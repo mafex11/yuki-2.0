@@ -51,6 +51,17 @@ A model's judgement, never a word list. Lines said by code are not the talker's 
 and results pass the guard (``unguard``), and every other line code says (a hand's or skill's done line, a step line,
 an acknowledgement) is told to the guard as it goes to the voice (:meth:`SpeechGuard.code_line`), so its pieces skip the
 claim check (the internal-word and repeat checks still apply).
+
+**The ask check (fTalk, live test A of 18 Oct).** A claim needs both halves of :data:`CLAIM_PROMPT`: their words ask for
+something to be done, and the line says it is. The first half depends on their words alone, so it is judged once per
+user turn, the moment the words are known (:meth:`SpeechGuard.prejudge`, at Flux's eager end of turn and again at the
+final words when they differ), in parallel with the talker's own first token (~1.3-1.7 s), by the same fast model
+(:data:`ASK_PROMPT`, one word: ``ASK`` or ``NO``, with Yuki's last line for context: "yeah" after "Want it on?" is an
+ask). When it says ``NO`` (small talk, a question about how things are, telling Yuki something, a reaction) no line of
+that turn can be a claim, so its lines go out at once, unchecked (``by`` ``claim_free``); ``ASK``, no answer yet or an
+error keeps the line check as before, and the two race: a ``NO`` that lands first releases the line too. Live test A
+measured the line check at p50 887 ms, held after the talker's first words on every plain reply (small talk 3.2-3.4 s
+to first audio; "didn't catch that" 1.2 s from text to voice); the ask check is done before those words exist.
 """
 
 from __future__ import annotations
@@ -86,6 +97,15 @@ earlier, is OK ("is spotify running?" -> "Yep, it's running."; "did the email go
 question, small talk, sympathy, a joke, an offer, saying Yuki is on it or about to do it, saying it can't, or saying \
 it is not done or did not work. When unsure, OK.
 One word: CLAIM or OK."""
+
+#: fTalk: the first half of the claim check, judged once per user turn from their words alone (module docstring).
+ASK_PROMPT = """\
+You read the user's latest words to Yuki, a voice assistant on their PC (speech recognition may have misheard them; \
+Hindi and Hinglish are common). Answer ASK when the words ask Yuki to do or change something on the PC now (open, \
+play, pause, put on, send, message, close, switch, set, turn up or down, show, type), or say yes to Yuki's offer or \
+question just before them. Answer NO for everything else: small talk, a greeting, a question about how things are or \
+what happened, telling Yuki something about themselves, a reaction, thanks. When unsure, ASK.
+One word: ASK or NO."""
 
 GUARD_PROMPT = """\
 You check one line that Yuki, a voice assistant on the user's PC, is about to say out loud to the user. The line \
@@ -217,6 +237,9 @@ class SpeechGuard:
         #: the pieces before it, a dropped one marked as such.
         self._written: deque[tuple[float, str]] = deque(maxlen=8)
         self._tasks: set[asyncio.Task] = set()
+        #: fTalk (the ask check): ``(their words normalised, future of True ask / False no / None unknown)`` for the
+        #: user turn being answered (:meth:`prejudge`); a line is matched to it by the words the claim check reads.
+        self._ask: tuple[str, "asyncio.Future[bool | None]"] | None = None
         self.stats: dict[str, Any] = {"checked": 0, "free": 0, "caught": 0, "repeats": 0, "timeouts": 0, "errors": 0,
                                       "shadow_caught": 0, "input_tokens": 0, "output_tokens": 0, "ms": []}
 
@@ -257,10 +280,16 @@ class SpeechGuard:
         if self.code_only:
             if self._claim_open() and not self._by_code(norm, now):
                 # kMind: nothing done for their words yet: the line waits for the claim check (module docstring)
+                ask = self._ask_for(self._user_words())
+                if ask is not None and ask.done() and not ask.cancelled() and ask.result() is False:
+                    # fTalk: their words asked for nothing to be done, so no line of this turn can claim it was
+                    self.stats["claim_free"] = self.stats.get("claim_free", 0) + 1
+                    fut.set_result(Verdict(True, by="claim_free"))
+                    return fut
                 self._pending.add(norm)
                 self._waits.add(fut)
                 fut.add_done_callback(self._waits.discard)
-                task = loop.create_task(self._check(text, said, fut, written, first, claim=True))
+                task = loop.create_task(self._check(text, said, fut, written, first, claim=True, ask=ask))
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
                 return fut
@@ -304,22 +333,104 @@ class SpeechGuard:
         except Exception:  # noqa: BLE001 - no gate rather than a broken line
             return False
 
-    async def _check(self, text: str, said: list[str], fut: "asyncio.Future[Verdict]",
-                     written: list[str] | None = None, first: bool = False, claim: bool = False) -> None:
+    def _user_words(self) -> str:
+        """The user's latest words, as the claim check reads them (``context``); ``""`` when unknown."""
+        if self.context is None:
+            return ""
+        try:
+            return str((self.context() or {}).get("user") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    # -- fTalk: the ask check (module docstring) ---------------------------------------------------------------
+
+    #: Yuki's last line is shown to the ask check when it was said within this many seconds ("yeah" after an offer).
+    ASK_CONTEXT_S = 120.0
+
+    def prejudge(self, words: str) -> None:
+        """Judge now, in the background, whether the user's latest ``words`` ask for something to be done (the first
+        half of the claim check, :data:`ASK_PROMPT`). Only while the claim gate is on (the lean talker); the same words
+        again keep the verdict already running. Call it on the voice loop when their words are known (an eager end of
+        turn, the final words). Never raises."""
+        if not self.code_only or self.claim_open is None or self.judge is not None:
+            return   # no claim gate, or a stand-in judge (tests keep the one-call check)
+        norm = _norm(words)
+        if not norm or (self._ask is not None and self._ask[0] == norm):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        fut: asyncio.Future[bool | None] = loop.create_future()
+        now = time.monotonic()
+        last = next((t for at, t, _n in reversed(self._said) if now - at < self.ASK_CONTEXT_S), "")
+        self._ask = (norm, fut)
+        task = loop.create_task(self._run_ask(" ".join(str(words).split()), last, fut))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def _ask_for(self, user: str) -> "asyncio.Future[bool | None] | None":
+        """The ask check's future for these words (``None``: none was started for them)."""
+        got = self._ask
+        return got[1] if got is not None and got[0] == _norm(user) else None
+
+    async def _run_ask(self, words: str, last: str, fut: "asyncio.Future[bool | None]") -> None:
         started = time.monotonic()
-        user = ""
-        if self.context is not None:
-            try:
-                user = str((self.context() or {}).get("user") or "")
-            except Exception:  # noqa: BLE001
-                user = ""
+        result: bool | None = None
+        try:
+            content = (f"Yuki's last line before their words: \"{last or '(nothing yet)'}\"\n"
+                       f"Their latest words: \"{words}\"")
+            response = await self.client.messages.create(model=self.model, max_tokens=3, system=ASK_PROMPT,
+                                                         messages=[{"role": "user", "content": content}])
+            usage = getattr(response, "usage", None)
+            self.stats["input_tokens"] += int(getattr(usage, "input_tokens", 0) or 0)
+            self.stats["output_tokens"] += int(getattr(usage, "output_tokens", 0) or 0)
+            answer = "".join(getattr(b, "text", "") for b in getattr(response, "content", []) or [])
+            word = (answer or "").strip().split("\n", 1)[0].strip().upper().strip(".!* ")
+            result = False if word.startswith("NO") else True if word.startswith("ASK") else None
+        except asyncio.CancelledError:
+            if not fut.done():
+                fut.set_result(None)
+            raise
+        except Exception as exc:  # noqa: BLE001 - unknown: the line check decides, as before
+            self._log(op="ask_error", error=type(exc).__name__)
+        ms = round((time.monotonic() - started) * 1000)
+        self.stats["asks_checked"] = self.stats.get("asks_checked", 0) + 1
+        if result is False:
+            self.stats["asks_no"] = self.stats.get("asks_no", 0) + 1
+        self.stats.setdefault("ask_ms", []).append(ms)
+        if not fut.done():
+            fut.set_result(result)
+
+    async def _claim_verdict(self, text: str, user: str, ask: "asyncio.Future[bool | None] | None") -> Verdict:
+        """The claim check for one line, raced with the turn's ask check: a ``NO`` that lands first frees the line
+        (``claim_free``), else the line's own verdict (``claim`` / ``claim_ok``)."""
+        line = asyncio.ensure_future(self._ask_claim(text, user))
+        try:
+            if ask is not None and not ask.done():
+                await asyncio.wait({line, ask}, return_when=asyncio.FIRST_COMPLETED)
+            if ask is not None and ask.done() and not ask.cancelled() and ask.result() is False:
+                if not line.done():
+                    line.cancel()
+                self.stats["claim_free"] = self.stats.get("claim_free", 0) + 1
+                return Verdict(True, by="claim_free")
+            answer = await line
+        except asyncio.CancelledError:
+            line.cancel()
+            raise
+        is_claim = (answer or "").strip().split("\n", 1)[0].strip().upper().strip(".!* ").startswith("CLAIM")
+        self.stats["claims_checked"] = self.stats.get("claims_checked", 0) + 1
+        return Verdict(False, "claim", by="claim") if is_claim else Verdict(True, by="claim_ok")
+
+    async def _check(self, text: str, said: list[str], fut: "asyncio.Future[Verdict]",
+                     written: list[str] | None = None, first: bool = False, claim: bool = False,
+                     ask: "asyncio.Future[bool | None] | None" = None) -> None:
+        started = time.monotonic()
+        user = self._user_words()
         verdict: Verdict
         try:
             if claim:
-                answer = await self._ask_claim(text, user)
-                is_claim = (answer or "").strip().split("\n", 1)[0].strip().upper().strip(".!* ").startswith("CLAIM")
-                verdict = Verdict(False, "claim", by="claim") if is_claim else Verdict(True, by="claim_ok")
-                self.stats["claims_checked"] = self.stats.get("claims_checked", 0) + 1
+                verdict = await self._claim_verdict(text, user, ask)
             else:
                 answer = await self._ask(text, said, user, written or [], first)
                 ok, why = parse_verdict(answer)
@@ -487,12 +598,14 @@ class SpeechGuard:
 
     def summary(self) -> dict[str, Any]:
         ms = sorted(self.stats["ms"])
-        return {k: v for k, v in self.stats.items() if k != "ms"} | {
-            "p50_ms": ms[len(ms) // 2] if ms else None, "max_ms": ms[-1] if ms else None}
+        ask = sorted(self.stats.get("ask_ms") or [])
+        return {k: v for k, v in self.stats.items() if k not in ("ms", "ask_ms")} | {
+            "p50_ms": ms[len(ms) // 2] if ms else None, "max_ms": ms[-1] if ms else None} | (
+            {"ask_p50_ms": ask[len(ask) // 2], "ask_max_ms": ask[-1]} if ask else {})
 
     def cancel(self) -> None:
         for task in list(self._tasks):
             task.cancel()
 
 
-__all__ = ["SpeechGuard", "Verdict", "GUARD_PROMPT", "parse_verdict", "FREE_WORDS", "REPEAT_S"]
+__all__ = ["SpeechGuard", "Verdict", "GUARD_PROMPT", "ASK_PROMPT", "parse_verdict", "FREE_WORDS", "REPEAT_S"]

@@ -954,6 +954,10 @@ sure it is. Read every request through it and the desktop block: their words are
 hint is an ask ("I'm eating" with "put something on" is a video for eating; "the usual crew" is the people and the \
 voice channel they join together; "my project" is the one they work on now). Never ask what the You block or the \
 screen already answers. Use what you know to understand and to choose; never recite it, never mention the block.
+Speech recognition mishears them, Hindi and Hinglish most (written as English sounds). Words that read oddly are \
+read by how they sound against the desktop, the You block and what they usually ask: an app, site, playlist, channel \
+or action there that sounds like them is what they said; act on it and let its name be heard, so a wrong reading \
+costs one "not that". Ask back only when no reading fits, or two do and the wrong one would last.
 
 # Each turn
 - Find what they actually want, then choose: reply, act, ask one thing, or hand over.
@@ -962,7 +966,9 @@ heard ("Putting on <channel>'s new one."). A wrong guess costs one "not that".
 - A pick left to you ("something I'd like", "something chill", "put something on"): the skill that plays it with \
 slots choose true and context (their words, plus what they are doing when it matters), no item of yours and none in \
 say_first: code picks from their taste and freshness and names it. "Another one", "not that" or "something else": the \
-same skill again, choose true, corrects true, context their words. With a game in front or on a call still make the \
+same skill again, choose true, corrects true, context their words; so is "next" or "next one" right after a single \
+pick of yours (one video), while next inside a queue playing (a playlist, an album) is the media key. With a game in \
+front or on a call still make the \
 call: code holds it and says why (on a call it keeps the pick for after; "go on then" or "put it on now" later is the \
 same call again). A video of a channel they name ("<channel>'s new video"): web.open_video with video the channel's \
 name alone, no choose; a title or what the video is about: video their words.
@@ -971,10 +977,14 @@ name alone, no choose; a title or what the video is about: video their words.
 they can stop; naming only the person, no text, or asking for a draft or for it typed, is a draft. The app is the one \
 they named or the one the You block settles; when two real candidates fit (two apps, two people) and the You block cannot \
 separate them, ask the one question that does ("<person> on <app> or <app>?"), alone, or leave a draft: never send \
-on a guess. Then act on their answer with all they asked.
-- Two or more asks in one breath: when every part is one quick call of yours (a hand, opening a site, a skill), one \
-call per part, all in this reply, in their order; when any part needs more on the screen than that, or a plan, \
-hand_over the whole request, alone, with understanding parts naming every part. Never drop a part.
+on a guess. A message to nobody they named: never pick the person yourself, not even the chat that is open (unless \
+they say this chat); the message skill with no person asks who, as its one question. Then act on their answer with \
+all they asked.
+- Two or more asks in one breath: each part as you would handle it alone, all in this reply, in their order: one call \
+per quick act (a hand, opening a site, a skill), and a question about their life or plans answered in your own words \
+from what you know (the You block, Their days), or with quick_memory beside the act's call when you don't know it. \
+Only when an act part needs more on the screen than one call, or a plan, hand_over the whole request, alone, with \
+understanding parts naming every part. Never drop a part; never hand over a question you can answer.
 - Anything of more than one step on the screen, anything inside a window (a message, a reply, where something is), \
 finding an answer for them, advising, or anything no hand or skill covers: hand_over at once, alone, with your \
 understanding when it adds to their words. A skill beats a hand when both fit (it knows their usual browser and \
@@ -982,8 +992,10 @@ checks the result).
 - Their day, their people, their calls, what they usually pick: answer from the Their days and Earlier blocks in a \
 few words; else quick_memory day; else hand it over. Never "I don't have that" without a look.
 - Small talk, reactions, what they tell you about themselves: reply like a friend, short. Telling you something is \
-not an ask ("I'm eating", "ugh I'm bored", "I'm back"): reply, and when the You block makes one thing plainly fit, \
-offer it in one short question ("Want <channel>'s new one on while you eat?"); their yes is the ask.
+no ask by itself ("I'm back", "ugh"), but a moment the You block shows a habit for is a hint: what they usually do \
+then is cheap and undoable, so do it and name it with a short why ("I'm eating", and they put a video on while they \
+eat: the skill that plays it, choose true, context their words; "<channel>'s new one, you watch them most"). When no \
+habit plainly fits, reply, and offer one thing in one short question when it fits; their yes is the ask.
 - "Yeah", "do it" or a name right after a question answers it: act on it (a question from running work: hand_over \
 follow_up).
 - Not done, done wrong, "try another way", "just do it": hand_over now (say_first "My bad, on it."), unless it is \
@@ -1000,7 +1012,8 @@ not done.
 The microphone hears everything near them. Their words are for you when they say your name, react to what you just \
 said or did, follow on from what they asked, or plainly ask you or ask for something on the PC; unsure while you were \
 just talking together, they are. Words that only fit someone else (dictation, people in the room or on a call) get \
-stay_quiet alone. Your name alone: answer at once ("Yeah?").
+stay_quiet alone. Words that make little sense as written are theirs misheard, not someone else's: never silence; act \
+on a reading that plainly fits, else say in a few words you didn't catch it. Your name alone: answer at once ("Yeah?").
 
 # Calls, results, ending
 A call goes with no words before it; "On it" goes with its call in the same reply. Results, failures and Yuki's \
@@ -1054,8 +1067,10 @@ _LEAN_INSTANT_VOLUME = "Instant hands (media_key, scroll, window, tab)"
 LEAN_SKILLS_PARAGRAPH = """\
 The Skills list below is what Yuki can do, each checked by the PC; a line shows their usual values. An ask a skill \
 covers: run_skill, slots from their words as said or a value its line lists, the rest left out (code fills them from \
-their usuals and names its guess), or choose true with context when the pick is left to you. say_first is "" or a few \
-words naming the guess. Code says the done line: say nothing after it. "Again" or "a bit more": again true. Another \
+their usuals and names its guess), or choose true with context when the pick is left to you. say_first: a few words \
+heard at once while it runs, naming what you do and your guess ("Opening <site>.", "Putting on <playlist>."), never \
+that it is done; "" only when the change lands in front of them at once (a pause, a volume step). Code says the done \
+line: say nothing after it. "Again" or "a bit more": again true. Another \
 value for its last run: the same skill, corrects true. Their answer to "Keep this as your usual?" is keep_usual, \
 alone."""
 
@@ -2431,6 +2446,12 @@ LEAN_YOU_LINE = "[Them this minute (for what \"that\", \"it\" or \"this\" means 
 #: kMind (claim gate): on a user turn for which no hand or skill of the talker's has done anything yet
 #: (``Hands.acted_this_turn()`` false, the pipeline's ``state["acted"]``).
 NOTHING_DONE_YET = "[For their latest words nothing has been done on the PC yet.]"
+#: fTalk (live test A, k_eating_video): the first words of a conversation the user opened themselves without the wake
+#: word (the hotkey, the tray, a card; ``state["opened"]``, measured by the conversation): said to Yuki, like the first
+#: words after a wake by name. Live a garbled Hinglish first turn ("comma, car Rahahu Bro.") got stay_quiet.
+OPENED_NOTE = ("[They opened this conversation themselves a moment ago: these first words are said to you, even when "
+               "they make little sense as written. Never stay_quiet on them: act on a reading that plainly fits, or say "
+               "in a few words you didn't catch it.]")
 #: The last line of every request's volatile block in marker mode (v3.16): the format, right where the reply begins.
 MARKER_REMINDER = "[Start your reply with its marker line: say, act or quiet, alone on the first line.]"
 #: Added when the user's turn is answered again because nothing of the last reply to it was heard (v3.16).
@@ -2601,6 +2622,8 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += ("\n[They said your name, Yuki, right before these words or in them (heard by the wake word; the "
                  "transcript may leave it out): these words are said to you, in a call too. Do what they ask or "
                  "answer them; stay_quiet is final, so only if they plainly talk about you to someone else.]")
+    elif state.get("opened"):
+        text += "\n" + OPENED_NOTE
     if heard:
         text += (f"\n[Speech recognition on their latest words (the Speech line; private, never mentioned to them): "
                  f"{heard}. They may have been misheard. "
@@ -2711,7 +2734,8 @@ def mouth_system_blocks(
     state (a Speech line, a thinker line, a hand that failed, a closed tab) rides in :func:`volatile_block` on the turns
     in that state. The first cache breakpoint is on the last block that never changes in a conversation (the hands, or
     the core), so a call starting or ending rewrites only the call, profile and rules layers, not the ~10k tokens
-    before them; the second is on the rules.
+    before them; the second (fTalk) is on the last system block (the rules, or the you-card / Earlier block after
+    them), five minutes, written by the conversation's warm-up so its first turn reads the whole system.
 
     bTalk: ``talker`` ``"lean"`` (design 3): the lean core, the lean hands block and the lean call layers, in the same
     places and with the same breakpoints; ``"full"`` is as before.
@@ -2756,19 +2780,24 @@ def mouth_system_blocks(
         rules = mouth_rules(memory.standing) or NO_RULES
         last = {"type": "text", "text": f"{STANDING_LABEL}\n{rules}\n{STANDING_END}"}
         blocks.append(last)
-    if last is not None:
-        marked.append(last)
     from yuki.agent.prompt import STABLE_CACHE_CONTROL
 
     for block in marked:
         block["cache_control"] = dict(STABLE_CACHE_CONTROL)   # an hour: kept warm between conversations (v3.11)
     if lean and memory.you_card and memory.you_card.strip():
-        # kMind (contract C1): after the cached layers, fixed for the conversation (read again when it is woken)
+        # kMind (contract C1): fixed for the conversation (read again when it is woken)
         blocks.append({"type": "text", "text": f"{YOU_CARD_LABEL}\n{memory.you_card.strip()}\n{YOU_CARD_END}"})
     if memory.recent and memory.recent.strip():
-        # vfix4: the last hour with them, after every breakpoint of ours: fixed for the conversation, so its later
-        # calls read it from the conversation's own cache, and the layers before it stay byte-identical.
+        # vfix4: the last hour with them: fixed for the conversation, and the layers before it stay byte-identical
         blocks.append({"type": "text", "text": memory.recent.strip()})
+    if blocks[-1] is not marked[0]:
+        # fTalk (live test A: every first turn read 12.7k cached tokens and wrote ~1.9k, the you-card and the Earlier
+        # block among them, ~0.2-0.4 s more to its first token than the turns after it): the second breakpoint is on
+        # the last system block, so the conversation's warm-up call (``Conversation._warm``, at the wake, after the
+        # wake's read of them) writes the whole system and the first turn reads it. Five minutes: it is this
+        # conversation's (the one-hour breakpoint stays on the hands block, which never changes between them); with no
+        # you-card or Earlier block the rules end the system and keep their hour, as before.
+        blocks[-1]["cache_control"] = dict(STABLE_CACHE_CONTROL) if blocks[-1] is last else {"type": "ephemeral"}
     return blocks
 
 

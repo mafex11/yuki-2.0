@@ -1894,6 +1894,15 @@ class TurnObserver:
         self.owes_reply_since = None
         self._activity()
 
+    def _prejudge(self, words: str) -> None:
+        """fTalk: the claim gate's ask check starts on their words now, alongside the talker (speechguard.prejudge)."""
+        fn = getattr(self.guard, "prejudge", None)
+        if callable(fn) and str(words or "").strip():
+            try:
+                fn(words)
+            except Exception:  # noqa: BLE001 - only a head start: the line check stays
+                pass
+
     def as_observer(self) -> Any:
         outer = self
 
@@ -2275,6 +2284,7 @@ class TurnObserver:
             note, low, near = heard_note(result.get("words") if isinstance(result, dict) else None, self.keyterms,
                                          cut_before=self.cut_before(), screen=self.screen_terms)
             self.heard, self.heard_plain = note, bool(note and not (low or near))
+            self._prejudge(getattr(frame, "text", "") or "")
             return
         if isinstance(frame, UserStartedSpeakingFrame):
             self.user_speaking = True
@@ -2315,6 +2325,7 @@ class TurnObserver:
                 self.recent_words.append(turn.user_text.strip())
             if self.guard is not None:
                 self.guard.new_turn()
+            self._prejudge(turn.user_text)   # fTalk: the same words as the eager ones keep that check
             self._last_words, self._words_at = "", None
             turn.eot_at = now  # Flux pushes the final transcript at its end of turn
             turn.eager_at, self._eager_at = self._eager_at, None
@@ -5688,6 +5699,19 @@ class Conversation:
             self.log.event("warm", note="skipped: the chosen voice model's service keeps no prompt cache")
             return
         request: dict[str, Any] = {"messages": [{"role": "user", "content": "."}]}
+        job = getattr(self, "_recent_job", None)
+        if job is not None and not self.dormant:
+            # fTalk: the warm-up writes the whole system (the you-card and the Earlier block carry the second
+            # breakpoint, mouth.mouth_system_blocks), so it waits for the wake's read of them, as the first call does
+            # (at most RECENT_WAIT_S), then freezes them: a read that lands later would change the system after it
+            try:
+                if not job.done():
+                    await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(job)), self.RECENT_WAIT_S)
+            except Exception:  # noqa: BLE001 - past the bound: the view read at the build
+                pass
+            close = getattr(self, "_recent_close", None)
+            if callable(close):
+                close()
         try:
             from pipecat.processors.aggregators.llm_context import LLMContext
 
@@ -6519,10 +6543,27 @@ class Conversation:
             acted = self._acted_this_turn()
             if acted is not None:
                 state["acted"] = acted
+        if self._opened_by_hand():
+            state["opened"] = True   # fTalk: the first words of a conversation they opened themselves (mouth.OPENED_NOTE)
         reflex = self._reflex_state()
         if reflex:
             state["reflex"] = reflex   # lSpeed: the reflex that ran for these words (mouth.REFLEX_NOTES)
         return state
+
+    def _opened_by_hand(self) -> bool:
+        """fTalk (live test A, k_eating_video): the call answers the first words of a conversation the user opened
+        themselves without the wake word (the hotkey, the tray, a card): those words are said to Yuki, as the first
+        words after a wake by name are (``named``). A wake (``woken_by_name`` or ``name_check``) and a wake after a
+        goodbye keep their own rules. Measured state, never the words. Never raises."""
+        try:
+            if self.dormant or self.woken_by_name or self.name_check or self.after_goodbye:
+                return False
+            call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
+            if call is not None and not call.user_turn:
+                return False
+            return int(self.observer.user_turns) <= 1
+        except Exception:  # noqa: BLE001
+            return False
 
     def _claim_open(self) -> bool:
         """kMind (the claim gate): the talker's words now are a reply to the user's own turn in which nothing was done
