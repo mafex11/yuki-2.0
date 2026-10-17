@@ -18,7 +18,8 @@
   open loops and a two-line recent past, each line saying how sure it is. When it comes, it replaces the brief in the
   profile block and the places block (it holds both); the places are still read for the join check
   (:func:`channel_known`). When it can't be read (``""``), those two stand in, as before. The "you right now" record
-  stays either way (review M3: its fail-closed line when it misses its wait; the card may come without a live part).
+  stays either way (review M3: its fail-closed line when it misses its wait; the card may come without a live part),
+  less the lines the card already holds whole (kYou merge note 4, :func:`beside_card`).
 * **The talker's understanding** (contract C3, voice only): the talker's reading of the heard words (goal, parts, a
   pick left to Yuki, context), shown labelled as a seed: their exact words win.
 * **The "you right now" record** comes through the state design's section 11 interface: the request turn's provider
@@ -173,8 +174,8 @@ class Gathered:
     Attributes:
         overview: The window list and the Now picture (``Dispatcher.overview_text``), and when it was read.
         payload: The overview as data (the executor's window facts).
-        you: The "you right now" text (``render(you, "thinker")``, or the Now board as a stand-in; with or without
-            the you-card).
+        you: The "you right now" text (``render(you, "thinker")``, or the Now board as a stand-in; with the you-card,
+            less the lines the card holds whole).
         card: The you-card (C1, :func:`read_card`), ``""`` when it could not be read.
         people: People named and their last messages.
         places: The user's places from memory (:func:`read_places`: the pages they watch, the voice channels they
@@ -521,6 +522,18 @@ def channel_known(name: Any, app: str | None = None, *, now: float | None = None
     return any(span_in(want, list(words)) for _shown, texts in seen for words in texts)
 
 
+def beside_card(you: str, card: str) -> str:
+    """The "you right now" text without the lines the you-card already holds whole (kYou merge note 4: the planner's
+    card carries the same record's focus, day, just-changed and thread-now lines as its "right now"). String identity
+    only (spaces folded), never a reading: a line the card words otherwise, or that changed between the two reads,
+    stays; ``""`` when the card holds every line."""
+    held = " ".join(str(card or "").split())
+    if not held:
+        return you
+    keep = [line for line in str(you or "").split("\n") if line.strip() and " ".join(line.split()) not in held]
+    return "\n".join(keep)
+
+
 def read_card(memory: Any, *, limit: int = CARD_CHARS) -> str:
     """kBrain (contract C1): the planner's you-card (``MemoryClient.you_card(purpose="planner")``, code-built, no
     model call), capped; ``""`` when memory can't give one (not installed, an older memory without it, a failure or
@@ -681,6 +694,10 @@ def gather(*, dispatcher: Any, memory: Any, settings: Any, words: str, names: Se
             # kBrain (C1): the card holds who they are and their things: the brief and the places block would say the
             # same again (the places stay read for the join check)
             out.profile = profile_text(names=names, brief=None, rules=rules, limit=limits.profile_chars)
+            if out.you and out.you != YOU_UNKNOWN:
+                # kYou merge note 4: the card's "right now" is this record's top lines; the ones it holds whole are
+                # not said twice (the due items, the usual now and the other threads stay)
+                out.you = beside_card(out.you, out.card)
         else:
             places = results.get("places")
             out.places = places.text if isinstance(places, Places) else ""
@@ -1276,7 +1293,7 @@ def answer_report(question: str, answer: str | None) -> str:
 
 
 __all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "read_places", "Places", "channel_known",
-           "PLACES_LABEL", "read_profile_parts", "read_card", "CARD_LABEL", "understanding_block",
+           "PLACES_LABEL", "read_profile_parts", "read_card", "beside_card", "CARD_LABEL", "understanding_block",
            "UNDERSTANDING_LABEL", "read_menu",
            "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "seed_memory", "seed_memory_text",
            "request_turn", "Conversation",

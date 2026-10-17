@@ -183,7 +183,7 @@ def plan_schema() -> dict[str, Any]:
         "properties": {
             "commit": {"type": "string", "enum": list(COMMITS)},
             "quote": _nullable("string", "Their exact words asking for it."),
-            "to": _nullable("string", "The person or channel."),
+            "to": _nullable("string", "The person or channel (one of their ways: the place they named)."),
             # sBrainFix (F1c): their own words, never translated or restyled (the core prompt says it in full)
             "text": _nullable("string", "The message, in their words."),
         },

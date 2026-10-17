@@ -253,6 +253,9 @@ class Lane(QThread):
         #: V4: the app named for the running job after it became current (:meth:`name_app_job`), given to the agent
         #: again once its run has begun, so the run's own start cannot overwrite it (review F9).
         self._named_late: dict[int, str] = {}
+        #: kMind merge note (review L5): the voice talker's understanding (C3) that came after its job was submitted
+        #: (:meth:`seed_job`), taken by the brain once, as it writes the planner's first turn; a later one is dropped.
+        self._seeds_late: dict[int, dict[str, Any]] = {}
         #: appWin2 review F1: words added to a job before its run's body began (still queued, or current a moment before
         #: ``Agent.run`` empties the steering inbox), handed to the agent once it has begun; ``_begun`` is that job's id.
         self._early_steers: dict[int, list[str]] = {}
@@ -476,6 +479,22 @@ class Lane(QThread):
             return True
         return False
 
+    def seed_job(self, job_id: int, understanding: dict[str, Any]) -> bool:
+        """kMind merge note (review L5): the talker's understanding (C3) for a job submitted before it was complete,
+        kept for the brain to take as it writes the planner's first turn (:meth:`_late_seed`). ``False`` when that job
+        is neither running nor queued here (it ended, or was cancelled)."""
+        with self._state:
+            running = self._current is not None and self._current.id == job_id
+            queued = job_id in self._waiting and job_id not in self._skip
+            if running or queued:
+                self._seeds_late[job_id] = dict(understanding)
+        return running or queued
+
+    def _late_seed(self, job_id: int) -> dict[str, Any] | None:
+        """The late understanding kept for ``job_id`` (taken once), else ``None``."""
+        with self._state:
+            return self._seeds_late.pop(job_id, None)
+
     def answer(self, text: str) -> None:
         """Hand the user's answer to a paused request."""
         self._answers.put(text)
@@ -542,6 +561,7 @@ class Lane(QThread):
                 self._active = agent if not skipped and agent is not self.agent else None
                 if skipped:   # words added while it waited go with it: you stopped (or replaced) that request
                     self._early_steers.pop(job.id, None)
+                    self._seeds_late.pop(job.id, None)
             if skipped:
                 # Cancelled while it waited: it never reaches the agent, so a
                 # cancel meant for it cannot land on the next request instead.
@@ -582,6 +602,7 @@ class Lane(QThread):
                     self._paused_job = None
                     self._named_late.pop(job.id, None)
                     self._early_steers.pop(job.id, None)
+                    self._seeds_late.pop(job.id, None)
                 self.runtime.lane_done.emit(
                     self.name, job.id, job.request, bool(reached_for_hands), reached_for_hands
                 )
@@ -627,7 +648,8 @@ class Lane(QThread):
             seed = plan_seed(job.skill or getattr(runtime, "_skills", {}).get(job.id))
             events = agent.run(job.request, user_words=list(words or ()), context=job.context or "",
                                channel="voice" if voice else "typed", request_id=job.log_request_id or "",
-                               origin_hwnd=job.origin_hwnd, plan_seed=seed, understanding=job.understanding)
+                               origin_hwnd=job.origin_hwnd, plan_seed=seed, understanding=job.understanding,
+                               late_understanding=lambda job_id=job.id: self._late_seed(job_id))
             return self._relay(job, agent, events, allowed, refused)
         events = self.agent.run(
             job.request, origin_hwnd=job.origin_hwnd, effort=effort if voice else None,
@@ -1416,6 +1438,25 @@ class AgentRuntime(QObject):
             return True
         self._apps_named[request_id] = named
         return False
+
+    def seed(self, request_id: int, understanding: dict[str, Any] | None) -> bool:
+        """kMind merge note (review L5): the voice talker's understanding (contract C3) for a request submitted on the
+        call's first bytes, before the understanding was complete. The brain takes it as it writes the planner's first
+        turn (its reads take longer than the understanding does); one that comes later is dropped: their exact words
+        stand alone then, as for a request with no understanding. Kept for a front-desk hand-off too. Returns whether
+        the request was still queued or running (content-free log)."""
+        if not isinstance(understanding, dict) or not understanding:
+            return False
+        request_id = int(request_id)
+        ok = False
+        for lane in (self.worker, self.front_desk):
+            if lane.seed_job(request_id, understanding):
+                ok = True
+                if lane is self.front_desk:
+                    self._understandings.setdefault(request_id, dict(understanding))
+                break
+        self.ui_log.event("late_seed", id=request_id, delivered=ok)
+        return ok
 
     def running_ids(self) -> dict[str, int | None]:
         """``lane -> id`` of the request each lane is driving now."""
