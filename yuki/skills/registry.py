@@ -53,6 +53,13 @@ OUTCOMES: tuple[str, ...] = ("running", "done", "already", "unverified", "failed
                              "handed_over", "refused", "cancelled", "other_device", "no_route", "error")
 #: Outcomes where the run changed nothing on the PC: its window claims no moment (D18 attribution matches app + kind).
 IDLE_OUTCOMES: tuple[str, ...] = ("already", "held_game", "asked", "refused", "cancelled", "other_device", "no_route")
+#: kHands brief item 6: ``skill_route_tries`` holds every rung a run tried, its last one too (the run's own row names
+#: that one as well). The counters read the run's row for its last rung, so a ``skill_route_tries`` row that is its
+#: run's last rung is left out of every union with ``skill_runs`` (never counted twice). SQL on the unaliased table;
+#: the skill (a try row copies its run's) lets the lookup use ``skill_runs``' (skill, t0) index.
+TRY_NOT_LAST = ("NOT EXISTS (SELECT 1 FROM skill_runs r WHERE r.skill = skill_route_tries.skill AND "
+                "r.run_key = skill_route_tries.run_key AND r.rung = skill_route_tries.rung AND "
+                "r.variant IS skill_route_tries.variant AND r.via = skill_route_tries.via)")
 
 
 def has_tables(store: Any) -> bool:
@@ -266,8 +273,9 @@ def set_run_app(store: Any, run_key: str, app: str | None) -> bool:
 
 def record_route_try(store: Any, run_key: str, route: Route, checked: bool | None, *, outcome: str,
                      ms: float | None = None) -> bool:
-    """A rung that ran (or could not) and was not the last one of its run: its verdict in ``skill_route_tries``, so
-    the counters see every rung while ``skill_runs`` keeps one row per run."""
+    """A rung that ran (or could not): its verdict in ``skill_route_tries``, so the counters see every rung while
+    ``skill_runs`` keeps one row per run. The run's last rung is written here too (kHands brief item 6: successes are
+    logged); the counters leave that row out (:data:`TRY_NOT_LAST`), since the run's own row names it."""
     def write(conn: Any) -> None:
         base = conn.execute("SELECT skill, t0 FROM skill_runs WHERE run_key = ?", (run_key,)).fetchone()
         if base is None:
@@ -419,7 +427,8 @@ def trust(store: Any, skill_key: str, *, now: float | None = None, until: float 
             "WHERE skill = ? AND rung IS NOT NULL AND t0 >= ? AND t0 < ? AND outcome NOT IN ('running', 'held_game', "
             "'asked', 'refused', 'cancelled', 'other_device')" + runs_real + " "
             "UNION ALL SELECT rung, variant, via, checked, NULL, at, ms, id FROM skill_route_tries "
-            "WHERE skill = ? AND at >= ? AND at < ?" + tries_real + ") ORDER BY t DESC, id DESC",
+            "WHERE skill = ? AND at >= ? AND at < ?" + tries_real + " AND " + TRY_NOT_LAST + ") "
+            "ORDER BY t DESC, id DESC",
             (skill_key, lo, hi, skill_key, lo, hi))
     except Exception:  # noqa: BLE001 - no trust yet
         return out
@@ -505,7 +514,7 @@ def _merged_last5(store: Any, key: str, *, real_only: bool = True) -> list[int]:
             "SELECT checked, recheck FROM (SELECT checked, recheck, coalesce(t_done, t0) AS t, id FROM skill_runs "
             "WHERE skill = ? AND checked IS NOT NULL AND rung IS NOT NULL" + runs_real
             + " UNION ALL SELECT checked, NULL, at, id FROM skill_route_tries WHERE skill = ? AND checked IS NOT NULL"
-            + tries_real + ") ORDER BY t DESC, id DESC LIMIT ?",
+            + tries_real + " AND " + TRY_NOT_LAST + ") ORDER BY t DESC, id DESC LIMIT ?",
             (key, key, CHANGE_WINDOW))
     except Exception:  # noqa: BLE001
         return []
@@ -540,8 +549,9 @@ def last_runs(store: Any, skill_key: str, *, since: float, limit: int = 5) -> li
 
 def import_evidence(store: Any, skill_key: str, route: Route, *, ok: int, source: str,
                     now: float | None = None) -> bool:
-    """Intake: verified runs of an old procedure counted as this rung's evidence (``seed_ok``), its source kept
-    (``procedure:<id>``). Pipeline code only (``python -m yuki.skills.intake --apply``), never a hand edit."""
+    """Imported evidence: verified runs from elsewhere counted as this rung's evidence (``seed_ok``), its source kept
+    (today the ways learner's: the user's own checked demonstrations of a way, ``source = "learned_way"``,
+    :func:`yuki.skills.learn.ways._import_evidence`). Pipeline code only, never a hand edit."""
     now = time.time() if now is None else float(now)
 
     def write(conn: Any) -> None:
@@ -582,7 +592,7 @@ def runs_between(store: Any, since: float, until: float) -> list[dict[str, Any]]
 
 
 __all__ = ["DISABLE_AFTER", "RETRY_AFTER_S", "OPEN_RUNS", "CHANGE_RUNS", "OUTCOMES", "RouteTrust", "has_tables", "seed",
-           "CAPABILITY_ORIGIN", "SEEDED_ORIGINS",
+           "CAPABILITY_ORIGIN", "SEEDED_ORIGINS", "TRY_NOT_LAST",
            "skill_ids", "new_run_key", "start_run", "finish_run", "set_run_app", "record_route_try", "set_recheck",
            "mark_false_done", "trust", "usable", "offer_ready", "menu_version", "last_runs", "import_evidence",
            "table_counts", "runs_between"]
