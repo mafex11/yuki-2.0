@@ -44,10 +44,11 @@ of the app and the chat's scope) and must be one of the route's thread ids; anot
 "no". Failing that, one of the route's threads read since the run began. **Nothing is typed into a chat that isn't
 confirmed open.**
 
-**Rule 8** (Q3): ``send = "send"`` (the user plainly said "send X to Y") types X and presses the app's send key, both
-judged by Yuki's own check with the user's words, and both whom and what must stand in their words
-(:func:`yuki.skills.uia_route.check_sends`); ``draft`` (naming only the person, or saying what to write without "send")
-types it and leaves it; no text just opens the chat. On the new brain the consent rule may allow a send in Yuki's own
+**Rule 8** (Q3; the send rule, lead decision 18 Oct): ``send = "send"`` (their words message, tell, ask or reply to
+someone and give what to say: "tell Y X", "send X to Y"; the talker or the planner judges it, after the countdown)
+types X and presses the app's send key, both judged by Yuki's own check with the user's words, and both whom and what
+must stand in their words (:func:`yuki.skills.uia_route.check_sends`); ``draft`` (they asked for a draft) types it and
+leaves it; no text (naming only the person) just opens the chat. On the new brain the consent rule may allow a send in Yuki's own
 wording of what the user asked to say (failure fix-plan Item 11, row 4, with the 3 s countdown showing the text, or
 after their yes): that very step's grant (:attr:`yuki.skills.engine.RunContext.grant`) lets exactly that text go to
 exactly that person (by their id in the people index), in their own direct message only, and nothing else (Item 11's L2;
@@ -1607,16 +1608,13 @@ def route_voice_join(call: RouteCall) -> RouteResult:
     image = str((data.get("images") or [""])[0])
     # the microphone before anything is done: the question's "is it Discord's own call", and the onset's baseline
     before = _mic_held(image)
-    answer = call.values.get("join_in_call")
-    if answer is not True:
-        asked = _call_question(call, data, app, name, before)
-        if asked is not None:
-            if answer is False:
-                # their "no" to the in-call question: their call stays as it is
-                return RouteResult(ran=False, ask=LINE_STAY, outcome="declined")
-            return RouteResult(ran=False, ask=asked[0], outcome="ask_in_call", facts={"call": asked[1]})
-        # lMsg: with no call live there was no question to answer, so a "no" given here (a planner's guess, live 17
-        # Oct: "Okay, I'll leave your call as it is" with no call open) is no answer: the join goes ahead
+    # the in-call question (their "no" keeps their call as it is; with no call live a "no" is no answer, lMsg) and,
+    # after the switcher, the join itself: the same code as discord.voice's link rung (kHands merge note 8)
+    from yuki.skills.discord_route import in_call_gate, join_tail
+
+    gate = in_call_gate(call, data, app, name, before)
+    if gate is not None:
+        return gate
     hands = call.ctx.hands
     if hands is None or not data.get("switcher"):
         return RouteResult(ran=False, outcome="no_hands" if hands is None else "no_switcher")
@@ -1638,35 +1636,7 @@ def route_voice_join(call: RouteCall) -> RouteResult:
         return RouteResult(ran=False, outcome="switcher_unseen", facts={"steps": len(steps), "steps_done": done})
     if done == 0:
         return RouteResult(ran=False, outcome="switcher_failed", facts={"steps": len(steps)})
-    joined = _wait_mic(call.ctx, image, before, VOICE_WAIT_S)
-    pressed = ""
-    if not joined and before is not False:
-        # review r2 L5: no onset can show (the microphone unreadable, or Discord already held it): the switcher's
-        # channel still gets the same time to open before "Join Voice" is pressed (never the channel in view before)
-        call.ctx.sleep(VOICE_WAIT_S)
-    if not joined:
-        label = ((data.get("labels") or {}).get("en") or {}).get("join_voice")
-        if isinstance(label, list) and len(label) >= 2:
-            role, button = str(label[0]), str(label[1])
-            question = _judged(hands, hwnd, image, role, button)
-            if question == HANDED_OVER:
-                from yuki.skills.engine import TO_PLANNER
-
-                return RouteResult(ran=True, outcome=TO_PLANNER, app=app)
-            if question is not None:
-                return RouteResult(ran=True, ask=question, outcome="held_by_check", app=app)
-            if _refused("click", hwnd=hwnd):
-                return RouteResult(ran=True, held="game", outcome="refused", app=app)
-            pressed = _press(hwnd, role, button)
-            if pressed == "pressed":
-                joined = _wait_mic(call.ctx, image, before, JOIN_WAIT_S)
-    if joined:
-        _note_channel(call.ctx, name)
-    return RouteResult(ran=True, outcome="joined" if joined else "opened", app=app,
-                       say=SAY_JOINED.format(channel=name, app=_title(app)),
-                       unverified_line=LINE_VOICE_UNCONFIRMED.format(channel=name),
-                       facts={"onset": joined, "join_button": pressed or "not_needed", "steps_done": done,
-                              "mic_before": {True: "held", False: "free", None: "unknown"}[before]})
+    return join_tail(call, data, app, hwnd, image, before, name, {"steps_done": done})
 
 
 def _note_channel(ctx: Any, name: str) -> None:

@@ -1260,6 +1260,9 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
               reads=waited.reads, observed=waited.evidence)
         if waited.verdict is True:
             line = done_line(skill, plan.values, plan.named, route=route, say=res.say)
+            # kHands brief item 6: every rung tried is in skill_route_tries, the last one too (the counters leave a
+            # run's last rung out of that table: registry.TRY_NOT_LAST)
+            _ledger_try(ctx, run_key, route, True, "done", route_ms)
             _ledger_finish(ctx, run_key, outcome="done", checked=True, route=route, ms=route_ms,
                            value=res.value, entity_digest=res.entity_digest, app=app_done,
                            evidence={"numbers": _numbers(plan.values), "check": waited.evidence})
@@ -1292,6 +1295,7 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                                 ledger={"route": route, "ms": route_ms, "value": res.value, "app": app_done,
                                         "evidence": {"numbers": _numbers(plan.values), "check": waited.evidence}})
             say = res.unverified_line or LINE_UNVERIFIED
+            _ledger_try(ctx, run_key, route, None, "unverified", route_ms)
             _ledger_finish(ctx, run_key, outcome="unverified", checked=None, route=route, ms=route_ms,
                            value=res.value, app=app_done,
                            evidence={"numbers": _numbers(plan.values), "check": waited.evidence})
@@ -1302,6 +1306,7 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
         if sends or not route.retry_after_acting:
             # review M3: a rung that acted on a skill that sends (or one whose data says so) is never followed by
             # another acting rung or a hand-off: the message may have gone anyway, and a second try would send twice
+            _ledger_try(ctx, run_key, route, False, "failed", route_ms)
             _ledger_finish(ctx, run_key, outcome="failed", checked=False, route=route, ms=route_ms, app=app_done,
                            evidence={"numbers": _numbers(plan.values), "check": waited.evidence})
             return _simple(skill.key, "failed", ctx, started, say=LINE_SEND_FAILED if sends else LINE_FAILED,

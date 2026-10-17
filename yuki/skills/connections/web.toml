@@ -31,7 +31,7 @@ app = "web"
 [capability."web.open_page"]
 end = "page"
 kind = "open"
-menu = "open a site's front page or one of its pages in a browser; nothing plays until they pick"
+menu = "open a site's front page or one of its pages in a browser; nothing plays unless choose=true"
 done_line = "{site} is up."
 offer_class = "judged"
 handoff = true
@@ -99,7 +99,7 @@ recheck = { probe = "driver", driver = "web_route", call = "page_seen", after_s 
 [capability."web.open_video"]
 end = "media_play"
 kind = "change"
-menu = "play a video: one they picked, or choose=true for Yuki's pick from their taste"
+menu = "play a video they named, or Yuki's pick from their taste (choose=true, context=their words)"
 done_line = "Playing it."
 offer_class = "never"
 handoff = true

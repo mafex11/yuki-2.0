@@ -19,9 +19,10 @@ eval). Step by step:
    value must be one of its options, or a boolean that spells exactly one of them (lSkills, live 17 Oct: ``mute:
    true`` for on / off, :func:`bool_option`); numbers are numbers in range; ``points`` is a signed number or the
    schema's direction words ``up`` / ``down``; an entity or a text must stand in the user's words as whole words
-   (:func:`yuki.skills.uia_route.said`) or be a name the menu listed (taste) or a told value; an entity value no taste
-   row is called that sounds like exactly one listed name is that name (lSkills, live 17 Oct: "Lumin" for lumen with
-   ``[playlist: lumen | ネオン]`` listed; :func:`yuki.skills.taste.heard_as`). A person (a ``person``
+   (:func:`yuki.skills.uia_route.said`) or be a name the menu listed (taste; an entity slot's known values and
+   ``app.way``'s control labels, :func:`_listed`; a live way's key, :func:`_way_given`) or a told value; an entity
+   value no taste row is called that sounds like exactly one listed name is that name (lSkills, live 17 Oct: "Lumin" for
+   lumen with ``[playlist: lumen | ネオン]`` listed; :func:`yuki.skills.taste.heard_as`). A person (a ``person``
    slot, or a text slot the capability binds to a ``contact``: ``message``'s ``person``) may also be a name the
    people index resolves to exactly one person whom the words name as heard: a learned misheard form ("hey meant"),
    a transliteration ("हेमंत") or a close mishearing by sound (:func:`yuki.memory.contacts.names_person`); a group
@@ -108,6 +109,15 @@ FROM_WORDED = "worded"
 #: after "words" (what the user named still wins: the engine chooses only when they named nothing), named in the done
 #: line by the engine, and a guess for taste (``taste.GUESS_FILLS``: Yuki's own pick never feeds itself).
 FROM_CHOSEN = "chosen"
+#: Where a given value came from when the words don't hold it and it is kept as given anyway, for its route to refuse:
+#: today only ``app.way``'s ``way`` naming none of the user's live ways (kWays review L1: the route asks "Which of your
+#: ways?", never runs another way in its place). The engine's word for a given value too (``engine.FROM_GIVEN``).
+FROM_GIVEN = "given"
+#: ``app.way``'s slots (connections/ways.toml, contract C4): which way (a live way's key or name), and where in the app
+#: (a control's label the menu lists, one of their things, or an item's own words).
+WAY_CAPABILITY = "app.way"
+WAY_SLOT = "way"
+WAY_ITEM_SLOT = "item"
 #: The slot types code checks with no words at all (an option, a number, a switch): how a ``sends_when`` slot's given
 #: value is read before the slot loop (:func:`_sends`).
 CODE_TYPES: tuple[str, ...] = ("enum", "number", "points", "bool")
@@ -365,6 +375,12 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
             return True, who
         if site and _site_said(text, words):
             return True, text
+        # kWays merge note 2 (review M1): a label the menu lists for this slot (``app.way``'s item: a way's control,
+        # "New thread", whatever words the user used for it, "a fresh one"); only ``app.way``'s item slot is given
+        # such names (:func:`_listed`), never a person or what to write
+        listed = next((n for n in menu_names if _words(n).casefold() == text.casefold()), None)
+        if listed is not None:
+            return True, listed
         return False, None
     if t == "person":
         who = None
@@ -423,6 +439,68 @@ def from_pref(store: Any, slot: Slot, option: str) -> tuple[bool, Any]:
     if slot.type in ("person", "text"):
         return False, None
     return check_value(slot, option, [option], menu_names=[option])
+
+
+def _listed(skill: Skill, slot: Slot, store: Any, *, now: float) -> list[str]:
+    """The names the menu lists for a slot with no taste kind of its own, which step 1 accepts as listed (the slot
+    loop's ``menu_names``; a speed-up: each route still matches what it is given against the user's own things):
+
+    * an entity slot: the user's known values of the capability for that slot (contract C5,
+      :func:`yuki.skills.learn.values.known`, Not mine left out: the menu's "theirs"; its label, the form a request
+      passes), and, for a capability that joins a call, on its first entity slot (the channel the done line names),
+      the channels a join was noted for (tastes ``<app>_voice``: the menu's "voice channels"; kHands merge note 4);
+    * ``app.way``'s item slot: the labels of the user's ways' controls (kWays merge note 2:
+      :func:`yuki.skills.learn.ways.control_labels`, ``item = "New thread"``).
+
+    Any other slot: none (a person or what to write is never taken from a list). Never raises (``[]``)."""
+    if store is None or slot.taste:
+        return []
+    cap = skill.capability or skill.key
+    out: list[Any] = []
+    try:
+        if slot.type == "text":
+            if cap != WAY_CAPABILITY or slot.name != WAY_ITEM_SLOT:
+                return []
+            from yuki.skills.learn.ways import control_labels
+
+            return [n for n in dict.fromkeys(_words(x) for x in control_labels(store)) if n]
+        if slot.type != "entity":
+            return []
+        from yuki.skills.learn.values import known
+
+        out += [v.get("label") or v.get("value") for v in known(store, cap, now=now).get(cap) or []
+                if v.get("slot") == slot.name]
+        first = next((s for s in skill.slots if s.type == "entity"), None)
+        if str(getattr(skill, "end", "") or "") == "call_join" and skill.app and first is slot:
+            from yuki.skills import taste
+
+            out += taste.candidates(store, f"{skill.app}_voice", now=now)
+    except Exception:  # noqa: BLE001 - what was read so far
+        pass
+    return [n for n in dict.fromkeys(_words(x) for x in out) if n]
+
+
+def _way_given(store: Any, value: Any) -> dict[str, Any] | None:
+    """kWays merge note 1: the live way of the user's (``app.way``'s ``way`` slot) a given value names, by its key or
+    its name as a menu line or the you-card shows it (case and spaces aside): ``{"name", "key"}``, the form the route
+    compares (:func:`yuki.skills.uia_route.choose_way`). ``None``: none (or memory can't say). Never raises."""
+    if store is None:
+        return None
+    if isinstance(value, Mapping):
+        value = value.get("key") or value.get("name")
+    want = _words(value).casefold()
+    if not want:
+        return None
+    try:
+        from yuki.skills.learn.ways import live_ways
+
+        for w in live_ways(store):
+            key, name = _words(w.get("key")), _words(w.get("name"))
+            if want in (key.casefold(), name.casefold()) and key:
+                return {"name": name or key, "key": key}
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def told_values(store: Any, skill_key: str) -> dict[str, Any]:
@@ -1234,7 +1312,15 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             # kTaste (C2): the engine's pick for this run (the user asked Yuki to choose, or named only the channel)
             values[slot.name], filled[slot.name] = chosen[slot.name], str(chosen_from or FROM_CHOSEN)
             continue
-        menu_names = taste.candidates(store, slot.taste, now=now) if (slot.taste and store is not None) else []
+        way_slot = cap == WAY_CAPABILITY and slot.name == WAY_SLOT and slot.type == "entity" and store is not None
+        if way_slot and slot.name in given:
+            # kWays merge note 1: a live way of theirs named by its key or name (the menu line's ``way = <key>``)
+            way = _way_given(store, given[slot.name])
+            if way is not None:
+                values[slot.name], filled[slot.name] = way, "words"
+                continue
+        menu_names = taste.candidates(store, slot.taste, now=now) if (slot.taste and store is not None) \
+            else _listed(skill, slot, store, now=now)
         # tTaste merge note 2 (phase T): a slot every route of which runs only with a value an offered option carries
         # (``taste.takes_offers``: today ``web.open_video``'s ``video``) lists the names just offered aloud, and a value
         # that is one of them takes the offer's link ("the Deji one" plays it). Any other span is still accepted as for
@@ -1320,6 +1406,14 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                                                                               sources, now)):
                     return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=heard_as[0]), [heard_as[0]],
                                dropped=list(dropped))
+            if way_slot:
+                # kWays review L1: a way that is none of theirs (a misroute: "in Notion type X") is kept as given, so
+                # the route asks "Which of your ways?"; dropped, the slot's default would run their only way instead
+                raw = given[slot.name]
+                text = (raw.get("key") or raw.get("name")) if isinstance(raw, Mapping) else raw
+                if _words(text):
+                    values[slot.name], filled[slot.name] = {"name": _words(text)}, FROM_GIVEN
+                    continue
             dropped.append(slot.name)
         # FILL_ORDER "words" (2): an app their own words name, before any live guess, preference, fill policy or
         # bound default (the volume of "Spotify", not of the app playing). Never an app Yuki itself just acted in (a
@@ -1611,8 +1705,8 @@ def eval_resolver(db_path: Any, *, client: Any = None, model: str | None = None,
     return EvalResolver(Store.open(path), client=client, model=model, prompt=prompt, loaded=loaded)
 
 
-__all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "FROM_GRANT", "FROM_WORDED", "CODE_TYPES",
-           "CONFIRM_PERSON", "JUST_ACTED_S",
+__all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "FROM_GRANT", "FROM_WORDED", "FROM_GIVEN",
+           "CODE_TYPES", "CONFIRM_PERSON", "JUST_ACTED_S",
            "CONFIRM_ONCE_S", "Live", "Plan", "Ask", "Held", "Handoff", "Refused", "app_name", "app_identity",
            "known_apps", "named_app", "just_acted", "call_apps", "check_value", "bool_option", "pref_option",
            "from_pref",
