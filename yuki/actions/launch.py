@@ -1331,9 +1331,13 @@ _ACTIVATION_INTERFACE = None
 #: only; a new process (an updated package) tries protocol activation again.
 _NO_PROTOCOL: set[str] = set()
 _no_protocol_lock = threading.Lock()
-#: How long a running package that refused protocol activation is watched for the page its alias carried (its react
-#: time plus a second), before ``open_url``'s address bar takes over.
+#: How long a package that refused protocol activation is watched for the page its alias carried (its react time plus a
+#: second), before ``open_url``'s address bar (or the web skill's next rung) takes over: from the hand-off when it was
+#: running, from its first window on screen when it started cold (review r1 M1: a cold Arc drops the address and shows
+#: its new-tab view, percFix 5 Oct; the whole 14 s cold page wait and a second alias hand-off took 23 s).
 _REFUSED_PAGE_S = _RUNNING_REACT_S + 1.0
+#: How often the cold start's window is looked for (a window list, no page read) before that watch begins.
+_WINDOW_UP_POLL_S = 0.1
 
 
 def _hresult_of(error: str) -> int | None:
@@ -1346,6 +1350,23 @@ def _hresult_of(error: str) -> int | None:
     except ValueError:
         return None
     return value & 0xFFFFFFFF
+
+
+def _await_window_up(identity: "_AppIdentity", before: dict[int, int], until: float) -> float | None:
+    """Review r1 M1: when (``time.monotonic()``) one of the app's own windows is first on screen after a cold start,
+    looked for every :data:`_WINDOW_UP_POLL_S` by a window list alone (no page read), until ``until``; ``None`` when
+    none came. Only for an app whose windows can be recognised (``identity.confirmable``); never raises."""
+    windows = _app_windows(identity, before)
+    while True:
+        try:
+            if windows():
+                return time.monotonic()
+        except Exception:  # noqa: BLE001 - not listed this time
+            pass
+        left = until - time.monotonic()
+        if left <= 0:
+            return None
+        time.sleep(min(_WINDOW_UP_POLL_S, left))
 
 
 def _activation_failure(name: str, via: str, error: str) -> str:
@@ -2792,6 +2813,12 @@ def launch_app(
     the address and kept its old page, or showed a YouTube tab it already had).
     A window that already showed the very page asked for and still does is
     ``ok=True`` with ``details["page_state"] = "already"`` (review r1 M1).
+    lSkills review r1 M1: a package whose protocol activation Windows refused
+    (``details["no_protocol"]``), started through its alias or
+    ``ActivateApplication``, is watched for the page :data:`_REFUSED_PAGE_S`
+    from the hand-off (running) or from its first window (cold), is never
+    handed the address again the same way, and windows of it showing no page
+    at all are ``ok=False`` with ``details["reason"] = "page_blank"``.
 
     The window that appeared (or changed) is brought to the foreground exactly as
     :func:`focus_window` does and waited on until it accepts input, so the caller
@@ -3049,6 +3076,15 @@ def launch_app(
             mark("start_again")
     if not details["launched"]:
         return finish(False, f"could not start {chosen['name']!r}: {failure}", details)
+    # review r1 M1: a package whose protocol activation Windows refused (now, or earlier in this process), its address
+    # carried by its alias or ActivateApplication instead: Arc drops what a cold start carries (percFix, 5 Oct: its
+    # new-tab view) and ignores what a running instance's alias carries (3, 5 and 10 Oct), so its page is watched
+    # briefly, never handed again the same way, and windows showing no page are "not opened" (``page_blank``)
+    no_protocol = bool(details.get("protocol_refused")) or (
+        plan is not None and plan.get("via") in ("AppExecutionAlias", "ActivateApplication")
+        and str(chosen.get("appid") or "").lower() in _NO_PROTOCOL)
+    if no_protocol:
+        details["no_protocol"] = True
 
     handed_off = time.monotonic()
     window_deadline = handed_off + timeout_s
@@ -3073,11 +3109,20 @@ def launch_app(
     if page_targets:
         details["page_targets"] = page_targets
         content_deadline = handed_off + content_timeout_s + (0.0 if already_running else timeout_s)
-        if already_running and details.get("protocol_refused"):
+        if no_protocol and already_running:
             # lSkills: a running package that refused protocol activation got the address through its alias, which Arc
             # ignored on 3, 5 and 10 Oct: a browser that takes it shows the page within the react time, so the
             # address bar (open_url) isn't kept waiting the whole content wait behind it
             content_deadline = min(content_deadline, handed_off + _REFUSED_PAGE_S)
+        elif no_protocol and identity.confirmable:
+            # review r1 M1: started cold (Arc's usual state): its window first, by a window list alone, then the page
+            # for the same short watch from then on - not the whole 14 s cold page wait for an address a cold Arc drops
+            up_at = _await_window_up(identity, before, content_deadline if deadline is None
+                                     else min(content_deadline, float(deadline)))
+            mark("window_up")
+            if up_at is not None:
+                details["window_up_ms"] = round((up_at - handed_off) * 1000.0, 1)
+                content_deadline = min(content_deadline, up_at + _REFUSED_PAGE_S)
         if deadline is not None:
             content_deadline = min(content_deadline, float(deadline))
         page_wait = _await_page(identity, page_targets, before, content_deadline - time.monotonic(),
@@ -3096,6 +3141,7 @@ def launch_app(
                 details,
             )
         if (page_wait is not None and page_wait.windows and not page_wait.seen and not already_running
+                and not no_protocol   # review r1 M1: the same alias again, which a running Arc ignores (6 s for nothing)
                 and (deadline is None or float(deadline) - time.monotonic() >= _AGAIN_MIN_S)
                 and identity.running_pids()):
             # percFix (live 5 Oct): Arc started cold with an address came up on its own new-tab view and never
@@ -3141,6 +3187,17 @@ def launch_app(
             # host): not opened, so a skill goes on to its next rung instead of counting this as acted
             details["reason"] = "page_unchanged"
             details["page_state"] = "same" if still else "other"
+        elif no_protocol and page_wait is not None and page_wait.windows and not page_wait.seen:
+            # review r1 M1: its windows are up and show no page at all after a start through its alias or
+            # ActivateApplication (Windows refused it the address by protocol activation; a cold Arc shows its
+            # new-tab view): not opened, so open_url's address bar or the web skill's next rung types it, instead of
+            # an "opened, not known" that the skill counted as acted and handed to the thinker 6 s later
+            details["reason"] = "page_blank"
+            details["page_state"] = "blank"
+            page_miss = (False, (
+                f"handed {chosen['name']} {page_targets[0]} through {details.get('via_word') or details.get('via')}, "
+                f"but after {page_wait.waited_ms / 1000.0:.1f} s its windows show no page at all (Windows would not "
+                f"hand it the address by protocol activation): the address did not open"))
         # The address is not on screen.  What did change, if anything, is
         # looked up once, without waiting any longer.
         window_deadline = time.monotonic() + 2 * _POLL_S
@@ -4122,13 +4179,17 @@ def open_url(
             by (see :func:`launch_app`); ``None``: the waits above only.
         address_bar: lSkills (live 17 Oct): with ``app`` and a web address, when
             the app didn't open the address handed to it (``page_unchanged``:
-            it kept the page it had; or the start failed while it runs) and it
-            is a browser by machine data, the address is typed into its own
-            address bar (:func:`_address_bar_open`; a new tab, a frame field
-            only, verified by the page). After two ignored hand-offs in a row
-            (one once its protocol activation was refused) the hand-off is
-            skipped and the address typed at once. ``False``: the hand-off's
-            own result only (the web skill, whose next rung types it itself).
+            it kept the page it had - another page counts only in a packaged
+            or protocol-refused browser; ``page_blank``: a refused package
+            showing no page; a packaged start whose windows show none; or the
+            start failed while it runs) and it is a browser by machine data,
+            the address is typed into its own address bar
+            (:func:`_address_bar_open`; a new tab, a frame field only, verified
+            by the page). After two ignored hand-offs in a row (one once its
+            protocol activation was refused) the hand-off is skipped and the
+            address typed at once; once that typing got as far as Enter, it is
+            the answer (never handed over too). ``False``: the hand-off's own
+            result only (the web skill, whose next rung types it itself).
 
     A web address handed to a browser that was already running is checked
     against what its windows showed right before (:func:`_pages_before`): an
@@ -4170,7 +4231,10 @@ def open_url(
                 # bar at once, not after the whole page wait (x8WebArc review r1 L1, carried to the hand)
                 typed_first = _address_bar_open(app, address, deadline=deadline,
                                                 handed=ActionResult(ok=False, summary="", details={"launched": False}))
-                if typed_first is not None and typed_first.ok:
+                if typed_first is not None and (typed_first.ok
+                                                or typed_first.details.get("bar_stage") == "not_seen"):
+                    # opened, or the address went in and Enter was pressed with no page seen yet (review r1 L2): the
+                    # address isn't handed over again, so a slow page never opens twice
                     typed_first.details["url"] = target
                     typed_first.details["handoff_skipped"] = True
                     return typed_first
@@ -4185,8 +4249,16 @@ def open_url(
             return launched
         if ld.get("refused") == "game" or typed_first is not None:
             return launched
-        ignored = ld.get("reason") == "page_unchanged"
-        if ignored and ld.get("page_state") == "same":
+        same = ld.get("reason") == "page_unchanged" and ld.get("page_state") == "same"
+        # review r1 L1: another page showing ("other") is an ignored hand-off only in a packaged browser or one whose
+        # protocol activation was refused (Arc restoring old tabs); a desktop browser that took the address and
+        # landed on another host (twitter.com -> x.com, a login elsewhere) gets no second tab of the same address
+        ignored = same or (ld.get("reason") == "page_unchanged"
+                           and (bool(ld.get("no_protocol")) or _is_packaged(appid)))
+        blank_page = ld.get("reason") == "page_blank"
+        if same or blank_page:
+            # kept the very page it had, or (review r1 M1) a refused package's start showed no page at all: the next
+            # address goes straight into its address bar (one such hand-off is enough once protocol was refused)
             _note_ignored(appid, True)
         page_check = ld.get("page_check") if isinstance(ld.get("page_check"), dict) else {}
         # its windows show no page at all after a packaged app's alias or activation carried the address (percFix: Arc
@@ -4194,7 +4266,7 @@ def open_url(
         blank = (bool(page_check.get("windows")) and not page_check.get("seen")
                  and ld.get("via") in ("AppExecutionAlias", "ActivateApplication"))
         failed_start = not ld.get("launched") and bool(ld.get("protocol_refused") or ld.get("launch_error"))
-        if not (ignored or failed_start or (blank and ld.get("page_verified") is not True)):
+        if not (ignored or blank_page or failed_start or (blank and ld.get("page_verified") is not True)):
             return launched
         typed = _address_bar_open(app, address, deadline=deadline, handed=launched)
         if typed is None:

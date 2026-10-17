@@ -312,10 +312,11 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
         x = _num(value)
         return (x is not None and x != 0.0), x
     if t == "bool":
+        # a JSON boolean only (review r1 L5): the one shipped bool slot is discord.voice's join_in_call, a join gate
+        # (true leaves the current call), so no string spelling ("yes", "on", "1") ever answers it
         if isinstance(value, bool):
             return True, value
-        truth = _truth(value)
-        return (truth is not None), truth
+        return False, None
     text = _words(value)
     if t == "app":
         if any(text.casefold() == o.casefold() for o in slot.options):

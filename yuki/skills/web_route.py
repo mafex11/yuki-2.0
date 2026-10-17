@@ -47,7 +47,8 @@ x8WebArc (10 Oct: "open YouTube in Arc" opened nothing new in Arc five times, an
   different browsers named and the slot naming neither: Yuki asks which, never guesses.
 * **The ladder is protocol, then the address bar, then the hand-off.** Rung A hands the address over as a launch
   argument (``launch.open_url``: a packaged browser by protocol activation, how a running browser takes a link), within
-  the request's deadline. A browser that kept the page it had (``page_unchanged``) did not open it: that rung did not
+  the request's deadline. A browser that kept the page it had (``page_unchanged``), or one whose protocol activation
+  Windows refused that came up showing no page at all (``page_blank``: a cold Arc), did not open it: that rung did not
   run, and the next one does. The address-bar rung (:func:`route_address_bar`) types the address into the chosen
   browser's own address field in its own window (by hwnd): a new tab (the route's ``new_tab`` keys), the address typed
   and read back, Enter as navigation; only into a text field of the browser's own frame (never a page's own box, so
@@ -706,12 +707,13 @@ def route_told_link(call: RouteCall) -> RouteResult:
     seen = _launch_seen(result)
     if not getattr(result, "ok", False):
         details = getattr(result, "details", None) or {}
-        if seen["reason"] == "page_unchanged":
-            # x8WebArc: the browser kept the page it had: not opened
+        if seen["reason"] in ("page_unchanged", "page_blank"):
+            # x8WebArc: the browser kept the page it had: not opened (page_blank, review r1 M1: a protocol-refused
+            # browser came up showing no page at all: not opened either)
             if source != "default" and seen["state"] == "same":
                 _note_ignored(key, True)
-            _log_open(call, "protocol", seen, "page_unchanged")
-            return RouteResult(ran=False, outcome="page_unchanged",
+            _log_open(call, "protocol", seen, seen["reason"])
+            return RouteResult(ran=False, outcome=seen["reason"],
                                facts={"browser_from": source, "via": seen["via"], "state": seen["state"]})
         if not (isinstance(details, Mapping) and (details.get("launched") or details.get("hwnd"))):
             return RouteResult(ran=False, outcome="not_opened", facts={"browser_from": source, "via": seen["via"]})
@@ -1327,11 +1329,14 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
         _note_window(call, key or _app_key(seen["process"]), seen["hwnd"])
     facts = {"browser_from": source, "via": seen["via"]}
     if not getattr(result, "ok", False):
-        if seen["reason"] == "page_unchanged":
+        if seen["reason"] in ("page_unchanged", "page_blank"):
+            # page_blank (review r1 M1): a browser whose protocol activation Windows refused came up showing no page
+            # at all (a cold Arc drops the address): not opened either, so the address-bar rung types it now instead
+            # of the done-check waiting 6 s on nothing and handing the request to the thinker
             if named and seen["state"] == "same":
                 _note_ignored(key, True)
-            _log_open(call, "protocol", seen, "page_unchanged")
-            return RouteResult(ran=False, outcome="page_unchanged", facts={**facts, "state": seen["state"]}), \
+            _log_open(call, "protocol", seen, seen["reason"])
+            return RouteResult(ran=False, outcome=seen["reason"], facts={**facts, "state": seen["state"]}), \
                 name, key, source, seen
         details = getattr(result, "details", None) or {}
         launched = isinstance(details, Mapping) and bool(details.get("launched") or details.get("hwnd"))

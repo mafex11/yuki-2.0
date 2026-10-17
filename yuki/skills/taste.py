@@ -494,8 +494,14 @@ def described(store: Any, kind: str, *, now: float | None = None, names: Any = (
         picked = str(source or "") != SEEN_SOURCE and float(n_obs or 0.0) > 0
         items.append(((0 if picked else 1, -float(n_obs or 0.0), float(last_at or 0.0)), item))
     items.sort(key=lambda kv: kv[0])
-    out = [item for _k, item in items]
-    have = {_norm(i["name"]) for i in out}
+    out: list[dict[str, Any]] = []
+    have: set[str] = set()
+    for _k, item in items:
+        # review r1 L6: two rows with the same name would put that name twice in the judgement's enum (a request the
+        # API may refuse): the first kept, which the order above makes the picked, most-played row
+        if _norm(item["name"]) not in have:
+            have.add(_norm(item["name"]))
+            out.append(item)
     for n in names or []:
         clean = " ".join(str(n or "").split())
         if clean and _norm(clean) not in have:
@@ -514,10 +520,10 @@ Answer only with the pick tool:
   an item they called "Korean", or "lofi" for one they called "study beats"), and no other item fits as well.
 - content: the words name a language, a genre, a scene or an artist, and its name or its "heard" titles plainly show
   that of exactly one item.
-- mood: the words ask for a feel or an activity without naming one of their {things} ("something chill", "something
-  to work out to", "something to sleep to"), and no item's name or "called" words say it: pick nothing (their usual
+- mood: the words ask for a feel or an activity without naming one of their {things} ("something upbeat", "music
+  for a long drive", "something for cooking"), and no item's name or "called" words say it: pick nothing (their usual
   for the hour will play). A feel or an activity is never content.
-- none: the words name one of their {things} by a word none of these goes by ("my gym playlist" with no item called
+- none: the words name one of their {things} by a word none of these goes by ("my party playlist" with no item called
   that), or two items fit equally: pick nothing."""
 
 
@@ -605,7 +611,8 @@ def judge(said: str, words: Any, items: list[dict[str, Any]], *, kind: str = "sp
     ask within :data:`MEANING_TTL_S` has it at once). A ``name`` verdict stands only when the words say that name by
     identity or sound (:func:`_name_said`). Content (names, titles, words) goes to the model only, never to a log."""
     started = time.perf_counter()
-    names = [str(i.get("name") or "") for i in items if i.get("name")]
+    # each name once (review r1 L6: a duplicate value in the tool's enum may get the request refused)
+    names = list(dict.fromkeys(str(i.get("name") or "") for i in items if i.get("name")))
     text = " ".join(str(said or "").split())
     if not names or not text:
         return Meant(None, "unknown")
