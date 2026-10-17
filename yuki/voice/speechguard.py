@@ -139,7 +139,7 @@ class Verdict:
     ok: bool
     why: str = ""
     ms: float = 0.0
-    by: str = "model"   # model | free | repeat | timeout | error | off | shadow (would have dropped; said anyway)
+    by: str = "model"   # model | free | repeat | timeout | error | off | shadow | claim | claim_ok (kMind)
 
 
 def _norm(text: str) -> str:
@@ -291,7 +291,7 @@ class SpeechGuard:
             if claim:
                 answer = await self._ask_claim(text, user)
                 is_claim = (answer or "").strip().split("\n", 1)[0].strip().upper().strip(".!* ").startswith("CLAIM")
-                verdict = Verdict(False, "claim", by="claim") if is_claim else Verdict(True, by="model")
+                verdict = Verdict(False, "claim", by="claim") if is_claim else Verdict(True, by="claim_ok")
                 self.stats["claims_checked"] = self.stats.get("claims_checked", 0) + 1
             else:
                 answer = await self._ask(text, said, user, written or [], first)
