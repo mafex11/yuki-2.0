@@ -9,9 +9,11 @@ This module builds ONE card from the stores that already hold the answer, by cod
 * **Right now** - the you-now record (``yuki.memory.younow``: focus, the day, what just changed, the thread now);
 * **Usually now** - the active routines due around this hour, the sites, channels and playlists the user picks most
   at this hour (``yuki.skills.learn.values`` hour histograms, ``yuki.skills.taste.top``);
-* **Your things** - sites with their usual browser and a work mark, YouTube channels, Spotify playlists with what the
-  user calls them, meeting tabs, Discord voice channels, the user's own ways (contract C4 rows), usual means
-  (``prefs``), and the people block (``yuki.memory.contacts.directory``: names, how each is heard, their app);
+* **Your things** - sites with their usual browser and a work mark, YouTube channels (by display name, most watched
+  first), Spotify playlists with what the user calls them, meeting tabs, the voice channels and servers of the apps
+  that join calls (``yuki.skills.discord_route.voice_channels``), the things inside their own ways' apps (their
+  projects) and the ways themselves (contract C4 rows: run only when asked, never offered), usual means (``prefs``),
+  and the people block (``yuki.memory.contacts.directory``: names, how each is heard, their app);
 * **Open** - the brief's live items (dated goals, loops, plans), top 3;
 * **Lately** - the last two day digests, one short line each.
 
@@ -38,7 +40,9 @@ from datetime import datetime
 from typing import Any
 
 PURPOSES: tuple[str, ...] = ("talker", "planner", "judge")
-TALKER_CHARS = 1_800
+#: The voice talker reads the card cut at a line boundary to 2,200 chars (kMind: ``mouth.fetch_you_card``): the card
+#: fits it whole, the lines that decide most first (right now, usually now, their things), so nothing is cut there.
+TALKER_CHARS = 2_200
 WIDE_CHARS = 3_000
 CACHE_S = 60.0
 #: How many of each kind of thing a card names (talker, wide).
@@ -273,10 +277,9 @@ def _things(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, wide:
     try:
         from yuki.skills import taste
 
-        chans = [n for n in taste.candidates(store, "youtube_handle", now=now, by="n_obs", limit=CHANNELS_N[i])
-                 if str(n or "").strip()][:CHANNELS_N[i]]
+        chans = _channels(store, now, CHANNELS_N[i])
         if chans:
-            out.append("YouTube channels they watch (most first): " + ", ".join(_clip(n, 26) for n in chans))
+            out.append("YouTube channels they watch (most watched first): " + ", ".join(chans))
         lists = taste.described(store, "spotify_playlist", now=now, limit=PLAYLISTS_N[i])
         if lists:
             bits = []
@@ -286,30 +289,60 @@ def _things(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, wide:
                 bits.append(_clip(d.get("name"), 28) + (f" (they call it {' / '.join(called)})" if called else "")
                             + (" (played often)" if isinstance(plays, (int, float)) and plays >= 3 else ""))
             out.append("Spotify playlists: " + ", ".join(bits))
-        voice = [n for n in taste.candidates(store, "discord_voice", now=now, by="n_obs", limit=VOICE_N[i])
-                 if str(n or "").strip()][:VOICE_N[i]]
-        if voice:
-            out.append("Discord voice channels they join: " + ", ".join(_clip(n, 30) for n in voice))
     except Exception:  # noqa: BLE001
         pass
-    out += _places(store, 4 if not wide else 6)
-    ways = _ways(store, 3 if not wide else 6)
-    if ways:
-        out.append("Their own ways (learned): " + "; ".join(ways))
+    out += _places(store, now, VOICE_N[i], 4 if not wide else 6)
+    ways = _live_ways(store)
+    out += _way_things(ways, 6 if not wide else 10)
+    lines = _ways(ways, 3 if not wide else 6)
+    if lines:
+        out.append("Their own ways (learned from them; run only when they ask, never offered): " + "; ".join(lines))
     usuals = _usuals(store, 4 if not wide else 8)
     if usuals:
         out.append("Usual means: " + "; ".join(usuals))
     return out
 
 
-def _places(store: Any, n: int) -> list[str]:
-    """The servers of the apps that join calls (catalog data: ``end = "call_join"``; their processes from the chat
-    data, as ``yuki.brain.context.read_places``): the part before ": " of their chats' scopes (the capture's own
-    "<server>: <channel>" form), most recently seen first. RAM only."""
+def _channels(store: Any, now: float, n: int) -> list[str]:
+    """The YouTube channels the user watches, most watched first (``tastes.n_obs``: decayed watch units, kTaste), each
+    by its display name (``Store.yt_channels``: a feed's or oEmbed's name) with the handle the slot takes when it
+    differs; then the names their own app showed with no watch yet. RAM only."""
+    from yuki.skills import taste
+
+    rows = [t for t in taste.top(store, "youtube_handle", now=now, n=10_000) if str(t.name or "").strip()]
+    rows.sort(key=lambda t: (-t.n_obs, t.entity_key))
+    rows = rows[:n]
+    try:
+        known = store.yt_channels([t.entity_key for t in rows]) if rows else {}
+    except Exception:  # noqa: BLE001
+        known = {}
+    out: list[str] = []
+    for t in rows:
+        handle = " ".join(str(t.name).split())
+        name = " ".join(str((known.get(t.entity_key) or {}).get("name") or "").split()) or handle
+        same = "".join(name.casefold().split()) == "".join(handle.lstrip("@").casefold().split())
+        out.append(_clip(name, 26) + ("" if same else f" ({_clip(handle, 24)})"))
+    if len(out) < n:
+        have = {"".join(x.casefold().split()) for x in out}
+        for name in taste.seen_names(store, "youtube_handle"):
+            if len(out) >= n:
+                break
+            if "".join(name.casefold().split()) not in have:
+                out.append(_clip(name, 26))
+    return out
+
+
+def _places(store: Any, now: float, n_voice: int, n_servers: int) -> list[str]:
+    """Per app that joins calls (catalog data: ``end = "call_join"``): the voice channels they join (tastes
+    ``<app>_voice``) and the ones memory saw them in (``yuki.skills.discord_route.voice_channels``, kHands merge note
+    5: newest first) with each one's server, then the servers they chat in (the part before ": " of their chats'
+    scopes: the capture's own "<server>: <channel>" form, as ``yuki.brain.context.read_places``), recent first. RAM
+    only."""
     try:
         from yuki.memory.store import app_key
         from yuki.skills.catalog import capabilities
         from yuki.skills.chat import app_data
+        from yuki.skills.menu import voice_channels
 
         apps = sorted({str(s.app) for s in capabilities().skills if str(getattr(s, "end", "")) == "call_join" and
                        s.app})
@@ -317,16 +350,32 @@ def _places(store: Any, n: int) -> list[str]:
         return []
     out = []
     for app in apps:
+        title = app.capitalize()
+        voice: list[str] = []
+        try:
+            from yuki.skills import taste
+
+            voice = [_clip(x, 30) for x in taste.candidates(store, f"{app}_voice", now=now, by="n_obs",
+                                                            limit=n_voice) if str(x or "").strip()]
+        except Exception:  # noqa: BLE001
+            pass
+        seen = voice_channels(store, app)
+        for vc in seen:
+            if len(voice) >= n_voice:
+                break
+            label = _clip(vc.name, 30) + (f" (in {_clip(vc.place, 30)})" if vc.place else "")
+            if vc.name and _clip(vc.name, 30) not in voice and label not in voice:
+                voice.append(label)
+        if voice:
+            out.append(f"{title} voice channels they join (recent first): " + ", ".join(voice))
+        servers: list[str] = []
         try:
             keys = sorted({app_key(str(p)) or "" for p in app_data(app).get("processes") or []} - {""})
-            if not keys:
-                continue
             rows = store._query(f"SELECT scope_ciphertext FROM threads WHERE process IN ({','.join('?' * len(keys))})"
                                 " AND merged_into IS NULL AND kind = 'conversation' AND scope_ciphertext IS NOT NULL"
-                                " ORDER BY last_seen DESC LIMIT 200", keys)
+                                " ORDER BY last_seen DESC LIMIT 200", keys) if keys else []
         except Exception:  # noqa: BLE001
-            continue
-        servers: list[str] = []
+            rows = []
         for (ct,) in rows:
             try:
                 scope = " ".join(str(store._dec(ct) or "").split())
@@ -335,41 +384,68 @@ def _places(store: Any, n: int) -> list[str]:
             head, sep, _rest = scope.partition(": ")
             if sep and head and head not in servers:
                 servers.append(head)
-            if len(servers) >= n:
+            if len(servers) >= n_servers:
                 break
+        for vc in seen:
+            if len(servers) >= n_servers:
+                break
+            if vc.place and vc.place not in servers:
+                servers.append(vc.place)
         if servers:
-            out.append(f"{app.capitalize()} servers they chat in (recent first): " + ", ".join(_clip(x, 30)
-                                                                                           for x in servers))
+            out.append(f"{title} servers they're in (recent first): " + ", ".join(_clip(x, 30) for x in servers))
     return out
 
 
-def _ways(store: Any, n: int) -> list[str]:
-    """Contract C4: the learned ways (lane kWays' rows, ``origin = 'learned_way'``), name and how often, with the
-    items they were used with when the row keeps them (``spec["values"]`` or ``spec["items"]``: names)."""
+def _live_ways(store: Any) -> list[dict[str, Any]]:
+    """Contract C4: the user's own ways as the route runs them (``yuki.skills.learn.ways.live_ways``). RAM only."""
     try:
-        rows = store._query("SELECT name_ciphertext, spec_ciphertext, provenance FROM skills WHERE origin ="
-                            " 'learned_way' AND deleted_at IS NULL AND retired_at IS NULL ORDER BY uses DESC,"
-                            " updated_at DESC LIMIT ?", (int(n),))
+        from yuki.skills.learn.ways import live_ways
+
+        return live_ways(store)
     except Exception:  # noqa: BLE001
         return []
-    out = []
-    for name_ct, spec_ct, prov in rows:
-        try:
-            name = " ".join(str(store._dec(name_ct) or "").split()) if name_ct else ""
-            spec = json.loads(store._dec(spec_ct) or "{}") if spec_ct else {}
-            prov = json.loads(prov or "{}")
-        except Exception:  # noqa: BLE001
+
+
+def _way_things(ways: Sequence[dict[str, Any]], n: int) -> list[str]:
+    """The user's things inside their ways' apps (a way's item slot: ``spec["item"]["things"]``, the group labels of
+    the rows they pick, e.g. their projects in a coding app), most days first, one line per app."""
+    from yuki.skills.learn.ways import app_title
+
+    by_app: dict[str, tuple[str, list[dict[str, Any]]]] = {}
+    for w in ways:
+        spec = w.get("spec") or {}
+        things = [t for t in ((spec.get("item") or {}).get("things") or []) if isinstance(t, dict) and t.get("name")]
+        if not things:
             continue
+        noun, have = by_app.setdefault(str(w.get("app") or ""), (str(spec.get("item_noun") or "thing"), []))
+        names = {t["name"] for t in have}
+        have.extend(t for t in things if t["name"] not in names)
+    out = []
+    for app, (noun, things) in by_app.items():
+        things.sort(key=lambda t: (-int(t.get("days") or 0), -int(t.get("picks") or 0)))
+        bits = [_clip(t["name"], 28) + (f" ({_sure_days(int(t.get('days') or 0))})" if t.get("days") else "")
+                for t in things[:n]]
+        out.append(f"Their {noun} groups in {app_title(app)} (the ones they pick in; most days first): "
+                   + ", ".join(bits))
+    return out
+
+
+def _ways(ways: Sequence[dict[str, Any]], n: int) -> list[str]:
+    """Contract C4: the learned ways, name, app and how sure (the days of their demonstrations, or the user told it);
+    run only when asked (a way is never offered)."""
+    from yuki.skills.learn.ways import app_title
+
+    out = []
+    for w in list(ways)[:n]:
+        name = " ".join(str(w.get("name") or "").split())
         if not name:
             continue
-        items = []
-        for it in (spec.get("values") or spec.get("items") or []) if isinstance(spec, dict) else []:
-            label = it.get("name") if isinstance(it, dict) else it
-            if str(label or "").strip():
-                items.append(_clip(label, 24))
-        days = int(prov.get("days") or 0) if isinstance(prov, dict) else 0
-        out.append(_clip(name, 50) + (f" (with {', '.join(items[:4])})" if items else "")
-                   + (f" ({_sure_days(days)})" if days else ""))
+        prov = w.get("prov") or {}
+        days = int(prov.get("days") or 0)
+        sure = "they told Yuki" if prov.get("told") else _sure_days(days) if days else ""
+        app = app_title(str(w.get("app") or ""))
+        where = "" if not app or app.split(" (")[0].casefold() in name.casefold() else f" in {app}"
+        out.append(_clip(name, 50) + where + (f" ({sure})" if sure else ""))
     return out
 
 

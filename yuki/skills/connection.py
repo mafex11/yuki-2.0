@@ -87,8 +87,9 @@ from typing import Any, Callable, Iterable, Mapping
 #: The bundled connection files.
 CONNECTIONS_DIR = Path(__file__).with_name("connections")
 
-#: At most this many capabilities load from the shipped files (one neutral menu line each: design §2, "<= 8").
-MAX_CAPABILITIES = 8
+#: At most this many capabilities load from the shipped files (one neutral menu line each: design §2 said "<= 8"; 12
+#: since app.way, lane kWays, filled the eighth place: room for the next capability file).
+MAX_CAPABILITIES = 12
 #: At most this many live learned skills (decision D4 of the habits plan: skill libraries collapse as they grow; design
 #: §4.9: ranked, the rest stay in the Playbook only). :mod:`yuki.skills.catalog` applies it.
 MAX_SKILLS = 20

@@ -23,7 +23,8 @@ The pipeline (each a module here)::
   new skill, no model call. < 0.2 s. On a database no full pass was ever written to (the first start after the
   install), that slot runs the first full pass and lName's one-time back-fill of stated usuals (design §9.3).
 * :func:`nightly` - the portrait scheduler's night pass (``yuki.memory.portrait.PortraitScheduler._night``), never
-  with a game in front or a call open (:func:`quiet`); then the back-fill if it has not run yet.
+  with a game in front or a call open (:func:`quiet`); then the back-fill if it has not run yet, then the user's own
+  ways (:func:`learn_ways`: ``yuki.skills.learn.ways``, contract C4).
 * :func:`routine_inputs` - the routine miner's onsets keyed by learned skill id (phase L lWire's ``keyed_onsets``).
 
 Logs are content-free (``skills_learned``: counts, CPU ms, code words). ``occasions`` and the learned rows stay out of
@@ -176,6 +177,16 @@ def _run(store: Any, *, now: float | None, name: bool, worker: Any, log: LogFn |
     res = Result()
     c0, w0 = time.thread_time(), time.perf_counter()
     try:
+        try:
+            # the action trace's links (ui_links): compile.link_ends()/split_parts() cut long paths by them; the old
+            # tick that kept them growing is gone (kClean review M1), so the full pass brings them up to date first
+            from yuki.memory import trace_links
+
+            for _ in range(20):  # 5,000 trace rows a call; a day is ~7,000
+                if not trace_links.update(store, now=now).get("more"):
+                    break
+        except Exception:  # noqa: BLE001
+            pass
         idx = B.load_index(store, now)
         built = O.build(store, now=now, browsers=idx.browsers, index=idx)
         res.built = built
@@ -417,25 +428,27 @@ def nightly(store: Any, *, now: float | None = None, worker: Any = None, log: Lo
         return None
     res = run(store, now=now, name=True, worker=worker, log=log, write_rows=True)
     _backfill(store, res, worker=worker, log=log)
-    _ways(store, now=now, worker=worker, log=log)
+    learn_ways(store, now=now, worker=worker, log=log)
     return res
 
 
-def _ways(store: Any, *, now: float, worker: Any = None, log: LogFn | None = None) -> None:
-    """Lane kWays' learner of the user's own ways (contract C4: ``yuki.skills.learn.ways``, its own module), run
-    after the night's pass when that module is installed: its ``nightly(store, now=, worker=, log=)``. A guarded import
-    (the module lands on its own branch); a failure is logged content-free and never stops the night."""
+def learn_ways(store: Any, *, now: float | None = None, worker: Any = None, log: LogFn | None = None,
+               use_model: bool = True) -> dict[str, int]:
+    """The learner of the user's own ways (contract C4: :func:`yuki.skills.learn.ways.learn`, lane kWays), after the
+    night's pass and the CLI's ``rebuild``: finds, names (a few small calls, each way named once) and writes the
+    ``learned_way`` rows. Content-free counts; a failure is logged content-free and never stops the night."""
+    now = time.time() if now is None else float(now)
     try:
         from yuki.skills.learn import ways
-    except ImportError:
-        return
-    fn = getattr(ways, "nightly", None)
-    if not callable(fn):
-        return
-    try:
-        fn(store, now=now, worker=worker, log=log)
+
+        got = ways.learn(store, now=now, settings=_settings_of(worker), log=log, use_model=use_model)
     except Exception as exc:  # noqa: BLE001 - the next night tries again
         _log(log, "error", where="learn.ways", error=type(exc).__name__)
+        return {"error": 1}
+    out = {k: int(v) for k, v in got.items() if isinstance(v, (int, bool))}
+    if got.get("error"):
+        out["error"] = 1
+    return out
 
 
 def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequence[int] | None = None) -> Any:
@@ -515,4 +528,4 @@ def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequenc
 
 
 __all__ = ["INCREMENTAL_S", "BROWSERS_STATE", "RECORDS_STATE", "FIRST_RETRY_S", "Result", "quiet", "run", "rebuild", "incremental",
-           "nightly", "routine_inputs"]
+           "nightly", "learn_ways", "routine_inputs"]

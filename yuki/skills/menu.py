@@ -12,15 +12,17 @@
   recency-weighted use (``rank="n_obs"``: stable through the day for a cached prompt block) or lifted by this hour
   (``rank="hour"``). A value never has a line of its own: the per-value learned lines are gone (one skill, many
   values; a value the user marked Not mine is never shown);
-* then **the user's own ways** (contract C4: lane kWays' ``origin = 'learned_way'`` rows), one short line each, run
-  through the ``app.way`` capability with ``way`` set to the line's value.
+* then **the user's own ways** (contract C4: lane kWays' ``origin = 'learned_way'`` rows), one whole line each
+  (:func:`yuki.skills.learn.ways.menu_lines`: the key, the app, their things in it, the controls' exact labels), run
+  through the ``app.way`` capability with ``way`` set to the line's value; never offered.
 
 Within ``Settings.skills_menu_chars`` (2,400) the values give way first (half their budget, then none); a capability's
 words are never cut for size. One line each::
 
     - spotify.playlist: play a playlist, album or liked songs from Spotify's Your Library, by its name [playlist] · theirs: [playlist: lumen | 3AM]
     - web.open_page: open a site's front page ... [site] [page] [item] [browser] · theirs: youtube, claude.ai (work) ... · usually in Chrome
-    - app.way: <the way's name> [way = <its key>] [item] [text]
+    - discord.voice: join a Discord voice channel ... [channel] [server] · voice channels: lounge (in <server>) | ... · servers: ...
+    - app.way: <the way's name> [way = <its key>] in <app>; project: <their things>; or item "New thread" (its Button); runs when asked
 
 People are not listed (the talker has the people directory). The talker's menu is rebuilt nightly (it sits in the
 cached ``HANDS_PROMPT`` block; same-day changes go in its volatile ``skills_now``); the thinker's sits in its
@@ -103,6 +105,19 @@ def _app_name(store: Any, key: str, names: dict[str, str]) -> str:
     return names.get(key, "")
 
 
+def voice_channels(store: Any, app: str) -> list[Any]:
+    """The voice channels memory saw the user in on a call-joining app (``yuki.skills.discord_route.voice_channels``
+    over the app's own chat data: ``[VoiceChannel(name, place, url, seen, rows)]``, newest first), for the menu and the
+    you-card. ``[]`` when there are none or memory can't be read. Never raises."""
+    try:
+        from yuki.skills.chat import app_data
+        from yuki.skills.discord_route import voice_channels as seen
+
+        return list(seen(store, app_data(app)) or [])
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def values_part(skill: Skill, store: Any, *, now: float | None = None, rank: str = "hour",
                 chars: int = VALUES_CHARS) -> str:
     """The user's own values for one capability, in at most ``chars`` (``""`` when none): the learner's known values
@@ -151,10 +166,21 @@ def values_part(skill: Skill, store: Any, *, now: float | None = None, rank: str
                 if got:
                     parts.append(f"[{slot.name}: {' | '.join(got)}]")
         if str(getattr(skill, "end", "") or "") == "call_join" and skill.app:
-            # the voice channels a join was noted for on this app (tastes ``<app>_voice``, as the planner's places)
-            got = [_value(n) for n in taste.candidates(store, f"{skill.app}_voice", now=now, by=rank)[:NAMES_N] if n]
-            if got:
-                parts.append(f"voice channels: {' | '.join(got)}")
+            # the voice channels a join was noted for on this app (tastes ``<app>_voice``), then the ones memory saw
+            # the user in (kHands merge note 5: ``discord_route.voice_channels``, newest first) with their servers
+            chans = [_value(n) for n in taste.candidates(store, f"{skill.app}_voice", now=now, by=rank)[:NAMES_N]
+                     if n]
+            servers: list[str] = []
+            for vc in voice_channels(store, skill.app):
+                # names only (the slots take them); which server each sits in is on the you-card
+                if vc.place and _value(vc.place) not in servers:
+                    servers.append(_value(vc.place))
+                if vc.name and len(chans) < NAMES_N and _value(vc.name) not in chans:
+                    chans.append(_value(vc.name))
+            if chans:
+                parts.append(f"voice channels: {' | '.join(chans)}")
+            if servers:
+                parts.append(f"servers: {' | '.join(servers[:NAMES_N])}")
         if any(src == "site" for src in (skill.bind or {}).values()):
             for kind, site, page, _var in taste.site_kinds():
                 got = [_value(n) for n in taste.candidates(store, kind, now=now, by=rank)[:NAMES_N] if n]
@@ -172,28 +198,19 @@ def values_part(skill: Skill, store: Any, *, now: float | None = None, rank: str
 
 
 def way_lines(store: Any, *, limit: int = WAYS_N) -> list[str]:
-    """Contract C4: one short line per learned way of the user's (lane kWays' rows: ``origin = 'learned_way'``, live,
-    most used first): ``- app.way: <its name> [way = <its key>] [item] [text]``. ``[]`` with none (or before lane kWays'
-    rows exist). Never raises."""
+    """Contract C4: one line per learned way of the user's (lane kWays' rows: ``origin = 'learned_way'``, live as the
+    route reads them: :func:`yuki.skills.learn.ways.live_ways`, most used first), whole, as
+    :func:`yuki.skills.learn.ways.menu_lines` writes it: ``- app.way: <its name> [way = <its key>] in <app>; <item
+    noun>: <their things>; or item "<a control's own label>" (its <role>); runs when asked`` (the key and the exact
+    control label are what the route takes; never cut). A way is never offered. ``[]`` with none. Never raises."""
     if store is None:
         return []
     try:
-        from yuki.skills.catalog import LIVE_STATES
+        from yuki.skills.learn import ways
 
-        rows = store._query("SELECT key, name_ciphertext FROM skills WHERE origin = ? AND deleted_at IS NULL AND"
-                            " retired_at IS NULL AND state IN (" + ",".join("?" * len(LIVE_STATES)) + ") ORDER BY"
-                            " uses DESC, updated_at DESC LIMIT ?", (WAY_ORIGIN, *LIVE_STATES, int(limit)))
+        return [f"- {WAY_CAPABILITY}: {line}" for line in ways.menu_lines(store)[:max(0, int(limit))]]
     except Exception:  # noqa: BLE001
         return []
-    out = []
-    for key, name_ct in rows:
-        try:
-            name = " ".join(str(store._dec(name_ct) or "").split()) if name_ct else ""
-        except Exception:  # noqa: BLE001
-            name = ""
-        if key and name:
-            out.append(_clip(f"- {WAY_CAPABILITY}: {name} [way = {key}] [item] [text]", MENU_LINE_CHARS))
-    return out
 
 
 def menu_lines(loaded: Loaded, *, store: Any = None, now: float | None = None, chars: int = MENU_CHARS,
@@ -329,8 +346,10 @@ def talker_tool(keys: list[str] | tuple[str, ...]) -> dict[str, Any]:
         "properties": {
             "say_first": {"type": "string", "description": "Written first: words said as it starts, or \"\"."},
             "skill": {"type": "string", "enum": list(keys)},
-            "slots": {"type": "object", "description": "Only from their words, exactly as said, or a name the Skills "
-                                                       "line lists; leave the rest out (Yuki fills them)."},
+            "slots": {"type": "object", "description": "From their words as said, or a value the Skills line lists; "
+                                                       "when they leave the pick to Yuki, choose true and context "
+                                                       "(their words, what they are doing); leave the rest out (Yuki "
+                                                       "fills them)."},
             "again": {"type": "boolean", "description": "They asked for the same again (\"a bit more\")."},
             "corrects": {"type": "boolean", "description": "They corrected the last run of this skill."},
         },
@@ -368,5 +387,6 @@ def thinker_tool(menu: str, keys: list[str] | tuple[str, ...]) -> dict[str, Any]
 
 
 __all__ = ["MENU_CHARS", "TALKER", "THINKER", "PLANNER", "AUDIENCES", "VALUES_CHARS", "TALKER_HEAD", "PLANNER_HEAD",
-           "names_other_key", "menu_skills", "skill_line", "values_part", "way_lines", "menu_lines", "menu_text",
+           "names_other_key", "menu_skills", "skill_line", "voice_channels", "values_part", "way_lines", "menu_lines",
+           "menu_text",
            "planner_menu", "request_key", "talker_tool", "THINKER_HEAD", "thinker_tool"]

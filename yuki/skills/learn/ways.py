@@ -831,11 +831,13 @@ def keep_told(store: Any, *, app: str, spec: Mapping[str, Any], name: str, now: 
 
 
 def live_ways(store: Any) -> list[dict[str, Any]]:
-    """The live ways: ``[{"key", "app", "name", "spec", "everyday", "uses"}]`` (decrypted in RAM). Never raises."""
+    """The live ways (not retired, not deleted; what the route runs, the menu lists and the Playbook shows): ``[{"id",
+    "key", "app", "name", "spec", "prov", "everyday", "uses", "last_used_at"}]`` (decrypted in RAM), most used first.
+    Never raises."""
     try:
-        rows = store._query("SELECT key, app, name_ciphertext, spec_ciphertext, provenance, uses FROM skills WHERE "
-                            "origin = ? AND retired_at IS NULL AND deleted_at IS NULL ORDER BY uses DESC, updated_at "
-                            "DESC LIMIT ?", (ORIGIN, MAX_WAYS))
+        rows = store._query("SELECT id, key, app, name_ciphertext, spec_ciphertext, provenance, uses, last_used_at FROM "
+                            "skills WHERE origin = ? AND retired_at IS NULL AND deleted_at IS NULL ORDER BY uses DESC, "
+                            "updated_at DESC LIMIT ?", (ORIGIN, MAX_WAYS))
     except Exception:  # noqa: BLE001
         return []
     out: list[dict[str, Any]] = []
@@ -848,24 +850,33 @@ def live_ways(store: Any) -> list[dict[str, Any]]:
             continue
         if not isinstance(spec, dict) or int(spec.get("v") or 0) != SPEC_VERSION:
             continue
-        out.append({"key": str(r["key"]), "app": str(r["app"] or ""), "name": " ".join(str(name or "").split()),
-                    "spec": spec, "everyday": bool((prov or {}).get("everyday")), "uses": int(r["uses"] or 0)})
+        prov = prov if isinstance(prov, dict) else {}
+        out.append({"id": int(r["id"]), "key": str(r["key"]), "app": str(r["app"] or ""),
+                    "name": " ".join(str(name or "").split()), "spec": spec, "prov": prov,
+                    "everyday": bool(prov.get("everyday")), "uses": int(r["uses"] or 0),
+                    "last_used_at": r["last_used_at"]})
     return out
 
 
-def menu_lines(store: Any) -> list[str]:
-    """One line per live way for a menu or the you-card: its name, key, app, item noun and top things, and the item
-    values its controls take (their own labels, exactly as the route compares them: ``item = "New thread"``); never
-    offered, "runs when asked"."""
+def app_title(app: str) -> str:
+    """A way's app as people say it (its prettified program name), for the menu, the you-card and the Playbook."""
+    return _app_title(app)
+
+
+def menu_lines(store: Any, ways: Sequence[Mapping[str, Any]] | None = None) -> list[str]:
+    """One line per live way for a menu or the you-card: its name, its key as the ``way`` slot's value (``[way =
+    app.way#...]``), app, item noun and top things, and the item values its controls take (their own labels, exactly
+    as the route compares them: ``item = "New thread"``); never offered, "runs when asked". ``ways``: rows already
+    read by :func:`live_ways`."""
     out = []
-    for w in live_ways(store):
+    for w in (live_ways(store) if ways is None else ways):
         item = (w["spec"].get("item") or {})
         things_ = [t["name"] for t in item.get("things") or []][:5]
         noun = str(w["spec"].get("item_noun") or "item")
         controls = [(" ".join(str(s.get("name") or "").split()), str(s.get("role") or "control"))
                     for s in w["spec"].get("steps") or []
                     if isinstance(s, dict) and s.get("do") == "control" and str(s.get("name") or "").strip()]
-        out.append(f'{w["name"] or "your way"} [{w["key"]}] in {w["app"]}'
+        out.append(f'{w["name"] or "your way"} [way = {w["key"]}] in {_app_title(w["app"])}'
                    + (f"; {noun}: {', '.join(things_)}" if things_ else "")
                    + "".join(f'; or item "{c}" (its {role})' for c, role in controls)
                    + "; runs when asked")
@@ -938,4 +949,4 @@ if __name__ == "__main__":
 __all__ = ["CAPABILITY", "ORIGIN", "END_FACTS", "MAX_WAYS", "Step", "Demo", "Way", "demonstrations", "group_key",
            "passes", "kept_places", "merge_groups", "things", "template", "way_key", "find", "learn", "keep_told",
            "live_ways", "menu_lines", "control_labels", "note_use", "name_digest", "container_digest", "covered_apps",
-           "capability_id"]
+           "capability_id", "app_title"]

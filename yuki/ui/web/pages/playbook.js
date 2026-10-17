@@ -5,7 +5,8 @@
      which app, and Rename / Not mine / This is work (Not work on a work one); the channels and playlists you pick
      are listed read-only;
    - Your routines: when, how sure, and the card each leads to;
-   - Your own ways: the multi-step things Yuki learned from you (Rename / Not mine); a plain empty state until then.
+   - Your own ways: the multi-step things Yuki learned from you, with how it learned each, your things in it (your
+     projects) and Rename / Delete (gone for good); never offered; a plain empty state until then.
    The buttons live in pages/skills.js and go to memory's own skill_edit through Python; nothing here edits memory.
    The old practice sections (procedures, proposals, lessons) are gone from the page. */
 (function () {
@@ -49,12 +50,15 @@
   }
 
   function wayRow(w) {
+    const things = w.things || [];
     return h('div', { class: 'proc2', data: { thing: '', ref: w.ref, name: w.name } },
-      h('h4', null, w.name, w.your_name ? h('span', { class: 't3', text: ' · your name' }) : null),
+      h('h4', null, w.name, w.app ? h('span', { class: 't3', text: ' · in ' + w.app }) : null,
+        w.your_name ? h('span', { class: 't3', text: ' · your name' }) : null),
       [w.seen, w.used].filter(Boolean).length ? h('div', { class: 'when', text: [w.seen, w.used].filter(Boolean).join(' · ') }) : null,
+      things.length ? h('div', { class: 'when t2', text: (w.things_title || 'Yours in it') + ': ' + things.join(', ') }) : null,
       h('div', { class: 'acts inline' },
         key('Rename', { cls: 'xs', data: { do: 'thing-rename' }, title: 'Call it what you call it' }),
-        key('Not mine', { cls: 'xs ghost', data: { do: 'thing-notmine' }, title: 'This isn’t something I do' })));
+        key('Delete', { cls: 'xs ghost', data: { do: 'thing-delete' }, title: 'Forget this way for good' })));
   }
 
   function ruleRow(r, i) {
