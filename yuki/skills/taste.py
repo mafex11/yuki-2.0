@@ -66,6 +66,24 @@ playlist a minute after "Japanese" was paired with ネオン; "something chill" 
   say that name by identity or sound. The Spotify driver asks it after its Library read and, once its own check sees
   the row play, keeps those words as another name of the row (:func:`note` ``said_as``): the next time is by identity,
   with no judgement. Content goes to the model only, never to a log.
+
+**Time, not clicks** (kTaste, 17 Oct audit; research 4.3: YouTube says a click misleads): a pick weighs the units of
+what then played (:func:`yuki.skills.youtube_feed.units`, five minutes = one): a watched video its page's media seconds,
+a playlist the app's own playing spans until the next pick, a visit to an entity's own page alone
+:data:`VISIT_UNITS`; a sitting (:data:`SESSION_GAP_S`) sums its picks up to :data:`SESSION_UNITS`. ``n_obs`` is those
+decayed units.
+
+**"Something I'd like"** (kTaste, contract C2, audit 17 Oct decision 2): when the user asks Yuki to choose ("a video I
+like", "something chill", "put something on"; ``run_skill`` slots ``choose = true`` and ``context``), :func:`choose`
+picks like a recommender among the user's own candidates (:data:`CHOOSE_KINDS`: a channel's new or unwatched upload, a
+channel, a playlist): their taste at this hour and kind of day plus a share of their all-time weight, halved per recent
+skip, a video weighted by how new it is; the user's words judged over the best :data:`CHOOSE_N` by the voice's small
+model on what each holds (bounded; the habit order stands when it is late; no word lists). The engine plays the top
+pick and says it with a code-written why (:func:`choice_line`: "Putting on Deji's new one - it's out today, and you
+usually watch them around lunch."); :func:`chosen` keeps it for the conversation, so "another one" / "not that" takes
+the next (another channel first), and notes it, so a pick changed or closed within :data:`SKIP_S` counts as a skip.
+Never with a game in front or in a call (:func:`held_line`). Yuki's own pick is a guess (:data:`GUESS_FILLS`): it
+never feeds the taste it came from.
 """
 
 from __future__ import annotations
@@ -74,9 +92,9 @@ import json
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 #: The smoothing of the hour histograms when scoring an hour (minutes; map-routines T1.3: sigma = 90 min).
 SIGMA_MIN = 90.0
@@ -286,7 +304,8 @@ def find(store: Any, kind: str, name: str) -> Taste | None:
 def offered(store: Any, *, now: float | None = None) -> list[Taste]:
     """The fresh uploads named aloud after a request in the last minutes (:func:`yuki.skills.youtube_feed.offered`), as
     tastes: the name said (the channel's), the video's link, its key. What "the Deji one" is matched against, for a
-    slot that :func:`takes_offers` (``web.open_video``'s ``video``: a video nobody picked never plays). Never raises
+    slot that :func:`takes_offers` (``web.open_video``'s ``video``: the taste fill never guesses a video; one nobody
+    named plays only when the user asked Yuki to choose, :func:`choose`). Never raises
     (``[]``)."""
     try:
         from yuki.skills import youtube_feed
@@ -713,6 +732,13 @@ HALF_LIFE_DAYS = 21.0
 SESSION_GAP_S = 1800.0
 #: An entity whose decayed weight is under this drops out (about one pick seven weeks ago).
 FLOOR = 0.2
+#: kTaste (17 Oct audit, research 4.3: a click misleads, time watched counts): a pick weighs the units of what then
+#: played (:func:`yuki.skills.youtube_feed.units`: five minutes = one), a visit to an entity's own page alone
+#: :data:`VISIT_UNITS` (and a capability pick at least that: a pick is never weaker than a visit), a session at most
+#: :data:`SESSION_UNITS`; a playlist's listening is read at most :data:`LISTEN_SPAN_S` past its pick.
+VISIT_UNITS = 0.5
+SESSION_UNITS = 8.0
+LISTEN_SPAN_S = 3 * 3600.0
 #: A page template variable with this name is an opaque id (a video's), opened only from a link or an offered option's
 #: ref, never said (lSplit review r1 L5): its pages make no taste kind.
 OPAQUE_VAR = "id"
@@ -722,10 +748,10 @@ OPAQUE_VAR = "id"
 RETIRED_KINDS: tuple[str, ...] = ("yt_channel",)
 #: A request of Yuki's counts as the user's pick when its runs' values came from these fill sources
 #: (``skill_runs.filled``), and never when any came from :data:`GUESS_FILLS` (a guess must not feed itself). Only the
-#: taste guess: ``pref`` fills means slots only (``connection.py`` derives ``Slot.pref`` for ``role = "means"``: which
-#: browser, never which entity), so "open Deji's channel" in the usual browser is still the user's pick (tTaste r1 M1).
+#: taste guess and Yuki's own pick for "something I'd like" (``chosen``, kTaste): ``pref`` fills means slots only
+#: (``connection.py`` derives ``Slot.pref`` for ``role = "means"``: which browser, never which entity), so "open Deji's channel" in the usual browser is still the user's pick (tTaste r1 M1).
 ASKED_FILLS: frozenset[str] = frozenset({"words", "again", "told"})
-GUESS_FILLS: frozenset[str] = frozenset({"taste"})
+GUESS_FILLS: frozenset[str] = frozenset({"taste", "chosen"})
 #: The fields an offered option's value carries beyond its name (``youtube_feed.Offer.value``): a slot every route of
 #: which needs one of them is filled from the offers (:func:`takes_offers`).
 OFFER_FIELDS: frozenset[str] = frozenset({"key", "ref"})
@@ -846,34 +872,70 @@ def _not_mine_moments(store: Any) -> set[int]:
         return set()
 
 
+def _listened(store: Any, heard: list[tuple[str, str, float, str, str, str, float]], rows: list[dict[str, Any]],
+              since: float, now: float) -> list[float]:
+    """Per capability pick of ``heard`` (``(kind, group, at, value, ref, app, moment at)``), the units of what then
+    played (:func:`yuki.skills.youtube_feed.units`): the app's own ``media_play`` spans from the pick until the app's
+    next pick of that end kind (any entity, anyone's), at most :data:`LISTEN_SPAN_S`. 1.0 each when they can't be read."""
+    if not heard:
+        return []
+    try:
+        from yuki.skills.youtube_feed import units
+
+        out: list[float] = []
+        spans: dict[str, list[tuple[float, float]]] = {}
+        bounds: dict[str, list[float]] = {}
+        for r in rows:
+            if r.get("kind") != "page" and r.get("app"):
+                bounds.setdefault(str(r["app"]), []).append(float(r["at"]))
+        for _k, _g, at, _v, _r, app, seen_at in heard:
+            if app not in spans:
+                spans[app] = [(float(m["at"]), float(m.get("ended_at") or m["at"])) for m in store.moments_between(
+                    since, now + 1.0, kinds=["media_play"], app=app)]
+            nxt = next((b for b in sorted(bounds.get(app, [])) if b > seen_at), now)
+            end = min(nxt, at + LISTEN_SPAN_S, now)
+            secs = sum(max(0.0, min(end, b) - max(at, a)) for a, b in spans[app])
+            out.append(units(secs))
+        return out
+    except Exception:  # noqa: BLE001 - a pick still counts once
+        return [1.0] * len(heard)
+
+
 class _Picks:
-    """The picks gathered per ``(kind, group)``: ``(at, value, ref)``, later collapsed into sessions and decayed."""
+    """The picks gathered per ``(kind, group)``: ``(at, value, ref, units)``, later collapsed into sessions and decayed.
+    A session (the same entity again within :data:`SESSION_GAP_S`) weighs its picks' units summed, at most
+    :data:`SESSION_UNITS` (kTaste: time watched or listened, not clicks: two long videos of one channel in a sitting
+    weigh more than one, a channel page alone little)."""
 
     def __init__(self) -> None:
-        self.by: dict[tuple[str, str], list[tuple[float, str, str]]] = {}
+        self.by: dict[tuple[str, str], list[tuple[float, str, str, float]]] = {}
 
-    def add(self, kind: str, group: str, at: float, value: str, ref: str) -> None:
-        self.by.setdefault((kind, group), []).append((float(at), value, ref))
+    def add(self, kind: str, group: str, at: float, value: str, ref: str, units: float = 1.0) -> None:
+        self.by.setdefault((kind, group), []).append((float(at), value, ref, max(0.0, float(units))))
 
     def rows(self, store: Any, now: float) -> dict[tuple[str, str], dict[str, Any]]:
-        """``{(kind, entity_key): row}``: two decayed hour histograms, the decayed count, the newest name and link."""
+        """``{(kind, entity_key): row}``: two decayed hour histograms, the decayed units, the newest name and link."""
         out: dict[tuple[str, str], dict[str, Any]] = {}
         for (kind, _group), picks in self.by.items():
             picks.sort(key=lambda p: p[0])
-            wd, we = [0.0] * 24, [0.0] * 24
-            total, last, kept = 0.0, None, 0
+            sessions: list[list[float]] = []         # [first at, units]
+            last = None
             name, ref = "", ""
-            for at, value, link in picks:
-                if last is not None and at - last < SESSION_GAP_S:
-                    last = at
-                    continue
+            for at, value, link, units in picks:
+                if last is not None and at - last < SESSION_GAP_S and sessions:
+                    sessions[-1][1] = min(SESSION_UNITS, sessions[-1][1] + units)
+                else:
+                    sessions.append([at, min(SESSION_UNITS, units)])
                 last = at
-                weight = math.pow(0.5, max(0.0, now - at) / (HALF_LIFE_DAYS * 86400.0))
+                name, ref = value or name, link or ref
+            wd, we = [0.0] * 24, [0.0] * 24
+            total, kept = 0.0, 0
+            for at, units in sessions:
+                weight = units * math.pow(0.5, max(0.0, now - at) / (HALF_LIFE_DAYS * 86400.0))
                 weekend, hour = _slot_of(at)
                 (we if weekend else wd)[hour] += weight
                 total += weight
                 kept += 1
-                name, ref = value or name, link or ref
             if total < FLOOR or not name:
                 continue
             key = entity_key(store, kind, name)
@@ -926,6 +988,7 @@ def recompute(store: Any, *, now: float | None = None, days: float = SEED_DAYS, 
     picks = _Picks()
     cap_of = {(a, e): k for k, a, e in caps}
     page_rows: list[dict[str, Any]] = []
+    heard: list[tuple[str, str, float, str, str, str, float]] = []
     for r in rows:
         if r.get("kind") == "page":
             page_rows.append(r)
@@ -943,7 +1006,8 @@ def recompute(store: Any, *, now: float | None = None, days: float = SEED_DAYS, 
             if not value:
                 continue
             group = str(r.get("entity_key") or _norm(value))
-            picks.add(kind, group, float(r["at"]), value, fill(site_name, page_kind, **{var: value}) or "")
+            picks.add(kind, group, float(r["at"]), value, fill(site_name, page_kind, **{var: value}) or "",
+                      VISIT_UNITS)
             counts["visits"] += 1
             continue
         kind = cap_of.get((str(r.get("app") or ""), str(r.get("kind") or "")))
@@ -963,8 +1027,14 @@ def recompute(store: Any, *, now: float | None = None, days: float = SEED_DAYS, 
         since_at = facts.get("since")
         ok_since = isinstance(since_at, (int, float)) and not isinstance(since_at, bool) and since_at <= float(r["at"])
         at = float(since_at) if ok_since else float(r["at"])
-        picks.add(kind, str(r.get("entity_key") or _norm(value)), at, value, ref or "")
+        heard.append((kind, str(r.get("entity_key") or _norm(value)), at, value, ref or "", str(r.get("app") or ""),
+                      float(r["at"])))
         counts["picks"] += 1
+    # kTaste: a playlist pick weighs the time it then played (the app's own media spans until the next pick), not 1;
+    # the pick itself at least :data:`VISIT_UNITS`, as a visit to an entity's page (review M3: a list picked once and
+    # played briefly stays known, over :data:`FLOOR`, for weeks)
+    for (kind, group, at, value, ref, app, seen_at), got in zip(heard, _listened(store, heard, rows, since, now)):
+        picks.add(kind, group, at, value, ref, max(VISIT_UNITS, got))
     channel_kind = ""
     fresh: dict[str, float] = {}
     if page_rows:
@@ -973,8 +1043,8 @@ def recompute(store: Any, *, now: float | None = None, days: float = SEED_DAYS, 
 
             channel_kind = youtube_feed.CHANNEL_KIND if youtube_feed.CHANNEL_KIND in kinds else ""
             if channel_kind:
-                for at, handle, ref, group in youtube_feed.attributed(store, page_rows, users):
-                    picks.add(channel_kind, group, at, handle, ref)
+                for at, handle, ref, group, got in youtube_feed.attributed(store, page_rows, users, now=now):
+                    picks.add(channel_kind, group, at, handle, ref, got)
                     counts["picks"] += 1
                 fresh = youtube_feed.fresh_ages(store)
         except Exception:  # noqa: BLE001 - the channel picks from pages alone
@@ -1239,6 +1309,570 @@ def seed(store: Any, *, now: float | None = None, log: LogFn | None = None, retr
     return {"pages": got, "youtube": yt, "yt_channel": flat}
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# kTaste: "something I'd like" (contract C2; audit 17 Oct decision 2, research 4.3)
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: The capabilities a request may ask Yuki to choose for (``slots.choose = true``) and what each picks: a YouTube video
+#: (it plays), a YouTube channel (its page opens), a playlist of the user's own (it plays). Generic capabilities only;
+#: which videos, channels and playlists exist is learned.
+CHOOSE_KINDS: dict[str, str] = {"web.open_video": "video", "web.open_page": "channel", "spotify.playlist": "playlist"}
+#: The slot each kind fills.
+CHOOSE_SLOTS: dict[str, str] = {"video": "video", "channel": "item", "playlist": "playlist"}
+#: The picks of one conversation are remembered this long after the last one (RAM): "another one" / "not that" takes
+#: the next candidate, never one already put on.
+CONVO_S = 1800.0
+#: A pick changed this soon (asked again, the video closed, another playlist started) was skipped: negative feedback,
+#: its weight halving every :data:`SKIP_HALF_LIFE_DAYS`.
+SKIP_S = 20.0
+SKIP_HALF_LIFE_DAYS = 14.0
+SKIP_DAYS = 60.0
+#: How a candidate scores: its taste at this hour (:func:`score_at`, time watched or listened, decayed) plus this share of
+#: its all-time weight (a favourite still counts at an odd hour); halved per recent skip; for a video, times
+#: ``FRESH_FLOOR + exp(-age / AGE_DAYS)`` (new first, an unwatched older upload still a candidate).
+TOTAL_W = 0.1
+FRESH_FLOOR = 0.3
+AGE_DAYS = 7.0
+#: A video candidate comes from the feeds of the best this-many channels (read when older than an hour, within
+#: :data:`CHOOSE_FEED_S`), at most two unwatched uploads per channel (the second weighs this much less).
+CHOOSE_CHANNELS = 8
+SECOND_W = 0.7
+#: How long a pick waits for those feeds (a slower one finishes on its own and serves the next pick; feeds are kept an
+#: hour, so only the first pick of an hour waits).
+CHOOSE_FEED_S = 1.0
+#: The judgement of the user's words over the candidates: at most this many, bounded by this long (one small model
+#: call; the habit order stands when it is late).
+CHOOSE_N = 8
+CHOOSE_WAIT_S = 2.5
+#: The whole pick (feeds, judgement) ends within this long of its start (the engine waits a little more,
+#: ``engine.CHOOSE_TIMEOUT_S``): the judgement gets what is left of it, and none under :data:`JUDGE_MIN_S`.
+CHOOSE_DEADLINE_S = 4.0
+JUDGE_MIN_S = 0.6
+#: A candidate's hour fit at least this share of its own best hour today: "you usually ... around now".
+HABIT_SHARE = 0.5
+
+CHOOSE_SYSTEM = """You help a voice assistant pick what to put on for a person who asked it to choose for them. Their
+own {things} are listed in the order their habits suggest for right now (best first): what they watch or play at this
+hour, how much, how recently, and what is new. Rank them for what they asked. Keep the habit order unless their words
+say what they are doing or the mood they want and some items plainly suit that better than others (a long video to
+eat along to, something calm when they want it chill, music when they want music). Judge by what each item holds (the
+titles they watched or that played, what they called it, how long they usually stay), never by its name alone. Answer
+only with the rank tool: every id once, best first."""
+
+
+@dataclass
+class Choice:
+    """Yuki's pick for "something I'd like": its ``kind`` (:data:`CHOOSE_KINDS`), the slot it fills and that slot's
+    value (``{"name", "key", "ref"}``), other slot values it sets (``extra``: a channel's page kind), the name said, its
+    key and the key feedback attaches to (``group``: the channel or the playlist), the code-written why, how old a
+    video is (days), its title (RAM only), whether the user's words were judged, among how many, how long it took, and
+    whether it is the channel or playlist they named (``named``: their pick, filled ``words``)."""
+
+    kind: str
+    slot: str
+    value: dict[str, Any]
+    extra: dict[str, Any]
+    name: str
+    key: str
+    group: str
+    why: str = ""
+    fresh_d: float | None = None
+    title: str = ""
+    judged: bool = False
+    n: int = 0
+    ms: float = 0.0
+    named: bool = False
+
+
+@dataclass
+class _Cand:
+    name: str
+    key: str
+    group: str
+    value: dict[str, Any]
+    score: float
+    fit: float
+    peak: float
+    total: float
+    last_at: float
+    hist: list[float]
+    fresh_d: float | None = None
+    title: str = ""
+    desc: dict[str, Any] = field(default_factory=dict)
+
+
+_convo_lock = threading.Lock()
+_convo: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def _convo_state(session: str, kind: str, now: float) -> dict[str, Any]:
+    """The picks of this conversation for ``kind`` (``{"keys", "last", "at", "context"}``), forgotten
+    :data:`CONVO_S` after the last one."""
+    with _convo_lock:
+        for k in [k for k, v in _convo.items() if now - float(v.get("at") or 0.0) > CONVO_S]:
+            _convo.pop(k, None)
+        return dict(_convo.get((str(session or ""), kind)) or {})
+
+
+def _peak(wd: list[float], we: list[float], now: float) -> float:
+    """The best hour fit of today's kind of day (:func:`score_at` at each hour of today): what "usually" is measured
+    against."""
+    stamp = datetime.fromtimestamp(float(now))
+    base = now - (stamp.hour * 3600 + stamp.minute * 60 + stamp.second)
+    return max(score_at(wd, we, base + h * 3600.0 + 1800.0) for h in range(24))
+
+
+def _skip_weights(store: Any, now: float) -> dict[str, float]:
+    """``{group: decayed skips}``: picks of Yuki's the user skipped (asked again within :data:`SKIP_S`, or the video's
+    page shown under :data:`SKIP_S` in all, or another playlist within :data:`SKIP_S`), halving every
+    :data:`SKIP_HALF_LIFE_DAYS`. Never raises (``{}``)."""
+    try:
+        events = store.taste_events(since=now - SKIP_DAYS * 86400.0, until=now + 1.0, kinds=["chose", "skipped"])
+    except Exception:  # noqa: BLE001
+        return {}
+    # one skip per pick (review L2): a pick asked away again (``skipped``, its ``chose_at``) is not counted again when
+    # its page also closed fast
+    again = {(str(d.get("key") or ""), round(float(d.get("chose_at") or 0.0), 1))
+             for d in (e.get("detail") or {} for e in events if e.get("kind") == "skipped")}
+    out: dict[str, float] = {}
+    for e in events:
+        d = e.get("detail") or {}
+        group, at = str(d.get("group") or ""), float(e.get("at") or 0.0)
+        if not group:
+            continue
+        if e.get("kind") == "chose" and ((str(d.get("key") or ""), round(at, 1)) in again
+                                         or not _closed_fast(store, d, at, now)):
+            continue
+        out[group] = out.get(group, 0.0) + math.pow(0.5, max(0.0, now - at) / (SKIP_HALF_LIFE_DAYS * 86400.0))
+    return out
+
+
+#: A chosen video's page opened at most this long before :func:`chosen` stamped the pick (the route ran and its
+#: done-check saw the page first; a page moment's ``at`` is its visit's first row): the quick-close window starts then.
+CHOSE_LEAD_S = 15.0
+
+
+def _closed_fast(store: Any, detail: Mapping[str, Any], at: float, now: float) -> bool:
+    """Whether a pick Yuki put on was closed or changed within :data:`SKIP_S`: a video whose watch page was in front
+    under that long in all within ten minutes (read once ten minutes have passed), a playlist another one replaced that
+    fast."""
+    try:
+        if detail.get("kind") == "video":
+            if now - at < 600.0:
+                return False
+            rows = [r for r in store.moments_between(at - CHOSE_LEAD_S, at + 600.0, kinds=["page"])
+                    if str(r.get("entity_key") or "") == str(detail.get("key") or "")]
+            return bool(rows) and sum(float(r.get("value") or 0.0) for r in rows) < SKIP_S
+        if detail.get("kind") == "playlist" and detail.get("taste_kind"):
+            for r in store.moments_between(at + 1.0, at + SKIP_S, kinds=["media_context"]):
+                name = store.moment_entity(r)
+                if name and entity_key(store, str(detail["taste_kind"]), name) != str(detail.get("group") or ""):
+                    return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def _rows_of(store: Any, kind: str) -> list[tuple[str, str, str, list[float], list[float], float, float]]:
+    """``(key, name, ref, weekday, weekend, units, last_at)`` of the picked rows of a taste kind (never the names an
+    app only showed). Decrypted in RAM; never raises (``[]``)."""
+    try:
+        rows = store._query("SELECT entity_key, name_ciphertext, ref_ciphertext, hist_weekday, hist_weekend, n_obs, "
+                            "last_at FROM tastes WHERE kind = ? AND source != ? AND n_obs > 0", (kind, SEEN_SOURCE))
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for key, name_ct, ref_ct, wd, we, n_obs, last_at in rows:
+        try:
+            name = " ".join(str(store._dec(name_ct) or "").split())
+            ref = str(store._dec(ref_ct) or "") if ref_ct else ""
+        except Exception:  # noqa: BLE001
+            continue
+        if name:
+            out.append((str(key), name, ref, _hist(wd), _hist(we), float(n_obs or 0.0), float(last_at or 0.0)))
+    return out
+
+
+def _squash(text: Any) -> str:
+    return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
+
+
+def _base(rows: list[tuple[str, str, str, list[float], list[float], float, float]], now: float,
+          skips: Mapping[str, float]) -> list[_Cand]:
+    out = []
+    for key, name, ref, wd, we, total, last_at in rows:
+        fit = score_at(wd, we, now)
+        score = (fit + TOTAL_W * total) * math.pow(0.5, skips.get(key, 0.0))
+        out.append(_Cand(name, key, key, {"name": name, "key": key, "ref": ref}, score, fit, _peak(wd, we, now),
+                         total, last_at, [a + b for a, b in zip(wd, we)]))
+    out.sort(key=lambda c: (-c.score, -c.total, c.key))
+    return out
+
+
+def _same_name(text: Any, name: Any) -> bool:
+    """Whether ``text`` IS ``name``: the same letters and digits, a leading "@" and a trailing possessive aside
+    ("Deji's", "@Deji" = "Deji"). A format of the text, never a guess at meaning; a longer text that only holds the
+    name ("the Sidemen video about the island") is not it (review H2)."""
+    said = " ".join(str(text or "").split()).lstrip("@")
+    forms = {_squash(said)}
+    for tail in ("'s", "’s", "'", "’"):
+        if said.casefold().endswith(tail) and len(said) > len(tail):
+            forms.add(_squash(said[: -len(tail)]))
+            break
+    want = _squash(str(name or "").lstrip("@"))
+    return bool(want) and want in forms
+
+
+def _channels(store: Any, now: float, skips: Mapping[str, float], only: str) -> list[_Cand]:
+    """The user's YouTube channels as candidates (their display name when a feed or oEmbed gave one), best first;
+    ``only``: the channel that text IS (:func:`_same_name` on its display name or handle: "Sidemen", "Deji's"), else
+    none."""
+    from yuki.skills import youtube_feed
+
+    cands = _base(_rows_of(store, youtube_feed.CHANNEL_KIND), now, skips)
+    try:
+        known = store.yt_channels([c.key for c in cands])
+    except Exception:  # noqa: BLE001
+        known = {}
+    for c in cands:
+        info = known.get(c.key) or {}
+        handle = c.name
+        c.name = " ".join(str(info.get("name") or handle).split())
+        c.value = {"name": handle, "key": c.key, "ref": c.value.get("ref") or ""}
+        c.desc = {"handle": handle}
+    if only:
+        cands = [c for c in cands if _same_name(only, c.name) or _same_name(only, c.desc.get("handle"))]
+    return cands
+
+
+def _videos(store: Any, channels: list[_Cand], now: float, *, network: bool, log: LogFn | None,
+            budget_s: float) -> list[_Cand]:
+    """The unwatched uploads of the best :data:`CHOOSE_CHANNELS` channels (their feeds read first when older than an
+    hour and ``network``), at most two per channel, scored by the channel's score and the upload's age."""
+    from yuki.connect.templates import fill
+    from yuki.skills import youtube_feed
+
+    top_ch = channels[:CHOOSE_CHANNELS]
+    if not top_ch:
+        return []
+    if network and budget_s > 0 and youtube_feed.blocked() is None:
+        youtube_feed.refresh(store, [c.key for c in top_ch], now=now, budget_s=budget_s, log=log)
+    by = {c.key: c for c in top_ch}
+    try:
+        vids = store.yt_videos(channel_keys=list(by), unwatched=True)
+        seen = store.page_entity_keys_seen([v["video_key"] for v in vids])
+    except Exception:  # noqa: BLE001
+        return []
+    per: dict[str, int] = {}
+    out: list[_Cand] = []
+    for v in vids:      # newest first
+        ch, pub, key = by.get(str(v.get("channel_key") or "")), v.get("published_at"), str(v["video_key"])
+        if ch is None or key in seen or not v.get("video_id") or pub is None or float(pub) > now:
+            continue
+        if per.get(ch.key, 0) >= 2:
+            continue
+        ref = fill(youtube_feed.SITE, youtube_feed.WATCH_PAGE, id=str(v["video_id"])) or ""
+        if not ref:
+            continue
+        age = max(0.0, (now - float(pub)) / 86400.0)
+        score = ch.score * (FRESH_FLOOR + math.exp(-age / AGE_DAYS)) * (SECOND_W if per.get(ch.key) else 1.0)
+        per[ch.key] = per.get(ch.key, 0) + 1
+        title = " ".join(str(v.get("title") or "").split())
+        out.append(_Cand(ch.name, key, ch.key, {"name": ch.name, "key": key, "ref": ref}, score, ch.fit, ch.peak,
+                         ch.total, ch.last_at, ch.hist, round(age, 2), title, dict(ch.desc)))
+    out.sort(key=lambda c: (-c.score, c.fresh_d or 0.0, c.key))
+    return out
+
+
+def _describe(store: Any, kind: str, taste_kind: str, cands: list[_Cand], now: float) -> list[dict[str, Any]]:
+    """What the judgement sees of each candidate (RAM only, never logged): when they usually pick it, what they watched
+    of it or what played while it ran and what they called it, how long they stay; a video's own title and age."""
+    items = []
+    if kind == "playlist":
+        known = {_norm(i.get("name")): i for i in described(store, taste_kind, now=now, names=[c.name for c in cands],
+                                                            limit=len(cands) + MEANING_ITEMS)}
+    else:
+        from yuki.skills import youtube_feed
+
+        watched = youtube_feed.by_channel(store, since=now - SEED_DAYS * 86400.0, now=now)
+    for i, c in enumerate(cands):
+        item: dict[str, Any] = {"id": f"c{i + 1}", "name": c.name}
+        if (hours := _peak_hours(c.hist)):
+            item["usually"] = hours
+        if kind == "playlist":
+            got = known.get(_norm(c.name)) or {}
+            for k in ("called", "heard"):
+                if got.get(k):
+                    item[k] = got[k]
+        else:
+            w = watched.get(c.group) or {}
+            if w.get("titles"):
+                item["they watched"] = w["titles"]
+            if w.get("videos"):
+                item["minutes per video they watch"] = round(float(w["secs"]) / 60.0 / int(w["videos"]))
+            if kind == "video":
+                item["this video"] = c.title
+                item["days old"] = c.fresh_d
+        items.append(item)
+    return items
+
+
+def _judge_order(store: Any, kind: str, taste_kind: str, cands: list[_Cand], words: Any, context: str, now: float,
+                 *, client: Any = None, model: str | None = None, settings: Any = None,
+                 wait_s: float = CHOOSE_WAIT_S) -> list[_Cand] | None:
+    """The user's words judged over the candidates by the voice's small model (one forced tool call, the ids as an
+    enum, bounded by ``wait_s`` on its own thread): the candidates in its order, or None (no model, late, malformed).
+    Content goes to the model only."""
+    try:
+        if settings is None:
+            from yuki.config import Settings
+
+            settings = Settings()
+        model = model or str(getattr(settings, "voice_mouth_model", "") or "")
+        client = client if client is not None else _judge_client(settings)
+    except Exception:  # noqa: BLE001
+        return None
+    items = _describe(store, kind, taste_kind, cands, now)
+    ids = [i["id"] for i in items]
+    turns = [str(w) for w in (words if isinstance(words, (list, tuple)) else [words]) if str(w or "").strip()]
+    stamp = datetime.fromtimestamp(now)
+    things = {"video": "YouTube channels' new videos", "channel": "YouTube channels", "playlist": "playlists"}[kind]
+    request = {"model": model, "max_tokens": 120, "system": CHOOSE_SYSTEM.replace("{things}", things),
+               "tools": [{"name": "rank", "description": "Their items, best fit first.", "input_schema": {
+                   "type": "object", "properties": {"order": {"type": "array", "items": {"type": "string",
+                                                                                          "enum": ids}}},
+                   "required": ["order"]}}],
+               "tool_choice": {"type": "tool", "name": "rank"},
+               "messages": [{"role": "user", "content": json.dumps(
+                   {"their words": turns[-3:], "what they asked": context, "now": stamp.strftime("%A %H:%M"),
+                    "items": items}, ensure_ascii=False)}]}
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            box["response"] = client.messages.create(**request)
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = type(exc).__name__
+
+    thread = threading.Thread(target=run, name="yuki-taste-choose", daemon=True)
+    thread.start()
+    thread.join(max(0.1, float(wait_s)))
+    response = box.get("response")
+    if response is None:
+        return None
+    call = next((b for b in getattr(response, "content", []) or [] if getattr(b, "type", None) == "tool_use"), None)
+    order = [str(x) for x in (dict(getattr(call, "input", {}) or {}).get("order") or []) if str(x) in ids]
+    if not order:
+        return None
+    by = dict(zip(ids, cands))
+    ranked = [by[i] for i in dict.fromkeys(order)]
+    return ranked + [c for c in cands if c not in ranked]
+
+
+def _time_word(now: float) -> str:
+    """The part of the day as said: a format of the clock, never a judgement."""
+    h = datetime.fromtimestamp(now).hour
+    if 5 <= h < 11:
+        return "in the morning"
+    if 11 <= h < 15:
+        return "around lunch"
+    if 15 <= h < 18:
+        return "in the afternoon"
+    if 18 <= h < 22:
+        return "in the evening"
+    return "late at night"
+
+
+def _why(c: _Cand, kind: str, cands: list[_Cand], now: float, named: bool) -> str:
+    """The short why of a pick, from its own numbers: how new it is (a video), and its habit (watched or played at
+    this hour, the most lately, or recently)."""
+    parts = []
+    if kind == "video" and c.fresh_d is not None:
+        if c.fresh_d < 1:
+            parts.append("it's out today")
+        elif c.fresh_d < 2:
+            parts.append("it came out yesterday")
+        elif c.fresh_d < 7:
+            parts.append("it's new this week")
+    if not named:
+        verb, past, obj = ("play", "played", "it") if kind == "playlist" else ("watch", "watched", "them")
+        if c.fit > 0 and c.fit >= HABIT_SHARE * c.peak:
+            parts.append(f"you usually {verb} {obj} {_time_word(now)}")
+        elif cands and c.total >= max(x.total for x in cands):
+            parts.append(f"it's what you've {past} most lately")
+        elif now - c.last_at < 3 * 86400.0:
+            parts.append(f"you {past} {obj} recently")
+    return ", and ".join(parts)
+
+
+def _possessive(name: str) -> str:
+    return f"{name}'" if name.endswith(("s", "S")) else f"{name}'s"
+
+
+def _what(choice: Choice) -> str:
+    """The pick as said: "Deji's new one", "one of Deji's you haven't seen", "Deji's channel", "lumen"."""
+    if choice.kind == "video":
+        if choice.fresh_d is not None and choice.fresh_d < 7:
+            return f"{_possessive(choice.name)} new one"
+        return f"one of {_possessive(choice.name)} you haven't seen"
+    if choice.kind == "channel":
+        return f"{_possessive(choice.name)} channel"
+    return choice.name
+
+
+def choice_line(choice: Choice, *, where: str = "") -> str:
+    """The done line of a pick (code-written, one sentence): "Putting on Deji's new one - it's out today, and you
+    usually watch them around lunch." ``where``: the route's own browser words (" in Arc")."""
+    verb = "Opening" if choice.kind == "channel" else "Putting on"
+    why = f" - {choice.why}" if choice.why else ""
+    return f"{verb} {_what(choice)}{where}{why}."
+
+
+def held_line(choice: Choice | None, why: str) -> str:
+    """Decision 2: never with a game in front or in a call. The line says so and names the pick kept for later
+    (:func:`keep_for_later`: the next ask of this conversation plays it)."""
+    head = ("You're in a game, so I won't put anything on now." if why == "game"
+            else "You're on a call, so I held off.")
+    if choice is None:
+        return head
+    what = _what(choice)
+    return f"{head} I'll keep {what} for after."
+
+
+def choose(store: Any, kind: str, *, words: Any = (), context: str = "", session: str | None = None, only: str = "",
+           asked: bool = False, taste_kind: str = "", now: float | None = None, settings: Any = None,
+           log: LogFn | None = None, network: bool = True, judge_wait_s: float = CHOOSE_WAIT_S,
+           feed_budget_s: float | None = None, client: Any = None, model: str | None = None) -> Choice | None:
+    """Yuki's pick for "something I'd like" of ``kind`` (:data:`CHOOSE_KINDS`'s values), like a recommender: the
+    user's own candidates scored by what they watch or play at this hour and day, how much (time, not clicks), how
+    recently, how new (a video), less what they skipped; the ones already put on in this conversation left out ("another
+    one", "not that": the next); the user's words (``context``: theirs or the understanding's, and ``words``) judged
+    over the best :data:`CHOOSE_N` by a small model when there are two or more (bounded; the habit order stands when it
+    is late). ``only``: the channel or playlist the user named, exactly (:func:`_same_name`: "Deji's new video" ->
+    "Deji"): that channel's newest unwatched upload, no judgement; ``asked`` (they asked Yuki to choose): an ``only``
+    that is none of theirs ("something chill" given as the video) is their words for the judgement and the pick is free
+    (review M1), else None. A pick kept from a held request (:func:`keep_for_later`) comes first. None when there is
+    nothing to pick. Nothing plays here; the only thing noted is a ``skipped`` event (once per pick) when this asks
+    again within :data:`SKIP_S` of the last pick (:func:`chosen` notes the pick, once it played). Content-free logs;
+    never raises."""
+    started = time.perf_counter()
+    now = time.time() if now is None else float(now)
+    if judge_wait_s > 0 and client is None and (asked or not only):
+        prewarm()           # the judgement's client is made while the feeds are read
+    try:
+        state = _convo_state(str(session or ""), kind, now)
+        last = state.get("last") or None
+        if last and now - float(last[2]) <= SKIP_S and state.get("skipped") != last[2]:
+            # asked again this soon: the last pick was skipped (negative feedback for its channel or playlist), once
+            with _convo_lock:
+                (_convo.get((str(session or ""), kind)) or {})["skipped"] = last[2]
+            store.add_taste_event("skipped", {"kind": kind, "group": str(last[1]), "key": str(last[0]),
+                                              "chose_at": float(last[2]), "how": "again"}, at=now)
+        skips = _skip_weights(store, now)
+        if kind == "playlist":
+            if not taste_kind:
+                return None
+            every: list[_Cand] | None = _base(_rows_of(store, taste_kind), now, skips)
+            named = [c for c in every if _same_name(only, c.name)] if only else every
+        else:
+            every, named = None, _channels(store, now, skips, only)
+        cands = named
+        if only and not named and asked:
+            # they asked Yuki to choose and the text given names none of theirs: their words, for the judgement
+            if _norm(only) not in _norm(context):
+                context = " ".join(f"{context or ''} {only}".split())
+            only = ""
+            cands = every if every is not None else _channels(store, now, skips, "")
+        if kind == "video":
+            budget = CHOOSE_FEED_S if feed_budget_s is None else float(feed_budget_s)
+            cands = _videos(store, cands, now, network=network, log=log, budget_s=budget)
+        given = set(state.get("keys") or [])
+        left = [c for c in cands if c.key not in given]
+        if not left and cands and given:
+            # every candidate was put on already: around again, never the one playing now
+            left = [c for c in cands if not last or c.key != last[0]]
+        # "another one": another channel or playlist before a second of one already put on in this conversation
+        groups = set(state.get("groups") or [])
+        left = [c for c in left if c.group not in groups] + [c for c in left if c.group in groups]
+        if not left:
+            _log_choose(log, kind, n=0, started=started)
+            return None
+        # the pick named for later when a game or a call held it (:func:`keep_for_later`): first, as said (the
+        # judgement still weighs new words against it: "go on then" keeps it, "something chill" may not)
+        kept = [c for c in left if c.key == state.get("held")] if not only else []
+        if kept:
+            left = kept + [c for c in left if c is not kept[0]]
+        judged = moved = False
+        said = " ".join(str(context or "").split())
+        wait = min(float(judge_wait_s), CHOOSE_DEADLINE_S - (time.perf_counter() - started))
+        if not only and len(left) > 1 and wait >= JUDGE_MIN_S and (said or words):
+            got = _judge_order(store, kind, taste_kind, left[:CHOOSE_N], words, said, now, client=client,
+                               model=model, settings=settings, wait_s=wait)
+            if got is not None:
+                judged, moved = True, got[0] is not left[0]
+                left = got + left[CHOOSE_N:]
+        best = left[0]
+        extra = {"page": "handle"} if kind == "channel" else {}
+        value = dict(best.value)
+        choice = Choice(kind, CHOOSE_SLOTS[kind], value, extra, best.name, best.key, best.group,
+                        _why(best, kind, cands, now, bool(only)), best.fresh_d, best.title, judged, len(left),
+                        round((time.perf_counter() - started) * 1000.0, 1), bool(only))
+        _log_choose(log, kind, n=len(left), started=started, judged=judged, moved=moved, fresh_d=best.fresh_d,
+                    skips=len(skips), again=len(given), kept=bool(kept) or None)
+        return choice
+    except Exception as exc:  # noqa: BLE001 - no pick: the request goes the normal way
+        _log_choose(log, kind, n=0, started=started, error=type(exc).__name__)
+        return None
+
+
+def keep_for_later(choice: Choice, *, session: str | None = None, now: float | None = None) -> None:
+    """A pick a game or a call held (:func:`held_line` named it): kept for this conversation (RAM, :data:`CONVO_S`),
+    so the next ask to choose ("go on then", after the game) puts that one on. Never raises."""
+    now = time.time() if now is None else float(now)
+    try:
+        with _convo_lock:
+            st = _convo.setdefault((str(session or ""), choice.kind), {"keys": [], "groups": []})
+            st["held"] = choice.key
+            st["at"] = now
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _log_choose(log: LogFn | None, kind: str, *, n: int, started: float, **fields: Any) -> None:
+    """The content-free ``taste_choose`` line: the kind, how many candidates, how long, code words and numbers."""
+    if log is None:
+        return
+    try:
+        log("taste_choose", kind=kind, n=int(n), ms=round((time.perf_counter() - started) * 1000.0, 1),
+            **{k: v for k, v in fields.items() if v is not None})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def chosen(store: Any, choice: Choice, *, session: str | None = None, taste_kind: str = "",
+           now: float | None = None) -> None:
+    """A pick was put on and its done-check saw it: kept for this conversation ("another one" takes the next) and noted
+    (``taste_events`` ``chose``: digests and code words only), so a quick close or change counts as a skip later
+    (:func:`_skip_weights`). Never raises."""
+    now = time.time() if now is None else float(now)
+    with _convo_lock:
+        key = (str(session or ""), choice.kind)
+        st = _convo.setdefault(key, {"keys": [], "groups": []})
+        if choice.key not in st["keys"]:
+            st["keys"].append(choice.key)
+        if choice.group not in st.setdefault("groups", []):
+            st["groups"].append(choice.group)
+        st["last"] = (choice.key, choice.group, now)
+        st["at"] = now
+        st.pop("held", None)
+    try:
+        store.add_taste_event("chose", {"kind": choice.kind, "key": choice.key, "group": choice.group,
+                                        "taste_kind": taste_kind or None, "judged": bool(choice.judged),
+                                        "n": int(choice.n)}, at=now)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 __all__ = ["SIGMA_MIN", "FALLBACK_MASS", "MENU_CANDIDATES", "OPTIONS_N", "SEEN_SOURCE", "SEEN_MAX", "SAID_SUFFIX",
            "Taste", "hour_score", "score_at", "top", "candidates", "seen_names", "options", "said_kind", "said_target",
            "said_words", "find", "offered", "find_offered", "takes_offers", "MEANING_WAIT_S", "MEANING_TTL_S",
@@ -1247,4 +1881,7 @@ __all__ = ["SIGMA_MIN", "FALLBACK_MASS", "MENU_CANDIDATES", "OPTIONS_N", "SEEN_S
            "SEED_DAYS", "HALF_LIFE_DAYS",
            "SESSION_GAP_S", "FLOOR", "OPAQUE_VAR", "RETIRED_KINDS", "ASKED_FILLS", "GUESS_FILLS", "OFFER_FIELDS",
            "entity_key", "site_kinds",
-           "capability_kinds", "slot_kind", "recompute", "seed_sites", "note", "saw", "unsay", "busy", "seed"]
+           "capability_kinds", "slot_kind", "recompute", "seed_sites", "note", "saw", "unsay", "busy", "seed",
+           "VISIT_UNITS", "SESSION_UNITS", "LISTEN_SPAN_S", "CHOOSE_KINDS", "CHOOSE_SLOTS", "CONVO_S", "SKIP_S",
+           "CHOOSE_N", "CHOOSE_WAIT_S", "CHOSE_LEAD_S", "Choice", "choose", "chosen", "keep_for_later", "choice_line",
+           "held_line"]

@@ -3596,11 +3596,27 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX IF NOT EXISTS taste_events_at ON taste_events(at, kind);
     """,
+    # 45 (2026-10-18, kClean; docs/research/audit-2026-10-17/00-SYNTHESIS.md section 8, decision 3): data only, no
+    # schema change. The old learners are switched off and deleted; their Playbook rows (origins in
+    # RETIRED_PLAYBOOK_ORIGINS) are retired (state and valid_to), their per-app state rows in nudge_state removed, and
+    # what the live test harness left is purged (yuki.memory.testtag.purge). The Python step does it all
+    # (Store._migrate_45); the counts go to nudge_state CLEANUP_STATE, content-free. The old task tables stay.
+    """
+    SELECT 1;
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
 #: -> the :class:`Store` method's name): data moves that need the store's key (an HMAC identity, a decryption).
-PY_MIGRATIONS: dict[int, str] = {26: "_migrate_27"}
+PY_MIGRATIONS: dict[int, str] = {26: "_migrate_27", 44: "_migrate_45"}
+#: Migration 45: the playbook origins the old learners wrote (the demo learner, the habit miner, the old loop's
+#: session pitfalls and slider ways, the run learner's post-mortems and distills, the know-how intake). All retired.
+RETIRED_PLAYBOOK_ORIGINS: tuple[str, ...] = ("demo", "miner", "session", "postmortem", "knowhow", "distill", "slider")
+#: Migration 45: the old learners' state rows in nudge_state (names, and prefixes ending in ":").
+RETIRED_STATE_ROWS: tuple[str, ...] = ("trace:demos", "trace:demos_state", "trace:go_tos_served", "trace:habits",
+                                       "trace:habits:app:", "trace:learn", "trace:tasks", "trace:tasks:noise")
+#: Where migration 45 leaves its counts (JSON, content-free).
+CLEANUP_STATE = "cleanup:v45"
 #: When the timeline began judging meetings by call evidence live (written by migration 27): meeting rows that ended
 #: before it are checked against the call rows when read (:meth:`Store._meetings_proven`).
 MEETING_GATE_CHECKPOINT = "meeting_evidence_since"
@@ -3935,6 +3951,35 @@ class Store:
         ("captures", "thread_id"), ("journal", "thread_id"), ("journal_batches", "thread_id"), ("calls", "thread_id"),
         ("work_thread_events", "thread_id"), ("links_seen", "capture_thread_id"),
     )
+
+    def _migrate_45(self, conn: sqlite3.Connection) -> dict[str, int]:
+        """Migration 45's data step (inside its transaction): every live playbook of the old learners retired, their
+        state rows gone, and the live test's leftovers purged (:func:`yuki.memory.testtag.purge`). Counts only, kept
+        in ``nudge_state`` :data:`CLEANUP_STATE`; idempotent (a database without these rows changes nothing)."""
+        from yuki.memory import testtag
+
+        now = time.time()
+        marks = ",".join("?" * len(RETIRED_PLAYBOOK_ORIGINS))
+        out: dict[str, int] = {}
+        try:
+            out["playbooks_retired"] = int(conn.execute(
+                f"UPDATE playbooks SET state = 'retired', valid_to = ?, updated_at = ? WHERE valid_to IS NULL AND"
+                f" origin IN ({marks})", (now, now, *RETIRED_PLAYBOOK_ORIGINS)).rowcount or 0)
+        except sqlite3.OperationalError:   # an older database without practice memory
+            out["playbooks_retired"] = 0
+        gone = 0
+        for name in RETIRED_STATE_ROWS:
+            if name.endswith(":"):
+                gone += int(conn.execute("DELETE FROM nudge_state WHERE name >= ? AND name < ?",
+                                         (name, name[:-1] + chr(ord(":") + 1))).rowcount or 0)
+            else:
+                gone += int(conn.execute("DELETE FROM nudge_state WHERE name = ?", (name,)).rowcount or 0)
+        out["state_rows"] = gone
+        out.update({f"test_{k}": v for k, v in testtag.purge(conn, self._dec, now=now).items()})
+        conn.execute("INSERT INTO nudge_state(name, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE"
+                     " SET value = excluded.value, updated_at = excluded.updated_at",
+                     (CLEANUP_STATE, json.dumps(out, sort_keys=True), now))
+        return out
 
     def _migrate_27(self, conn: sqlite3.Connection) -> dict[str, int]:
         """Migration 27's data step (inside its transaction): every capture thread gets its identity key
@@ -4904,12 +4949,6 @@ class Store:
         """One fact version by id (current or not)."""
         rows = self._query("SELECT * FROM portrait_facts WHERE id=?", (int(fact_id),))
         return self._fact(rows[0]) if rows else None
-
-    def portrait_history(self, limit: int = 200) -> list[PortraitFact]:
-        """Every fact version, newest first (current and superseded)."""
-        return [self._fact(r) for r in self._query(
-            "SELECT * FROM portrait_facts ORDER BY id DESC LIMIT ?", (int(limit),)
-        )]
 
     def _insert_fact(
         self, conn: sqlite3.Connection, *, kind: str, subject: str, text: str, valid_from: float,
@@ -7148,17 +7187,6 @@ class Store:
             params.append(int(limit))
         return [self._entry(r) for r in self._query(sql, params)], total
 
-    def set_journal_sources(self, sources: dict[int, dict[str, Any] | None]) -> int:
-        """Replace journal rows' provenance (``{journal id: source dict or None}``), in place: metadata about a row (the
-        misheard words and Yuki's guess, :mod:`yuki.memory.misheard`), never its words. Returns how many."""
-
-        def op(conn: sqlite3.Connection) -> int:
-            return sum(conn.execute("UPDATE journal SET source_ciphertext=? WHERE id=?",
-                                    (None if src is None else self.cipher.encrypt(json.dumps(src, ensure_ascii=False)),
-                                     int(jid))).rowcount for jid, src in sources.items())
-
-        return int(self._write(op)) if sources else 0
-
     def work_events_between(self, since: float, until: float, *, limit: int = 200) -> list[dict[str, Any]]:
         """What happened to the threads of work in ``[since, until)``, oldest first: ``{"thread_id", "title", "status",
         "at", "action", "state"}`` (decrypted; merged and dismissed threads left out)."""
@@ -8181,39 +8209,6 @@ class Store:
             error=r["error"], cost_usd=r["cost_usd"], input_tokens=r["input_tokens"] or 0,
             output_tokens=r["output_tokens"] or 0, score=score,
         )
-
-    def revise_weekly_review(
-        self, review: WeeklyReview, *, text: str, sections: dict[str, Any], teaser: str | None, model: str | None,
-        stats: ReviewStats | None = None, vector: np.ndarray | None = None, embed_model: str | None = None,
-    ) -> int:
-        """Store a corrected version of a finished review (``python -m yuki.memory.recheck``): a new ``ok`` row for the
-        same week and period, dated like the original (so the review schedule and the teaser card see no new run:
-        its ``nudge_id`` is carried over), and the original marked ``superseded`` (kept as history, out of every
-        ``ok`` read: the latest review, recall, the window). Returns the new id."""
-        now = time.time()
-        stats = stats or ReviewStats()
-
-        def seal(value: Any) -> str | None:
-            return None if value is None else self.cipher.encrypt(json.dumps(value, ensure_ascii=False, default=str))
-
-        def op(conn: sqlite3.Connection) -> int:
-            cur = conn.execute(
-                "INSERT INTO weekly_reviews(at, finished_at, week, period_start, period_end, trigger, model,"
-                " text_ciphertext, sections_ciphertext, teaser_ciphertext, numbers_ciphertext, candidates_ciphertext,"
-                " candidates_run_id, nudge_id, calls, input_tokens, output_tokens, cache_write_tokens,"
-                " cache_read_tokens, cost_usd, latency_ms, stop_reason, outcome)"
-                " VALUES (?,?,?,?,?,'recheck',?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,'ok')",
-                (float(review.at), now, review.week, float(review.period_start), float(review.period_end), model,
-                 self._enc(text), seal(sections), self._enc(teaser), seal(review.numbers), review.candidates_run_id,
-                 review.nudge_id, stats.calls, stats.input_tokens, stats.output_tokens, stats.cache_write_tokens,
-                 stats.cache_read_tokens, stats.cost_usd, stats.latency_ms, stats.stop_reason))
-            new_id = int(cur.lastrowid)
-            conn.execute("UPDATE weekly_reviews SET outcome='superseded' WHERE id=?", (int(review.id),))
-            if vector is not None:
-                self._put_vec(conn, "weekly_review_vec", "review_id", new_id, vector, embed_model)
-            return new_id
-
-        return self._write(op)
 
     def start_weekly_review(
         self, week: str, period_start: float, period_end: float, trigger: str, model: str | None,
@@ -9483,16 +9478,6 @@ class Store:
 
     # -- corrections applied everywhere, name aliases (migration 18; yuki.memory.corrections) -------------
 
-    def queue_correction_pass(self, correction_id: int, *, at: float | None = None) -> None:
-        """Queue the correction-apply pass for one user correction (idempotent: a queued, running or finished
-        pass is left alone; a failed one is queued again)."""
-        now = float(at) if at is not None else time.time()
-        self._write(lambda conn: conn.execute(
-            "INSERT INTO correction_passes(correction_id, status, queued_at, updated_at) VALUES (?,?,?,?)"
-            " ON CONFLICT(correction_id) DO UPDATE SET status='queued', updated_at=excluded.updated_at"
-            " WHERE correction_passes.status='failed'",
-            (int(correction_id), "queued", now, now)))
-
     def correction_pass(self, correction_id: int) -> dict[str, Any] | None:
         """The pass of one correction: ``{correction_id, status, queued_at, started_at, finished_at, attempts,
         changes: [...], cost_usd, error}``, or None when none was queued."""
@@ -9670,31 +9655,6 @@ class Store:
             return new_id
 
         return self._write(op)
-
-    def set_episode_labels(self, rows: dict[int, tuple[str | None, str | None]], *, overwrite: bool = False) -> int:
-        """Write sessions' titles and summaries (migration 35), ``{episode id: (title, summary)}``, current episodes
-        only; without ``overwrite`` an episode that has a title already is left. Returns how many were written."""
-
-        def op(conn: sqlite3.Connection) -> int:
-            n = 0
-            for eid, (title, summary) in rows.items():
-                title, summary = " ".join(str(title or "").split()), " ".join(str(summary or "").split())
-                if not title or not summary:
-                    continue
-                guard = "" if overwrite else " AND title_ciphertext IS NULL"
-                n += conn.execute(f"UPDATE episodes SET title_ciphertext=?, summary_ciphertext=? WHERE id=? AND"
-                                  f" expired_at IS NULL{guard}",
-                                  (self.cipher.encrypt(title), self.cipher.encrypt(summary), int(eid))).rowcount
-            return n
-
-        return int(self._write(op)) if rows else 0
-
-    def episodes_without_labels(self, since: TimeArg = None) -> list[EpisodeRecord]:
-        """Current episodes without a session title (migration 35), oldest first."""
-        where, params = self._episode_filter(since, None)
-        where += (" AND " if where else " WHERE ") + "e.title_ciphertext IS NULL"
-        return [self._episode(r) for r in self._query("SELECT e.* FROM episodes e" + where
-                                                      + " ORDER BY e.started_at, e.id", params)]
 
     def retire_episodes(self, pairs: Sequence[tuple[int, int]]) -> int:
         """Expire episodes that retell a stretch another one tells (``(retold id, kept id)``): kept as history,
@@ -10860,9 +10820,6 @@ class Store:
                  "title": self._dec(r["title_ciphertext"]), "scope": self._dec(r["scope_ciphertext"]),
                  "text": self.cipher.decrypt(r["delta_ciphertext"]), "by_yuki": bool(r["by_yuki"])} for r in rows]
 
-    def max_capture_id(self) -> int:
-        return int(self._query("SELECT coalesce(max(id), 0) FROM captures")[0][0])
-
     # -- call digests as vectors (migration 23) -------------------------------------------
 
     def call_digests_without_vectors(self, limit: int = 32) -> list[dict[str, Any]]:
@@ -10935,22 +10892,6 @@ class Store:
             return []
         return [self._summary(r) for r in self._query(
             "SELECT * FROM session_summaries WHERE id IN (%s) ORDER BY started_at" % ",".join("?" * len(wanted)), wanted)]
-
-    def captures_by_ids(self, ids: Iterable[int]) -> list[dict[str, Any]]:
-        """Captures by id with their window (as :meth:`recent_captures`), oldest first."""
-        wanted = sorted({int(i) for i in ids if i is not None})
-        if not wanted:
-            return []
-        rows = self._query(
-            "SELECT c.id, c.at, c.kind, c.delta_ciphertext, c.thread_id, c.by_yuki, c.trigger, t.app, t.process, t.host,"
-            " t.title_ciphertext, t.scope_ciphertext, t.url_ciphertext FROM captures c JOIN threads t ON t.id = c.thread_id"
-            " WHERE c.id IN (%s) ORDER BY c.at, c.id" % ",".join("?" * len(wanted)), wanted)
-        return [{"id": r["id"], "at": r["at"], "kind": r["kind"],
-                 "text": user_side_text(r["kind"], self.cipher.decrypt(r["delta_ciphertext"])),
-                 "thread_id": r["thread_id"], "app": _shown(r["app"], r["process"]), "process": r["process"],
-                 "title": self._dec(r["title_ciphertext"]), "scope": self._dec(r["scope_ciphertext"]),
-                 "url": self._dec(r["url_ciphertext"]), "host": r["host"], "by_yuki": bool(r["by_yuki"]),
-                 "trigger": r["trigger"], "attention": capture_attention(r["trigger"])} for r in rows]
 
     # -- moments: one table of state changes (migration 40, yuki.memory.moments) -----------------------------------
 
@@ -11162,12 +11103,6 @@ class Store:
              json.dumps(detail, sort_keys=True, separators=(",", ":")) if detail else None))
         return int(cur.lastrowid)
 
-    def add_routine_event(self, routine_id: int, kind: str, at: float | None = None, *, nudge_id: int | None = None,
-                          detail: dict[str, Any] | None = None) -> int:
-        """One routine event (content-free ``detail``: numbers and code words only); returns its id."""
-        when = time.time() if at is None else float(at)
-        return self._write(lambda conn: self._routine_event(conn, routine_id, kind, when, nudge_id, detail))
-
     def routine_events(self, routine_id: int | None = None, *, since: TimeArg = None, until: TimeArg = None,
                        kinds: Iterable[str] | None = None) -> list[dict[str, Any]]:
         """Routine events with ``at`` in ``[since, until)``, oldest first (``detail`` parsed)."""
@@ -11195,24 +11130,6 @@ class Store:
                 d["detail"] = {}
             out.append(d)
         return out
-
-    def set_routine_mode(self, routine_id: int, mode: str, at: float | None = None, *,
-                         detail: dict[str, Any] | None = None) -> bool:
-        """Move a routine's ``offer_mode`` (early | late | quiet | off) and note a ``mode_change`` event with the
-        old and new mode; False when the routine is missing or already in that mode."""
-        when = time.time() if at is None else float(at)
-
-        def op(conn: sqlite3.Connection) -> bool:
-            row = conn.execute("SELECT offer_mode FROM routines WHERE id = ?", (int(routine_id),)).fetchone()
-            if row is None or row[0] == mode:
-                return False
-            conn.execute("UPDATE routines SET offer_mode = ?, updated_at = ? WHERE id = ?",
-                         (str(mode), when, int(routine_id)))
-            self._routine_event(conn, int(routine_id), "mode_change", when, None,
-                                {"mode_from": row[0], "mode_to": str(mode), **(detail or {})})
-            return True
-
-        return self._write(op)
 
     def presence_spans(self, since: float, until: float) -> list[tuple[float, float]]:
         """The user's own present stretches overlapping ``[since, until)`` (timeline rows ``present`` not begun while

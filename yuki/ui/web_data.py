@@ -9,8 +9,8 @@ Every builder runs on a worker thread and is safe to call again; a failing part 
 
 Times are epoch seconds (the page formats them); words the page shows are plain and honest about what memory does
 not have (a memory without the people index, practice memory or goals gets the older views, probed with getattr).
-E11-E14 (32-build-E11-E14.md): contact rhythm (``rhythm_view``), the Playbook from ``workflows()``
-(``build_playbook``), the ledger from the run traces with why, result and Undo (``build_activity``), today's goals on
+E11-E14 (32-build-E11-E14.md): contact rhythm (``rhythm_view``), the Playbook from ``playbook()``
+(``build_playbook``; audit 17 Oct), the ledger from the run traces with why, result and Undo (``build_activity``), today's goals on
 Home's Now strip (``goals_today``). appTodo (4 Oct): the to-do list on Home and Work (``todo_lists``), and no threads
 anywhere in the window: Work is the list and today's sessions, Home's Now tile the current session (``now_session``).
 """
@@ -1316,8 +1316,7 @@ def work_today(memory: Any, v: Any, sessions: list[dict[str, Any]], board: dict[
     """Today on the Work page, the same figures as the Day tab (``v``: the day view both read): ``focus`` minutes
     (the Day's Active: at the PC, not full screen) and your ``usual`` by now; the ``longest`` stretch in one app
     (the Day's Longest focus) with the session it was in; ``worked``: the threads of work with the most time today
-    (``[title, minutes, thread ref]``, from today's sessions grouped by the thread their journal entries belong to;
-    capC6: a 4th item when the PC checked something got done in it today, :func:`worked_evidence`);
+    (``[title, minutes, thread ref]``, from today's sessions grouped by the thread their journal entries belong to);
     ``coming``: memory's meetings ahead (``[when words, title]``) and where they were seen."""
     from yuki.ui.window.data import nat_time
 
@@ -1343,45 +1342,11 @@ def work_today(memory: Any, v: Any, sessions: list[dict[str, Any]], board: dict[
             row = mins.setdefault(th["ref"], [th["title"], 0, th["ref"]])
             row[1] += m
         worked = sorted((r for r in mins.values() if r[1] >= 1), key=lambda r: -r[1])[:WORKED_SHOWN]
-        worked_evidence(memory, worked, sessions, threads, now)
     coming = [[ahead_words(m["at"], bool(m.get("all_day")), now), m.get("title") or ""] for m in board.get("meetings") or []][:3]
     seen = list(dict.fromkeys(a for m in (board.get("meetings") or [])[:3] for a in m.get("seen") or []))
     return {"focus": focus, "usual": round(usual) if usual is not None else None, "longest": longest,
             "worked": worked, "coming": coming,
             "coming_seen": f"seen on your screen in {_and(seen)}" if seen else ""}
-
-
-def worked_evidence(memory: Any, worked: list[list[Any]], sessions: list[dict[str, Any]], threads: list[Any],
-                    now: float) -> None:
-    """capC6 (report 78 §12, C6): each Worked on today row gains, as its 4th item, the latest thing the PC checked got
-    done inside that thread's sessions today (``{"text": "you saved a file (.pptx) at 4 PM", "goal", "ref"
-    ("task:12"), "action" (the outcome's action id)}``); a row with none keeps its three items. Only tasks memory calls
-    learnable whose outcome made, sent or ran something (``trace_graph.DONE_FACTS``: a window or page that merely came
-    up is never shown as done), never unclear, never one the user said was not theirs; the ids stay in the data,
-    the page shows words only. Never a card, never spoken. Small reads (memory's ``done_evidence``, one per session of
-    the row's thread, newest first, until one holds a checked task)."""
-    fn = getattr(memory, "done_evidence", None)
-    if not callable(fn) or not worked:
-        return
-    timed = [s for s in sessions if s.get("start_at") and s.get("end_at")]
-    if not timed:
-        return
-    spans: dict[str, list[tuple[float, float]]] = {}
-    for s, th in zip(timed, threads or []):
-        if th:
-            spans.setdefault(th["ref"], []).append((float(s["start_at"]), float(s["end_at"])))
-    for row in worked:
-        # read per session of the row's thread, newest first (review C6-1: one capped read of the whole day let a busy
-        # day's other tasks crowd a row's out); the sessions do not overlap, so the first that holds one has the latest
-        for a, b in sorted(spans.get(row[2], []), key=lambda x: -x[1]):
-            got = _safe(lambda a=a, b=b: fn(a, b + 1.0, limit=3), []) or []
-            inside = [e for e in got if isinstance(e, dict) and e.get("at") is not None and e.get("words")
-                      and a <= float(e["at"]) <= b + 1.0]
-            if inside:
-                e = max(inside, key=lambda x: float(x["at"]))
-                row.append({"text": f"{e['words']} at {e.get('clock') or hm(e['at'])}", "goal": e.get("goal") or "",
-                            "ref": f"task:{int(e['task'])}", "action": int(e["action"])})
-                break
 
 
 def dates_said(text: str, now: float) -> str:
@@ -1709,7 +1674,6 @@ def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
     from yuki.ui.window.data import nat_time
 
     sessions = day_sessions(memory, v)
-    session_tasks(memory, sessions, since, {ln.key: ln.label for ln in v.lanes})
     calls_rows = _safe(lambda: memory.calls_in(since=since, until=since + 86400, limit=30), []) or []
     lookup = name_lookup(people)
     calls = []
@@ -1745,42 +1709,7 @@ def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
             "buckets": buckets, "sessions": sessions, "calls": calls, "totals": totals,
             "week_hours": week if week is not None else week_days(memory, now),
             "pending": pending_view(pending, ("episode:",), now),
-            "can": {"correct": callable(getattr(memory, "correct_item", None)),
-                    "correct_task": callable(getattr(memory, "task_correct", None))}}
-
-
-def task_view(t: dict[str, Any], labels: dict[str, str] | None = None) -> dict[str, Any]:
-    """One task as the Day page shows it inside its session (capC2, decision D5): the goal, the apps, the time span
-    and the outcome in plain words, the user's verdict when they corrected it, and its ref for the correction."""
-    labels = labels or {}
-    apps = [labels.get(a, a) for a in t.get("apps") or [] if a]
-    return {"ref": t.get("ref"), "goal": " ".join(str(t.get("goal") or "").split()),
-            "apps": list(dict.fromkeys(apps))[:4], "start": hm(t.get("start_at")), "end": hm(t.get("end_at")),
-            "start_at": t.get("start_at"), "end_at": t.get("end_at"), "outcome": t.get("outcome_words") or "",
-            "checked": t.get("outcome") not in (None, "", "unclear"), "verdict": t.get("verdict")}
-
-
-def session_tasks(memory: Any, sessions: list[dict[str, Any]], since: float,
-                  labels: dict[str, str] | None = None) -> None:
-    """capC2 (decision D5): each session's tasks (``tasks``), oldest first, from memory's ``day_tasks``: a task goes
-    in the session holding its middle (else the one it overlaps most); one inside no session is not shown. Never a
-    card, never spoken. Reads only; a memory without tasks leaves the sessions as they are."""
-    fn = getattr(memory, "day_tasks", None)
-    if not callable(fn) or not sessions:
-        return
-    tasks = _safe(lambda: fn(since, since + 86400.0), []) or []
-    for t in tasks:
-        if not isinstance(t, dict) or t.get("start_at") is None or t.get("end_at") is None:
-            continue
-        s0, s1 = float(t["start_at"]), float(t["end_at"])
-        mid = (s0 + s1) / 2
-        home = next((s for s in sessions if s.get("start_at", 0) <= mid < s.get("end_at", 0)), None)
-        if home is None:
-            over = [(min(s1, s.get("end_at", 0)) - max(s0, s.get("start_at", 0)), s) for s in sessions]
-            over = [x for x in over if x[0] > 0]
-            home = max(over, key=lambda x: x[0])[1] if over else None
-        if home is not None:
-            home.setdefault("tasks", []).append(task_view(t, labels))
+            "can": {"correct": callable(getattr(memory, "correct_item", None))}}
 
 
 def day_sessions(memory: Any, v: Any) -> list[dict[str, Any]]:
@@ -1868,174 +1797,28 @@ def _top_full(v: Any) -> str:
 # -- Playbook ------------------------------------------------------------------------------------------------------
 
 
-#: NEW blocks on the Playbook page at most (the design shows one); more tentative items go to their lists.
-PROPOSALS_SHOWN = 2
-#: How each practice object came to be (``playbooks.origin``), in the words the Playbook page's side line uses. Every
-#: way on the page rests on a success (appLearn: a post-mortem's way is the one that worked in the end); a style note
-#: is the user's own words.
-ORIGIN_WORDS = {"distill": "From a run that worked", "run": "From a run that worked",
-                "postmortem": "From a run that worked in the end", "slider": "From a run that worked",
-                "user": "In your words", "taught": "You taught me",
-                "miner": "Seen in what you do", "knowhow": "From what I learned before",
-                # capC4: a way learned from what the user did themselves (a task with a checked outcome)
-                "demo": "Learned from what you did"}
-#: The kinds the Playbook page and the Activity rows may show (appLearn): ways and the user's style notes. A pitfall
-#: is a quiet note for Yuki's own use, never shown as something learned.
+#: The kinds the Activity rows may show (appLearn): ways and the user's style notes. A pitfall is a quiet note for
+#: Yuki's own use, never shown as something learned.
 SHOWN_KINDS = ("procedure", "habit", "style", "question")
 
 
-def app_words(apps: list[Any]) -> str:
-    """The apps a playbook is for, as the page names them (``chrome`` -> ``Chrome``; none: ``Any app``)."""
-    from yuki.core.appnames import prettify
-
-    names = [prettify(str(a)) or str(a) for a in apps or [] if str(a).strip()]
-    return " · ".join(dict.fromkeys(names)) if names else "Any app"
-
-
-def _learned_line(c: dict[str, Any]) -> str:
-    """Where a playbook came from and how much evidence it has, e.g. ``From a run that worked, 29 Sep · seen on 3
-    days``."""
-    head = "In your words" if c.get("kind") == "style" else ORIGIN_WORDS.get(str(c.get("origin") or ""), "Learned")
-    since = short_day(epoch_of(c.get("since")))
-    ev = c.get("evidence") if isinstance(c.get("evidence"), dict) else {}
-    bits = []
-    if int(ev.get("days") or 0) > 1:
-        bits.append(f"seen on {ev['days']} days")
-    if int(ev.get("corrected") or 0):
-        bits.append(f"corrected {ev['corrected']}×")
-    return f"{head}{', ' + since if since else ''}" + (" · " + ", ".join(bits) if bits else "")
-
-
-def procedure_view(c: dict[str, Any]) -> dict[str, Any]:
-    """A procedure or habit from ``workflows()`` as the Playbook page's "How you do things" row: title, the line under
-    it (a habit's rule, or what it avoids), its steps, the app, uses and last use, confidence (meter and word) and where
-    it came from. Disabled ones say so."""
-    steps = [str(s) for s in c.get("steps") or [] if str(s).strip()]
-    when = ""
-    if c.get("kind") == "habit":
-        when = " ".join(str(c.get("text") or "").split())
-    elif c.get("avoid"):
-        when = f"Not: {' '.join(str(c['avoid']).split())}"
-    uses = int(c.get("uses") or 0)
-    return {"ref": c.get("id"), "kind": c.get("kind"), "title": c.get("title") or "", "when": when, "steps": steps,
-            "app": app_words(c.get("apps") or []), "uses": uses, "last": short_day(epoch_of(c.get("last_used"))),
-            "conf": c.get("confidence"), "conf_word": conf_word(c.get("confidence")) or str(c.get("label") or ""),
-            "state": c.get("state"), "disabled": bool(c.get("disabled")), "learned": _learned_line(c)}
-
-
-def choice_view(c: dict[str, Any]) -> dict[str, Any]:
-    """A habit from ``workflows()`` as an app choice on the Playbook page (the 4 Oct item W7b): what the choice is about
-    (the first thing it names - a site, an app, a person - else its title), the default it settles on, or that Yuki
-    asks; never the counts behind it (the miner's text, "39.3 minutes by 39 visits over 3 days", stays memory's). The
-    page says it as "YouTube: usually Chrome"."""
-    about = [str(e).strip() for e in c.get("people") or [] if str(e).strip()]
-    title = " ".join(str(c.get("title") or "").split())
-    default = " ".join(str(c.get("default") or "").split())
-    uses = int(c.get("uses") or 0)
-    out = {"ref": c.get("id"), "kind": "habit", "title": title, "subject": about[0] if about else title,
-           "default": default, "ask": bool(c.get("ask")) and not default, "app": app_words(c.get("apps") or []),
-           "uses": uses, "last": short_day(epoch_of(c.get("last_used"))), "conf": c.get("confidence"),
-           "conf_word": conf_word(c.get("confidence")) or str(c.get("label") or ""), "disabled": bool(c.get("disabled")),
-           "learned": _learned_line(c)}
-    out["line"] = choice_words(out)
-    return out
-
-
-def choice_words(ch: dict[str, Any]) -> str:
-    """An app choice in one plain sentence: "YouTube: usually Chrome.", "Riya: I ask which one.", or just what it is
-    about when there is no default yet."""
-    subject = str(ch.get("subject") or ch.get("title") or "")
-    subject = subject[:1].upper() + subject[1:]
-    if ch.get("default"):
-        return f"{subject}: usually {ch['default']}."
-    if ch.get("ask"):
-        return f"{subject}: I ask which one."
-    return f"{subject}." if subject else ""
-
-
-def lesson_view(c: dict[str, Any]) -> dict[str, Any]:
-    """A pitfall or style note as a Lessons row: what it is about (bold), what went wrong, what to do instead, how
-    often it was used and where it came from."""
-    # practice memory's own text() appends " Instead: ..." and " Not: ..." to what happened; those two parts have
-    # their own fields here (``instead``, ``avoid``), so the "because" line is the part before them
-    text = str(c.get("text") or "").split(" Instead: ")[0].split(" Not: ")[0]
-    return {"ref": c.get("id"), "kind": c.get("kind"), "dont": c.get("title") or "",
-            "because": " ".join(text.split()),
-            "do": " ".join(str(c.get("instead") or "").split()), "used": int(c.get("uses") or 0),
-            "from": _learned_line(c), "conf": c.get("confidence"), "disabled": bool(c.get("disabled"))}
-
-
-def proposal_view(c: dict[str, Any]) -> dict[str, Any]:
-    """What Yuki is not sure of yet - a playbook seen once, or a question it would like to ask - as the NEW proposal
-    block: title, the basis line, its steps; ``question`` ones are answered in the user's words."""
-    if c.get("kind") == "question":
-        return {"ref": c.get("id"), "kind": "question", "title": " ".join(str(c.get("text") or c.get("title") or "").split()),
-                "basis": "I’d like to know, so I stop guessing.", "steps": []}
-    steps = [str(s) for s in c.get("steps") or [] if str(s).strip()]
-    ev = c.get("evidence") if isinstance(c.get("evidence"), dict) else {}
-    seen = int(ev.get("seen") or 0)
-    basis = " ".join(str(c.get("text") or "").split()) if not steps else ""
-    if c.get("kind") == "habit":   # an app choice: said plainly, never the counts behind it (the 4 Oct item W7b)
-        basis = choice_words(choice_view(c))
-    when = short_day(epoch_of(c.get("since")))
-    tail = f"Seen {seen} time{'s' if seen != 1 else ''}" if seen else "Seen once"
-    if c.get("origin") == "demo":
-        # capC4 (decision D3): your way, seen once - a hint until you do it again, or it works when Yuki follows it
-        return {"ref": c.get("id"), "kind": c.get("kind"), "title": c.get("title") or "", "source": "demo",
-                "basis": (f"Your way, seen once{', ' + when if when else ''}: learned from what you did. I’ll do it "
-                          f"on my own once you’ve done it again, or once it worked when I followed it."),
-                "steps": steps, "app": app_words(c.get("apps") or [])}
-    return {"ref": c.get("id"), "kind": c.get("kind"), "title": c.get("title") or "",
-            "basis": (basis + (" " if basis else "") + f"{tail}{', ' + when if when else ''}; I’ll use it once you say so.").strip(),
-            "steps": steps, "app": app_words(c.get("apps") or [])}
-
-
 def build_playbook(memory: Any) -> dict[str, Any]:
-    """The Playbook page from practice memory (``workflows()``, Phase C): NEW proposals (seen once, or a question),
-    procedures and habits ("How you do things"), lessons (the user's style notes), with uses, last use and
-    confidence; then the standing rules and requests. Without practice memory, today's know-how instead (probed).
-    Only what Yuki learned from a success shows (appLearn): memory sends no pitfall, and none is drawn if one came."""
-    from yuki.ui.window.data import learned_items
-
-    workflows = getattr(memory, "workflows", None)
-    wf = _safe(workflows, {}) if callable(workflows) else {}
-    wf = wf if isinstance(wf, dict) else {}
-    available = bool(wf.get("available"))
-
-    def shown(key: str) -> list[dict[str, Any]]:
-        return [c for c in wf.get(key) or [] if isinstance(c, dict) and c.get("kind") in SHOWN_KINDS] if available \
-            else []
-
-    # the 4 Oct item W7: procedures are a title and numbered steps; habits are app choices said plainly ("Slack:
-    # usually Chrome"), never their counts
-    procs = [procedure_view(c) for c in shown("procedures") if c.get("kind") == "procedure"]
-    choices = [choice_view(c) for c in shown("procedures") if c.get("kind") == "habit"]
-    lessons = [lesson_view(c) for c in shown("lessons") if c.get("kind") == "style"]
-    # what Yuki is not sure of yet: questions first, at most PROPOSALS_SHOWN as the NEW blocks (the design shows one);
-    # the other tentative ways and lessons stay visible in their own lists, marked as seen once
-    pending = shown("proposals")
-    pending.sort(key=lambda c: c.get("kind") != "question")
-    props = [proposal_view(c) for c in pending[:PROPOSALS_SHOWN]]
-    for c in pending[PROPOSALS_SHOWN:]:
-        if c.get("kind") == "procedure":
-            procs.append({**procedure_view(c), "conf_word": "your way, seen once" if c.get("origin") == "demo"
-                          else "tentative, seen once", "tentative": True})
-        elif c.get("kind") == "habit":
-            choices.append({**choice_view(c), "conf_word": "tentative, seen once", "tentative": True})
-        elif c.get("kind") == "style":
-            lessons.append({**lesson_view(c), "tentative": True})
-    know = [] if available else [{"title": k.title, "line": k.line, "app": k.app}
-                                 for k in (_safe(lambda: learned_items(memory, limit=24), []) or [])]
+    """The Playbook page (audit 17 Oct, learning.md §9.4): memory's ``playbook()`` (``yuki.skills.playbook.page``):
+    what Yuki can do (``can_do``), what it knows the user uses (``things``, by kind, with Rename / Not mine / This is
+    work), the routines with the card each leads to (``routines``), the user's own ways (``ways``); then the standing
+    rules and requests. The old practice sections (procedures, proposals, lessons) are gone from the page."""
+    playbook = getattr(memory, "playbook", None)
+    pb = _safe(playbook, {}) if callable(playbook) else {}
+    pb = pb if isinstance(pb, dict) else {}
     rules = [rule_json(r) for r in (_safe(memory.rules, []) or [])]
     standing = []
     for r in _safe(memory.standing_requests, []) or []:
         text = " ".join(str(r.get("quote") or r.get("condition") or "").split())
         if text:
             standing.append({"ref": r.get("ref"), "text": text, "since": short_day(epoch_of(r.get("created_at")))})
-    return {"proposals": props, "procedures": procs, "choices": choices, "know_how": know, "lessons": lessons, "rules": rules,
-            "standing": standing, "workflows_available": available, "learning": wf.get("learning") or None,
-            # phase L (lPage merge note 1): "Skills Yuki learned from you" (yuki.skills.playbook.learned_section)
-            "skills": wf.get("skills") if isinstance(wf.get("skills"), dict) else None}
+    return {"available": bool(pb.get("available")), "can_do": list(pb.get("can_do") or []),
+            "things": list(pb.get("things") or []), "routines": list(pb.get("routines") or []),
+            "ways": list(pb.get("ways") or []), "rules": rules, "standing": standing}
 
 
 # -- Activity ------------------------------------------------------------------------------------------------------
@@ -2678,11 +2461,11 @@ TODO_TABLES = ("todos", "conversation_facts", "open_loops")
 PAGE_TABLES: dict[str, tuple[str, ...]] = {
     # Home's Your list follows Work's split (report 69): who owes what and what you moved to the list are work_items
     "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls", *TODO_TABLES, "work_items"),
-    # the Work page (4 Oct): replies, loops, meetings; capC6: a thread's checked evidence line reads ui_tasks
-    "work": ("timeline", *TODO_TABLES, "work_items", "messages", "ui_tasks"),
-    "day": ("timeline", "calls", "ui_tasks"),
+    # the Work page (4 Oct): replies, loops, meetings
+    "work": ("timeline", *TODO_TABLES, "work_items", "messages"),
+    "day": ("timeline", "calls"),
     "me": ("contacts", "portraits", "portrait_facts", "conversation_facts", "journal"),
-    "playbook": ("playbooks", "questions", "standing_requests", "knowhow", "conversation_facts", "skills"),
+    "playbook": ("skills", "routines", "tastes", "standing_requests", "conversation_facts"),
     "activity": ("runs", "nudges", "todos", "calls", "timeline"),
     "shell": ("questions",),
 }

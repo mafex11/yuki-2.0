@@ -5,7 +5,8 @@
     python -m yuki.skills.learn rebuild [--db PATH] [--dry-run] [--report] [--show] [--no-name]
     python -m yuki.skills.learn backfill-usuals --db PATH [--dry-run] [--force]
 
-* ``rebuild`` recomputes the occasions and the learned skills (the night pass, by hand).
+* ``rebuild`` recomputes the occasions and the learned skills, then the user's own ways (``learn_ways``; the night
+  pass, by hand).
 * ``backfill-usuals`` is lName's one-time back-fill of the user's stated usuals (``yuki.skills.learn.backfill``; the
   learner runs it by itself after its first written pass).
 * ``--dry-run`` copies the database first (``yuki.eval.dbcopy.copy_db``, source opened read-only), brings its moments
@@ -16,7 +17,7 @@
   counts, means app keys, rung, executable end, commit), groups no capability serves, the routine preview keyed by
   skill id, timings. No name, title, site, person or value.
 * ``--show`` prints the learned skills with their names and bound values: on this PC's console only, never logged.
-* ``--no-name`` skips the naming call (the skills stay nameless).
+* ``--no-name`` skips the naming calls (the skills and new ways stay nameless).
 """
 
 from __future__ import annotations
@@ -88,7 +89,7 @@ def report(store: Any, res: Any, *, now: float, inc: dict[str, Any] | None = Non
             "means": c.means if c else {}, "rung": c.rung if c else None, "link_share": c.link_share if c else None,
             "exec_end": c.exec_end if c else None, "commit": c.commit if c else None,
             "end_commit": c.end_commit if c else None, "probe": c.probe if c else None,
-            "covered": c.covered if c else 0, "merged": list(g.merged_from),
+            "covered": c.covered if c else 0,
             "state": p.state if p else ("refused" if g.bar.passes else "seen"),
             "offer_static": p.provenance.get("offer_static") if p else None,
             "late": sum(1 for o in g.occasions if o.by == "user" and not o.context_known),
@@ -125,7 +126,6 @@ def report(store: Any, res: Any, *, now: float, inc: dict[str, Any] | None = Non
         "dropped": dict(sorted(built.dropped.items())) if built else {},
         "browsers": built.browsers if built else {},
         "groups": groups, "seen": seen, "c_only": c_only,
-        "merges": [{"from": a, "into": b} for a, b in res.merges],
         "totals": {"named_skills": sum(1 for d in groups if d["state"] in ("candidate", "trusted", "listed")
                                        and not d["usage"]),
                    "usage_records": sum(1 for d in groups if d["state"] in ("candidate", "trusted", "listed")
@@ -157,11 +157,10 @@ def _text(rep: dict[str, Any]) -> str:
                      f"n={d['n']}/{d['days']}d asked={d['asked']} last={d['last']} means={d['means']} "
                      f"rung={d['rung']} link={d['link_share']} exec={d['exec_end']}/{d['commit']} "
                      f"state={d['state']} offer_static={d['offer_static']} late={d['late']}"
-                     + (f" merged={d['merged']}" if d["merged"] else "") + (f" verbs={d['verbs']}" if d['verbs'] else ""))
+                     + (f" verbs={d['verbs']}" if d['verbs'] else ""))
     lines.append("groups no capability serves (route C only, never written):")
     for d in rep["c_only"]:
         lines.append(f"  {d['end']:<14} app={d['app']} n={d['n']}/{d['days']}d passes={d['passes']}")
-    lines.append(f"merges: {rep['merges']}")
     lines.append(f"seen only (below the bar): {len(rep['seen'])}")
     for d in rep["seen"][:30]:
         lines.append(f"  {d['capability']:<18} {d['gid']} {d['end']} n={d['n']}/{d['days']}d asked={d['asked']} "
@@ -235,13 +234,16 @@ def main(argv: list[str] | None = None) -> int:
         moments = _moments_current(store) if args.dry_run else None
         now = time.time()
         res = learn.run(store, now=now, name=not args.no_name, write_rows=True, name_dry_run=args.dry_run)
+        # the user's own ways (contract C4), as the night pass runs them; named only with the naming call on
+        ways = learn.learn_ways(store, now=now, use_model=not args.no_name and not args.dry_run) if res.ok else {}
         inc = learn.incremental(store, now=time.time()) if args.dry_run else None
         if args.report or args.json:
             rep = report(store, res, now=now, inc=inc, moments=moments)
-            print(json.dumps(rep, indent=1, default=str) if args.json else _text(rep))
+            rep["ways"] = ways
+            print(json.dumps(rep, indent=1, default=str) if args.json else _text(rep) + f"\nways: {json.dumps(ways)}")
         else:
             print(json.dumps({"ok": res.ok, "error": res.error, "cpu_s": res.cpu_s,
-                              "counts": {k: int(v) for k, v in res.counts.items()}}, default=str))
+                              "counts": {k: int(v) for k, v in res.counts.items()}, "ways": ways}, default=str))
         if args.show:
             print(_show(store))
     finally:

@@ -42,7 +42,7 @@ mixer_moves_slider = false
 [capability."spotify.playlist"]
 end = "media_context"
 kind = "change"
-menu = "play a playlist, album or liked songs from Spotify's Your Library, by its name"
+menu = "play a playlist, album or liked songs from Your Library by name, or Yuki's pick (choose=true, context)"
 done_line = "Playing {playlist.name} on Spotify."
 offer_class = "everyday"
 handoff = true

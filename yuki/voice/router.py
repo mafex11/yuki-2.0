@@ -41,6 +41,8 @@ item that is on an items line, typing their words into the field the focus line 
 opening Yuki's own window;
 - one of the user's skills on the Skills line, when there is one: the talker runs it in one call, whatever app it is \
 in; two separate asks in one turn ("pause the music and mute the PC") are one call each;
+- a pick left to Yuki ("put on a video I like", "something chill", "another one", "not that") when the Skills line has \
+the skill that plays it: the talker runs it with Yuki choosing (code picks from their taste), never naming a pick itself;
 - a message to someone (the message skill: it opens their chat and types their words);
 - a short question about their day, what they did, who they talked to or what they usually pick (the talker reads its \
 day block and one quick memory look);

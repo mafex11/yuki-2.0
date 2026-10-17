@@ -13,10 +13,21 @@ extraction and session summaries (and so the journal facts, rules, know-how and 
 the misheard-names pass, the persona, the portrait's inputs, the commitments check, the day digest, the weekly review,
 the work threads, the brief's judge, the know-how backfill, the call vocabulary, the practice learner, the skill
 learner's asked occasions, statements and learned-skill score, the routine miner's "done today", and the offer bars
-(``registry.offer_ready`` and the routine cards' own D14 read, the playbook's "worked N times"). Nothing is deleted:
-the rows stay where they are, and :func:`report` (``yuki-cli -m yuki.memory.testtag``) lists them, read-only, so the
-user decides whether to purge them. Answers (memory search, the recall index, the standing rules) are not filtered
-here: what a test left shows there until the user purges it.
+(``registry.offer_ready`` and the routine cards' own D14 read, the playbook's "worked N times"). :func:`report`
+(``yuki-cli -m yuki.memory.testtag``) lists what a test left, read-only; :func:`purge` (audit 17 Oct, decision 3: the
+user said purge) deletes it, idempotent: once by migration 45 and again with ``--purge`` after a later live test.
+
+**What the purge takes** (counts only in its result): by the tag, the test sessions' turns, batches and summaries,
+the journal facts conversation memory drew from their exchanges (and ends the portrait facts resting on those alone),
+the conversation facts (rules, preferences, commitments) resting on test exchanges only, the unanswered questions
+resting on test material only, Yuki's run traces and their playbook events, skill runs (their ``uses`` taken back,
+``last_used_at`` back to the latest real run), surfaced cards, moments and asked occasions of test requests.
+By the test sessions' own span (the harness drove the desktop while the user was away; these rows carry no tag): the
+know-how, the "said" taste pairings, the misheard-name aliases, the episodes, Yuki's own journal facts, the moments
+and occasions (with the preference observations fed from them) learned inside it, and the corrections said in it
+(ended, with the journal and portrait changes their pass made undone). The standing rules a test session made are
+conversation facts resting on its exchanges only, so they go with them. Kept: what the screen showed in the
+span (screen journal facts, links seen, the hour counts of "observed" tastes), which may be real incoming content.
 
 **Live lookups still see test runs** (review r1 M2): they say how a route or a control behaves on this PC, whoever
 asked, so a test measures the same Yuki the user runs and real evidence (a verified rung B, a false done) is never
@@ -43,11 +54,12 @@ Public API::
     test_turn_ids(store) -> frozenset[int]
     is_test_journal(entry, turn_ids) -> bool;  is_test_fact(fact, turn_ids) -> bool
     report(db_path=None, *, show=False) -> dict               # read-only; the database is opened ?mode=ro
+    purge(conn, dec, *, now) -> dict[str, int]                # inside the caller's write transaction; counts
 
 Usage::
 
-    yuki-cli -m yuki.memory.testtag [--db PATH] [--json] [--show]
-    python -m yuki.memory.testtag [--db PATH] [--json] [--show]
+    yuki-cli -m yuki.memory.testtag [--db PATH] [--json] [--show] [--purge]
+    python -m yuki.memory.testtag [--db PATH] [--json] [--show] [--purge]
 
 Counts, ids and times only unless ``--show`` (then the derived facts' own text, on this terminal only).
 """
@@ -58,7 +70,8 @@ import argparse
 import json
 import sqlite3
 import sys
-from collections.abc import Iterable, Mapping
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -179,6 +192,309 @@ def is_test_fact(fact: Any, turn_ids: frozenset[int] | set[int]) -> bool:
     except (TypeError, ValueError):
         return False
     return bool(ids) and all(i in turn_ids for i in ids)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The purge
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: Test sessions closer than this (s) are one span; a span is padded by :data:`SPAN_PAD_S` on each side.
+SPAN_JOIN_S = 300.0
+SPAN_PAD_S = 120.0
+
+
+def _has(conn: sqlite3.Connection, table: str, column: str | None = None) -> bool:
+    cols = _columns(conn, table)
+    return bool(cols) and (column is None or column in cols)
+
+
+def _ids(rows: Iterable[Any]) -> list[int]:
+    return sorted({int(r[0]) for r in rows})
+
+
+def _delete_ids(conn: sqlite3.Connection, table: str, column: str, ids: Iterable[int]) -> int:
+    ids = sorted({int(i) for i in ids})
+    if not ids or not _has(conn, table, column):
+        return 0
+    n = 0
+    for i in range(0, len(ids), 400):
+        part = ids[i:i + 400]
+        n += max(0, int(conn.execute(f"DELETE FROM {table} WHERE {column} IN ({','.join('?' * len(part))})",
+                                     part).rowcount or 0))
+    return n
+
+
+def test_spans(conn: sqlite3.Connection) -> list[tuple[float, float]]:
+    """The live test's sessions as time spans (first to last turn of each, sessions closer than
+    :data:`SPAN_JOIN_S` joined, each padded by :data:`SPAN_PAD_S`), oldest first. ``[]`` with no test turns."""
+    rows = conn.execute("SELECT min(at), max(at) FROM conversation_turns WHERE session_id >= ? AND session_id < ?"
+                        " GROUP BY session_id ORDER BY 1", _session_range()).fetchall() if _has(
+        conn, "conversation_turns", "session_id") else []
+    merged: list[list[float]] = []
+    for a, b in rows:
+        if a is None:
+            continue
+        if merged and float(a) <= merged[-1][1] + SPAN_JOIN_S:
+            merged[-1][1] = max(merged[-1][1], float(b))
+        else:
+            merged.append([float(a), float(b)])
+    return [(a - SPAN_PAD_S, b + SPAN_PAD_S) for a, b in merged]
+
+
+def _session_range() -> tuple[str, str]:
+    """The test session ids as a range on the session index (LIKE ignores case and reads every row)."""
+    return TEST_SESSION_PREFIX, TEST_SESSION_PREFIX[:-1] + chr(ord(TEST_SESSION_PREFIX[-1]) + 1)
+
+
+def _in_spans(column: str, spans: Sequence[tuple[float, float]]) -> tuple[str, list[float]]:
+    """A SQL condition (and its parameters) true for a row whose ``column`` (code's own name) lies in one of
+    ``spans``."""
+    if not spans:
+        return "0", []
+    return "(" + " OR ".join(f"({column} >= ? AND {column} <= ?)" for _ in spans) + ")", [x for s in spans for x in s]
+
+
+def _purge_corrections(conn: sqlite3.Connection, dec: Callable[[Any], str | None],
+                       spans: Sequence[tuple[float, float]], *, now: float) -> dict[str, int]:
+    """The corrections made inside the test's span (``portrait_facts`` of kind ``correction``, origin ``user``: the
+    harness's scripted "that's wrong" through the voice tools; a correction carries no session) are ended, not deleted
+    (as a correction the user takes back), and their correction pass is undone where it can be exactly: the journal
+    facts it rewrote or retired (its own batch, ``journal_batches.model = 'correction:<id>'``: the new versions go and
+    the old rows are current again) and the portrait facts it rewrote or retired (the pass's own change record: old and
+    new ids). A pass not yet run is skipped. Changes on other surfaces (to-dos, episodes, threads, questions, the
+    persona, conversation facts) are kept and counted. Idempotent: an ended correction is never read again. Counts."""
+    out: dict[str, int] = {}
+    if not spans or not _has(conn, "portrait_facts", "kind"):
+        return out
+    cond, params = _in_spans("valid_from", spans)
+    rows = conn.execute(f"SELECT id FROM portrait_facts WHERE kind = 'correction' AND origin = 'user' AND valid_to IS"
+                        f" NULL AND {cond}", params).fetchall()
+    for (cid,) in [tuple(r) for r in rows]:
+        cid = int(cid)
+        conn.execute("UPDATE portrait_facts SET valid_to = ?, expired_at = ? WHERE id = ?", (now, now, cid))
+        out["corrections_ended"] = out.get("corrections_ended", 0) + 1
+        run = conn.execute("SELECT status, started_at, changes_ciphertext FROM correction_passes WHERE"
+                           " correction_id = ?", (cid,)).fetchone() if _has(conn, "correction_passes") else None
+        if run is None:
+            continue
+        if run[0] in ("queued", "applying", "failed"):
+            conn.execute("UPDATE correction_passes SET status = 'skipped', updated_at = ? WHERE correction_id = ?",
+                         (now, cid))
+            continue
+        # the journal: the pass's own batch
+        batches = _ids(conn.execute("SELECT id FROM journal_batches WHERE model = ?", (f"correction:{cid}",))) if (
+            _has(conn, "journal_batches", "model")) else []
+        if batches:
+            marks = ",".join("?" * len(batches))
+            new = _ids(conn.execute(f"SELECT id FROM journal WHERE batch_id IN ({marks})", batches))
+            later = _ids(conn.execute(f"SELECT id FROM journal WHERE batch_id IN ({marks}) AND superseded_at IS NOT"
+                                      f" NULL", batches))
+            if later:   # a version the pass wrote was itself corrected since: the chain is kept as it is
+                out["correction_changes_kept"] = out.get("correction_changes_kept", 0) + len(new)
+            else:
+                _delete_ids(conn, "journal_vec", "journal_id", new)
+                n_new = _delete_ids(conn, "journal", "id", new)
+                back = conn.execute(f"UPDATE journal SET superseded_at = NULL, superseded_by = NULL WHERE superseded_by"
+                                    f" IN ({marks})", batches).rowcount
+                out["correction_journal_undone"] = out.get("correction_journal_undone", 0) + max(
+                    n_new, int(back or 0))
+        # the portrait and the other surfaces: the pass's own change record (old and new ids; decrypted in RAM only)
+        try:
+            changes = json.loads(dec(run[2]) or "[]") if run[2] else []
+        except Exception:  # noqa: BLE001 - an unreadable record: nothing more is undone
+            changes = []
+        started = float(run[1] or 0.0)
+        for ch in changes if isinstance(changes, list) else []:
+            if not isinstance(ch, dict) or not ch.get("ok") or ch.get("surface") == "journal":
+                continue
+            old, new_id = ch.get("old_id"), ch.get("new_id")
+            if ch.get("surface") != "portrait" or old is None:
+                out["correction_changes_kept"] = out.get("correction_changes_kept", 0) + 1
+                continue
+            if new_id is not None:
+                cur = conn.execute("SELECT 1 FROM portrait_facts WHERE id = ? AND valid_to IS NULL",
+                                   (int(new_id),)).fetchone()
+                if cur is None:   # the rewritten fact changed again since: kept
+                    out["correction_changes_kept"] = out.get("correction_changes_kept", 0) + 1
+                    continue
+                _delete_ids(conn, "portrait_fact_vec", "fact_id", [int(new_id)])
+                conn.execute("DELETE FROM portrait_facts WHERE id = ?", (int(new_id),))
+                n = conn.execute("UPDATE portrait_facts SET valid_to = NULL, expired_at = NULL, superseded_by = NULL"
+                                 " WHERE id = ? AND superseded_by = ?", (int(old), int(new_id))).rowcount
+            else:   # retired by the pass (ended at or after its start, superseded by nothing)
+                n = conn.execute("UPDATE portrait_facts SET valid_to = NULL, expired_at = NULL WHERE id = ? AND"
+                                 " superseded_by IS NULL AND valid_to >= ?", (int(old), started)).rowcount
+            out["correction_portrait_undone"] = out.get("correction_portrait_undone", 0) + int(n or 0)
+    return out
+
+
+def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: float) -> dict[str, int]:
+    """Delete what the live test left and what was learned from it (module docstring), inside the caller's write
+    transaction (``conn``; ``dec`` decrypts a stored field). Idempotent: a second run finds nothing. Counts per kind,
+    only the kinds where something went; content-free. Never reads words to decide: the tag, or the test sessions'
+    own span for rows that carry none."""
+    out: dict[str, int] = {}
+
+    def count(kind: str, n: int) -> None:
+        if n:
+            out[kind] = out.get(kind, 0) + int(n)
+
+    spans = test_spans(conn)
+    lo, hi = _session_range()
+    turn_ids: set[int] = set()
+    if _has(conn, "conversation_turns", "session_id"):
+        turn_ids = set(_ids(conn.execute("SELECT id FROM conversation_turns WHERE session_id >= ? AND session_id < ?",
+                                         (lo, hi))))
+    # journal facts conversation memory drew from test exchanges (their provenance names the exchange), and Yuki's
+    # own facts written inside the test's span
+    gone_journal: set[int] = set()
+    if turn_ids and _has(conn, "journal", "source_ciphertext") and spans:
+        from yuki.memory.store import Store
+
+        for r in conn.execute("SELECT id, source_ciphertext FROM journal WHERE app = ? AND at >= ? AND at <= ?",
+                              (Store.CONVERSATION_APP, spans[0][0], spans[-1][1])).fetchall():
+            try:
+                source = json.loads(dec(r["source_ciphertext"]) or "null") if r["source_ciphertext"] else None
+            except Exception:  # noqa: BLE001 - unreadable provenance: not provably a test's
+                continue
+            if is_test_journal({"source": source}, turn_ids):
+                gone_journal.add(int(r["id"]))
+    if spans and _has(conn, "journal", "by_yuki"):
+        cond, params = _in_spans("at", spans)
+        gone_journal |= set(_ids(conn.execute(f"SELECT id FROM journal WHERE by_yuki = 1 AND {cond}", params)))
+    if gone_journal and _has(conn, "portrait_facts", "source_ids"):
+        ended = 0
+        for r in conn.execute("SELECT id, source_ids FROM portrait_facts WHERE valid_to IS NULL AND source_ids IS NOT"
+                              " NULL").fetchall():
+            try:
+                ids = {int(i) for i in json.loads(r["source_ids"] or "[]")}
+            except (TypeError, ValueError):
+                continue
+            if ids and ids <= gone_journal:
+                conn.execute("UPDATE portrait_facts SET valid_to = ? WHERE id = ?", (now, int(r["id"])))
+                ended += 1
+        count("portrait_facts_ended", ended)
+    if (gone_journal or turn_ids) and _has(conn, "questions", "source_ids"):
+        # unanswered questions resting only on test material: a conversation question's sources are exchange (turn)
+        # ids, any other's are journal ids. An answered one keeps: its answer is the user's own
+        qs = []
+        for r in conn.execute("SELECT id, origin, source_ids FROM questions WHERE source_ids IS NOT NULL AND"
+                              " answered_at IS NULL AND coalesce(status, '') != 'answered'").fetchall():
+            try:
+                ids = {int(i) for i in json.loads(r["source_ids"] or "[]")}
+            except (TypeError, ValueError):
+                continue
+            if ids and ids <= (turn_ids if r["origin"] == "conversation" else gone_journal):
+                qs.append(int(r["id"]))
+        _delete_ids(conn, "question_vec", "question_id", qs)
+        count("questions", _delete_ids(conn, "questions", "id", qs))
+    _delete_ids(conn, "journal_vec", "journal_id", gone_journal)
+    count("journal_facts", _delete_ids(conn, "journal", "id", gone_journal))
+    # conversation facts (rules, preferences, commitments) resting on test exchanges only
+    if turn_ids and _has(conn, "conversation_facts", "source_turn_ids"):
+        facts = []
+        for r in conn.execute("SELECT id, source_turn_ids FROM conversation_facts WHERE source_turn_ids IS NOT NULL"):
+            try:
+                cited = json.loads(r["source_turn_ids"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            if is_test_fact({"source_turn_ids": cited}, turn_ids):
+                facts.append(int(r["id"]))
+        _delete_ids(conn, "conversation_fact_vec", "fact_id", facts)
+        count("conversation_facts", _delete_ids(conn, "conversation_facts", "id", facts))
+    # the user's corrections said inside the test's span (a correction carries no session) and what their pass changed
+    for kind, n in _purge_corrections(conn, dec, spans, now=now).items():
+        count(kind, n)
+    # the test sessions' own records
+    if _has(conn, "session_summaries", "session_id"):
+        sums = _ids(conn.execute("SELECT id FROM session_summaries WHERE session_id >= ? AND session_id < ?", (lo, hi)))
+        _delete_ids(conn, "session_summary_vec", "summary_id", sums)
+        count("session_summaries", _delete_ids(conn, "session_summaries", "id", sums))
+    if _has(conn, "conversation_batches", "session_id"):
+        count("conversation_batches", conn.execute("DELETE FROM conversation_batches WHERE session_id >= ? AND"
+                                                   " session_id < ?", (lo, hi)).rowcount)
+    _delete_ids(conn, "conversation_turn_vec", "turn_id", turn_ids)
+    count("conversation_turns", _delete_ids(conn, "conversation_turns", "id", turn_ids))
+    if _has(conn, "runs", "run_key"):
+        count("run_rows", conn.execute(f"DELETE FROM runs WHERE NOT ({sql_real_run()})").rowcount)
+    if _has(conn, "playbook_events", "run_key"):
+        count("playbook_events", conn.execute(
+            f"DELETE FROM playbook_events WHERE NOT {sql_real_request('run_key')}").rowcount)
+    if _has(conn, "skill_runs", "request_id"):
+        # the uses a test run added to its skill (registry.finish counts a done or already run once, and stamps
+        # last_used_at)
+        used: list[int] = []
+        for r in conn.execute(f"SELECT skill_id, count(*) AS n FROM skill_runs WHERE NOT ({sql_real_skill_run()}) AND"
+                              " outcome IN ('done', 'already') AND skill_id IS NOT NULL GROUP BY skill_id").fetchall():
+            conn.execute("UPDATE skills SET uses = max(0, uses - ?) WHERE id = ?", (int(r["n"]), int(r["skill_id"])))
+            count("skill_uses_taken_back", int(r["n"]))
+            used.append(int(r["skill_id"]))
+        if _has(conn, "skill_route_tries", "run_key"):
+            count("skill_route_tries", conn.execute(
+                "DELETE FROM skill_route_tries WHERE run_key IN (SELECT run_key FROM skill_runs WHERE run_key IS NOT"
+                f" NULL AND NOT ({sql_real_skill_run()}))").rowcount)
+        count("skill_runs", conn.execute(f"DELETE FROM skill_runs WHERE NOT ({sql_real_skill_run()})").rowcount)
+        # last_used_at back to the skill's latest real done run (none left: unset), only where a test run stamped it
+        # later than that (a real run's own stamp is a moment after its t_done)
+        for sid in used:
+            real = conn.execute("SELECT max(coalesce(t_done, at)) FROM skill_runs WHERE skill_id = ? AND outcome IN"
+                                " ('done', 'already')", (sid,)).fetchone()[0]
+            count("skill_last_used_reset", conn.execute(
+                "UPDATE skills SET last_used_at = ? WHERE id = ? AND last_used_at > ?",
+                (real, sid, float(real or 0.0) + 5.0)).rowcount)
+    if _has(conn, "surfaced", "session_id"):
+        count("surfaced", conn.execute("DELETE FROM surfaced WHERE session_id >= ? AND session_id < ?",
+                                       (lo, hi)).rowcount)
+    # moments of test requests, and every moment and occasion inside the test's span (the harness drove the desktop),
+    # with the preference observations fed from them (skills.prefs: source "occasion:<moment id>")
+    moment_ids: set[int] = set()
+    if _has(conn, "moments", "request_id"):
+        moment_ids |= set(_ids(conn.execute(f"SELECT id FROM moments WHERE NOT {sql_real_request('request_id')}")))
+        if spans:
+            cond, params = _in_spans("at", spans)
+            moment_ids |= set(_ids(conn.execute(f"SELECT id FROM moments WHERE {cond}", params)))
+    occ: set[int] = set()
+    if _has(conn, "occasions", "asked_run"):
+        occ |= set(_ids(conn.execute(f"SELECT id FROM occasions WHERE NOT {sql_real_request('asked_run')}")))
+        if moment_ids:
+            mids = sorted(moment_ids)
+            for i in range(0, len(mids), 400):
+                part = mids[i:i + 400]
+                occ |= set(_ids(conn.execute(f"SELECT id FROM occasions WHERE end_moment_id IN"
+                                             f" ({','.join('?' * len(part))})", part)))
+        if spans:
+            cond, params = _in_spans("at", spans)
+            occ |= set(_ids(conn.execute(f"SELECT id FROM occasions WHERE {cond}", params)))
+    if moment_ids and _has(conn, "pref_events", "source"):
+        mids = sorted(moment_ids)
+        for i in range(0, len(mids), 400):
+            part = [f"occasion:{m}" for m in mids[i:i + 400]]
+            count("pref_observations", conn.execute(
+                f"DELETE FROM pref_events WHERE type = 'observed' AND source IN ({','.join('?' * len(part))})",
+                part).rowcount)
+    count("occasions", _delete_ids(conn, "occasions", "id", occ))
+    count("moments", _delete_ids(conn, "moments", "id", moment_ids))
+    if spans:
+        # learned inside the test's span; none of these rows carries a session
+        if _has(conn, "knowhow", "created_at"):
+            cond, params = _in_spans("created_at", spans)
+            kh = _ids(conn.execute(f"SELECT id FROM knowhow WHERE {cond}", params))
+            _delete_ids(conn, "knowhow_vec", "knowhow_id", kh)
+            count("knowhow", _delete_ids(conn, "knowhow", "id", kh))
+        if _has(conn, "tastes", "source"):
+            cond, params = _in_spans("last_at", spans)
+            count("taste_said_pairings", conn.execute(f"DELETE FROM tastes WHERE source = 'said' AND {cond}",
+                                                      params).rowcount)
+        if _has(conn, "name_aliases", "created_at"):
+            cond, params = _in_spans("created_at", spans)
+            count("name_aliases", conn.execute(f"DELETE FROM name_aliases WHERE {cond}", params).rowcount)
+        if _has(conn, "episodes", "started_at"):
+            # an episode wholly inside the span narrates the harness's desktop
+            ep = _ids(conn.execute("SELECT id FROM episodes WHERE " + " OR ".join(
+                "(started_at >= ? AND ended_at <= ?)" for _ in spans), [x for s in spans for x in s]))
+            _delete_ids(conn, "episode_vec", "episode_id", ep)
+            count("episodes", _delete_ids(conn, "episodes", "id", ep))
+    return out
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -368,7 +684,7 @@ def format_report(rep: Mapping[str, Any]) -> str:
         for it in items:
             meta = ", ".join(f"{k} {v}" for k, v in it.items() if k not in ("text",))
             lines.append(f"  - {meta}" + (f": {it['text']}" if it.get("text") else ""))
-    lines.append("Every learner now skips these. Purging them is your call; this command never deletes anything.")
+    lines.append("Every learner skips these. --purge deletes them; without it this command never deletes anything.")
     return "\n".join(lines)
 
 
@@ -378,7 +694,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", help="the memory database (default: the live one, opened read-only)")
     parser.add_argument("--json", action="store_true", help="print JSON")
     parser.add_argument("--show", action="store_true", help="also print the derived facts' text (this terminal only)")
+    parser.add_argument("--purge", action="store_true",
+                        help="delete what the live test left and what was learned from it (counts printed)")
     args = parser.parse_args(argv)
+    if args.purge:
+        from yuki.memory.store import Store
+
+        store = Store.open(args.db)
+        try:
+            got = store._write(lambda conn: purge(conn, store._dec, now=time.time()))
+        finally:
+            store.close()
+        print(json.dumps({"purged": got}, indent=2))
+        return 0
     rep = report(args.db, show=args.show)
     if args.json:
         print(json.dumps(rep, ensure_ascii=False, indent=2))
@@ -393,7 +721,8 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = ["TEST_SESSION_PREFIX", "is_test_session", "is_test_request", "is_test_item", "keep_real",
            "sql_real_session", "sql_real_request", "sql_real_run", "sql_real_skill_run", "sql_real_route_try",
-           "test_turn_ids", "is_test_journal", "is_test_fact", "report", "format_report", "main"]
+           "test_turn_ids", "is_test_journal", "is_test_fact", "test_spans", "purge", "report", "format_report",
+           "main"]
 
 
 if __name__ == "__main__":

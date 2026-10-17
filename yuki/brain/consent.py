@@ -38,8 +38,9 @@ applies decides:
 
    A send: **refuse** ("undeclared send") unless the plan declared ``consent.commit = send`` and the step is a sending
    capability. A plan that declares a send while its capability step leaves a draft (its send slot on a non-sending
-   option) is refused too, so the planner makes the two agree. Then (HANDBOOK rule 8: "send X to Y" means send; naming
-   only the person means a draft):
+   option) is refused too, so the planner makes the two agree. Then (HANDBOOK rule 8 and the lead's send rule of 18 Oct:
+   "send X to Y", and "message / tell / ask / reply to Y" with X in their words, mean send after the countdown; naming
+   only the person, or asking for a draft, means a draft; the commit check reads which):
 
    * code facts first, each a **refuse** the planner can fix: ``consent.to`` is given; the capability's person slot
      names the same person as ``to`` (the same words, or memory's people index, ``live.people_in``, finds one person
@@ -801,8 +802,15 @@ def _templated_slot(skill: Any, arg: str) -> str:
 
 
 def text_slot(skill: Any) -> str:
-    """The slot of a sending capability that holds the text it sends (its checks' ``text`` argument)."""
-    return _templated_slot(skill, "text")
+    """The slot of a sending capability that holds the text it sends (its checks' ``text`` argument). A sending
+    capability whose check reads its own run instead (a driver probe with no arguments: ``app.way``, the user's own
+    ways, kWays merge note 2) types its slot named ``text`` (its data's own slot name): that one, so the countdown's
+    text, the send grant (``uia_route.route_way`` matches it) and a draft keep the same words."""
+    named = _templated_slot(skill, "text")
+    if named or not getattr(skill, "sends_when", ()):
+        return named
+    slot = skill.slot("text") if callable(getattr(skill, "slot", None)) else None
+    return "text" if slot is not None and str(getattr(slot, "type", "") or "") == "text" else ""
 
 
 def person_slot(skill: Any) -> str:
@@ -1381,9 +1389,10 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
 
 def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str], live: Live, sk: Any, asked: bool,
           failed: bool, effect: str = "") -> Verdict:
-    """Row 4 for a step that sends (module docstring, row 4; HANDBOOK rule 8: "send X to Y" means send, naming only
-    the person means a draft). The order matters: an ask's yes skips everything after it (``after_ask``), so every
-    refusal and the send slots come before the asks."""
+    """Row 4 for a step that sends (module docstring, row 4; HANDBOOK rule 8 and the send rule: "send X to Y" and
+    "message / tell / ask / reply to Y" with X in their words mean send, naming only the person means a draft). For one
+    of the user's own ways (``app.way``: no person slot) ``to`` is the place they named. The order matters: an ask's
+    yes skips everything after it (``after_ask``), so every refusal and the send slots come before the asks."""
     if consent["commit"] != "send":
         line = LINE_UNDECLARED_SEND
         if step.tool == "type_text" and sends_now(step, live):

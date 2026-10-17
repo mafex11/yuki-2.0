@@ -1,0 +1,74 @@
+# app.way: run one of the user's own ways (audit 17 Oct, synthesis §6.1; contract C4). A capability any user needs:
+# "do it the way I do it in that app". Which ways exist is learned, never written here: yuki/skills/learn/ways.py
+# learns a multi-step way the user does in one app that no other capability covers (from at least 3 of their own
+# demonstrations on 3 days, or at once when they tell Yuki), with the parts that change as slots, and keeps it as a
+# skills row (origin = 'learned_way', capability_id = this capability's row).
+#
+# The route is rung B: the way's template replayed by yuki/skills/uia_route.py route_way through the step runner,
+# each control found by its identity (a row of the way's learned list by the item slot, a field by its keyed digests,
+# a control only when the item slot is its label), each step checked and held for Yuki's own check, the user's hands
+# stop it.
+# What is typed is the user's own words; the end key (Enter) only when they plainly said to send it ("send" below),
+# else it stays a draft. Never offered and never a routine (offer_class = "never": a way may be their work). Never
+# with a game in front (the route takes focus).
+
+[connection]
+app = "app"
+
+[capability."app.way"]
+end = "message_sent"
+kind = "change"
+menu = "do one of the user's own ways in an app (way, item, their words); a draft unless their words ask to send, tell or ask it"
+done_line = "Done."
+commit = "words"
+offer_class = "never"
+handoff = true
+sends_when = { slot = "send", in = ["send"] }
+
+# Which way: its key or its name as a menu line or the you-card shows it. Left out (or a value the resolver does not
+# keep): the only way, or the one whose app or name the user's words hold (yuki/skills/uia_route.py choose_way).
+[[capability."app.way".slot]]
+name = "way"
+type = "entity"
+role = "fill"
+default = ""
+
+# Where in the app, and nothing else decides it: a control's own label exactly as the menu line gives it ("New
+# thread"); else one of their things (a project: a send naming only that asks first which of its items), or the words
+# of one item's own name. "" = where the app is now.
+[[capability."app.way".slot]]
+name = "item"
+type = "text"
+role = "fill"
+default = ""
+
+# What to type: the user's own words only.
+[[capability."app.way".slot]]
+name = "text"
+type = "text"
+role = "fill"
+default = ""
+ask = "What should I write?"
+
+# send: they plainly said to send or submit it; draft: type it and leave it for them.
+[[capability."app.way".slot]]
+name = "send"
+type = "enum"
+role = "fill"
+options = ["send", "draft"]
+default = "draft"
+
+[[capability."app.way".route]]
+rung = "B"
+variant = "replay"
+via = "driver"
+driver = "uia_route"
+call = "way"
+needs_focus = true
+retry_after_acting = false
+
+[capability."app.way".route.done]
+probe = "driver"
+driver = "uia_route"
+call = "way_done"
+within_s = 3

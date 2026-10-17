@@ -38,7 +38,8 @@ loop never leaves a stale "no game" in force.
 
 **Soft budget** (:func:`budget`, :func:`writer_budget`, :func:`type_on`):
 
-* B1 non-deadline cards: at most :data:`B1_PER_DAY` a day, at least :data:`B1_GAP_S` after any card, counted from a
+* B1 non-deadline cards: at most :data:`B1_PER_DAY` a day (3 since 18 Oct: rare), at most :data:`USUAL_PER_DAY` of
+  them "usual" cards, at least :data:`B1_GAP_S` after any card, counted from a
   :class:`History` (stored rows when live, :class:`RowHistory`; the judge's own shadow book in shadow). The Today card
   does not count toward the day's number (it keeps the gap); the "While you were away" list does.
 * B2 deadline and asked cards (a reminder at its time, the routine in its window, standing requests) skip B1; they obey
@@ -80,8 +81,10 @@ from yuki.memory.younow import holds_now
 #: After this long with the call status unknown, a reminder or a standing request passes H3 (when no meeting shows).
 CALL_UNKNOWN_PASS_S = 10 * 60.0
 #: B1: non-deadline cards a day, and the gap after any card.
-B1_PER_DAY = 4
+B1_PER_DAY = 3
 B1_GAP_S = 20 * 60.0
+#: "Your usual now" cards (candidates.gen_usual) a day, within B1.
+USUAL_PER_DAY = 2
 #: B4: writer calls an hour, the gap between two, a day.
 WRITER_PER_HOUR = 6
 WRITER_GAP_S = 90.0
@@ -96,7 +99,7 @@ _TOGGLES: dict[str, tuple[str, ...]] = {
     "checkins_enabled": ("checkin:",),
     "questions_enabled": ("question",),
     "presence_enabled": ("stuck", "recap", "followup", "plans", "thread"),
-    "routine_offers": ("routine",),
+    "routine_offers": ("routine", "usual"),
     "resume_enabled": ("away",),
 }
 
@@ -314,6 +317,8 @@ def budget(history: History, now: float, config: Any, *, type: str, urgency: str
         return Decision(False, "B1:gap", last + B1_GAP_S)
     if type not in B1_FREE_TYPES and history.counted_today(now, config) >= B1_PER_DAY:
         return Decision(False, "B1:day", user_day_start(now, config) + 86400.0)
+    if type == "usual" and history.shown_today(now, config, "usual") >= USUAL_PER_DAY:
+        return Decision(False, "B1:usual_day", user_day_start(now, config) + 86400.0)
     return ALLOW
 
 
@@ -323,8 +328,8 @@ def type_on(type: str, config: Any) -> bool:
         if any(type == p or (p.endswith(":") and type.startswith(p)) for p in prefixes):
             if not bool(getattr(config, toggle, True)):
                 return False
-    if type == "routine" and not offers_on(config):
-        return False   # rLane: the routine card is its offer; offers = "off" stops it
+    if type in ("routine", "usual") and not offers_on(config):
+        return False   # rLane: the routine and usual cards are their offer; offers = "off" stops them
     return True
 
 

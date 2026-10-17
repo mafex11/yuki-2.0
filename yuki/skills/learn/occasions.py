@@ -55,7 +55,7 @@ import bisect
 import json
 import time
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import SimpleNamespace
@@ -453,27 +453,7 @@ class Builder:
 
     def _src(self, m: dict[str, Any]) -> dict[str, Any]:
         """The bind sources of an end moment (RAM only; the entity read apart, :meth:`_entity`)."""
-        kind, facts = m["kind"], m["facts"]
-        src: dict[str, Any] = {"app": m["app"], "service": m.get("service"), "value": m.get("value"),
-                               "means": m.get("means")}
-        if kind == "page":
-            if facts.get("scope") == "host":
-                src["site"] = facts.get("host")
-                src["page"] = None
-                src["top_host"] = facts.get("top_host")
-                src["host"] = facts.get("host")
-            elif facts.get("template"):
-                site, _, page = str(facts["template"]).partition(".")
-                src["site"], src["page"], src["host"] = site, page or None, facts.get("host")
-        if kind == "message_sent":
-            tid = facts.get("thread_id")
-            host, url_ct = self._threads.get(int(tid), ("", None)) if isinstance(tid, int) else ("", None)
-            src["host"] = host[4:] if host.startswith("www.") else host
-            src["thread_id"] = tid
-            src["url_ct"] = url_ct
-            src["contact"] = facts.get("contact_id")
-        src["entity_digest"] = m.get("entity_key") or m.get("entity_digest")
-        return src
+        return moment_src(m, self._threads)
 
     def _entity(self, m: dict[str, Any]) -> Any:
         try:
@@ -836,6 +816,41 @@ class Builder:
             return
 
 
+def moment_src(m: Mapping[str, Any], threads: Mapping[int, tuple[str, Any]] | None = None) -> dict[str, Any]:
+    """The bind sources of an end moment (RAM only; the entity read apart): what ``bind.attrs_for`` maps onto a
+    capability's slots. ``threads``: ``{thread id: (host, url ciphertext)}`` for a send's chat (the pass's own read);
+    without it a send has no host. Also the values' routine onsets (:func:`yuki.skills.learn.values.value_onsets`)."""
+    kind = m["kind"]
+    facts = m.get("facts") or {}
+    if isinstance(facts, str):
+        try:
+            facts = json.loads(facts)
+        except (TypeError, ValueError):
+            facts = {}
+    if not isinstance(facts, Mapping):
+        facts = {}
+    src: dict[str, Any] = {"app": m.get("app"), "service": m.get("service"), "value": m.get("value"),
+                           "means": m.get("means")}
+    if kind == "page":
+        if facts.get("scope") == "host":
+            src["site"] = facts.get("host")
+            src["page"] = None
+            src["top_host"] = facts.get("top_host")
+            src["host"] = facts.get("host")
+        elif facts.get("template"):
+            site, _, page = str(facts["template"]).partition(".")
+            src["site"], src["page"], src["host"] = site, page or None, facts.get("host")
+    if kind == "message_sent":
+        tid = facts.get("thread_id")
+        host, url_ct = (threads or {}).get(int(tid), ("", None)) if isinstance(tid, int) else ("", None)
+        src["host"] = host[4:] if host.startswith("www.") else host
+        src["thread_id"] = tid
+        src["url_ct"] = url_ct
+        src["contact"] = facts.get("contact_id")
+    src["entity_digest"] = m.get("entity_key") or m.get("entity_digest")
+    return src
+
+
 def build(store: Any, *, now: float | None = None, since: float | None = None, browsers: dict[str, int] | None = None,
           is_game: Any = None, index: Any = None) -> Built:
     """One segmentation pass (see the module docstring); ``since`` defaults to the moments' retention. ``index``: the
@@ -882,4 +897,4 @@ def save(store: Any, occasions: Sequence[Occasion], *, since: float, until: floa
 
 
 __all__ = ["END_KINDS", "LATE_SEND_S", "DUCK_S", "CORRECTION_S", "KEEP_DAYS", "VERB_ENDS", "NOT_MINE_STATE", "Occasion",
-           "Built", "Spans", "Builder", "not_mine_spans", "build", "save"]
+           "Built", "Spans", "Builder", "not_mine_spans", "moment_src", "build", "save"]

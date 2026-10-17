@@ -61,9 +61,9 @@ hits (retired unconfirmed after 28 days).
   (:func:`fact_fate`): the user's review ("not right") or their correction turns the line off for good; a model's
   tidy-up (dreaming's merge or retire, the admission bar) is undone the next night: its version ends and the line is
   written again from counts.
-* :func:`due_offers` (which offerable routines' card window is open now, for the card lane, never more than the day's
-  cards left), :func:`active_near` (the talker's "now" block: offerable routines only, R1.5), :func:`why_line` (the
-  card's why line, from counts), :func:`tell`.
+* :func:`active_near` (the talker's "now" block: offerable routines only, R1.5), :func:`why_line` (the card's why
+  line, from counts), :func:`tell`. The card window and its due rule are the card lane's
+  (:mod:`yuki.memory.routine_offers`).
 * Logs: ``routines_mined`` (content-free: keys, unmapped counts, candidates, states, cpu ms) in the portrait log.
 
 CLI: ``python -m yuki.memory.routines --show`` (the routines, read-only), ``--report`` (mine now on a temporary copy
@@ -142,13 +142,6 @@ MEASURED_ORIGIN = "measured"
 #: writer (dreaming, the admission bar, a recheck) is a tidy-up the miner undoes from the counts.
 USER_PASSES = ("review", "correct")
 USER_RUN_KINDS = ("correct",)
-#: The card lane's windows (PLAN B.3 triggers; the lane's settings may narrow them): early [at - 8, at - 1] min,
-#: late [at + 1, at + 3] min.
-OFFER_LEAD_MIN = 8.0
-OFFER_LEAD_LAST_MIN = 1.0
-OFFER_LATE_MIN = (1.0, 3.0)
-#: Routine cards a day, at most (the lane's ``routine_per_day``).
-OFFERS_PER_DAY = 2
 
 #: The day-sets a clock window is mined on: a fixed calendar menu (calendar structure, not words).
 DAYSETS: dict[str, Callable[[date], bool]] = {
@@ -446,7 +439,8 @@ def _matches(skill: Any, cap: Any, m: Mapping[str, Any], app: str | None) -> boo
 
 
 def key_entity(key: Any) -> str | None:
-    """The entity part of a learned routine key (``skill:<id>|<entity key>``: a playlist routine), else ``None``."""
+    """The entity part of a learned routine key (``skill:<id>|<entity key>``: a playlist routine; a capability record's
+    ``skill:<record id>|<value id>``: its value id, read through ``yuki.skills.learn.values``), else ``None``."""
     parts = str(key or "").split("|")
     if len(parts) == 2 and parts[0].startswith("skill:") and parts[1]:
         return parts[1]
@@ -525,14 +519,18 @@ def skill_onsets(store: Any, skill: Any, since: float, until: float, *, app: str
     return sorted(out)
 
 
-def habit_run_done(store: Any, skill: Any, since: float, until: float, *, entity: str | None = None) -> float | None:
+def habit_run_done(store: Any, skill: Any, since: float, until: float, *, entity: str | None = None,
+                   key: str | None = None) -> float | None:
     """The first time in ``[since, until]`` a run of the skill's habit ended done (``done`` / ``already``): its own key,
     and a usage record's capability (``offers.habit_keys``: "play my X playlist" runs on the capability; lWire review
     r1 M3). ``entity``: a ``routine_key`` routine's entity; a run counts only when its played entity
     (``skill_runs.entity_digest``, the moments' own digest) is that one, read through the moments that carry both.
-    Never raises."""
-    from yuki.memory.offers import habit_keys
+    ``key``: the routine's key; a routine on one value of a capability's record (``offers.routine_value``) has no run
+    of its own value in the ledger, so ``None``. Never raises."""
+    from yuki.memory.offers import habit_keys, routine_value
 
+    if key and routine_value(store, key) is not None:
+        return None
     keys = habit_keys(skill)
     if not keys:
         return None
@@ -634,10 +632,12 @@ def keyed_onsets(store: Any, since: float, until: float, *, skills: Sequence[Any
 def _learned_inputs(store: Any, got: Inputs, skills: Sequence[Any], since: float, until: float,
                     presence: Presence | None) -> Inputs:
     """The learner's inputs with each key's means app (its occasions' most used app; a key's first occasion otherwise)
-    and its offer gate, and ``presence`` when the caller has one. Never drops a key."""
+    and its offer gate, and ``presence`` when the caller has one: the skill's, and for a routine on one value of a
+    capability's record (``skill:<record id>|<value id>``) that value's own (``offers.routine_gate``: its everyday and
+    Not mine in place of the record's naming verdict). Never drops a key."""
     from dataclasses import replace
 
-    from yuki.memory.offers import skill_offerable
+    from yuki.memory.offers import routine_gate, routine_value, skill_offerable
 
     by_key = {s.key: s for s in skills}
     apps: dict[int, str] = {}
@@ -666,7 +666,14 @@ def _learned_inputs(store: Any, got: Inputs, skills: Sequence[Any], since: float
                 gate[info.skill] = bool(skill_offerable(store, by_key.get(info.skill))[0])
             except Exception:  # noqa: BLE001
                 gate[info.skill] = False
-        got.keys[key] = replace(info, app=apps.get(sid, info.app), offerable=gate[info.skill])
+        offerable = gate[info.skill]
+        value = routine_value(store, key)
+        if value is not None:
+            try:
+                offerable = bool(routine_gate(store, by_key.get(info.skill), key, value=value)[0])
+            except Exception:  # noqa: BLE001
+                offerable = False
+        got.keys[key] = replace(info, app=apps.get(sid, info.app), offerable=offerable)
     if presence is not None:
         got.presence = presence
     return got
@@ -1564,109 +1571,28 @@ class RoutineMiner:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def offer_window(row: Mapping[str, Any], d: date, *, lead_min: float = OFFER_LEAD_MIN,
-                 lead_last_min: float = OFFER_LEAD_LAST_MIN,
-                 late_min: tuple[float, float] = OFFER_LATE_MIN) -> tuple[float, float] | None:
-    """The card window of a routine on day ``d`` by its offer mode (early ``[at - 8, at - 1]``, late
-    ``[at + 1, at + 3]`` minutes), as epoch seconds; None for quiet or off, or a day outside its day-set."""
-    mode = str(row.get("offer_mode") or "early")
-    if mode not in ("early", "late") or not dayset_has(str(row.get("dayset")), d) or row.get("at_min") is None:
-        return None
-    dm = from_clock(float(row["at_min"]))
-    lo, hi = (dm - lead_min, dm - lead_last_min) if mode == "early" else (dm + late_min[0], dm + late_min[1])
-    return day_start(d) + lo * 60.0, day_start(d) + hi * 60.0
-
-
-def done_today(store: Any, row: Mapping[str, Any], now: float, *, skills: Sequence[Any] | None = None) -> bool:
-    """The routine's own end state already happened today (since 04:00): the user reached its learned skill's end
-    (:func:`skill_onsets`), or a run of its skill's habit ended done (:func:`habit_run_done`); a playlist routine
-    counts only its own playlist (:func:`key_entity`)."""
-    since = day_start(day_of(now))
-    skill = next((s for s in (load_skills(store) if skills is None else skills) if s.key == row.get("skill_id")), None)
-    entity = key_entity(row.get("key"))
-    if skill is not None:
-        if skill_onsets(store, skill, since, now, app=row.get("app"), entity=entity):
-            return True
-        return habit_run_done(store, skill, since, now, entity=entity) is not None
-    try:
-        from yuki.memory.testtag import sql_real_skill_run
-
-        got = store._query("SELECT 1 FROM skill_runs WHERE skill = ? AND t0 >= ? AND t0 < ? AND outcome = 'done' AND "
-                           + sql_real_skill_run() + " LIMIT 1",
-                           (str(row.get("skill_id")), since, now))
-    except Exception:  # noqa: BLE001 - no skill ledger yet
-        got = []
-    return bool(got)
-
-
-def due_offers(store: Any, now: float | None = None, *, skills: Sequence[Any] | None = None,
-               trusted: Callable[[Any], bool] | None = None, per_day: int = OFFERS_PER_DAY,
-               lead_min: float = OFFER_LEAD_MIN, lead_last_min: float = OFFER_LEAD_LAST_MIN,
-               late_min: tuple[float, float] = OFFER_LATE_MIN) -> list[dict[str, Any]]:
-    """The routines whose card window is open now (R2.3 "when a routine is due"), first window first: active, of a
-    learned skill that passes the offer gate (``offers.skill_offerable``) and whose route is trusted for offers
-    (``registry.offer_ready``, D14, unless ``trusted`` says otherwise), offer mode early or late, today in its day-set,
-    ``now`` inside the mode's window, its end state not yet happened today, not offered today, and fewer than
-    ``per_day`` routine cards offered today. The card lane (rLane) adds its own holds (game in front, calls, quiet
-    hours, the tab census) on top. Content-free dicts."""
-    from yuki.memory.offers import skill_offerable
-
-    now = time.time() if now is None else float(now)
-    skills = load_skills(store) if skills is None else tuple(skills)
-    by_key = {s.key: s for s in skills}
-    today = day_of(now)
-    since = day_start(today)
-    offered = store.routine_events(since=since, until=now + 1.0, kinds=["offered"])
-    if len({e["routine_id"] for e in offered}) >= per_day:
-        return []
-    offered_ids = {e["routine_id"] for e in offered}
-    if trusted is None:
-        def trusted(skill: Any) -> bool:
-            from yuki.memory.offers import offer_trusted
-
-            return offer_trusted(store, skill)   # D14; a usage record's runs pooled with its capability's
-    out: list[dict[str, Any]] = []
-    for row in store.routines(states=["active"]):
-        skill = by_key.get(row.get("skill_id"))
-        if skill is None or row["id"] in offered_ids or not skill_offerable(store, skill)[0]:
-            continue
-        win = offer_window(row, today, lead_min=lead_min, lead_last_min=lead_last_min, late_min=late_min)
-        if win is None or not win[0] <= now <= win[1]:
-            continue
-        if any(_gap(o["at_min"], row.get("at_min")) < MATCH_MIN and o["key"] == row["key"] for o in out):
-            continue   # a told row and a mined row of one moment: one card
-        if done_today(store, row, now, skills=skills):
-            continue
-        try:
-            ok = bool(trusted(skill))
-        except Exception:  # noqa: BLE001
-            ok = False
-        if not ok:
-            continue
-        out.append({"id": int(row["id"]), "key": row["key"], "skill": row.get("skill_id"), "app": row.get("app"),
-                    "dayset": row["dayset"], "at_min": row["at_min"], "mode": row.get("offer_mode") or "early",
-                    "window": [win[0], win[1]], "expires_at": day_start(today) + (from_clock(float(row["at_min"]))
-                                                                                  + 10.0) * 60.0,
-                    "hits": row.get("hits"), "eligible": row.get("eligible"), "rate": row.get("rate")})
-    out.sort(key=lambda o: o["window"][0])
-    return out[:max(0, per_day - len(offered_ids))]   # never more than the day's routine cards left (review L5)
-
-
 def active_near(store: Any, now: float | None = None, minutes: float = 60.0, *, limit: int = 2,
                 skills: Sequence[Any] | None = None) -> list[dict[str, Any]]:
     """Active routines of a skill that passes the offer gate whose time is within ``minutes`` of now on a day of their
     day-set (the talker's "now" block), nearest first, at most ``limit``: content-free numbers plus the label when one
     was told. Context routines (a skill that is never offered, such as a voice channel) never reach it (R1.5)."""
-    from yuki.memory.offers import skill_offerable
+    from yuki.memory.offers import routine_gate, routine_value, skill_offerable
 
     now = time.time() if now is None else float(now)
     today = day_of(now)
     dm_now = day_minute(now)
-    offerable = {s.key for s in (load_skills(store) if skills is None else skills)
-                 if getattr(s, "origin", "") == "learned" and skill_offerable(store, s)[0]}
+    learned = {s.key: s for s in (load_skills(store) if skills is None else skills)
+               if getattr(s, "origin", "") == "learned"}
+    offerable = {k for k, s in learned.items() if skill_offerable(store, s)[0]}
     out = []
     for row in store.routines(states=["active"]):
-        if row.get("skill_id") not in offerable:
+        value = routine_value(store, row.get("key"))
+        if value is not None:
+            # a routine on one value of a capability's record: that value's own gate (offers.routine_gate)
+            skill = learned.get(str(row.get("skill_id") or ""))
+            if skill is None or not routine_gate(store, skill, row.get("key"), value=value)[0]:
+                continue
+        elif row.get("skill_id") not in offerable:
             continue
         if not dayset_has(str(row["dayset"]), today) or row.get("at_min") is None:
             continue

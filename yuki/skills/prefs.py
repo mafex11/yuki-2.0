@@ -647,7 +647,8 @@ def feed_observed(store: Any, *, now: float | None = None, since: float | None =
       (:data:`OBSERVED_STATE`, :data:`OBSERVED_MARGIN_S` behind), and an event already written for that moment is never
       written again, so a re-run or a learner rebuild never writes one twice;
     * a skill marked Not mine keeps its occasions (the learner leaves them on the tombstone's id): the events fed from
-      them before the button are removed (``unfed``), and none is fed again.
+      them before the button are removed (``unfed``), and none is fed again; the same for a value of a capability's
+      record the user marked Not mine (its occasions: the record's id and that value's ``key_value_digest``).
 
     Content-free counts; never raises."""
     now = time.time() if now is None else float(now)
@@ -661,15 +662,19 @@ def feed_observed(store: Any, *, now: float | None = None, since: float | None =
         return {"error": "state"}
     try:
         rows = store._query(
-            "SELECT o.end_moment_id, o.capability, o.means, o.at, o.skill_id FROM occasions o WHERE o.by = 'user' AND"
+            "SELECT o.end_moment_id, o.capability, o.means, o.at, o.skill_id, o.key_value_digest FROM occasions o"
+            " WHERE o.by = 'user' AND"
             " o.context_known = 1 AND o.means IS NOT NULL AND o.means != '' AND o.end_moment_id IS NOT NULL AND"
             " o.at > ? AND o.at <= ? ORDER BY o.at", (lo, now))
         not_mine = {int(r[0]) for r in store._query("SELECT id FROM skills WHERE origin = 'learned' AND state ="
                                                      " 'not_mine'")}
     except Exception:  # noqa: BLE001 - a database before migration 43: nothing to feed
         return {"skipped": "no_occasions"}
-    if not_mine:
-        out["unfed"] = _unfeed(store, not_mine)
+    from yuki.skills.learn.values import not_mine_ids
+
+    not_mine_values = not_mine_ids(store)
+    if not_mine or not_mine_values:
+        out["unfed"] = _unfeed(store, not_mine, not_mine_values)
     from collections import Counter
 
     from yuki.skills.catalog import capabilities
@@ -696,9 +701,9 @@ def feed_observed(store: Any, *, now: float | None = None, since: float | None =
             moments[int(d["id"])] = d
     from yuki.memory.routines import _moment_attrs
 
-    for mid, cap_key, means, at, sid in rows:
+    for mid, cap_key, means, at, sid, kvd in rows:
         out["occasions"] += 1
-        if sid is not None and int(sid) in not_mine:
+        if sid is not None and (int(sid) in not_mine or str(kvd or "") in not_mine_values.get(int(sid), ())):
             skipped["not_mine"] += 1
             continue
         cap = caps.get(str(cap_key))
@@ -755,15 +760,21 @@ def feed_observed(store: Any, *, now: float | None = None, since: float | None =
     return out
 
 
-def _unfeed(store: Any, skill_ids: set[int]) -> int:
-    """Remove the ``observed`` events the feed wrote from the occasions of these skills (the user marked them Not mine:
-    what they were learned from is not the user's). Returns how many went; never raises."""
+def _unfeed(store: Any, skill_ids: set[int], values: dict[int, set[str]] | None = None) -> int:
+    """Remove the ``observed`` events the feed wrote from the occasions of these skills, and of these values of a
+    record (``{record id: value ids}``) (the user marked them Not mine: what they were learned from is not the user's).
+    Returns how many went; never raises."""
     marks = ",".join("?" * len(skill_ids))
 
     def op(conn: Any) -> int:
         mids = [int(r[0]) for r in conn.execute(
             f"SELECT DISTINCT end_moment_id FROM occasions WHERE skill_id IN ({marks}) AND end_moment_id IS NOT NULL",
-            tuple(sorted(skill_ids))).fetchall()]
+            tuple(sorted(skill_ids))).fetchall()] if skill_ids else []
+        for rid, vids in (values or {}).items():
+            if vids:
+                mids += [int(r[0]) for r in conn.execute(
+                    "SELECT DISTINCT end_moment_id FROM occasions WHERE skill_id = ? AND end_moment_id IS NOT NULL AND"
+                    f" key_value_digest IN ({','.join('?' * len(vids))})", (int(rid), *sorted(vids))).fetchall()]
         n = 0
         for start in range(0, len(mids), 400):
             part = [f"{OBSERVED_SOURCE}{m}" for m in mids[start:start + 400]]

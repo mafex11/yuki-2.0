@@ -37,6 +37,20 @@ says itself which of its text is speech (:data:`yuki.voice.mouth.MARKERS`), so t
 it still scores every spoken line with the same model and logs what it would have dropped (``op`` caught with
 ``shadow`` true), but it never blocks, never holds a line's audio for its verdict and never drops the rest of a
 reply. A leak of reasoning into speech is then a measured number (its ``shadow_caught`` count), not a silence.
+
+**The claim gate (kMind, audit 17 Oct; ``Hands.acted_this_turn``).** Live test 1 had 12 false "done" lines, four of
+them a reply that ran nothing ("Excalidraw's open in Chrome"). For the lean talker (``code_only``), while the
+conversation's ``claim_open()`` says nothing was done for the user's current turn (no hand or skill of the talker's
+verified anything, no reflex did it, no call in this turn yet), each line the talker writes gets one isolated check by
+the fast model (:data:`CLAIM_PROMPT`, one word: ``CLAIM`` or ``OK``) and its audio waits for it (``blocks``). The check
+reads the line against their latest words: only a line that tells them what they asked for is done, or already so, is
+a claim; a truthful answer to "is it paused?" or "did it send?" is not (review H1). A claim is dropped in every mode
+(``why`` ``claim``), ``on_claim`` is told (the conversation then answers the turn again, told so), and the rest of the
+reply goes too. No verdict in time or an error says the line (fail open: a false claim is rarer than every other line).
+A model's judgement, never a word list. Lines said by code are not the talker's and never claim-checked: owed outcomes
+and results pass the guard (``unguard``), and every other line code says (a hand's or skill's done line, a step line,
+an acknowledgement) is told to the guard as it goes to the voice (:meth:`SpeechGuard.code_line`), so its pieces skip the
+claim check (the internal-word and repeat checks still apply).
 """
 
 from __future__ import annotations
@@ -56,7 +70,22 @@ FREE_WORDS = 3
 #: The lines said in the last this many seconds are shown to the check (a repeat in other words).
 REPEAT_S = 20.0
 #: What the check may answer when it drops a line.
-REASONS = ("reasoning", "about_user", "internals", "fragment", "repeat")   # "repeat": the exact-repeat check
+REASONS = ("reasoning", "about_user", "internals", "fragment", "repeat", "claim")   # "repeat": the exact-repeat check
+
+#: kMind: the claim gate's check (module docstring): one line, judged against the user's latest words, for which nothing
+#: was done yet. Review H1 (18 Oct): a truthful answer to "is it paused?" or "did it send?" is no claim.
+CLAIM_PROMPT = """\
+You check one line that Yuki, a voice assistant on the user's PC, is about to say out loud, against the user's latest \
+words. Nothing has been done on their PC for those words yet: no action ran for them.
+Answer CLAIM only when their latest words ask Yuki to do or change something (open, play, pause, send, close, switch, \
+set, show) and the line tells them it is done or that it is already so: "Done.", "There you go.", "Sent.", "It's up \
+in Chrome.", "Already playing."
+Answer OK for everything else. An answer to their question about how things are now, or about what was done \
+earlier, is OK ("is spotify running?" -> "Yep, it's running."; "did the email go?" -> "Yes, it went out earlier."; \
+"what did you change?" -> "I closed the tab and turned it down."). So is a \
+question, small talk, sympathy, a joke, an offer, saying Yuki is on it or about to do it, saying it can't, or saying \
+it is not done or did not work. When unsure, OK.
+One word: CLAIM or OK."""
 
 GUARD_PROMPT = """\
 You check one line that Yuki, a voice assistant on the user's PC, is about to say out loud to the user. The line \
@@ -120,7 +149,7 @@ class Verdict:
     ok: bool
     why: str = ""
     ms: float = 0.0
-    by: str = "model"   # model | free | repeat | timeout | error | off | shadow (would have dropped; said anyway)
+    by: str = "model"   # model | free | repeat | timeout | error | off | shadow | claim | claim_ok (kMind)
 
 
 def _norm(text: str) -> str:
@@ -169,6 +198,14 @@ class SpeechGuard:
         self.code_only = bool(code_only)
         #: ``()``: a line was dropped (the turn log keeps only what was heard); set by the conversation.
         self.on_drop: Callable[[], None] | None = None
+        #: kMind (the claim gate): ``() -> bool``: nothing was done for the user's current turn yet, so the talker's
+        #: lines are checked for a claim of something done (set by the conversation for the lean talker; ``None``: off).
+        self.claim_open: Callable[[], bool] | None = None
+        #: ``()``: a line was dropped as a claim of something not done (set by the conversation).
+        self.on_claim: Callable[[], None] | None = None
+        self._waits: set[Any] = set()   # futures whose audio waits for the verdict in every mode (the claim gate)
+        #: kMind (review L6): lines code sent to the voice lately, ``(at, normalised)``: never claim-checked
+        self._code_lines: deque[tuple[float, str]] = deque(maxlen=16)
         self._said: deque[tuple[float, str, str]] = deque(maxlen=12)   # (at, words, normalised) of lines let through
         self._turn: set[str] = set()   # the lines said since the user last spoke (normalised): exact repeats
         #: The same lines in words, for the model's repeat judgement: only what answers the user's latest words (a
@@ -218,6 +255,15 @@ class SpeechGuard:
         written = [t for at, t in self._written if now - at < REPEAT_S]
         self._written.append((now, text.strip()))
         if self.code_only:
+            if self._claim_open() and not self._by_code(norm, now):
+                # kMind: nothing done for their words yet: the line waits for the claim check (module docstring)
+                self._pending.add(norm)
+                self._waits.add(fut)
+                fut.add_done_callback(self._waits.discard)
+                task = loop.create_task(self._check(text, said, fut, written, first, claim=True))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+                return fut
             # bTalk: the model call is off (design 3); the two code rules above decided, and the line goes out
             self.stats["free"] += 1
             self.heard(text)
@@ -234,8 +280,32 @@ class SpeechGuard:
         task.add_done_callback(self._tasks.discard)
         return fut
 
+    #: A line code sent to the voice is matched to its spoken pieces for this long (s).
+    CODE_LINE_S = 30.0
+
+    def code_line(self, text: str) -> None:
+        """kMind (review L6): ``text`` goes to the voice from code (a ``TTSSpeakFrame``: a done line, a step line, an
+        acknowledgement), not from the talker's reply: its pieces are never claim-checked."""
+        norm = _norm(text)
+        if norm:
+            self._code_lines.append((time.monotonic(), norm))
+
+    def _by_code(self, norm: str, now: float) -> bool:
+        """Whether a piece is (part of) a line code sent to the voice in the last :data:`CODE_LINE_S` seconds."""
+        piece = f" {norm} "
+        return any(now - at < self.CODE_LINE_S and piece in f" {line} " for at, line in self._code_lines)
+
+    def _claim_open(self) -> bool:
+        fn = self.claim_open
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001 - no gate rather than a broken line
+            return False
+
     async def _check(self, text: str, said: list[str], fut: "asyncio.Future[Verdict]",
-                     written: list[str] | None = None, first: bool = False) -> None:
+                     written: list[str] | None = None, first: bool = False, claim: bool = False) -> None:
         started = time.monotonic()
         user = ""
         if self.context is not None:
@@ -245,9 +315,15 @@ class SpeechGuard:
                 user = ""
         verdict: Verdict
         try:
-            answer = await self._ask(text, said, user, written or [], first)
-            ok, why = parse_verdict(answer)
-            verdict = Verdict(ok, why, by="model")
+            if claim:
+                answer = await self._ask_claim(text, user)
+                is_claim = (answer or "").strip().split("\n", 1)[0].strip().upper().strip(".!* ").startswith("CLAIM")
+                verdict = Verdict(False, "claim", by="claim") if is_claim else Verdict(True, by="claim_ok")
+                self.stats["claims_checked"] = self.stats.get("claims_checked", 0) + 1
+            else:
+                answer = await self._ask(text, said, user, written or [], first)
+                ok, why = parse_verdict(answer)
+                verdict = Verdict(ok, why, by="model")
         except asyncio.CancelledError:
             if not fut.done():
                 fut.set_result(Verdict(self.short(text), "unchecked", by="error"))
@@ -283,6 +359,18 @@ class SpeechGuard:
         self.stats["output_tokens"] += int(getattr(usage, "output_tokens", 0) or 0)
         return "".join(getattr(b, "text", "") for b in getattr(response, "content", []) or [])
 
+    async def _ask_claim(self, text: str, user: str) -> str:
+        if self.judge is not None:
+            result = self.judge(text, [], user)
+            return await result if asyncio.iscoroutine(result) else str(result)
+        content = f"The user's latest words: \"{user or '(none)'}\"\nThe line to check: \"{text}\""
+        response = await self.client.messages.create(model=self.model, max_tokens=4, system=CLAIM_PROMPT,
+                                                     messages=[{"role": "user", "content": content}])
+        usage = getattr(response, "usage", None)
+        self.stats["input_tokens"] += int(getattr(usage, "input_tokens", 0) or 0)
+        self.stats["output_tokens"] += int(getattr(usage, "output_tokens", 0) or 0)
+        return "".join(getattr(b, "text", "") for b in getattr(response, "content", []) or [])
+
     async def decide(self, fut: "asyncio.Future[Verdict]", text: str, *, wait_s: float | None = None) -> Verdict:
         """The verdict for a line whose audio (or text) is ready now: waits at most ``wait_s`` (default the timeout).
 
@@ -302,7 +390,7 @@ class SpeechGuard:
             if verdict.by != "free":
                 self.heard(text)
             return verdict
-        if self.shadow and verdict.by != "vocab":
+        if self.shadow and verdict.by not in ("vocab", "claim"):
             # v3.16: the marker channel decides what is spoken; this verdict is only measured (a leak, if any, is
             # logged with its reason) and the line is said. A check that failed has no verdict: not a catch. Yuki's
             # own internal words (``vocab``) are dropped in every mode.
@@ -314,6 +402,11 @@ class SpeechGuard:
             return Verdict(True, verdict.why, verdict.ms, by="shadow")
         self.stats["caught"] += 1
         self._log(op="caught", why=verdict.why, by=verdict.by, chars=len(text), ms=verdict.ms)
+        if verdict.by == "claim" and self.on_claim is not None:
+            try:
+                self.on_claim()
+            except Exception:  # noqa: BLE001
+                pass
         if self.on_drop is not None:
             try:
                 self.on_drop()
@@ -348,11 +441,15 @@ class SpeechGuard:
             return True
         return (await self.decide(fut, text)).ok
 
-    @staticmethod
-    def blocks(fut: Any) -> bool:
-        """The verdict is in and drops the line in every mode, shadow too: Yuki's own internal words (``vocab``)."""
+    def blocks(self, fut: Any) -> bool:
+        """The line waits for its verdict in every mode, shadow too: Yuki's own internal words (``vocab``, decided at
+        once) and a line under the claim gate (kMind: its check is running, or it found a claim)."""
         try:
-            return bool(fut is not None and fut.done() and fut.result().by == "vocab")
+            if fut is None:
+                return False
+            if fut in self._waits:
+                return True
+            return bool(fut.done() and fut.result().by in ("vocab", "claim"))
         except Exception:  # noqa: BLE001
             return False
 

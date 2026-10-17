@@ -183,7 +183,7 @@ def plan_schema() -> dict[str, Any]:
         "properties": {
             "commit": {"type": "string", "enum": list(COMMITS)},
             "quote": _nullable("string", "Their exact words asking for it."),
-            "to": _nullable("string", "The person or channel."),
+            "to": _nullable("string", "The person or channel (one of their ways: the place they named)."),
             # sBrainFix (F1c): their own words, never translated or restyled (the core prompt says it in full)
             "text": _nullable("string", "The message, in their words."),
         },
@@ -456,9 +456,6 @@ class Checks:
         spent_skills: Skills that already ran in this request and handed over or couldn't confirm the result (code
             ids): a plan that runs one again is invalid, as is one that runs the skill the seed handed over
             (:func:`spent_skills`).
-        done_skills: Skills whose skill route ended done in this request (sBrainFix, F2: the planner was then asked
-            for the rest of the request): that exact skill is not run again here (its family still may, for another
-            value).
         words: The user's own words of this request (bRound2, F1c: a send's text is measured against them,
             :func:`send_text_error`); empty: not measured.
         text_bounced: A send's text that kept too few of their words was already sent back once in this request
@@ -475,7 +472,6 @@ class Checks:
     repeat_rejected: bool = False
     current_plan: str | None = None
     spent_skills: frozenset[str] = frozenset()
-    done_skills: frozenset[str] = frozenset()
     words: tuple[str, ...] = ()
     text_bounced: bool = False
     bounced_now: bool = False
@@ -520,8 +516,6 @@ def _spent_error(where: str, skill: str, checks: Checks) -> str | None:
     """The error for a plan that runs a skill that just handed over or couldn't confirm (``skill``: a menu id, so the
     error holds no model-written text), else ``None``."""
     why = spent_skills(checks).get(skill_family(skill))
-    if why is None and str(skill or "").strip() in checks.done_skills:
-        why = "already did its part in this request"
     if why is None:
         return None
     # the id in quotes: the log's code of this error (error_code) leaves quoted values out
@@ -1357,6 +1351,9 @@ class ExecResult:
     #: steps is safe (it sends and joins nothing, and its route may be followed after acting): that skill's id. The
     #: Brain then replans once by steps after a look instead of ending (x10); ``None`` otherwise.
     unconfirmed_skill: str | None = None
+    #: kBrain review M2: on a plan that didn't end done, the lines of the request's ``run_skill`` parts their own check
+    #: saw done, said before the line the request ends on (``done.with_parts``).
+    parts: list[str] = field(default_factory=list)
 
 
 __all__ = [

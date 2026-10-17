@@ -189,6 +189,9 @@ class Job:
     #: The card, coach-note and where-typed text that came with a typed request: the new brain's labelled ``context``,
     #: never quotable as the user's words. The old loop gets the same text inside ``request``, as before.
     context: str | None = None
+    #: kBrain (contract C3): the voice talker's reading of the heard words (``{"goal", "parts", "choose", "context"}``),
+    #: a seed for the brain's plan, never an order and never quotable; ``None``: none came (typed requests).
+    understanding: dict[str, Any] | None = None
 
 
 def _typed_tuple(words: "Iterable[str] | str | None") -> tuple[str, ...] | None:
@@ -250,6 +253,9 @@ class Lane(QThread):
         #: V4: the app named for the running job after it became current (:meth:`name_app_job`), given to the agent
         #: again once its run has begun, so the run's own start cannot overwrite it (review F9).
         self._named_late: dict[int, str] = {}
+        #: kMind merge note (review L5): the voice talker's understanding (C3) that came after its job was submitted
+        #: (:meth:`seed_job`), taken by the brain once, as it writes the planner's first turn; a later one is dropped.
+        self._seeds_late: dict[int, dict[str, Any]] = {}
         #: appWin2 review F1: words added to a job before its run's body began (still queued, or current a moment before
         #: ``Agent.run`` empties the steering inbox), handed to the agent once it has begun; ``_begun`` is that job's id.
         self._early_steers: dict[int, list[str]] = {}
@@ -281,9 +287,13 @@ class Lane(QThread):
         return self._active or self.agent
 
     def _brain_mode(self) -> str:
-        """``Settings.brain`` now: ``loop`` | ``typed`` | ``all`` (anything else reads as ``loop``)."""
-        mode = str(getattr(getattr(self.runtime, "settings", None), "brain", "loop") or "loop")
-        return mode if mode in ("loop", "typed", "all") else "loop"
+        """``Settings.brain`` now: ``all`` (shipped: the brain takes typed requests and the voice's hand-overs) |
+        ``typed`` | ``loop`` (the rollback value only); anything else reads as ``all``."""
+        from yuki.brain.settings import BRAIN_MODES, DEFAULT_MODE
+
+        mode = str(getattr(getattr(self.runtime, "settings", None), "brain", DEFAULT_MODE) or DEFAULT_MODE)
+        mode = mode.strip().lower()
+        return mode if mode in BRAIN_MODES else DEFAULT_MODE
 
     def _agent_for(self, job: "Job") -> Any:
         """Who drives ``job``: the new brain for a typed request when ``Settings.brain`` is ``typed`` or ``all``, and
@@ -322,8 +332,9 @@ class Lane(QThread):
             return self._brain
 
     def _make_brain(self) -> Any:
-        """This lane's brain, sharing the loop agent's settings (so the model switch reaches it), its session log and
-        the runtime's memory. The worker's acts (one desk lease per act run) with the send countdown and the takeover
+        """This lane's brain, sharing the loop agent's settings, its session log and the runtime's memory. Its planner
+        model is its own (``brain_model``, else the brain's default: ``BrainSettings``), so the old loop's model switch
+        does not reach it. The worker's acts (one desk lease per act run) with the send countdown and the takeover
         pause; the front desk only looks: its dispatcher is on the hands-blocked backend and an act plan is handed to
         the worker (``Brain.hands`` false)."""
         from yuki.brain import Brain
@@ -468,6 +479,22 @@ class Lane(QThread):
             return True
         return False
 
+    def seed_job(self, job_id: int, understanding: dict[str, Any]) -> bool:
+        """kMind merge note (review L5): the talker's understanding (C3) for a job submitted before it was complete,
+        kept for the brain to take as it writes the planner's first turn (:meth:`_late_seed`). ``False`` when that job
+        is neither running nor queued here (it ended, or was cancelled)."""
+        with self._state:
+            running = self._current is not None and self._current.id == job_id
+            queued = job_id in self._waiting and job_id not in self._skip
+            if running or queued:
+                self._seeds_late[job_id] = dict(understanding)
+        return running or queued
+
+    def _late_seed(self, job_id: int) -> dict[str, Any] | None:
+        """The late understanding kept for ``job_id`` (taken once), else ``None``."""
+        with self._state:
+            return self._seeds_late.pop(job_id, None)
+
     def answer(self, text: str) -> None:
         """Hand the user's answer to a paused request."""
         self._answers.put(text)
@@ -534,6 +561,7 @@ class Lane(QThread):
                 self._active = agent if not skipped and agent is not self.agent else None
                 if skipped:   # words added while it waited go with it: you stopped (or replaced) that request
                     self._early_steers.pop(job.id, None)
+                    self._seeds_late.pop(job.id, None)
             if skipped:
                 # Cancelled while it waited: it never reaches the agent, so a
                 # cancel meant for it cannot land on the next request instead.
@@ -574,6 +602,7 @@ class Lane(QThread):
                     self._paused_job = None
                     self._named_late.pop(job.id, None)
                     self._early_steers.pop(job.id, None)
+                    self._seeds_late.pop(job.id, None)
                 self.runtime.lane_done.emit(
                     self.name, job.id, job.request, bool(reached_for_hands), reached_for_hands
                 )
@@ -619,7 +648,8 @@ class Lane(QThread):
             seed = plan_seed(job.skill or getattr(runtime, "_skills", {}).get(job.id))
             events = agent.run(job.request, user_words=list(words or ()), context=job.context or "",
                                channel="voice" if voice else "typed", request_id=job.log_request_id or "",
-                               origin_hwnd=job.origin_hwnd, plan_seed=seed)
+                               origin_hwnd=job.origin_hwnd, plan_seed=seed, understanding=job.understanding,
+                               late_understanding=lambda job_id=job.id: self._late_seed(job_id))
             return self._relay(job, agent, events, allowed, refused)
         events = self.agent.run(
             job.request, origin_hwnd=job.origin_hwnd, effort=effort if voice else None,
@@ -984,6 +1014,8 @@ class AgentRuntime(QObject):
         self._skills: dict[int, dict[str, Any]] = {}   # phase S: front-desk requests' pinned skill, kept for a hand-off
         #: bWire: front-desk requests' typed words and labelled context (the new brain's), kept for a hand-off.
         self._typed: dict[int, tuple[tuple[str, ...] | None, str | None]] = {}
+        #: kBrain (C3): front-desk requests' understanding from the voice talker, kept for a hand-off.
+        self._understandings: dict[int, dict[str, Any]] = {}
         #: bWire: the window in front when the user called Yuki up, for a front-desk request the new brain hands to the
         #: worker (written by the lane's thread, popped in _on_lane_done).
         self._brain_origins: dict[int, int] = {}
@@ -1037,6 +1069,8 @@ class AgentRuntime(QObject):
         #: ``COST_CHECK_S`` (incremental log reads), one ``notice`` a day past the threshold.
         self._cost_alert = None
         self._cost_stop = threading.Event()
+        #: kBrain: the start-up warm-up's timer (cancelled on stop).
+        self._brain_warm: threading.Timer | None = None
         try:
             from yuki.core.cost import CostAlert, CostLedger
 
@@ -1055,10 +1089,17 @@ class AgentRuntime(QObject):
     #: Seconds between two background checks of the day's spend (memory spends while no request runs).
     COST_CHECK_S = 600.0
 
+    #: kBrain: seconds after start before the worker's brain warms its planner (app start settles first).
+    BRAIN_WARM_DELAY_S = 20.0
+
     def start(self) -> None:
-        """Start both lane threads (and the daily cost check)."""
+        """Start both lane threads (and the daily cost check), and warm the worker's brain once the app has settled
+        (:meth:`warm_brain`)."""
         self.worker.start()
         self.front_desk.start()
+        self._brain_warm = threading.Timer(self.BRAIN_WARM_DELAY_S, self.warm_brain)
+        self._brain_warm.daemon = True
+        self._brain_warm.start()
         if self._cost_alert is not None:
             def loop() -> None:
                 while not self._cost_stop.wait(self.COST_CHECK_S if self._cost_checked else 30.0):
@@ -1067,6 +1108,21 @@ class AgentRuntime(QObject):
 
             self._cost_checked = False
             threading.Thread(target=loop, name="yuki-cost-check", daemon=True).start()
+
+    def warm_brain(self) -> bool:
+        """kBrain: the worker's brain writes its planner's cached prefix and opens its connection
+        (``Brain.warm_cache``: one token out, only when nothing warmed it in the last 50 minutes), on its own daemon
+        thread. Called at start and by the voice at a conversation's start; ``False`` under ``brain = "loop"`` or when
+        the brain can't be made. Never raises."""
+        try:
+            brain = self.worker.brain()
+        except Exception:  # noqa: BLE001
+            brain = None
+        warm = getattr(brain, "warm_cache", None)
+        if not callable(warm):
+            return False
+        threading.Thread(target=warm, name="yuki-brain-warm", daemon=True).start()
+        return True
 
     def check_cost(self) -> None:
         """Check the day's spend now, off the GUI thread (one notice a day past the line)."""
@@ -1081,6 +1137,8 @@ class AgentRuntime(QObject):
         exchange that closed the app could be lost at exit.
         """
         self._cost_stop.set()
+        if self._brain_warm is not None:
+            self._brain_warm.cancel()
         for lane in (self.worker, self.front_desk):
             lane.shutdown()
         for lane in (self.worker, self.front_desk):
@@ -1105,6 +1163,7 @@ class AgentRuntime(QObject):
         user_words: "Iterable[str] | str | None" = None, pack: Any = None, needs_hands: bool | None = None,
         app_named: str | None = None, log_request_id: str | None = None, skill: dict[str, Any] | None = None,
         typed_words: "Iterable[str] | str | None" = None, context: str | None = None,
+        understanding: dict[str, Any] | None = None,
     ) -> tuple[str, int]:
         """Route one request to a lane.
 
@@ -1144,6 +1203,8 @@ class AgentRuntime(QObject):
                 theirs), the new brain's ``user_words``; the old loop never reads it.
             context: The card / coach-note / where-typed text that came with it: the new brain's labelled context,
                 never quotable. Both are kept across a front-desk hand-off.
+            understanding: kBrain (contract C3): the voice talker's reading of the words (goal, parts, choose,
+                context), a seed for the brain, never an order; kept across a front-desk hand-off.
 
         Returns:
             ``(lane name, request id)``.
@@ -1178,11 +1239,14 @@ class AgentRuntime(QObject):
         context = str(context) if context else None
         if lane is not self.worker and (typed is not None or context):
             self._typed[request_id] = (typed, context)
+        seed = dict(understanding) if isinstance(understanding, dict) and understanding else None
+        if seed is not None and lane is not self.worker:
+            self._understandings[request_id] = seed
         # review r2 L1: the newer fields by keyword (a field added beside them can never take the pin's place)
         waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source, view_hwnd, memory_query,
                                    previous_query, words, fresh, app_named=named,
                                    log_request_id=log_request_id or None, skill=pin, typed_words=typed,
-                                   context=context))
+                                   context=context, understanding=seed))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
             origin_hwnd=origin_hwnd, source=source, view_hwnd=view_hwnd,
@@ -1194,7 +1258,8 @@ class AgentRuntime(QObject):
                          memory_query: str | None = None, user_words: "Iterable[str] | str | None" = None,
                          app_named: str | None = None, log_request_id: str | None = None,
                          skill: dict[str, Any] | None = None, typed_words: "Iterable[str] | str | None" = None,
-                         context: str | None = None, origin_hwnd: int | None = None) -> int:
+                         context: str | None = None, origin_hwnd: int | None = None,
+                         understanding: dict[str, Any] | None = None) -> int:
         """Put a request on the worker's queue explicitly.
 
         Args:
@@ -1207,6 +1272,7 @@ class AgentRuntime(QObject):
             typed_words / context: bWire: the user's typed words and the labelled context, for the new brain.
             origin_hwnd: bWire: the window in front when the user called Yuki up (only the new brain's hand-off
                 passes it; the old loop's hand-off runs with none, as before).
+            understanding: kBrain (C3): the talker's reading of the words, kept across the hand-off.
 
         Returns:
             The new request id.
@@ -1219,7 +1285,9 @@ class AgentRuntime(QObject):
                                           log_request_id=log_request_id or None,
                                           skill=dict(skill) if isinstance(skill, dict) and skill.get("key")
                                           else None, typed_words=_typed_tuple(typed_words),
-                                          context=str(context) if context else None))
+                                          context=str(context) if context else None,
+                                          understanding=dict(understanding) if isinstance(understanding, dict)
+                                          and understanding else None))
         self.ui_log.event(
             "queued", id=request_id, origin=origin_id, waiting=waiting, request=request,
             **({"request_id": log_request_id} if log_request_id else {}),
@@ -1371,6 +1439,25 @@ class AgentRuntime(QObject):
         self._apps_named[request_id] = named
         return False
 
+    def seed(self, request_id: int, understanding: dict[str, Any] | None) -> bool:
+        """kMind merge note (review L5): the voice talker's understanding (contract C3) for a request submitted on the
+        call's first bytes, before the understanding was complete. The brain takes it as it writes the planner's first
+        turn (its reads take longer than the understanding does); one that comes later is dropped: their exact words
+        stand alone then, as for a request with no understanding. Kept for a front-desk hand-off too. Returns whether
+        the request was still queued or running (content-free log)."""
+        if not isinstance(understanding, dict) or not understanding:
+            return False
+        request_id = int(request_id)
+        ok = False
+        for lane in (self.worker, self.front_desk):
+            if lane.seed_job(request_id, understanding):
+                ok = True
+                if lane is self.front_desk:
+                    self._understandings.setdefault(request_id, dict(understanding))
+                break
+        self.ui_log.event("late_seed", id=request_id, delivered=ok)
+        return ok
+
     def running_ids(self) -> dict[str, int | None]:
         """``lane -> id`` of the request each lane is driving now."""
         return {lane.name: lane.current_id for lane in (self.worker, self.front_desk)}
@@ -1433,6 +1520,7 @@ class AgentRuntime(QObject):
             return
         typed, context = self._typed.pop(request_id, (None, None))
         origin = self._brain_origins.pop(request_id, None)
+        understanding = self._understandings.pop(request_id, None)
         if needed_hands:
             new_id = self.queue_for_worker(request, origin_id=request_id,
                                            source=self._sources.pop(request_id, "text"),
@@ -1441,7 +1529,8 @@ class AgentRuntime(QObject):
                                            app_named=self._apps_named.pop(request_id, None),
                                            log_request_id=log_id,
                                            skill=self._skills.pop(request_id, None),
-                                           typed_words=typed, context=context, origin_hwnd=origin)
+                                           typed_words=typed, context=context, origin_hwnd=origin,
+                                           understanding=understanding)
             # both runtime ids (the front desk's, the worker's) and the one log id they share from here on
             self.ui_log.event("handoff", id=request_id, worker_id=new_id, refused=list(refused),
                               **({"request_id": log_id} if log_id else {}))

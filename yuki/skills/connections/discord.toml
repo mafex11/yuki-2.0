@@ -2,8 +2,11 @@
 # §6; PLAN.md D0, D17, D19, Q3/rule 8). Driver data: true for anyone's Discord. Which channels and people the user
 # joins and messages, and when, are learned, never written here.
 #
-# discord.voice joins a voice channel through Discord's own quick switcher (Ctrl+K, then "!" and the channel's name:
-# Discord's documented voice-channel filter), asks first when the user is already in a call (saying what will happen:
+# discord.voice joins a voice channel by its server and/or its name (kHands): first by the channel's own deep link, for a
+# voice channel memory saw in Discord (its capture threads keep the channel's address and, in the window title, the
+# server it sits in: "<channel> | <server>"; yuki/skills/discord_route.py); else through Discord's own quick switcher
+# (Ctrl+K, then "!" and the channel's name: Discord's documented voice-channel filter). Either way it asks first when
+# the user is already in a call (saying what will happen:
 # Discord switches its own channel; another app's call is never left, so none is promised), and presses Discord's
 # "Join Voice" button only if the switcher only opened the channel (unverified until the first live run). Checked by
 # Discord taking the microphone within 5 s (an onset: a microphone it already held proves nothing). Joining is judged
@@ -27,6 +30,9 @@ services = ["discord.com", "discord"]
 switcher = ["ctrl", "k"]
 open = ["enter"]
 send = ["enter"]
+# a chat's window title is "<chat><place_sep><place>" ("#general | Friends"): the server a channel sits in, as memory's
+# capture keeps the title (yuki/skills/discord_route.py)
+place_sep = " | "
 
 # The quick switcher's filters: "@" a person, "#" a text channel, "!" a voice channel. A group DM goes by its name.
 [chat.prefix]
@@ -59,21 +65,31 @@ in_call = "You're already in a call. Join {channel} on Discord as well?"
 [capability."discord.voice"]
 end = "call_join"
 kind = "change"
-menu = "join a Discord voice channel by its name (asks first during a call)"
+menu = "join a Discord voice channel by its name and/or its server (asks first during a call)"
 done_line = "Joined {channel}."
 commit = "words"
 offer_class = "never"
 handoff = true
 serves = [{ end = "call_join", target = "call", needs = "chat_voice" }]
 
-# The channel, from the user's words only (redteam D10: a channel nobody named is never joined, so no taste fill; a
-# join that took is noted in tastes as kind discord_voice for phase T).
+# The channel, from the user's words only (redteam D10: never filled by taste; a join that took is noted in tastes as
+# kind discord_voice). Not required (kHands): with a server named and no channel, the link rung joins the one voice
+# channel memory saw there, or the one of them the user joined most (picked tastes only, never a name only seen);
+# else it asks which. Words that name only part of a channel's name join it only when it is the only one there or the
+# one they join most (yuki/skills/discord_route.py pick_voice_channel).
 [[capability."discord.voice".slot]]
 name = "channel"
 type = "entity"
 role = "fill"
-required = true
 ask = "Which voice channel?"
+
+# The server, in the user's own words: matched to a server memory saw a voice channel in (its words held, by sound, or
+# said as its letters; a server matched only by its letters never settles a join by itself: the channel is asked by
+# name). Never filled by taste.
+[[capability."discord.voice".slot]]
+name = "server"
+type = "entity"
+role = "fill"
 
 # The user's answer to the in-call question ([chat.asks]): true joins anyway, false leaves their call as it is. The
 # question is asked in the rung (yuki/skills/chat.py route_voice_join), after the engine's game check, so a game in
@@ -82,6 +98,22 @@ ask = "Which voice channel?"
 name = "join_in_call"
 type = "bool"
 role = "fill"
+
+# Rung A first (kHands): a voice channel memory saw, by its server and/or name, opened by its own deep link
+# (discord://-/channels/<server>/<channel>), then joined as after the switcher.
+[[capability."discord.voice".route]]
+rung = "A"
+variant = "link"
+via = "driver"
+driver = "discord_route"
+call = "voice_link"
+needs_focus = true
+means = "app"
+args = { app = "discord" }
+say = "Joined {channel} on Discord."
+retry_after_acting = false
+done = { probe = "mic_held", process = "Discord.exe", within_s = 5 }
+recheck = { probe = "mic_held", process = "Discord.exe", after_s = 3, same_source = true }
 
 [[capability."discord.voice".route]]
 rung = "A"

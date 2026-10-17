@@ -24,8 +24,14 @@ ScreenshotPolicy = Literal["never", "ask", "auto"]
 BRAIN_MODES: tuple[str, ...] = ("loop", "typed", "all")
 
 
+#: kMind (audit 17 Oct, decision 4): the shipped brain. The plan-first brain takes typed and spoken requests; ``loop``
+#: (the old step-by-step agent and the full talker) is the rollback setting only.
+BRAIN_DEFAULT = "all"
+
+
 def _brain_default() -> str:
-    """``YUKI_BRAIN``, else ``brain`` in ``%LOCALAPPDATA%/Yuki/settings.json``, else ``loop`` (read once, at start)."""
+    """``YUKI_BRAIN``, else ``brain`` in ``%LOCALAPPDATA%/Yuki/settings.json``, else :data:`BRAIN_DEFAULT` (read once,
+    at start)."""
     forced = (os.environ.get("YUKI_BRAIN") or "").strip().lower()
     if forced in BRAIN_MODES:
         return forced
@@ -36,9 +42,9 @@ def _brain_default() -> str:
 
         data = json.loads(prefs_path().read_text(encoding="utf-8"))
     except (OSError, ValueError, ImportError):
-        return "loop"
+        return BRAIN_DEFAULT
     value = str(data.get("brain") or "").strip().lower() if isinstance(data, dict) else ""
-    return value if value in BRAIN_MODES else "loop"
+    return value if value in BRAIN_MODES else BRAIN_DEFAULT
 
 
 #: The skills switch (failure fix-plan Item 1, 10 Oct): ``on`` everything (the shipped capabilities and the skills Yuki
@@ -199,11 +205,37 @@ DEFAULT_PRICING: dict[str, dict[str, float]] = {
         "cache_read": 0.10,
     },
 }
+# kMind: the 5.5 generation at its own list rates (Sonnet 5.5 the lean voice talker, measured on this PC 18 Oct; Opus
+# 5.5 cache reads as listed, Haiku 5.5's cache rates at the usual 1.25x / 0.1x of its input)
+for _family, _rates in (("sonnet-5-5", {"input": 2.00, "output": 10.00, "cache_write": 2.50, "cache_read": 0.20}),
+                        ("opus-5-5", {"input": 4.00, "output": 20.00, "cache_write": 5.00, "cache_read": 0.20}),
+                        ("haiku-5-5", {"input": 0.10, "output": 0.50, "cache_write": 0.125, "cache_read": 0.01})):
+    for _profile in ("global", "us"):
+        DEFAULT_PRICING[f"{_profile}.anthropic.claude-{_family}"] = dict(_rates)
 
 #: The voice mouth (docs/VOICE.md §5). Claude Haiku 4.5 is Active on Bedrock with
 #: an end-of-life "no sooner than 2026-10-16" and no Haiku successor listed
 #: (checked 2026-09-25), so this is a setting, not a constant in code.
 DEFAULT_VOICE_MOUTH_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+#: kMind (audit 17 Oct): the lean talker's model (``brain = "all"``, the voice that reads the user and decides). The
+#: full talker (the ``loop`` rollback) and the voice's side calls (speech guard, rest check, router) keep
+#: :data:`DEFAULT_VOICE_MOUTH_MODEL`.
+DEFAULT_VOICE_LEAN_MODEL = "global.anthropic.claude-sonnet-5-5"
+
+#: How "thinking off" is asked of a model (data, by id). Sonnet 5.5 refuses ``{"type": "disabled"}`` (HTTP 400) and
+#: takes ``{"type": "between_tools"}`` (no thinking before the reply; notes between tool calls come back as thinking
+#: blocks, which the voice drops unheard); no other model takes ``between_tools`` (HTTP 400, verified 18 Oct for Haiku
+#: 5.5 and Opus 5.5). Every other model: ``disabled`` (Haiku 5.5 takes it at its default effort). Opus 5.5 cannot turn
+#: thinking off at all, so it is not supported as the voice talker.
+THINKING_OFF: dict[str, dict[str, str]] = {
+    model: {"type": "between_tools"}
+    for model in ("global.anthropic.claude-sonnet-5-5", "us.anthropic.claude-sonnet-5-5")
+}
+
+
+def thinking_off(model: str) -> dict[str, str]:
+    """The ``thinking`` value that turns thinking off on ``model`` (:data:`THINKING_OFF`, else ``disabled``)."""
+    return dict(THINKING_OFF.get(str(model or ""), {"type": "disabled"}))
 
 #: The same models through the US inference profiles (a failover target, yuki.agent.failover).
 for _alias, _rates in (("sonnet", DEFAULT_PRICING[MODEL_ALIASES["sonnet"]]),
@@ -228,6 +260,15 @@ DEFAULT_FALLBACKS: dict[str, list[dict[str, str | None]]] = {
         {"model": DEFAULT_VOICE_MOUTH_MODEL, "region": "us-east-1"},
         {"model": "us.anthropic.claude-haiku-4-5-20251001-v1:0", "region": "us-east-1"},
         {"model": MODEL_ALIASES["sonnet"], "region": None},
+    ],
+    # Sonnet 5.5: the lean talker (kMind) and the brain's planner (kBrain, ``brain_model``) share this chain (it is
+    # keyed by model id): the same model from us-east-1, then Sonnet 5, then the fast Haiku. Sonnet 5 comes before
+    # Haiku because the planner sends adaptive thinking and an effort, which Haiku refuses (HTTP 400, no further
+    # failover); the talker sets thinking off as each model takes it, so it works on either.
+    DEFAULT_VOICE_LEAN_MODEL: [
+        {"model": DEFAULT_VOICE_LEAN_MODEL, "region": "us-east-1"},
+        {"model": MODEL_ALIASES["sonnet"], "region": None},
+        {"model": DEFAULT_VOICE_MOUTH_MODEL, "region": None},
     ],
 }
 
@@ -340,7 +381,10 @@ class Settings:
             language hints it is given.
         voice_eot_threshold / voice_eager_eot_threshold / voice_eot_timeout_ms:
             Flux's end-of-turn settings (eager off: ``None``).
-        voice_mouth_model: Bedrock model id of the fast mouth.
+        voice_mouth_model: Bedrock model id of the fast mouth: the full talker (the ``loop`` rollback) and the voice's
+            side calls (speech guard, rest check, router, progress).
+        voice_lean_model: kMind (audit 17 Oct): the lean talker's model (``brain = "all"``): the voice that reads the
+            user (the you-card) and decides. Thinking off as the model takes it (:func:`thinking_off`).
         voice_mouth_max_tokens: Output ceiling for one spoken reply.
         voice_tts_provider: ``gemini`` (Gemini TTS, the default since 2026-09-27: voice Leda, sound
             tags and a per-turn style the mouth chooses), ``elevenlabs`` or ``deepgram`` (Aura-2,
@@ -487,15 +531,7 @@ class Settings:
         voice_qos: While a conversation is live, the process is opted out of Windows' power throttling and the voice
             loop, the speaker's writer and the microphone's callback threads too (v3.17, D7).
         voice_mmcss: Those threads also join the MMCSS "Audio" task (Windows' scheduler for audio threads).
-        voice_practice: The talker gets practice memory's lines for the user's words (v3.18): the Lessons line (the
-            top pitfalls and habits of the apps in play, at most ``voice_lessons_chars``) and the Learned ways line.
-        voice_skills: The talker may run a learned way as its hand (``run_skill``, v3.18), step by step, each step
-            checked, handed to the thinker at the first deviation; only ways above both floors are offered.
-        voice_skill_min_cosine: A way is offered as a skill only this near the words (measured, 29-build §2.1).
-        voice_skill_min_confidence: ... and only this sure (memory's computed confidence; above one source's 0.667).
-        voice_lessons_chars: The Lessons line's size in the talker's volatile block.
-        voice_hand_traces: Every talker hand (and learned-way run) is kept as a run trace in practice memory so the
-            learners see the hands too (v3.18; written off the voice loop).
+        voice_hand_traces: Every talker hand is kept as a run trace in memory (v3.18; written off the voice loop).
         voice_reflex: lSpeed (live test 17 Oct 2026, problem 1; ``yuki.voice.reflex``). The user's own words for which
             one talker hand (a media key, a relative volume change or mute, a window brought up, restored or
             minimised, a scroll, an app opened) was verified done, and nothing else was done for that turn, are kept
@@ -513,10 +549,6 @@ class Settings:
             (``yuki.memory.testtag``: ``TEST_SESSION_PREFIX`` / ``is_test_session``, xGlue), and so are sessions whose
             id starts with one of these. A test conversation (or one whose session id starts with one of these) never
             teaches the book, live or seeded: the stored book is only read, and nothing is written to it.
-        voice_practice, voice_skills (Phase S, D15): the old talker learning path (the Lessons and Learned ways lines,
-            the step-list ``run_skill``) is off by default. It never runs beside the skill path: with ``skills`` on it
-            stays off whatever these say; with ``skills = false`` they work as before S (``voice_practice`` the lines,
-            ``voice_skills`` also the step-list hand). Deleted in phase P.
         skills: The skill path (PLAN.md Phase S, docs/research/audit-2026-10-09): the talker's Skills menu and its
             ``run_skill`` / ``keep_usual`` hands, the thinker's ``run_skill`` tool. With a ``volume`` skill loaded the
             talker's own ``app_volume`` hand, its volume keys and the thinker's ``app_volume`` tool are off; ``false``
@@ -587,6 +619,7 @@ class Settings:
     voice_eager_eot_threshold: float | None = 0.4
     voice_eot_timeout_ms: int = 5000
     voice_mouth_model: str = DEFAULT_VOICE_MOUTH_MODEL
+    voice_lean_model: str = DEFAULT_VOICE_LEAN_MODEL
     voice_mouth_max_tokens: int = 400
     voice_tts_provider: str = "gemini"
     voice_gemini_model: str = "gemini-3.8-flash-lite-tts"
@@ -690,13 +723,7 @@ class Settings:
     voice_stt_warm: bool = True
     voice_qos: bool = True
     voice_mmcss: bool = True
-    # v3.18 practice memory for the talker (docs/research/revamp-2026-10-02/29-build-voice-procedures.md); off since
-    # phase S (D15): never beside the skill path, back only with skills = false (and these on)
-    voice_practice: bool = False
-    voice_skills: bool = False
-    voice_skill_min_cosine: float = 0.56
-    voice_skill_min_confidence: float = 0.70
-    voice_lessons_chars: int = 400
+    # v3.18: the talker's hands are kept as run traces in memory (the old talker learning path is deleted, kClean)
     voice_hand_traces: bool = True
     # lSpeed (live test 17 Oct 2026, problem 1): the learned reflex path (yuki.voice.reflex)
     voice_reflex: bool = True
@@ -807,10 +834,13 @@ class Settings:
     #: A request pack (Agent.build_pack) older than this is rebuilt for its screen half (the memory half is kept).
     pack_max_age_s: float = 20.0
     # -- the brain rebuild (docs/research/audit-2026-10-09/next/brain-design.md rev 2, release 17a) --
-    #: Which requests the new brain takes (:data:`BRAIN_MODES`): ``loop`` (the default: nothing changes), ``typed``,
-    #: ``all``. Read at each request's start, so flipping it back is the rollback (``YUKI_BRAIN`` or ``brain`` in
-    #: ``settings.json`` at start).
+    #: Which requests the new brain takes (:data:`BRAIN_MODES`): ``all`` (typed and spoken; the default since 18 Oct),
+    #: ``typed`` (typed only), ``loop`` (none: the old step-by-step agent and the full talker; the rollback value).
+    #: Read at each request's start (``YUKI_BRAIN`` or ``brain`` in ``settings.json`` at start); anything else is
+    #: ``all``.
     brain: str = field(default_factory=_brain_default)
+    #: The planner's model (kBrain, 18 Oct): Sonnet 5.5; the brain falls back to the same model when this is empty.
+    brain_model: str = "global.anthropic.claude-sonnet-5-5"
     #: The planner's effort per channel (adaptive thinking on both; pinned for a whole request, tuned from the
     #: request logs).
     brain_effort_voice: str = "low"
@@ -827,7 +857,7 @@ class Settings:
         # screenshots never (brain-design.md 5, L1): the ask and auto values are gone; bPrune removes the setting
         self.screenshot_policy = "never"
         mode = str(self.brain or "").strip().lower()
-        self.brain = mode if mode in BRAIN_MODES else "loop"
+        self.brain = mode if mode in BRAIN_MODES else BRAIN_DEFAULT
         # the skills switch (Item 1): a bool, or the switch's own word given as ``skills`` ("capabilities"); the
         # learned skills are never on with the skill path off
         switch = skills_mode_of(self.skills)

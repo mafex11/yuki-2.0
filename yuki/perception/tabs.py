@@ -267,13 +267,16 @@ def _on_uia_thread(job: Any, budget_s: float, name: str) -> tuple[dict, bool]:
     return shared, pending.timed_out
 
 
-def read_tabs(hwnd: int, *, budget_s: float = 0.2) -> TabStrip:
-    """``hwnd``'s tabs (read-only, at most ``budget_s``). Never raises."""
+def read_tabs(hwnd: int, *, budget_s: float = 0.2, all_groups: bool = False) -> TabStrip:
+    """``hwnd``'s tabs (read-only, at most ``budget_s``). Never raises. ``all_groups``: every group's tabs (a vertical
+    strip's pinned and essentials too; each tab's ``index`` counts inside its group), for finding a tab by its title
+    and acting on it by identity (kHands)."""
     started = time.perf_counter()
     strip = TabStrip(hwnd=int(hwnd))
 
     def job(automation: Any, shared: dict) -> None:
-        found, nodes, complete = walk_tabs(automation, int(hwnd), time.monotonic() + budget_s * 0.9)
+        found, nodes, complete = walk_tabs(automation, int(hwnd), time.monotonic() + budget_s * 0.9,
+                                           all_groups=all_groups)
         shared["tabs"] = [t for t, _e in found]
         shared["nodes"], shared["complete"] = nodes, complete
 

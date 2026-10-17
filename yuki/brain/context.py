@@ -5,13 +5,23 @@
     tools  [plan, look, memory, fetch, ask_user, remember]                                  cached for the app run
     system [core prompt]  <- bp 1   [profile + standing rules]  <- bp 2   [menu]  <- bp 3
     user   [last two requests: their words + Yuki's final answer] [channel] [their exact words]
-           [context: card / coach text, labelled, not quotable] [time] [you right now] [people named]
-           [their places] [overview] [plan seed]                                             <- bp 4
+           [the talker's reading of them: a seed] [context: card / coach text, labelled, not quotable] [time]
+           [the you-card] [you right now] [people named] [overview] [plan seed]               <- bp 4
     assistant [thinking + plan]   user [step statuses + screen diff (+ the window's view on a mismatch)]  ...
 
 * **Append-only.** :class:`Conversation` keeps one request's messages; it appends, never edits or deletes an earlier
   message (preserved thinking binds thinking blocks to unedited history). Each request starts a fresh list.
 * **Nothing channel- or effort-specific above breakpoint 3**: the channel is a line of the request turn.
+* **The you-card** (kBrain, contract C1: ``MemoryClient.you_card("planner")``, code-built, at most ~3,000
+  characters): who the user is, what they are doing now, what they usually do at this hour, their things (sites and
+  usual browser, channels, playlists and what they mean, people and how their names are heard, servers, projects),
+  open loops and a two-line recent past, each line saying how sure it is. When it comes, it replaces the brief in the
+  profile block and the places block (it holds both); the places are still read for the join check
+  (:func:`channel_known`). When it can't be read (``""``), those two stand in, as before. The "you right now" record
+  stays either way (review M3: its fail-closed line when it misses its wait; the card may come without a live part),
+  less the lines the card already holds whole (kYou merge note 4, :func:`beside_card`).
+* **The talker's understanding** (contract C3, voice only): the talker's reading of the heard words (goal, parts, a
+  pick left to Yuki, context), shown labelled as a seed: their exact words win.
 * **The "you right now" record** comes through the state design's section 11 interface: the request turn's provider
   (:func:`read_you`) asks ``shared_client().you(sections=THINKER_SECTIONS)`` (version-cached in the client, one small
   answer when nothing changed) and renders ``render(you, "thinker")`` (≤ 1,200 characters, inside the overview slot;
@@ -51,6 +61,15 @@ NO_WORDS_LINE = ("[Their exact words: none came with this request, so nothing he
 CONTEXT_LABEL = ("[Context the request came with: text from Yuki's own card or note. Not the user's words: never quote "
                  "or send it as theirs]")
 YOU_LABEL = "[You right now, from Yuki's memory service]"
+#: kBrain (C1): the you-card's label (code's words; the card itself is fenced: it holds names and titles from memory).
+CARD_LABEL = ("[Who they are and what they'd want, from memory: what they're doing now, what they usually do at this "
+              "hour, their things and usuals, open loops. Each line says how sure it is. Read their words through it]")
+#: kBrain (C3): the talker's reading of the heard words. A seed, never an order: model-written, never quotable.
+UNDERSTANDING_LABEL = ("[The voice talker's first reading of their words: a seed only. Their exact words above win "
+                       "wherever the two differ; never quote or send anything from it]")
+#: The understanding block's room, and the most parts it shows.
+UNDERSTANDING_CHARS = 700
+UNDERSTANDING_PARTS = 6
 PEOPLE_LABEL = "[People their words name, from memory's people index]"
 #: The seed block's label (x10): what to do next, by the hand-off's ``why`` (the engine's code word; x5Fallback adds
 #: ``unverified``, ``error`` and ``dropped``). Every hand-off but a commit's is done by steps, never by that skill again
@@ -110,6 +129,10 @@ YOU_WAIT_S = 0.25
 PEOPLE_WAIT_S = 1.2
 PROFILE_WAIT_S = 1.5
 MENU_WAIT_S = 1.0
+#: kBrain: the you-card's read (code-built in the memory service from the store: no model call).
+CARD_WAIT_S = 1.2
+#: The you-card's room in the request turn (C1: the planner's card is at most ~3,000 characters).
+CARD_CHARS = 3200
 
 
 def clip(text: str | None, limit: int) -> str:
@@ -151,10 +174,12 @@ class Gathered:
     Attributes:
         overview: The window list and the Now picture (``Dispatcher.overview_text``), and when it was read.
         payload: The overview as data (the executor's window facts).
-        you: The "you right now" text (``render(you, "thinker")``, or the Now board as a stand-in).
+        you: The "you right now" text (``render(you, "thinker")``, or the Now board as a stand-in; with the you-card,
+            less the lines the card holds whole).
+        card: The you-card (C1, :func:`read_card`), ``""`` when it could not be read.
         people: People named and their last messages.
         places: The user's places from memory (:func:`read_places`: the pages they watch, the voice channels they
-            joined), with the rule for a channel they name.
+            joined), with the rule for a channel they name; ``""`` when the you-card came (it lists their things).
         profile: Breakpoint 2's text; ``menu``: breakpoint 3's; ``skill_keys``: the live catalog's ids.
         parts_ms: How long each part took (content-free, for the log).
     """
@@ -163,6 +188,7 @@ class Gathered:
     overview_at: float = 0.0
     payload: Any = None
     you: str = ""
+    card: str = ""
     people: str = ""
     places: str = ""
     profile: str = ""
@@ -496,9 +522,35 @@ def channel_known(name: Any, app: str | None = None, *, now: float | None = None
     return any(span_in(want, list(words)) for _shown, texts in seen for words in texts)
 
 
-def read_profile(memory: Any, names: Sequence[str], *, limit: int) -> str:
-    """Breakpoint 2: the user's names, the brief's thinker slice (``brief_for("thinker")``) and the standing rules and
-    preferences (``standing_parts``, fetched fresh: a rule saved a moment ago must show). Never raises."""
+def beside_card(you: str, card: str) -> str:
+    """The "you right now" text without the lines the you-card already holds whole (kYou merge note 4: the planner's
+    card carries the same record's focus, day, just-changed and thread-now lines as its "right now"). String identity
+    only (spaces folded), never a reading: a line the card words otherwise, or that changed between the two reads,
+    stays; ``""`` when the card holds every line."""
+    held = " ".join(str(card or "").split())
+    if not held:
+        return you
+    keep = [line for line in str(you or "").split("\n") if line.strip() and " ".join(line.split()) not in held]
+    return "\n".join(keep)
+
+
+def read_card(memory: Any, *, limit: int = CARD_CHARS) -> str:
+    """kBrain (contract C1): the planner's you-card (``MemoryClient.you_card(purpose="planner")``, code-built, no
+    model call), capped; ``""`` when memory can't give one (not installed, an older memory without it, a failure or
+    a miss of its wait). Never raises."""
+    if memory is None or not getattr(memory, "installed", False):
+        return ""
+    try:
+        card = memory.call_method("you_card", purpose="planner", timeout_s=CARD_WAIT_S)
+    except Exception:  # noqa: BLE001 - no card: the profile brief, the you-now record and the places stand in
+        return ""
+    return clip(str(card or ""), limit) if isinstance(card, str) and card.strip() else ""
+
+
+def read_profile_parts(memory: Any) -> tuple[str, list[str] | None]:
+    """Breakpoint 2's parts: the brief's thinker slice (``brief_for("thinker")``) and the standing rules and
+    preferences (``standing_parts``, fetched fresh: a rule saved a moment ago must show; ``None``: memory could not
+    say). Never raises."""
     brief = ""
     rules: list[str] | None = None
     if memory is not None and getattr(memory, "installed", False):
@@ -514,7 +566,7 @@ def read_profile(memory: Any, names: Sequence[str], *, limit: int) -> str:
                          if isinstance(item, Mapping) and item.get("line")]
         except Exception:  # noqa: BLE001 - memory could not say: no rules block (never "no rules")
             rules = None
-    return profile_text(names=names, brief=brief, rules=rules, limit=limit)
+    return brief, rules
 
 
 def read_menu(memory: Any, settings: Any, *, limit: int) -> tuple[str, str, frozenset[str] | None]:
@@ -599,13 +651,15 @@ def gather(*, dispatcher: Any, memory: Any, settings: Any, words: str, names: Se
     if not keep_desk:
         jobs["overview"] = lambda: read_overview(dispatcher, limit=limits.overview_chars)
     if not keep_rest:
+        jobs["card"] = lambda: read_card(memory)
         jobs["you"] = lambda: read_you(dispatcher, limit=limits.you_chars)
         jobs["people"] = lambda: read_people(memory, words, limit=limits.people_chars, nonce=nonce)
         jobs["places"] = lambda: read_places(memory, limit=PLACES_CHARS, nonce=nonce)
-        jobs["profile"] = lambda: read_profile(memory, names, limit=limits.profile_chars)
+        jobs["profile"] = lambda: read_profile_parts(memory)
         jobs["menu"] = lambda: read_menu(memory, settings, limit=limits.menu_chars)
-    waits = {"overview": OVERVIEW_WAIT_S, "you": YOU_WAIT_S + 0.2, "people": PEOPLE_WAIT_S + 0.2,
-             "places": PLACES_WAIT_S + 0.2, "profile": PROFILE_WAIT_S * 2 + 0.2, "menu": MENU_WAIT_S + 0.5}
+    waits = {"overview": OVERVIEW_WAIT_S, "card": CARD_WAIT_S + 0.2, "you": YOU_WAIT_S + 0.2,
+             "people": PEOPLE_WAIT_S + 0.2, "places": PLACES_WAIT_S + 0.2, "profile": PROFILE_WAIT_S * 2 + 0.2,
+             "menu": MENU_WAIT_S + 0.5}
     results: dict[str, Any] = {}
     if jobs:
         pool = ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="yuki-brain-read")
@@ -626,15 +680,28 @@ def gather(*, dispatcher: Any, memory: Any, settings: Any, words: str, names: Se
         out.overview_at = time.monotonic()
     if keep_rest and reuse is not None:
         out.you, out.people, out.profile, out.places = reuse.you, reuse.people, reuse.profile, reuse.places
+        out.card = reuse.card
         out.menu, out.menu_lines, out.skill_keys = reuse.menu, reuse.menu_lines, reuse.skill_keys
     else:
+        out.card = str(results.get("card") or "")
+        out.people = str(results.get("people") or "")
+        brief, rules = results.get("profile") if isinstance(results.get("profile"), tuple) else ("", None)
+        # the live record always (review M3: RAM-cached, its own fail-closed line when it misses its wait); the card
+        # may lack its live part
         you = results.get("you")
         out.you = YOU_UNKNOWN if you is None else str(you)   # missed its wait: fails closed
-        out.people = str(results.get("people") or "")
-        places = results.get("places")
-        out.places = places.text if isinstance(places, Places) else ""
-        out.profile = str(results.get("profile") or "") or profile_text(names=names, brief=None, rules=None,
-                                                                        limit=limits.profile_chars)
+        if out.card:
+            # kBrain (C1): the card holds who they are and their things: the brief and the places block would say the
+            # same again (the places stay read for the join check)
+            out.profile = profile_text(names=names, brief=None, rules=rules, limit=limits.profile_chars)
+            if out.you and out.you != YOU_UNKNOWN:
+                # kYou merge note 4: the card's "right now" is this record's top lines; the ones it holds whole are
+                # not said twice (the due items, the usual now and the other threads stay)
+                out.you = beside_card(out.you, out.card)
+        else:
+            places = results.get("places")
+            out.places = places.text if isinstance(places, Places) else ""
+            out.profile = profile_text(names=names, brief=brief, rules=rules, limit=limits.profile_chars)
         menu = results.get("menu")
         if isinstance(menu, tuple):
             out.menu, out.menu_lines, out.skill_keys = menu
@@ -848,9 +915,55 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "",
     return text
 
 
+def understanding_block(understanding: Mapping[str, Any] | None, *, nonce: str = "") -> str:
+    """kBrain (contract C3): the voice talker's reading of the heard words, as the planner sees it: its goal, its
+    parts (each ``what``, and the skill and slots it guessed), whether the user left a pick to Yuki, and the context
+    it noted. Model-written, so fenced and labelled as a seed (their exact words win; nothing in it is quotable).
+    ``""`` when none came or it holds nothing usable. Shape-checked only; never a reading of its words."""
+    if not isinstance(understanding, Mapping):
+        return ""
+    keep: dict[str, Any] = {}
+    goal = one_line(understanding.get("goal"), 200)
+    if goal:
+        keep["goal"] = goal
+    parts = []
+    for part in list(understanding.get("parts") or [])[:UNDERSTANDING_PARTS]:
+        if not isinstance(part, Mapping):
+            continue
+        item: dict[str, Any] = {}
+        what = one_line(part.get("what"), 160)
+        if what:
+            item["what"] = what
+        skill = one_line(part.get("skill"), 80)
+        if skill:
+            item["skill"] = skill
+        slots = part.get("slots")
+        if isinstance(slots, Mapping) and slots:
+            item["slots"] = {str(k)[:40]: (v if isinstance(v, (bool, int, float)) else one_line(v, 120))
+                             for k, v in list(slots.items())[:8]}
+        if item:
+            parts.append(item)
+    if parts:
+        keep["parts"] = parts
+    if isinstance(understanding.get("choose"), bool):
+        keep["choose"] = understanding["choose"]
+    noted = one_line(understanding.get("context"), 240)
+    if noted:
+        keep["context"] = noted
+    if not keep:
+        return ""
+    try:
+        body = json.dumps(keep, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return ""
+    return UNDERSTANDING_LABEL + "\n" + fence(clip(body, UNDERSTANDING_CHARS),
+                                             source="the voice talker's reading of their words", nonce=nonce or "seed")
+
+
 def request_turn(*, words: Sequence[str], channel: str, context: str, gathered: Gathered,
                  history: Sequence[Exchange], seed: Mapping[str, Any] | None, limits: Any,
-                 nonce: str, seed_hint: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+                 nonce: str, seed_hint: Mapping[str, Any] | None = None,
+                 understanding: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
     """The request's one user turn, as text blocks in the design's order; the last block carries breakpoint 4."""
     texts: list[str] = []
     recent = recent_block(history, limit=limits.recent_chars)
@@ -859,10 +972,16 @@ def request_turn(*, words: Sequence[str], channel: str, context: str, gathered: 
     texts.append(CHANNEL_LINES.get(channel, CHANNEL_LINES["typed"]))
     said = "\n".join(w.strip() for w in words if str(w).strip())
     texts.append(f"{WORDS_LABEL}\n{said}" if said else NO_WORDS_LINE)
+    seeded = understanding_block(understanding, nonce=nonce)
+    if seeded:
+        texts.append(seeded)
     if context.strip():
         texts.append(f"{CONTEXT_LABEL}\n" + fence(clip(context, limits.context_chars),
                                                   source="Yuki's own card or note", nonce=nonce))
     texts.append(datetime.now().strftime("[Now: %A %d %B %Y, %H:%M, local time]"))
+    if gathered.card:
+        texts.append(f"{CARD_LABEL}\n" + fence(gathered.card, source="Yuki's memory of the user (the you-card)",
+                                                nonce=nonce))
     if gathered.you:
         texts.append(f"{YOU_LABEL}\n" + fence(gathered.you, source="Yuki's memory service (what is on screen and "
                                                                     "going on now)", nonce=nonce))
@@ -1094,8 +1213,8 @@ def look_report(result: ExecResult | Mapping[str, Any], plan: Plan | None) -> st
     return "\n".join(lines)
 
 
-#: The one-word reply the planner gives after a skill route did its part when all they asked is done
-#: (:func:`skill_rest_report`; ``yuki.brain.agent.rest_done_reply`` compares it exactly).
+#: The one-word reply the planner gives after a part was done when all they asked is done
+#: (:func:`part_rest_report`; ``yuki.brain.agent.rest_done_reply`` compares it exactly).
 REST_DONE_WORD = "done"
 #: pBrain review r1 (M1: B14 on a skill route, the goal "Open a new tab in Arc with YouTube's front page." and the rest
 #: turn's ``done`` for "Open a new tab and put something on from the front page"): a rest turn reads their words, not
@@ -1104,24 +1223,6 @@ REST_DONE_WORD = "done"
 REST_LAST_PART = ("Read their words above, not the plan's goal, to the last thing they ask for. A pick their words "
                   "leave to you (\"put something on\", \"a video I'd like\") is yours to make from memory and the "
                   "screen, never a reason to stop.")
-
-
-def skill_rest_report(plan: Plan | None, line: str) -> str:
-    """A skill route that ended done (sBrainFix, F2): the skill's own check saw its own part, which may be only part of
-    what they asked ("Open YouTube home" for "open a new tab and put something on"). Whether anything is left is the
-    planner's to read from their words, never code's: it plans the rest by steps or replies that it is all done (the
-    held line then stands), read to the last thing they ask for (:data:`REST_LAST_PART`, pBrain review r1 M1).
-    Code-written; the skill is a menu id, the line code's own."""
-    pid = plan.id if plan else ""
-    skill = str(getattr(plan, "skill", "") or "") if plan else ""
-    return "\n".join([
-        f"{CHECK_LABEL} Plan {pid} ended: done. The skill {skill} did its part and its own check saw it. Yuki's line "
-        f"for it, not said yet: {one_line(line, 200)}",
-        f"Their request may ask for more than that skill does. {REST_LAST_PART} If that last thing is not done yet, "
-        f"plan the rest now by steps (revises {pid}): look first, then click or type in the app, with a done probe "
-        f"that reads that last thing; don't run that skill again or redo what it did. Reply with the one word "
-        f"{REST_DONE_WORD} only when Yuki's line shows that last thing happened. If the rest can't be done, say why "
-        f"in one short line."])
 
 
 def part_rest_report(result: ExecResult | Mapping[str, Any], plan: Plan | None, line: str) -> str:
@@ -1192,11 +1293,12 @@ def answer_report(question: str, answer: str | None) -> str:
 
 
 __all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "read_places", "Places", "channel_known",
-           "PLACES_LABEL", "read_profile", "read_menu",
+           "PLACES_LABEL", "read_profile_parts", "read_card", "beside_card", "CARD_LABEL", "understanding_block",
+           "UNDERSTANDING_LABEL", "read_menu",
            "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "seed_memory", "seed_memory_text",
            "request_turn", "Conversation",
            "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report",
-           "look_report", "skill_rest_report", "REST_DONE_WORD", "invalid_report", "unconfirmed_report",
+           "look_report", "REST_DONE_WORD", "invalid_report", "unconfirmed_report",
            "part_rest_report", "text_back_report", "REST_LAST_PART",
            "answer_report", "clip",
            "one_line", "fence", "CHECK_LABEL", "STEER_LABEL"]

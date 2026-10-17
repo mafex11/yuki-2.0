@@ -376,50 +376,38 @@ def _tastes(store: Any) -> list[str]:
 
 
 def _skills(store: Any, now: float, places: _Places) -> list[str]:
-    """The user's live learned skills' names for things (a bound site, a bound value that is a name: "Google Meet",
-    and the app they did it in), most done lately first: the times the learner saw them do it and Yuki's runs,
-    each faded by its last time."""
-    import json
-
+    """The names of the user's things the learner knows (contract C5, :func:`yuki.skills.learn.values.known`: every
+    capability's values, marked not-mine left out): each value's label (a site by the name its pages write, a value
+    that is a name: "Google Meet") and the name the user gave it (``named_by`` the user), best first by the value's own
+    recency score."""
     try:
-        from yuki.skills.catalog import LIVE_STATES
+        from yuki.skills.learn.values import known
 
-        marks = ",".join("?" * len(LIVE_STATES))
-        rows = store._query(f"SELECT app, uses, last_used_at, name_ciphertext, spec_ciphertext, provenance FROM skills "
-                            f"WHERE origin = 'learned' AND deleted_at IS NULL AND retired_at IS NULL AND state IN "
-                            f"({marks})", tuple(LIVE_STATES))
+        table = known(store, now=now)
     except Exception:  # noqa: BLE001
         return []
     site_keys = {h.casefold().split(".")[-2] if "." in h else h.casefold() for h in places.hosts}
     ranked: list[tuple[float, list[str]]] = []
-    for app, uses, last_used, name_ct, spec_ct, prov in rows:
-        try:
-            p = json.loads(prov or "{}")
-            spec = json.loads(_dec(store, spec_ct) or "{}")
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(p, dict) or not isinstance(spec, dict):
-            continue
-        w = (float(p.get("n") or 0) * _fade(now - float(p.get("last_at") or 0))
-             + float(uses or 0) * _fade(now - float(last_used or 0)))
-        label = _dec(store, name_ct)
-        names: list[str] = []
-        bound = spec.get("bound") if isinstance(spec.get("bound"), dict) else {}
-        for value in bound.values():
-            value = " ".join(str(value or "").split())
-            if "." in value or value.casefold() in site_keys:   # a host or a site's key: named as its pages write it
-                names.append(places.name_of_site(value, [label]))
-            elif _is_name(value):                               # a value that is a name ("Google Meet")
-                names.append(value)
-        # the program the learner saw them use (the provenance's app: "chrome"; the row's app is its connection)
-        for key in (p.get("app"), app):
-            got = places.app_of.get(str(key or "").casefold(), "")
-            if got:
-                names.append(got)
-                break
-        names = [n for n in names if n]
-        if names and w > 0:
-            ranked.append((w, names))
+    for values in (table or {}).values():
+        for v in values or ():
+            if not isinstance(v, dict):
+                continue
+            try:
+                w = float(v.get("score") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            names: list[str] = []
+            label = " ".join(str(v.get("label") or "").split())
+            given = " ".join(str(v.get("name") or "").split()) if v.get("named_by") == "user" else ""
+            if given:
+                names.append(given)   # the user's own word for it
+            if "." in label or label.casefold() in site_keys:   # a host or a site's key: named as its pages write it
+                names.append(places.name_of_site(label, [given] if given else []))
+            elif _is_name(label):                               # a value that is a name ("Google Meet")
+                names.append(label)
+            names = [n for n in names if n]
+            if names and w > 0:
+                ranked.append((w, names))
     return [n for _w, names in sorted(ranked, key=lambda x: -x[0]) for n in names]
 
 

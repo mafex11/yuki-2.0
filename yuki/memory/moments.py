@@ -1962,7 +1962,9 @@ def _open(db: Path | None) -> Any:
 
 
 def _copy(db: Path | None, dest: Path) -> Path:
-    from yuki.eval.c3_data import copy_db
+    """A read-only copy of ``db`` (default: the live database) into ``dest``, an empty folder
+    (:func:`yuki.eval.dbcopy.copy_db`)."""
+    from yuki.eval.dbcopy import copy_db
     from yuki.memory.store import default_db_path
 
     return copy_db(Path(db) if db else default_db_path(), dest)

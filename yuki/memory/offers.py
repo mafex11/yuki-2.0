@@ -26,8 +26,10 @@ rule about anyone's words) - of things that are plainly Yuki's own small job:
 * ``ask``: a suggested request put **unsent** in the ask bar; nothing runs until the user presses Enter, and then
   it is an ordinary request of theirs with the live strip and Stop;
 * ``run_skill`` (PLAN.md Phase R, D10, D11, D14): **code-only** (:data:`CODE_ONLY_DOS`). Only the routine lane
-  (:mod:`yuki.memory.routine_offers`) writes it, from what the user measurably does at that time (the "Your usual"
-  card: their meeting tab, never their work); it is never in a model's schema or the judge's enum
+  (:mod:`yuki.memory.routine_offers`) and the card judge's "usual" card (:func:`yuki.memory.candidates.gen_usual`, 18
+  Oct: media the user puts on at this time of day, channel :data:`USUAL_CHANNEL`) write it, from what the user
+  measurably does at that time (their meeting tab, their music, a video; never their work); it is never in a model's
+  schema or the judge's enum
   (:data:`MODEL_DOS`), :func:`validate_offer` refuses it from any model dict, and :func:`allowed_dos` gives it to
   the ``routine`` channel only. Only a skill the learner wrote from what the user does (phase L) that passes the offer
   gate (:func:`skill_offerable`: never sends, never commits, rung A or a verified rung B, its capability's offer class,
@@ -73,6 +75,9 @@ RETIRED_DOS: tuple[str, ...] = ("draft",)
 MODEL_DOS: tuple[str, ...] = tuple(d for d in OFFER_DOS if d not in CODE_ONLY_DOS and d not in RETIRED_DOS)
 #: The one card channel that may carry a code-only kind: the "Your usual" routine card (trigger ``routine``).
 ROUTINE_CHANNEL = "routine"
+#: The card judge's "usual" card (trigger ``usual``): media at the user's usual time, its button a ``run_skill`` of a
+#: shipped media capability (checked again at the click: ``candidates.usual_offerable``).
+USUAL_CHANNEL = "usual"
 #: Offers whose effect Undo takes back (06 §4.3); ``run_skill``: the window that was in front comes back.
 UNDOABLE: frozenset[str] = frozenset({"todo_add", "bring_back", "run_skill"})
 #: An offer can be acted on for this long after its card was written (s); then its button is gone (06 §4.2).
@@ -414,8 +419,8 @@ def stored_offer(nudge: Any) -> dict[str, Any] | None:
         return None
     if do == "run_skill" and (not str(offer.get("skill") or "").strip()
                               or not isinstance(offer.get("expires_at"), (int, float))
-                              or _routine_id(offer) is None):
-        return None   # only the routine lane's shape (routine_offer): a skill, its routine, its own expiry
+                              or (_routine_id(offer) is None and not offer.get("usual"))):
+        return None   # only the routine lane's or the usual card's shape: a skill, its routine or usual, its own expiry
     return offer
 
 
@@ -533,7 +538,8 @@ def habit_keys(skill: Any) -> tuple[str, ...]:
 
 def _pooled_last(store: Any, keys: tuple[str, ...], n: int) -> list[int]:
     """The newest ``n`` decided runs and rung tries of these ledger keys together, newest first (1 verified, 0 not):
-    the registry's own "last 5" read, over two keys."""
+    the registry's own "last 5" read, over two keys. A rung try that is also its run's last rung (the same run key,
+    rung, variant and via in ``skill_runs``) counts once, as the run."""
     marks = ",".join("?" * len(keys))
     from yuki.memory.testtag import sql_real_route_try, sql_real_skill_run
 
@@ -542,27 +548,36 @@ def _pooled_last(store: Any, keys: tuple[str, ...], n: int) -> list[int]:
             f"SELECT checked, recheck FROM (SELECT checked, recheck, coalesce(t_done, t0) AS t, id FROM skill_runs WHERE"
             f" skill IN ({marks}) AND checked IS NOT NULL AND rung IS NOT NULL AND {sql_real_skill_run()} UNION ALL"
             f" SELECT checked, NULL, at, id FROM skill_route_tries WHERE skill IN ({marks}) AND checked IS NOT NULL"
-            f" AND {sql_real_route_try()}) ORDER BY t DESC, id DESC LIMIT ?", (*keys, *keys, int(n)))
+            f" AND {sql_real_route_try()} AND NOT EXISTS (SELECT 1 FROM skill_runs r WHERE"
+            f" r.run_key = skill_route_tries.run_key AND r.rung = skill_route_tries.rung AND"
+            f" r.variant IS skill_route_tries.variant AND r.via = skill_route_tries.via))"
+            f" ORDER BY t DESC, id DESC LIMIT ?", (*keys, *keys, int(n)))
     except Exception:  # noqa: BLE001
         return []
     return [1 if int(c) == 1 and r != 0 else 0 for c, r in rows]
 
 
 def offer_trusted(store: Any, skill: Any, *, now: float | None = None) -> bool:
-    """D14 for a routine card's skill: ``yuki.skills.registry.offer_ready`` on the skill's own runs. A usage record's
-    runs are pooled with its capability's (:func:`habit_keys`; lWire review r1 M3: "play my X playlist" is ledgered on
-    the capability, so the record's own key alone could never reach the bar): the same bar and numbers (the
-    registry's), on the verified runs of both keys, the newest 5 read across both by time. Never raises."""
+    """D14 for a routine card's skill. An ``open`` skill (bring a tab or a page forward: undoable, its run checked by
+    its own done-check, the card says what happened) is trusted unless it is distrusted (18 Oct): one of its routes
+    disabled, or its newest decided run failed. D14's "2 verified runs first" kept the one learned routine (the
+    weekday Meet tab, never run by Yuki) from ever being offered. A ``change`` skill keeps D14's bar:
+    ``yuki.skills.registry.offer_ready`` on its own runs, a usage record's runs pooled with its capability's
+    (:func:`habit_keys`; lWire review r1 M3), the newest 5 read across both by time. Never raises."""
     from yuki.skills import registry
 
     keys = habit_keys(skill)
     try:
+        if str(getattr(skill, "kind", "") or "change") == "open":
+            for k in keys:
+                if any(t.disabled_at for t in registry.trust(store, k, now=now, real_only=True).values()):
+                    return False
+            newest = _pooled_last(store, keys, 1)
+            return not newest or newest[0] == 1
         if len(keys) < 2:
             return bool(registry.offer_ready(store, skill, now=now))
         # lBrain: an offer is a learner's call, so a live test's runs never count (``real_only``, as offer_ready)
         total_ok = sum(sum(t.ok for t in registry.trust(store, k, now=now, real_only=True).values()) for k in keys)
-        if str(getattr(skill, "kind", "") or "change") == "open":
-            return total_ok >= registry.OPEN_RUNS
         newest = _pooled_last(store, keys, registry.CHANGE_WINDOW)
         return (total_ok >= registry.CHANGE_RUNS and len(newest) >= registry.CHANGE_WINDOW
                 and 0 not in newest[:registry.CHANGE_WINDOW])
@@ -641,6 +656,50 @@ def skill_offerable(store: Any, skill: Any, *, meta: dict[str, Any] | None = Non
     return True, "ok"
 
 
+#: The record's own verdicts a value routine replaces with its value's (:func:`routine_gate`): the learner's static
+#: part (a ``judged`` record's ``everyday`` is per value) and the record's naming verdict.
+VALUE_OWNS: tuple[str, ...] = ("static", "nameless", "may_be_work")
+
+
+def routine_value(store: Any, key: Any) -> tuple[str, dict[str, Any]] | None:
+    """``(capability key, value)`` of a routine on one value of a capability's record (``skill:<record id>|<value
+    id>``, contract C5; :func:`yuki.skills.learn.values.routine_value`), else ``None``. Never raises."""
+    if not key or "|" not in str(key):
+        return None
+    try:
+        from yuki.skills.learn.values import routine_value as _value
+
+        return _value(store, key)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def routine_gate(store: Any, skill: Any, key: Any = None, *, meta: dict[str, Any] | None = None,
+                 value: tuple[str, dict[str, Any]] | None = None) -> tuple[bool, str]:
+    """The offer gate of a routine keyed ``key`` on ``skill``: :func:`skill_offerable`, and for a routine on one value
+    of a capability's record (:func:`routine_value`; ``value`` when the caller read it already) the value's own gate
+    (``yuki.skills.learn.values.routine_offerable``: its everyday and Not mine) in place of the record's naming verdict
+    (:data:`VALUE_OWNS`). The record's live state, sends, commit, class, rung and won't line stay. ``(ok, why)``."""
+    meta = skill_meta(store, skill) if meta is None and skill is not None else meta
+    ok, why = skill_offerable(store, skill, meta=meta)
+    value = value if value is not None else routine_value(store, key)
+    if value is None or (not ok and why not in VALUE_OWNS):
+        return ok, why
+    if why == "static":
+        # skill_offerable stopped before its rung check: the rung is the record's own
+        rung = str(((meta or {}).get("prov") or {}).get("rung") or "")
+        if rung not in OFFER_RUNGS or (rung == "B" and not _rung_b_verified(store, habit_keys(skill))):
+            return False, "rung"
+    if not ok and skill_wont_line(skill) is None:
+        return False, "unknown_wont"
+    try:
+        from yuki.skills.learn.values import routine_offerable
+
+        return routine_offerable(value[1])
+    except Exception:  # noqa: BLE001
+        return False, "no_value"
+
+
 def card_question(store: Any, skill: Any, *, fallback: str = "", meta: dict[str, Any] | None = None) -> str:
     """The routine card's question: the learned skill's own name as a question ("<name>?") when it has a real one
     (the naming call's or the user's), else ``fallback`` (the lane's fixed words for its end kind); ``""``: none."""
@@ -659,17 +718,19 @@ def routine_offer(store: Any, routine: Any, now: float | None = None, *, expires
                   question: str = "") -> tuple[dict[str, Any] | None, str]:
     """The ``run_skill`` offer of a routine card, built by code (no model), or ``(None, why)``:
 
-    * ``no_skill`` (the routine's skill isn't loaded); the offer gate's own words (:func:`skill_offerable`:
+    * ``no_skill`` (the routine's skill isn't loaded); the offer gate's own words (:func:`routine_gate`:
       ``not_learned``, ``not_live``, ``sends``, ``commit``, ``offer_class``, ``static``, ``rung``, ``nameless``,
-      ``may_be_work``, ``unknown_wont``); ``no_preview`` (no card question: ``question``, else
-      :func:`card_question` with no fallback); ``bad_params`` (a bound parameter the skill has no slot for);
+      ``may_be_work``, ``unknown_wont``; a value routine's ``not_mine``, ``work``, ``may_be_work``); ``no_preview``
+      (no card question: ``question``, else :func:`card_question` with no fallback); ``bad_params`` (a bound
+      parameter the skill has no slot for);
     * ``not_ready``: its route isn't trusted for offers (:func:`offer_trusted`: ``yuki.skills.registry.offer_ready``,
       D14: 2 verified runs for opening things, 5 and none failed in the last 5 for changing things; a usage record's
       runs pooled with its capability's);
     * ``unavailable``: the skill's own availability check, last because it reads the screen (``available(skill)``:
       a site tab census; ``None`` = couldn't read counts as not available).
 
-    ``routine``: a :class:`yuki.memory.routine_offers.Routine` (``id``, ``skill_id``, ``params``, ``offer_mode``).
+    ``routine``: a :class:`yuki.memory.routine_offers.Routine` (``id``, ``key``, ``skill_id``, ``params``,
+    ``offer_mode``).
     ``ready`` / ``skills`` replace the registry check and the skill loader (tests, replays)."""
     now = time.time() if now is None else float(now)
     key = str(getattr(routine, "skill_id", "") or "")
@@ -686,7 +747,7 @@ def routine_offer(store: Any, routine: Any, now: float | None = None, *, expires
     if skill is None:
         return None, "no_skill"
     meta = skill_meta(store, skill)
-    ok, why_not = skill_offerable(store, skill, meta=meta)
+    ok, why_not = routine_gate(store, skill, getattr(routine, "key", None), meta=meta)
     if not ok:
         return None, why_not
     preview = _squash(question or card_question(store, skill, meta=meta), STEP_MAX)
@@ -833,11 +894,28 @@ def _act_run_skill(store: Any, n: Any, offer: dict[str, Any], now: float) -> dic
     card (channel ``routine``: kind ``notice``, trigger ``routine``) may carry it: any other card is refused
     (``no_offer``), whatever its offer says."""
     do = "run_skill"
-    if channel_of(n) != ROUTINE_CHANNEL:
+    channel = channel_of(n)
+    if channel not in (ROUTINE_CHANNEL, USUAL_CHANNEL):
         return {"ok": False, "why": "no_offer", "do": do}
     if now > float(offer["expires_at"]):
         _set_outcome(store, n.id, "expired", at=now, only_if=(None,))
         return {"ok": False, "why": "expired", "do": do}
+    if channel == USUAL_CHANNEL:   # a shipped media capability, checked again now (never the user's work)
+        try:
+            from yuki.memory.candidates import usual_offerable
+            from yuki.skills.catalog import load
+
+            skill = load(store=store).get(str(offer["skill"]))
+            ready = skill is not None and usual_offerable(skill) and str(offer.get("usual") or "") == skill.key
+        except Exception:
+            ready = False
+        if not ready:
+            return {"ok": False, "why": "not_ready", "do": do}
+        if not _set_outcome(store, n.id, "running", at=now, only_if=(None,)):
+            got = store.nudge(n.id)
+            return {"ok": False, "why": "already", "state": getattr(got, "outcome", None) or "running", "do": do}
+        return {"ok": True, "do": do, "state": "running", "skill": str(offer["skill"]),
+                "slots": dict(offer.get("slots") or {}), "undo": True}
     rid = _routine_id(offer)
     try:
         from yuki.memory import routine_offers
@@ -851,7 +929,8 @@ def _act_run_skill(store: Any, n: Any, offer: dict[str, Any], now: float) -> dic
         from yuki.skills.catalog import load
 
         skill = load(store=store).get(str(offer["skill"]))
-        ready = bool(skill is not None and skill_offerable(store, skill)[0] and offer_trusted(store, skill, now=now))
+        ready = bool(skill is not None and routine_gate(store, skill, r.key)[0]
+                     and offer_trusted(store, skill, now=now))
     except Exception:
         ready = False
     if not ready:
@@ -1078,7 +1157,7 @@ __all__ = [
     "WONT_LINES", "SKILL_WONT_LINES", "RUN_OUTCOMES", "OFFER_SCHEMA", "JUDGE_OFFER_PROPERTIES",
     "OFFER_RULES", "WEIGHTS", "OFF_AT", "LEARN_WINDOW_S", "STOP_WITHIN_S", "resolve_ref", "validate_offer",
     "stored_offer", "card_offer_view", "skill_wont_line", "skill_meta", "named", "usage_capability", "habit_keys",
-    "offer_trusted", "skill_offerable", "card_question",
+    "offer_trusted", "skill_offerable", "VALUE_OWNS", "routine_value", "routine_gate", "card_question",
     "OFFER_COMMITS", "OFFER_RUNGS", "routine_offer", "act", "offer_result", "undo",
     "record_outcome", "channel_of", "signal", "offer_scores", "allowed_dos", "offer_allowed", "outcome_words",
     "feedback_lines",

@@ -14,10 +14,14 @@
 # when the app's link data can build one (discord://, slack://, whatsapp://send?phone=), else the app's quick switcher
 # or search; last, a chat whose address is a web page the app's link data matches opens at that address in a browser
 # (web_link: the chat only, nothing typed there). Each opens the chat and checks it is open by memory's encrypted
-# thread ids or its address (never a window title) before anything is typed. Rule 8: "send X to Y" types X and presses
-# send (after Yuki's own check, the judge); naming only the person, or saying what to write without "send", leaves a
-# draft. A send is checked by memory's capture of the sent message. Never offered (offer_class = "never"). Never with a
-# game in front ("after the round?"). The code is yuki/skills/chat.py and yuki/skills/web_route.py.
+# thread ids or its address (never a window title) before anything is typed. Rule 8 (send rule, lead decision 18 Oct):
+# words that message, tell, ask or reply to someone and give what to say ("tell Y X", "send X to Y", "reply to Y
+# saying X") send exactly that text, once, after the countdown they can stop (Yuki's own check, the judge, sees the
+# send key); naming only the person opens the chat, and asking for a draft types it and leaves it. The talker or the
+# planner judges which from their words (send = "send" / "draft"); nothing here lists words. Into a person's own
+# direct message only, never a group chat or channel unless they named it. A send is checked by memory's capture of
+# the sent message. Never offered (offer_class = "never"). Never with a game in front ("after the round?"). The code
+# is yuki/skills/chat.py and yuki/skills/web_route.py.
 
 [connection]
 app = "chat"
@@ -26,8 +30,8 @@ app = "chat"
 end = "message_sent"
 kind = "change"
 # (the menu line with its slots must fit yuki/skills/connection.py MENU_LINE_CHARS, 140, or the talker sees no slot
-# names: 133 with these words)
-menu = "message a person, group or channel in a chat app; a draft unless they said send"
+# options: 137 with these words)
+menu = "message a person, group or chat channel; sends words they gave, a draft if they ask"
 done_line = "Done."
 commit = "words"
 offer_class = "never"
@@ -77,7 +81,9 @@ role = "fill"
 default = ""
 ask = "What should I write?"
 
-# send: they plainly said to send it; draft: type it and leave it for them.
+# send: their words message, tell, ask or reply to someone and give what to say (sent after the countdown: exactly
+# that text, once); draft: they asked for a draft (typed and left for them). Naming only the person gives no text (the
+# chat opens). The talker or the planner judges it from their words; the default is a draft.
 [[capability.message.slot]]
 name = "send"
 type = "enum"

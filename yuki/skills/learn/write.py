@@ -1,6 +1,11 @@
 """Writing learned skills (phase L design §4.6, §4.7, §4.9): one transaction, the cap, the trust ladder, tombstones,
 content-free provenance, and the hook for the naming call (phase L ``lName``: ``yuki.skills.learn.name``).
 
+* **One record per capability** (contract C5): a capability's record (``<capability>#all``) holds its known values in
+  its spec (``spec["values"]``, :mod:`yuki.skills.learn.values`); a per-value row the learner wrote before (one per
+  site) is retired by the pass that writes its capability's record (``retired_why = "values"``), its user marks (a
+  Rename, Not mine, the work verdict) carried onto the value. A per-value row a live routine is keyed on stays as that
+  routine's anchor (:func:`kept_keys`), out of the menu.
 * **Rows**: a passing capability-backed group is a ``skills`` row with ``origin = 'learned'`` and ``capability_id``
   (its capability's row, seeded from the files by ``yuki.skills.registry.seed``). ``spec_ciphertext`` holds the
   catalog's spec (``yuki.skills.catalog``, ``SPEC_VERSION`` 1: the bound key values, the menu line, the learned rungs),
@@ -144,7 +149,7 @@ def provenance(group: Group, cap: Any, compiled: Any, store: Any, now: float) ->
         "late": sum(1 for o in user if not o.context_known),
         "means": compiled.means, "app": app, "app_share": round(share, 3),
         "verbs": {k: dict(v) for k, v in verbs.items()}, "covered": compiled.covered,
-        "merged": list(group.merged_from), "label": _clip(f"{label_app}: {cap.key.rpartition('.')[2].replace('_', ' ')}"
+        "label": _clip(f"{label_app}: {cap.key.rpartition('.')[2].replace('_', ' ')}"
                                                           if label_app else cap.key, 60),
         "moments": [o.end_moment_id for o in sorted(user, key=lambda o: o.at)[-30:] if o.end_moment_id is not None],
         "score": None, "built_at": round(now, 1),
@@ -324,6 +329,87 @@ def _existing(store: Any) -> dict[str, dict[str, Any]]:
     return out
 
 
+def kept_keys(store: Any) -> frozenset[str]:
+    """The skill keys of the per-value learned rows that keep their own group (contract C5's one exception): a row a
+    routine that is not retired is keyed on (``routines.key = 'skill:<id>'``, or its ``skill_id`` naming the row's key:
+    the routine's anchor, which must stay loadable for the routine's card), and a row the user marked Forget this / Not
+    mine (its occasions keep the tombstone's id). Never raises (empty)."""
+    out: set[str] = set()
+    try:
+        for (key,) in store._query(
+                "SELECT s.key FROM skills s WHERE s.origin = 'learned' AND s.key NOT LIKE '%#all' AND ("
+                "s.deleted_at IS NOT NULL OR s.state IN ('deleted', 'not_mine') OR ('skill:' || s.id) IN ("
+                "SELECT r.key FROM routines r WHERE r.state != 'retired') OR s.key IN ("
+                "SELECT r.skill_id FROM routines r WHERE r.state != 'retired' AND r.skill_id IS NOT NULL))"):
+            out.add(str(key))
+    except Exception:  # noqa: BLE001 - a database before the routines table: tombstones alone
+        try:
+            out = {str(k) for (k,) in store._query(
+                "SELECT key FROM skills WHERE origin = 'learned' AND key NOT LIKE '%#all' AND (deleted_at IS NOT"
+                " NULL OR state IN ('deleted', 'not_mine'))")}
+        except Exception:  # noqa: BLE001
+            return frozenset()
+    return frozenset(out)
+
+
+def _own_values(store: Any, existing: dict[str, dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
+    """The record's own say by value id: its kept ``marks`` (values idle for a while keep theirs), then its last values
+    (the user's Rename, Not mine and the work verdict carry over). RAM only."""
+    from yuki.skills.learn.values import MARK_FIELDS
+
+    old = existing.get(key)
+    out: dict[str, dict[str, Any]] = {}
+    if old is not None:
+        spec = _old_spec(store, old)
+        kept = spec.get("marks")
+        for vid, f in (kept.items() if isinstance(kept, dict) else ()):
+            if isinstance(f, dict):
+                out[str(vid)] = {k: f.get(k) for k in MARK_FIELDS}
+        for v in spec.get("values") or []:
+            if isinstance(v, dict) and v.get("id"):
+                out[str(v["id"])] = {k: v.get(k) for k in MARK_FIELDS}
+    return out
+
+
+def _carry_rows(store: Any, existing: dict[str, dict[str, Any]], cap: Any, vals: list[dict[str, Any]],
+                own: dict[str, dict[str, Any]]) -> None:
+    """A value the record did not hold before takes what the per-value row(s) the learner wrote for it said: the
+    naming call's everyday verdict, the user's Forget / Not mine (``mark``) and Rename. A row is found by its key (the
+    value with each of its parts' values: a site's page kinds), never by reading its words. In place; RAM only."""
+    from yuki.skills.learn import values as V
+    from yuki.skills.learn.group import skill_key, value_digest
+
+    ident, others = V.value_slots(cap)
+    if ident is None:
+        return
+    for v in vals:
+        if v["id"] in own:
+            continue        # the record already carries this value: its own marks win (a restore stays restored)
+        base = [(ident.name, value_digest(store.cipher, ident.name, v["value"]))]
+        tries = [tuple(sorted(base))]
+        for s in others:
+            for part in (v.get("parts") or {}).get(s.name) or {}:
+                if part:
+                    tries.append(tuple(sorted([*base, (s.name, value_digest(store.cipher, s.name, part))])))
+        for keys in tries:
+            row = existing.get(skill_key(store.cipher, cap.key, keys))
+            if row is None:
+                continue
+            prov = row.get("prov") or {}
+            if v.get("everyday") is None and isinstance(prov.get("everyday"), bool):
+                v["everyday"] = prov["everyday"]
+            if row.get("deleted_at") is not None or row.get("state") in TOMBSTONES:
+                v["mark"] = "not_mine"
+            if prov.get("named_by") == "user" and v.get("named_by") != "user":
+                try:
+                    name = " ".join(str(store._dec(row["name_ciphertext"]) or "").split()) if row.get(
+                        "name_ciphertext") else ""
+                except Exception:  # noqa: BLE001
+                    name = ""
+                if name:
+                    v["name"], v["named_by"] = name, "user"
+
+
 def plan(store: Any, groups: Sequence[Group], caps: dict[str, Any], compiled: dict[str, Any], now: float
          ) -> tuple[list[Planned], Counter]:
     """The rows the passing capability-backed groups make, ranked and capped (no write)."""
@@ -360,6 +446,20 @@ def plan(store: Any, groups: Sequence[Group], caps: dict[str, Any], compiled: di
         p = Planned(group=g, cap=cap, compiled=compiled[g.gid], key=key, row_id=int(old["id"]) if old else None)
         bound = bound_values(g, cap)
         p.spec = {"v": 1, "bound": bound, "menu": menu_line(cap, bound), "routes": list(p.compiled.routes)}
+        if g.usage:
+            # contract C5: the record's known values (the sites, services, playlists), the user's say carried over
+            from yuki.skills.learn import values as V
+
+            own = _own_values(store, existing, key)
+            vals = V.build(g, cap, store, now, own, extra=g.extra)
+            _carry_rows(store, existing, cap, vals, own)
+            if vals:
+                p.spec["values"] = vals
+                counts["values"] += len(vals)
+            # the user's say outlives a value's idle days (review M1): kept by value id, applied when it comes back
+            marks = V.marks_of(own, vals)
+            if marks:
+                p.spec["marks"] = marks
         p.provenance = provenance(g, cap, p.compiled, store, now)
         if scorer is not None:
             try:
@@ -402,8 +502,9 @@ def plan(store: Any, groups: Sequence[Group], caps: dict[str, Any], compiled: di
         p.provenance["verified_runs"] = verified
         out.append(p)
     out.sort(key=lambda p: (-p.score, p.key))
+    anchors = kept_keys(store)
     for i, p in enumerate(out):
-        if i >= MAX_SKILLS:
+        if i >= MAX_SKILLS and p.key not in anchors:     # a live routine's anchor stays loadable (never listed)
             p.state = LISTED
             counts["listed"] += 1
             continue
@@ -510,10 +611,15 @@ def write(store: Any, planned: list[Planned], *, now: float, cap_ids: dict[str, 
     stops passing keeps its state while its last occasion or use is under :data:`DORMANT_DAYS` old (design §4.7,
     review r2 L6; ``last_seen``: each key's latest occasion this pass, passing or not), then goes ``dormant``, and
     ``retired`` after :data:`RETIRE_DAYS`. Returns counts (content-free)."""
+    from yuki.skills.catalog import LIVE_STATES
+
     last_seen = last_seen or {}
     counts: Counter = Counter()
     existing = _existing(store)
     keep = {p.key for p in planned}
+    # contract C5: the capabilities whose record this pass writes; their per-value rows retire now (values carried)
+    recorded = {p.cap.key for p in planned if p.group.usage and p.spec.get("values")}
+    anchors = kept_keys(store)
 
     def op(conn: Any) -> None:
         for p in planned:
@@ -581,6 +687,24 @@ def write(store: Any, planned: list[Planned], *, now: float, cap_ids: dict[str, 
         for key, old in existing.items():
             if key in keep or old.get("deleted_at") is not None or old.get("state") in TOMBSTONES:
                 continue
+            cap_key, _, tail = key.rpartition("#")
+            if cap_key in recorded and tail != "all" and key not in anchors:
+                if old.get("state") == "retired":
+                    continue
+                prov = dict(old.get("prov") or {})
+                prov["retired_why"] = "values"
+                cur = conn.execute("UPDATE skills SET state = 'retired', retired_at = ?, provenance = ?, updated_at = ?"
+                                   " WHERE id = ? AND deleted_at IS NULL AND state NOT IN (?, ?)",
+                                   (now, json.dumps(prov, sort_keys=True, separators=(",", ":"), default=str), now,
+                                    int(old["id"]), *TOMBSTONES))
+                if cur.rowcount:
+                    counts["retired_values"] += 1
+                continue
+            if key in anchors and old.get("state") in LIVE_STATES:
+                # a live routine's anchor stays loadable while its routine stands (kProactive merge note 4): the
+                # routine miner retires the routine, then this row goes the usual way
+                counts["kept_anchor"] += 1
+                continue
             last = max(float(old["prov"].get("last_at") or 0.0), float(old.get("last_used_at") or 0.0),
                        float(last_seen.get(key) or 0.0))
             idle_days = (now - last) / DAY_S if last else RETIRE_DAYS + 1
@@ -617,5 +741,6 @@ def capability_ids(store: Any) -> dict[str, int]:
 
 
 __all__ = ["DORMANT_DAYS", "RETIRE_DAYS", "TOMBSTONES", "LISTED", "NAME_PROVENANCE", "NAME_SPEC_FIELDS", "Planned",
+           "kept_keys",
            "WriteResult", "bound_values", "menu_line", "provenance", "name_input", "offer_static", "plan",
            "name_planned", "write", "capability_ids"]

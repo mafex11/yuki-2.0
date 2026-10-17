@@ -94,8 +94,6 @@ STANDING_SECTION_HEADINGS = RULE_HEADINGS + (
 #: logged requests replayed on a copy of the real memory (docs/research/revamp-2026-10-02/22-build-A6-A9.md); before,
 #: the same 5 to-dos and 5 know-how lines (~2.5k chars) went with every request.
 TODO_MIN_COSINE = 0.40
-KNOWHOW_MIN_COSINE = 0.40
-KNOWHOW_APP_MIN_COSINE = 0.30
 
 #: Longest memory query (the embedder reads ~128 tokens, ~500 characters of English).
 MEMORY_QUERY_CHARS = 500
@@ -148,9 +146,6 @@ BRIEF_TTL_S = 300.0
 
 #: Bound on the task frame's memory read (``MemoryClient.frame_facts``: SQL only, a few ms on the real memory).
 FRAME_TIMEOUT_S = 0.5
-
-#: Most know-how lines attached to one request.
-KNOWHOW_LINES = 6
 
 #: Longest a request waits for the embedding of its words for the know-how similarity
 #: lookup. The memory service's embedder answers in ~10-30 ms; a cold one (or a local
@@ -256,10 +251,6 @@ class MemoryContext:
     #: The ids of the brief lines in it and the brief's version (for the personal-ness log, ``record_surfaced``).
     brief_ids: list[str] = field(default_factory=list)
     brief_at: float | None = None
-    #: Practice memory for this request (``MemoryClient.practice``: procedures and a habit or style note near the
-    #: words, pitfalls of the apps in play), for the task frame; ``None`` from an older memory (then know-how lines
-    #: come as before).
-    practice: dict[str, Any] | None = None
     #: Wall time of the fast-memory lookup (embedding + ranking), ms.
     relevant_ms: float = 0.0
     #: What the whole memory holds for this moment (``MemoryClient.related``: the user's words, their screen,
@@ -905,7 +896,7 @@ class MemoryAccess:
         action: bool = False,
         open_apps: Any = (),
     ) -> MemoryContext:
-        """Portrait, practice memory (or know-how), standing context and (asked for) resume context. Never raises.
+        """Portrait, the brief, standing context and (asked for) resume context. Never raises.
 
         The lookups share one bound. When the portrait cannot be fetched but an
         older one was, that one is used (``stale_cache``); know-how, standing
@@ -930,8 +921,8 @@ class MemoryAccess:
             action: The request asks Yuki to act (the caller's measure: a spoken hand-off, or a task frame that
                 resolved a person, a route or a referent): Yuki's own past exchanges from other days weigh less in
                 the whole-memory ranking (``yuki.memory.related.ACTION_OWN_DISCOUNT``).
-            open_apps: The open windows' process names: with the apps the words name and ``apps``, the apps in play
-                whose pitfalls practice memory always shows (``MemoryClient.practice``).
+            open_apps: The open windows' process names (kept for the callers; practice memory's notes are no longer
+                fetched: audit 17 Oct 2026).
         """
         started = time.perf_counter()
         deadline = started + timeout_s
@@ -955,23 +946,6 @@ class MemoryAccess:
                 result.brief_ids = list(cut["ids"]) if cut["text"] else []
                 result.brief_at = cut["at"] if cut["text"] else None
             remaining = max(deadline - time.perf_counter(), 0.05)
-            if "practice" not in self._absent:
-                # practice memory (Phase C) replaces the know-how lines: procedures near the words, pitfalls of the
-                # apps in play (named in the words, the open windows, the caller's) - not the window in front alone
-                try:
-                    found = self.call_method(
-                        "practice", query, apps=[str(a) for a in (apps or ()) if a],
-                        open_apps=[str(a) for a in (open_apps or ()) if a] + ([app] if app else []),
-                        embed_wait_s=min(KNOWHOW_EMBED_WAIT_S, remaining), timeout_s=remaining)
-                    result.practice = found if isinstance(found, dict) else None
-                except MemoryUnavailable:
-                    result.practice = None
-            if result.practice is None:
-                try:
-                    result.knowhow = self._knowhow_lines(app, query, max(deadline - time.perf_counter(), 0.05),
-                                                         gate=gate, apps=apps)
-                except MemoryUnavailable as exc:
-                    result.error = result.error or str(exc)
             if "standing_parts" not in self._absent:
                 try:
                     parts = self.call_method("standing_parts", timeout_s=max(deadline - time.perf_counter(), 0.05))
@@ -1101,26 +1075,6 @@ class MemoryAccess:
             except MemoryUnavailable:
                 return None
         return found if isinstance(found, dict) else None
-
-    def _knowhow_lines(self, app: str | None, query: str, remaining: float, *, gate: bool, apps: Any) -> list[str]:
-        """Know-how for this request: by measured relevance to the words when gated (:data:`KNOWHOW_MIN_COSINE`, the
-        apps in play at :data:`KNOWHOW_APP_MIN_COSINE`), else the old order (the app in front's, then similar).
-        Raises :class:`MemoryUnavailable`."""
-        wait = min(KNOWHOW_EMBED_WAIT_S, remaining)
-        named = [str(a) for a in (apps or ()) if a]
-
-        def fetch(c: Any) -> Any:
-            if gate:
-                try:
-                    return c.knowhow(app=app, query=query, limit=KNOWHOW_LINES, embed_wait_s=wait,
-                                     min_cosine=KNOWHOW_MIN_COSINE, apps=named,
-                                     app_min_cosine=KNOWHOW_APP_MIN_COSINE)
-                except TypeError:   # an older memory: no floors
-                    pass
-            return c.knowhow(app=app, query=query, limit=KNOWHOW_LINES, embed_wait_s=wait)
-
-        lines = self.call("knowhow", fetch, timeout_s=remaining)
-        return [str(line).strip() for line in (lines or []) if str(line).strip()][:KNOWHOW_LINES]
 
     def _gate_todos(self, result: MemoryContext, query: str, deadline: float) -> None:
         """Keep only the to-dos whose cosine to the words clears :data:`TODO_MIN_COSINE` (the user's list and the

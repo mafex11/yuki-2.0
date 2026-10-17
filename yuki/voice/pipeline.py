@@ -37,7 +37,7 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from yuki.config import Settings
+from yuki.config import Settings, thinking_off
 from yuki.voice.expressive import strip_tags
 from yuki.voice.keys import DEEPGRAM, ELEVENLABS, GOOGLE, get_key
 from yuki.voice.keyterms import name_terms, vocabulary
@@ -69,6 +69,24 @@ def _with_text(event: Any, text: str) -> Any:
 
         return SimpleNamespace(type=getattr(event, "type", "content_block_delta"), index=getattr(event, "index", 0),
                                delta=SimpleNamespace(type="text_delta", text=text))
+
+
+async def read_head(stream: Any) -> tuple[list[Any], bool]:
+    """The talker's stream up to its first content block (``message_start``, pings), and whether the reply was
+    declined before any output (kMind, review M2: a ``message_delta`` with ``stop_reason`` ``refusal`` before any
+    content). A failure the stream reports on its way there raises here, where the failover catches it."""
+    head: list[Any] = []
+    while True:
+        try:
+            event = await stream.__anext__()
+        except StopAsyncIteration:
+            return head, False
+        head.append(event)
+        kind = getattr(event, "type", "")
+        if kind == "message_delta":
+            return head, getattr(getattr(event, "delta", None), "stop_reason", None) == "refusal"
+        if kind in ("content_block_start", "message_stop"):
+            return head, False
 
 #: Default voices per provider when ``Settings.voice_tts_voice`` is empty.
 DEFAULT_VOICES = {"elevenlabs": "cgSgspJ2msm6clMCkdW9", "deepgram": "aura-2-thalia-en"}
@@ -439,13 +457,7 @@ class LlmCall:
     early_say: float | None = None      # a call's say_first went to the voice while the call was being written
     route: str | None = None            # E3a (v3.17): the router's decision for this turn (thinker / talker / None)
     route_ms: float | None = None       # and how long it took from its request
-    # v3.18: practice memory's lines in the volatile block (yuki.voice.practice): which lookup, its wait, and what the
-    # block held (kinds and ids, size); the text itself only goes into the request
-    practice: str = "off"               # final | partial | previous | none | off
-    practice_wait_ms: float | None = None
-    practice_block: str | None = None   # content: the request only, never a log
-    talker_block: str = ""              # "pitfall:7;habit:9;skill:12"
-    talker_block_chars: int = 0
+    tool: bool = False                 # kMind: a tool call began in this reply (the claim gate stops checking)
 
 
 #: Tools whose spoken acknowledgement travels in the call itself (``say_first``), said as soon as it is written.
@@ -1142,7 +1154,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 named=bool(hook("named", default=False)), work=hook("work", default=None),
                 cut=hook("cut", default=None), after_goodbye=bool(hook("after_goodbye", default=False)),
                 channel=channel, rerun=bool(hook("rerun", default=False)), state=hook("state", default=None),
-                practice=getattr(self._yuki_call, "practice_block", None), talker=talker))
+                talker=talker))
             return params
 
         def _sync_cancel_tools(self) -> None:
@@ -1177,17 +1189,24 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             params.result_callback = settle
             await super()._cancel_tool_handler(params)
 
-        async def _yuki_open(self, api_call: Any, params: Any) -> tuple[Any, Any]:
-            """Open the reply's stream and read its first event, with failover (v3.5).
+        async def _yuki_open(self, api_call: Any, params: Any) -> tuple[Any, list[Any]]:
+            """Open the reply's stream and read its head (the events before its first content block), with failover
+            (v3.5).
 
             The mouth had none (the reliability builder's note, 2026-09-27). As ``yuki.agent.failover``
             does for the brain: a failure that says nothing about the request (throttled, overloaded, 5xx,
             timeout, no connection) is retried once on the same target after a short backoff, a missing
             model or profile (404/424) moves on at once, then the chain of ``Settings.model_fallbacks`` for
-            the mouth's model (the global profile from us-east-1, the US profile, then Sonnet). The first
-            event is read here because Bedrock often reports throttling as the stream's first event. A
+            the mouth's model (the global profile from us-east-1, the US profile, then Sonnet). The head
+            is read here because Bedrock often reports throttling as the stream's first event. A
             target that worked is kept for ``failover_sticky_s``. Logged ``model_retry`` /
             ``model_failover`` (content-free).
+
+            kMind (review M2): a reply the model declined before any output (Sonnet 5.5's safety classifiers: HTTP 200,
+            ``stop_reason`` ``refusal``, no content) is run once more on the first target of the chain with another
+            model (thinking off as that model takes it), never made sticky (a decline is about this request); logged
+            ``model_refusal`` (content-free). With no other model, or a second decline, the declined reply goes on as
+            before (silent: the reply watch answers the turn again).
             """
             from yuki.agent.failover import adapt_params, classify
 
@@ -1199,8 +1218,12 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             moved = bool(callable(routed) and routed())
             tries = 1 if moved else 2
             last: BaseException | None = None
+            declined: tuple[str, Any, list[Any]] | None = None   # (the model, its stream, its head)
             for index in range(start, len(chain)):
                 target = chain[index]
+                model = str((target or {}).get("model") or params.get("model") or "")
+                if declined is not None and model == declined[0]:
+                    continue   # the same model declines the same request again
                 for attempt in range(tries if index == 0 else 1):
                     try:
                         if target is None and moved:
@@ -1212,14 +1235,22 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                             response = await super()._create_message_stream(api_call, params)
                         else:
                             client = hooks.client_for(target.get("region"))
-                            response = await client.beta.messages.create(**adapt_params(params, target["model"]))
+                            moved_params = adapt_params(params, target["model"])
+                            off = params.get("thinking")
+                            if isinstance(off, dict) and off.get("type") in ("disabled", "between_tools"):
+                                moved_params["thinking"] = thinking_off(target["model"])   # kMind: each model's own
+                            response = await client.beta.messages.create(**moved_params)
                         stream = response.__aiter__()
-                        try:
-                            first = await stream.__anext__()
-                        except StopAsyncIteration:
-                            first = None
-                        hooks.model_ok(index, target)
-                        return stream, first
+                        head, refused = await read_head(stream)
+                        if refused and declined is None:
+                            declined = (model, stream, head)
+                            hook("model_declined", "declined", target)
+                            break   # once, on the next target with another model
+                        if declined is not None:
+                            hook("model_declined", "refused_again" if refused else "answered", target)
+                        else:
+                            hooks.model_ok(index, target)
+                        return stream, head
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:  # noqa: BLE001 - classified from the SDK's own types
@@ -1232,6 +1263,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                             await asyncio.sleep(0.4)
                             continue
                         break
+            if declined is not None:
+                return declined[1], declined[2]   # no other model answered: the declined reply, as before
             assert last is not None
             raise last
 
@@ -1239,11 +1272,11 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             call = self._yuki_call
             if call is not None:
                 call.sent = time.monotonic()
-            stream, first = await self._yuki_open(api_call, params)
+            stream, head = await self._yuki_open(api_call, params)
 
             async def events() -> Any:
-                if first is not None:
-                    yield first
+                for event in head:
+                    yield event
                 async for event in stream:
                     yield event
 
@@ -1263,12 +1296,24 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 tool_id, args, said = None, "", True
                 early_wait = False  # a tell_yuki whose early thinker start waits for its screen field (v3.9)
                 last_text: Any = None   # the latest text delta (the shape a channel's leftover words go out in)
+                thoughts: set[Any] = set()   # kMind (review L1): the indexes of thinking blocks, dropped
                 try:
                     async for event in response:
                         now = time.monotonic()
                         if call.first_event is None:
                             call.first_event = now
                         kind = getattr(event, "type", "")
+                        if kind == "content_block_start" and getattr(event.content_block, "type", "") in (
+                                "thinking", "redacted_thinking"):
+                            # kMind (review L1): Sonnet 5.5's notes between tool calls (``between_tools``) are never
+                            # spoken, and kept out of the conversation: its history is edited every turn (volatile
+                            # block, markers, chronological order), and a replayed thinking block after an edit is
+                            # a 400 on accounts that enforce the history check; without the blocks there is none
+                            thoughts.add(getattr(event, "index", None))
+                            continue
+                        if kind in ("content_block_delta", "content_block_stop") and thoughts and \
+                                getattr(event, "index", None) in thoughts:
+                            continue
                         if call.first_content is None and kind in ("content_block_start", "content_block_delta"):
                             call.first_content = now
                         if channel is not None:
@@ -1292,6 +1337,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                         if kind == "content_block_start" and getattr(event.content_block, "type", "") == "tool_use":
                             tool_id, args = str(event.content_block.id), ""
                             name = getattr(event.content_block, "name", "")
+                            call.tool = True
                             if call.first_text is not None and self._yuki_words is None:
                                 # The reply's words are complete (it goes on to a call): the voice says the
                                 # sentence waiting for its lookahead now, not when the call is written (v3.7).
@@ -1301,14 +1347,9 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                             # The mouth has decided to hand over: the thinker starts on the user's own words while
                             # the call is still being written (v3.6), as soon as its first field says whether the
                             # window in front is to be read for it (v3.9, a few tokens in).
+                            # kMind: hand_over starts when its call is complete (its understanding, written last,
+                            # goes with the request: contract C3); tell_yuki on its first field, as before
                             early_wait = name == "tell_yuki" and call.user_turn
-                            if name == "hand_over" and call.user_turn:
-                                # bTalk (design 2, 8): hand_over has no screen field to wait for; the request starts on
-                                # the block's first bytes, as tell_yuki's does on its first field
-                                if self._speculation_gate.is_speculating:
-                                    self._yuki_early_pending = (tool_id, False)   # once the turn is confirmed
-                                else:
-                                    hook("handoff_began", tool_id, False)
                         elif (kind == "content_block_delta" and tool_id is not None
                               and hasattr(event.delta, "partial_json")):
                             args += event.delta.partial_json or ""
@@ -1344,12 +1385,6 @@ def skills_on(settings: Any) -> bool:
         return enabled(settings)
     except Exception:  # noqa: BLE001 - no skill package: the old path
         return False
-
-
-def practice_on(settings: Any) -> bool:
-    """Whether the old talker learning path runs (the Lessons and Learned ways lines, D15): only with ``voice_practice``
-    on and the skill path off; never beside the Skills menu."""
-    return bool(getattr(settings, "voice_practice", False)) and not skills_on(settings)
 
 
 #: Marks that end a reply's first clause: the voice starts on it while the rest is still being written (v3.7).
@@ -1516,9 +1551,15 @@ def _clause_tts(base: type, *, strip_marks: bool = False) -> type:
         async def process_frame(self, frame: Any, direction: Any) -> None:
             from pipecat.frames.frames import (
                 FunctionCallsStartedFrame, InterruptionFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame,
+                TTSSpeakFrame,
             )
 
-            if isinstance(frame, LLMFullResponseStartFrame):
+            if isinstance(frame, TTSSpeakFrame):
+                # kMind (review L6): words said by code, not the talker's reply: never held by the claim check
+                note = getattr(getattr(self, "_yuki_guard", None), "code_line", None)
+                if callable(note):
+                    note(strip_tags(str(getattr(frame, "text", "") or "")))
+            elif isinstance(frame, LLMFullResponseStartFrame):
                 # A new reply: a look flagged after the last reply's end (a speculative reply's held calls run once
                 # the turn is confirmed, after its end has passed) is not this reply's (review fixes).
                 self._yuki_answer_next = False
@@ -1643,6 +1684,8 @@ class _Turn:
     gave_up: bool = False                # the rerun was silent too: the error tone said so, the window was extended
     tts_silent: int = 0                  # replies of this turn whose voice played nothing at all
     repeat_dropped: bool = False         # V9: a reply to it was word for word the line said before, and was not said
+    claim_dropped: bool = False          # kMind: a line of its reply claimed something done with nothing done (dropped)
+    claim_rerun: bool = False            # ... and it was answered again for that (the rerun is told so)
     # vGame (5 Oct): said to Yuki by measured evidence, and what the fast path did with it
     named: bool = False                  # the name was heard with it (the wake word), or it came right after the name
     fast: str | None = None              # "dismiss" (ended at once) | "name" (the name alone, answered at once)
@@ -1713,8 +1756,6 @@ class TurnObserver:
         self._last_words = ""
         self._words_at: float | None = None
         self.grounder: Any = None
-        #: Practice memory's lookups for the talker (:class:`yuki.voice.practice.PracticeLookup`, v3.18), or ``None``.
-        self.practice: Any = None
         self.hands: Any = None
         self.state = "starting"
         self.fatal: str | None = None
@@ -1977,9 +2018,6 @@ class TurnObserver:
             self._words_at = time.monotonic()  # when speech recognition last heard a new word
         if self.grounder is not None:
             self.grounder.interim(transcript)
-        # v3.18: practice memory is looked up on the final words only (their lookup, ~10-35 ms measured, fits inside the
-        # grounding wait the talker's call has anyway); a lookup per interim transcript was CPU spent on every word of
-        # every utterance, a call's talk to the others included (lightweight rule)
         if self.hands is not None and hasattr(self.hands, "prefetch_desk"):
             self.hands.prefetch_desk()  # the reply's desktop block, read while they talk (v3.7)
 
@@ -2124,11 +2162,6 @@ class TurnObserver:
             "desk": c.desk if c else None, "desk_ms": c.desk_ms if c else None,
             "desk_chars": c.desk_chars if c else None,
             "desk_tabs_ms": c.desk_tabs_ms if c else None,
-            # v3.18: practice memory's lines in the talker's volatile block (kinds and ids, size; never their text)
-            "practice": c.practice if c else None,
-            "practice_wait_ms": c.practice_wait_ms if c else None,
-            "talker_block": (c.talker_block or None) if c else None,
-            "talker_block_chars": c.talker_block_chars if c else None,
             "llm_prep_ms": ms(c.grounded, c.sent) if c else None,
             "llm_open_ms": ms(c.sent, c.opened) if c else None,
             "llm_first_event_ms": ms(c.sent, c.first_event) if c else None,
@@ -2256,8 +2289,6 @@ class TurnObserver:
                 self.turn.cut = True
             if self.grounder is not None:
                 self.grounder.new_turn()
-            if self.practice is not None:
-                self.practice.new_turn()
             if self.hands is not None:
                 self.hands.prefetch()  # the tabs for the reply's desktop block, read while they talk
             self.set_state("hearing")
@@ -2289,8 +2320,6 @@ class TurnObserver:
             turn.eager_at, self._eager_at = self._eager_at, None
             if self.grounder is not None:
                 self.grounder.final(turn.user_text)  # before the aggregator hands the context over
-            if self.practice is not None:
-                self.practice.final(turn.user_text)
             if self.on_final_words is not None and turn.user_text.strip():
                 try:
                     self.on_final_words(turn.user_text)   # only puts work on a pre-started thread
@@ -2451,15 +2480,6 @@ class _Hooks:
         # the desktop summary and the lookup (review F3: never in front of them)
         recent_task = (asyncio.ensure_future(self._recent(job, getattr(self.c, "_recent_close", None)))
                        if job is not None else None)
-        practice = getattr(self.c, "practice", None)
-        if practice is not None and user_turn:
-            # the final words' lookup starts here, with the call (the observer sees the transcript a moment later:
-            # Pipecat calls observers from a queue of its own); a lookup of the same words already running is reused
-            words = _last_user_text(context)
-            if words.strip():
-                practice.final(words)
-        practice_task = (asyncio.ensure_future(self._practice_for(practice, user_turn))
-                         if practice is not None else None)
         if user_turn:
             # lSpeed: a reflex running for these words (a hand, 4-400 ms) is waited for, bounded, so the call is told
             # whether it is done and only speaks
@@ -2467,8 +2487,6 @@ class _Hooks:
         lookup_text = await self._lookup(call, user_turn)
         if recent_task is not None:
             await recent_task
-        if practice_task is not None:
-            self._practice(call, *(await practice_task))
         desk_text = None
         if desk_task is not None:
             snap, how = await desk_task
@@ -2509,36 +2527,6 @@ class _Hooks:
         call.grounding_chars = len(text or "")   # (lookup.block: the whole-memory block for the talker, v3.14)
         return text
 
-    async def _practice_for(self, practice: Any, user_turn: bool) -> tuple[Any, str, float]:
-        """The practice lookup for this call, waiting at most as long as the grounding lookup: ``(lookup, how, ms)``."""
-        started = time.monotonic()
-        try:
-            found, how = await practice.for_call(self.c.settings.voice_grounding_wait_ms if user_turn else 0.0,
-                                                 user_turn=user_turn)
-        except Exception:  # noqa: BLE001 - a hint; never block the reply on it
-            found, how = None, "none"
-        return found, how, (time.monotonic() - started) * 1000
-
-    def _practice(self, call: LlmCall, found: Any, how: str, wait_ms: float) -> None:
-        """Practice memory's lines for this call (v3.18): into the volatile block, offered skills registered for
-        run_skill, and what the block held on the call (kinds, ids, size) for the turn log; a content-free event."""
-        call.practice = how
-        call.practice_wait_ms = round(wait_ms, 1)
-        self.c._shown_ids = []
-        if found is None:
-            return
-        block = found.block
-        call.practice_block = block or None
-        call.talker_block = found.kinds_ids()
-        call.talker_block_chars = len(block or "")
-        self.c._shown_ids = found.ids()
-        practice = getattr(self.c, "practice", None)
-        if practice is not None and found.skills:
-            practice.offer(found, self.c.observer.user_turns)
-        facts = found.facts()
-        self.c.log.event("practice", op="block", session=self.c.session, how=how, user_turn=call.user_turn,
-                         wait_ms=call.practice_wait_ms, **facts)
-
     def call_started(self, call: LlmCall) -> None:
         self.c.observer.call_started(call)
 
@@ -2559,7 +2547,8 @@ class _Hooks:
         if self.routed():
             return []   # Settings → AI moved the talker: its client retries there and uses only the user's backup
         s = self.c.settings
-        return [dict(t) for t in (getattr(s, "model_fallbacks", None) or {}).get(s.voice_mouth_model, [])
+        model = getattr(self.c, "talker_model", None) or s.voice_mouth_model
+        return [dict(t) for t in (getattr(s, "model_fallbacks", None) or {}).get(model, [])
                 if isinstance(t, dict) and t.get("model")]
 
     def sticky_index(self, size: int) -> int:
@@ -2577,6 +2566,12 @@ class _Hooks:
         where = "primary" if target is None else f"{target.get('model')}@{target.get('region') or 'home'}"
         self.c.log.event("model_retry" if kind == "retry" and index == 0 else "model_failover", target=where,
                          kind=kind, status=getattr(exc, "status_code", None), error=type(exc).__name__)
+
+    def model_declined(self, op: str, target: dict[str, Any] | None) -> None:
+        """kMind (review M2): the reply was declined before any output (``declined``), and how the run on another model
+        went (``answered`` / ``refused_again``). Content-free."""
+        where = "primary" if target is None else f"{target.get('model')}@{target.get('region') or 'home'}"
+        self.c.log.event("model_refusal", op=op, target=where)
 
     def model_ok(self, index: int, target: dict[str, Any] | None) -> None:
         if index:
@@ -3429,6 +3424,9 @@ class Conversation:
         #: (``full`` / ``lean``); fixed for the conversation with its tools and prompt.
         self.brain_voice = voice_on_brain(settings)
         self.talker = talker_kind(settings)
+        #: kMind: the talker's model: the lean talker's own (``Settings.voice_lean_model``), else the mouth's.
+        self.talker_model = str((getattr(settings, "voice_lean_model", "") if self.talker == "lean" else "")
+                                or settings.voice_mouth_model)
         #: yConsumers: the lean talker (voice on the new brain) gets memory's one "you right now" line in its volatile
         #: block, from :class:`TalkerYou`'s background cache; the full talker is byte-for-byte as before.
         self._you_on = self.talker == "lean"
@@ -3447,11 +3445,6 @@ class Conversation:
         #: Why and how the conversation ended (content-free, for the ``session stop`` event; 04 F3).
         self.stop_facts: dict[str, Any] = {}
         self.observer.on_audible = self._on_audible
-        # -- v3.18 -------------------------------------------------------------------------------------------
-        #: Practice memory's lookups for the talker (lessons, learned ways; :mod:`yuki.voice.practice`), made in run.
-        self.practice: Any = None
-        #: The playbook ids the talker's latest call was shown (a hand's trace carries them as ``injected``).
-        self._shown_ids: list[int] = []
         # -- vfix4 -------------------------------------------------------------------------------------------
         #: The last hour read again on the wake (:meth:`_refresh_recent`), until the first call has waited for it.
         self._recent_job: Any = None
@@ -4762,6 +4755,7 @@ class Conversation:
 
         self._recent_job, self._recent_close = job, close
         log, session, started = self.log, self.session, time.monotonic()
+        lean = self.talker == "lean"
 
         def work() -> None:
             try:
@@ -4770,11 +4764,18 @@ class Conversation:
                 failed = object()
                 text = fetch_recent(memory, failed=failed)
                 ok = text is not failed   # a failed read keeps the view read at the build (review F4)
+                card = None
+                if lean:
+                    from yuki.voice.mouth import fetch_you_card
+
+                    card = fetch_you_card(memory)   # kMind (C1): the card as it is now; None keeps the build's
                 with lock:
                     before = mouth_memory.recent
                     used = ok and gate["open"]
                     if used:
                         mouth_memory.recent = text
+                    if card and gate["open"]:
+                        mouth_memory.you_card = card
                 if log is not None:
                     log.event("recent", op="woken", session=session, ok=ok, used=used,
                               chars=len(text or "") if ok else 0,
@@ -4854,7 +4855,7 @@ class Conversation:
             hands.on_step = lambda name, what, ok, report, ms: self.observer.chat({
                 "type": "hand_step", "turn_id": self.observer.turn_id(), "name": name,
                 "args": strip_tags(what) if isinstance(what, str) else what, "ok": ok, "result": report, "ms": ms})
-            # v3.18: practice memory sees the hands (their run traces) and the hands run the learned ways offered
+            # v3.18: memory keeps the hands' run traces
             hands.memory = self.memory if getattr(self.settings, "voice_hand_traces", True) else None
             # lSpeed: with a reflex running on the eager end of turn, its words count before their final transcript
             hands.words = self._hand_words
@@ -4862,9 +4863,7 @@ class Conversation:
             # this request (probed by the hands: an older Hands has no such hook)
             hands.exchange = self._exchange_words
             hands.turn_key = self.observer.turn_id
-            hands.shown = lambda: list(self._shown_ids)
             hands.user_turn = lambda: self.observer.user_turns
-            hands.practice = self.practice
             # Phase S: the skill path (its keys fixed with this conversation's tools), the engine's memory and settings
             hands.skill_keys = tuple(self._skill_keys())
             # review r2 L3: the volume skill runs unheld on unsure words, so then it takes no focus (the same state
@@ -5051,8 +5050,8 @@ class Conversation:
             client=self._client,
             retry_on_timeout=True,
             settings=AnthropicLLMService.Settings(
-                model=s.voice_mouth_model, max_tokens=s.voice_mouth_max_tokens, enable_prompt_caching=True,
-                thinking=AnthropicLLMService.ThinkingConfig(type="disabled"),
+                model=self.talker_model, max_tokens=s.voice_mouth_max_tokens, enable_prompt_caching=True,
+                thinking=AnthropicLLMService.ThinkingConfig(**thinking_off(self.talker_model)),
                 # The core layer: Pipecat composes its async-tool paragraphs onto it; the
                 # service subclass sends the result as the first of the prompt's layers.
                 system_instruction=LEAN_MOUTH_PROMPT if lean else MOUTH_PROMPT,
@@ -5183,6 +5182,10 @@ class Conversation:
                                 context=lambda: {"user": self.observer.last_user_text},
                                 shadow=self.channel == "marker", **code_only)   # v3.16: marker: it only measures
             guard.on_drop = self.observer.guarded
+            if self.talker == "lean":
+                # kMind (the claim gate, Hands.acted_this_turn): no "done" without an act in this turn
+                guard.claim_open = self._claim_open
+                guard.on_claim = self._claim_dropped
             self.guard = guard
             self.observer.guard = guard
             tts.set_guard(guard)
@@ -5353,20 +5356,6 @@ class Conversation:
                                      source=str(getattr(s, "voice_grounding_source", "relevant") or "relevant"))
             self.grounder.warm()
             self.observer.grounder = self.grounder
-        if practice_on(s) and self.memory is not None:
-            # v3.18: practice memory for the talker (lessons from its mistakes, learned ways its hands can run); off
-            # since phase S (D15), back only with skills = false and voice_practice on
-            from yuki.voice.practice import LESSONS_CHARS, SKILL_MIN_CONFIDENCE, SKILL_MIN_COSINE, PracticeLookup
-
-            hands = getattr(self.bridge, "hands", None)
-            self.practice = PracticeLookup(
-                self.memory, apps=self._apps_in_play, log=self.log,
-                min_cosine=float(getattr(s, "voice_skill_min_cosine", SKILL_MIN_COSINE)),
-                min_confidence=float(getattr(s, "voice_skill_min_confidence", SKILL_MIN_CONFIDENCE)),
-                lessons_chars=int(getattr(s, "voice_lessons_chars", LESSONS_CHARS)),
-                skills=bool(getattr(s, "voice_skills", True) and s.voice_hands and hands is not None))
-            self.practice.warm()
-            self.observer.practice = self.practice
         self.observer.idle_state = lambda: "working" if self.bridge.open_voice_jobs() else "listening"
         runner = WorkerRunner(handle_sigint=False, check_dangling_tasks=False)
         worker = self._build()
@@ -5433,16 +5422,6 @@ class Conversation:
                 self.log.event("grounding", op="summary", lookups=len(timings), unloaded=unloaded,
                                p50_ms=round(timings[len(timings) // 2], 1) if timings else None,
                                max_ms=round(timings[-1], 1) if timings else None)
-            if self.practice is not None:
-                self.practice.release()
-                timings = sorted(self.practice.timings)
-                hands = getattr(self.bridge, "hands", None)
-                self.log.event("practice", op="summary", lookups=len(timings),
-                               p50_ms=round(timings[len(timings) // 2], 1) if timings else None,
-                               max_ms=round(timings[-1], 1) if timings else None,
-                               traces=getattr(hands, "traces_queued", None))
-                if self._bound and hands is not None and getattr(hands, "practice", None) is self.practice:
-                    hands.practice = None
             self.log.event("narrator", op="summary", **self.gate.stats)
             if you_cache is not None:   # this conversation's counts only (the cache is the process's)
                 base = self._you_stats0
@@ -5724,8 +5703,8 @@ class Conversation:
         except Exception as exc:  # noqa: BLE001 - then only the connection is warmed
             self.log.event("warm", note=f"plain warm-up ({type(exc).__name__})")
         try:
-            response = await self._client.messages.create(model=self.settings.voice_mouth_model, max_tokens=1,
-                                                          **request)
+            response = await self._client.messages.create(model=self.talker_model, max_tokens=1,
+                                                          thinking=thinking_off(self.talker_model), **request)
             usage = getattr(response, "usage", None)
             self.log.event("warm", ms=round((time.monotonic() - started) * 1000),
                            cache_write_tokens=getattr(usage, "cache_creation_input_tokens", None),
@@ -5760,9 +5739,7 @@ class Conversation:
         s = self.settings
         tools: list[dict[str, Any]] = []
         if s.voice_hands and getattr(self.bridge, "hands", None) is not None:
-            keys = self._skill_keys()
-            learned = bool(not keys and practice_on(s) and getattr(s, "voice_skills", False) and self.memory is not None)
-            tools = talker_hand_tools(keys, learned_ways=learned)
+            tools = talker_hand_tools(self._skill_keys())
         self._hand_tools_cache = tools
         if self.log is not None:
             mouth_memory = getattr(self, "mouth_memory", None)
@@ -6327,7 +6304,7 @@ class Conversation:
         turn = obs.turn
         if turn is None or turn.trigger != "user" or not (turn.user_text or "").strip():
             return None
-        if turn.heard or turn.tools or turn.quiet or turn.gave_up:
+        if (turn.heard and not turn.claim_dropped) or turn.tools or turn.quiet or turn.gave_up:
             return None  # heard something, or acted, or handed over, or chose silence, or already given up on
         if not (turn.cut or turn.responses):
             return None  # its reply may still be on its way
@@ -6376,6 +6353,9 @@ class Conversation:
                 turn.rerun = True
                 turn.responses_at_rerun = turn.responses
                 turn.rerun_at = now
+                if turn.claim_dropped:
+                    # kMind: answered again because a line claimed something done with nothing done (told so)
+                    turn.claim_dropped, turn.claim_rerun = False, True
                 obs.rerun_turn = turn
                 self.log.event("reply_watch", op="rerun", turn=turn.n, cut=bool(turn.cut),
                                responses=turn.responses, after_ms=round((now - turn.transcript_at) * 1000),
@@ -6502,6 +6482,8 @@ class Conversation:
         turn = self.observer.turn
         if turn is not None and getattr(turn, "repeat_dropped", False):
             state["repeat"] = True   # V9: the rerun is told its last reply repeated the line before
+        if turn is not None and getattr(turn, "claim_rerun", False):
+            state["claim"] = True    # kMind: the rerun is told its last reply claimed something not done
         scrolling = self._scrolling_line()
         if scrolling:
             state["scrolling"] = scrolling   # V7: a page scrolling on by itself; the talker stops it
@@ -6532,10 +6514,56 @@ class Conversation:
             you_line = talker_you().line()
             if you_line:
                 state["you"] = you_line
+        if self.talker == "lean":
+            # kMind (claim gate): whether a hand or skill of the talker's did something verified in this user turn
+            acted = self._acted_this_turn()
+            if acted is not None:
+                state["acted"] = acted
         reflex = self._reflex_state()
         if reflex:
             state["reflex"] = reflex   # lSpeed: the reflex that ran for these words (mouth.REFLEX_NOTES)
         return state
+
+    def _claim_open(self) -> bool:
+        """kMind (the claim gate): the talker's words now are a reply to the user's own turn in which nothing was done
+        yet: no call in this turn or this reply, no hand or skill verified anything (``Hands.acted_this_turn``), no
+        reflex did it. A stream and state fact, never the words. Never raises."""
+        try:
+            turn = self.observer.turn
+            if turn is None or turn.trigger != "user" or turn.tools:
+                return False
+            call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
+            if call is None or not call.user_turn or call.tool:
+                return False
+            return self._acted_this_turn() is False
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _claim_dropped(self) -> None:
+        """kMind: a line of the reply claimed something done with nothing done; it was dropped (the turn is answered
+        again once, told so: ``_reply_watch``, ``mouth.CLAIM_NOTE``)."""
+        turn = self.observer.turn
+        if turn is not None and turn.trigger == "user":
+            turn.claim_dropped = True
+            self.log.event("claim_gate", op="dropped", turn=turn.n)
+
+    def _acted_this_turn(self) -> bool | None:
+        """kMind (the claim gate, ``Hands.acted_this_turn``): ``True`` / ``False`` for a user turn (a reflex that did
+        it counts), ``None`` when there are no hands or this call is not a user turn's. Never raises."""
+        call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
+        if call is not None and not getattr(call, "user_turn", True):
+            return None
+        hands = getattr(self.bridge, "hands", None)
+        fn = getattr(hands, "acted_this_turn", None)
+        if not callable(fn):
+            return None
+        try:
+            if fn():
+                return True
+            rec = self._reflex_state()
+            return bool(rec and rec.get("state") == "done")
+        except Exception:  # noqa: BLE001
+            return None
 
     #: V7: a continuous scroll waits while the user talks and this long after their words (they may be "stop").
     SCROLL_TALK_HOLD_S = 1.5
@@ -6573,18 +6601,6 @@ class Conversation:
             return scrolling.continuous_state()
         except Exception:  # noqa: BLE001 - a hint only
             return None
-
-    # -- v3.18: practice memory and the thinker's request pack -----------------------------------------------------
-
-    def _apps_in_play(self) -> list[str]:
-        """The open windows' processes from the hands' latest desktop summary, the one in front first (practice
-        memory's apps in play; a summary read while they talked, no read here)."""
-        hands = getattr(self.bridge, "hands", None)
-        snap = getattr(hands, "last", None)
-        apps = dict(getattr(snap, "apps", None) or {})
-        front = getattr(snap, "foreground", None)
-        ordered = ([apps.pop(front)] if front in apps else []) + list(apps.values())
-        return list(dict.fromkeys(a for a in ordered if a))
 
     def more_held(self, max_sentences: int = 2, max_chars: int = 280) -> tuple[str, bool] | None:
         """H2: the next part of the talker's held words (``(part, more left)``), taken; ``None`` when nothing is held."""
