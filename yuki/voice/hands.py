@@ -158,6 +158,15 @@ _FAILED_NOTE_LEAN = (
     "It did not work. If the report says why nothing more can happen (already at the end), say that and stop. "
     "Otherwise call hand_over in this same reply, intent new_task, saying so in a few words as its say_first."
 )
+#: lVoice review r1 L7 (live 17 Oct, problem 7): added to the failed note of a hand whose try did not take effect and
+#: was not passed on, while this turn's one retry is open (:meth:`Hands._may_retry`): one try on another app or target
+#: instead of the hand-off. Principle 2: never one their words ruled out (live pass A opened Excalidraw in Chrome when
+#: Arc failed, where his drawings are not: a FAIL). Once the retry is used the note is the plain one (hand it over).
+_RETRY_OPEN = (
+    " Or, instead of the hand-off: one more try is open in this turn, with one hand on another app or target that does "
+    "what they asked, never one their words ruled out (an app or browser they named stays that one, and so does the "
+    "place what they asked for lives). If that one does not take effect either, hand it over."
+)
 #: N1 (report 47): a level asked to move that cannot (already at its top or bottom, or already there). Live 3 Oct
 #: "increase the Spotify volume" at 100% was said as "Turned it up" twice while nothing changed.
 _NOOP_NOTE = (
@@ -559,6 +568,10 @@ _CODE_LINE_MEDIA = {("playpause", "paused"): "Paused.", ("playpause", "playing")
                     ("nexttrack", ""): "Next one.", ("prevtrack", ""): "Previous one.", ("stop", ""): "Stopped."}
 _CODE_LINE_WINDOW = {"minimize": "Minimized.", "maximize": "Maximized.", "fullscreen": "Full screen.",
                      "close": "Closed."}
+#: lVoice review r1 L2: what the thinker is told (as a follow-up to the job its fallback just made for these words) of
+#: the reply's later calls that were not run once that job took their whole request (``{steps}``: code's words).
+_ORDER_PASSED_FOLLOW = ("Yuki's voice had also planned these parts for the same words, and did not run them: {steps}. "
+                        "Their whole request is yours: do every part their words asked for, these too if so.")
 #: (An opening verified says "It's up." / "It's open."; a tab closed "Closed it.": :meth:`Hands._code_line`.)
 #: The earlier request of this conversation that ended not done (``VoiceBridge.last_not_done``), for the thinker.
 _END_REST_EARLIER = (" Their request before this one ended not done (its outcome: \"{outcome}\"): never redo the way "
@@ -995,6 +1008,9 @@ class Snapshot:
     tabs: dict[int, list[str]] = field(default_factory=dict)
     #: Their identities (UIA RuntimeId text; "" when the provider gives none), in the same order.
     tab_ids: dict[int, list[str]] = field(default_factory=dict)
+    #: lVoice review r1 L4: whether each strip read was whole (a read cut short by its budget may miss tabs that are
+    #: there, so a tab missing from it is never called gone).
+    tabs_complete: dict[int, bool] = field(default_factory=dict)
     tabs_ms: float | None = None
     at: float = 0.0
     ms: float = 0.0
@@ -1238,6 +1254,11 @@ class Hands:
         #: lVoice (a hook for lSpeed's reflex path, :meth:`reflex_done`): ``{step key: when}`` of steps the reflex ran
         #: for the words being heard, so the talker's own call for the same step is that step, never a second act.
         self._reflex: dict[str, float] = {}
+        #: lVoice review r1 M2 (rule 8): the user turn in which a verified skill run's skill sends to other people or
+        #: joins a call (its data): no end check of that turn hands a rest on (a false "more" never risks a second send).
+        self._commit_turn: Any = None
+        #: lVoice review r1 L4: ``{hwnd: whether that window's strip read was whole}`` for :attr:`_other_tabs`.
+        self._other_complete: dict[int, bool] = {}
         #: The names on the screen in front (yuki.voice.screennames, v3.10): its app, its hwnd and the names, read
         #: once per change of the window in front, its title or the action log (``refresh_screen_names``).
         self.screen_names: list[str] = []
@@ -1362,11 +1383,13 @@ class Hands:
         self._lines_said = {}
         self._opened = {}
         self._other_tabs = {}
+        self._other_complete = {}
         self._then_open = None
         self._step_owed = None
         self._halt = None
         self.halted = None
         self._order = None
+        self._commit_turn = None
 
     def new_user_turn(self) -> None:
         """The user spoke: the talker may use its hands again (after telling them what happened)."""
@@ -1853,14 +1876,16 @@ class Hands:
                 tab = str(getattr(record, "tab_id", "") or "")
                 if not tab:
                     return True
+                # review r1 L4: a tab missing from a strip read cut short by its budget may still be there: gone only
+                # on a whole read (seen is seen either way)
                 ids = [i for i in (snap.tab_ids.get(hwnd) or []) if i]
                 if ids:
-                    return tab in ids
+                    return True if tab in ids else (False if snap.tabs_complete.get(hwnd, True) else None)
                 kept = self._other_tabs.get(hwnd)
                 if kept is not None and time.monotonic() - float(kept[2]) < time.time() - at:
                     ids = [i for i in kept[1] if i]
                     if ids:
-                        return tab in ids
+                        return True if tab in ids else (False if self._other_complete.get(hwnd, True) else None)
                 return None
             if _is_real_backend(self.backend):
                 return True if _window_shown(hwnd) else False
@@ -1944,6 +1969,7 @@ class Hands:
             return ""
         snap.tabs[snap.foreground] = [t.name for t in strip.tabs]
         snap.tab_ids[snap.foreground] = [getattr(t, "tab_id", "") or "" for t in strip.tabs]
+        snap.tabs_complete[snap.foreground] = bool(getattr(strip, "complete", True))
         return tabs_line(strip)
 
     def _keep_tabs(self, hwnd: int, title: str, strip: Any) -> None:
@@ -2179,10 +2205,38 @@ class Hands:
                     self.log.event("hands", op=name, order_passed=True, call=params.tool_call_id)
                 await params.result_callback(dict(_ORDER_PASSED),
                                              properties=FunctionCallResultProperties(run_llm=False))
+                self._follow_planned(name, args)   # review r1 L2: the job that has their request hears of this part
                 return
             await self._handle_one(params, gate)
         finally:
             self._leave_order(gate)
+
+    def _follow_planned(self, name: str, args: dict[str, Any]) -> None:
+        """lVoice review r1 L2: a call of the reply that was not run because an earlier one's fallback gave the thinker
+        their whole request is named to that job as a follow-up (:data:`_ORDER_PASSED_FOLLOW`, the step in code's
+        words, through ``bridge.note_planned``), so a job seeded with one failed part's pin still knows the reply
+        planned another. Off the reply's path; never raises."""
+        note = getattr(self.bridge, "note_planned", None) if self.bridge is not None else None
+        if not callable(note):
+            return
+
+        async def run() -> None:
+            try:
+                step = await asyncio.to_thread(self._end_step, name, dict(args))
+                if step:
+                    sent = await note(_ORDER_PASSED_FOLLOW.format(steps=step[:REST_REPORT_CHARS]))
+                    if self.log is not None:
+                        self.log.event("hands", op=name, order_passed_note=bool(sent))
+            except Exception as exc:  # noqa: BLE001
+                if self.log is not None:
+                    self.log.event("hands", op=name, order_passed_note=False, error=type(exc).__name__)
+
+        try:
+            task = asyncio.ensure_future(run())
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _handle_one(self, params: Any, gate: dict[str, Any] | None = None) -> None:
         """One hand, its turn in the gate come (the body :meth:`handle` always had)."""
@@ -2226,9 +2280,13 @@ class Hands:
         # now, beside the act (it reads their words and the step's kind only); the step check joins it
         # pVoice: a step after a "then" (that only moves) or an opening with nothing after it starts the turn's end
         # check the same way (vRound2's rest check stays the silent window or tab step's when no "then" is open)
-        end_kind = self._end_candidate(name, args, then_open)
+        # review r1 L3: a call with the reply's next call already waiting behind it starts no check of its own (the
+        # last call's check reads the whole turn; a check started here would only use up the turn's bound)
+        waiting_now = self._queued_behind(gate)
+        end_kind = None if waiting_now else self._end_candidate(name, args, then_open)
         end_job = self._end_start(name, args, end_kind, then_open) if end_kind else None
-        rest_job = self._rest_start(name, args) if end_job is None and self._rest_candidate(name, args) else None
+        rest_job = self._rest_start(name, args) if end_job is None and not waiting_now \
+            and self._rest_candidate(name, args) else None
         if args.get("say_first") and self.bridge is not None:
             await self.bridge._ack_if_silent(params, args)  # said already while it was written, as a rule
         self.busy += 1
@@ -2246,6 +2304,7 @@ class Hands:
                 self.bridge.busy_tools = max(0, self.bridge.busy_tools - 1)
                 if self.bridge.gate is not None:
                     self.bridge.gate.poke()
+        self._retry_settle(facts)   # review r1 L5: a retry refused before it acted gives the halt back
         ms = round((time.monotonic() - started) * 1000)
         if self.on_action is not None and facts.get("sent_at") is not None:
             self.on_action(facts["sent_at"])
@@ -2256,16 +2315,24 @@ class Hands:
         # the report and says what happened (or hands it over).
         verified = facts.get("verified")
         confirmed = ok and verified is True and name != "press_keys"
-        if confirmed and "say_when_done" not in args:
-            # lVoice (fix (d)): say_when_done is optional; left out, code says its own line for what verified (none for
-            # a window or tab brought up: its step line is said by the step check below)
+        # review r1 L10: a null say_when_done is left out too (only "" written on purpose is a chosen silence)
+        omitted = args.get("say_when_done") is None
+        coded = False   # review r1 M1: a line of code's own (generic words: its repeat rule holds within the turn)
+        op = str(args.get("action") or ("show" if name == "tab" else ""))
+        if confirmed and omitted:
+            # lVoice (fix (d)): say_when_done is optional; left out, code says its own line for what verified (a window
+            # or tab brought up: its step line, below)
             line = self._code_line(name, args, facts)
+            coded = bool(line)
         game = _game_trouble(facts)
         turn = self._call_safely(self.user_turn, None)
         # lVoice (problem 3): the reply's next call waits behind this one: the rest of their request is that call's, so
         # no check of this step's own (it would judge this part alone); the last call's check reads the whole turn
         queued = self._queued_behind(gate)
         if queued:
+            if end_job is not None and turn is not None and self._given(self._end_checked, turn) > 0:
+                # review r1 L3: the bound is given back for a check this call will not join
+                self._end_checked = (turn, self._given(self._end_checked, turn) - 1)
             end_job = rest_job = None
         # sVoiceFix (F4): a call refused for its own shape, given back once to be called again: no trouble guidance
         # ("never try again") rides with that call (it would contradict the note that asks for it)
@@ -2287,17 +2354,32 @@ class Hands:
         # fx2: an opening that leaves part of their request to do (the talker's own "then") is not the whole request;
         # x3 (3b): nor is a window or tab step that does (a focus, a restore, a tab shown or opened first)
         rest = " ".join(str(args.get("then") or "").split()) if name in THEN_HANDS else ""
+        # review r1 M1: a window or tab brought up (focus, restore, tab shown) whose call left say_when_done out: code
+        # says the step's own line of what is showing at once (silent when the reply's next call waits: that call is
+        # the rest), and Yuki's own rest check, started beside the act, is joined off the reply's path (as after a
+        # sound hand): more goes to the thinker by code. Probe R1: the x3 step check made that line wait ~1 s for the
+        # check plus a talker run. "" written on purpose stays the x3 step check (the talker's turn back for the rest);
+        # with no step line known, the x3 step check too (never silence)
+        step_line = " ".join(str(facts.get("step_line") or "").split())
+        first_step = bool(confirmed and omitted and not rest and op in STEP_FIRST_OPS.get(name, ()) and op != "new"
+                          and (queued or step_line))
+        if first_step:
+            line, coded = ("" if queued else step_line), True
         speak = bool(line) and confirmed and not rest
+        said_key = ""
         if speak:
             words = " ".join(line.casefold().split())
+            # review r1 M1: code's own lines are generic ("It's up." for GitHub and for Amazon, probe R6): one is kept
+            # from repeating within its user turn only; the talker's own words keep the 60 s rule
+            said_key = f"{turn}\x1f{words}" if coded else words
             now = time.monotonic()
             self._lines_said = {k: at for k, at in self._lines_said.items() if now - at < _REPEAT_LINE_S}
-            if words in self._lines_said:
+            if said_key in self._lines_said:
                 speak, line = False, ""   # said a moment ago for the same kind of step: this time it is silent
                 if self.log is not None:
                     self.log.event("hands", op=name, repeat_line_silent=True, call=params.tool_call_id)
             else:
-                self._lines_said[words] = now
+                self._lines_said[said_key] = now
         if not facts.get("halted"):   # lVoice: a hand not tried (the hands stopped) did nothing to keep
             self.actions.add("your hand", _what(name, args), report[:400], ok=ok, verified=verified, turn=turn,
                              hwnd=facts.get("live_hwnd"), tab_id=facts.get("live_tab") or "")
@@ -2362,7 +2444,6 @@ class Hands:
             await params.result_callback({"done": report[:700], "then": rest[:200],
                                           "how_to_handle_it": note.format(rest=rest[:200])})
             return
-        op = str(args.get("action") or ("show" if name == "tab" else ""))
         if end_job is not None and not rest and not facts.get("starting") \
                 and (confirmed or (ok and facts.get("expected") and end_kind == "then")) \
                 and await self._end_rest(params, name, args, report, end_job):
@@ -2370,15 +2451,22 @@ class Hands:
             # "then" step's rest was left at a step that only moves): the rest went to the thinker by code; the done
             # line, if any, was not said (it would stand for the whole)
             if speak:
-                self._lines_said.pop(" ".join(line.casefold().split()), None)
+                self._lines_said.pop(said_key, None)
             return
         # lVoice (problem 3): a verified sound hand, or the last call of a reply of several, gets the turn's end check
         # after it (joined off the reply's path: this call settles as it always did, its done line at once)
+        first_off = bool(first_step and not queued and rest_job is not None and end_job is None and turn is not None)
+        if first_off:
+            # review r1 M1: the step's line is said below at once; the rest check started with the call is joined off
+            # the reply's path (its bound counts as a step check: at most twice per user turn)
+            self._step_checked = (turn, self._step_checks(turn) + 1)
+            self._parts_spawn(params, name, args, report, said=line if speak else "", job=rest_job, check="step")
+            rest_job = None
         parts = (confirmed or bool(ok and facts.get("expected"))) and not queued and not rest and end_job is None \
-            and rest_job is None and self._parts_candidate(name, args)
+            and rest_job is None and not first_off and self._parts_candidate(name, args)
         if parts:
             self._parts_spawn(params, name, args, report, said=line if speak else "")
-        if confirmed and not parts and not str(args.get("say_when_done") or "").strip() \
+        if confirmed and not parts and not first_step and not str(args.get("say_when_done") or "").strip() \
                 and op in STEP_FIRST_OPS.get(name, ()) \
                 and not (op == "new" and str(args.get("url") or "").strip()) \
                 and turn is not None and self._step_checks(turn) < self.STEP_CHECKS_PER_TURN:
@@ -2481,7 +2569,7 @@ class Hands:
         elif ok:
             note, key = self._note(_UNCONFIRMED_NOTE, _UNCONFIRMED_NOTE_LEAN), "not_verified"
         else:
-            note, key = self._note(_FAILED_NOTE, _FAILED_NOTE_LEAN), "failed"
+            note, key = self._note(_FAILED_NOTE, _FAILED_NOTE_LEAN) + self._retry_words(facts), "failed"
         if ((((name in INSTANT_HANDS or name == SKILL_HAND) and not facts.get("refused")) or facts.get("stale")
              or facts.get("handover"))
                 and not facts.get("settled")
@@ -2886,6 +2974,8 @@ class Hands:
             op = str(args.get("action") or ("show" if name == "tab" else ""))
             if self.halted or op not in STEP_FIRST_OPS.get(name, ()) or str(args.get("say_when_done") or "").strip():
                 return False
+            if self._turn_sent():
+                return False   # review r1 M2: never a rest handed on in a turn whose skill run sent or joined
             if " ".join(str(args.get("then") or "").split()) or (op == "new" and str(args.get("url") or "").strip()):
                 return False
             turn = self._call_safely(self.user_turn, None)
@@ -3226,8 +3316,8 @@ class Hands:
         hand the rest to, this turn not with the thinker already, hands not halted, at most
         :data:`END_CHECKS_PER_TURN` per turn. Never raises."""
         try:
-            if self.halted or " ".join(str(args.get("then") or "").split()):
-                return None
+            if self.halted or " ".join(str(args.get("then") or "").split()) or self._turn_sent():
+                return None   # review r1 M2: never a rest handed on in a turn whose skill run sent or joined
             turn = self._call_safely(self.user_turn, None)
             if turn is None or self._given(self._end_checked, turn) >= END_CHECKS_PER_TURN:
                 return None
@@ -3318,13 +3408,17 @@ class Hands:
 
     # -- lVoice (live 17 Oct, problem 3): the turn's end check after a skill, a sound hand, or a reply's last call --
 
-    def _parts_candidate(self, name: str, args: dict[str, Any]) -> bool:
+    def _parts_candidate(self, name: str, args: dict[str, Any], *, commits: bool | None = None) -> bool:
         """Whether this verified call gets the turn's end check after it (:data:`PARTS_HANDS`: a skill run or a sound
         hand; or any hand that is the last of several this user turn called), with a bridge to hand the rest to, this
         turn not with the thinker already, hands not halted, at most :data:`END_CHECKS_PER_TURN` per turn. The calls'
-        own kinds and counts only, never the words. Never raises."""
+        own kinds and counts only, never the words. Review r1 M2 (rule 8, no double send): never after a skill run
+        that sends or joins (``commits``, its data, :meth:`_skill_commits`; not known counts as one), nor in a turn
+        that had one. Never raises."""
         try:
             if self.halted or name == KEEP_USUAL_HAND or (name == "scroll" and args.get("keep") == "stop"):
+                return False
+            if (name == SKILL_HAND and commits is not False) or self._turn_sent():
                 return False
             turn = self._call_safely(self.user_turn, None)
             if turn is None or self._given(self._parts_checked, turn) >= PARTS_CHECKS_PER_TURN \
@@ -3360,11 +3454,18 @@ class Hands:
         job["calls_noted"] = self._calls_noted
         return job
 
-    def _parts_spawn(self, params: Any, name: str, args: dict[str, Any], report: str, *, said: str = "") -> None:
-        """Start the end check now and join it off the reply's path (:meth:`_parts_rest`). Never raises."""
+    def _parts_spawn(self, params: Any, name: str, args: dict[str, Any], report: str, *, said: str = "",
+                     job: dict[str, Any] | None = None, check: str = "parts") -> None:
+        """Start the end check now and join it off the reply's path (:meth:`_parts_rest`). Review r1 M1: ``job``, a
+        check already started (a first step's rest check, begun beside the act), is joined instead (``check`` names
+        it in the log). Never raises."""
         try:
-            job = self._parts_start(name, args)
-            task = asyncio.ensure_future(self._parts_rest(params, name, args, report, job, said=said))
+            if job is None:
+                job = self._parts_start(name, args)
+            else:
+                job.setdefault("turn", self._call_safely(self.user_turn, None))
+                job.setdefault("calls_noted", self._calls_noted)
+            task = asyncio.ensure_future(self._parts_rest(params, name, args, report, job, said=said, check=check))
             self._background.add(task)
             task.add_done_callback(self._background.discard)
         except Exception as exc:  # noqa: BLE001 - no check: as before
@@ -3372,14 +3473,14 @@ class Hands:
                 self.log.event("hands", op=name, parts_error=type(exc).__name__)
 
     async def _parts_rest(self, params: Any, name: str, args: dict[str, Any], report: str, job: dict[str, Any], *,
-                          said: str = "") -> bool:
+                          said: str = "", check: str = "parts") -> bool:
         """The end check's verdict, joined after the call settled (its own done line was said at once). More: the rest
         of their request goes to the thinker by code (``bridge.escalate`` with :data:`_END_REST_CONTEXT` ``parts``:
         the steps done, never to be redone), "On it." said by code when nothing was said for their words yet. No, no
         verdict, the user spoke again, or the turn went to the thinker already: nothing more. ``True`` when it went.
         Logged content-free. Never raises."""
         try:
-            more = await asyncio.to_thread(self._rest_join, job, name, "end_check", REST_CHECK_S, check="parts")
+            more = await asyncio.to_thread(self._rest_join, job, name, "end_check", REST_CHECK_S, check=check)
             if more is not True:
                 return False
             gate = self._order
@@ -3388,12 +3489,26 @@ class Hands:
             # a later call of this turn came since (a reply's next part delivered one by one, or a run the talker made
             # after): its own check reads the whole turn, so this one stands down (never the rest twice)
             later = self._calls_noted > int(job.get("calls_noted") or 0) or self.busy > 0
-            if moved or later or self.halted or taken or self._turn_had_job():
+            if moved or later or self.halted or taken or self._turn_had_job() or self._turn_sent():
                 if self.log is not None:
                     self.log.event("hands", op=name, turn_rest="parts",
                                    skipped="moved_on" if moved else "later_call" if later else "taken")
                 return False
-            steps = [s for s in (job.get("holder") or {}).get("steps") or [] if s] or [self._end_step(name, args)]
+            # review r1 L8: a voice job waits on a question they heard (or their words are held as its answer): a hand
+            # acted on these words, so the rest never goes as that job's answer; nothing more here (the talker's turn)
+            pending = getattr(self.bridge, "answer_pending", None)
+            if callable(pending) and self._call_safely(pending, True):
+                if self.log is not None:
+                    self.log.event("hands", op=name, turn_rest="parts", skipped="answer_waiting")
+                return False
+            # review r1 L9: a game in front holds the hand-off (read again now, as the skill fallback does: D17(2));
+            # a read that fails holds it too
+            if await asyncio.to_thread(self._game_closed):
+                if self.log is not None:
+                    self.log.event("hands", op=name, turn_rest="parts", skipped="game")
+                return False
+            steps = [s for s in (job.get("holder") or {}).get("steps") or [] if s] \
+                or [await asyncio.to_thread(self._end_step, name, args)]
             context = _END_REST_CONTEXT["parts"].format(steps="; ".join(steps)[:REST_REPORT_CHARS],
                                                         earlier=self._earlier_not_done())
             bridge = self.bridge
@@ -3413,7 +3528,7 @@ class Hands:
             spoken = await self._say_ack(params) if ack else ""
             if self.log is not None:
                 self.log.event("hands", op=name, escalated=True, acked=bool(spoken), call=params.tool_call_id,
-                               turn_rest="parts", verdict="more", steps=len(steps))
+                               turn_rest="parts", verdict="more", steps=len(steps), check=check)
             return True
         except Exception as exc:  # noqa: BLE001 - the call is settled already: nothing more
             if self.log is not None:
@@ -3439,12 +3554,31 @@ class Hands:
         """lVoice (fix (d)): the done line code says for a verified hand whose call left ``say_when_done`` out
         (:data:`_CODE_LINE_MEDIA`, :data:`_CODE_LINE_WINDOW`; a tab closed: "Closed it."), else ``""`` (nothing said:
         a window or tab brought up says its step line; a scroll or a click is seen happening). Fixed words of code by
-        the hand's operation and verified state, never a reading of their words."""
+        the hand's operation and verified state, never a reading of their words. Review r1 L10: a play/pause key with
+        no ``want`` says the state it verified, the volume keys and ``app_volume`` the level or mute they read back,
+        ``open_yuki`` "It's up."."""
         try:
             if name == "media_key":
                 key = str(args.get("key") or "")
+                if key in _VOLUME_KEYS:
+                    # review r1 L10: the system volume as its report verified it (fixed words and its own number)
+                    level, muted = facts.get("volume_level"), facts.get("volume_muted")
+                    if key == "volumemute" or muted is True:
+                        return "Muted." if muted is True else "Unmuted." if muted is False else ""
+                    return f"Volume's at {int(level)}." if isinstance(level, (int, float)) else ""
                 want = str(args.get("want") or "").strip().lower() if key == "playpause" else ""
+                if key == "playpause" and not want:
+                    want = str(facts.get("media_now") or "").strip().lower()   # review r1 L10: the state it verified
                 return _CODE_LINE_MEDIA.get((key, want), "")
+            if name == "app_volume":
+                level, muted = facts.get("app_level"), facts.get("app_muted")
+                if muted is True:
+                    return "Muted."
+                if isinstance(level, (int, float)):
+                    return f"Its volume's at {int(level)}."
+                return "Unmuted." if muted is False else ""
+            if name == "open_yuki":
+                return "It's up."
             if name == "window":
                 return _CODE_LINE_WINDOW.get(str(args.get("action") or ""), "")
             if name == "tab" and str(args.get("action") or "") == "close":
@@ -3763,6 +3897,7 @@ class Hands:
                                 "timed_out": True}
             report = (f"It had not finished after {self.SKILL_HAND_MAX_S:g} s, so what it did is not known; nothing "
                       f"was confirmed.")
+        self._retry_settle(facts)   # review r1 L5: a retry refused before it acted gives the halt back
         ms = round((time.monotonic() - started) * 1000)
         prefs = facts.pop("_prefs", None)
         if self.on_action is not None and facts.get("sent_at") is not None:
@@ -3893,7 +4028,14 @@ class Hands:
         elif outcome == "timeout":
             line = LINE_SKILL_TIMEOUT   # never tried again (it may have sent): said plainly, nothing handed over
         self._skill_reply_log(params, name, ok, report, facts, ms, hand_id, line=bool(line), fallback=None)
-        if verified and not self._queued_behind(gate) and self._parts_candidate(name, args):
+        if (verified or facts.get("acted") or facts.get("sent_at") is not None or outcome == "timeout") \
+                and facts.get("commits") is not False:
+            # review r1 M2 (rule 8): a run that may have acted, of a skill that sends or joins (its data; not known
+            # counts as one): no end check of this turn hands a rest on after it (a false "more" never risks a second
+            # send or join)
+            self._commit_turn = self._call_safely(self.user_turn, None)
+        if verified and not self._queued_behind(gate) and self._parts_candidate(name, args,
+                                                                                  commits=facts.get("commits")):
             # lVoice (problem 3): a checked skill run is often one part of their request ("pause the music and mute
             # the PC" ran the volume skill alone, live 0 of 6): the turn's end check runs after it, off the reply's
             # path; its own line (code's, naming only what it did) is said at once
@@ -4138,8 +4280,10 @@ class Hands:
         # takes no focus
         sound_only = skill_key == VOLUME_SKILL and bool(self._call_safely(self.unsure, False))
         if self.halted and self._may_retry(SKILL_HAND, args):
-            # lVoice (problem 7): the one retry of this turn, on another target (a skill after a failed hand)
+            # lVoice (problem 7): the one retry of this turn, on another target (a skill after a failed hand); review
+            # r1 L5: the halt is kept to give back if this run is refused before it acts (:meth:`_retry_settle`)
             self._halt["retries"] = int(self._halt.get("retries") or 0) + 1
+            self._halt["pending"] = self.halted
             self.halted = None
         if self.halted:
             facts.update(refused=True, outcome="refused", halted=True)   # x3: the thinker has it already, never again
@@ -4253,6 +4397,8 @@ class Hands:
             self.last_skill = {"skill": skill_key, "values": dict(result.values or {}),
                                "outcome": str(facts.get("outcome") or result.outcome),
                                "options": list(result.options or []), "run_key": result.run_key, "at": time.time()}
+        if facts.get("verified") is True or facts.get("acted") or facts.get("sent_at") is not None:
+            facts["commits"] = self._skill_commits(skill_key, slots, facts.get("_values"))   # review r1 M2 (rule 8)
         return ok, report, facts
 
     def _skill_act_off(self, result: Any, off: str, facts: dict[str, Any], memory: Any) -> str:
@@ -4452,12 +4598,76 @@ class Hands:
         self._halt = {"turn": turn, "name": name, "target": _step_key(name, args or {}), "passed": False,
                       "retries": int((before or {}).get("retries") or 0)}
 
+    def _retry_settle(self, facts: dict[str, Any]) -> None:
+        """lVoice review r1 L5: a call let through as this turn's one retry (:meth:`_may_retry`) that was refused before
+        it acted (the thinker busy on the desktop, its own shape, held, a game in front) gives the halt back: the next
+        hand of the turn is "not tried" again, and the retry stays used (no further try). One that acted keeps it
+        cleared: its own outcome decides (a failure halts again, :meth:`_halt_now`). Never raises."""
+        try:
+            halt = self._halt
+            if not isinstance(halt, dict) or "pending" not in halt:
+                return
+            pending = halt.pop("pending")
+            if facts.get("refused") and not facts.get("acted") and facts.get("sent_at") is None \
+                    and self.halted is None and halt.get("turn") == self._call_safely(self.user_turn, None):
+                self.halted = pending
+                if self.log is not None:
+                    self.log.event("hands", retry_refused=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _retry_words(self, facts: dict[str, Any]) -> str:
+        """lVoice review r1 L7: :data:`_RETRY_OPEN` when the hand whose failed note this is did not take effect, was not
+        passed on, and this turn's one retry is still open; else ``""`` (the plain note: hand it over). State only."""
+        try:
+            halt = self._halt
+            if facts.get("refused") or not self.halted or not isinstance(halt, dict) or halt.get("passed") \
+                    or int(halt.get("retries") or 0) >= 1 or halt.get("turn") != self._call_safely(self.user_turn, None):
+                return ""
+            return _RETRY_OPEN
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _skill_commits(skill_key: str, slots: dict[str, Any], values: Any = None) -> bool:
+        """lVoice review r1 M2 (rule 8): whether a run of ``skill_key`` sends something to other people or joins a call,
+        by its data: ``sends_with`` (the run's resolved values with the call's own over them, partial: a condition on a
+        value not known counts as met) or a commit end (a join; ``engine.run_commit``), as :meth:`_skill_fallback` reads
+        them. ``True`` when it cannot be told (never a second send). Blocking (the catalog): off the voice loop."""
+        try:
+            from yuki.skills import engine
+            from yuki.skills.catalog import load
+            from yuki.skills.connection import sends_with
+
+            key = str(skill_key or "")
+            catalog = load()
+            skill = catalog.get(key)
+            if skill is None and "#" in key:
+                # a learned skill this process has not read yet: the capability it specialises (its key's own head)
+                # carries the same sends / end data
+                skill = catalog.get(key.split("#", 1)[0])
+            if skill is None:
+                return True
+            got = {k: v for k, v in (values.items() if isinstance(values, dict) else ()) if v not in (None, "", [], {})}
+            got.update({k: v for k, v in (slots or {}).items() if v not in (None, "", [], {})})
+            if sends_with(skill, got, partial=True) or getattr(skill, "end", "") == "call_join":
+                return True
+            return engine.run_commit(skill) != "none"
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _turn_sent(self) -> bool:
+        """lVoice review r1 M2: whether a checked skill run of this user turn sends or joins (:attr:`_commit_turn`)."""
+        turn = self._call_safely(self.user_turn, None)
+        return turn is not None and self._commit_turn == turn
+
     def _guard_desk(self, name: str, args: dict[str, Any] | None = None) -> None:
         """Refuse a window hand while the thinker works on the desktop; refuse any hand after a wrong effect, but for
         its one retry on another target in the same turn (lVoice, problem 7)."""
         if self.halted:
             if args is not None and self._may_retry(name, args):
                 self._halt["retries"] = int(self._halt.get("retries") or 0) + 1
+                self._halt["pending"] = self.halted   # review r1 L5: given back if refused before it acts
                 self.halted = None
                 if self.log is not None:
                     self.log.event("hands", op=name, retry=True)
@@ -4660,15 +4870,23 @@ class Hands:
             if _detail(result, "refused") == "game":
                 facts["refused"] = "game"   # D17(2): a game came to the front before the key: never handed over
             if ok and before is not None:
-                changed, words = self._media_after(before)
+                seen: dict[str, Any] = {}
+                changed, words = self._media_after(before, seen=seen)
                 report += "; " + words
                 now = self._media_status() if want else None
                 # With the state they want known, verified means it is in that state now, not only that it changed.
                 facts["verified"] = changed and (not want or (now is not None and now[1].lower() == want))
+                state = (now[1] if now is not None else seen.get("status")) if changed else None
+                if state:
+                    facts["media_now"] = str(state)   # lVoice review r1 L10: code's line ("Paused.") reads it
             elif ok and volume is not None:
-                changed, words = self._volume_after(volume)
+                seen = {}
+                changed, words = self._volume_after(volume, seen=seen)
                 report += "; " + words
                 facts["verified"] = changed
+                if changed and isinstance(seen.get("after"), dict):
+                    after = seen["after"]   # lVoice review r1 L10: code's line ("Volume's at 40.") reads it
+                    facts["volume_level"], facts["volume_muted"] = after.get("level"), after.get("muted")
             return ok, report, facts
         if name == "scroll" and args.get("keep") == "start":
             return self._keep_scrolling(args, facts)   # V7: on and on, until they say stop
@@ -5135,6 +5353,12 @@ class Hands:
         result = act(app, level=level, change=change, mute=mute)
         ok, report, facts = self._report(result, "", facts)
         facts["verified"] = bool(_detail(result, "verified")) if ok else False
+        if facts["verified"]:
+            # lVoice review r1 L10: what it read back, for code's done line when the call left say_when_done out
+            after, muted = _detail(result, "after"), _detail(result, "muted_after")
+            facts["app_level"] = after if isinstance(after, (int, float)) and (level is not None or change is not None) \
+                else None
+            facts["app_muted"] = muted if mute is not None and isinstance(muted, bool) else None
         if ok and _detail(result, "noop"):
             # N1: nothing moved (already at the level or its end): no done line, no hand-off; the talker says it
             facts.update(noop=True, settled=True, verified=None)
@@ -5210,6 +5434,8 @@ class Hands:
         if names:
             self._other_tabs = {h: v for h, v in self._other_tabs.items() if time.monotonic() - v[2] < _TABS_FRESH_S}
             self._other_tabs[hwnd] = (names, ids, time.monotonic(), frozenset())
+            self._other_complete = {h: c for h, c in self._other_complete.items() if h in self._other_tabs}
+            self._other_complete[hwnd] = bool(getattr(strip, "complete", True))   # review r1 L4
         return names, ids, frozenset()
 
     def _offer_tabs(self, hwnd: int, numbers: list[int]) -> None:
@@ -5610,10 +5836,14 @@ class Hands:
         for _ in range(times - 1 if verb in ("next", "previous") else 0):
             if not route(verb, result.app_id, log=log).sent:   # the rest of the presses, on the same session
                 break
-        changed, words = self._media_after(before, app_id=result.app_id, verb=verb)
+        seen: dict[str, Any] = {}
+        changed, words = self._media_after(before, app_id=result.app_id, verb=verb, seen=seen)
         now = self._media_status(result.app_id) if want else None
         # With the state they want known, verified means that session is in it now, not only that it changed.
         facts["verified"] = changed and (not want or (now is not None and now[1].lower() == want))
+        state = (now[1] if now is not None else seen.get("status")) if changed else None
+        if state:
+            facts["media_now"] = str(state)   # lVoice review r1 L10: code's line ("Paused.") reads it
         return True, f"sent {verb} to {name}'s media session (Windows' media controls, no key); {words}", facts
 
     def _endpoint_volume(self, key: str, times: int,
@@ -5633,8 +5863,12 @@ class Hands:
             facts["verified"] = None
             return True, (f"the system volume is now {after.get('level')}%{' (muted)' if after.get('muted') else ''} "
                           f"(Windows' audio endpoint, no key)"), facts
-        changed, words = self._volume_after(volume)
+        seen: dict[str, Any] = {}
+        changed, words = self._volume_after(volume, seen=seen)
         facts["verified"] = changed
+        if changed and isinstance(seen.get("after"), dict):
+            # lVoice review r1 L10: code's line ("Volume's at 40.") reads it
+            facts["volume_level"], facts["volume_muted"] = seen["after"].get("level"), seen["after"].get("muted")
         return True, f"set the system volume through Windows' audio endpoint (no key); {words}", facts
 
     def _media_status(self, app_id: str | None = None) -> tuple[str, str, str] | None:
@@ -5671,7 +5905,8 @@ class Hands:
             return now[1] != before[1] and now[1] != "closed"
         return now[1] != before[1]
 
-    def _media_after(self, before: tuple[str, ...], *, app_id: str | None = None, verb: str = "") -> tuple[bool, str]:
+    def _media_after(self, before: tuple[str, ...], *, app_id: str | None = None, verb: str = "",
+                     seen: dict[str, Any] | None = None) -> tuple[bool, str]:
         """What the media session says after a transport command or key: ``app_id``'s session (the one the command
         was aimed at, critic M1c: another app's title change never counts), else the current one; watched until it
         shows the effect, at most :data:`_WATCH_S` (a condition poll). A measured fact for the report."""
@@ -5685,6 +5920,8 @@ class Hands:
             time.sleep(_POLL_S)
         if after == before:
             return False, f"media: {before[0]} still {before[1]} after {_WATCH_S:g} s"
+        if seen is not None:
+            seen["status"] = after[1]   # lVoice review r1 L10: the state seen, for code's done line
         track = f" \"{after[2]}\"" if len(after) > 2 and after[2] and after[2] != before[2] else ""
         return True, f"media: {after[0]} now {after[1]}{track} (was {before[0]} {before[1]})"
 
@@ -5695,7 +5932,7 @@ class Hands:
         except Exception:  # noqa: BLE001
             return None
 
-    def _volume_after(self, before: dict[str, Any]) -> tuple[bool, str]:
+    def _volume_after(self, before: dict[str, Any], seen: dict[str, Any] | None = None) -> tuple[bool, str]:
         deadline = time.monotonic() + _WATCH_S
         after = before
         while time.monotonic() < deadline:
@@ -5706,6 +5943,8 @@ class Hands:
             time.sleep(_POLL_S)
         if after == before:
             return False, f"the volume is still {before.get('level')}%{' (muted)' if before.get('muted') else ''}"
+        if seen is not None:
+            seen["after"] = dict(after)   # lVoice review r1 L10: the level seen, for code's done line
         return True, (f"the volume is now {after.get('level')}%{' (muted)' if after.get('muted') else ''} "
                       f"(was {before.get('level')}%{' muted' if before.get('muted') else ''})")
 

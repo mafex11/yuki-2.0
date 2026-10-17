@@ -1450,6 +1450,55 @@ class VoiceBridge(QObject):
             jobs = list(self._jobs.values()) + list(self._unsubmitted.values()) + list(self._finished)
         return any(j.source == "voice" and not j.remember and not j.unadopted and j.user_turn == turn for j in jobs)
 
+    def answer_pending(self) -> bool:
+        """lVoice review r1 L8: whether a voice job waits on a question the user heard (:meth:`_answerable`) or a turn
+        of theirs is held as such an answer (a claim not settled yet). The hands' end check then hands no rest on:
+        :meth:`escalate` would route their words as that job's answer, though a hand already acted on them. State
+        only; ``True`` when it cannot be told (nothing is handed on then). Never raises."""
+        try:
+            claim = self._claim
+            if claim is not None and not claim.done and not claim.dropped:
+                return True
+            return self._answerable() is not None
+        except Exception:  # noqa: BLE001
+            return True
+
+    async def note_planned(self, text: str) -> bool:
+        """lVoice review r1 L2: a labelled note (code's words: a part of the reply the voice planned and did not run,
+        once the thinker took their whole request) for the open job made for the user's current turn
+        (:meth:`_same_turn_job`): steered into it while it runs, or kept for when it starts. Never routed as the answer
+        to a question it asks (a job waiting on one is left alone), never a new job. ``True`` when it went. Logged
+        content-free. Never raises."""
+        job = self._same_turn_job()
+        if job is None or not text or job.state == WAITING:
+            return False
+        loop = asyncio.get_running_loop()
+        decided: asyncio.Future = loop.create_future()
+
+        note = "(From Yuki's voice, about the request you are on) " + " ".join(str(text).split())
+
+        def route() -> None:
+            how = "none"
+            try:
+                if job.closing is None and job.state in OPEN_STATES and job.state != WAITING:
+                    if job.job_id is not None and job.state == RUNNING:
+                        self._steer(job, job.job_id, note)   # as an adopted job's note is steered in (_adopt)
+                        how = "added"
+                    elif job.state == QUEUED:
+                        job.pending_steers.append(note)   # not started yet: delivered when it starts (_on_started)
+                        how = "queued"
+            except Exception:  # noqa: BLE001
+                how = "none"
+            loop.call_soon_threadsafe(lambda: decided.done() or decided.set_result(how))
+
+        self._gui(route)
+        try:
+            how = await asyncio.wait_for(decided, timeout=5.0)
+        except asyncio.TimeoutError:
+            how = "none"
+        self._log("bridge", op="note_planned", token=job.token, how=how, chars=len(text))
+        return how != "none"
+
     async def _ack_if_silent(self, params: Any, args: dict[str, Any]) -> None:
         """Say the call's ``say_first`` words now when the reply that made it said nothing aloud.
 
