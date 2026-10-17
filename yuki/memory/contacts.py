@@ -46,6 +46,12 @@ Latin runs by sound too, one word or a name split in two. :func:`resolve` reads 
 words sounding like it, two signals agreeing), and then only when no group chat or channel is called exactly that. By
 default a literal name nobody in the index has stays nobody's: the chat driver says it doesn't know who that is, and
 never sends to someone who merely sounds alike. Fixed format rules over the user's own data, never a word list.
+For that "nobody" case only, :func:`sounds_alike` names the one person the name loosely sounds like (:func:`_alike`:
+one consonant class apart) and whether it is tight to a heard form the user confirmed (:func:`_alike_tight`: that form
+plus one final consonant, "Kumar" for the user's "quix", live test 17 Oct): the chat driver uses only a tight one for a
+draft or an open without asking, and asks once about the rest ("Did you mean Hemanth?", recorded by
+:func:`note_alike_asked`; its answer, :func:`alike_answered`, lets the person's name through :func:`names_person`);
+never for a send.
 
 Lightweight: the model call runs only when memory changed since the last run (after the nightly audit, or by hand);
 nothing here is on a request's path but SQL.
@@ -71,6 +77,11 @@ Public API (the memory API wraps it: ``MemoryClient.contact``, ``people_director
                                                         # name them (as written, transliterated or, unless
                                                         # by_sound=False: a send's recipient, by sound)
     transliterated(store, name) -> Contact | None       # the one person a name in a Brahmic script reads as
+    sounds_alike(store, name) -> Alike | None           # a name nobody goes by: the one person it (loosely) sounds
+                                                        # like, the form matched, confirmed form?, tight?
+    note_alike_asked(store, said, person_id, words) -> bool   # the chat driver's "Did you mean X?" (RAM; once)
+    alike_answered(store, person_id, words) -> str | None     # the name it asked about, once the user spoke since
+    dm_claim(contact, route, others) -> str             # whose DM a route two people hold is ("own"/"other"/"shared")
     sounds_in(name, texts, short=False) -> str | None   # the words in ``texts`` that sound like ``name`` (an app)
     contacts_of_threads(store, thread_ids) -> {thread id: [(Contact, Route)]}
     recent_chat_contacts(store, now=None, minutes=10) -> list[dict]
@@ -133,17 +144,21 @@ THEIRS_WEIGHT = 0.25
 #: Style samples: the user's last own messages per route (decrypted when read, for the resolved person only).
 STYLE_SAMPLES = 5
 SAMPLE_CHARS = 160
-#: The directory block for the cached profile layer (the talker, the voice thinker, typed chat).
+#: The directory block for the cached profile layer (the talker, the voice thinker, typed chat). The talker cuts its
+#: copy to the same size at a line (``yuki.voice.mouth.PEOPLE_CHARS``), so the block fits it whole.
 DIRECTORY_CHARS = 900
 DIRECTORY_PLACES = 3
+#: Heard forms the user confirmed, shown per person (each the way speech writes their name: "hey meant" for Hemanth).
+DIRECTORY_HEARD = 4
 #: Contacts and routes cached per database until their tables change (checked by a stamp query, ~0.1 ms).
 _CACHE: dict[str, tuple[tuple[Any, ...], list["Contact"]]] = {}
 _CACHE_LOCK = threading.Lock()
 #: Per thread, the other senders' counts as of its newest message id (group shares; decrypted once, incrementally).
 _SENDERS: dict[tuple[str, int], tuple[int, dict[str, list[float]]]] = {}
 
-DIRECTORY_HEAD = ("People the user talks to (memory's people index; where they talk, most used lately first; "
-                  "about(name) for counts and the user's last messages):")
+DIRECTORY_HEAD = ("People the user talks to (memory's people index; where they talk, most used first; \"heard as\": "
+                  "speech wrote their name so and the user confirmed it: that person, never ask; about(name) for "
+                  "more):")
 PLACES_HEAD = "Group chats the user writes in most:"
 
 
@@ -483,6 +498,207 @@ def heard_people(found: Sequence[Any], text: str | None, *, single: bool = False
         if c is not None and (c.id not in hits or start < hits[c.id][0]):
             hits[c.id] = (start, c, words)
     return sorted(hits.values(), key=lambda h: h[0])
+
+
+# ---------------------------------------------------------------------------
+# A name nobody goes by: who it sounds like, loosely (live test 17 Oct: "Kumar" for the user's "quix")
+# ---------------------------------------------------------------------------
+
+#: The looser sound match (:func:`_alike`), used only for a name that no one of the user's people goes by as written
+#: and the strict rule (:func:`_sound_ok`) reads as nobody: its answer is a question (the chat driver's "Did you mean
+#: Hemanth?"), never a send by sound. Two Latin spellings at most this far apart ("kumar" / "quix" 0.4; "rohan" /
+#: "rahul" 0.6 is refused)...
+ALIKE_MAX_DISTANCE = 0.45
+#: ...whose sound keys differ by at most this many consonant classes (one left out, added or changed: a final "r" an
+#: accent leaves unsaid or speech recognition adds, KMR for KM)...
+ALIKE_KEY_EDITS = 1
+#: ...with the same onset, and at least this many letters each (a shorter name matches only as written).
+ALIKE_MIN_LETTERS = 4
+#: The tight rule (:func:`_alike_tight`, the only sound match used without a question, for a draft or an open): a heard
+#: form the user confirmed with a sound key at least this long (classes)...
+TIGHT_MIN_KEY = 2
+#: ...ending in one of these letters (a vowel)...
+TIGHT_VOWELS = frozenset("aeiou")
+#: ...heard with this one sound class added at the very end: the final "r" speech recognition adds (or an accent leaves
+#: unsaid) after a name's final vowel ("quix" heard "Kumar", live 17 Oct). Measured on the user's index (review r1 M2):
+#: any final consonant also took "Komlal" to Komal and "Brams" to Bram unasked; with "r" only, the silent matches of
+#: 117 common names and words were Kumar, Qumar, Gumar, Komlar, Tippar, Tibbar and "broker".
+TIGHT_ADDED = "R"
+#: How long the chat driver's sound-alike question ("Did you mean bobsled?") waits for its answer (the exchange's
+#: span, as the skill resolver's ``CONFIRM_ONCE_S``): asked once per name within it, and the answer counts within it.
+ALIKE_ANSWER_S = 120.0
+_ALIKE_LOCK = threading.Lock()
+#: (database, the name as said, folded) -> (when asked, the person's id, the name as said, the user's turns then, the
+#: newest turn then). RAM only; never logged.
+_ALIKE_ASKED: dict[tuple[str, str], tuple[float, int, str, int, str]] = {}
+
+
+def _key_edits(a: str, b: str) -> int:
+    """Edit distance of two sound keys (classes added, left out or changed)."""
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _alike(run: Heard, name: Heard) -> bool:
+    """Whether a run of Latin words may loosely be ``name`` heard another way: the same onset, sound keys within
+    :data:`ALIKE_KEY_EDITS`, :data:`ALIKE_MIN_LETTERS` letters each and spellings within :data:`ALIKE_MAX_DISTANCE`.
+    Never across scripts (a transliteration is the strict rule's). A fixed format rule over the user's own data."""
+    if run.script or name.script or not run.key or not name.key or run.onset != name.onset:
+        return False
+    if min(len(run.letters), len(name.letters)) < ALIKE_MIN_LETTERS:
+        return False
+    return _key_edits(run.key, name.key) <= ALIKE_KEY_EDITS and \
+        _distance(run.letters, name.letters) <= ALIKE_MAX_DISTANCE
+
+
+def _alike_tight(run: Heard, form: Heard) -> bool:
+    """Whether one Latin word is ``form`` (a heard form the user confirmed) with a final "r" added: "Kumar" for "quix",
+    the sound speech recognition adds after a name that ends in a vowel (live test 17 Oct). The same onset; ``form``
+    of :data:`ALIKE_MIN_LETTERS` letters, ending in one of :data:`TIGHT_VOWELS`, with a sound key of
+    :data:`TIGHT_MIN_KEY` classes or more; the word's key exactly ``form``'s plus :data:`TIGHT_ADDED` at its end, the
+    word ending on those consonant letters; and its letters before them spelled within :data:`HEARD_MAX_DISTANCE` of
+    ``form``'s. A changed sound, a sound left out, any other added sound or the same short key is never tight ("Nick",
+    "Nisha" or "niece" for "niche", "Papa" for "Pippa", "Binod" for "Barun", "Kumari" for "quix": review r1 M2,
+    measured on the user's own index); those are asked. A fixed format rule."""
+    if run.script or form.script or run.onset != form.onset or len(form.letters) < ALIKE_MIN_LETTERS:
+        return False
+    if form.letters[-1] not in TIGHT_VOWELS or len(form.key) < TIGHT_MIN_KEY:
+        return False
+    if run.key != form.key + TIGHT_ADDED:
+        return False
+    head = run.letters
+    while head and sound_key(head) != form.key:
+        head = head[:-1]
+    tail = run.letters[len(head):]
+    if not tail or any(ch in TIGHT_VOWELS or ch == "y" for ch in tail):
+        return False
+    return len(head) >= ALIKE_MIN_LETTERS and _distance(head, form.letters) <= HEARD_MAX_DISTANCE
+
+
+def _one_word(text: str) -> Heard | None:
+    """How ``text`` sounds when it is one Latin word (the tight rule's only input), else ``None``."""
+    words = spoken_words(text)
+    return heard_of([words[0][1]]) if len(words) == 1 else None
+
+
+def _tight_to(word: Heard | None, contact: Contact) -> bool:
+    """Whether ``word`` is tight (:func:`_alike_tight`) to one of the heard forms ``contact``'s user confirmed."""
+    if word is None:
+        return False
+    forms = [f for f in (heard_form(h) for h in contact.heard()) if f is not None and f.key]
+    return any(_alike_tight(word, f) for f in forms)
+
+
+@dataclass(frozen=True)
+class Alike:
+    """The one person a name nobody goes by sounds like (:func:`sounds_alike`): the contact, the name or alias it
+    sounds like as memory keeps it (``form``), whether that form is a heard form the user confirmed (``confirmed``: a
+    ``name_aliases`` correction, ``how = "heard"``; the person's own name or a handle seen in their chats is not),
+    whether the strict rule (:func:`resolve` with ``heard``, which the skill resolver asks about) finds them too, and
+    whether the name is tight to a confirmed heard form of theirs (``tight``, :func:`_alike_tight`: the chat driver's
+    only match without a question, for a draft or an open)."""
+
+    contact: Contact
+    form: str
+    confirmed: bool
+    strict: bool
+    tight: bool = False
+
+
+def sounds_alike(store: Store, name: str | None) -> Alike | None:
+    """The one person ``name`` sounds like when none of the user's people goes by it as written (:func:`resolve` finds
+    nobody) and no group chat or channel is called exactly that: one of their names or aliases matched by the strict
+    rule (:func:`_sound_ok`), the looser one (:func:`_alike`) or the tight one (:func:`_alike_tight`, a confirmed
+    heard form), and nobody else's. ``None`` when anyone fits as written, none or two people sound alike, or memory
+    can't say. For the chat driver's question ("Did you mean bobsled?") and, only when ``tight``, a draft or an open
+    without one; never whom a send goes to. Never raises."""
+    try:
+        text = " ".join(str(name or "").split())
+        form = heard_form(text)
+        if form is None or resolve(store, text):
+            return None
+        want = tokens(text)
+        if any(tokens(r.chat) == want for r in places(store)):
+            return None
+        word = _one_word(text)
+        hits: list[tuple[bool, float, Contact, str, bool, bool]] = []
+        for c in people(store):
+            heard = {" ".join(tokens(h)) for h in c.heard()}
+            for n in c.names:
+                f = heard_form(n)
+                if f is None or not f.key:
+                    continue
+                confirmed = " ".join(tokens(n)) in heard
+                strict = _sound_ok(form, f)
+                tight = confirmed and word is not None and _alike_tight(word, f)
+                if strict or tight or _alike(form, f):
+                    hits.append((tight, _distance(form.letters, f.letters), c, n, confirmed, strict))
+        if not hits or len({h[2].id for h in hits}) != 1:
+            return None
+        hits.sort(key=lambda h: (not h[0], h[1], not h[4]))
+        tight, _d, c, n, confirmed, _s = hits[0]
+        return Alike(contact=c, form=" ".join(str(n).split()), confirmed=confirmed,
+                     strict=any(h[5] for h in hits), tight=tight)
+    except Exception:
+        return None
+
+
+def _turns(words: Sequence[str] | str | None) -> list[str]:
+    return [str(w) for w in ([words] if isinstance(words, str) else list(words or [])) if str(w or "").strip()]
+
+
+def note_alike_asked(store: Store, said: str, person_id: int, words: Sequence[str] | str | None, *,
+                     now: float | None = None) -> bool:
+    """Note that the chat driver asked whether ``said`` (the user's name, "Kumar") meant the person ``person_id``
+    ("Did you mean bobsled?"), with the user's turns as they stood (``words``: the exchange's turns, newest last).
+    ``False`` when the same name was asked about within :data:`ALIKE_ANSWER_S` (the same name given again means the
+    answer was no: never asked twice). RAM only. Never raises."""
+    now = time.time() if now is None else float(now)
+    turns = _turns(words)
+    try:
+        key = (_db_key(store), " ".join(tokens(said)))
+    except Exception:
+        return False
+    with _ALIKE_LOCK:
+        for k in [k for k, v in _ALIKE_ASKED.items() if not (0.0 <= now - v[0] <= ALIKE_ANSWER_S)]:
+            _ALIKE_ASKED.pop(k, None)
+        if key in _ALIKE_ASKED:
+            return False
+        _ALIKE_ASKED[key] = (now, int(person_id), " ".join(str(said).split()), len(turns), turns[-1] if turns else "")
+        return True
+
+
+def alike_answered(store: Store, person_id: int | None, words: Sequence[str] | str | None, *,
+                   now: float | None = None) -> str | None:
+    """The user's name for ``person_id`` that the chat driver's sound-alike question asked about within
+    :data:`ALIKE_ANSWER_S` ("Kumar", asked "Did you mean bobsled?"), when the user has spoken since (a turn newer than
+    the question stands in ``words``), their newest turn doesn't give that same name again (the resolver's own "the
+    same name again is a no") and the name still stands in their turns. Whether they said yes is the talker's
+    judgement (it names the person again only on a yes); a run for that person after it may open their chat or type a
+    draft there, never send (review r1 H1: never by sound alone; confirmed first). ``None`` otherwise."""
+    if person_id is None:
+        return None
+    now = time.time() if now is None else float(now)
+    turns = _turns(words)
+    if not turns:
+        return None
+    try:
+        db = _db_key(store)
+    except Exception:
+        return None
+    with _ALIKE_LOCK:
+        asked = [v for (d, _s), v in _ALIKE_ASKED.items()
+                 if d == db and v[1] == int(person_id) and 0.0 <= now - v[0] <= ALIKE_ANSWER_S]
+    for _at, _p, said, n, last in asked:
+        newer = len(turns) > n or turns[-1] != last
+        if newer and not span_in(said, turns[-1]) and any(span_in(said, t) for t in turns[:-1]):
+            return said
+    return None
 
 
 def _clean(value: Any, cap: int) -> str:
@@ -1641,6 +1857,13 @@ def names_person(store: Store, name: str | None, texts: Sequence[str] | str | No
     name the user said is checked as said (the resolver keeps it, and :func:`resolve` without ``heard`` finds nobody
     for a name not theirs).
 
+    With ``by_sound``, failing all that (review r1 M3: never a loose sound on its own): the person the chat driver's
+    sound-alike question asked about, once the user has answered it (:func:`alike_answered`: "Did you mean bobsled?"
+    about their "Kumar", and a turn of theirs since; a yes gives the person's name back); or one word of ``texts``
+    that is tight to a heard form of theirs the user confirmed (:func:`_alike_tight`: "Kumar" for "quix", the same
+    rule the chat driver takes without a question) and that nobody goes by or sounds like. Never a send's recipient
+    (``by_sound=False``).
+
     ``by_sound=False`` (a send's recipient: whom a message goes to): no Latin by sound at all, neither for ``name``
     (found as written) nor in ``texts`` (:func:`named_in` only: as written, a learned heard form, a transliteration),
     so a thinker's "Kiran" for the user's "Karan" is nobody's, never a send to Kiran. Never raises (``None``)."""
@@ -1650,14 +1873,33 @@ def names_person(store: Store, name: str | None, texts: Sequence[str] | str | No
             return None
         target = next(iter(who.values()))
         found = people(store)
-        for text in [texts] if isinstance(texts, str) else list(texts or []):
+        texts = [texts] if isinstance(texts, str) else list(texts or [])
+        for text in texts:
             if any(c.id == target.id for c, _w in named_in(store, text)):
                 return target
             if by_sound and any(c.id == target.id for _s, c, _w in heard_people(found, text, single=True)):
                 return target
+        if by_sound and (alike_answered(store, target.id, texts) or _tightly_named(store, found, target, texts)):
+            return target
     except Exception:
         return None
     return None
+
+
+def _tightly_named(store: Store, found: Sequence[Contact], target: Contact, texts: Sequence[str]) -> bool:
+    """Whether one Latin word of ``texts`` is tight (:func:`_alike_tight`) to a heard form of ``target``'s the user
+    confirmed, sounds like none of anyone else's names (strict or loose) and is nobody's name as written."""
+    if not target.heard():
+        return False
+    others = [f for c in found if c.id != target.id for f in (heard_form(n) for n in c.names) if f is not None]
+    for text in texts:
+        for _start, w in spoken_words(text):
+            word = heard_of([w])
+            if word is None or not _tight_to(word, target):
+                continue
+            if not any(_alike(word, f) or _sound_ok(word, f) for f in others) and not resolve(store, w):
+                return True
+    return False
 
 
 def transliterated(store: Store, name: str | None) -> Contact | None:
@@ -1907,6 +2149,55 @@ def rank_routes(store: Store, contact: Contact, *, now: float | None = None) -> 
     return Ranking(routes, margin, margin < ROUTE_MARGIN, pref)
 
 
+#: :func:`dm_claim`'s answers: the person's own direct message, another holder's, or not to be told apart.
+CLAIM_OWN, CLAIM_OTHER, CLAIM_SHARED = "own", "other", "shared"
+
+
+def dm_claim(contact: Contact, route: Route, others: Sequence[Contact]) -> str:
+    """Whose direct message ``route`` (one of ``contact``'s, kind ``dm``) is, when ``others`` (the other people whose
+    routes hold its capture threads too: memory linked one DM to two people) exist: :data:`CLAIM_OWN` when nobody else
+    holds it, or its chat name as memory keeps it names ``contact`` (a name or alias as whole words: "Darvesh (DM)")
+    and none of the others; :data:`CLAIM_OTHER` when it names one of the others and not ``contact`` (Malini's link to
+    "Darvesh (DM)"); else :data:`CLAIM_SHARED`. Identity data only (the people's own names against the chat's)."""
+    if not others:
+        return CLAIM_OWN
+    if route.kind != "dm":
+        return CLAIM_SHARED
+
+    def names(c: Contact) -> bool:
+        return any(span_in(n, route.chat) for n in c.names if tokens(n))
+
+    mine, theirs = names(contact), any(names(o) for o in others)
+    if mine and not theirs:
+        return CLAIM_OWN
+    if theirs and not mine:
+        return CLAIM_OTHER
+    return CLAIM_SHARED
+
+
+def _dm_holders(found: Sequence[Contact]) -> dict[int, list[Contact]]:
+    """Capture thread id -> the people with a direct-message route on it."""
+    out: dict[int, list[Contact]] = {}
+    for c in found:
+        for r in c.routes:
+            if r.kind == "dm":
+                for t in r.thread_ids:
+                    out.setdefault(int(t), []).append(c)
+    return out
+
+
+def _claims(contact: Contact, routes: Sequence[Route], holders: dict[int, list[Contact]]) -> dict[int, str]:
+    """Route id -> :func:`dm_claim` for each of ``contact``'s routes (``own`` for a group chat or channel)."""
+    out: dict[int, str] = {}
+    for r in routes:
+        if r.kind != "dm":
+            out[r.id] = CLAIM_OWN
+            continue
+        others = {o.id: o for t in r.thread_ids for o in holders.get(int(t), []) if o.id != contact.id}
+        out[r.id] = dm_claim(contact, r, list(others.values()))
+    return out
+
+
 def samples(store: Store, route: Route, limit: int = STYLE_SAMPLES) -> list[dict[str, Any]]:
     """The user's last own messages on a route, newest first: ``{"text", "at"}`` (decrypted now; tombstoned ones,
     past the capture TTL, are gone)."""
@@ -2114,11 +2405,19 @@ def card_text(c: dict[str, Any]) -> str:
 
 
 def directory(store: Store, *, now: float | None = None, chars: int = DIRECTORY_CHARS) -> str:
-    """The compact people block (<= ``chars``): per person their name, relation, aliases (heard forms too), routes
-    most used lately first, and how the user writes to them; then the group chats the user writes in most. No counts
-    or dates (it sits in a cached prompt layer and should change only when the people or their order do). ``""``
-    when the index is empty. People are ordered by how much the user deals with them lately: their routes' own-message
-    weight plus :data:`THEIRS_WEIGHT` of the person's messages. Never raises."""
+    """The compact people block (<= ``chars``): per person their name, relation, the heard forms the user confirmed,
+    their routes (their own direct messages first), then aliases and how the user writes to them while room lasts;
+    then the group chats the user writes in most. No counts or dates (it sits in a cached prompt layer and should
+    change only when the people or their order do). ``""`` when the index is empty. Never raises.
+
+    **Who comes first** (live test 17 Oct: the user's best friend, 141 messages that week, was left out while two
+    colleagues' lines filled the block): the people the user names to Yuki (a heard form of their name the user
+    confirmed, :meth:`Contact.heard`) and talks to, then everyone else, each by how much the user deals with them
+    lately: their routes' own-message weight plus :data:`THEIRS_WEIGHT` of the person's messages, a direct message
+    that memory also linked to someone else counted by :func:`dm_claim` (its chat names the other person: none of it;
+    neither or both: a share). **Fitting**: every line first at its shortest (name, relation, heard forms, the apps of
+    their direct messages), as many people as fit in that order; then, while room lasts, the fuller lines for the
+    first ones (aliases and the chats' names, then the tone)."""
     now = time.time() if now is None else float(now)
     try:
         found = people(store)
@@ -2126,15 +2425,30 @@ def directory(store: Store, *, now: float | None = None, chars: int = DIRECTORY_
         return ""
     if not found:
         return ""
-    ranked: list[tuple[float, Contact, Ranking]] = []
+    holders = _dm_holders(found)
+    ranked: list[tuple[bool, float, Contact, list[Route], bool]] = []
     for c in found:
         try:
             ranking = rank_routes(store, c, now=now)
-            weight = sum(r.score + THEIRS_WEIGHT * r.weight_theirs for r in ranking.routes)
+            claims = _claims(c, ranking.routes, holders)
+            weight = 0.0
+            for r in ranking.routes:
+                claim = claims.get(r.id, CLAIM_OWN)
+                if claim == CLAIM_OTHER:
+                    continue
+                share = 1.0
+                if claim == CLAIM_SHARED:
+                    share = 1.0 / (1 + len({o.id for t in r.thread_ids for o in holders.get(int(t), [])
+                                            if o.id != c.id}))
+                weight += share * (r.score + THEIRS_WEIGHT * r.weight_theirs)
+            order = {CLAIM_OWN: 0, CLAIM_SHARED: 1}
+            shown = sorted((r for r in ranking.routes if claims.get(r.id, CLAIM_OWN) != CLAIM_OTHER),
+                           key=lambda r: (r.kind != "dm", order.get(claims.get(r.id, CLAIM_OWN), 2)))
+            close = ranking.close and not ranking.preferred and len(shown) > 1 and shown[:2] == ranking.routes[:2]
         except Exception:
             continue
-        ranked.append((weight, c, ranking))
-    ranked.sort(key=lambda x: (-x[0], x[1].name.casefold()))
+        ranked.append((bool(c.heard()) and weight > 0, weight, c, shown, close))
+    ranked.sort(key=lambda x: (not x[0], -x[1], x[2].name.casefold()))
     try:
         group = [measure_route(store, r, None, now) for r in places(store)]
     except Exception:
@@ -2146,24 +2460,27 @@ def directory(store: Store, *, now: float | None = None, chars: int = DIRECTORY_
             per_service[r.service] = r
     group = list(per_service.values())[:DIRECTORY_PLACES]
     places_line = (PLACES_HEAD + " " + "; ".join(_short_route(r) for r in group)) if group else ""
-    lines = [DIRECTORY_HEAD]
     room = chars - len(DIRECTORY_HEAD) - (len(places_line) + 1 if places_line else 0)
-    for weight, c, ranking in ranked:
-        # the fullest line that fits, else a shorter one (no tone, then no aliases); people stay in their order:
-        # once nobody's line fits, the rest are left to about()
-        added = False
-        for full in (2, 1, 0):
-            line = _directory_line(c, ranking, weight, detail=full)
-            if len(line) + 1 <= room:
-                lines.append(line)
-                room -= len(line) + 1
-                added = True
-                break
-        if not added:
-            break
+    # 1. as many people as fit, each at its shortest line, in their order (a line too long for the room left is
+    # skipped, and a shorter one after it may still fit)
+    kept: list[list[Any]] = []
+    for _heard, weight, c, shown, close in ranked:
+        line = _directory_line(c, shown, weight, detail=0, close=close)
+        if len(line) + 1 <= room:
+            kept.append([c, shown, weight, close, line])
+            room -= len(line) + 1
+    # 2. the fuller lines for the first people while room lasts: aliases and chat names for each, then the tone
+    for detail in (1, 2):
+        for item in kept:
+            c, shown, weight, close, line = item
+            fuller = _directory_line(c, shown, weight, detail=detail, close=close)
+            if len(fuller) - len(line) <= room:
+                room -= len(fuller) - len(line)
+                item[4] = fuller
+    lines = [DIRECTORY_HEAD] + [item[4] for item in kept]
     if places_line:
         lines.append(places_line)
-    return "\n".join(lines) if len(lines) > 1 else ""
+    return "\n".join(lines) if kept or places_line else ""
 
 
 def _short_route(r: Route) -> str:
@@ -2174,23 +2491,32 @@ def _short_route(r: Route) -> str:
     return f"{app} DM {chat}" if r.kind == "dm" else f"{app} {chat}"
 
 
-def _directory_line(c: Contact, ranking: Ranking, weight: float, *, detail: int = 2) -> str:
-    """One person's directory line; ``detail`` 2: relation, aliases, routes and tone; 1: without the tone; 0: name,
-    relation and routes only."""
+def _directory_line(c: Contact, routes: Sequence[Route], weight: float, *, detail: int = 2,
+                    close: bool = False) -> str:
+    """One person's directory line. ``detail`` 0: name, relation, the heard forms the user confirmed (up to
+    :data:`DIRECTORY_HEARD`; the talker takes them as that person, never asks), and where a message to them goes:
+    the apps of their own direct messages ("Discord DM > WhatsApp DM"), or with none, their first group chat or
+    channel by name; 1: also their other aliases and their first two routes with the chats' names; 2: also how the
+    user writes to them."""
     bits = []
     if c.relation:
         bits.append(_words_clip(c.relation, 36))
     if detail >= 1:
         aka = [a["name"] for a in c.aliases if a.get("how") != "heard"][:2]
-        heard = c.heard()[:2]
         if aka:
             bits.append("aka " + ", ".join(_words_clip(a, 24) for a in aka))
-        if heard:
-            bits.append("heard as " + ", ".join(_words_clip(h, 20) for h in heard))
+    heard = list(dict.fromkeys(_words_clip(h, 20) for h in c.heard()))[:DIRECTORY_HEARD]
+    if heard:
+        bits.append("heard as " + ", ".join(heard))
     line = f"- {c.name}" + (f" ({'; '.join(bits)})" if bits else "")
-    if ranking.routes:
-        line += ": " + " > ".join(_short_route(r) for r in ranking.routes[:2])
-        if ranking.close and len(ranking.routes) > 1 and not ranking.preferred:
+    dms = [r for r in routes if r.kind == "dm"]
+    if detail == 0 and routes:
+        # the shortest line: where a message to them goes (their own direct messages, by app), else their first
+        # group chat or channel by name
+        line += ": " + (" > ".join(f"{r.app or r.service} DM" for r in dms[:2]) if dms else _short_route(routes[0]))
+    elif routes:
+        line += ": " + " > ".join(_short_route(r) for r in routes[:2])
+        if close and len(routes) > 1:
             line += " (about even)"
     elif weight <= 0:
         line += ": no chat seen"

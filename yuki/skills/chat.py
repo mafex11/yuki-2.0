@@ -18,7 +18,12 @@ one ranked first. A person whose chats are groups or channels only is told plain
 X"); one with no DM in the named app hears "I don't have a <app> chat with X" (or is offered their DM in another
 app); with DMs only in apps the routes don't drive, the run says "no route" (the thinker does it its own way). Each
 route's app comes from its stored service or its threads' programs, matched against the apps' data. The app is the one
-the user named, else the usual route's; the done line names an app the user didn't.
+the user named, else the usual route's; the done line names an app the user didn't. A DM memory linked to two people
+goes to the one its chat name names (``contacts.dm_claim``), never to the other (lMsg). A name none of their people
+goes by that is tight to a heard form of theirs the user confirmed ("Kumar" for "quix": that form plus one final
+consonant) is that person for a draft or an open; anything looser, or a send, is asked once ("Did you mean bobsled?";
+:func:`_sounds_alike`), and a send to that person after the answer is typed and left, never sent by sound
+(:func:`_send_gate`, review r1 H1). A send the send check would refuse is refused before the chat opens.
 
 **Opening the chat** (rung A, two ways per app, in order):
 
@@ -47,7 +52,8 @@ wording of what the user asked to say (failure fix-plan Item 11, row 4, with the
 after their yes): that very step's grant (:attr:`yuki.skills.engine.RunContext.grant`) lets exactly that text go to
 exactly that person (by their id in the people index), in their own direct message only, and nothing else (Item 11's L2;
 a group chat or channel, even the person's usual one, still needs the user's own words). The opened chat's composer is
-read first: other text already there (the app's kept draft) means nothing is typed or pressed, said plainly; a composer
+read first (zero-width characters and the BOM are not text: Discord's empty box reads "U+FEFF" and a newline, live 17
+Oct): other text already there (the app's kept draft) means nothing is typed or pressed, said plainly; a composer
 that can't be read gets a send's words typed and its send key never pressed (told to press Enter). A send is "done" only
 when memory captured the user's own message equal to that text in that very chat (the messages table, matched by the
 route's capture thread ids, never by the app's name); "pressed send, couldn't confirm it landed" otherwise, once the
@@ -62,6 +68,9 @@ name from the user's words, Enter; if Discord doesn't take the microphone within
 ``discord_voice``, encrypted). With a call live it asks first, in the rung (after the engine's game check), and the
 question says what will happen (review r2 M2): "Switch to {channel}?" when the call is Discord's own, else "Join
 {channel} on Discord as well?" (nothing leaves another app's call); the answer comes back as the ``join_in_call`` slot.
+lMsg (live problem 11): a channel memory never saw in the app (:func:`channel_known`) is never joined ("I don't know a
+Discord voice channel called NDLS."); memory's open calls are checked against the live microphone (:func:`_current_calls`),
+so a call that ended is not "live"; and a ``join_in_call`` "no" with no call live answers nothing.
 
 Every route takes focus: never with a game in front (the engine holds the run: "after the round?"), each focus and
 opened link asks ``gamegate.refuse_input`` here, and the input layer refuses again. The steps run through the hands
@@ -119,7 +128,20 @@ LINE_DRAFT_THERE = "There's already unsent text in your chat with {name}, so I l
 #: would re-run the skill and type them a second time).
 LINE_TYPED_UNREAD = ("It's typed in your chat with {name}, but I couldn't read the message box, so I didn't send it. "
                      "Press Enter when you want it to go.")
+#: lMsg: a send Yuki's own send check refused before any step (whom or what is not in the user's words): nothing typed,
+#: nothing sent; told, not asked (a "yes" would only meet the same check). Review r1 L7: the check runs before the chat
+#: is opened (:func:`_send_gate`), so nothing takes focus; :data:`LINE_SEND_REFUSED` is the runner's own later refusal.
+LINE_SEND_HELD = "I didn't send anything to {name}: I wasn't sure it's who and what you said."
+LINE_SEND_REFUSED = ("Your chat with {name} is open, but I didn't type or send anything: I wasn't sure it's what you "
+                     "said.")
+#: lMsg review r1 H1: a send to the person the sound-alike question asked about, after the user answered it, is typed
+#: and left (whom it goes to is never settled by sound; the user presses Enter, or a later send by the name memory
+#: learned from their answer goes as usual). Told, not asked.
+LINE_TYPED_ALIKE = ("It's typed in your chat with {name}, not sent: I don't send to a name I only matched by sound. "
+                    "Press Enter if it's them.")
 LINE_VOICE_UNCONFIRMED = "I opened {channel} in Discord, but couldn't confirm you joined it."
+#: lMsg (live problem 11): a voice channel memory never saw in the app is never joined; said plainly (never a guess).
+LINE_NO_CHANNEL = "I don't know a {app} voice channel called {channel}."
 #: Asked before a join while a call is live (review r2 M2: the question says what the route does; never a promise to
 #: leave a call it can't leave). The app's own words come from its data (``[chat.asks]``); these are the fallbacks.
 ASK_ALSO_JOIN = "You're already in a call. Join {channel} on {app} as well?"
@@ -253,6 +275,9 @@ class Target:
     id: int | None = None
     #: review r2 L1: the person has chats with the user, and none is a direct message (groups or channels only)
     no_dm: bool = False
+    #: lMsg: found by how the words sound (a heard form the user confirmed, for a draft or an open only), never as
+    #: written: no send goes to such a target, and no send grant covers it
+    by_sound: bool = False
 
 
 @dataclass
@@ -294,14 +319,94 @@ def _chat_route(store: Any, route: Any) -> ChatRoute:
                      preferred=bool(getattr(route, "preferred", False)))
 
 
-def find_target(store: Any, person: str) -> Target | Asked:
+def _person_target(store: Any, contact: Any, said: str, *, by_sound: bool = False) -> Target:
+    """``contact`` as a message target: their own direct messages as routes, most used first (:data:`PERSON_KIND`,
+    memory's chat kind: never a group chat or channel they write in, even one ranked first). A DM memory also linked
+    to other people is marked ``shared`` (no send grant covers it) and comes after their own; one whose chat name
+    names one of those others and not them (``contacts.dm_claim``: Malini's link to "Darvesh (DM)", live data 17 Oct)
+    is not theirs at all and is left out, so "message Malini" never opens Darvesh's chat."""
+    from yuki.memory import contacts as C
+
+    try:
+        ranking = C.rank_routes(store, contact)
+        dms = [r for r in ranking.routes if getattr(r, "kind", "") == PERSON_KIND]
+        others = len(ranking.routes) - len(dms)
+        owners = C.contacts_of_threads(store, [t for r in dms for t in r.thread_ids]) if dms else {}
+        own: list[ChatRoute] = []
+        shared: list[ChatRoute] = []
+        for r in dms:
+            holders = {int(c.id): c for t in r.thread_ids for c, _r in owners.get(t, []) if int(c.id) != int(contact.id)}
+            claim = C.dm_claim(contact, r, list(holders.values())) if holders else C.CLAIM_OWN
+            if claim == C.CLAIM_OTHER:
+                continue
+            route = _chat_route(store, r)
+            # review r2 L2: a DM whose threads another live contact also holds is not this person's alone
+            route.shared = bool(holders)
+            (own if claim == C.CLAIM_OWN else shared).append(route)
+        routes = own + shared
+    except Exception:  # noqa: BLE001
+        routes, others = [], 0
+    return Target(name=contact.name, said=said, routes=routes, id=int(contact.id), no_dm=not routes and others > 0,
+                  by_sound=by_sound)
+
+
+#: lMsg (live test 17 Oct: "Kumar" for the user's "quix"): asked once when a name none of their people goes by sounds
+#: like exactly one of them by the looser rule (``contacts.sounds_alike``), or by the tight rule on a send. The strict
+#: rule's matches are the skill resolver's own question (``resolve.CONFIRM_PERSON``, the same words). The person is
+#: named by memory's name when the form matched is a heard form ("Did you mean Hemanth?", never "niche?").
+ASK_ALIKE = "Did you mean {name}?"
+
+
+def _sounds_alike(store: Any, who: str, mode: str, words: Sequence[str] = ()) -> Target | Asked | None:
+    """For a name none of the user's people (nor a group chat or channel) goes by as written: the one person it sounds
+    like (``contacts.sounds_alike``). Tight to a heard form of theirs the user confirmed ("Kumar" for "quix": that form
+    plus one final consonant), for a draft or an open: that person (``by_sound``: the done line names them, so a wrong
+    guess shows). Anything looser, or a send: asked once, "Did you mean bobsled?" (review r1 M2: a loose match never
+    opens a chat unasked; rule 8, x6/xL2Grant: whom a message is sent to is never matched by sound, confirmed first),
+    noted with the user's turns as they stand (``contacts.note_alike_asked``) so only an answer given after it counts
+    (:func:`_answered_alike`). ``None``: nobody alike, the strict rule's match (the resolver asks that), or the
+    question was asked already (the same name again: the answer was no)."""
+    from yuki.memory import contacts as C
+
+    alike = C.sounds_alike(store, who)
+    if alike is None or alike.strict:
+        return None
+    if alike.tight and mode != "send":
+        return _person_target(store, alike.contact, who, by_sound=True)
+    if C.note_alike_asked(store, who, int(alike.contact.id), words):
+        name = alike.contact.name if alike.confirmed else alike.form
+        return Asked(ASK_ALIKE.format(name=name), list(dict.fromkeys([name, alike.form])), outcome="sounds_like")
+    return None
+
+
+def _answered_alike(call: RouteCall, target: Target) -> bool:
+    """Whether this run's person is the one the sound-alike question asked about, answered since
+    (``contacts.alike_answered``: a turn of the user's newer than the question). Such a run may open the chat or type
+    a draft, never send (review r1 H1): :func:`_send_gate` turns its send into a draft."""
+    if target.place or target.id is None:
+        return False
+    store = _store(call.ctx)
+    if store is None:
+        return False
+    try:
+        from yuki.memory.contacts import alike_answered
+
+        return alike_answered(store, target.id, [str(w) for w in call.ctx.words or () if w]) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def find_target(store: Any, person: str, *, mode: str = "", words: Sequence[str] = ()) -> Target | Asked:
     """Whom ``person`` (the user's words) names: one of their people (``contacts.resolve``: a name or alias, whole or a
     whole-word part of it, a misheard form the user corrected; two who fit: a question), with only their own direct
-    messages as routes (:data:`PERSON_KIND`, memory's chat kind: never a group chat or channel they write in, even one
-    ranked first; a DM another of their people also holds is marked ``shared``); else a group chat or channel whose
-    name is those words (identity), else "I don't know who that is". When the words are a group's or channel's whole
-    name, a person whose name only stands inside them is not the one named (the place wins), and a person they name
-    as a whole name or a part of one makes it a question, never a guess (review r2 M2)."""
+    messages as routes (:func:`_person_target`); else a group chat or channel whose name is those words (identity);
+    else, for a run (``mode``: ``send``, ``draft`` or ``open``; ``words``: the user's turns, newest last), the one
+    person the name sounds like (:func:`_sounds_alike`: tight to a confirmed heard form, for a draft or an open; else
+    asked once); else "I don't know who that is". Without ``mode`` (:func:`whom`, the send grant's person, the
+    done-check) never by sound. When the words
+    are a group's or channel's whole name, a person whose name only stands inside them is not the one named (the place
+    wins), and a person they name as a whole name or a part of one makes it a question, never a guess (review r2
+    M2)."""
     from yuki.memory import contacts as C
 
     who = _words(person)
@@ -334,21 +439,7 @@ def find_target(store: Any, person: str) -> Target | Asked:
         names = [c.name for c in people.values()][:3]
         return Asked(ASK_WHICH.format(who=who, names=" or ".join(names)), names, outcome="two_people")
     if people:
-        contact = next(iter(people.values()))
-        try:
-            ranking = C.rank_routes(store, contact)
-            dms = [r for r in ranking.routes if getattr(r, "kind", "") == PERSON_KIND]
-            others = len(ranking.routes) - len(dms)
-            owners = C.contacts_of_threads(store, [t for r in dms for t in r.thread_ids]) if dms else {}
-            routes = []
-            for r in dms:
-                route = _chat_route(store, r)
-                # review r2 L2: a DM whose threads another live contact also holds is not this person's alone
-                route.shared = any(int(c.id) != int(contact.id) for t in r.thread_ids for c, _r in owners.get(t, []))
-                routes.append(route)
-        except Exception:  # noqa: BLE001
-            routes, others = [], 0
-        return Target(name=contact.name, said=who, routes=routes, id=int(contact.id), no_dm=not routes and others > 0)
+        return _person_target(store, next(iter(people.values())), who)
     if places:
         now = time.time()
         try:
@@ -356,6 +447,13 @@ def find_target(store: Any, person: str) -> Target | Asked:
         except Exception:  # noqa: BLE001
             pass
         return Target(name=places[0].chat, said=who, routes=[_chat_route(store, r) for r in places], place=True)
+    if mode:
+        try:
+            alike = _sounds_alike(store, who, mode, words)
+        except Exception:  # noqa: BLE001 - memory can't say: nobody, as before
+            alike = None
+        if alike is not None:
+            return alike
     return Asked(LINE_UNKNOWN.format(who=who), outcome="unknown_person")
 
 
@@ -431,6 +529,10 @@ def _said_as(call: RouteCall, target: Target) -> str:
     by id, in their own direct message, :func:`yuki.skills.uia_route.granted_send`)."""
     from yuki.skills.uia_route import said
 
+    if target.by_sound:
+        # lMsg: a person found only by how the words sound never receives a send (their name as memory keeps it is
+        # not in the user's words, so the send check refuses it before any step)
+        return target.name
     words = [str(w) for w in call.ctx.words or () if w]
     for form in (target.said, target.name):
         if form and said(form, words):
@@ -455,8 +557,30 @@ def _said_as(call: RouteCall, target: Target) -> str:
 
 
 def _app_named(values: Mapping[str, Any]) -> str | None:
+    """The chat app the run's ``app`` value names: an app with chat data by its key, title, program or image name
+    (identity), else the one chat app whose title the value sounds like (``contacts.sounds_in``, the short-name rule:
+    "this card" for Discord, live 17 Oct, when the value reached the driver as heard); else the value's own key (no
+    chat data: "I don't have a <app> chat with X"). ``None`` when no app was given."""
     app = values.get("app")
-    return _app_key(app) or None if app else None
+    key = _app_key(app) if app else ""
+    if not key:
+        return None
+    if app_data(key):
+        return key
+    apps = chat_apps()
+    for name in apps:
+        d = app_data(name)
+        known = {name, _app_key(d.get("title"))} | {_app_key(x) for x in [*(d.get("processes") or []),
+                                                                         *(d.get("images") or [])]}
+        if key in known:
+            return name
+    try:
+        from yuki.memory.contacts import sounds_in
+
+        heard = [name for name in apps if sounds_in(_title(name), [str(app)], short=True)]
+    except Exception:  # noqa: BLE001
+        heard = []
+    return heard[0] if len(heard) == 1 else key
 
 
 def _target_route(call: RouteCall) -> tuple[Target, ChatRoute] | RouteResult:
@@ -471,13 +595,16 @@ def _target_route(call: RouteCall) -> tuple[Target, ChatRoute] | RouteResult:
             pass
     person = call.values.get("person")
     person = person.get("name") if isinstance(person, Mapping) else person
-    key = (_words(person), _app_named(call.values) or "")
+    text, send = _text_mode(call.values)
+    mode = "send" if send else ("draft" if text else "open")
+    key = (_words(person), _app_named(call.values) or "", mode)
     if key not in cache:
         store = _store(call.ctx)
         if store is None:
             cache[key] = None
         else:
-            target = find_target(store, str(person or ""))
+            target = find_target(store, str(person or ""), mode=mode,
+                                 words=[str(w) for w in call.ctx.words or () if w])
             cache[key] = target if isinstance(target, Asked) else (target, pick_route(target, key[1] or None))
     got = cache[key]
     if got is None:
@@ -641,15 +768,16 @@ def _composer_text(hands: Any) -> str | None:
 
 
 def _composer_state(hands: Any, text: str) -> str:
-    """The opened chat's composer against the user's words (review r1 L6, r2 H1): ``"empty"``, ``"same_text"`` (it
-    already holds exactly ``text``, whitespace and case folded: an identity check of the user's own words),
-    ``"other_text"`` (anything else: the app's kept draft) or ``"unread"``."""
+    """The opened chat's composer against the user's words (review r1 L6, r2 H1): ``"empty"`` (nothing but whitespace,
+    zero-width characters and the BOM: Discord's empty message box holds "U+FEFF" and a newline, live test 17 Oct),
+    ``"same_text"`` (it already holds exactly ``text``, whitespace, zero-width characters and case folded: an
+    identity check of the user's own words), ``"other_text"`` (anything else: the app's kept draft) or ``"unread"``."""
     from yuki.skills.donecheck import _norm_text
 
     held = _composer_text(hands)
     if held is None:
         return "unread"
-    if not held.strip():
+    if not _norm_text(held):
         return "empty"
     return "same_text" if text and _norm_text(held) == _norm_text(text) else "other_text"
 
@@ -919,17 +1047,61 @@ def _where(values: Mapping[str, Any], app: str) -> str:
     return "" if _app_named(values) else f" on {_title(app)}"
 
 
-def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Target, route: ChatRoute, *, via: str,
-                since: float, hwnd: int) -> RouteResult:
-    """After the chat was asked to open: wait until it is seen open, then (only then) type the user's words, and press
-    send when they plainly said so. The route's result: acted, with its RAM facts for the done-check."""
+def _send_decl(call: RouteCall, target: Target, route: ChatRoute, text: str) -> tuple[dict[str, Any], Any]:
+    """What a send declares to the send check, and the grant that may cover it: ``({"to", "what", "person_id",
+    "kind"}, grant)``. Item 11's L2: the send also says whom by the person's id, so the brain's consent grant for this
+    step (the engine's validated ``ctx.grant``; none on the voice or the old loop) covers exactly its text to exactly
+    its person, though Yuki worded the text or speech wrote the name another way. Only into that person's own direct
+    message (the route's kind as memory keeps it): a group chat or channel of theirs is read by other people, so there
+    the send carries no person id and needs the user's own words (review r1 H1); never a person found by sound."""
+    own_dm = not target.place and target.id is not None and route.kind == "dm" and not route.shared \
+        and not target.by_sound
+    sends = {"to": _said_as(call, target), "what": text, "person_id": target.id if own_dm else None,
+             "kind": route.kind}
+    grant = getattr(call.ctx, "grant", None) if getattr(call.ctx, "origin", "") == "thinker" else None
+    return sends, grant
+
+
+def _send_gate(call: RouteCall, target: Target, route: ChatRoute) -> tuple[bool, RouteResult | None]:
+    """Before the chat is opened, a send meets the very check its steps would meet (``uia_route.check_sends`` on the
+    same declaration, words and grant: whom and what in the user's words, or the brain's grant). ``(as_draft,
+    refusal)``: ``(False, None)`` it may go (or it is no send); ``(True, None)`` it would be refused, but its person is
+    the one the sound-alike question asked about and the user answered since (:func:`_answered_alike`): typed and left
+    as a draft (review r1 H1: never sent by sound, confirmed or not); ``(False, result)`` refused, said before anything
+    takes focus (review r1 L7)."""
+    from yuki.skills.uia_route import check_sends
+
     text, send = _text_mode(call.values)
+    if not send:
+        return False, None
+    sends, grant = _send_decl(call, target, route, text)
+    args: dict[str, Any] = {"sends": True, "to": str(sends.get("to") or ""), "what": str(sends.get("what") or "")}
+    for name in ("person_id", "kind"):
+        if sends.get(name) is not None:
+            args[name] = sends[name]
+    if check_sends(args, [str(w) for w in call.ctx.words or () if w], grant=grant) is None:
+        return False, None
+    if _answered_alike(call, target):
+        return True, None
+    return False, RouteResult(ran=False, ask=LINE_SEND_HELD.format(name=target.name), outcome="send_refused",
+                              facts={"mode": "send", "held_at": "send_check"})
+
+
+def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Target, route: ChatRoute, *, via: str,
+                since: float, hwnd: int, as_draft: bool = False) -> RouteResult:
+    """After the chat was asked to open: wait until it is seen open, then (only then) type the user's words, and press
+    send when they plainly said so. The route's result: acted, with its RAM facts for the done-check. ``as_draft``
+    (:func:`_send_gate`): a send to a person matched by sound, answered since: typed and left, said so."""
+    text, send = _text_mode(call.values)
+    send = send and not as_draft
     name = target.name
     where = _where(call.values, app)
     chat, ev = _wait_chat(call, data, route, since, hwnd)
     facts: dict[str, Any] = {"via": via, "chat": {True: "open", False: "other", None: "unknown"}[chat],
                              "by": str(ev.get("by") or ev.get("board") or ev.get("status") or ""),
                              "mode": "send" if send else ("draft" if text else "open")}
+    if as_draft:
+        facts["as_draft"] = "sound_alike"
     ram: dict[str, Any] = {"app": app, "thread_ids": list(route.thread_ids), "chat": chat}
     if not text:
         return RouteResult(ran=True, outcome="opened", app=app, say=SAY_OPENED.format(name=name, where=where),
@@ -937,7 +1109,7 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
                            facts_ram=ram)
     if chat is not True:
         # never type into a chat that isn't confirmed open: it may be someone else's
-        if chat is False and send:
+        if chat is False and (send or as_draft):
             # review r2 L4: another chat opened and nothing was typed: settled with the driver's own line (never "the
             # PC shows it didn't go through", and not counted as a failed send)
             return RouteResult(ran=True, ask=LINE_UNSURE_CHAT.format(app=_title(app), name=name),
@@ -965,15 +1137,9 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     if send and not blind:
         steps.append({"do": "keys", "keys": [str(k) for k in data.get("send") or ["enter"]]})
     if steps:
-        # Item 11's L2: the send also says whom by the person's id, so the brain's consent grant for this step (the
-        # engine's validated ``ctx.grant``; none on the voice or the old loop) covers exactly its text to exactly its
-        # person, though Yuki worded the text or speech wrote the name another way. Only into that person's own
-        # direct message (the route's kind as memory keeps it): a group chat or channel of theirs is read by other
-        # people, so there the send carries no person id and needs the user's own words (review r1 H1)
-        own_dm = not target.place and target.id is not None and route.kind == "dm" and not route.shared
-        sends = ({"to": _said_as(call, target), "what": text, "person_id": target.id if own_dm else None,
-                  "kind": route.kind} if send and not blind else None)
-        grant = getattr(call.ctx, "grant", None) if getattr(call.ctx, "origin", "") == "thinker" else None
+        # Item 11's L2 (:func:`_send_decl`): whom by the person's id too, only into their own direct message
+        decl, grant = _send_decl(call, target, route, text)
+        sends = decl if send and not blind else None
         _ok, run = run_steps(call.ctx.hands, steps, words=call.ctx.words, apps=list(data.get("images") or []),
                              key="message", sends=sends, grant=grant)
     else:
@@ -988,6 +1154,12 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     ram.update(typed=typed, pressed=pressed)
     facts.update(typed={True: "yes", False: "no", None: "unknown"}[typed], pressed=pressed,
                  steps=int(run.get("steps") or len(steps)), steps_done=int(run.get("steps_done") or 0))
+    if send and run.get("refused_steps") and not _dispatched(run, "type") and not pressed:
+        # lMsg: the send check refused the steps before any ran (whom or what isn't in the user's words, and no grant):
+        # nothing typed, nothing sent. Told so, never "I tried to send it, but the PC shows it didn't go through"
+        ram.update(typed=False, pressed=False)
+        return RouteResult(ran=True, ask=LINE_SEND_REFUSED.format(name=name), outcome="send_refused", app=app,
+                           facts={**facts, "held_at": "send_check"}, facts_ram=ram)
     if send and not pressed and run.get("held") and _dispatched(run, "type"):
         # review r1 L6: the text is in the composer and Yuki's own check held the send key. Told, not asked: a "yes"
         # would re-run the skill and type the text again into the kept draft
@@ -1007,6 +1179,14 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
         ram.update(typed=False)
         return RouteResult(ran=True, ask=LINE_NOT_TYPED.format(name=name), outcome="not_typed", app=app,
                            facts={**facts, "typed": "no"}, facts_ram=ram)
+    if as_draft:
+        # review r1 H1: the send they asked for, to a person matched by sound and answered since, is typed and left;
+        # told plainly, never "Sent" (the done-check would wait for a send that never goes)
+        if typed is False:
+            return RouteResult(ran=True, ask=LINE_NOT_TYPED.format(name=name), outcome="not_typed", app=app,
+                               facts={**facts, "held_at": "whom"}, facts_ram=ram)
+        return RouteResult(ran=True, ask=LINE_TYPED_ALIKE.format(name=name), outcome="typed_alike", app=app,
+                           facts={**facts, "held_at": "whom"}, facts_ram=ram)
     say = (SAY_SENT if send else SAY_DRAFT).format(name=name, where=where)
     unverified = (LINE_SENT_UNCONFIRMED if pressed else LINE_NOT_TYPED if typed is False else
                   LINE_TYPED_NOT_SENT if send else LINE_DRAFT_UNCONFIRMED).format(name=name)
@@ -1032,6 +1212,9 @@ def route_open_link(call: RouteCall) -> RouteResult:
     text, _send = _text_mode(call.values)
     if text and call.ctx.hands is None:
         return RouteResult(ran=False, outcome="no_hands")      # typing needs hands (the voice's or the brain's desk)
+    as_draft, refused = _send_gate(call, target, route)
+    if refused is not None:
+        return refused
     if _refused("open_url"):
         return RouteResult(ran=False, held="game", outcome="refused")
     since = time.time()
@@ -1040,7 +1223,8 @@ def route_open_link(call: RouteCall) -> RouteResult:
         return RouteResult(ran=False, held="game", outcome="refused")
     if not getattr(opened, "ok", False):
         return RouteResult(ran=False, outcome="not_opened")
-    return _after_open(call, app, data, target, route, via="link", since=since, hwnd=_app_hwnd(data))
+    return _after_open(call, app, data, target, route, via="link", since=since, hwnd=_app_hwnd(data),
+                       as_draft=as_draft)
 
 
 def route_switcher(call: RouteCall) -> RouteResult:
@@ -1061,6 +1245,9 @@ def route_switcher(call: RouteCall) -> RouteResult:
     steps, way_text = _switch_steps(call, data, route)
     if not steps:
         return RouteResult(ran=False, outcome="no_switcher")
+    as_draft, refused = _send_gate(call, target, route)
+    if refused is not None:
+        return refused
     hwnd, failed = _focus_app(data)
     if failed is not None:
         return failed
@@ -1075,7 +1262,7 @@ def route_switcher(call: RouteCall) -> RouteResult:
         return RouteResult(ran=False, outcome="switcher_unseen", facts={"steps": len(steps), "steps_done": done})
     if done == 0:
         return RouteResult(ran=False, outcome="switcher_failed", facts={"steps": len(steps)})
-    return _after_open(call, app, data, target, route, via="switcher", since=since, hwnd=hwnd)
+    return _after_open(call, app, data, target, route, via="switcher", since=since, hwnd=hwnd, as_draft=as_draft)
 
 
 def _switch_steps(call: RouteCall, data: Mapping[str, Any], route: ChatRoute) -> tuple[list[dict[str, Any]], str]:
@@ -1246,9 +1433,41 @@ def _judged(hands: Any, hwnd: int, image: str, role: str, name: str) -> str | No
     return None
 
 
+def _known_image(key: str) -> str:
+    """The program image of the chat app whose data names ``key`` among its app keys (``processes``; Discord's
+    "discord" -> "discord.exe"), casefolded; ``""`` when no chat app's data names it."""
+    for name in chat_apps():
+        d = app_data(name)
+        if key in {_app_key(p) for p in d.get("processes") or []} and d.get("images"):
+            return str(d["images"][0]).casefold()
+    return ""
+
+
+def _mic_live(process: str) -> bool | None:
+    """Whether the program ``process`` (memory's app key or an image name) holds the microphone now: True with an
+    active capture session; False when it has capture sessions and none is active (it let go of the microphone: the
+    call ended), or when it is a chat app whose own data gives its image name and that image has no capture session
+    at all (review r1 L5: an app that drops its session after a call); ``None`` when it can't be read, or an app
+    whose image name is only guessed from its key has no session under that guess (a packaged app's key is not its
+    image name, so absence proves nothing there)."""
+    from yuki.skills.donecheck import _mic_held_by
+
+    name = str(process or "").strip().casefold()
+    if not name:
+        return None
+    known = name if name.endswith(".exe") else _known_image(_app_key(name))
+    held, n = _mic_held_by(known or f"{name}.exe")
+    if held is None or (not held and n == 0 and not known):
+        return None
+    return bool(held)
+
+
 def _current_calls(memory: Any) -> list[str] | None:
-    """The app keys of the calls memory sees going on now (``MemoryClient.current_calls``: an app using the microphone
-    as a call), or ``None`` when it can't say."""
+    """The app keys of the calls going on now: memory's open calls (``MemoryClient.current_calls``: an app using the
+    microphone as a call), each checked against the live microphone right now (lMsg, live problem 11: a call memory
+    still showed open 2 hours after it ended made a join ask "switch?"). A call whose app holds no active capture
+    session now is over and left out; one whose microphone can't be read keeps memory's word. ``None`` when memory
+    can't say."""
     from yuki.skills.engine import _mem
 
     if memory is None:
@@ -1256,7 +1475,90 @@ def _current_calls(memory: Any) -> list[str] | None:
     calls = _mem(memory, "current_calls", lambda c: c.current_calls(), timeout_s=0.3)
     if not isinstance(calls, list):
         return None
-    return [k for k in (_app_key(c.get("process") or c.get("app")) for c in calls if isinstance(c, Mapping)) if k]
+    out: list[str] = []
+    for c in calls:
+        if not isinstance(c, Mapping):
+            continue
+        key = _app_key(c.get("process") or c.get("app"))
+        if key and _mic_live(str(c.get("process") or key)) is not False:
+            out.append(key)
+    return out
+
+
+def voice_labels(data: Mapping[str, Any]) -> list[list[str]]:
+    """The app's own words for a voice channel's header, per display language (``[chat.labels.<lang>]``
+    ``voice_channel``: Discord's "Voice Channel", which memory's capture keeps before the channel's name in the
+    thread's scope, "Voice Channel lofi lounge"), as word lists. ``[]`` when the app's data has none."""
+    from yuki.memory.contacts import tokens
+
+    out: list[list[str]] = []
+    labels = data.get("labels") if isinstance(data.get("labels"), Mapping) else {}
+    for lang in labels.values():
+        if not isinstance(lang, Mapping):
+            continue
+        value = lang.get("voice_channel")
+        for label in [value] if isinstance(value, str) else list(value or []):
+            words = tokens(str(label or ""))
+            if words and words not in out:
+                out.append(words)
+    return out
+
+
+def channel_known(store: Any, data: Mapping[str, Any], name: str, *, kind: str = "discord_voice") -> bool | None:
+    """Whether ``name`` (the user's words for a voice channel) names a voice channel memory has seen in this app (the
+    app's own keys in its data, ``processes``): a capture thread whose scope (the chat header) is the app's own
+    voice-channel label (:func:`voice_labels`) followed by the channel's name with those words in it, whole and in
+    order ("Voice Channel lofi lounge"), or a channel a join was noted for (tastes of ``kind``). Review r1 L4: a DM, a
+    text channel ("general") or a server's name is not a voice channel. With no label in the app's data, any of the
+    app's thread titles or scopes counts (the first build's rule). Identity of the user's words in memory's own data,
+    never a word list; titles and names stay in RAM. ``None`` when memory's threads can't be read."""
+    from yuki.memory import contacts as C
+
+    want = C.tokens(name)
+    keys = sorted({_app_key(p) for p in data.get("processes") or []} - {""})
+    if not want or not keys:
+        return False
+    labels = voice_labels(data)
+    marks = ",".join("?" * len(keys))
+    try:
+        rows = store._query(f"SELECT title_ciphertext, scope_ciphertext FROM threads WHERE process IN ({marks})"
+                            " AND merged_into IS NULL", keys)
+    except Exception:  # noqa: BLE001
+        return None
+    for row in rows:
+        for blob in ((row[1],) if labels else (row[0], row[1])):
+            if not blob:
+                continue
+            try:
+                text = store._dec(blob)
+            except Exception:  # noqa: BLE001 - a row the key can't read
+                continue
+            if not text:
+                continue
+            if not labels:
+                if C.span_in(want, str(text)):
+                    return True
+                continue
+            words = C.tokens(str(text))
+            if any(words[:len(lab)] == lab and C.span_in(want, words[len(lab):]) for lab in labels):
+                return True
+    try:
+        from yuki.skills import taste
+
+        return any(C.span_in(want, n) for n in taste.candidates(store, kind, limit=50))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _known_channel(ctx: Any, app: str, data: Mapping[str, Any], name: str) -> bool | None:
+    """:func:`channel_known` through the run's memory (``None``: memory can't say; the join is then judged as
+    before)."""
+    from yuki.skills.engine import _mem, _store_of
+
+    if getattr(ctx, "memory", None) is None:
+        return None
+    got = _mem(ctx.memory, "voice_channel", lambda c: channel_known(_store_of(c), data, name), timeout_s=0.8)
+    return got if isinstance(got, bool) else None
 
 
 def _call_question(call: RouteCall, data: Mapping[str, Any], app: str, name: str, mic_before: bool | None
@@ -1266,16 +1568,17 @@ def _call_question(call: RouteCall, data: Mapping[str, Any], app: str, name: str
     question). The live call is this app's own (it holds the microphone now, or memory's open calls name it): "Switch
     to {channel}?" (the app leaves its current channel by itself). Another app's, or one memory can't name: "Join
     {channel} on {app} as well?" (no route leaves another app's call, so none is promised). Words from the app's data
-    (``[chat.asks]``). ``(question, code word)``."""
-    from yuki.skills.engine import _in_call
-
+    (``[chat.asks]``). ``(question, code word)``. lMsg (live problem 11): memory's open calls are checked against the
+    live microphone first (:func:`_current_calls`), and the voice's own picture counts only when its hands carry one
+    (``in_call``), so a call that ended hours ago never makes a join ask "switch?"."""
     keys = {_app_key(p) for p in data.get("processes") or []}
     calls = _current_calls(call.ctx.memory) or []
     own = mic_before is True or any(k in keys for k in calls)
-    try:
-        live = bool(_in_call(call.ctx.hands, call.ctx.memory))
-    except Exception:  # noqa: BLE001
-        live = False
+    hands = call.ctx.hands
+    if hands is not None and hasattr(hands, "in_call"):
+        live = bool(getattr(hands, "in_call", False))
+    else:
+        live = bool(calls)
     if not (own or live):
         return None
     asks = data.get("asks") if isinstance(data.get("asks"), Mapping) else {}
@@ -1295,15 +1598,25 @@ def route_voice_join(call: RouteCall) -> RouteResult:
     name = _words(channel.get("name") if isinstance(channel, Mapping) else channel)
     if not name:
         return RouteResult(ran=False, ask="Which voice channel?", outcome="no_channel")
-    if call.values.get("join_in_call") is False:
-        return RouteResult(ran=False, ask=LINE_STAY, outcome="declined")
+    known = _known_channel(call.ctx, app, data, name)
+    if known is False:
+        # lMsg (live problem 11): "open NDL's channel" was planned as a Discord voice join. A channel memory never saw
+        # in this app is never joined: said plainly, nothing done (the caller may mean a creator's channel elsewhere)
+        return RouteResult(ran=False, ask=LINE_NO_CHANNEL.format(app=_title(app), channel=name),
+                           outcome="unknown_channel")
     image = str((data.get("images") or [""])[0])
     # the microphone before anything is done: the question's "is it Discord's own call", and the onset's baseline
     before = _mic_held(image)
-    if call.values.get("join_in_call") is not True:
+    answer = call.values.get("join_in_call")
+    if answer is not True:
         asked = _call_question(call, data, app, name, before)
         if asked is not None:
+            if answer is False:
+                # their "no" to the in-call question: their call stays as it is
+                return RouteResult(ran=False, ask=LINE_STAY, outcome="declined")
             return RouteResult(ran=False, ask=asked[0], outcome="ask_in_call", facts={"call": asked[1]})
+        # lMsg: with no call live there was no question to answer, so a "no" given here (a planner's guess, live 17
+        # Oct: "Okay, I'll leave your call as it is" with no call open) is no answer: the join goes ahead
     hands = call.ctx.hands
     if hands is None or not data.get("switcher"):
         return RouteResult(ran=False, outcome="no_hands" if hands is None else "no_switcher")

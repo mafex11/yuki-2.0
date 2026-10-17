@@ -489,8 +489,17 @@ def probe_chat_open(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
     return None, {"status": "no_reader"}
 
 
+#: Zero-width characters and the byte-order mark (U+200B-U+200F, U+2060, U+FEFF): nobody typed them, and a chat app's
+#: own composer may hold them when empty (Discord's empty message box reads "U+FEFF" and a newline: live test, 17 Oct).
+#: Dropped before any text is compared or tested for being empty.
+ZERO_WIDTH = "​‌‍‎‏⁠﻿"
+_NO_ZERO_WIDTH = {ord(ch): None for ch in ZERO_WIDTH}
+
+
 def _norm_text(text: Any) -> str:
-    return " ".join(str(text or "").split()).casefold()
+    """Text as compared: zero-width characters and the BOM dropped (:data:`ZERO_WIDTH`), whitespace runs as one space,
+    case folded. ``""`` for text that shows nothing (an empty composer)."""
+    return " ".join(str(text or "").translate(_NO_ZERO_WIDTH).split()).casefold()
 
 
 def _same_text(want: str, got: str) -> bool:
