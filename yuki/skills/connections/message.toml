@@ -25,7 +25,9 @@ app = "chat"
 [capability.message]
 end = "message_sent"
 kind = "change"
-menu = "message a person, group or channel in a chat app; sends only if they said send"
+# (the menu line with its slots must fit yuki/skills/connection.py MENU_LINE_CHARS, 140, or the talker sees no slot
+# names: 133 with these words)
+menu = "message a person, group or channel in a chat app; a draft unless they said send"
 done_line = "Done."
 commit = "words"
 offer_class = "never"
@@ -42,7 +44,11 @@ bind = { person = "contact", app = "app" }
 # ("hey meant" for Hemanth), a transliteration ("हेमंत") or a close mishearing by sound - and runs it as that
 # person's own name. A name two people fit is dropped and asked; a group chat or channel still needs its name said.
 # A name the user said that none of their people goes by, but that sounds like exactly one of them, is asked ("Did you
-# mean Hemanth?"), never swapped for that person.
+# mean Hemanth?"), never swapped for that person. One that only loosely sounds like a heard form of theirs the user
+# confirmed ("Kumar" for the user's "quix": a final "r" speech recognition adds) is that person for a draft or an
+# open (the done line names them); for a send it is asked first ("Did you mean quix?"), since whom a message is sent
+# to is never matched by sound (yuki/memory/contacts.py sounds_alike; yuki/skills/chat.py find_target). Each such
+# question is asked once: the same name given again is "I don't know who that is".
 [[capability.message.slot]]
 name = "person"
 type = "text"
