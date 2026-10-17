@@ -19,11 +19,13 @@ user said purge) deletes it, idempotent: once by migration 45 and again with ``-
 
 **What the purge takes** (counts only in its result): by the tag, the test sessions' turns, batches and summaries,
 the journal facts conversation memory drew from their exchanges (and ends the portrait facts resting on those alone),
-the conversation facts (rules, preferences, commitments) resting on test exchanges only, Yuki's run traces and their
-playbook events, skill runs (their ``uses`` taken back), surfaced cards, moments and asked occasions of test requests.
+the conversation facts (rules, preferences, commitments) resting on test exchanges only, the unanswered questions
+resting on test material only, Yuki's run traces and their playbook events, skill runs (their ``uses`` taken back,
+``last_used_at`` back to the latest real run), surfaced cards, moments and asked occasions of test requests.
 By the test sessions' own span (the harness drove the desktop while the user was away; these rows carry no tag): the
 know-how, the "said" taste pairings, the misheard-name aliases, the episodes, Yuki's own journal facts, the moments
-and occasions (with the preference observations fed from them) learned inside it.
+and occasions (with the preference observations fed from them) learned inside it. Kept: what the screen showed in the
+span (screen journal facts, links seen, the hour counts of "observed" tastes), which may be real incoming content.
 
 **Live lookups still see test runs** (review r1 M2): they say how a route or a control behaves on this PC, whoever
 asked, so a test measures the same Yuki the user runs and real evidence (a verified rung B, a false done) is never
@@ -296,14 +298,17 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
                 conn.execute("UPDATE portrait_facts SET valid_to = ? WHERE id = ?", (now, int(r["id"])))
                 ended += 1
         count("portrait_facts_ended", ended)
-    if gone_journal and _has(conn, "questions", "source_ids"):
+    if (gone_journal or turn_ids) and _has(conn, "questions", "source_ids"):
+        # unanswered questions resting only on test material: a conversation question's sources are exchange (turn)
+        # ids, any other's are journal ids. An answered one keeps: its answer is the user's own
         qs = []
-        for r in conn.execute("SELECT id, source_ids FROM questions WHERE source_ids IS NOT NULL").fetchall():
+        for r in conn.execute("SELECT id, origin, source_ids FROM questions WHERE source_ids IS NOT NULL AND"
+                              " answered_at IS NULL AND coalesce(status, '') != 'answered'").fetchall():
             try:
                 ids = {int(i) for i in json.loads(r["source_ids"] or "[]")}
             except (TypeError, ValueError):
                 continue
-            if ids and ids <= gone_journal:
+            if ids and ids <= (turn_ids if r["origin"] == "conversation" else gone_journal):
                 qs.append(int(r["id"]))
         _delete_ids(conn, "question_vec", "question_id", qs)
         count("questions", _delete_ids(conn, "questions", "id", qs))
@@ -337,16 +342,27 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
         count("playbook_events", conn.execute(
             f"DELETE FROM playbook_events WHERE NOT {sql_real_request('run_key')}").rowcount)
     if _has(conn, "skill_runs", "request_id"):
-        # the uses a test run added to its skill (registry.finish counts a done or already run once)
+        # the uses a test run added to its skill (registry.finish counts a done or already run once, and stamps
+        # last_used_at)
+        used: list[int] = []
         for r in conn.execute(f"SELECT skill_id, count(*) AS n FROM skill_runs WHERE NOT ({sql_real_skill_run()}) AND"
                               " outcome IN ('done', 'already') AND skill_id IS NOT NULL GROUP BY skill_id").fetchall():
             conn.execute("UPDATE skills SET uses = max(0, uses - ?) WHERE id = ?", (int(r["n"]), int(r["skill_id"])))
             count("skill_uses_taken_back", int(r["n"]))
+            used.append(int(r["skill_id"]))
         if _has(conn, "skill_route_tries", "run_key"):
             count("skill_route_tries", conn.execute(
                 "DELETE FROM skill_route_tries WHERE run_key IN (SELECT run_key FROM skill_runs WHERE run_key IS NOT"
                 f" NULL AND NOT ({sql_real_skill_run()}))").rowcount)
         count("skill_runs", conn.execute(f"DELETE FROM skill_runs WHERE NOT ({sql_real_skill_run()})").rowcount)
+        # last_used_at back to the skill's latest real done run (none left: unset), only where a test run stamped it
+        # later than that (a real run's own stamp is a moment after its t_done)
+        for sid in used:
+            real = conn.execute("SELECT max(coalesce(t_done, at)) FROM skill_runs WHERE skill_id = ? AND outcome IN"
+                                " ('done', 'already')", (sid,)).fetchone()[0]
+            count("skill_last_used_reset", conn.execute(
+                "UPDATE skills SET last_used_at = ? WHERE id = ? AND last_used_at > ?",
+                (real, sid, float(real or 0.0) + 5.0)).rowcount)
     if _has(conn, "surfaced", "session_id"):
         count("surfaced", conn.execute("DELETE FROM surfaced WHERE session_id >= ? AND session_id < ?",
                                        (lo, hi)).rowcount)
