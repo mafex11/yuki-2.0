@@ -548,13 +548,12 @@ def habit_run_done(store: Any, skill: Any, since: float, until: float, *, entity
         if not digests:
             return None
     try:
-        from yuki.memory.testtag import sql_real_request, sql_real_session
+        from yuki.memory.testtag import sql_real_skill_run
 
         # lBrain: a live test's run never counts as the habit done today
         rows = store._query(
             f"SELECT min(coalesce(t_done, t0)) FROM skill_runs WHERE skill IN ({','.join('?' * len(keys))}) AND"
-            " t0 >= ? AND t0 <= ? AND outcome IN ('done', 'already') AND " + sql_real_session("session_id")
-            + " AND " + sql_real_request("request_id")
+            " t0 >= ? AND t0 <= ? AND outcome IN ('done', 'already') AND " + sql_real_skill_run()
             + (f" AND entity_digest IN ({','.join('?' * len(digests))})" if digests else ""),
             (*keys, float(since), float(until) + 1.0, *digests))
     except Exception:  # noqa: BLE001 - no skill ledger yet
@@ -1590,10 +1589,10 @@ def done_today(store: Any, row: Mapping[str, Any], now: float, *, skills: Sequen
             return True
         return habit_run_done(store, skill, since, now, entity=entity) is not None
     try:
-        from yuki.memory.testtag import sql_real_request, sql_real_session
+        from yuki.memory.testtag import sql_real_skill_run
 
         got = store._query("SELECT 1 FROM skill_runs WHERE skill = ? AND t0 >= ? AND t0 < ? AND outcome = 'done' AND "
-                           + sql_real_session("session_id") + " AND " + sql_real_request("request_id") + " LIMIT 1",
+                           + sql_real_skill_run() + " LIMIT 1",
                            (str(row.get("skill_id")), since, now))
     except Exception:  # noqa: BLE001 - no skill ledger yet
         got = []

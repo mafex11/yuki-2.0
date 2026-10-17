@@ -793,10 +793,6 @@ def parse_header(raw: Mapping[str, Any], checks: Checks) -> Plan:
             errors.append("a send needs consent.quote (the user's words asking for it), consent.to and consent.text")
         if consent.commit == "join" and not (consent.quote and consent.to):
             errors.append("a join needs consent.quote (the user's words asking for it) and consent.to")
-        if consent.commit == "join" and consent.to:
-            unknown = join_target_error("consent.to", consent.to, skill)
-            if unknown:
-                errors.append(unknown)
         if consent.commit == "send" and consent.quote and consent.to and consent.text:
             bounce = send_text_error(consent, checks)
             if bounce:
@@ -1156,12 +1152,14 @@ def _joining_skill(key: Any) -> Any:
 
 def join_target_error(field_name: str, name: Any, skill_key: Any = None) -> str | None:
     """lBrain (live problem 11): a join through a skill that joins a call (``discord.voice``: its declared end
-    ``call_join``) whose target (``consent.to``, or the skill's name slot) memory has seen as no voice channel of that
-    skill's app, read from the request's places (``yuki.brain.context.channel_known``: tastes of the channels they
-    joined, the app's capture threads): the error, else ``None``. A steps plan's join (a meeting's window brought
-    forward for the user's click, consent row 3) and memory unable to say are no error (the join is judged as before:
-    the consent rule's row 3, the capability's own check). Identity of the words in memory's own data, never a reading
-    of them."""
+    ``call_join``) whose name slot (the value the rung uses) memory has seen as no voice channel of that skill's app,
+    read from the request's places (``yuki.brain.context.channel_known``: tastes of the channels they joined, the
+    app's capture threads): the error, else ``None``. A steps plan's join (a meeting's window brought forward for the
+    user's click, consent row 3) and memory unable to say are no error (the join is judged as before: the consent
+    rule's row 3, the capability's own check). Identity of the words in memory's own data, never a reading of them.
+    The planner's free-text ``consent.to`` is not checked (review r1 L1: "lofi lounge VC" would fail the whole-span rule
+    for a known channel; the slot is checked here, and the rung checks its filled slot again: lMsg's
+    ``unknown_channel``)."""
     sk = _joining_skill(skill_key)
     if sk is None:
         return None

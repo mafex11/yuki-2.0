@@ -1981,7 +1981,7 @@ class ConversationWorker:
         ``session_idle_s`` passed since its last exchange, or when a later
         exchange belongs to another session.
         """
-        turns = testtag.keep_real(self.store.turns_unsummarized(self.max_attempts))   # lBrain: never a live test's
+        turns = self.unsummarized_turns()   # lBrain: never a live test's
         if not turns:
             return []
         latest = self.store.latest_turn()
@@ -2166,7 +2166,7 @@ class ConversationWorker:
             result = PassResult()
             wall = time.time()
             if force or wall >= self._retry_at:
-                pending = testtag.keep_real(self.store.turns_pending(self.max_attempts))   # lBrain: never a live test's
+                pending = self.pending_turns()   # lBrain: never a live test's
                 if force or self.extraction_due(pending, wall):
                     for sid, turns in self.batches(pending):
                         hold = None if force else self.held_until(turns, pending)
@@ -2190,7 +2190,7 @@ class ConversationWorker:
         if now < self._retry_at:
             candidates.append(self._retry_at - now)
         else:
-            pending = testtag.keep_real(self.store.turns_pending(self.max_attempts))
+            pending = self.pending_turns()
             if pending:
                 due = now if len(pending) >= self.min_turns else min(t.created_at for t in pending) + self.max_wait_s
                 holds = [self.held_until(b, pending) for _sid, b in self.batches(pending)]
@@ -2199,9 +2199,47 @@ class ConversationWorker:
                 if due <= now:
                     return 0.0
                 candidates.append(due - now)
-            for t in testtag.keep_real(self.store.turns_unsummarized(self.max_attempts))[-1:]:
-                candidates.append(t.at + self.session_idle_s - now)
+            newest = self.newest_unsummarized_at()
+            if newest is not None:
+                candidates.append(newest + self.session_idle_s - now)
         return max(1.0, min(candidates))
+
+    # -- live-test isolation (lBrain) ------------------------------------------
+
+    #: The waiting turns' conditions (the store's own ``turns_pending`` / ``turns_unsummarized``), read with
+    #: ``max_attempts`` as their one parameter.
+    _PENDING_SQL = "extracted=0 AND extract_attempts < ?"
+    _UNSUMMARIZED_SQL = "summary_id IS NULL AND summary_attempts < ?"
+
+    def pending_turns(self) -> list[ConversationTurn]:
+        """The turns waiting for extraction (``store.turns_pending``), oldest first, never a live test's
+        (:mod:`yuki.memory.testtag`). They are left out in SQL, so they are never read or decrypted: test turns stay
+        ``extracted = 0`` for good and would otherwise be read on every pass and wake (review r1 L2)."""
+        return self._real_turns(self._PENDING_SQL, "turns_pending")
+
+    def unsummarized_turns(self) -> list[ConversationTurn]:
+        """The turns no session summary covers yet (``store.turns_unsummarized``), oldest first, never a live test's
+        (left out in SQL, as :meth:`pending_turns`)."""
+        return self._real_turns(self._UNSUMMARIZED_SQL, "turns_unsummarized")
+
+    def newest_unsummarized_at(self) -> float | None:
+        """The newest unsummarised real turn's time (the next wake's idle end), read without decrypting any turn.
+        ``None`` when there is none."""
+        query = getattr(self.store, "_query", None)
+        if query is None:   # a store without the raw read: the filtered list's last turn
+            turns = self.unsummarized_turns()
+            return float(turns[-1].at) if turns else None
+        rows = query(f"SELECT max(at) FROM conversation_turns WHERE {self._UNSUMMARIZED_SQL} AND "
+                     f"{testtag.sql_real_session('session_id')}", (int(self.max_attempts),))
+        return float(rows[0][0]) if rows and rows[0][0] is not None else None
+
+    def _real_turns(self, where: str, method: str) -> list[ConversationTurn]:
+        query, turn = getattr(self.store, "_query", None), getattr(self.store, "_turn", None)
+        if query is None or turn is None:   # a store without the raw read: its own method, filtered after
+            return testtag.keep_real(getattr(self.store, method)(self.max_attempts))
+        return [turn(r) for r in query(f"SELECT * FROM conversation_turns WHERE {where} AND "
+                                       f"{testtag.sql_real_session('session_id')} ORDER BY at, id",
+                                       (int(self.max_attempts),))]
 
     def run(self, stop: threading.Event | None = None) -> None:
         """Loop until :meth:`stop` (or ``stop`` is set), woken by Yuki's turn event or the next due time."""

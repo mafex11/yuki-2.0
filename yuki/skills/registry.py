@@ -12,8 +12,10 @@ capabilities (:mod:`yuki.skills.connection`); the tables of migration 41 hold wh
   of that app and kind inside ``[t0, t_done + lag]`` are Yuki's), and finished with the done-check's verdict:
   ``checked`` 1 (seen), 0 (contradicted), NULL (couldn't read); ``recheck`` 0 marks a false done (D19).
 
-Trust is computed from the ledger, never stored (:func:`trust`); a live test harness's runs are never part of it
-(lBrain, :mod:`yuki.memory.testtag`):
+Trust is computed from the ledger, never stored (:func:`trust`). Live lookups (the rung ladder, the menu) read every
+run, a live test harness's included: they say how a route behaves on this PC. Learners read it ``real_only`` (the
+offer bar, :func:`offer_ready`, and the skill learner's score): a live test is never the user asking (lBrain,
+:mod:`yuki.memory.testtag`):
 
 * rung A is usable at once; rung B after one verified run (its own or imported evidence); rung C always (it is the
   thinker, gated by the engine);
@@ -387,11 +389,14 @@ def _route_key(rung: Any, variant: Any, via: Any) -> str:
 
 
 def trust(store: Any, skill_key: str, *, now: float | None = None, until: float | None = None,
-          disable_after: int = DISABLE_AFTER) -> dict[str, RouteTrust]:
+          disable_after: int = DISABLE_AFTER, real_only: bool = False) -> dict[str, RouteTrust]:
     """``{route key: RouteTrust}`` for one skill, from its ledger rows (``until``: only runs before it, for replays and
     evals "as of that time"). A rung whose newest decided runs are ``disable_after`` contradictions in a row is
     disabled (from the last one) unless it was retried since (24 h) or its connection file changed since: the streak
-    counts only runs after ``skill_routes.hash_changed_at`` (review M1)."""
+    counts only runs after ``skill_routes.hash_changed_at`` (review M1). ``real_only``: leave out a live test
+    harness's runs (:mod:`yuki.memory.testtag`); only learners set it (offers, the skill learner). The live lookups
+    (the rung ladder, the menu) read every run: a rung verified once on this PC is usable, and two false dones disable
+    it, whoever asked (lBrain review r1 M2)."""
     now = time.time() if now is None else float(now)
     out: dict[str, RouteTrust] = {}
     try:
@@ -407,16 +412,14 @@ def trust(store: Any, skill_key: str, *, now: float | None = None, until: float 
                                 hash_changed_at=float(changed_at) if changed_at is not None else None)
         hi = float(until) if until is not None else now + 1.0
         lo = now - TRUST_DAYS * 86400.0
-        # lBrain (live test 17 Oct): a live test harness's runs never count for or against a rung (yuki.memory.testtag)
-        from yuki.memory.testtag import sql_real_route_try, sql_real_skill_run
-
+        runs_real, tries_real = _real_filters(real_only)
         rows = store._query(
             "SELECT rung, variant, via, checked, recheck, t, ms FROM ("
             "SELECT rung, variant, via, checked, recheck, coalesce(t_done, t0) AS t, ms, id FROM skill_runs "
             "WHERE skill = ? AND rung IS NOT NULL AND t0 >= ? AND t0 < ? AND outcome NOT IN ('running', 'held_game', "
-            "'asked', 'refused', 'cancelled', 'other_device') AND " + sql_real_skill_run() + " "
+            "'asked', 'refused', 'cancelled', 'other_device')" + runs_real + " "
             "UNION ALL SELECT rung, variant, via, checked, NULL, at, ms, id FROM skill_route_tries "
-            "WHERE skill = ? AND at >= ? AND at < ? AND " + sql_real_route_try() + ") ORDER BY t DESC, id DESC",
+            "WHERE skill = ? AND at >= ? AND at < ?" + tries_real + ") ORDER BY t DESC, id DESC",
             (skill_key, lo, hi, skill_key, lo, hi))
     except Exception:  # noqa: BLE001 - no trust yet
         return out
@@ -451,6 +454,16 @@ def trust(store: Any, skill_key: str, *, now: float | None = None, until: float 
     return out
 
 
+def _real_filters(real_only: bool) -> tuple[str, str]:
+    """The ``AND ...`` conditions that leave a live test harness's ``skill_runs`` and ``skill_route_tries`` rows out
+    (:mod:`yuki.memory.testtag`), or ``("", "")`` when every run counts."""
+    if not real_only:
+        return "", ""
+    from yuki.memory.testtag import sql_real_route_try, sql_real_skill_run
+
+    return f" AND {sql_real_skill_run()}", f" AND {sql_real_route_try()}"
+
+
 def usable(route: Route, t: RouteTrust | None, *, now: float | None = None) -> tuple[bool, str]:
     """Whether a rung may run now: ``(ok, why not)``. Rung A at once; rung B after one verified run; a disabled rung
     after :data:`RETRY_AFTER_S` (one try)."""
@@ -464,12 +477,13 @@ def usable(route: Route, t: RouteTrust | None, *, now: float | None = None) -> t
 
 
 def offer_ready(store: Any, skill: Skill | str, route: Route | str | None = None, *,
-                kind: str | None = None, now: float | None = None) -> bool:
+                kind: str | None = None, now: float | None = None, real_only: bool = True) -> bool:
     """D14, the one place it is decided: a skill (or one of its routes) may be offered on a card when its ledger holds
-    2 verified runs ("open" skills) or 5 verified runs with none failed in the last 5 ("change" skills)."""
+    2 verified runs ("open" skills) or 5 verified runs with none failed in the last 5 ("change" skills). An offer is a
+    learner's call, so a live test harness's runs never count towards it (``real_only``, lBrain)."""
     key = skill.key if isinstance(skill, Skill) else str(skill)
     kind = kind or (skill.kind if isinstance(skill, Skill) else "change")
-    table = trust(store, key, now=now)
+    table = trust(store, key, now=now, real_only=real_only)
     if route is not None:
         rkey = route.key if isinstance(route, Route) else str(route)
         items = [table[rkey]] if rkey in table else []
@@ -480,19 +494,18 @@ def offer_ready(store: Any, skill: Skill | str, route: Route | str | None = None
     total_ok = sum(t.ok for t in items)      # live verified runs only (imported evidence never makes an offer)
     if kind == "open":
         return total_ok >= OPEN_RUNS
-    newest = items[0].last5 if route is not None else _merged_last5(store, key)
+    newest = items[0].last5 if route is not None else _merged_last5(store, key, real_only=real_only)
     return total_ok >= CHANGE_RUNS and len(newest) >= CHANGE_WINDOW and 0 not in newest[:CHANGE_WINDOW]
 
 
-def _merged_last5(store: Any, key: str) -> list[int]:
+def _merged_last5(store: Any, key: str, *, real_only: bool = True) -> list[int]:
     try:
-        from yuki.memory.testtag import sql_real_route_try, sql_real_skill_run
-
+        runs_real, tries_real = _real_filters(real_only)
         rows = store._query(
             "SELECT checked, recheck FROM (SELECT checked, recheck, coalesce(t_done, t0) AS t, id FROM skill_runs "
-            "WHERE skill = ? AND checked IS NOT NULL AND rung IS NOT NULL AND " + sql_real_skill_run()
+            "WHERE skill = ? AND checked IS NOT NULL AND rung IS NOT NULL" + runs_real
             + " UNION ALL SELECT checked, NULL, at, id FROM skill_route_tries WHERE skill = ? AND checked IS NOT NULL"
-            " AND " + sql_real_route_try() + ") ORDER BY t DESC, id DESC LIMIT ?",
+            + tries_real + ") ORDER BY t DESC, id DESC LIMIT ?",
             (key, key, CHANGE_WINDOW))
     except Exception:  # noqa: BLE001
         return []

@@ -12,11 +12,16 @@ test answers.
 extraction and session summaries (and so the journal facts, rules, know-how and misheard names it draws from them),
 the misheard-names pass, the persona, the portrait's inputs, the commitments check, the day digest, the weekly review,
 the work threads, the brief's judge, the know-how backfill, the call vocabulary, the practice learner, the skill
-learner's asked occasions and statements, the routine miner's "done today", and the skills' trust ledger (a rung's
-trust and disable streak, the offer bars). Nothing is deleted: the rows stay where they are, and :func:`report`
-(``yuki-cli -m yuki.memory.testtag``) lists them, read-only, so the user decides whether to purge them. Answers
-(memory search, the recall index, the standing rules) are not filtered here: what a test left shows there until the
-user purges it.
+learner's asked occasions, statements and learned-skill score, the routine miner's "done today", and the offer bars
+(``registry.offer_ready`` and the routine cards' own D14 read, the playbook's "worked N times"). Nothing is deleted:
+the rows stay where they are, and :func:`report` (``yuki-cli -m yuki.memory.testtag``) lists them, read-only, so the
+user decides whether to purge them. Answers (memory search, the recall index, the standing rules) are not filtered
+here: what a test left shows there until the user purges it.
+
+**Live lookups still see test runs** (review r1 M2): they say how a route or a control behaves on this PC, whoever
+asked, so a test measures the same Yuki the user runs and real evidence (a verified rung B, a false done) is never
+dropped: the rung ladder and the menu (``registry.trust`` without ``real_only``), the finish gate's control record
+(``practice.control_record``), the resolver's "again" (``registry.last_runs``).
 
 A test item is identified by the exact tag the harness writes, never by reading words: a session id that starts with
 :data:`TEST_SESSION_PREFIX`, or a request id / run key that holds it right after its own prefix and separator. What was
@@ -33,6 +38,7 @@ Public API::
     is_test_session(session_id) -> bool;  is_test_request(request_id) -> bool;  is_test_item(item) -> bool
     keep_real(items) -> list                                  # items whose session / request / run key is not a test's
     sql_real_session(column) -> str;  sql_real_request(column) -> str   # SQL conditions, no parameters
+    sql_real_run(alias="") -> str                             # practice memory's runs: session id and run key
     sql_real_skill_run(alias="") -> str;  sql_real_route_try(alias="") -> str
     test_turn_ids(store) -> frozenset[int]
     is_test_journal(entry, turn_ids) -> bool;  is_test_fact(fact, turn_ids) -> bool
@@ -111,6 +117,14 @@ def sql_real_request(column: str) -> str:
     parts = [f"coalesce({column}, '') NOT LIKE '{TEST_SESSION_PREFIX}%'"]
     parts += [f"coalesce({column}, '') NOT LIKE '%{sep}{TEST_SESSION_PREFIX}%'" for sep in _SEPARATORS]
     return "(" + " AND ".join(parts) + ")"
+
+
+def sql_real_run(alias: str = "") -> str:
+    """A SQL condition (no parameters) true for a practice memory ``runs`` row (a run head or a step) that is not a
+    live test's: neither its ``session_id`` nor the tag in its ``run_key``. ``alias``: the table's alias in the query,
+    or none. Every query over ``runs`` that leaves test runs out uses this one condition."""
+    a = f"{alias}." if alias else ""
+    return f"{sql_real_session(a + 'session_id')} AND {sql_real_request(a + 'run_key')}"
 
 
 def sql_real_skill_run(alias: str = "") -> str:
@@ -195,15 +209,19 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 def _cipher(db: Path) -> Any:
-    """The store's field cipher from the key next to the database (read only; ``None`` without a key)."""
-    from yuki.memory.store import KEY_FILENAME
+    """The store's field cipher from the key next to the database (read only; ``None`` without a key, or when the key
+    can't be read or used: the report then shows no text and finds no journal facts). Never raises."""
+    try:
+        from yuki.memory.store import KEY_FILENAME
 
-    key = db.parent / KEY_FILENAME
-    if not key.exists():
+        key = db.parent / KEY_FILENAME
+        if not key.exists():
+            return None
+        from yuki.memory.crypto import FieldCipher, load_or_create_key
+
+        return FieldCipher(load_or_create_key(key))
+    except Exception:  # noqa: BLE001 - a key that can't be read or used: no text, never a crash
         return None
-    from yuki.memory.crypto import FieldCipher, load_or_create_key
-
-    return FieldCipher(load_or_create_key(key))
 
 
 def report(db_path: str | Path | None = None, *, show: bool = False) -> dict[str, Any]:
@@ -374,8 +392,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = ["TEST_SESSION_PREFIX", "is_test_session", "is_test_request", "is_test_item", "keep_real",
-           "sql_real_session", "sql_real_request", "sql_real_skill_run", "sql_real_route_try", "test_turn_ids", "is_test_journal", "is_test_fact", "report",
-           "format_report", "main"]
+           "sql_real_session", "sql_real_request", "sql_real_run", "sql_real_skill_run", "sql_real_route_try",
+           "test_turn_ids", "is_test_journal", "is_test_fact", "report", "format_report", "main"]
 
 
 if __name__ == "__main__":

@@ -3,10 +3,10 @@
 ``check(step, plan, user_words, live, check_verdict) -> allow | ask | refuse | draft``, row by row, the first row that
 applies decides:
 
-1. **Game in front** (the Now board's ``game_front``, else the local foreground read, D9; unknown when the step's facts
-   were read is read again from the game gate's own check, :func:`game_holds`, and counts as a game only when that
-   read fails too) and the step takes focus, sends input, restores, launches or opens a link: **refuse** ("after the
-   round?").
+1. **Game in front** (the Now board's ``game_front``, else the local foreground read, D9; unknown from both, which
+   happens only when the local read raised, is read once more at the step, :func:`game_holds`, and counts as a game
+   only when that read fails too) and the step takes focus, sends input, restores, launches or opens a link:
+   **refuse** ("after the round?").
    The D17 backstop in ``yuki/actions`` still guards underneath. A ``run_skill`` is not refused here: the skill engine
    applies each rung's own game rule (a no-focus rung, the mixer or the media session, may run mid-game).
 2. The step's app has its "Act" switch off, or one of its kinds is "just suggest" (``util.PolicyReader``,
@@ -227,8 +227,8 @@ class Call:
 class Live:
     """Code facts at the moment a step runs.
 
-    ``game``: the game in front (``""`` none, its name, ``None`` unknown: row 1 reads the game gate again,
-    :func:`game_holds`). ``calling``: the windows the Now board lists in ``calling_tabs``. ``typed_pending``:
+    ``game``: the game in front (``""`` none, its name, ``None`` unknown: the local read raised; row 1 reads the game
+    gate once more, :func:`game_holds`). ``calling``: the windows the Now board lists in ``calling_tabs``. ``typed_pending``:
     windows holding text Yuki typed and has not sent (a set of hwnds, or the executor's own map of hwnd to the text
     waiting there, which a question then shows).
     ``reads``: what this request has read so far (``file``, ``clipboard``, ``memory``: M9). ``join_controls``: the
@@ -1161,9 +1161,9 @@ def takes_screen(call: Call) -> bool:
 
 def game_now(board: Mapping[str, Any] | None = None) -> str | None:
     """D9: the game in front: the Now board's ``game_front`` when fresh (its name, or ``"game"``), else the local read
-    of the foreground program (``gamegate.game_in_front``). ``""``: none; ``None``: neither could tell (row 1 then
-    reads the game gate again at the step, :func:`game_holds`, and counts it as a game only if that fails too). Never
-    raises."""
+    of the foreground program (``gamegate.game_in_front``). ``""``: none; ``None``: only when that local read raised
+    (row 1 then reads the game gate once more at the step, :func:`game_holds`, and counts it as a game only if that
+    fails too). Never raises."""
     try:
         from yuki.memory.now import game_in_front as board_game
 
@@ -1270,11 +1270,12 @@ def screen_gate(step: Call, live: Live) -> Verdict | None:
 
 def game_holds(live: Live) -> bool:
     """Row 1's game state for this step. ``live.game`` as read when the step's facts were gathered (:func:`game_now`:
-    the Now board when fresh, else the local foreground read); when that was unknown (``None``), the game gate's own
-    check of the program in front is read now, directly (``gamegate.game_in_front``: the foreground window's program
-    against the gate's machine facts, the registered board source included), so an unreadable board or a read that
-    failed a moment ago never counts as a game by itself (live test 17 Oct: "You're in a game: after the round?" with
-    no game running). Only when that read fails too is it a game (fail closed). Never raises."""
+    the Now board when fresh, else the local foreground read). ``game_now`` is ``None`` only when that local read
+    (``gamegate.game_in_front``) raised; then it is read once more here, so a read that failed a moment ago and works
+    now decides. Only when this read fails too is it a game (fail closed). Hardening only: this is not what gave the
+    17 Oct live test's "after the round?" with no game (that line came from a key refusal tagged ``game`` below this
+    rule: ``actions/input.py`` ``_game_stopped`` -> ``executor`` ``LINE_GAME``; see the lBrain report). Never
+    raises."""
     if live.game is not None:
         return bool(live.game)
     try:
@@ -1286,7 +1287,7 @@ def game_holds(live: Live) -> bool:
 
 
 def _rows_1_2(step: Call, live: Live, traits: Traits) -> Verdict | None:
-    # row 1: a game in front (unknown: the game gate's own check decides, :func:`game_holds`)
+    # row 1: a game in front (unknown: read once more, fail closed: :func:`game_holds`)
     if takes_screen(step) and game_holds(live):
         return Verdict(REFUSE, 1, "game", line=LINE_GAME, final=True)
 

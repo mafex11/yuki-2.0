@@ -61,7 +61,8 @@ from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
-from yuki.memory.testtag import sql_real_request as _real_request, sql_real_session as _real_session
+from yuki.memory.testtag import sql_real_run as _real_run, sql_real_session as _real_session
+from yuki.memory.testtag import sql_real_skill_run as _real_skill_run
 from yuki.skills.learn.group import step_token
 
 #: The end kinds (``yuki.skills.connection.SERVE_ENDS``).
@@ -769,7 +770,7 @@ class Builder:
         # lBrain: a live test's failed request never tags the user's own occasion after it (its acting steps still
         # hold their ends: they are Yuki's, never the user's)
         heads = {str(r[0]): str(r[1] or "") for r in _q(self.store, "SELECT run_key, outcome FROM runs WHERE step = 0"
-                                                                    " AND at >= ? AND " + _real_session("session_id"),
+                                                                    " AND at >= ? AND " + _real_run(),
                                                        (self.since - 3600.0,))}
         failed_apps: list[tuple[float, str, str]] = sorted(
             (float(d["t1"]), d["app"], str(d["run_key"])) for d in steps
@@ -802,8 +803,8 @@ class Builder:
                               " u.recheck, u.rung, u.variant, u.via, u.request_id, c.key AS capability FROM skill_runs u"
                               " LEFT JOIN"
                               " skills s ON s.id = u.skill_id LEFT JOIN skills c ON c.id = coalesce(s.capability_id,"
-                              " s.id) WHERE u.t0 >= ? AND u.t0 <= ? AND " + _real_session("u.session_id") + " AND "
-                              + _real_request("u.request_id"), (self.since, self.until))
+                              " s.id) WHERE u.t0 >= ? AND u.t0 <= ? AND " + _real_skill_run("u"),
+                  (self.since, self.until))
         out = []
         for r in rows:
             d = dict(r)

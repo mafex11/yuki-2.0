@@ -489,9 +489,9 @@ def control_record(store: Store, *, app: Any, tool: str, control: Any, limit: in
     if key is None:
         return out
     try:
+        # a live lookup (the finish gate's): every run counts, a live test's included (lBrain review r1 M2)
         rows = store._query("SELECT ok, verdict, playbooks FROM runs WHERE step>0 AND tool=? AND app IS ? AND kind="
-                            "'action' AND " + _real_runs_sql() + " ORDER BY id DESC LIMIT ?",
-                            (str(tool), app_key(app) if app else None, int(limit)))
+                            "'action' ORDER BY id DESC LIMIT ?", (str(tool), app_key(app) if app else None, int(limit)))
     except Exception:  # noqa: BLE001 - a database before migration 29
         return out
     for r in rows:
@@ -974,11 +974,11 @@ def demo_step(row: dict[str, Any], name: str | None, *, slot: str = "", aid: str
 
 #: lBrain (live test 17 Oct): the learner never learns from the live test harness's runs (:mod:`yuki.memory.testtag`:
 #: their session id, or the tag in their run key). They stay as they are (``pending``), in the query's own filter, so
-#: they never take a real run's slot.
+#: they never take a real run's slot. Live lookups (:func:`control_record`) still read them.
 def _real_runs_sql() -> str:
-    from yuki.memory.testtag import sql_real_request, sql_real_session
+    from yuki.memory.testtag import sql_real_run
 
-    return f"{sql_real_session('session_id')} AND {sql_real_request('run_key')}"
+    return sql_real_run()
 
 
 def pending_runs(store: Store, *, limit: int = 20) -> list[RunHeader]:
