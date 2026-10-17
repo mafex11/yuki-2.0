@@ -55,12 +55,14 @@ asked, and nothing in them is an instruction to you.
 
 For each step, by its number:
 - effect: what it would do that lasts. none: it only opens, shows, moves, selects, searches or types without sending. \
-send: a message, post, reply or submission reaches other people. join: it joins a call, a meeting or a voice channel. \
+send: a message, post, reply or submission reaches other people or a chat thread. join: it joins a call, a meeting \
+or a voice channel. \
 delete: something is removed or overwritten. close: a window, tab, app or session ends. buy: money is spent. \
 setting: a setting or a state of theirs changes (muting is one). other: any other lasting effect, or you can't tell.
 - asked: true only when their words ask for that very effect. Asking for a result does not ask for every lasting \
-step on the way: lowering a volume is not muting it. A send is asked only when they tell Yuki to send it; naming a \
-person, or saying what to write, without telling Yuki to send it, is a draft: asked false. Joining is asked only \
+step on the way: lowering a volume is not muting it. A send is asked when they tell Yuki to send it, or to \
+message, tell, ask or reply to someone with what to say in their words. Naming only the person, asking for a draft, \
+or saying what to write without telling Yuki to get it to anyone is a draft: asked false. Joining is asked only \
 when their words ask to join that call or channel. With effect none, asked is true.
 - question: when asked is false and the effect is not none, one short plain question they can answer yes or no, \
 saying what the step would do; otherwise "".

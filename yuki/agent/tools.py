@@ -4643,12 +4643,15 @@ class Dispatcher:
         details: dict[str, Any] = {"verified": verified}
         if result.held:
             details["refused"] = "game"
+        elif result.outcome == "held_call":
+            # kTaste (C2, decision 2): a call is live, so Yuki's own pick was kept for after it: settled, never redone
+            details["refused"] = "call"
         text = result.report()
         if result.handoff:
             from yuki.agent.frame import pinned_lines
 
             text += "\n" + "\n".join(pinned_lines(result.handoff))
-        ok = result.outcome in ("done", "already", "unverified", "handed_over", "asked", "other_device")
+        ok = result.outcome in ("done", "already", "unverified", "handed_over", "asked", "other_device", "held_call")
         payload: dict[str, Any] = {"details": details, "skill": result.skill, "outcome": result.outcome,
                                    "route": result.route, "handoff": result.handoff}
         if result.done:

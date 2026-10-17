@@ -234,6 +234,9 @@ class _Request:
     #: kBrain (contract C3): the voice talker's reading of the words, a seed shown labelled (never an order, never
     #: quotable); ``None`` for typed requests.
     understanding: dict[str, Any] | None = None
+    #: kMind merge note (review L5): the runtime's late understanding for a request the voice submitted before it was
+    #: complete (``AgentRuntime.seed``), taken once as the planner's first turn is written; ``None``: none can come.
+    late_understanding: Callable[[], Any] | None = field(default=None, repr=False, compare=False)
     started: float = field(default_factory=time.monotonic)
     started_at: datetime = field(default_factory=datetime.now)
     epoch: float = field(default_factory=time.time)
@@ -1391,7 +1394,8 @@ class Brain:
 
     def run(self, request: str, *, user_words: list[str], context: str = "", channel: str, request_id: str,
             plan_seed: dict | None = None, origin_hwnd: int | None = None,
-            understanding: Mapping[str, Any] | None = None) -> Iterator[AgentEvent]:
+            understanding: Mapping[str, Any] | None = None,
+            late_understanding: Callable[[], Any] | None = None) -> Iterator[AgentEvent]:
         """Handle one request (design 2). ``user_words``: the typed text or the heard turns, from the runtime or the
         bridge only; when none come, nothing is quotable (fail closed, M2) and ``request`` is shown as context only;
         ``context``: card / coach / where-typed text, shown labelled and never quotable; ``channel``: ``voice`` |
@@ -1399,7 +1403,10 @@ class Brain:
         ``origin_hwnd``: the window in front when the user called Yuki up (a typed request runs with Yuki's own box in
         front): told to the planner as a code line (the hwnd only), and the executor's stand-in for the foreground.
         ``understanding``: the voice talker's reading of the words (contract C3: goal, parts, choose, context), shown
-        to the planner labelled as a seed: their exact words win. Yields events; pauses on :class:`AskUser`; ends with exactly one :class:`Final` or :class:`ErrorEvent`."""
+        to the planner labelled as a seed: their exact words win. ``late_understanding``: the runtime's reader of one
+        that came after the request was submitted (``AgentRuntime.seed``), asked once when there was none, as the
+        planner's first turn is written. Yields events; pauses on :class:`AskUser`; ends with exactly one
+        :class:`Final` or :class:`ErrorEvent`."""
         self._begin(request, user_words, channel)
         words = [str(w).strip() for w in (user_words or []) if str(w).strip()]
         context = str(context or "")
@@ -1426,7 +1433,7 @@ class Brain:
                        seed=dict(plan_seed) if isinstance(plan_seed, Mapping) else None, number=self._requests,
                        origin_hwnd=origin,
                        understanding=dict(understanding) if isinstance(understanding, Mapping) and understanding
-                       else None)
+                       else None, late_understanding=late_understanding if callable(late_understanding) else None)
         self._req = req
         self._acting_words = req.shown
         if not words:
@@ -1607,6 +1614,16 @@ class Brain:
         self._menu_lines = gathered.menu_lines
         catalog = load_catalog() if gathered.skill_keys is not None else None
         sends = sends_fn(catalog)
+        if req.understanding is None and req.late_understanding is not None:
+            # kMind merge note (review L5): an understanding that came after the request started, while its parts were
+            # read; one that comes after this point is dropped (their exact words stand alone, as with none)
+            try:
+                late = req.late_understanding()
+            except Exception:  # noqa: BLE001 - none: as before
+                late = None
+            if isinstance(late, Mapping) and late:
+                req.understanding = dict(late)
+                self.logger.log("brain_late_seed", taken=True)
         conv = Conversation(request_turn(words=req.words, channel=req.channel, context=req.context,
                                          gathered=gathered, history=list(self._history), seed=req.seed, limits=bs,
                                          nonce=nonce, seed_hint=hint_box[0] if hint_box else None,

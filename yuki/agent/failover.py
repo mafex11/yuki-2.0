@@ -103,12 +103,18 @@ def adapt_params(params: dict[str, Any], model: str) -> dict[str, Any]:
 
     A fixed-budget thinking config (``{"type": "enabled", "budget_tokens": N}``, what a Haiku 4.5
     call carries) is refused by Sonnet 5 / Opus 5, which take adaptive thinking: it becomes
-    adaptive on another model. Everything else is sent as it was.
+    adaptive on another model. Thinking turned off (``disabled``, or Sonnet 5.5's ``between_tools``) stays off in
+    ``model``'s own form (:func:`yuki.config.thinking_off`): one model refuses the other's value (HTTP 400). Everything
+    else is sent as it was.
     """
     out = {**params, "model": model}
     thinking = params.get("thinking")
     if model != params.get("model") and isinstance(thinking, dict) and thinking.get("type") == "enabled":
         out["thinking"] = {"type": "adaptive"}
+    elif isinstance(thinking, dict) and thinking.get("type") in ("disabled", "between_tools"):
+        from yuki.config import thinking_off
+
+        out["thinking"] = thinking_off(model)
     return out
 
 
