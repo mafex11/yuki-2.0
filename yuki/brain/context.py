@@ -1247,6 +1247,23 @@ def part_rest_report(result: ExecResult | Mapping[str, Any], plan: Plan | None, 
     return "\n".join(lines)
 
 
+def answer_part_report(result: ExecResult | Mapping[str, Any], plan: Plan | None, line: str) -> str:
+    """fBrain (18 Oct live A, "Pause the song bro, also what time's my meeting tomorrow": the act plan read memory for
+    the meeting, then ended on the pause's line alone and the question was never answered): an act plan that ended and
+    read memory or fetched something in its steps. Code's line for the act is held; what the reads returned (each
+    fenced by whoever read it) goes back so the planner answers what their words asked from it, in plain text. Code
+    then says its line and the answer after it. Code-written."""
+    pid = plan.id if plan else ""
+    reads = [str(r) for r in _field(result, "reads", None) or [] if str(r).strip()]
+    lines = [f"{CHECK_LABEL} Plan {pid} ended. Yuki's line for what it did, not said yet: {one_line(line, 200)}",
+             "What its reads returned:\n\n" + ("\n\n".join(reads) if reads else "(Nothing came back.)"),
+             f"If their words above also asked something, reply now in plain text with only the answer, from what "
+             f"came back (one or two short sentences, in their terms; if it holds nothing, say so): code says its own "
+             f"line first, so never repeat or claim what was done. If they asked nothing more, reply with the one word "
+             f"{REST_DONE_WORD}."]
+    return "\n".join(lines)
+
+
 def text_back_report(plan: Plan | None, line: str) -> str:
     """pBrain: an act request not confirmed done got a plain reply from the planner: it was not said, and the planner
     gets one more turn with where it stands (code's own line) to finish by steps or ask as a plan. Code-written."""
@@ -1299,6 +1316,6 @@ __all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "re
            "request_turn", "Conversation",
            "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report",
            "look_report", "REST_DONE_WORD", "invalid_report", "unconfirmed_report",
-           "part_rest_report", "text_back_report", "REST_LAST_PART",
+           "part_rest_report", "text_back_report", "answer_part_report", "REST_LAST_PART",
            "answer_report", "clip",
            "one_line", "fence", "CHECK_LABEL", "STEER_LABEL"]

@@ -147,6 +147,23 @@ LINE_STOPPED_SEND = "Stopped. Nothing was sent."
 LINE_CUT_SHORT = "I lost my train of thought partway through, so I stopped there."
 #: A run the engine held for a live call that gave no line of its own (its own line says so and names the pick).
 LINE_HELD_CALL = "You're on a call, so I held off."
+#: fBrain (18 Oct live A, k_t3_draft: a focus the input gate refused said "You're in a game: after the round?" with no
+#: game anywhere): an act step the input gate refused while no game is in front and none is its target. The gate
+#: refuses for a game, or fails closed when its own check broke; with no game seen, the game line would be untrue, so
+#: this one says only that the step was stopped (``{what}``: the step in words), and the run ends there (a replan would
+#: meet the same gate). ``{what}``: :data:`STOPPED_WHAT`.
+LINE_INPUT_STOPPED = "Something on the PC stopped me {what}, so I left it there."
+#: The step a gate stopped, in words (the closed act verbs; anything else: "there").
+STOPPED_WHAT: dict[str, str] = {
+    "launch_app": "opening the app", "focus_window": "bringing that window forward", "open_url": "opening the page",
+    "window_action": "arranging the window", "tab": "switching the tab", "click": "clicking", "type_text": "typing",
+    "hotkey": "pressing the shortcut", "press": "pressing the key", "scroll": "scrolling",
+    "set_slider": "moving the slider", "write_clipboard": "copying"}
+#: fBrain (18 Oct live A, "Pull up ChatGPT and ElevenLabs": two open_url steps whose own reports said "navigation
+#: confirmed", done none, said "I did it, but I couldn't confirm it worked."): the probe whose words say an act verb's
+#: effect, for a plan by steps that wrote done none and whose every act step its own report saw take
+#: (:meth:`Executor._steps_seen`). Verb -> probe: data, never a reading of their words.
+STEP_LINE_PROBES: dict[str, str] = {"open_url": "page_at"}
 LINE_DRAFT_HELD = "I opened the chat but didn't type the text in."
 LINE_CHAT_UNCONFIRMED = "I couldn't confirm the chat is open, so I didn't type anything."
 #: A ``run_skill`` step that didn't get it done, as said when the request ends on it (x9: never the outcome's code
@@ -1116,7 +1133,12 @@ class Executor:
             status.state, status.why = "failed", why
             payload = outcome.payload if isinstance(outcome.payload, dict) else {}
             if payload.get("refused") == "game" or (payload.get("details") or {}).get("refused") == "game":
-                return RunResult("refused", line=consent.LINE_GAME, final=True)
+                if self._game_seen(call):
+                    return RunResult("refused", line=consent.LINE_GAME, final=True)
+                status.state, status.why = "refused", "input_gate"
+                self._emit_log("brain_gate_no_game", verb=call.tool)
+                return RunResult("refused", line=LINE_INPUT_STOPPED.format(
+                    what=STOPPED_WHAT.get(call.tool, "there")), final=True)
             return self._mismatch_result(index, why, seen=shown, call=call, seen_fenced=external and bool(body))
         status.state, status.why = "ok", why
         return None
@@ -2211,6 +2233,8 @@ class Executor:
         result = done.pick_done(self.head, env, hwnd=self.last_act.get("hwnd"), last_window=entry,
                                 cancelled=self.host.cancelled,
                                 args=self._probe_args(probe, args) if args is not None else None)
+        if probe == done.NONE and result.verdict is None and not runs:
+            result = self._steps_seen() or result
         if not runs and not before:
             return result
         if result.verdict is False:
@@ -2218,6 +2242,57 @@ class Executor:
             result.line = done.not_confirmed(seen=result.seen, probe=result.probe, args=result.args,
                                              window_entry=result.window)
         return done.parts_done([*(self._part(run) for run in runs), result], before=before)
+
+    def _steps_seen(self) -> done.DoneResult | None:
+        """fBrain: a plan by steps that wrote done none (so nothing reads what they asked for) whose every act step ran
+        and was seen to take by its own report (``status.verdict`` True: :func:`util.action_verdict`, or the step's
+        own expect), each said in its probe's words (:data:`STEP_LINE_PROBES`, from the step's own arguments: "Chatgpt
+        is open in Chrome"). Level ``likely``, never ``verified``: the steps were seen, what they asked for was not
+        read. ``None`` when any act step wasn't seen (a key, a click with nothing watched) or no step's verb has such
+        words: the plan's "couldn't confirm" line stands. Code facts only."""
+        lines: list[str] = []
+        for index, step in enumerate(self.steps):
+            verb = self._verb(step)
+            if verb not in ACT_VERBS:
+                continue
+            status = self.statuses[index] if index < len(self.statuses) else None
+            if status is None or status.state != "ok" or status.verdict is not True:
+                return None
+            probe = STEP_LINE_PROBES.get(verb)
+            if probe == "page_at":
+                address = words(field_of(step, "value", ""))
+                if not _web_host(address):
+                    continue
+                args = {"site": address}
+                image = self._open_images.get(index, "")
+                if image:
+                    args["process"] = image
+                try:
+                    line = done.line_for(probe, args, {})
+                except (KeyError, IndexError, ValueError):
+                    continue
+                if line and line not in lines:
+                    lines.append(line)
+        if not lines:
+            return None
+        parts = [done.DoneResult(True, util.LIKELY, line, probe="steps", seen="each step's own report saw it")
+                 for line in lines]
+        result = done.parts_done(parts)
+        result.level = util.LIKELY
+        return result
+
+    def _game_seen(self, call: Call) -> bool:
+        """fBrain: whether a game is in front, or is the window this step aimed at, read now through the game gate's
+        own reads (``gamegate.game_in_front`` / ``window_game``): the input gate's refusal is then a game's. ``True``
+        when the read itself fails (fail closed: the game line, as before). Never raises."""
+        try:
+            from yuki.memory.gamegate import game_in_front, window_game
+
+            if game_in_front():
+                return True
+            return bool(call.hwnd and window_game(int(call.hwnd)))
+        except Exception:  # noqa: BLE001 - can't tell: as a game
+            return True
 
     def _deciding_skill(self, cls: str) -> _SkillRun | None:
         """The ``run_skill`` step whose capability's own check decides the plan. A send plan: the last one that sent
