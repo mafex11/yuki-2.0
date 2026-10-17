@@ -24,8 +24,14 @@ ScreenshotPolicy = Literal["never", "ask", "auto"]
 BRAIN_MODES: tuple[str, ...] = ("loop", "typed", "all")
 
 
+#: kMind (audit 17 Oct, decision 4): the shipped brain. The plan-first brain takes typed and spoken requests; ``loop``
+#: (the old step-by-step agent and the full talker) is the rollback setting only.
+BRAIN_DEFAULT = "all"
+
+
 def _brain_default() -> str:
-    """``YUKI_BRAIN``, else ``brain`` in ``%LOCALAPPDATA%/Yuki/settings.json``, else ``loop`` (read once, at start)."""
+    """``YUKI_BRAIN``, else ``brain`` in ``%LOCALAPPDATA%/Yuki/settings.json``, else :data:`BRAIN_DEFAULT` (read once,
+    at start)."""
     forced = (os.environ.get("YUKI_BRAIN") or "").strip().lower()
     if forced in BRAIN_MODES:
         return forced
@@ -36,9 +42,9 @@ def _brain_default() -> str:
 
         data = json.loads(prefs_path().read_text(encoding="utf-8"))
     except (OSError, ValueError, ImportError):
-        return "loop"
+        return BRAIN_DEFAULT
     value = str(data.get("brain") or "").strip().lower() if isinstance(data, dict) else ""
-    return value if value in BRAIN_MODES else "loop"
+    return value if value in BRAIN_MODES else BRAIN_DEFAULT
 
 
 #: The skills switch (failure fix-plan Item 1, 10 Oct): ``on`` everything (the shipped capabilities and the skills Yuki
@@ -199,11 +205,37 @@ DEFAULT_PRICING: dict[str, dict[str, float]] = {
         "cache_read": 0.10,
     },
 }
+# kMind: the 5.5 generation at its own list rates (Sonnet 5.5 the lean voice talker, measured on this PC 18 Oct; Opus
+# 5.5 cache reads as listed, Haiku 5.5's cache rates at the usual 1.25x / 0.1x of its input)
+for _family, _rates in (("sonnet-5-5", {"input": 2.00, "output": 10.00, "cache_write": 2.50, "cache_read": 0.20}),
+                        ("opus-5-5", {"input": 4.00, "output": 20.00, "cache_write": 5.00, "cache_read": 0.20}),
+                        ("haiku-5-5", {"input": 0.10, "output": 0.50, "cache_write": 0.125, "cache_read": 0.01})):
+    for _profile in ("global", "us"):
+        DEFAULT_PRICING[f"{_profile}.anthropic.claude-{_family}"] = dict(_rates)
 
 #: The voice mouth (docs/VOICE.md §5). Claude Haiku 4.5 is Active on Bedrock with
 #: an end-of-life "no sooner than 2026-10-16" and no Haiku successor listed
 #: (checked 2026-09-25), so this is a setting, not a constant in code.
 DEFAULT_VOICE_MOUTH_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+#: kMind (audit 17 Oct): the lean talker's model (``brain = "all"``, the voice that reads the user and decides). The
+#: full talker (the ``loop`` rollback) and the voice's side calls (speech guard, rest check, router) keep
+#: :data:`DEFAULT_VOICE_MOUTH_MODEL`.
+DEFAULT_VOICE_LEAN_MODEL = "global.anthropic.claude-sonnet-5-5"
+
+#: How "thinking off" is asked of a model (data, by id). Sonnet 5.5 refuses ``{"type": "disabled"}`` (HTTP 400) and
+#: takes ``{"type": "between_tools"}`` (no thinking before the reply; notes between tool calls come back as thinking
+#: blocks, which the voice drops unheard); no other model takes ``between_tools`` (HTTP 400, verified 18 Oct for Haiku
+#: 5.5 and Opus 5.5). Every other model: ``disabled`` (Haiku 5.5 takes it at its default effort). Opus 5.5 cannot turn
+#: thinking off at all, so it is not supported as the voice talker.
+THINKING_OFF: dict[str, dict[str, str]] = {
+    model: {"type": "between_tools"}
+    for model in ("global.anthropic.claude-sonnet-5-5", "us.anthropic.claude-sonnet-5-5")
+}
+
+
+def thinking_off(model: str) -> dict[str, str]:
+    """The ``thinking`` value that turns thinking off on ``model`` (:data:`THINKING_OFF`, else ``disabled``)."""
+    return dict(THINKING_OFF.get(str(model or ""), {"type": "disabled"}))
 
 #: The same models through the US inference profiles (a failover target, yuki.agent.failover).
 for _alias, _rates in (("sonnet", DEFAULT_PRICING[MODEL_ALIASES["sonnet"]]),
@@ -228,6 +260,11 @@ DEFAULT_FALLBACKS: dict[str, list[dict[str, str | None]]] = {
         {"model": DEFAULT_VOICE_MOUTH_MODEL, "region": "us-east-1"},
         {"model": "us.anthropic.claude-haiku-4-5-20251001-v1:0", "region": "us-east-1"},
         {"model": MODEL_ALIASES["sonnet"], "region": None},
+    ],
+    # kMind: the lean talker: the same model from us-east-1, then the fast Haiku (thinking off as each model takes it)
+    DEFAULT_VOICE_LEAN_MODEL: [
+        {"model": DEFAULT_VOICE_LEAN_MODEL, "region": "us-east-1"},
+        {"model": DEFAULT_VOICE_MOUTH_MODEL, "region": None},
     ],
 }
 
@@ -340,7 +377,10 @@ class Settings:
             language hints it is given.
         voice_eot_threshold / voice_eager_eot_threshold / voice_eot_timeout_ms:
             Flux's end-of-turn settings (eager off: ``None``).
-        voice_mouth_model: Bedrock model id of the fast mouth.
+        voice_mouth_model: Bedrock model id of the fast mouth: the full talker (the ``loop`` rollback) and the voice's
+            side calls (speech guard, rest check, router, progress).
+        voice_lean_model: kMind (audit 17 Oct): the lean talker's model (``brain = "all"``): the voice that reads the
+            user (the you-card) and decides. Thinking off as the model takes it (:func:`thinking_off`).
         voice_mouth_max_tokens: Output ceiling for one spoken reply.
         voice_tts_provider: ``gemini`` (Gemini TTS, the default since 2026-09-27: voice Leda, sound
             tags and a per-turn style the mouth chooses), ``elevenlabs`` or ``deepgram`` (Aura-2,
@@ -587,6 +627,7 @@ class Settings:
     voice_eager_eot_threshold: float | None = 0.4
     voice_eot_timeout_ms: int = 5000
     voice_mouth_model: str = DEFAULT_VOICE_MOUTH_MODEL
+    voice_lean_model: str = DEFAULT_VOICE_LEAN_MODEL
     voice_mouth_max_tokens: int = 400
     voice_tts_provider: str = "gemini"
     voice_gemini_model: str = "gemini-3.8-flash-lite-tts"
@@ -807,7 +848,8 @@ class Settings:
     #: A request pack (Agent.build_pack) older than this is rebuilt for its screen half (the memory half is kept).
     pack_max_age_s: float = 20.0
     # -- the brain rebuild (docs/research/audit-2026-10-09/next/brain-design.md rev 2, release 17a) --
-    #: Which requests the new brain takes (:data:`BRAIN_MODES`): ``loop`` (the default: nothing changes), ``typed``,
+    #: Which requests the new brain takes (:data:`BRAIN_MODES`): ``all`` (the default since kMind, 18 Oct), ``typed``,
+    #: ``loop`` (the rollback),
     #: ``all``. Read at each request's start, so flipping it back is the rollback (``YUKI_BRAIN`` or ``brain`` in
     #: ``settings.json`` at start).
     brain: str = field(default_factory=_brain_default)
@@ -827,7 +869,7 @@ class Settings:
         # screenshots never (brain-design.md 5, L1): the ask and auto values are gone; bPrune removes the setting
         self.screenshot_policy = "never"
         mode = str(self.brain or "").strip().lower()
-        self.brain = mode if mode in BRAIN_MODES else "loop"
+        self.brain = mode if mode in BRAIN_MODES else BRAIN_DEFAULT
         # the skills switch (Item 1): a bool, or the switch's own word given as ``skills`` ("capabilities"); the
         # learned skills are never on with the skill path off
         switch = skills_mode_of(self.skills)
