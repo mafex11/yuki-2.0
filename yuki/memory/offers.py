@@ -26,8 +26,10 @@ rule about anyone's words) - of things that are plainly Yuki's own small job:
 * ``ask``: a suggested request put **unsent** in the ask bar; nothing runs until the user presses Enter, and then
   it is an ordinary request of theirs with the live strip and Stop;
 * ``run_skill`` (PLAN.md Phase R, D10, D11, D14): **code-only** (:data:`CODE_ONLY_DOS`). Only the routine lane
-  (:mod:`yuki.memory.routine_offers`) writes it, from what the user measurably does at that time (the "Your usual"
-  card: their meeting tab, never their work); it is never in a model's schema or the judge's enum
+  (:mod:`yuki.memory.routine_offers`) and the card judge's "usual" card (:func:`yuki.memory.candidates.gen_usual`, 18
+  Oct: media the user puts on at this time of day, channel :data:`USUAL_CHANNEL`) write it, from what the user
+  measurably does at that time (their meeting tab, their music, a video; never their work); it is never in a model's
+  schema or the judge's enum
   (:data:`MODEL_DOS`), :func:`validate_offer` refuses it from any model dict, and :func:`allowed_dos` gives it to
   the ``routine`` channel only. Only a skill the learner wrote from what the user does (phase L) that passes the offer
   gate (:func:`skill_offerable`: never sends, never commits, rung A or a verified rung B, its capability's offer class,
@@ -73,6 +75,9 @@ RETIRED_DOS: tuple[str, ...] = ("draft",)
 MODEL_DOS: tuple[str, ...] = tuple(d for d in OFFER_DOS if d not in CODE_ONLY_DOS and d not in RETIRED_DOS)
 #: The one card channel that may carry a code-only kind: the "Your usual" routine card (trigger ``routine``).
 ROUTINE_CHANNEL = "routine"
+#: The card judge's "usual" card (trigger ``usual``): media at the user's usual time, its button a ``run_skill`` of a
+#: shipped media capability (checked again at the click: ``candidates.usual_offerable``).
+USUAL_CHANNEL = "usual"
 #: Offers whose effect Undo takes back (06 §4.3); ``run_skill``: the window that was in front comes back.
 UNDOABLE: frozenset[str] = frozenset({"todo_add", "bring_back", "run_skill"})
 #: An offer can be acted on for this long after its card was written (s); then its button is gone (06 §4.2).
@@ -414,8 +419,8 @@ def stored_offer(nudge: Any) -> dict[str, Any] | None:
         return None
     if do == "run_skill" and (not str(offer.get("skill") or "").strip()
                               or not isinstance(offer.get("expires_at"), (int, float))
-                              or _routine_id(offer) is None):
-        return None   # only the routine lane's shape (routine_offer): a skill, its routine, its own expiry
+                              or (_routine_id(offer) is None and not offer.get("usual"))):
+        return None   # only the routine lane's or the usual card's shape: a skill, its routine or usual, its own expiry
     return offer
 
 
@@ -549,20 +554,26 @@ def _pooled_last(store: Any, keys: tuple[str, ...], n: int) -> list[int]:
 
 
 def offer_trusted(store: Any, skill: Any, *, now: float | None = None) -> bool:
-    """D14 for a routine card's skill: ``yuki.skills.registry.offer_ready`` on the skill's own runs. A usage record's
-    runs are pooled with its capability's (:func:`habit_keys`; lWire review r1 M3: "play my X playlist" is ledgered on
-    the capability, so the record's own key alone could never reach the bar): the same bar and numbers (the
-    registry's), on the verified runs of both keys, the newest 5 read across both by time. Never raises."""
+    """D14 for a routine card's skill. An ``open`` skill (bring a tab or a page forward: undoable, its run checked by
+    its own done-check, the card says what happened) is trusted unless it is distrusted (18 Oct): one of its routes
+    disabled, or its newest decided run failed. D14's "2 verified runs first" kept the one learned routine (the
+    weekday Meet tab, never run by Yuki) from ever being offered. A ``change`` skill keeps D14's bar:
+    ``yuki.skills.registry.offer_ready`` on its own runs, a usage record's runs pooled with its capability's
+    (:func:`habit_keys`; lWire review r1 M3), the newest 5 read across both by time. Never raises."""
     from yuki.skills import registry
 
     keys = habit_keys(skill)
     try:
+        if str(getattr(skill, "kind", "") or "change") == "open":
+            for k in keys:
+                if any(t.disabled_at for t in registry.trust(store, k, now=now, real_only=True).values()):
+                    return False
+            newest = _pooled_last(store, keys, 1)
+            return not newest or newest[0] == 1
         if len(keys) < 2:
             return bool(registry.offer_ready(store, skill, now=now))
         # lBrain: an offer is a learner's call, so a live test's runs never count (``real_only``, as offer_ready)
         total_ok = sum(sum(t.ok for t in registry.trust(store, k, now=now, real_only=True).values()) for k in keys)
-        if str(getattr(skill, "kind", "") or "change") == "open":
-            return total_ok >= registry.OPEN_RUNS
         newest = _pooled_last(store, keys, registry.CHANGE_WINDOW)
         return (total_ok >= registry.CHANGE_RUNS and len(newest) >= registry.CHANGE_WINDOW
                 and 0 not in newest[:registry.CHANGE_WINDOW])
@@ -833,11 +844,28 @@ def _act_run_skill(store: Any, n: Any, offer: dict[str, Any], now: float) -> dic
     card (channel ``routine``: kind ``notice``, trigger ``routine``) may carry it: any other card is refused
     (``no_offer``), whatever its offer says."""
     do = "run_skill"
-    if channel_of(n) != ROUTINE_CHANNEL:
+    channel = channel_of(n)
+    if channel not in (ROUTINE_CHANNEL, USUAL_CHANNEL):
         return {"ok": False, "why": "no_offer", "do": do}
     if now > float(offer["expires_at"]):
         _set_outcome(store, n.id, "expired", at=now, only_if=(None,))
         return {"ok": False, "why": "expired", "do": do}
+    if channel == USUAL_CHANNEL:   # a shipped media capability, checked again now (never the user's work)
+        try:
+            from yuki.memory.candidates import usual_offerable
+            from yuki.skills.catalog import load
+
+            skill = load(store=store).get(str(offer["skill"]))
+            ready = skill is not None and usual_offerable(skill) and str(offer.get("usual") or "") == skill.key
+        except Exception:
+            ready = False
+        if not ready:
+            return {"ok": False, "why": "not_ready", "do": do}
+        if not _set_outcome(store, n.id, "running", at=now, only_if=(None,)):
+            got = store.nudge(n.id)
+            return {"ok": False, "why": "already", "state": getattr(got, "outcome", None) or "running", "do": do}
+        return {"ok": True, "do": do, "state": "running", "skill": str(offer["skill"]),
+                "slots": dict(offer.get("slots") or {}), "undo": True}
     rid = _routine_id(offer)
     try:
         from yuki.memory import routine_offers

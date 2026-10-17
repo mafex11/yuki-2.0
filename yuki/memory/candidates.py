@@ -20,8 +20,9 @@ does not need to decide.
 ``checkin:day_start`` (the Today card's head), ``checkin:followup``, ``checkin:evening``, ``checkin:care``,
 ``checkin:new_thread``; ``session:break``, ``session:callback``; ``stuck``, ``recap``, ``followup``, ``plans``;
 ``thread``, ``question``, ``work``, ``review`` (lasting: the Today card's lines); the judge's own ``today`` and
-``away``; and ``routine`` (jSwitch: the "Your usual" card, :meth:`yuki.memory.routine_offers.RoutineLane.candidates`,
-live only - the lane's due rule, words, ladder and learning unchanged). Not ported (question 2): ``notice`` (milestone:
+``away``; ``routine`` (jSwitch: the "Your usual" card, :meth:`yuki.memory.routine_offers.RoutineLane.candidates`,
+live only); and ``usual`` (18 Oct: media the user measurably puts on around this time of day, :func:`gen_usual`, with a
+button that runs the skill). Not ported (question 2): ``notice`` (milestone:
 "you just finished X") and ``recall`` (the screen meets something memory holds: screen trivia).
 
 **The check-in guard** (:func:`guard_ok`): a check-in rests on a goal or thread id, or a measured day anchor (``DAY`` /
@@ -109,7 +110,7 @@ DIGEST_LINE_CHARS = 120
 #: A card's code text is clipped to this.
 TEXT_CHARS = 300
 #: Timing classes a type in mode ``best`` may show at.
-BEST_CLASSES: tuple[str, ...] = ("sit_down", "switch", "after_commit")
+BEST_CLASSES: tuple[str, ...] = ("sit_down", "after_commit", "focus_end")
 #: A standing-request row is picked up this long after journal wrote it.
 ASKED_WITHIN_S = 6 * 3600.0
 #: A recap is a card while its call ended less than this long ago; a Today line after.
@@ -140,6 +141,7 @@ TYPES: dict[str, TypeInfo] = {
     "confirm": TypeInfo("card", True, "reminder"),
     "asked": TypeInfo("card", False, "reminder", urgency="asked"),
     "routine": TypeInfo("card", True, "notice", urgency="deadline"),   # jSwitch: RoutineLane.candidates()
+    "usual": TypeInfo("card", True, "notice"),                          # 18 Oct: gen_usual (media at the usual time)
     "checkin:day_start": TypeInfo("today_head", True, "question", frame=CHECKIN_FRAMES["day_start"],
                                   look_cap=CHECKIN_LOOK_CAPS["day_start"]),
     "checkin:followup": TypeInfo("card", False, "question", frame=CHECKIN_FRAMES["followup"],
@@ -187,6 +189,7 @@ class Candidate:
     asks: str | None = None       # "Q<id>" (a stored question) | "checkin" (its question row is made when written)
     needs_writer: bool = False
     offer_channel: str | None = None
+    offer: Any = None             # a code card's own typed offer (dict, or a function made after ``text``): "usual"
     nudge_id: int | None = None   # a row another writer already wrote (standing requests)
     why: str = ""                 # content-free reason code + counts
     seen_within: float = SEEN_KEEP_S
@@ -301,8 +304,10 @@ class Context:
     generator wants to be looked at again (an item becoming due, a window opening)."""
 
     def __init__(self, store: Any, you: Any, now: float, config: Any, seen: Seen, *, live: bool = False,
-                 memo: Memo | None = None, lane: Any = None) -> None:
+                 memo: Memo | None = None, lane: Any = None, worker: Any = None) -> None:
         self.store = store
+        #: The card worker (its model client and log), live only: the "usual" card's one wording call.
+        self.worker = worker
         #: The routine lane (:class:`yuki.memory.routine_offers.RoutineLane`), live only (jSwitch); None: no routine.
         self.lane = lane
         self.you = you
@@ -1187,6 +1192,271 @@ def gen_review(ctx: Context) -> list[Candidate]:
                       why="review written")]
 
 
+
+
+# ---------------------------------------------------------------------------
+# "Your usual now": the user's media at their usual time of day (18 Oct)
+# ---------------------------------------------------------------------------
+
+#: The capability ends a "usual" card may offer: media (a video, music). Generic end kinds (moment kinds), never the
+#: user's values; which things are the user's usual, and when, is measured below. Never a message, a call, a page (a
+#: page can be work) or anything that sends or commits.
+USUAL_ENDS: tuple[str, ...] = ("media_play", "media_context")
+#: How far back the usual is measured; how near now's time of day a day's pick must be; the bar: at least
+#: USUAL_MIN_DAYS such days, and USUAL_MIN_SHARE of the same kind of days (weekday / weekend) the user did anything at
+#: the PC around this time.
+USUAL_BACK_DAYS = 21
+USUAL_NEAR_S = 45 * 60.0
+USUAL_MIN_DAYS = 3
+USUAL_MIN_SHARE = 0.33
+#: Not when they put it on within this long (they are on it, or just were): read fresh at every evaluation.
+USUAL_RECENT_S = 2 * 3600.0
+#: The day counts (21 days of moments) are read again at most this often (they move by the day, not the minute).
+USUAL_STATS_S = 600.0
+#: The card is about now: it goes stale after this long.
+USUAL_TTL_S = 30 * 60.0
+#: The one cheap wording call (only with a you-card to word it from): the model, its cap and its wait.
+USUAL_WORDS_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+USUAL_WORDS_CHARS = 140
+USUAL_WORDS_PROMPT = """\
+You word one line on a small card that Yuki, the user's desktop assistant, shows when they sit back down at their PC. \
+The card offers to put on something the user usually puts on at about this time (the facts below come from what they \
+measurably do). Write ONE short, casual line (at most 18 words) that names the pick exactly as given and ends with a \
+question ("Put it on?" or similar). Use the profile only to make it personal and right for this moment (for example \
+"Lunch?" only when the profile says they usually eat around now). No praise, no exclamation marks, no emoji, no \
+"back at it", nothing about their work. Yuki is the one speaking: first person for Yuki ("I'll pick one you like"), second person for the user; never the word "Yuki"."""
+_USUAL_TOOL = {"name": "card_line", "description": "The card's one line.",
+               "input_schema": {"type": "object", "properties": {"line": {"type": "string"}}, "required": ["line"]}}
+
+
+def _usual_caps() -> list[Any]:
+    """The shipped capabilities a "usual" card may run: a media end (:data:`USUAL_ENDS`), nothing that sends, a run that
+    commits nothing (the engine's own table). Data only; ``[]`` when the files can't be read."""
+    try:
+        from yuki.skills.connection import load
+        from yuki.skills.engine import run_commit
+
+        caps = load().capabilities
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for cap in caps:
+        try:
+            if (cap.end in USUAL_ENDS and not getattr(cap, "sends", False) and not getattr(cap, "sends_when", ())
+                    and run_commit(cap) == "none"):
+                out.append(cap)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def usual_offerable(skill: Any) -> bool:
+    """Whether a "usual" card's button may run ``skill`` (checked again at the click, ``offers.act``)."""
+    key = str(getattr(skill, "key", "") or "")
+    return bool(key) and any(c.key == key for c in _usual_caps())
+
+
+def _day_kind(at: float) -> bool:
+    return datetime.fromtimestamp(at).weekday() >= 5
+
+
+def _tod_s(at: float) -> float:
+    d = datetime.fromtimestamp(at)
+    return d.hour * 3600.0 + d.minute * 60.0 + d.second
+
+
+def _near(a: float, b: float) -> bool:
+    gap = abs(_tod_s(a) - _tod_s(b))
+    return min(gap, 86400.0 - gap) <= USUAL_NEAR_S
+
+
+def usual_now(store: Any, now: float, caps: Sequence[Any] | None = None) -> list[dict[str, Any]]:
+    """The media the user usually puts on around now: per capability (:func:`_usual_caps`), the days in the last
+    :data:`USUAL_BACK_DAYS` of the same kind as today (weekday / weekend) on which the user's own end moment of it came
+    within :data:`USUAL_NEAR_S` of now's time of day, against the days they did anything at the PC around then.
+    Content-free counts (``{"cap", "hits", "days", "share", "at_min", "apps"}``; ``apps``: the programs its picks came
+    from, for :func:`_usual_recent`), best first; only those over the bar. A browser capability (its connection app is no program of the moments) counts the programs that also record
+    pages (a browser, measured). Never raises (``[]``)."""
+    caps = _usual_caps() if caps is None else list(caps)
+    if not caps:
+        return []
+    own_apps = {c.app for c in caps}
+    since = now - USUAL_BACK_DAYS * 86400.0
+    try:
+        rows = store._query("SELECT at, kind, app, by FROM moments WHERE at >= ? AND at < ?", (since, now + 1.0))
+    except Exception:  # noqa: BLE001
+        return []
+    weekend = _day_kind(now)
+    today = datetime.fromtimestamp(now).date()
+    browsers = {str(r[2] or "") for r in rows if r[1] == "page"}
+    present: set[Any] = set()
+    for at, _kind, _app, by in rows:
+        at = float(at)
+        if by == "user" and _day_kind(at) == weekend and _near(at, now) and datetime.fromtimestamp(at).date() != today:
+            present.add(datetime.fromtimestamp(at).date())
+    out = []
+    for cap in caps:
+        apps = {str(r[2] or "") for r in rows if r[1] == cap.end}
+        own = {cap.app} if cap.app in apps else (apps & browsers) - own_apps   # a browser, not another's own app
+        picks = [float(r[0]) for r in rows if r[1] == cap.end and r[3] == "user" and str(r[2] or "") in own]
+        if not picks:
+            continue
+        hit_days: dict[Any, float] = {}
+        for at in picks:
+            d = datetime.fromtimestamp(at).date()
+            if d != today and _day_kind(at) == weekend and _near(at, now):
+                hit_days.setdefault(d, at)
+        hits = len(hit_days)
+        days = max(hits, len(present))
+        share = hits / days if days else 0.0
+        if hits >= USUAL_MIN_DAYS and share >= USUAL_MIN_SHARE:
+            tods = sorted(_tod_s(at) for at in hit_days.values())
+            out.append({"cap": cap, "hits": hits, "days": days, "share": round(share, 2),
+                        "at_min": round(tods[len(tods) // 2] / 60.0), "apps": frozenset(own)})
+    out.sort(key=lambda u: (-u["share"], -u["hits"]))
+    return out
+
+
+def _usual_recent(store: Any, u: dict[str, Any], now: float) -> bool:
+    """Whether the user put this on themselves within :data:`USUAL_RECENT_S` (one indexed query, fresh each
+    evaluation; unknown counts as yes: no card)."""
+    try:
+        rows = store._query("SELECT app FROM moments WHERE kind = ? AND at >= ? AND at < ? AND by = 'user'",
+                            (u["cap"].end, now - USUAL_RECENT_S, now + 1.0))
+    except Exception:  # noqa: BLE001
+        return True
+    return any(str(r[0] or "") in u["apps"] for r in rows)
+
+
+def _usual_pick(store: Any, cap: Any, now: float) -> dict[str, Any]:
+    """What the card names and its button runs (read only when the card is written): the capability's taste slot
+    filled from the user's own top pick at this hour (``taste.top``: a playlist), else a fresh upload of the user's
+    channels at this hour for a slot filled from offered options (``youtube_feed.offer``, ``taste.takes_offers``: a
+    video), else contract C2's ``choose`` (the resolver picks from taste). ``{"slots", "name", "title", "offers"}``."""
+    from yuki.skills import taste
+
+    for slot in getattr(cap, "slots", ()) or ():
+        kind = str(getattr(slot, "taste", "") or "")
+        if kind and getattr(slot, "role", "") == "fill":
+            top = taste.top(store, kind, now=now, n=1)
+            if top and top[0].name:
+                return {"slots": {slot.name: top[0].name}, "name": top[0].name, "title": "", "offers": []}
+        if taste.takes_offers(cap, slot):
+            try:
+                from yuki.skills import youtube_feed
+
+                offers = youtube_feed.offer(store, now=now, budget_s=3.0)
+            except Exception:  # noqa: BLE001
+                offers = []
+            if offers:
+                o = offers[0]
+                return {"slots": {slot.name: o.value()}, "name": " ".join(o.name.split()),
+                        "title": " ".join(o.title.split()), "offers": [o]}
+    return {"slots": {"choose": True}, "name": "", "title": "", "offers": []}
+
+
+def _usual_lead(ctx: Context, facts: str, must: str) -> str | None:
+    """One cheap wording call (:data:`USUAL_WORDS_MODEL`) for the card's line, only when there is a you-card
+    (``yuki.memory.youcard``, purpose ``judge``) to make it personal; the line must name ``must`` (checked in code).
+    None: use the code's own words. Content goes to the model only; the log is content-free."""
+    w = ctx.worker
+    if w is None:
+        return None
+    try:
+        from yuki.memory.youcard import build_you_card
+
+        card = build_you_card(ctx.store, purpose="judge", now=ctx.now)
+    except Exception:  # noqa: BLE001 - no you-card yet (kYou not merged) or it failed: code words
+        return None
+    if not card:
+        return None
+    t0 = time.perf_counter()
+    try:
+        r = w.client.messages.create(
+            model=USUAL_WORDS_MODEL, max_tokens=120, system=USUAL_WORDS_PROMPT, tools=[_USUAL_TOOL],
+            tool_choice={"type": "tool", "name": "card_line"},
+            messages=[{"role": "user", "content": f"PROFILE (code-built)\n{card}\n\nTHE CARD\n{facts}"}])
+        block = next((b for b in r.content if getattr(b, "type", "") == "tool_use"), None)
+        line = " ".join(str((block.input or {}).get("line") or "").split()) if block is not None else ""
+        try:
+            from yuki.log.requests import usage_tokens
+
+            cost = w.settings.estimate_cost(USUAL_WORDS_MODEL, usage_tokens(r.usage))
+        except Exception:  # noqa: BLE001
+            cost = None
+        w._log("judge_usual_words", ms=round((time.perf_counter() - t0) * 1000.0), cost_usd=cost,
+               ok=bool(line and must.casefold() in line.casefold() and len(line) <= USUAL_WORDS_CHARS))
+    except Exception as exc:  # noqa: BLE001
+        w._log("judge_usual_words", error=type(exc).__name__)
+        return None
+    if not line or must.casefold() not in line.casefold() or len(line) > USUAL_WORDS_CHARS:
+        return None
+    return line
+
+
+def gen_usual(ctx: Context) -> list[Candidate]:
+    """``usual`` (18 Oct) - "Your usual now": media the user measurably puts on around this time of day
+    (:func:`usual_now`), not already on in the last :data:`USUAL_RECENT_S`. A card (time-bound,
+    :data:`USUAL_TTL_S`), so the moment test lets it show only at a natural break (sitting down, a call or game just
+    over, a long focus stretch ending); at most one per thing a day (its seen-mark) and ``USUAL_PER_DAY`` in all
+    (``attend.budget``). Its button runs the skill through the engine (``offers``: ``run_skill``, the tray's desk lease
+    and game re-check): the user's own top pick at this hour named on the card, or C2's ``choose``. Code text; one
+    cheap wording call only with a you-card (:func:`_usual_lead`). Never the user's work: media ends only."""
+    now = ctx.now
+    day = user_day(now, ctx.config.resume_day_start)
+    out: list[Candidate] = []
+    for u in ctx.memo.get("usual:stats", None, now, USUAL_STATS_S, lambda: usual_now(ctx.store, now)):
+        cap = u["cap"]
+        key = f"usual:{cap.key}:{day}"
+        if ctx.seen.looked(key, now, 86400.0) or _usual_recent(ctx.store, u, now):
+            continue
+        store = ctx.store
+        made: dict[str, Any] = {}
+        when = f"{int(u['at_min']) // 60:02d}:{int(u['at_min']) % 60:02d}"
+        days_word = "weekend days" if _day_kind(now) else "weekdays"
+        thing = "music" if cap.end == "media_context" else "a video"
+        why = f"You've put on {thing} around {when} on {u['hits']} of the last {u['days']} {days_word}."
+
+        def text(cap: Any = cap, made: dict[str, Any] = made, thing: str = thing, why: str = why) -> str | None:
+            pick = _usual_pick(store, cap, now)
+            if pick["title"]:
+                words = f"{pick['name']} posted \"{pick['title']}\". Put it on?"
+                must, facts = pick["title"][:40], f"{pick['name']}'s new video \"{pick['title']}\""
+            elif pick["name"]:
+                words = f"Your usual {pick['name']} around now? Put it on?"
+                must, facts = pick["name"], f"their playlist \"{pick['name']}\""
+            else:
+                words = f"Your usual {'music' if thing == 'music' else 'video'} around now? I'll pick one you like."
+                must, facts = "", ""
+            if must:   # the wording call only when the card names a pick (the code's own words are clearer otherwise)
+                words = _usual_lead(ctx, f"{facts}; {why}", must) or words
+            made.update(pick=pick, words=words)
+            return _clip(words, TEXT_CHARS)
+
+        def offer(cap: Any = cap, made: dict[str, Any] = made, why: str = why, thing: str = thing,
+                  when: str = when) -> dict[str, Any] | None:
+            pick = made.get("pick")
+            if not pick:
+                return None
+            slots = dict(pick["slots"])
+            if slots.get("choose"):
+                slots["context"] = f"the user's usual {thing} around {when} ({made.get('words') or ''})"
+            from yuki.memory.offers import SKILL_WONT_LINES
+
+            step = (f"put on \"{pick['title']}\"" if pick["title"] else f"put on {pick['name']}" if pick["name"]
+                    else f"pick {thing} you like and put it on")
+            return {"do": "run_skill", "label": "Put it on", "steps": [step], "refs": [f"U:{cap.key}"], "text": "",
+                    "due": None, "skill": cap.key, "slots": slots, "expires_at": now + USUAL_TTL_S,
+                    "wont": SKILL_WONT_LINES["none"], "why": why, "usual": cap.key}
+
+        out.append(Candidate(
+            "usual", key, created_at=now, expires_at=now + USUAL_TTL_S, home="card", time_bound=True,
+            window=(now, now + USUAL_TTL_S), confidence=min(0.9, 0.4 + float(u["share"]) / 2.0),
+            refs={"capability": cap.key}, evidence={"USUAL": now}, text=text, offer=offer, seen_within=86400.0,
+            why=f"usual end={cap.end} hits={u['hits']} days={u['days']} share={u['share']}"))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # All of them
 # ---------------------------------------------------------------------------
@@ -1195,6 +1465,7 @@ def gen_review(ctx: Context) -> list[Candidate]:
 #: seen-marks and expiry.
 GENERATORS: tuple[tuple[str, Callable[[Context], list[Candidate]], float], ...] = (
     ("routine", gen_routine, 0.0),
+    ("usual", gen_usual, 0.0),
     ("reminder", gen_reminders, 0.0),
     ("asked", gen_asked, 0.0),
     ("checkin", gen_checkins, 60.0),
@@ -1357,6 +1628,6 @@ def evidence_lines(store: Any, c: Candidate, now: float, safe: Callable[[Any, in
 
 __all__ = [
     "BEST_CLASSES", "CALL_UNKNOWN_GENERATORS", "Candidate", "Context", "DIGEST_LINE_CHARS", "GENERATORS", "Memo",
-    "SEEN_STATE", "Seen", "TYPES", "TypeInfo", "evidence_lines", "gen_routine", "generate", "guard_ok", "line_ref",
-    "remind_at", "resolve",
+    "SEEN_STATE", "Seen", "TYPES", "TypeInfo", "evidence_lines", "gen_routine", "gen_usual", "generate", "guard_ok",
+    "line_ref", "remind_at", "resolve", "usual_now", "usual_offerable",
 ]

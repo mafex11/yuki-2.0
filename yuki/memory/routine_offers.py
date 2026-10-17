@@ -8,30 +8,30 @@ measured usual moments in the ``routines`` table (map-routines R1.2: ``key`` ``s
 its usual window, with no model and no cost:
 
 * **due** (:meth:`RoutineLane.due`): an active routine of a skill, ``offer_mode`` ``early`` or ``late``, today in its
-  day-set, now inside the mode's window (``early``: ``routine_lead_min`` to ``routine_lead_last_min`` before the usual
-  time, 8 to 1 min; ``late``: 1 to 3 min after it), its end state not reached today (the user reached the learned
+  day-set, now inside the mode's window (18 Oct: ``early`` from :data:`WINDOW_BEFORE_MIN` before the usual time to
+  :data:`WINDOW_AFTER_MIN` after it, so the card waits for the user to sit down instead of being checked once at 08:50
+  and given up; ``late``: from 1 min after it to the same end). Before the lead (``routine_lead_min`` before the usual
+  time) the judge shows it only at a natural break (sitting down, a call or game just over); from then on at any
+  moment but mid-typing (``CardJudge._routine_moment``). Its end state not reached today (the user reached the learned
   skill's end: ``routines.skill_onsets``, or a skill run of it that ended done), not offered today, fewer than
   ``routine_per_day`` routine cards
   today. ``offer-now <id> [--in N]`` (:func:`request_offer_now`, a request file the worker reads each pass) makes one
   routine due at once, through the same card gates (it skips only the window and the day-set; its card counts
   against the day's 2, never uses up the routine's once-a-day slot, and is never learned from but for an explicit
   Less of these: its events say ``forced``);
-* **held by itself (D11)**: it passes only the coach's gates None, ``settling`` (once ``routine_settle_s`` past
-  sitting down) and ``meeting``, and holds whatever the gate says on a game or a full screen in front, the 120 s return
-  hold, any open call (a game's voice chat with the game behind is no call here: D8, map-routines R2.3), the last
-  meeting's app still playing (meeting audio), away, and Yuki acting. Screen sharing happens inside a call (D10). The
-  coarse gates (off, paused, locked, snoozed, quiet hours) give it no view at all. A calls or meeting-audio read that
-  fails counts as a hold (fail closed);
-* **the shared gates** (:mod:`yuki.core.attention`, channel ``routine``): at most 2 a day; it skips the 10-minute card
-  gap (critique M20) and moves it for every other card. A card on screen is the tray's to see (memory learns of it
-  only when it fades): the tray's queue shows one card at a time, and a routine card that waited asks
-  :func:`card_still_due` before it shows;
+* **held** by the card judge's one policy (:mod:`yuki.memory.attend`; D11): a game or a full screen in front, the
+  return hold, any open call (a game's voice chat with the game behind is no call here: D8), the meeting audio, away,
+  Yuki acting, a card showing; a meeting in front passes it, settling needs only ``routine_settle_s``; at most
+  ``routine_per_day`` a day. A routine card that waited in the tray's queue asks :func:`card_still_due` before it shows;
 * **the offer** (:func:`yuki.memory.offers.routine_offer`): the learned skill is loaded and passes the offer gate
   (``offers.skill_offerable``: never sends or commits, rung A or a verified B, its capability's ``offer_class``, a name
-  for a ``judged`` one, its Won't words known), its route trusted (``yuki.skills.registry.offer_ready``, D14), and
+  for a ``judged`` one, its Won't words known), its route not distrusted (``offers.offer_trusted``: an "open" skill
+  whose newest runs did not fail; a "change" skill by D14's bar), and
   available: for a site tab (``web_route.site_tab``) the tab census of its bound service
-  (:class:`yuki.memory.callevidence.SiteTabs`, at most once a day per routine; one tab found by identity, never two,
-  never an unreadable strip). Not available: no card that day;
+  (:class:`yuki.memory.callevidence.SiteTabs`; one tab found by identity, never two, never an unreadable strip). A
+  found tab holds for the day; not found yet (no browser window, no tab, an unreadable strip) is read again at most
+  every :data:`CENSUS_RETRY_S` while the card is due, only at moments the policy already passed. Not available: no
+  card yet;
 * **the card**: kind ``notice``, trigger ``routine``, heading "Your usual" (the UI), its text from fixed templates per
   end kind ("Your 9:00 meeting is coming up." late: "... started a minute ago ...") and the learned name as the
   question ("<name>?"; a nameless skill gets its end kind's fixed question), the why line from the counts ("You've
@@ -48,8 +48,8 @@ its usual window, with no model and no cost:
   declines of the late card in 10 days, or acceptance under 30% after 10 meeting days -> quiet (pre-declared). A run
   the PC couldn't confirm counts against the route only (the skill ledger), never against the routine.
 
-**With the card judge on** (``[judge] mode = "on"``, jSwitch, :mod:`yuki.memory.cardjudge`): :meth:`RoutineLane.tick`
-no longer runs. The judge asks :meth:`RoutineLane.candidates` (the same due rule and toggles), holds the candidate with
+**The card judge** (:mod:`yuki.memory.cardjudge`, live by default since 18 Oct; the old chain's ``tick``, ``holds`` and
+``_attention`` are gone) asks :meth:`RoutineLane.candidates` (the due rule and toggles), holds the candidate with
 its one policy (its rLane exceptions: a meeting in front passes the routine; meeting audio and a call fail closed;
 settling needs only ``routine_settle_s``; it skips the card gap and the day's 4 but keeps ``routine_per_day``; it never
 jumps a card showing) and writes the card through :meth:`RoutineLane.write` (:meth:`_write`, unchanged). The holds
@@ -61,8 +61,8 @@ forced), ``routine_held`` (the reason, on change), ``tab_census``. The tables ar
 
 Public API::
 
-    RoutineLane(worker).tick(now, config, view, gate) -> dict | None;  .due(...);  .learn(now, config)
     RoutineLane(worker).candidates(now, config, deadline=None) -> [Candidate];  .write(cand, now, config);  .held(...)
+    RoutineLane(worker).due(...);  .learn(now, config)
     routines(store) / routine(store, id) -> Routine;  record_event(store, id, kind, at=, nudge_id=, detail=)
     feedback(store, nudge_id, kind, now=None) -> dict;  why_line(r);  card_text(r, skill, mode)
     card_still_due(store, nudge_id, now=None, game=None) -> {"due", "why", "final"}
@@ -83,9 +83,11 @@ from typing import Any, Callable, Iterable, Sequence
 
 #: The card's trigger and the attention channel (yuki.memory.offers.ROUTINE_CHANNEL).
 TRIGGER = "routine"
-#: The late variant's window around the usual time (minutes after it): "started a minute ago".
+#: The offer window around the usual time (18 Oct): from this long before it to this long after it, so the card waits
+#: for the user to sit down. The late variant starts LATE_FROM_MIN after the usual time.
+WINDOW_BEFORE_MIN = 20.0
+WINDOW_AFTER_MIN = 10.0
 LATE_FROM_MIN = 1.0
-LATE_TO_MIN = 3.0
 #: After a card: the join within this long makes an accepted card ``joined``; within the longer one, the user
 #: joining without the card is ``self_served`` (B.3).
 JOINED_WITHIN_S = 10 * 60.0
@@ -108,6 +110,8 @@ LEARN_EVERY_S = 60.0
 REQUEST_FILE = "routine_offer_now.json"
 #: An ``offer-now`` request waits at most this long past its time for the card gates (s).
 REQUEST_WAIT_S = 10 * 60.0
+#: A routine's tab census that found no tab (yet) is read again after this long (s); a found one holds for the day.
+CENSUS_RETRY_S = 4 * 60.0
 #: Event kinds of ``routine_events`` this lane writes (map-routines R1.2).
 EVENT_KINDS: tuple[str, ...] = ("offered", "held", "accepted", "run_ok", "run_failed", "declined", "ignored",
                                 "self_served", "never", "mode_change")
@@ -121,9 +125,9 @@ SETTLE_KINDS: tuple[str, ...] = ("accepted", "declined", "ignored")
 ONSET_WORDS: dict[str, dict[str, str]] = {
     "call_join": {
         "early": "Your {at} meeting is coming up.",
-        "late": "Your {at} meeting started a minute ago.",
+        "late": "Your {at} meeting has started.",
         "named_early": "{label} is at {at}.",
-        "named_late": "{label} started a minute ago.",
+        "named_late": "{label} has started.",
         "why": "You've joined it around {when} on {hits} of the last {eligible} {days}.",
         "ask": "Bring its tab forward?",
     },
@@ -391,12 +395,17 @@ def in_dayset(dayset: str, day: date) -> bool:
 
 
 def window(r: Routine, day: date, config: Any, mode: str | None = None) -> tuple[float, float, float]:
-    """``(start, end, usual time)`` of the routine's offer window on ``day`` in ``mode`` (default its own)."""
+    """``(start, end, usual time)`` of the routine's offer window on ``day`` in ``mode`` (default its own): from
+    :data:`WINDOW_BEFORE_MIN` before the usual time (``late``: :data:`LATE_FROM_MIN` after it) to
+    :data:`WINDOW_AFTER_MIN` after it."""
     at = usual_at(r, day, getattr(config, "resume_day_start", "04:00"))
-    if (mode or r.offer_mode) == "late":
-        return at + LATE_FROM_MIN * 60.0, at + LATE_TO_MIN * 60.0, at
-    return (at - float(getattr(config, "routine_lead_min", 8.0)) * 60.0,
-            at - float(getattr(config, "routine_lead_last_min", 1.0)) * 60.0, at)
+    start = at + LATE_FROM_MIN * 60.0 if (mode or r.offer_mode) == "late" else at - WINDOW_BEFORE_MIN * 60.0
+    return start, at + WINDOW_AFTER_MIN * 60.0, at
+
+
+def phase(d_at: float, now: float, mode: str) -> str:
+    """The card's words: ``late`` once the usual time has passed (by a minute), else the routine's own mode."""
+    return "late" if now >= d_at + LATE_FROM_MIN * 60.0 else mode
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -581,8 +590,8 @@ class Due:
 
 
 class RoutineLane:
-    """The routine card in ``NudgeWorker.tick`` (see the module docstring). ``worker``: the
-    :class:`yuki.memory.nudges.NudgeWorker` (its store, log, attention, calls and meeting-audio reads).
+    """The routine card's lane for the card judge (see the module docstring). ``worker``: the
+    :class:`yuki.memory.nudges.NudgeWorker` (its store, log, the tray's event).
 
     ``skills``: the skill loader (default :func:`yuki.skills.connection.load`); ``ready`` replaces D14's
     ``offer_ready`` and ``available`` the availability check (tests, replays that say so)."""
@@ -598,8 +607,9 @@ class RoutineLane:
         self._held: dict[int, str] = {}
         #: (routine id, day, reason) held events already written (one row each a day).
         self._held_rows: set[tuple[int, str, str]] = set()
-        #: (routine id, day) -> the day's census answer (at most one census a day per routine; offer-now asks again).
-        self._census: dict[tuple[int, str], bool | None] = {}
+        #: (routine id, day) -> (the census answer, when read): True holds for the day; False / None is read again
+        #: after CENSUS_RETRY_S (the window opens before the user sits down; offer-now always asks again).
+        self._census: dict[tuple[int, str], tuple[bool | None, float]] = {}
         self._learned_at = 0.0
         self._request_mtime: float | None = None
         self._request: dict[str, Any] | None = None
@@ -633,50 +643,18 @@ class RoutineLane:
         except Exception:
             return None
 
-    # -- one pass ------------------------------------------------------------------------------------------------------
-
-    def tick(self, now: float, config: Any, view: Any, gate: str | None) -> dict[str, Any] | None:
-        """One pass: the learning upkeep, then at most one card (``{"trigger": "routine", "nudge_id", ...}``)."""
-        if not has_tables(self.store):
-            return None
-        try:
-            self.learn(now, config)
-        except Exception as exc:
-            self._log("nudge_error", where="routine_learn", error=f"{type(exc).__name__}: {exc}")
-        request = self._read_request(now)
-        if (not getattr(config, "routine_offers", True) or getattr(config, "offers", "yuki_only") == "off"
-                or not _skills_on(config)):
-            if request is not None:
-                self._finish_request(request, "off")
-            return None
-        due = self.due(now, config, request=request)
-        if not due:
-            return None
-        d = due[0]
-        if view is None:   # a coarse gate (locked, snoozed, quiet hours): nothing shows, a request keeps waiting
-            self._hold(d, now, config, str(gate or "gate"))
-            return None
-        why = self.holds(now, config, view, gate)
-        if why is None:
-            why = self._attention(now, config, d.forced)
-        if why is not None:
-            self._hold(d, now, config, why)
-            return None
-        return self._write(d, now, config)
-
-    # -- the card judge's lane (jSwitch: [judge] mode = "on") -----------------------------------------------------------
+    # -- the card judge's lane ------------------------------------------------------------------------------------------
 
     def candidates(self, now: float, config: Any, *, deadline: Callable[[float | None], Any] | None = None
                    ) -> list[Any]:
         """The routines due now as card candidates for the judge (:mod:`yuki.memory.cardjudge`; type ``routine``,
-        urgency ``deadline``, time-bound: its window). The same due rule as :meth:`tick` (:meth:`due`: the window,
-        the day-set, the end state not reached today, once a day per routine, at most ``routine_per_day`` routine
-        cards, an ``offer-now`` request first) and the same toggles (``routine_offers``, ``offers = "off"``: no card,
-        a request finishes ``off``). What :meth:`tick` adds is the judge's now: the holds (:meth:`holds`) and the
-        shared gates (:meth:`_attention`) are bypassed - the judge's one policy holds the card (a meeting in front
-        passes it, meeting audio and a call fail closed, settling needs ``routine_settle_s``, a card showing holds
-        it) and keeps its ``routine_per_day``. ``deadline(at)``: the next window's start today (the judge wakes then).
-        The learning upkeep (:meth:`learn`) runs on the judge's wake loop, not here."""
+        urgency ``deadline``, time-bound: its window). The due rule (:meth:`due`: the window, the day-set, the end
+        state not reached today, once a day per routine, at most ``routine_per_day`` routine cards, an ``offer-now``
+        request first) and the toggles (``routine_offers``, ``offers = "off"``: no card, a request finishes ``off``).
+        The judge's one policy holds the card (a meeting in front passes it, meeting audio and a call fail closed,
+        settling needs ``routine_settle_s``, a card showing holds it, its moment: ``refs.lead_at``) and keeps its
+        ``routine_per_day``. ``deadline(at)``: the next window's start today (the judge wakes then). The learning
+        upkeep (:meth:`learn`) runs on the judge's wake loop, not here."""
         from yuki.memory.candidates import Candidate
 
         if not has_tables(self.store):
@@ -708,32 +686,33 @@ class RoutineLane:
             words = None
             if d.skill is not None:
                 try:
-                    words = card_text(r, d.skill, d.mode, card_question(self.store, d.skill))
+                    words = card_text(r, d.skill, phase(d.at, now, d.mode), card_question(self.store, d.skill))
                 except Exception:
                     words = None
             opens = now if d.forced else window(r, day, config)[0]
+            lead_at = None if d.forced else d.at - float(getattr(config, "routine_lead_min", 8.0)) * 60.0
             c = Candidate("routine", key, created_at=opens, expires_at=d.until, urgency="deadline", home="card",
                           time_bound=True, window=(opens, d.until),
                           confidence=max(0.0, min(1.0, float(rate))) if rate is not None else 0.8,
-                          refs={"routine": r.id}, evidence={f"R{r.id}": d.at}, text=words,
+                          refs={"routine": r.id, "lead_at": lead_at}, evidence={f"R{r.id}": d.at}, text=words,
                           why=f"routine mode={d.mode} forced={int(d.forced)} lead_s={round(d.at - now)}")
             self._pending[key] = d
             out.append(c)
         return out
 
     def write(self, cand: Any, now: float, config: Any) -> dict[str, Any] | None:
-        """The judge chose this routine's candidate: the card written exactly as :meth:`tick` writes it
-        (:meth:`_write`: the offer through ``offers.routine_offer`` - the offer gate, a trusted route, availability -
-        the fixed words, the why and Won't lines, the ``offered`` event, the offer-now request finished). None: not
-        written (no longer due, or the offer said no: the hold is recorded as :meth:`tick` records it)."""
+        """The judge chose this routine's candidate: the card written (:meth:`_write`: the offer through
+        ``offers.routine_offer`` - the offer gate, a trusted route, availability - the fixed words, the why and Won't
+        lines, the ``offered`` event, the offer-now request finished). None: not written (no longer due, or the offer
+        said no: the hold is recorded)."""
         d = (getattr(self, "_pending", None) or {}).get(getattr(cand, "key", ""))
         if d is None:
             return None
         return self._write(d, now, config)
 
     def held(self, cand: Any, now: float, config: Any, reason: str) -> None:
-        """The judge held this routine's candidate (``reason``: the policy's, content-free): logged and recorded as
-        :meth:`tick`'s holds are (``routine_held`` on change, one ``held`` event a day per reason, an offer-now
+        """The judge held this routine's candidate (``reason``: the policy's, content-free): logged and recorded
+        (``routine_held`` on change, one ``held`` event a day per reason, an offer-now
         request's state). The judge's day budget (``B2:routine_day``) is the old ``attention:budget``: final for an
         offer-now request, as before."""
         d = (getattr(self, "_pending", None) or {}).get(getattr(cand, "key", ""))
@@ -804,42 +783,6 @@ class RoutineLane:
         out.sort(key=lambda d: (not d.forced, d.at))
         return out
 
-    # -- D11: holds of its own, whatever the gate says -----------------------------------------------------------------
-
-    def holds(self, now: float, config: Any, view: Any, gate: str | None) -> str | None:
-        """Why the lane may not show a card now (D11), or None. The coach's gate passes only None, settling and
-        meeting; then it holds by itself on each screen hold (``view.holds``), any open call and the meeting audio."""
-        held = set(getattr(view, "holds", ()) or ())
-        for reason in ("yuki_acting", "game", "fullscreen", "return_hold", "away"):
-            if reason in held:
-                return reason
-        if gate not in (None, "settling", "meeting"):
-            return str(gate)
-        if self.w._call_open(fail_closed=True):   # a read that failed counts as a call
-            return "call"
-        if self.w._meeting_held(now, view, config, fail_closed=True):
-            return "meeting_audio"
-        if "settling" in held or gate == "settling":
-            since = getattr(view, "at_pc_since", None)
-            if since is None or now < since + float(getattr(config, "routine_settle_s", 30.0)) \
-                    or float(getattr(view, "present_recent_s", 0.0)) <= 0.0:
-                return "settling"
-        return None
-
-    def _attention(self, now: float, config: Any, forced: bool) -> str | None:
-        """The shared gates (channel ``routine``): a card showing, the day's budget of 2 (``offer-now`` cards
-        included: it goes through the real card gates)."""
-        try:
-            att = self.w._attention(now, config)
-            att.load(TRIGGER, [n.at for n in self._today_cards(now, config)
-                               if n.at >= now - 86400.0])
-            decision = att.check(TRIGGER, now=now, facts={})
-        except Exception:
-            return "attention:error"   # fail closed: never a card that might jump one showing
-        if decision.allowed:
-            return None
-        return f"attention:{decision.reason}"
-
     def _hold(self, d: Due, now: float, config: Any, reason: str) -> None:
         rid = d.routine.id
         if self._held.get(rid) != reason:
@@ -873,13 +816,14 @@ class RoutineLane:
 
         def check(skill: Any) -> bool | None:
             key = (d.routine.id, day)
-            if key in self._census and not d.forced:
-                return self._census[key]
+            hit = self._census.get(key)
+            if hit is not None and not d.forced and (hit[0] is True or 0.0 <= now - hit[1] < CENSUS_RETRY_S):
+                return hit[0]
             if self._available is not None:
                 got = self._available(self.store, skill)
             else:
                 got = available(self.store, skill, log=self._log)
-            self._census[key] = got
+            self._census[key] = (got, now)
             if len(self._census) > 64:
                 self._census = {k: v for k, v in self._census.items() if k[1] == day}
             return got
@@ -895,7 +839,7 @@ class RoutineLane:
         question = card_question(self.store, skill) if skill is not None else ""
         if skill is None:
             why_not = "no_skill"
-        elif (text := card_text(r, skill, d.mode, question)) is None:
+        elif (text := card_text(r, skill, phase(d.at, now, d.mode), question)) is None:
             why_not = "no_words"
         elif "run_skill" not in offers.allowed_dos(self.store, offers.ROUTINE_CHANNEL, now,
                                                    enabled=getattr(config, "offers", "yuki_only") != "off"):
@@ -904,7 +848,8 @@ class RoutineLane:
         if why_not is None:
             why = why_line(r, skill)
             expire = float(getattr(config, "routine_expire_after_min", 10.0)) * 60.0
-            expires_at = (now if d.forced else d.at) + expire
+            # shown late in its window (the user sat down at 09:08): still a few minutes to press it
+            expires_at = now + expire if d.forced else max(d.at + expire, now + expire / 2.0)
             routine = r
             params = routine_params(self.store, r, skill)
             if params and not r.params:
