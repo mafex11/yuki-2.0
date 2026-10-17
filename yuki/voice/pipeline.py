@@ -5699,19 +5699,6 @@ class Conversation:
             self.log.event("warm", note="skipped: the chosen voice model's service keeps no prompt cache")
             return
         request: dict[str, Any] = {"messages": [{"role": "user", "content": "."}]}
-        job = getattr(self, "_recent_job", None)
-        if job is not None and not self.dormant:
-            # fTalk: the warm-up writes the whole system (the you-card and the Earlier block carry the second
-            # breakpoint, mouth.mouth_system_blocks), so it waits for the wake's read of them, as the first call does
-            # (at most RECENT_WAIT_S), then freezes them: a read that lands later would change the system after it
-            try:
-                if not job.done():
-                    await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(job)), self.RECENT_WAIT_S)
-            except Exception:  # noqa: BLE001 - past the bound: the view read at the build
-                pass
-            close = getattr(self, "_recent_close", None)
-            if callable(close):
-                close()
         try:
             from pipecat.processors.aggregators.llm_context import LLMContext
 

@@ -2734,8 +2734,7 @@ def mouth_system_blocks(
     state (a Speech line, a thinker line, a hand that failed, a closed tab) rides in :func:`volatile_block` on the turns
     in that state. The first cache breakpoint is on the last block that never changes in a conversation (the hands, or
     the core), so a call starting or ending rewrites only the call, profile and rules layers, not the ~10k tokens
-    before them; the second (fTalk) is on the last system block (the rules, or the you-card / Earlier block after
-    them), five minutes, written by the conversation's warm-up so its first turn reads the whole system.
+    before them; the second is on the rules.
 
     bTalk: ``talker`` ``"lean"`` (design 3): the lean core, the lean hands block and the lean call layers, in the same
     places and with the same breakpoints; ``"full"`` is as before.
@@ -2780,24 +2779,19 @@ def mouth_system_blocks(
         rules = mouth_rules(memory.standing) or NO_RULES
         last = {"type": "text", "text": f"{STANDING_LABEL}\n{rules}\n{STANDING_END}"}
         blocks.append(last)
+    if last is not None:
+        marked.append(last)
     from yuki.agent.prompt import STABLE_CACHE_CONTROL
 
     for block in marked:
         block["cache_control"] = dict(STABLE_CACHE_CONTROL)   # an hour: kept warm between conversations (v3.11)
     if lean and memory.you_card and memory.you_card.strip():
-        # kMind (contract C1): fixed for the conversation (read again when it is woken)
+        # kMind (contract C1): after the cached layers, fixed for the conversation (read again when it is woken)
         blocks.append({"type": "text", "text": f"{YOU_CARD_LABEL}\n{memory.you_card.strip()}\n{YOU_CARD_END}"})
     if memory.recent and memory.recent.strip():
-        # vfix4: the last hour with them: fixed for the conversation, and the layers before it stay byte-identical
+        # vfix4: the last hour with them, after every breakpoint of ours: fixed for the conversation, so its later
+        # calls read it from the conversation's own cache, and the layers before it stay byte-identical.
         blocks.append({"type": "text", "text": memory.recent.strip()})
-    if blocks[-1] is not marked[0]:
-        # fTalk (live test A: every first turn read 12.7k cached tokens and wrote ~1.9k, the you-card and the Earlier
-        # block among them, ~0.2-0.4 s more to its first token than the turns after it): the second breakpoint is on
-        # the last system block, so the conversation's warm-up call (``Conversation._warm``, at the wake, after the
-        # wake's read of them) writes the whole system and the first turn reads it. Five minutes: it is this
-        # conversation's (the one-hour breakpoint stays on the hands block, which never changes between them); with no
-        # you-card or Earlier block the rules end the system and keep their hour, as before.
-        blocks[-1]["cache_control"] = dict(STABLE_CACHE_CONTROL) if blocks[-1] is last else {"type": "ephemeral"}
     return blocks
 
 
