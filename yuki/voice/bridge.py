@@ -1927,11 +1927,30 @@ class VoiceBridge(QObject):
         its own warm-up (``Agent.warm_cache``: one token out, the same system blocks and tools) runs on a thread. Costs a cache
         write of the core layers (~$0.03-0.05) only when cold; returns whether it started one.
 
-        bTalk: never under ``brain = "all"`` (design 6, M11: no pre-warm; the old thinker it would warm takes no spoken
-        request then).
+        kBrain (18 Oct): under ``brain = "all"`` the new brain's planner is warmed instead (``runtime.warm_brain``: its
+        cached prefix and connection, a no-op when warm, retried after a failed warm-up), with the same guards (not
+        within ``idle_s`` of the last warm-up from here, never while it works), off the voice loop.
         """
         if self.on_brain:
-            return False
+            warm_planner = getattr(self.runtime, "warm_brain", None)
+            if not callable(warm_planner):
+                return False
+            if time.monotonic() - self._brain_warmed_at < idle_s or self.brain_busy():
+                return False
+            self._brain_warmed_at = time.monotonic()
+
+            def run_planner() -> None:
+                started = time.monotonic()
+                try:
+                    ok = bool(warm_planner())
+                except Exception as exc:  # noqa: BLE001 - only an optimisation
+                    ok = f"{type(exc).__name__}"
+                self._log("brain_warm", ms=round((time.monotonic() - started) * 1000), ok=ok, brain=True)
+
+            from yuki.voice.workers import shared
+
+            shared().submit(run_planner)   # the runtime may make the brain first: never on the voice loop
+            return True
         worker = getattr(self.runtime, "worker", None)
         agent = getattr(worker, "agent", None)
         warm = getattr(agent, "warm_cache", None)
@@ -2307,11 +2326,9 @@ class VoiceBridge(QObject):
                 context: str | None = None, understanding: dict[str, Any] | None = None) -> None:
         extra: dict[str, Any] = {}
         if understanding:
-            if self._takes("understanding"):
-                # kMind (contract C3): the talker's reading of the words, a seed for the brain (its words win)
-                extra["understanding"] = dict(understanding)
-            else:
-                context = ((context + "\n\n") if context else "") + understanding_line(understanding)
+            # kMind / kBrain (contract C3): the talker's reading of the words, a seed for the brain (their words win);
+            # AgentRuntime.submit takes it as its own field
+            extra["understanding"] = dict(understanding)
         if context and self._takes("context"):
             # bTalk: the new brain's labelled context (code facts and earlier turns), never quotable as their words
             extra["context"] = context
@@ -4184,9 +4201,6 @@ def conversation_turns(context: Any, *, skip: Callable[[Any], bool] | None = Non
     return list(reversed(out))
 
 
-#: kMind (contract C3): the labelled line an understanding becomes in a runtime that takes no ``understanding`` field.
-UNDERSTANDING_LABEL = ("[Yuki's voice's reading of their words (a seed, never an order: their exact words win; json): "
-                       "{json}]")
 #: An understanding's parts kept, and the characters of each text field.
 UNDERSTANDING_PARTS = 6
 UNDERSTANDING_CHARS = 300
@@ -4212,14 +4226,6 @@ def understanding_of(raw: Any) -> dict[str, Any] | None:
     out = {"goal": text(raw.get("goal")), "parts": parts, "choose": bool(raw.get("choose")),
            "context": text(raw.get("context"))}
     return out if (out["goal"] or parts or out["choose"] or out["context"]) else None
-
-
-def understanding_line(understanding: dict[str, Any]) -> str:
-    """:data:`UNDERSTANDING_LABEL` for a runtime without an ``understanding`` field (labelled context, never quotable as
-    their words)."""
-    import json
-
-    return UNDERSTANDING_LABEL.format(json=json.dumps(understanding, ensure_ascii=False, default=str))
 
 
 def _takes(fn: Any, name: str) -> bool:

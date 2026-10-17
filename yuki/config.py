@@ -261,9 +261,13 @@ DEFAULT_FALLBACKS: dict[str, list[dict[str, str | None]]] = {
         {"model": "us.anthropic.claude-haiku-4-5-20251001-v1:0", "region": "us-east-1"},
         {"model": MODEL_ALIASES["sonnet"], "region": None},
     ],
-    # kMind: the lean talker: the same model from us-east-1, then the fast Haiku (thinking off as each model takes it)
+    # Sonnet 5.5: the lean talker (kMind) and the brain's planner (kBrain, ``brain_model``) share this chain (it is
+    # keyed by model id): the same model from us-east-1, then Sonnet 5, then the fast Haiku. Sonnet 5 comes before
+    # Haiku because the planner sends adaptive thinking and an effort, which Haiku refuses (HTTP 400, no further
+    # failover); the talker sets thinking off as each model takes it, so it works on either.
     DEFAULT_VOICE_LEAN_MODEL: [
         {"model": DEFAULT_VOICE_LEAN_MODEL, "region": "us-east-1"},
+        {"model": MODEL_ALIASES["sonnet"], "region": None},
         {"model": DEFAULT_VOICE_MOUTH_MODEL, "region": None},
     ],
 }
@@ -527,15 +531,7 @@ class Settings:
         voice_qos: While a conversation is live, the process is opted out of Windows' power throttling and the voice
             loop, the speaker's writer and the microphone's callback threads too (v3.17, D7).
         voice_mmcss: Those threads also join the MMCSS "Audio" task (Windows' scheduler for audio threads).
-        voice_practice: The talker gets practice memory's lines for the user's words (v3.18): the Lessons line (the
-            top pitfalls and habits of the apps in play, at most ``voice_lessons_chars``) and the Learned ways line.
-        voice_skills: The talker may run a learned way as its hand (``run_skill``, v3.18), step by step, each step
-            checked, handed to the thinker at the first deviation; only ways above both floors are offered.
-        voice_skill_min_cosine: A way is offered as a skill only this near the words (measured, 29-build §2.1).
-        voice_skill_min_confidence: ... and only this sure (memory's computed confidence; above one source's 0.667).
-        voice_lessons_chars: The Lessons line's size in the talker's volatile block.
-        voice_hand_traces: Every talker hand (and learned-way run) is kept as a run trace in practice memory so the
-            learners see the hands too (v3.18; written off the voice loop).
+        voice_hand_traces: Every talker hand is kept as a run trace in memory (v3.18; written off the voice loop).
         voice_reflex: lSpeed (live test 17 Oct 2026, problem 1; ``yuki.voice.reflex``). The user's own words for which
             one talker hand (a media key, a relative volume change or mute, a window brought up, restored or
             minimised, a scroll, an app opened) was verified done, and nothing else was done for that turn, are kept
@@ -553,10 +549,6 @@ class Settings:
             (``yuki.memory.testtag``: ``TEST_SESSION_PREFIX`` / ``is_test_session``, xGlue), and so are sessions whose
             id starts with one of these. A test conversation (or one whose session id starts with one of these) never
             teaches the book, live or seeded: the stored book is only read, and nothing is written to it.
-        voice_practice, voice_skills (Phase S, D15): the old talker learning path (the Lessons and Learned ways lines,
-            the step-list ``run_skill``) is off by default. It never runs beside the skill path: with ``skills`` on it
-            stays off whatever these say; with ``skills = false`` they work as before S (``voice_practice`` the lines,
-            ``voice_skills`` also the step-list hand). Deleted in phase P.
         skills: The skill path (PLAN.md Phase S, docs/research/audit-2026-10-09): the talker's Skills menu and its
             ``run_skill`` / ``keep_usual`` hands, the thinker's ``run_skill`` tool. With a ``volume`` skill loaded the
             talker's own ``app_volume`` hand, its volume keys and the thinker's ``app_volume`` tool are off; ``false``
@@ -731,13 +723,7 @@ class Settings:
     voice_stt_warm: bool = True
     voice_qos: bool = True
     voice_mmcss: bool = True
-    # v3.18 practice memory for the talker (docs/research/revamp-2026-10-02/29-build-voice-procedures.md); off since
-    # phase S (D15): never beside the skill path, back only with skills = false (and these on)
-    voice_practice: bool = False
-    voice_skills: bool = False
-    voice_skill_min_cosine: float = 0.56
-    voice_skill_min_confidence: float = 0.70
-    voice_lessons_chars: int = 400
+    # v3.18: the talker's hands are kept as run traces in memory (the old talker learning path is deleted, kClean)
     voice_hand_traces: bool = True
     # lSpeed (live test 17 Oct 2026, problem 1): the learned reflex path (yuki.voice.reflex)
     voice_reflex: bool = True
@@ -848,11 +834,13 @@ class Settings:
     #: A request pack (Agent.build_pack) older than this is rebuilt for its screen half (the memory half is kept).
     pack_max_age_s: float = 20.0
     # -- the brain rebuild (docs/research/audit-2026-10-09/next/brain-design.md rev 2, release 17a) --
-    #: Which requests the new brain takes (:data:`BRAIN_MODES`): ``all`` (the default since kMind, 18 Oct), ``typed``,
-    #: ``loop`` (the rollback),
-    #: ``all``. Read at each request's start, so flipping it back is the rollback (``YUKI_BRAIN`` or ``brain`` in
-    #: ``settings.json`` at start).
+    #: Which requests the new brain takes (:data:`BRAIN_MODES`): ``all`` (typed and spoken; the default since 18 Oct),
+    #: ``typed`` (typed only), ``loop`` (none: the old step-by-step agent and the full talker; the rollback value).
+    #: Read at each request's start (``YUKI_BRAIN`` or ``brain`` in ``settings.json`` at start); anything else is
+    #: ``all``.
     brain: str = field(default_factory=_brain_default)
+    #: The planner's model (kBrain, 18 Oct): Sonnet 5.5; the brain falls back to the same model when this is empty.
+    brain_model: str = "global.anthropic.claude-sonnet-5-5"
     #: The planner's effort per channel (adaptive thinking on both; pinned for a whole request, tuned from the
     #: request logs).
     brain_effort_voice: str = "low"

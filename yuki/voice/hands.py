@@ -775,9 +775,9 @@ HAND_TOOLS: list[dict[str, Any]] = [
         "required": ["page"],
     },
 ]
-# v3.18: a learned way from practice memory, run as the talker's hand (yuki.voice.skills; offered on the volatile
-# block's "Learned ways" line only when it qualifies, refused for any way that was not offered).
-from yuki.voice.skills import RUN_SKILL_TOOL  # noqa: E402
+# The run_skill name among the hands (its schema here is the old step-list one; the talker is only ever given the
+# Skills menu's own run_skill: talker_hand_tools).
+from yuki.skills.uia_route import RUN_SKILL_TOOL  # noqa: E402
 
 HAND_TOOLS.append(RUN_SKILL_TOOL)
 HAND_NAMES = tuple(t["name"] for t in HAND_TOOLS)
@@ -810,13 +810,13 @@ MEDIA_KEY_TRANSPORT_DESCRIPTION = (
 )
 
 
-def talker_hand_tools(skill_keys: Any = (), *, learned_ways: bool = False) -> list[dict[str, Any]]:
+def talker_hand_tools(skill_keys: Any = ()) -> list[dict[str, Any]]:
     """The talker's hands for one conversation (fixed for it: the tools head the cached prefix).
 
     ``skill_keys``: the keys of this conversation's Skills menu (``yuki.skills``; empty: the skill path is off or no
     skill loaded). With keys, ``run_skill`` is the skill hand (its enum the keys) plus ``keep_usual``; with ``volume``
     among them, ``app_volume`` and the media_key volume keys are left out. Without keys the hands are as before phase
-    S, the step-list ``run_skill`` only with ``learned_ways`` (the old learning path, ``skills = false``)."""
+    S, with no ``run_skill`` (the old learned-way path is deleted)."""
     keys = [str(k) for k in (skill_keys or ()) if str(k or "").strip()]
     volume = VOLUME_SKILL in keys
     out: list[dict[str, Any]] = []
@@ -836,8 +836,6 @@ def talker_hand_tools(skill_keys: Any = (), *, learned_ways: bool = False) -> li
 
         out.append(talker_tool(keys))
         out.append(KEEP_USUAL_TOOL)
-    elif learned_ways:
-        out.append(RUN_SKILL_TOOL)
     return out
 #: UI Automation control types (the platform's fixed vocabulary) whose click can send, delete, buy or sign out: such a
 #: click always passes Yuki's own authorization check (34-review H1/H2: a machine fact, never the control's words).
@@ -1307,9 +1305,6 @@ class Hands:
         #: a volume skill run then takes no focus (review r2 L3: it is never held on unsure words, as the old sound
         #: hands were not, so its focus rungs and a hand-off are left out on that run).
         self.unsure: Any = None
-        #: :class:`yuki.voice.practice.PracticeLookup`: the learned ways the talker was offered (run_skill runs only
-        #: those), set by the conversation.
-        self.practice: Any = None
         #: appOpen: the watches of openings still starting (their results, newest last) and the stop of the running one.
         self.watched: list[dict[str, Any]] = []
         self._watch_stop: threading.Event | None = None
@@ -2404,9 +2399,9 @@ class Hands:
                            **{k: v for k, v in facts.items()
                               if (isinstance(v, (int, float, bool)) or v is None)
                               and k not in ("question", "request_id", "refused_why", "refused_at")})
-        # v3.18: every hand that acted is kept as a run trace for practice memory (off the loop, in order)
+        # v3.18: every hand that acted is kept as a run trace in memory (off the loop, in order)
         if name == SKILL_HAND:
-            self._trace_skill(args, ok=ok, report=report, facts=facts, ms=ms, call=params.tool_call_id)
+            pass   # a skill run keeps its own ledger (yuki.skills.engine); the old learned-way trace is deleted
         elif facts.get("starting"):
             # appOpen: the trace waits for the watch, so the learner reads the opening together with its outcome
             self._watch_open(name, args, report=report, facts=facts, ms=ms, call=params.tool_call_id)
@@ -2838,87 +2833,14 @@ class Hands:
             self.log.event("hand_trace", op="queued", name=name, ok=True, verified=verdict, ms=round(ms), steps=2,
                            injected=len(shown))
 
-    def _trace_skill(self, args: dict[str, Any], *, ok: bool, report: str, facts: dict[str, Any], ms: float,
-                     call: Any = None) -> None:
-        """Keep one learned way's run as a run trace: one step per action (and the look that found the screen did not
-        fit), each citing the way (``playbook``), the ways and lessons shown as ``injected``. Content-free log."""
-        from yuki.voice.skills import trace_steps
-
-        results = facts.get("results") or []
-        item = facts.get("item") or {}
-        pid = None
-        try:
-            pid = int(item.get("id")) if item.get("id") is not None else None
-        except (TypeError, ValueError):
-            pid = None
-        if self.log is not None:
-            self.log.event("skill", op="run", skill=pid, ok=bool(ok), verified=facts.get("verified"),
-                           steps=facts.get("steps"), steps_done=facts.get("steps_done"),
-                           deviated_at=facts.get("deviated_at"), deviation=facts.get("deviation"),
-                           refused=bool(facts.get("refused")), ms=round(ms), call=call)
-        memory = self.memory
-        if memory is None or not callable(getattr(memory, "record_run", None)) or not results:
-            return
-        request_id, words, shown = self._trace_ids(call)
-        steps = trace_steps(results, pid)
-        started = min((float(s.get("at") or time.time()) for s in steps), default=time.time())
-        outcome = ("final" if ok and facts.get("verified") is True else "held" if facts.get("held") else
-                   "refused" if facts.get("act_off") else
-                   "handed_over" if facts.get("deviated_at") is not None else "unverified")
-        run = {"source": "hand", "session_id": getattr(memory, "session_id", None), "request_id": request_id,
-               "lane": "voice", "at": started, "ended_at": started + float(ms or 0) / 1000.0,
-               "words": " / ".join(words[-2:]), "reply": str(report or "")[:300], "outcome": outcome,
-               "steps": steps, "wall_s": float(ms or 0) / 1000.0, "app": (item.get("apps") or [None])[0],
-               "injected": list(dict.fromkeys([*shown, *([pid] if pid is not None else [])])),
-               "cited": [pid] if pid is not None else []}
-
-        def write() -> None:
-            try:
-                memory.record_run(run)
-            except Exception as exc:  # noqa: BLE001
-                if self.log is not None:
-                    self.log.event("hand_trace", op="error", name=SKILL_HAND, error=type(exc).__name__)
-
-        self._queue(write)
-        if self.log is not None:
-            self.log.event("hand_trace", op="queued", name=SKILL_HAND, ok=bool(ok), steps=len(steps),
-                           injected=len(run["injected"]), cited=len(run["cited"]), call=call)
-
-    # -- v3.18: a learned way as a hand ---------------------------------------------------------------------------
-
-    def _skill(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
-        """Run a learned way the talker was offered (:mod:`yuki.voice.skills`): refused (and handed to the thinker by
-        code) when it was not offered, or when its call cannot run as written."""
-        from yuki.voice.skills import SkillRefused, SkillRunner
-
-        ref = str(args.get("skill") or "").strip()
-        turn = int(self._call_safely(self.user_turn, 0) or 0)
-        practice = self.practice
-        item = practice.offered(ref, turn) if practice is not None else None
-        words = [str(w) for w in (self._call_safely(self.words, []) or []) if str(w).strip()]
-        if item is None:
-            facts["skill_context"] = (f"I was about to run a learned way ({ref or 'none named'}) with my own hands, but "
-                                      f"it was not one offered for these words, so nothing was done.")
-            raise _Refused(f"{ref or 'that way'} is not on the Learned ways line you were shown; nothing was done",
-                           stale=True)
-        facts["item"] = item
-        try:
-            ok, report, more = SkillRunner(self).run(args, item=item, words=words)
-        except SkillRefused as exc:
-            facts["skill_context"] = (f"I was about to run my learned way {item.get('ref')} (\"{item.get('intent')}\") "
-                                      f"with my own hands, but did not: {exc}. Nothing was done.")
-            raise _Refused(f"the learned way was not run: {exc}; nothing was done", stale=True) from None
-        facts.update(more)
-        return ok, report, facts
-
     # -- Phase S: one of the user's skills as the talker's hand (yuki.skills; map-skills S3.4, S4.2, S4.3) ----------
 
     #: The outcomes whose line code always says itself (it settles the call: no talker run, no hand-off): a game in
-    #: front, Spotify playing on another device. x3 (fix-plan 3c): "couldn't confirm", a failure and the resolver's
+    #: front, a call (Yuki's own pick held for after it: kTaste), Spotify playing on another device. x3 (fix-plan 3c): "couldn't confirm", a failure and the resolver's
     #: question are no longer a stop: they fall back to the thinker doing it by steps (:meth:`_skill_fallback`), and
     #: their line (:data:`SKILL_SAID_PLAIN`) is said by code only when no fallback may go (a skill that may already have
     #: sent or joined, data that never hands over, a real question, no thinker to take it).
-    SKILL_SAID = ("held_game", "other_device")
+    SKILL_SAID = ("held_game", "held_call", "other_device")
     SKILL_SAID_PLAIN = ("unverified", "failed", "asked", "refused", "error")
     #: x3 (3c): the outcomes that fall back to the normal way (look at the screen, click, type) when they may.
     SKILL_FALLBACK = ("handed_over", "unverified", "failed", "asked", "refused", "error", "timeout")
@@ -4211,8 +4133,12 @@ class Hands:
     def _needs_offer(self, skill_key: str, slots: dict[str, Any]) -> bool:
         """sVoiceFix (F11): whether a run_skill is refused before any rung runs: its skill only plays an option offered
         aloud (:meth:`_pick_slot`), their words named none and none is offered now. Data only."""
+        from yuki.skills.engine import asks_choice
+
         pick = self._pick_slot(skill_key)
-        return bool(pick) and slots.get(pick) in (None, "", {}, []) and not self._offers_waiting()
+        # kTaste (C2): a run that asks Yuki to choose ({"choose": true}) has its pick filled by the engine
+        return (bool(pick) and slots.get(pick) in (None, "", {}, []) and not asks_choice(slots)
+                and not self._offers_waiting())
 
     def refused_first(self, args: Any) -> bool:
         """vRound2 (sVoiceFix "Left", lean #10): whether this ``run_skill`` call would be refused before running and
@@ -4843,7 +4769,10 @@ class Hands:
         v3.18: each hand also says what it acted on, for its run trace: ``facts["target"]`` (the control by role and
         name, the window or tab by its title, or what a sound hand moves) and ``facts["app"]`` (the process)."""
         if name == SKILL_HAND:
-            return self._skill(args, facts)
+            # the old learned-way run is deleted: run_skill is only the Skills menu's hand (_handle_skill), so one
+            # reaching here (no menu in this conversation) goes to the thinker by code, nothing done
+            facts["skill_context"] = "I was about to run one of your skills, but none is loaded here, so nothing was done."
+            raise _Refused("no skill is loaded in this conversation; nothing was done", stale=True)
         if name in ("scroll", "window", "tab", "click", "type") and args.get("window") is not None:
             # what the talker was shown (no read here: a hand's speed is the point)
             facts["app"] = self._app_at(args.get("window"))

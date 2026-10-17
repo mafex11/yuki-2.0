@@ -1632,7 +1632,7 @@ class VoiceSession(QObject):
         """The ``yuki-voice-standby`` thread: build a dormant conversation and run it until woken or lost."""
         from dataclasses import replace
 
-        from yuki.voice.mouth import fetch_memory
+        from yuki.voice.mouth import fetch_memory, talker_kind
         from yuki.voice.pipeline import preflight
 
         started = time.monotonic()
@@ -1682,7 +1682,7 @@ class VoiceSession(QObject):
                 settings = replace(settings, voice_stt_provider=facts["stt_provider"])   # vLocal: not ready yet
                 self.log.event("local_models", op="stt_fallback", note=facts.get("stt_note"),
                                local_busy=bool(facts.get("local_busy")), standby=True)
-            mouth_memory = fetch_memory(self.memory)
+            mouth_memory = fetch_memory(self.memory, lean=talker_kind(settings) == "lean")
             try:
                 keyterms, keyterm_facts = keyterms_job.result(timeout=3.0)
             except Exception as exc:  # noqa: BLE001 - recognition works without them
@@ -1914,7 +1914,7 @@ class VoiceSession(QObject):
 
         from yuki.voice.audio import Speaker, headphones_check
         from yuki.voice.echo import choose_mode, tone
-        from yuki.voice.mouth import fetch_memory
+        from yuki.voice.mouth import fetch_memory, talker_kind
         from yuki.voice.pipeline import VoiceUnavailable, preflight
 
         timings: dict[str, Any] = {}
@@ -1979,7 +1979,7 @@ class VoiceSession(QObject):
             if facts.get("stt_provider", settings.voice_stt_provider) != settings.voice_stt_provider:
                 settings = replace(settings, voice_stt_provider=facts["stt_provider"])   # vLocal: not ready yet
                 self.log.event("local_models", op="stt_fallback", note=facts.get("stt_note"))
-            mouth_memory = fetch_memory(self.memory)
+            mouth_memory = fetch_memory(self.memory, lean=talker_kind(settings) == "lean")
             mark("memory")
             try:
                 keyterms, keyterm_facts = keyterms_job.result(timeout=1.6)
@@ -2133,9 +2133,6 @@ def _import_pipeline() -> None:
     import yuki.voice.stallwatch  # noqa: F401
     import yuki.voice.steplines  # noqa: F401
     import yuki.voice.ttscache  # noqa: F401
-    # v3.18: practice memory's lookups and the learned-way runner (the audit found the lookup imported in run)
-    import yuki.voice.practice  # noqa: F401
-    import yuki.voice.skills  # noqa: F401
     from yuki.voice.gemini_tts import service_class
 
     service_class()
