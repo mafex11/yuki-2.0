@@ -505,9 +505,12 @@ def memory_texts(store: Store, days: float) -> list[str]:
     its portrait and conversation facts, the unknowns its questions asked about, and the names the user
     is shown by on screen - one entry per fact. Read once per batch. (``days`` is kept for the callers:
     journal facts carry no subject.)"""
+    from yuki.memory import testtag
+
     texts: list[str] = []
+    tests = testtag.test_turn_ids(store)   # lBrain: names a live test's scripted words gave are never the user's
     for read in (lambda: [f.subject for f in store.portrait_facts()],
-                 lambda: [f.subject for f in store.conversation_facts()],
+                 lambda: [f.subject for f in store.conversation_facts() if not testtag.is_test_fact(f, tests)],
                  lambda: [q.subject for q in store.questions()],
                  lambda: store.me_names()):
         try:

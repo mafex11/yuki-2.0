@@ -87,6 +87,7 @@ from typing import Any
 from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
+from yuki.memory import testtag
 from yuki.memory.journal import sanitize_untrusted, user_identity
 from yuki.memory.personality import nature_mark, usable
 from yuki.memory.store import (
@@ -521,7 +522,8 @@ def todo_numbers(store: Store, since: float, until: float, now: float) -> dict[s
             opened.append(row(f"todo:{t.id}", t.text, "user", t.created_at, t.due_at, t.due_all_day))
         if t.status == "done" and t.done_at is not None and since <= t.done_at < until:
             completed.append(row(f"todo:{t.id}", t.text, "user", t.done_at))
-    commitments = store.conversation_facts(("commitment",), None)
+    tests = testtag.test_turn_ids(store)   # lBrain: a live test's commitments are never the user's week
+    commitments = [f for f in store.conversation_facts(("commitment",), None) if not testtag.is_test_fact(f, tests)]
     starts = _root_starts(commitments)
     for f in commitments:
         if f.status == "superseded":
@@ -575,6 +577,8 @@ def conversation_numbers(store: Store, since: float, until: float) -> dict[str, 
     exchanges = 0
     days: set[str] = set()
     for at, sid in store.turn_times(since, until):
+        if testtag.is_test_session(sid):
+            continue   # lBrain: a live test's exchanges are never the user's sessions with Yuki
         exchanges += 1
         days.add(review_day(at).isoformat())
         if sid not in last or at - last[sid] > SESSION_GAP_S:
@@ -1025,7 +1029,8 @@ class ReviewWorker:
                 plines.append(line)
                 used += len(line)
         parts += ["", "PORTRAIT:", *(plines or ["(none yet)"])]
-        rules = self.store.conversation_facts(("rule", "preference"))
+        tests = testtag.test_turn_ids(self.store)
+        rules = [r for r in self.store.conversation_facts(("rule", "preference")) if not testtag.is_test_fact(r, tests)]
         parts += ["", "RULES (the user's own words for how Yuki talks to them):",
                   *([f"- \"{safe(r.quote or r.text, 240)}\" ({datetime.fromtimestamp(r.valid_from):%Y-%m-%d})"
                      for r in rules] or ["(none)"])]

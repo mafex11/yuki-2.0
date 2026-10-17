@@ -276,12 +276,15 @@ def _runs(store: Any, keys: Sequence[str], now: float) -> dict[str, tuple[int, i
     from yuki.skills import registry
 
     marks = ",".join("?" * len(keys))
+    from yuki.memory.testtag import sql_real_skill_run
+
     try:
         rows = store._query(
             "SELECT skill, sum(CASE WHEN checked = 1 AND (recheck IS NULL OR recheck != 0) THEN 1 ELSE 0 END), "
             "sum(CASE WHEN checked = 0 OR (checked = 1 AND recheck = 0) THEN 1 ELSE 0 END) FROM skill_runs "
             f"WHERE skill IN ({marks}) AND rung IS NOT NULL AND checked IS NOT NULL AND t0 >= ? AND t0 < ? AND "
-            "outcome NOT IN ('running', 'held_game', 'asked', 'refused', 'cancelled', 'other_device') GROUP BY skill",
+            "outcome NOT IN ('running', 'held_game', 'asked', 'refused', 'cancelled', 'other_device') AND "
+            + sql_real_skill_run() + " GROUP BY skill",
             (*keys, now - registry.TRUST_DAYS * 86400.0, now + 1.0))
     except Exception:  # noqa: BLE001 - no ledger yet
         return {}

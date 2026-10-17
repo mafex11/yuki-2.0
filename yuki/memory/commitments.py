@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
 
+from yuki.memory import testtag
 from yuki.memory.journal import HAIKU_MODEL, sanitize_untrusted
 from yuki.memory.personality import nature_mark, normalize_nature
 from yuki.memory.store import ConversationCall, ConversationFact, Store
@@ -281,7 +282,10 @@ class CommitmentChecker:
         self._last_at = now
         newest_j, newest_t = self._newest()
         try:
-            open_items = [f for f in self.store.conversation_facts(("commitment",))][-MAX_COMMITMENTS:]
+            # lBrain: a commitment resting on the live test's exchanges only is never checked as the user's
+            tests = testtag.test_turn_ids(self.store)
+            open_items = [f for f in self.store.conversation_facts(("commitment",))
+                          if not testtag.is_test_fact(f, tests)][-MAX_COMMITMENTS:]
         except Exception as exc:
             result.error = f"{type(exc).__name__}: {exc}"
             return result
@@ -363,8 +367,11 @@ class CommitmentChecker:
         shown_j: dict[int, tuple[float, str]] = {}
         jl: list[str] = []
         used = 0
+        # lBrain: the live test harness's exchanges, and what was journaled from them, are never evidence
+        tests = testtag.test_turn_ids(self.store)
         try:
-            entries = self.store.journal_between(oldest, now + 1.0)
+            entries = [j for j in self.store.journal_between(oldest, now + 1.0)
+                       if not testtag.is_test_journal(j, tests)]
         except Exception:
             entries = []
         for j in sorted(entries, key=lambda e: -e.at):
@@ -385,7 +392,7 @@ class CommitmentChecker:
         try:
             turns = self.store._query("SELECT id FROM conversation_turns WHERE at >= ? AND at <= ? ORDER BY at DESC",
                                       (oldest, now + 1.0))
-            turns = self.store.turns_by_ids([int(r[0]) for r in turns[:200]])
+            turns = testtag.keep_real(self.store.turns_by_ids([int(r[0]) for r in turns[:200]]))
         except Exception:
             turns = []
         from yuki.memory.conversations import own_words
@@ -407,7 +414,8 @@ class CommitmentChecker:
         shown_d: dict[int, float] = {}
         try:
             done = [f for f in self.store.conversation_facts(("commitment",), statuses=("done",))
-                    if f.valid_to and f.valid_to >= now - DONE_DAYS * 86400.0][-MAX_COMMITMENTS:]
+                    if f.valid_to and f.valid_to >= now - DONE_DAYS * 86400.0
+                    and not testtag.is_test_fact(f, tests)][-MAX_COMMITMENTS:]
         except Exception:
             done = []
         lines.append("DONE RECENTLY (an open commitment that is the same thing as one of these is done):")

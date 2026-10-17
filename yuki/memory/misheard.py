@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
 
+from yuki.memory import testtag
 from yuki.memory.store import NAME_FORM_WHY, PortraitRunStats
 from yuki.memory.store import WAKE_NAME as STORE_WAKE_NAME
 
@@ -262,8 +263,9 @@ def spoken_before(store: Any, turns: Sequence[Any], session_id: Any = None) -> l
     except Exception:
         return []
     mine = {getattr(t, "id", None) for t in turns}
+    # lBrain: the live test harness's scripted speech is never context for a name the user settled
     keep = [t for t in rows if t.id not in mine and t.session_id != session_id
-            and getattr(t, "addressed", None) != OTHERS and heard_by_speech(t)]
+            and getattr(t, "addressed", None) != OTHERS and heard_by_speech(t) and not testtag.is_test_item(t)]
     return keep[-SPOKEN_CONTEXT:]
 
 
@@ -898,7 +900,7 @@ class NamesPass:
 
     def windows(self, days: float, now: float) -> list[tuple[list[Any], list[Any]]]:
         """``[(context, exchanges)]``: each session's exchanges of the last ``days``, :data:`NAMES_WINDOW` at a time."""
-        turns = self.store.turns_between(now - float(days) * 86400.0, now)
+        turns = testtag.keep_real(self.store.turns_between(now - float(days) * 86400.0, now))   # lBrain
         by_session: dict[str, list[Any]] = {}
         for t in sorted(turns, key=lambda t: t.at):
             by_session.setdefault(t.session_id, []).append(t)
@@ -995,7 +997,7 @@ def would_resolve(store: Any, probe: Sequence[dict[str, Any]], aliases: Sequence
     now = time.time() if now is None else float(now)
     out = {"turns": 0, "person_turns": 0, "person_resolved": 0, "yuki_turns": 0, "yuki_resolved": 0}
     try:
-        turns = store.turns_between(now - float(days) * 86400.0, now)
+        turns = testtag.keep_real(store.turns_between(now - float(days) * 86400.0, now))   # lBrain
     except Exception:
         return out
     wake = _key(WAKE_NAME)

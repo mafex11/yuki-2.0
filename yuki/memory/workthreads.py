@@ -60,6 +60,7 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
+from yuki.memory import testtag
 from yuki.memory.store import WorkOp, WorkThread, capture_attention
 from yuki.memory.titles import (THREAD_NEXT_FIELD, THREAD_NEXT_MAX_CHARS, THREAD_PRESENT_FIELD,
                                 THREAD_PRESENT_MAX_CHARS, THREAD_SHOWN_FIELD, clean_shown)
@@ -481,7 +482,9 @@ def describe_thread(store: Any, t: WorkThread, *, facts: int = 12, events: int =
         except Exception:
             pass
         try:
-            out["chats"] = [s for s in store.session_summaries(since=spans[0] - 3600.0, until=spans[-1] + 3600.0)
+            # lBrain: a live test's sessions are never part of the user's work (yuki.memory.testtag)
+            out["chats"] = [s for s in testtag.keep_real(store.session_summaries(since=spans[0] - 3600.0,
+                                                                                 until=spans[-1] + 3600.0))
                             if any(s.started_at - 900 <= a <= s.ended_at + 900 for a in spans)][-4:]
         except Exception:
             pass

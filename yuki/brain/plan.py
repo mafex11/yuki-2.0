@@ -1101,6 +1101,9 @@ def _check_verb(step: Step, header: Plan, checks: Checks, prior: Sequence[Step],
             spent = _spent_error(where, call[0], checks)
             if spent:
                 errors.append(spent)
+            unknown = join_slot_error(where, call[0], call[1])
+            if unknown:
+                errors.append(unknown)
     if errors:
         raise PlanError(errors)
     # sends (design 2.2, 2.5 row 4; decision 2): a send runs only through a sending capability, declared
@@ -1124,6 +1127,66 @@ def _check_verb(step: Step, header: Plan, checks: Checks, prior: Sequence[Step],
         if raw_send:
             raise PlanError([f"{where}send through the message capability (run_skill), never by typing and "
                              f"pressing send; with no capability for that app, leave a draft and tell the user"])
+
+
+#: lBrain (live test 17 Oct, problem 11: "Open NDLS channel" planned as ``discord.voice``, a voice join, though NDL is
+#: the user's most watched YouTube channel; it stopped only at the join's own question): a join goes only to a voice
+#: channel memory has seen. The error names no value (the planner knows what it wrote; the log keeps code words).
+LINE_JOIN_UNKNOWN = ("names no voice channel memory has seen them in, so nothing is joined. A channel or page they "
+                     "name is a place to watch first: open its page (their places are in the request turn); if "
+                     "nothing fits, ask which they mean")
+
+
+def _joining_skill(key: Any) -> Any:
+    """The catalog skill ``key`` when it joins a call (its declared end ``call_join``), else ``None``."""
+    if not key:
+        return None
+    try:
+        from yuki.brain.util import skill
+
+        sk = skill(key)
+    except Exception:  # noqa: BLE001
+        return None
+    return sk if sk is not None and str(getattr(sk, "end", "") or "") == "call_join" else None
+
+
+def join_target_error(field_name: str, name: Any, skill_key: Any = None) -> str | None:
+    """lBrain (live problem 11): a join through a skill that joins a call (``discord.voice``: its declared end
+    ``call_join``) whose name slot (the value the rung uses) memory has seen as no voice channel of that skill's app,
+    read from the request's places (``yuki.brain.context.channel_known``: tastes of the channels they joined, the
+    app's capture threads): the error, else ``None``. A steps plan's join (a meeting's window brought forward for the
+    user's click, consent row 3) and memory unable to say are no error (the join is judged as before: the consent
+    rule's row 3, the capability's own check). Identity of the words in memory's own data, never a reading of them.
+    The planner's free-text ``consent.to`` is not checked (review r1 L1: "lofi lounge VC" would fail the whole-span rule
+    for a known channel; the slot is checked here, and the rung checks its filled slot again: lMsg's
+    ``unknown_channel``)."""
+    sk = _joining_skill(skill_key)
+    if sk is None:
+        return None
+    try:
+        from yuki.brain.context import channel_known
+
+        known = channel_known(name, str(getattr(sk, "app", "") or "") or None)
+    except Exception:  # noqa: BLE001 - unknown: no error
+        return None
+    return f"{field_name} {LINE_JOIN_UNKNOWN}" if known is False else None
+
+
+def join_slot_error(where: str, key: str, slots: Mapping[str, Any]) -> str | None:
+    """:func:`join_target_error` for a ``run_skill`` step of a skill that joins a call (its declared end
+    ``call_join``): each of its name slots (``entity`` / ``text``) the step fills."""
+    sk = _joining_skill(key)
+    if sk is None:
+        return None
+    for slot in getattr(sk, "slots", ()) or ():
+        value = (slots or {}).get(getattr(slot, "name", ""))
+        if isinstance(value, Mapping):
+            value = value.get("name") or value.get("value")
+        if getattr(slot, "type", "") in ("entity", "text") and isinstance(value, str) and value.strip():
+            bad = join_target_error(f"{where}run_skill slot {slot.name}", value, key)
+            if bad:
+                return bad
+    return None
 
 
 #: bRound2 (F1c): a send whose text keeps too few of the words the user said for it goes back to the planner once.
@@ -1297,7 +1360,7 @@ class ExecResult:
 
 
 __all__ = [
-    "send_text_error", "LINE_SEND_TEXT",
+    "send_text_error", "LINE_SEND_TEXT", "join_target_error", "join_slot_error", "LINE_JOIN_UNKNOWN",
     "ACT_VERBS", "READ_VERBS", "VERBS", "KINDS", "COMMITS", "SKILL_PROBES", "GENERIC_PROBES", "PROBES", "PROBE_ARGS",
     "ENGINE_ONLY_PROBES", "LOOK_WHATS", "WINDOW_ACTIONS", "TAB_ACTIONS", "MEMORY_KINDS", "VERB_FIELDS", "PLAN_TOOL",
     "STEPS_ROUTE", "SKILL_ROUTE_PREFIX", "MAX_STEPS", "plan_schema", "Target", "Consent", "Probe", "Element", "Step",

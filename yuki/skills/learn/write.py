@@ -392,7 +392,8 @@ def plan(store: Any, groups: Sequence[Group], caps: dict[str, Any], compiled: di
             continue
         verified = 0
         try:
-            verified = sum(t.ok for t in registry.trust(store, key, now=now).values())
+            # lBrain: a live test's runs never raise a learned skill's score (registry.trust ``real_only``)
+            verified = sum(t.ok for t in registry.trust(store, key, now=now, real_only=True).values())
         except Exception:  # noqa: BLE001
             verified = 0
         uses = int(old.get("uses") or 0) if old else 0

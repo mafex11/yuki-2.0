@@ -130,6 +130,7 @@ from typing import Any
 from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
+from yuki.memory import testtag
 from yuki.memory.journal import HAIKU_MODEL, sanitize_untrusted, user_identity
 from yuki.memory.admission import CONFIRMED_KEY
 from yuki.memory.titles import SHOWN_FIELD as TITLES_SHOWN_FIELD, SUMMARY_FIELD as TITLES_SUMMARY_FIELD
@@ -2169,22 +2170,36 @@ class PortraitWorker:
 
     # -- run ---------------------------------------------------------------
 
+    def _theirs(self, entries: Sequence[JournalEntry]) -> list[JournalEntry]:
+        """Journal facts that are the user's own evidence: not drawn from what Yuki itself put on screen
+        (``by_yuki``), and not drawn from the live test harness's exchanges (lBrain, 17 Oct: a live test's
+        scripted requests were journaled as the user's, "Arc is not properly installed"; :mod:`yuki.memory.testtag`).
+        Order kept. The live test's turn ids are read at most once a minute."""
+        clock = time.monotonic()
+        hit = getattr(self, "_test_turns", None)
+        if hit is None or clock - hit[0] > 60.0:
+            hit = (clock, testtag.test_turn_ids(self.store))
+            self._test_turns = hit
+        tests = hit[1]
+        return [j for j in entries if not j.by_yuki and not testtag.is_test_journal(j, tests)]
+
     def _window(self, kind: str, now: float) -> tuple[list[JournalEntry], float | None]:
         """The run's journal facts, without those drawn from what Yuki itself put on
         screen at the user's request (``by_yuki``): the pages Yuki opens for a
         task are not the user's interests or habits (a portrait said the user
         "likes ramen, udon, soba" after Yuki's own test tasks, 2026-09-24). The
         user's requests themselves reach the portrait through the facts
-        conversation memory journals from them."""
+        conversation memory journals from them; a live test's are never theirs
+        (:meth:`_theirs`)."""
         if kind == "weekly":
             # the whole week, plus anything older the checkpoint has not reached yet
             since = now - 7 * 86400.0
             merged = {j.id: j for j in self.store.journal_after_id(self.store.portrait_checkpoint())}
             merged.update({j.id: j for j in self.store.journal_between(since, None)})
-            return [merged[i] for i in sorted(merged) if not merged[i].by_yuki], since
+            return self._theirs([merged[i] for i in sorted(merged)]), since
         if kind == "first":
-            return [j for j in self.store.journal_after_id(0) if not j.by_yuki], None
-        return [j for j in self.store.journal_after_id(self.store.portrait_checkpoint()) if not j.by_yuki], None
+            return self._theirs(self.store.journal_after_id(0)), None
+        return self._theirs(self.store.journal_after_id(self.store.portrait_checkpoint())), None
 
     def run(self, kind: str = "nightly", *, now: float | None = None) -> RunResult:
         """One portrait run: operations over the window, then a render when anything changed.
@@ -2481,8 +2496,11 @@ class PortraitWorker:
         kept within :data:`RELATIONSHIP_CHARS`. Empty when there are neither.
         """
         try:
-            rules = self.store.conversation_facts(("rule", "preference"))
-            sessions = self.store.session_summaries(since=now - RELATIONSHIP_DAYS * 86400.0)
+            # lBrain: a live test's sessions, and rules drawn from them, are not the user's relationship with Yuki
+            tests = testtag.test_turn_ids(self.store)
+            rules = [r for r in self.store.conversation_facts(("rule", "preference"))
+                     if not testtag.is_test_fact(r, tests)]
+            sessions = testtag.keep_real(self.store.session_summaries(since=now - RELATIONSHIP_DAYS * 86400.0))
         except Exception:
             return ""
         try:
@@ -2676,8 +2694,7 @@ class PortraitWorker:
                 return None
             seen = self.loop_last_seen(loops)
             oldest = min(seen.values())
-            journal = [j for j in self.store.journal_after_id(done[0])
-                       if not j.by_yuki and j.at > oldest]
+            journal = [j for j in self._theirs(self.store.journal_after_id(done[0])) if j.at > oldest]
             chosen: list[JournalEntry] = []
             size = 0
             for j in journal:
@@ -2897,13 +2914,13 @@ class PortraitWorker:
         if fact_ids:
             wanted = {int(i) for i in fact_ids}
             since = cp["at"] if cp else now - AUDIT_RECENT_DAYS * 86400.0
-            recent = [j for j in self.store.journal_between(since, None) if not j.by_yuki]
+            recent = self._theirs(self.store.journal_between(since, None))
             return [f for f in facts if f.id in wanted], {i: "asked for" for i in wanted}, recent
         if full or cp is None:
-            recent = [j for j in self.store.journal_between(now - AUDIT_RECENT_DAYS * 86400.0, None) if not j.by_yuki]
+            recent = self._theirs(self.store.journal_between(now - AUDIT_RECENT_DAYS * 86400.0, None))
             why = "full audit" if full else "first audit"
             return facts, {f.id: why for f in facts}, recent
-        new = [j for j in self.store.journal_after_id(int(cp["journal_id"])) if not j.by_yuki]
+        new = self._theirs(self.store.journal_after_id(int(cp["journal_id"])))
         reasons = self._new_evidence(facts, cp, new)
         redone = self.store.journal_superseded_since({i for f in facts for i in f.source_ids}, cp["at"])
         for f in facts:
@@ -2972,8 +2989,8 @@ class PortraitWorker:
         """Per fact under review: its cited entries (the newest :data:`AUDIT_CITED`), the other entries of
         their threads, the entries most like it (local embeddings) and recent entries that name it."""
         cited_ids = {i for f in under for i in sorted(f.source_ids)[-AUDIT_CITED:]}
-        cited = {j.id: j for j in self.store.journal_by_ids(cited_ids) if not j.by_yuki}
-        mates = {tid: [j for j in self.store.journal_for_thread(tid, AUDIT_THREAD_ENTRIES) if not j.by_yuki]
+        cited = {j.id: j for j in self._theirs(self.store.journal_by_ids(cited_ids))}
+        mates = {tid: self._theirs(self.store.journal_for_thread(tid, AUDIT_THREAD_ENTRIES))
                  for tid in {j.thread_id for j in cited.values() if j.thread_id is not None}}
         similar: list[list[JournalEntry]] = [[] for _ in under]
         try:
@@ -2991,7 +3008,7 @@ class PortraitWorker:
             name = " ".join((f.subject or "").casefold().split())
             named = [j for j, t in folded if len(name) >= 3 and name in t][-8:]
             seen: dict[int, JournalEntry] = {}
-            for j in [*own, *around, *(x for x in like if not x.by_yuki), *named]:
+            for j in [*own, *around, *self._theirs(like), *named]:
                 seen.setdefault(j.id, j)
             out[f.id] = list(seen.values())
         return out

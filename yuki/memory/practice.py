@@ -489,6 +489,7 @@ def control_record(store: Store, *, app: Any, tool: str, control: Any, limit: in
     if key is None:
         return out
     try:
+        # a live lookup (the finish gate's): every run counts, a live test's included (lBrain review r1 M2)
         rows = store._query("SELECT ok, verdict, playbooks FROM runs WHERE step>0 AND tool=? AND app IS ? AND kind="
                             "'action' ORDER BY id DESC LIMIT ?", (str(tool), app_key(app) if app else None, int(limit)))
     except Exception:  # noqa: BLE001 - a database before migration 29
@@ -971,9 +972,19 @@ def demo_step(row: dict[str, Any], name: str | None, *, slot: str = "", aid: str
     return None
 
 
+#: lBrain (live test 17 Oct): the learner never learns from the live test harness's runs (:mod:`yuki.memory.testtag`:
+#: their session id, or the tag in their run key). They stay as they are (``pending``), in the query's own filter, so
+#: they never take a real run's slot. Live lookups (:func:`control_record`) still read them.
+def _real_runs_sql() -> str:
+    from yuki.memory.testtag import sql_real_run
+
+    return sql_real_run()
+
+
 def pending_runs(store: Store, *, limit: int = 20) -> list[RunHeader]:
-    """Runs waiting for the learner, oldest first."""
-    rows = store._query("SELECT * FROM runs WHERE step=0 AND learn='pending' ORDER BY at LIMIT ?", (int(limit),))
+    """Runs waiting for the learner, oldest first (never a live test's: :func:`_real_runs_sql`)."""
+    rows = store._query("SELECT * FROM runs WHERE step=0 AND learn='pending' AND " + _real_runs_sql()
+                        + " ORDER BY at LIMIT ?", (int(limit),))
     return [_header(store, r) for r in rows]
 
 
@@ -984,7 +995,8 @@ def set_learned(store: Store, key: str, state: str, note: str | None = None, *, 
 
 
 def runs_between(store: Store, since: float, until: float | None = None) -> list[RunHeader]:
-    sql, params = "SELECT * FROM runs WHERE step=0 AND at >= ?", [float(since)]
+    """Run heads in ``[since, until)``, oldest first; never a live test's (:func:`_real_runs_sql`)."""
+    sql, params = "SELECT * FROM runs WHERE step=0 AND " + _real_runs_sql() + " AND at >= ?", [float(since)]
     if until is not None:
         sql += " AND at < ?"
         params.append(float(until))
