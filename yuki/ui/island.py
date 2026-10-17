@@ -34,8 +34,8 @@ the pointer leaves (sizes and timings: the mock's Island spec, 3 Oct polish roun
 island, and only while Yuki hears, thinks or works, or speaks.
 
 **The run card** (E7) expands from the expanded island (the chevron, or a click on it while a run goes): the live steps from
-the chat thread (:class:`yuki.ui.chat_model.ChatModel`), "from memory" and "using your lesson" chips where the agent's
-task frame and its ``playbook`` field say so, the steer box ("added, not yet read" -> "read at step n", measured: the
+the chat thread (:class:`yuki.ui.chat_model.ChatModel`), a "from memory" chip where the agent's task frame says so,
+the steer box ("added, not yet read" -> "read at step n", measured: the
 next step taken after it was added), Stop, and "I'll take it from here".
 
 Rules it keeps: never takes focus (``WS_EX_NOACTIVATE``; only a click into the steer box lets it take the keyboard,
@@ -183,7 +183,7 @@ class RunInfo:
     # (no step total: Yuki acts on the go and plans nothing beforehand, so nothing on screen says "of N"; the user,
     # 3 Oct: "planning beforehand is not the right choice")
     steers: list[Steer] = field(default_factory=list)
-    chips: dict[int, list[tuple]] = field(default_factory=dict)   # step number -> [(icon, text[, playbook ref])]
+    chips: dict[int, list[tuple]] = field(default_factory=dict)   # step number -> [(icon, text)]
     frame: dict[str, Any] | None = None
     #: The brain's own live line of what it checks or does now and why (its ``now`` note, or the situation check's
     #: plain line), for the current step; "" when the step came without one (its own words show instead).
@@ -1117,7 +1117,6 @@ class RunCard(QWidget):
     ledger = Signal()
     close = Signal()
     again = Signal()
-    save_lesson = Signal()
     resume = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -1144,7 +1143,6 @@ class RunCard(QWidget):
         self.k_resume.clicked.connect(self.resume.emit)
         self.paused = False
         self.k_hand = L.Key("I’ll take it from here", parent=self)
-        self.k_save = L.Key("Save the lesson", variant="pri", parent=self)
         self.k_again = L.Key("Ask again", variant="pri", parent=self)
         self.k_close = L.Key("Close", variant="ghost", parent=self)
         self.k_ledger = L.Key("Full ledger", variant="ghost", parent=self)
@@ -1156,14 +1154,13 @@ class RunCard(QWidget):
         self.k_ledger.clicked.connect(self.ledger.emit)
         self.k_close.clicked.connect(self.close.emit)
         self.k_again.clicked.connect(self.again.emit)
-        self.k_save.clicked.connect(self.save_lesson.emit)
         self.mode = "live"
         self._say_on = False
         self._sum_on = False
 
     def set_card(self, *, mode: str, title: str, touch: str, count: str, cost: str, asked: str,
                  steps: list[dict[str, Any]], steers: list[Steer], summary: tuple[str, str] | None = None,
-                 foot_note: str = "", stop_kbd: str = "Alt Shift X", lesson: bool = False, waiting: str = "",
+                 foot_note: str = "", stop_kbd: str = "Alt Shift X", waiting: str = "",
                  paused: bool = False) -> None:
         """``mode``: ``live`` | ``done`` | ``stopped`` | ``handed`` | ``failed``. ``steps``: ``{kind, verb, obj, ms,
         note, chips}`` in order, the steps so far (never the ones to come). ``waiting``: the brain's own line before
@@ -1204,7 +1201,6 @@ class RunCard(QWidget):
             k.setVisible(live)
         self.paused = live and bool(paused)
         self.k_resume.setVisible(self.paused)   # appTakeover: the user took over; Resume goes on
-        self.k_save.setVisible(mode == "done" and lesson)
         self.k_close.setVisible(not live)
         self.k_again.setVisible(mode in ("stopped", "handed", "failed"))
         self.foot_note.set_text(foot_note)
@@ -1288,7 +1284,7 @@ class RunCard(QWidget):
             y += sh
         y += 14
         x = 18
-        for k in (self.k_resume, self.k_stop, self.k_hand, self.k_save, self.k_again):
+        for k in (self.k_resume, self.k_stop, self.k_hand, self.k_again):
             if k.isVisibleTo(self):
                 if apply:
                     k.move(x, y)
@@ -1921,7 +1917,6 @@ class Island(QObject):
         open_page(str): a window page ("settings", "activity").
         ask_again(str): put a stopped request's words back in the ask bar, unsent.
         state_changed(str): the resolved state (the tray's icon follows it).
-        save_lesson(): the run card's "Save the lesson".
         send_stop(int): Stop (or Esc) on the send countdown of that request: nothing is sent.
         send_swap(int, str, str): a chip tapped on the send countdown: ``(request, "who" | "where", the new value)``.
     """
@@ -1934,7 +1929,6 @@ class Island(QObject):
     open_page = Signal(str)
     ask_again = Signal(str)
     state_changed = Signal(str)
-    save_lesson = Signal()
     send_stop = Signal(int)
     send_swap = Signal(int, str, str)
     #: appTakeover: Resume on the paused bar or the run card (the user took over; the request goes on).
@@ -1947,7 +1941,6 @@ class Island(QObject):
         self.model = model
         self.state = ""
         self.expanded = False
-        self.lesson_available = False
         #: The pointer rests on the island (it shows the full bar instead of the compact pill).
         self.hovered = False
         #: Settings → Island: the tiny resting pill when idle (True, the default) or nothing.
@@ -1977,7 +1970,6 @@ class Island(QObject):
         rc.ledger.connect(lambda: self.open_page.emit("activity"))
         rc.close.connect(self._close_card)
         rc.again.connect(self._on_again)
-        rc.save_lesson.connect(self.save_lesson.emit)
         self.window.send.stop.connect(self._on_send_stop)
         self.window.send.swap.connect(self._on_send_swap)
         #: A new send countdown is to start its drain at the next render (once per countdown, not per redraw).
@@ -2399,7 +2391,7 @@ class Island(QObject):
                                  asked=asked if self._needs_say(asked) else "", steps=steps, steers=run.steers,
                                  summary=summary, foot_note=note,
                                  stop_kbd=_words(self.bindings.get("cancel")).replace("+", " ") or "Alt Shift X",
-                                 lesson=self.lesson_available, waiting=run.thought if mode == "live" else "",
+                                 waiting=run.thought if mode == "live" else "",
                                  paused=paused)
 
     def _needs_say(self, asked: str) -> bool:
@@ -2438,15 +2430,7 @@ class Island(QObject):
                 secs = times.get(st.key, st.seconds())
                 ms = f"{int(round(secs * 1000))} ms" if secs < 1 else f"{secs:.1f} s"
             note = st.result if kind == "failed" and st.result else ""
-            chips = []
-            for chip in run.chips.get(k, []):
-                icon, text = chip[0], chip[1]
-                if len(chip) > 2 and chip[2]:   # a playbook the step follows: its title from memory, once known
-                    title = self._lessons.get(str(chip[2]))
-                    if not title:
-                        continue   # not known yet, or a quiet note (a pitfall: never shown as learning, appLearn)
-                    text = f"using your lesson: {title}"
-                chips.append((icon, text))
+            chips = [(chip[0], chip[1]) for chip in run.chips.get(k, [])]
             out.append({"kind": kind, "verb": verb.strip(), "obj": obj.strip(), "ms": ms, "note": note[:160],
                         "chips": chips})
         return out
@@ -2592,32 +2576,6 @@ class Island(QObject):
         if final is not None and final.run is not None and final.run.request:
             self.ask_again.emit(_clean(final.run.request))
         self._close_card()
-
-    def step_meta(self, request_id: int, name: str, tool_input: dict) -> None:
-        """A step's own fields: a ``playbook`` it follows becomes the step's "using your lesson" chip."""
-        run = self.inputs.run
-        if run is None or run.id != request_id or not isinstance(tool_input, dict):
-            return
-        ref = tool_input.get("playbook")
-        if isinstance(ref, str) and ref.strip():
-            run.chips.setdefault(run.steps or 1, []).append(("lesson", "", ref.strip()))
-
-    #: Playbook ids -> their title (filled from memory by the tray, :meth:`set_lessons`).
-    _lessons: dict[str, str] = {}
-
-    def set_lessons(self, lessons: dict[str, str]) -> None:
-        self._lessons = dict(lessons)
-        if self.expanded:
-            self._render(animate=False)
-
-    def lesson_refs(self) -> list[str]:
-        """Playbook refs the shown run's steps follow whose titles are not known yet (the tray fetches them)."""
-        run = self.inputs.run
-        refs = [str(c[2]) for cs in (run.chips.values() if run else []) for c in cs if len(c) > 2 and c[2]]
-        return [r for r in refs if r not in self._lessons]
-
-    def _lesson_text(self, ref: str) -> str:
-        return self._lessons.get(ref) or ref
 
     def set_frame(self, request_id: int, frame: dict[str, Any]) -> None:
         """The agent's task frame for the run: a person and their usual route become the first step's
