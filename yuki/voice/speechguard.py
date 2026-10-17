@@ -57,8 +57,12 @@ something to be done, and the line says it is. The first half depends on their w
 user turn, the moment the words are known (:meth:`SpeechGuard.prejudge`, at Flux's eager end of turn and again at the
 final words when they differ), in parallel with the talker's own first token (~1.3-1.7 s), by the same fast model
 (:data:`ASK_PROMPT`, one word: ``ASK`` or ``NO``, with Yuki's last line for context: "yeah" after "Want it on?" is an
-ask). When it says ``NO`` (small talk, a question about how things are, telling Yuki something, a reaction) no line of
-that turn can be a claim, so its lines go out at once, unchecked (``by`` ``claim_free``); ``ASK``, no answer yet or an
+ask). The verdict belongs to one utterance: it is dropped when they start speaking again
+(:meth:`SpeechGuard.new_utterance`, which also takes Yuki's last line before their words, so a speculative reply's own
+pieces never become its context), and it is reused only for the same words against the same last line (review H1: a
+"yeah" to a question and a later "yeah" to an offer are two checks). When it says ``NO`` (plain small talk, a question
+about how things are, a reaction) no line of that turn can be a claim, so its lines go out at once, unchecked (``by``
+``claim_free``); ``ASK`` (a correction, a complaint or a hint at their moment counts, review L1), no answer yet or an
 error keeps the line check as before, and the two race: a ``NO`` that lands first releases the line too. Live test A
 measured the line check at p50 887 ms, held after the talker's first words on every plain reply (small talk 3.2-3.4 s
 to first audio; "didn't catch that" 1.2 s from text to voice); the ask check is done before those words exist.
@@ -102,9 +106,12 @@ One word: CLAIM or OK."""
 ASK_PROMPT = """\
 You read the user's latest words to Yuki, a voice assistant on their PC (speech recognition may have misheard them; \
 Hindi and Hinglish are common). Answer ASK when the words ask Yuki to do or change something on the PC now (open, \
-play, pause, put on, send, message, close, switch, set, turn up or down, show, type), or say yes to Yuki's offer or \
-question just before them. Answer NO for everything else: small talk, a greeting, a question about how things are or \
-what happened, telling Yuki something about themselves, a reaction, thanks. When unsure, ASK.
+play, pause, put on, send, message, close, switch, set, turn up or down, show, type); say yes to Yuki's offer or \
+question just before them; correct or complain about what Yuki just did or about something still wrong on the PC \
+("not that", "another one", "a bit more", "it's still loud", "that didn't work"); or tell Yuki about their moment in \
+a way they may want acted on (eating, bored, starting work, heading out). Answer NO only for plain small talk, a \
+greeting, a question about how things are or what happened, a reaction to something that is fine, thanks. When unsure, \
+ASK.
 One word: ASK or NO."""
 
 GUARD_PROMPT = """\
@@ -237,9 +244,12 @@ class SpeechGuard:
         #: the pieces before it, a dropped one marked as such.
         self._written: deque[tuple[float, str]] = deque(maxlen=8)
         self._tasks: set[asyncio.Task] = set()
-        #: fTalk (the ask check): ``(their words normalised, future of True ask / False no / None unknown)`` for the
-        #: user turn being answered (:meth:`prejudge`); a line is matched to it by the words the claim check reads.
-        self._ask: tuple[str, "asyncio.Future[bool | None]"] | None = None
+        #: fTalk (the ask check): ``(their words normalised, Yuki's last line before them, future of True ask /
+        #: False no / None unknown)`` for the utterance being answered (:meth:`prejudge`); a line is matched to it by
+        #: the words the claim check reads. Dropped when they start speaking again (:meth:`new_utterance`).
+        self._ask: tuple[str, str, "asyncio.Future[bool | None]"] | None = None
+        #: Yuki's last line as it stood when they began this utterance (``None``: not taken, read it at the check).
+        self._ask_last: str | None = None
         self.stats: dict[str, Any] = {"checked": 0, "free": 0, "caught": 0, "repeats": 0, "timeouts": 0, "errors": 0,
                                       "shadow_caught": 0, "input_tokens": 0, "output_tokens": 0, "ms": []}
 
@@ -347,32 +357,45 @@ class SpeechGuard:
     #: Yuki's last line is shown to the ask check when it was said within this many seconds ("yeah" after an offer).
     ASK_CONTEXT_S = 120.0
 
+    def _last_said(self) -> str:
+        """Yuki's last line let through in the last :data:`ASK_CONTEXT_S` seconds, ``""`` when none."""
+        now = time.monotonic()
+        return next((t for at, t, _n in reversed(self._said) if now - at < self.ASK_CONTEXT_S), "")
+
+    def new_utterance(self) -> None:
+        """The user began speaking (a new utterance): the last ask verdict is not theirs any more, and Yuki's last line
+        is taken now, before any piece of a speculative reply to these words can be let through."""
+        self._ask = None
+        self._ask_last = self._last_said()
+
     def prejudge(self, words: str) -> None:
         """Judge now, in the background, whether the user's latest ``words`` ask for something to be done (the first
-        half of the claim check, :data:`ASK_PROMPT`). Only while the claim gate is on (the lean talker); the same words
-        again keep the verdict already running. Call it on the voice loop when their words are known (an eager end of
-        turn, the final words). Never raises."""
+        half of the claim check, :data:`ASK_PROMPT`). Only while the claim gate is on (the lean talker). The verdict
+        depends on the words and on Yuki's last line before them, so it is reused only when both are the same (the
+        eager and the final words of one utterance), else judged again. Call it on the voice loop when their words are
+        known (an eager end of turn, the final words). Never raises."""
         if not self.code_only or self.claim_open is None or self.judge is not None:
             return   # no claim gate, or a stand-in judge (tests keep the one-call check)
         norm = _norm(words)
-        if not norm or (self._ask is not None and self._ask[0] == norm):
+        if not norm:
+            return
+        last = self._ask_last if self._ask_last is not None else self._last_said()
+        if self._ask is not None and self._ask[0] == norm and self._ask[1] == last:
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
         fut: asyncio.Future[bool | None] = loop.create_future()
-        now = time.monotonic()
-        last = next((t for at, t, _n in reversed(self._said) if now - at < self.ASK_CONTEXT_S), "")
-        self._ask = (norm, fut)
+        self._ask = (norm, last, fut)
         task = loop.create_task(self._run_ask(" ".join(str(words).split()), last, fut))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
     def _ask_for(self, user: str) -> "asyncio.Future[bool | None] | None":
-        """The ask check's future for these words (``None``: none was started for them)."""
+        """The ask check's future for these words in the utterance being answered (``None``: none was started)."""
         got = self._ask
-        return got[1] if got is not None and got[0] == _norm(user) else None
+        return got[2] if got is not None and got[0] == _norm(user) else None
 
     async def _run_ask(self, words: str, last: str, fut: "asyncio.Future[bool | None]") -> None:
         started = time.monotonic()

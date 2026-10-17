@@ -1894,12 +1894,13 @@ class TurnObserver:
         self.owes_reply_since = None
         self._activity()
 
-    def _prejudge(self, words: str) -> None:
-        """fTalk: the claim gate's ask check starts on their words now, alongside the talker (speechguard.prejudge)."""
-        fn = getattr(self.guard, "prejudge", None)
-        if callable(fn) and str(words or "").strip():
+    def _prejudge(self, words: str | None = None) -> None:
+        """fTalk: the claim gate's ask check starts on their words now, alongside the talker (speechguard.prejudge);
+        ``None``: they began a new utterance, so the last verdict is dropped (speechguard.new_utterance)."""
+        fn = getattr(self.guard, "new_utterance" if words is None else "prejudge", None)
+        if callable(fn) and (words is None or str(words).strip()):
             try:
-                fn(words)
+                fn() if words is None else fn(words)
             except Exception:  # noqa: BLE001 - only a head start: the line check stays
                 pass
 
@@ -2290,6 +2291,7 @@ class TurnObserver:
             self.user_speaking = True
             self._user_started_at = now
             self.heard, self.heard_plain = None, False  # a new turn: the last one's doubts are not about these
+            self._prejudge(None)   # fTalk (review H1): the last ask verdict was about other words, maybe another line
             if self.bot_speaking and self.turn is not None:
                 self.turn.interrupted = True
             if (self.turn is not None and self.turn.trigger == "user" and not self.turn.heard
@@ -2645,7 +2647,7 @@ class _Hooks:
     def after_goodbye(self) -> bool:
         c = self.c
         call = getattr(getattr(c, "_llm", None), "_yuki_call", None)
-        return bool(getattr(c, "after_goodbye", False) and (call is None or call.user_turn) and c.observer.user_turns <= 1)
+        return bool(getattr(c, "after_goodbye", False) and (call is None or call.user_turn) and c._call_turns() <= 1)
 
     def may_ack(self) -> bool:
         fn = getattr(self.c.bridge, "may_ack", None)
@@ -6548,9 +6550,18 @@ class Conversation:
             call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
             if call is not None and not call.user_turn:
                 return False
-            return int(self.observer.user_turns) <= 1
+            return self._call_turns() <= 1
         except Exception:  # noqa: BLE001
             return False
+
+    def _call_turns(self) -> int:
+        """The user turns a talker call made now answers, its own included. Review M1 (fTalk): a speculative call on
+        Flux's eager end of turn is made before the final words count their turn (``user_turns``), so an utterance
+        begun after the last counted words (``_user_started_at`` past ``last_user_at``, both set by the observer) adds
+        one, as ``_named_turn`` does with ``final``. Measured from the stream's own marks, never the words."""
+        obs = self.observer
+        begun = float(getattr(obs, "_user_started_at", 0.0) or 0.0) > float(getattr(obs, "last_user_at", 0.0) or 0.0)
+        return int(obs.user_turns) + (1 if begun else 0)
 
     def _claim_open(self) -> bool:
         """kMind (the claim gate): the talker's words now are a reply to the user's own turn in which nothing was done
