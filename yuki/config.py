@@ -510,7 +510,8 @@ class Settings:
             hand takes 4-400 ms), so it is told it is done and only speaks.
         voice_reflex_seed_days / voice_reflex_seed_skip: The first seeding reads the user's own repeated talker hands
             of this many days (practice memory's hand traces), leaving out sessions whose id starts with one of these
-            (the live test harness's own).
+            (the live test harness's own). A conversation whose own session id starts with one of these learns,
+            runs and takes corrections in RAM only: nothing of it is written to the user's book.
         voice_practice, voice_skills (Phase S, D15): the old talker learning path (the Lessons and Learned ways lines,
             the step-list ``run_skill``) is off by default. It never runs beside the skill path: with ``skills`` on it
             stays off whatever these say; with ``skills = false`` they work as before S (``voice_practice`` the lines,

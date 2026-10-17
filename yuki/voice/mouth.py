@@ -1144,8 +1144,9 @@ HAND_OVER: dict[str, Any] = {
 #: lSpeed (live test 17 Oct, problem 1): what the talker reads about the learned reflex that ran for the words it
 #: answers (``state["reflex"]``, set by the pipeline): the reflex ran the user's own learned hand at the end of their
 #: turn, with no model in front, through the hands' own act and check. By its state: done (checked), still running,
-#: sent but not seen to take effect, or nothing went out. ``{changed}``: they went on talking after the pause it acted
-#: on.
+#: sent but not seen to take effect, settled (no change seen, nothing more possible), or nothing went out. A reflex the
+#: hands refused before it acted has no note (review r2 M2). ``{changed}``: they went on talking after the pause it
+#: acted on.
 REFLEX_NOTES = {
     # review r1 M1: no "never another target": when the words meant another app the talker's call for it runs
     "done": ("[Done already, by code, and checked: {what} ({report}); these exact words of theirs got this before. "
@@ -1158,6 +1159,10 @@ REFLEX_NOTES = {
     "sent": ("[Sent once by code for these exact words of theirs, but its effect was not seen in time: {what} "
              "({report}). Never repeat it (the same call is skipped): tell them in a few words it may not have taken "
              "effect, or hand it over.{changed}]"),
+    # review r2 L3: nothing more could happen (at the end already, nothing moved): said as the report says, never done
+    "settled": ("[Tried at once by code for these exact words of theirs: {what}, but no change was seen ({report}). "
+                "No call for it (the same call is skipped): tell them in a few words what that report says (\"It's "
+                "already at the bottom.\"), never that it was done.{changed}]"),
     "failed": ("[Tried by code for their words, and nothing went out: {what} ({report}). Nothing of it is done: "
                "handle their request as usual.]"),
 }
@@ -1176,6 +1181,13 @@ REFLEX_DUP_SILENT = ("Already done a moment ago for these same words, and checke
 REFLEX_DUP_UNSEEN = ("Sent once a moment ago for these same words, but its effect was not seen in time; it was not "
                      "sent again (a second press can undo it or do it twice). Never repeat it: tell them in a few "
                      "words it may not have taken effect, or hand it over.")
+#: ... skipped because the reflex tried it and no change was seen, nothing more being possible (review r2 L3).
+REFLEX_DUP_SETTLED = ("Tried a moment ago by code for these same words; no change was seen and nothing more can "
+                      "happen (its report is in this result), so it was not tried twice. Tell them in a few words what "
+                      "the report says, never that it was done.")
+#: ... skipped because the reflex is still running for these words (review r2 L1: never started twice).
+REFLEX_DUP_RUNNING = ("Being done by code right now for these same words, so it was not started twice. Never repeat "
+                      "it: say in a few words that it is under way, or nothing; never that it is done.")
 
 
 def reflex_note(state: dict[str, Any] | None) -> str:
