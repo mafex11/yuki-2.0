@@ -1965,6 +1965,8 @@ def _restore_background_app(
     details.update(via=via, pid=pid, launched=not error or pid is not None)
     if error:
         details["launch_error"] = error
+    if via == "refused":
+        details["refused"] = _gate.kind_of(error)   # fHands: the gate's refusal, by kind (a game or something else)
     if error and pid is None:
         return False, f"{lead}, and asking it for a new window ({via}) failed: {error}"
     if pid and pid not in running:
@@ -4009,7 +4011,9 @@ def app_window(app: str, *, deadline: float | None = None) -> tuple[int | None, 
     address-bar rung): found by the app's identity (:func:`_own_window`: ``open``, ``minimized``, ``hidden``); with
     the app not running or showing no window, ``launch_app(app)`` brings one up (``launched``); ``(None, why)``
     otherwise (``no_app``: no such Start menu app; ``none``: no window came). Never raises; never with a game in front
-    (``launch_app`` refuses it: ``(None, "refused")``)."""
+    (``launch_app`` refuses it: ``(None, "refused")``, the word a caller holds as a game). fHands (review): a launch
+    stopped by anything else (the gate failed closed, another guard) is ``(None, "blocked")``, never "refused": it
+    is not said as a game."""
     try:
         chosen, _candidates = _match_apps(app, get_start_apps())
     except Exception:  # noqa: BLE001
@@ -4024,8 +4028,8 @@ def app_window(app: str, *, deadline: float | None = None) -> tuple[int | None, 
         started = launch_app(app, deadline=deadline)
     except Exception:  # noqa: BLE001
         return None, "none"
-    if _gate.carried(started.details):
-        return None, "refused"
+    if (kind := _gate.carried(started.details)) is not None:
+        return None, "refused" if kind == _gate.GAME else _gate.BLOCKED
     got = (started.details or {}).get("hwnd")
     return (int(got), "launched") if started.ok and got else (None, "none")
 

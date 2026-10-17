@@ -567,7 +567,9 @@ _BLOCKED_NOTE = (
     "Not done: something stopped this step before it acted, so nothing was done (the report says what). Say so in a "
     "few plain words from the report. No game refused it: never say they are in a game. No other hand."
 )
-#: The refusal kind of an action stopped by something other than a game (:data:`yuki.actions.gate.BLOCKED`).
+#: The refusal kind of an action stopped by something other than a game: the very word of
+#: :data:`yuki.actions.gate.BLOCKED` (not imported here: ``yuki.actions`` loads the win32 hands, and this module stays
+#: import-light; the actions are imported where a hand runs).
 BLOCKED_REFUSAL = "blocked"
 #: The same once the thinker has the request (the earlier hand's try went to it by code): nothing to say now.
 _HALTED_PASSED_NOTE = (
@@ -1171,10 +1173,9 @@ class ActionLog:
 
     def opened_tabs(self) -> list[tuple[int | None, str]]:
         """fHands: ``(hwnd, tab id)`` of this conversation's tabs that Yuki's hands or thinker put up (an opening that
-        held), newest first: "it" when a tab is named after one was just opened."""
-        with self._lock:
-            items = [r for r in self._items if r.convo == self.convo and r.tab_id and r.ok]
-        return [(r.hwnd, r.tab_id) for r in reversed(items)]
+        held), newest first: "it" when a tab is named after one was just opened. Within the same age window as
+        :meth:`records` (a tab put up long ago in a long conversation is no longer "the one we just opened")."""
+        return [(r.hwnd, r.tab_id) for r in reversed(self.records()) if r.tab_id and r.ok]
 
     def records(self, *, alive: Callable[[ActionRecord], Any] | None = None) -> list[ActionRecord]:
         """This conversation's records within :attr:`max_age_s`, oldest first; with ``alive``, those it finds gone
@@ -2428,7 +2429,8 @@ class Hands:
         if self.log is not None:
             # request_id: the hand's id (its marker's and trace's), so follow finds its outcome (fWire r1 L2)
             # kHands: a refused hand logs its code word and place (``refused_why``, ``refused_at``: code, never words)
-            why = facts.get("refused_why") or ("game" if facts.get("refused") == "game" else None)
+            why = facts.get("refused_why") or (facts.get("refused") if facts.get("refused") in ("game", BLOCKED_REFUSAL)
+                                               else None)
             self.log.event("hands", op=name, ok=ok, ms=ms, report_chars=len(report), call=params.tool_call_id,
                            done_line=speak, request_id=hand_id, refused_why=why,
                            refused_at=facts.get("refused_at"), action=(op or None),
@@ -4956,8 +4958,8 @@ class Hands:
                 ok_one, line, facts = self._report(act(h, action), "", facts)
                 oks.append(ok_one)
                 reports.append(line)
-                if facts.get("refused") == "game":
-                    break   # D17: a game in front holds the rest too
+                if facts.get("refused") in ("game", BLOCKED_REFUSAL):
+                    break   # D17: a game in front holds the rest too; so does a guard that stopped one (it would again)
             if len(hwnds) > 1:
                 facts["windows"] = len(hwnds)
             ok, report = all(oks) and len(oks) == len(hwnds), "; ".join(reports)
@@ -5637,10 +5639,13 @@ class Hands:
                 out["_targets"] = [(pick.index, pick.name, getattr(pick, "tab_id", "") or "", h)]
                 return out
             if len(found) > 1:
-                # the one showing is marked, so two tabs with one title can be asked about ("the one showing or the
-                # other?"), never by a number
-                listed = "; ".join(f'"{t.name[:60]}"' + (" (showing)" if t.selected else "") for t in found[:6])
-                raise _Refused(f"{len(found)} tabs fit those words: {listed}. Nothing was closed",
+                # the one showing is said apart from the titles (a marker inside them could be echoed into named), with
+                # its number on the tabs line: two tabs with one title are asked about as "the one showing or the
+                # other?" (never by a number), and "the one showing" is then called by that number
+                listed = "; ".join(f'"{t.name[:60]}"' for t in found[:6])
+                shown = next((t for t in found if t.selected), None)
+                where = f"; the one showing is tab {shown.index} on the tabs line" if shown is not None else ""
+                raise _Refused(f"{len(found)} tabs fit those words: {listed}{where}. Nothing was closed",
                                choose={"count": len(found), "titles": listed}, reason="several")
             out["_targets"] = [(t.index, t.name, getattr(t, "tab_id", "") or "", h) for t in found]
             return out
@@ -6242,7 +6247,7 @@ class Hands:
             facts["refused"] = "game"   # D17(2): the backstop refused it for a game; never handed to the thinker
         elif kind == BLOCKED_REFUSAL and not ok:
             # fHands (k_t3_draft): stopped by something else (never said as a game): said plainly, not handed on
-            facts["refused"], facts["refused_why"] = BLOCKED_REFUSAL, BLOCKED_REFUSAL
+            facts["refused"] = BLOCKED_REFUSAL
         return ok, lead + str(getattr(result, "summary", "")), facts
 
 
