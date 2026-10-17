@@ -19,25 +19,26 @@ watches, the sites and apps he opens, a friend's nickname) were missing, and eac
 :func:`usage_terms` builds the list from the user's own recent use, each source ranked by its own recency x count,
 the sources taken in turn (best of each first):
 
-* the right names of the user's corrections of the last :data:`CORRECTION_LEAD_DAYS`, newest first (they lead:
-  report 88; a corrected name is one recognition is known to get wrong); older ones come back with the person;
+* the right names of all the user's live corrections lead (report 88: a corrected name is one recognition is known
+  to get wrong, and it stays so however old the correction), those of the last :data:`CORRECTION_LEAD_DAYS` first,
+  then by count x recency, up to :data:`CORRECTION_LEAD_SHARE` of the list (the rest take their turn as a source);
 * the people the user deals with (:mod:`yuki.memory.contacts`: their routes' recency-weighted own messages plus a
-  share of theirs), each by their name, and by another name memory holds for them as a person's own (a heard form
-  that is also a portrait person fact's subject: a nickname the user says, not a mishearing);
+  share of theirs), each by their name, and by another name the user himself gave memory as a person's (a heard
+  form that is also the subject of a person fact of origin ``user``: a nickname the user says, not a mishearing);
 * the names of their tastes (:mod:`yuki.skills.taste`: playlists, YouTube channels; the decayed pick count), picked
   ones first, then names their own app showed;
 * their learned skills' sites, services and apps (a decayed count of the times they did it, and of Yuki's runs);
-* the apps and sites they had in front lately (the timeline: times in front, halved every :data:`HALF_LIFE_DAYS`). A
-  site is named as its own pages write it: the run of title words that are the labels of its host, capitalised
-  ("chatgpt.com" -> "ChatGPT", "docs.google.com" -> "Google Docs"), an identity of the words, never a list of sites;
+* the apps and sites they had in front lately (the timeline: times in front for at least :data:`PLACE_MIN_DWELL_S`,
+  halved every :data:`HALF_LIFE_DAYS`). A site is named as its own pages write it: the run of title words that are
+  the labels of its host, capitalised ("chatgpt.com" -> "ChatGPT", "docs.google.com" -> "Google Docs"), an identity
+  of the words, never a list of sites;
 * the user's own sites and accounts memory confirmed (``MemoryClient.user_resources``);
-* then, while there is room, older corrections, the portrait's people and the names of their work and interests,
-  newest first.
+* then, while there is room, the portrait's people and the names of their work and interests, newest first.
 
 **Never a heard form** (it would teach recognition the mistake): every heard form of ``name_aliases`` is left out
-("Barun" for Varun), unless memory holds that very word as a person's own name (above), and so are a resource's words
-that were only heard, and a taste's "said" words (what recognition wrote). A term must be something recognition can
-write and a person can say: Latin or Devanagari letters (the recognition languages; a name in another script is said
+("Barun" for Varun), unless the user himself gave that very word as a person's name (above), and so are a resource's
+words that were only heard, and a taste's "said" words (what recognition wrote). A term must be something recognition
+can write and a person can say: Latin or Devanagari letters (the recognition languages; a name in another script is said
 some other way, a resource of its own when memory confirmed it), not a typed handle (a digit right after a letter
 in a word longer than :data:`HANDLE_MIN_CHARS`), short (:data:`MAX_WORDS`, :data:`MAX_CHARS`). Deepgram takes at
 most 100 keyterms and 500 tokens across them (its docs: "the most important 20-50 terms"); the list stays within
@@ -66,6 +67,10 @@ MAX_TOTAL_CHARS = 520
 #: this many days): the user's present, not last month's (an app left two weeks ago weighs a quarter).
 USAGE_DAYS = 14.0
 HALF_LIFE_DAYS = 7.0
+#: A time in front counts as a use of the app or site only when it stayed in front at least this long (active or
+#: passive seconds): the shell's passing surfaces (a start menu, a snipping overlay, a launcher's helper window) are in
+#: front for a moment each time, the apps the user works in for longer. Measured on the user's timeline (review r1).
+PLACE_MIN_DWELL_S = 10.0
 #: Sites named per conversation at most (each needs its recent titles decrypted, in RAM only), and titles read per site.
 MAX_SITES = 30
 TITLES_PER_SITE = 12
@@ -75,9 +80,13 @@ SOURCE_DEPTH = 40
 #: (a name with a number says it apart, or is this short: "T3"). Measured: two such handles in the list made heard
 #: words near-names of them ("Bring" ~ a handle, the talker would have doubted a plain command).
 HANDLE_MIN_CHARS = 3
-#: A correction's right name leads the terms for this many days (report 88: the next conversations after it); later
-#: it is ranked as the person is (the people the user deals with), else it fills what room is left.
+#: Every live correction's right name leads the terms (report 88: a name the user corrected once is one recognition is
+#: known to get wrong, so it leads every next conversation's terms, however old the correction), those of the last
+#: this many days first, then the others by count x recency (:func:`_corrected`).
 CORRECTION_LEAD_DAYS = 7.0
+#: The corrections lead with at most this share of ``limit`` (a budget, so years of corrections never crowd out what
+#: the user uses lately); the rest take their turn with the other sources, best first.
+CORRECTION_LEAD_SHARE = 0.5
 
 
 def _usable(subject: str) -> str:
@@ -214,33 +223,39 @@ def _dec(store: Any, ciphertext: Any) -> str:
 
 class _Places:
     """The apps and sites the user had in front in the last :data:`USAGE_DAYS` (the timeline, the user's own time:
-    rows Yuki made are left out), each weighed by how many times they were in front (timeline rows: a count, so a
-    game left running for hours is not a hundred uses), each time halved every :data:`HALF_LIFE_DAYS`; the sites'
-    names from their own recent titles (decrypted in RAM, never kept or logged)."""
+    rows Yuki made are left out), each weighed by how many times they stayed in front for a while (timeline rows of at
+    least :data:`PLACE_MIN_DWELL_S`: a count, so a game left running for hours is not a hundred uses, and a surface
+    passed through on the way is none), each time halved every :data:`HALF_LIFE_DAYS`; the sites' names from their own
+    recent titles (decrypted in RAM, never kept or logged)."""
 
     def __init__(self, store: Any, now: float) -> None:
         self.store, self.now = store, now
         self.app_of: dict[str, str] = {}          # process key -> display name
-        self.apps: dict[str, float] = {}
-        self.hosts: dict[str, float] = {}
+        self.apps: dict[str, float] = {}          # display name -> weight of its times in front for a while
+        self.used: dict[str, float] = {}          # host -> the same
+        self.hosts: dict[str, float] = {}         # host -> weight of every time in front (naming, a skill's site)
         self.names: dict[str, str] = {}           # host -> its name as its pages write it
         since = now - USAGE_DAYS * 86400.0
         try:
             rows = store._query(
-                "SELECT app, process, host, CAST((? - ended_at) / 86400 AS INTEGER), COUNT(*) "
+                "SELECT app, process, host, CAST((? - ended_at) / 86400 AS INTEGER), COUNT(*), "
+                "SUM(CASE WHEN active_s + passive_s >= ? THEN 1 ELSE 0 END) "
                 "FROM timeline WHERE started_at > ? AND state = 'present' AND coalesce(by_yuki, 0) = 0 "
-                "AND coalesce(app, '') != '' GROUP BY app, process, host, 4", (now, since))
+                "AND coalesce(app, '') != '' GROUP BY app, process, host, 4", (now, PLACE_MIN_DWELL_S, since))
         except Exception:  # noqa: BLE001
             rows = []
-        for app, process, host, age_d, times in rows:
-            w = float(times or 0) * 0.5 ** (max(0, int(age_d or 0)) / HALF_LIFE_DAYS)
+        for app, process, host, age_d, times, stayed in rows:
+            fade = 0.5 ** (max(0, int(age_d or 0)) / HALF_LIFE_DAYS)
+            w, used = float(times or 0) * fade, float(stayed or 0) * fade
             name = _app_name(app)
-            if process and name:
+            if process and name:   # every program seen in front is named (a skill's app), used for a while or not
                 self.app_of.setdefault(str(process).casefold(), name)
-            if name:
-                self.apps[name] = self.apps.get(name, 0.0) + w
+            if name and used > 0:
+                self.apps[name] = self.apps.get(name, 0.0) + used
             if host:
                 self.hosts[str(host)] = self.hosts.get(str(host), 0.0) + w
+                if used > 0:
+                    self.used[str(host)] = self.used.get(str(host), 0.0) + used
         top = [h for h, _w in sorted(self.hosts.items(), key=lambda kv: -kv[1])][:MAX_SITES]
         titles: dict[str, list[str]] = {h: [] for h in top}
         if top:
@@ -278,27 +293,42 @@ class _Places:
         return ""
 
     def ranked(self) -> list[str]:
-        """Apps and named sites together, most used lately first."""
+        """Apps and named sites together, most used lately first (times in front for a while)."""
         both = [(w, name) for name, w in self.apps.items()]
-        both += [(w, self.names[h]) for h, w in self.hosts.items() if h in self.names]
+        both += [(w, self.names[h]) for h, w in self.used.items() if h in self.names]
         return [name for _w, name in sorted(both, key=lambda x: -x[0])]
 
 
-def _corrected(store: Any, now: float) -> tuple[list[str], list[str]]:
-    """The right names of the user's corrections, newest first (Yuki's own name forms are not corrections here):
-    those of the last :data:`CORRECTION_LEAD_DAYS` (they lead), and the older ones (they come back through the
-    people the user deals with, else fill what room is left)."""
+def _corrected(store: Any, now: float) -> list[str]:
+    """The right names of every live correction of the user's (Yuki's own name forms are not corrections here; an
+    undone or replaced one has ended), each once: those corrected in the last :data:`CORRECTION_LEAD_DAYS` first,
+    then the rest, each group by count x recency (every live correction to that name, each halved every
+    :data:`HALF_LIFE_DAYS`: a name the user corrected from three mishearings outranks one corrected once), then
+    newest first."""
     try:
-        rows = list(reversed(store.aliases()))
+        rows = store.aliases()
     except Exception:  # noqa: BLE001
-        return [], []
-    fresh = [a["name"] for a in rows if now - float(a.get("at") or 0) <= CORRECTION_LEAD_DAYS * 86400.0]
-    return fresh, [a["name"] for a in rows if a["name"] not in fresh]
+        return []
+    shown: dict[str, str] = {}
+    score: dict[str, float] = {}
+    newest: dict[str, float] = {}
+    for a in rows:
+        name = " ".join(str(a.get("name") or "").split())
+        if not name:
+            continue
+        key, at = name.casefold(), float(a.get("at") or 0)
+        if at >= newest.get(key, float("-inf")):
+            shown[key], newest[key] = name, at   # spelled as the newest correction spells it
+        score[key] = score.get(key, 0.0) + _fade(now - at)
+    lead_s = CORRECTION_LEAD_DAYS * 86400.0
+    order = sorted(score, key=lambda k: (now - newest[k] > lead_s, -score[k], -newest[k]))
+    return [shown[k] for k in order]
 
 
 def _people(store: Any, now: float, own_names: set[str]) -> list[str]:
-    """The people the user deals with lately (:func:`yuki.memory.contacts.directory`'s order: their routes' own-message
-    weight plus a share of theirs), each by their name and by another name memory holds as a person's own."""
+    """The people the user deals with lately (their routes' own-message weight plus a share of theirs: the directory's
+    weight before lMsg, copied here, not its order), each by their name and by another name the user gave memory as a
+    person's (``own_names``: :func:`_portrait`)."""
     try:
         from yuki.memory import contacts as C
 
@@ -401,8 +431,12 @@ def _resources(client: Any) -> list[str]:
 
 
 def _portrait(store: Any) -> tuple[list[str], set[str]]:
-    """The portrait's people, then the names of their work and interests, each newest first; and the people's names
-    (casefolded): the names memory holds as a person's own."""
+    """The portrait's people, then the names of their work and interests, each newest first; and the names the user
+    himself gave memory as a person's (casefolded): a person fact of origin ``user``, which the portrait writes only
+    from the user's own correction or answer (review r1, L3). A model's person fact is not enough: the v3.5 failure was
+    a misheard name a portrait run kept as a person, and a later run could make any heard form one; memory never
+    wrote the user's nickname for a friend anywhere on screen (measured: no chat title, sender or line has it), so the
+    user's own word is the evidence there is."""
     try:
         facts = list(store.portrait_facts(NAME_KINDS, include_corrections=False))
     except Exception:  # noqa: BLE001
@@ -410,23 +444,28 @@ def _portrait(store: Any) -> tuple[list[str], set[str]]:
     facts.sort(key=lambda f: -float(getattr(f, "valid_from", 0) or 0))
     people = [f.subject for f in facts if f.kind == "person" and _usable(f.subject)]
     names = [f.subject for f in facts if f.kind != "person" and _is_name(_usable(f.subject))]
-    return people + names, {" ".join(str(p).split()).casefold() for p in people}
+    own = {" ".join(str(f.subject).split()).casefold() for f in facts
+           if f.kind == "person" and _usable(f.subject) and getattr(f, "origin", None) == "user"}
+    return people + names, own
 
 
 def usage_terms(client: Any, limit: int = 50, *, now: float | None = None,
-                counts: dict[str, int] | None = None) -> list[str]:
-    """The keyterms for one conversation from what the user uses lately (the module docstring): the corrections'
-    right names first, then people, tastes, skills, apps and sites, and confirmed resources taken in turn (each
-    source's best first), then the portrait while there is room; never a heard form, at most ``limit`` terms and
+                counts: dict[str, int] | None = None, tags: dict[str, str] | None = None) -> list[str]:
+    """The keyterms for one conversation from what the user uses lately (the module docstring): every live
+    correction's right name first (up to :data:`CORRECTION_LEAD_SHARE` of ``limit``), then the rest of them, people,
+    tastes, skills, apps and sites, and confirmed resources taken in turn (each source's best first), then the
+    portrait while there is room; never a heard form, at most ``limit`` terms and
     :data:`MAX_TOTAL_CHARS` characters. ``client``: a ``MemoryClient`` (its ``store``) or a store. ``counts`` (when
-    given) gets the terms each source gave (content-free numbers for the log). Never raises."""
+    given) gets the terms each source gave (content-free numbers for the log); ``tags`` (when given) each term's
+    source (:func:`name_terms`). Never raises."""
     try:
-        return _usage_terms(client, limit, time.time() if now is None else float(now), counts)
+        return _usage_terms(client, limit, time.time() if now is None else float(now), counts, tags)
     except Exception:  # noqa: BLE001 - recognition works without them
         return []
 
 
-def _usage_terms(client: Any, limit: int, now: float, counts: dict[str, int] | None) -> list[str]:
+def _usage_terms(client: Any, limit: int, now: float, counts: dict[str, int] | None,
+                 tags: dict[str, str] | None = None) -> list[str]:
     store = getattr(client, "store", client)
     limit = max(0, int(limit))
     try:
@@ -458,13 +497,17 @@ def _usage_terms(client: Any, limit: int, now: float, counts: dict[str, int] | N
         out.append(as_keyterm(term))
         chars += len(term)
         tally[source] = tally.get(source, 0) + 1
+        if tags is not None:
+            tags[out[-1]] = source
         return True
 
-    fresh, older = _corrected(store, now)
-    for name in fresh:
+    corrected = _corrected(store, now)
+    lead = max(1, round(limit * CORRECTION_LEAD_SHARE)) if limit else 0
+    for name in corrected[:lead]:
         if len(out) >= limit:
             break
         add(name, "corrected")
+    sources.insert(0, ("corrected", corrected[lead:]))   # past the lead's share: a source of its own, first in turn
     queues = [(label, iter(terms[:SOURCE_DEPTH])) for label, terms in sources]
     while queues and len(out) < limit:
         still: list[tuple[str, Any]] = []
@@ -476,11 +519,10 @@ def _usage_terms(client: Any, limit: int, now: float, counts: dict[str, int] | N
                     still.append((label, it))
                     break
         queues = still
-    for label, rest in (("corrected", older), ("portrait", portrait)):
-        for value in rest:
-            if len(out) >= limit:
-                break
-            add(value, label)
+    for value in portrait:
+        if len(out) >= limit:
+            break
+        add(value, "portrait")
     if counts is not None:
         counts.update(tally)
     return out[:limit]
@@ -498,6 +540,21 @@ MAX_NAME_FORMS = 8
 def name_forms() -> list[str]:
     """The heard forms of Yuki's name memory learned, as last read with :func:`memory_keyterms` (newest first)."""
     return list(_NAME_FORMS)
+
+
+#: The sources whose terms are names recognition is known to get wrong or that are a person's (review r1, L1).
+NAME_SOURCES = ("corrected", "people")
+#: Those terms of the last :func:`memory_keyterms` read (as given to recognition); empty when the read fell back.
+_NAME_TERMS: list[str] = []
+
+
+def name_terms() -> list[str]:
+    """The last read's terms that are people's names or corrections' right names (:data:`NAME_SOURCES`), as given to
+    recognition; the rest of the keyterms are apps, sites and tastes. For the talker's near-name doubt
+    (``pipeline.heard_note``): measured on the user's own turns, a brand's near match is mostly plain command phrasing
+    ("you turn" ~ YouTube, "chart" ~ ChatGPT), a person's is the misheard name. Empty until a read, and after a read
+    that fell back to ``MemoryClient.speech_names`` (sources unknown)."""
+    return list(_NAME_TERMS)
 
 
 def vocabulary(user_names: Any = (), memory_terms: Any = (), cap: int = 50) -> list[str]:
@@ -527,7 +584,8 @@ def speech_hotwords(memory: Any, user_names: Any = (), *, limit: int = 50,
 def memory_keyterms(memory: Any, *, limit: int = 50, timeout_s: float = 1.5) -> tuple[list[str], dict[str, Any]]:
     """The keyterms for one conversation, and content-free facts for the log (``{"terms", "chars", "ms", "error",
     "name_forms", "sources"}``: ``sources`` is how many terms each source gave). The heard forms of Yuki's name are
-    read in the same call and kept for :func:`name_forms`.
+    read in the same call and kept for :func:`name_forms`; the terms that are people's names and corrections are kept
+    for :func:`name_terms`.
 
     Never raises; with memory unavailable the list is empty (the user's names are added by the caller).
     """
@@ -535,17 +593,27 @@ def memory_keyterms(memory: Any, *, limit: int = 50, timeout_s: float = 1.5) -> 
     if memory is None:
         return [], {"terms": 0, "error": "no memory"}
     counts: dict[str, int] = {}
+    tags: dict[str, str] = {}
 
     def read(client: Any) -> tuple[list[str], list[str] | None]:
         # lKeys: what the user uses lately (usage_terms), read on the memory service's own store; a client without a
-        # store (older ones) falls back to MemoryClient.speech_names, then to the portrait's facts.
+        # store (older ones), or an empty list (a source's reader broke), falls back to MemoryClient.speech_names
+        # (counted as its own source in the log), then to the portrait's facts.
         forms = getattr(client, "name_forms", None)
         heard = list(forms(WAKE_NAME))[:MAX_NAME_FORMS] if callable(forms) else None
-        if getattr(client, "store", None) is not None:
-            return usage_terms(client, limit, counts=counts), heard
+        has_store = getattr(client, "store", None) is not None
+        terms = usage_terms(client, limit, counts=counts, tags=tags) if has_store else []
+        if terms:
+            return terms, heard
         names: Callable[[int], Any] | None = getattr(client, "speech_names", None)
         if callable(names):
-            return list(names(limit)), heard
+            terms = list(names(limit))
+            counts.clear()
+            tags.clear()
+            counts["speech_names"] = len(terms)
+            return terms, heard
+        if not has_store:
+            return [], heard
         return terms_from_facts(client.store.portrait_facts(NAME_KINDS, include_corrections=False), (), limit), heard
 
     try:
@@ -555,6 +623,7 @@ def memory_keyterms(memory: Any, *, limit: int = 50, timeout_s: float = 1.5) -> 
     terms, heard = got if isinstance(got, tuple) and len(got) == 2 else (got, None)
     if heard is not None:
         _NAME_FORMS[:] = heard
+    _NAME_TERMS[:] = [t for t in terms or [] if tags.get(t) in NAME_SOURCES]
     return list(terms or []), {"terms": len(terms or []), "chars": sum(len(t) for t in terms or []),
                                "name_forms": len(_NAME_FORMS), "sources": dict(counts),
                                "ms": round((time.perf_counter() - started) * 1000)}
