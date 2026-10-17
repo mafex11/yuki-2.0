@@ -293,17 +293,38 @@ def read_tabs(hwnd: int, *, budget_s: float = 0.2, all_groups: bool = False) -> 
     return strip
 
 
+#: A strip longer than the line's limit keeps this many of its last tabs on the line (a new tab lands at the end).
+TAIL_TABS = 5
+
+
 def tabs_line(strip: TabStrip, *, limit: int = 20, name_chars: int = 60) -> str:
-    """The strip as one line for the voice's desktop block (``""`` without tabs)."""
+    """The strip as one line for the voice's desktop block (``""`` without tabs).
+
+    fHands (k-live-A k_tab_close_it): with more tabs than ``limit`` the line used to be the first ``limit`` alone, so
+    the tab showing (one Yuki had just opened, at the end of 28) was not on it and the talker took the user's older
+    tab of the same title, earlier on the line, for it. Now the line always holds the tab showing and the last
+    :data:`TAIL_TABS` (where a new tab lands), then the first ones up to ``limit``; a gap is marked "…"."""
     if not strip.tabs:
         return ""
-    shown = strip.tabs[:limit]
+    tabs = list(strip.tabs)
+    keep = set(range(len(tabs)))
+    if len(tabs) > limit:
+        keep = set(range(len(tabs) - TAIL_TABS, len(tabs))) | {k for k, t in enumerate(tabs) if t.selected}
+        for k in range(len(tabs)):
+            if len(keep) >= limit:
+                break
+            keep.add(k)
     items = []
-    for tab in shown:
+    last = None
+    for pos in sorted(keep):
+        tab = tabs[pos]
+        if last is not None and pos != last + 1:
+            items.append("…")
+        last = pos
         name = tab.name if len(tab.name) <= name_chars else tab.name[: name_chars - 1] + "…"
         items.append(f"{tab.index}{'*' if tab.selected else ''} \"{name}\"")
-    more = f"; +{len(strip.tabs) - limit} more" if len(strip.tabs) > limit else ""
-    return (f"tabs of [{strip.hwnd}] ({len(strip.tabs)}, * = the one showing): " + "; ".join(items) + more)
+    more = f"; {len(tabs) - len(keep)} more not listed" if len(keep) < len(tabs) else ""
+    return (f"tabs of [{strip.hwnd}] ({len(tabs)}, * = the one showing): " + "; ".join(items) + more)
 
 
 
@@ -395,9 +416,13 @@ class Candidate:
     match: str
     score: int
     selected: bool = False
+    #: fHands: how many weaker identity kinds also agree (a name match that sits in a learned place too)
+    also: int = 0
+    #: fHands: its name's keyed digest (content-free), so two tabs with the very same title are known as twins
+    digest: str = ""
 
-    def rank(self) -> tuple[int, int]:
-        return (MATCH_ORDER.index(self.match), -self.score)
+    def rank(self) -> tuple[int, int, int]:
+        return (MATCH_ORDER.index(self.match), -self.score, -self.also)
 
 
 def rank_tabs(found: list[tuple[int, int, Tab, str]], identity: dict[str, Any] | None) -> list[Candidate]:
@@ -415,22 +440,34 @@ def rank_tabs(found: list[tuple[int, int, Tab, str]], identity: dict[str, Any] |
     out = []
     for hwnd, pid, tab, digest in found:
         place = (tab.group, tab.index, groups_per_window.get(hwnd, 0))
+        named, placed = bool(digest and digest in names), place in places
         if tab.tab_id and (tab.tab_id, int(pid or 0)) in ids:
-            out.append(Candidate(hwnd, tab.tab_id, tab.group, tab.index, "runtime_id", 1, tab.selected))
-        elif digest and digest in names:
-            out.append(Candidate(hwnd, tab.tab_id, tab.group, tab.index, "name", names[digest], tab.selected))
-        elif place in places:
-            out.append(Candidate(hwnd, tab.tab_id, tab.group, tab.index, "position", places[place], tab.selected))
+            out.append(Candidate(hwnd, tab.tab_id, tab.group, tab.index, "runtime_id", 1, tab.selected,
+                                 also=int(named) + int(placed), digest=digest or ""))
+        elif named:
+            out.append(Candidate(hwnd, tab.tab_id, tab.group, tab.index, "name", names[digest], tab.selected,
+                                 also=int(placed), digest=digest or ""))
+        elif placed:
+            out.append(Candidate(hwnd, tab.tab_id, tab.group, tab.index, "position", places[place], tab.selected,
+                                 digest=digest or ""))
     return sorted(out, key=lambda c: c.rank())
 
 
 def census_decision(candidates: list[Candidate]) -> tuple[str, list[Candidate]]:
     """``("one", [best])``; ``("ask", [the tied ones])`` when the best ones match by the same identity equally; or
-    ``("none", [])`` (PLAN.md D8: two equal, ask; none, say no Meet tab is open)."""
+    ``("none", [])`` (PLAN.md D8: two equal, ask; none, say no Meet tab is open).
+
+    fHands (k-live-A meet_tab_zen: "show me the Google Meet tab" asked "the first or the second?" of two Meet tabs):
+    a weaker identity that also agrees breaks a tie (a name match in the place the site's tab is kept, :attr:`also`);
+    and tied tabs with the very same title (one name digest) are the same page twice, which no answer about them could
+    tell apart: the one showing in its window is taken, else the first along the strip, never a question."""
     if not candidates:
         return "none", []
     best = candidates[0]
     tied = [c for c in candidates if c.rank() == best.rank()]
+    if len(tied) > 1 and all(c.digest and c.digest == tied[0].digest for c in tied):
+        pick = next((c for c in tied if c.selected), None) or min(tied, key=lambda c: (c.group, c.index, c.hwnd))
+        return "one", [pick]
     return ("ask", tied) if len(tied) > 1 else ("one", [best])
 
 

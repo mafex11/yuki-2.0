@@ -556,9 +556,19 @@ _THEN_QUEUED_NOTE = (
 #: and the talker said "Chrome's not opening either", a failure of a try that was never made.
 _HALTED_NOTE = (
     "Not tried: nothing was done. Your hands stopped for this turn after an earlier hand did not take effect, and its "
-    "one retry is used. Never say this one failed, didn't open or isn't working: it was never tried. Say in a few "
-    "words that you'll leave it there (\"I'll leave it there for now.\"), alone: no other hand."
+    "one retry is used. Never say this one failed, didn't open or isn't working: it was never tried. In a few words, "
+    "say what did not work (the earlier hand, as the reason above says: \"Zen wouldn't come up\"), unless you said "
+    "that already, and that you'll leave it there; alone: no other hand."
 )
+#: fHands (k-live-A k_t3_draft): a hand stopped before it acted by something other than a game (the gate could not
+#: check and failed closed, or another guard refused it): said plainly as what it is, never as a game, and not handed
+#: on (the thinker would be stopped the same way).
+_BLOCKED_NOTE = (
+    "Not done: something stopped this step before it acted, so nothing was done (the report says what). Say so in a "
+    "few plain words from the report. No game refused it: never say they are in a game. No other hand."
+)
+#: The refusal kind of an action stopped by something other than a game (:data:`yuki.actions.gate.BLOCKED`).
+BLOCKED_REFUSAL = "blocked"
 #: The same once the thinker has the request (the earlier hand's try went to it by code): nothing to say now.
 _HALTED_PASSED_NOTE = (
     "Not tried: nothing was done. The thinker already has their request from an earlier hand of yours and does it; "
@@ -606,8 +616,8 @@ def end_message(words: list[str], earlier: list[str], steps: list[str], plain: b
 #: x3 (3f): several tabs fit the title the talker gave: it asks which, by title, never for a number.
 _TAB_CHOOSE_NOTE = (
     "Not done: {count} tabs fit their words, so nothing was closed. When their words meant all of them, call it again "
-    "with every true. Otherwise ask them which in a few words, by the tabs' titles ({titles}), the question alone with "
-    "no call; never ask for a tab number."
+    "with every true. Otherwise ask them which in a few words, by the tabs' titles ({titles}; two with one title: the "
+    "one showing or the other), the question alone with no call; never ask for a tab number."
 )
 #: After an opening with a rest, the screen is read again once it has settled: its windows, the window in front and
 #: the popups unchanged for SETTLE_QUIET_S, at most SETTLE_MAX_S (a launch is verified once its window takes input; a
@@ -624,7 +634,8 @@ HAND_TOOLS: list[dict[str, Any]] = [
         "description": (
             "Your hand: a media key, or the SYSTEM volume (every app at once, 2% per press). playpause, nexttrack, "
             "prevtrack and stop act on the media session that is playing, else the current one (through Windows' "
-            "media controls; never a game's). One app's volume is app_volume. "
+            "media controls; never a game's): playback itself (pause, play, skip). One app's volume, and muting or "
+            "silencing one app (its sound off while it plays on), is app_volume. "
             "Verified from the session's status or the volume." + _NOW
         ),
         "properties": {
@@ -648,7 +659,8 @@ HAND_TOOLS: list[dict[str, Any]] = [
             "app": {"type": "string", "description": "As the app volumes line names it, e.g. chrome.exe."},
             "change": {"type": "integer", "description": "Points to move it by, e.g. -20."},
             "level": {"type": "integer", "description": "Or the level, 0-100."},
-            "mute": {"type": "boolean", "description": "true mutes, false unmutes."},
+            "mute": {"type": "boolean", "description": (
+                "true mutes that app alone (its sound off, it keeps playing in place; no media key), false unmutes.")},
             "say_when_done": _DONE_LINE,
         },
         "required": ["app"],
@@ -1132,16 +1144,37 @@ class ActionLog:
             return self.convo
 
     def add(self, who: str, what: str, result: str, *, ok: bool, verified: bool | None, turn: Any = None,
-            hwnd: Any = None, tab_id: Any = "") -> None:
+            hwnd: Any = None, tab_id: Any = "") -> ActionRecord:
         try:
             handle = int(hwnd) if hwnd not in (None, "", 0) and str(hwnd).lstrip("-").isdigit() else None
         except (TypeError, ValueError):
             handle = None
+        record = ActionRecord(time.time(), who, what, " ".join(str(result).split()), verified, ok, convo=self.convo,
+                              turn=turn, hwnd=handle, tab_id=str(tab_id or ""))
         with self._lock:
-            self._items.append(ActionRecord(time.time(), who, what, " ".join(str(result).split()), verified, ok,
-                                            convo=self.convo, turn=turn, hwnd=handle,
-                                            tab_id=str(tab_id or "")))
+            self._items.append(record)
             self.version += 1
+        return record
+
+    def place(self, record: Any, hwnd: Any, tab_id: Any) -> None:
+        """fHands: what a record's effect sits on, learned after it was kept (a skill run's page: the window and tab
+        showing once it ran). Only a record without a tab of its own; never raises."""
+        if not isinstance(record, ActionRecord) or record.tab_id:
+            return
+        try:
+            handle = int(hwnd) if hwnd else None
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            record.hwnd = handle if handle else record.hwnd
+            record.tab_id = str(tab_id or "")
+
+    def opened_tabs(self) -> list[tuple[int | None, str]]:
+        """fHands: ``(hwnd, tab id)`` of this conversation's tabs that Yuki's hands or thinker put up (an opening that
+        held), newest first: "it" when a tab is named after one was just opened."""
+        with self._lock:
+            items = [r for r in self._items if r.convo == self.convo and r.tab_id and r.ok]
+        return [(r.hwnd, r.tab_id) for r in reversed(items)]
 
     def records(self, *, alive: Callable[[ActionRecord], Any] | None = None) -> list[ActionRecord]:
         """This conversation's records within :attr:`max_age_s`, oldest first; with ``alive``, those it finds gone
@@ -2381,8 +2414,11 @@ class Hands:
             else:
                 self._lines_said[said_key] = now
         if not facts.get("halted"):   # lVoice: a hand not tried (the hands stopped) did nothing to keep
-            self.actions.add("your hand", _what(name, args), report[:400], ok=ok, verified=verified, turn=turn,
-                             hwnd=facts.get("live_hwnd"), tab_id=facts.get("live_tab") or "")
+            # fHands (k-live-A: 43 of 58 scenarios): the ledger line is a record of what the hand did, never part of
+            # the act: one that can't be kept (a stand-in log of another shape raised here, after the act, and every
+            # hand came back "failed and returned no result") is logged and the hand's own result goes on
+            self._keep_record(params, name, args, report, ok=ok, verified=verified, turn=turn,
+                              hwnd=facts.get("live_hwnd"), tab_id=facts.get("live_tab") or "")
         if self.on_step is not None:
             try:
                 self.on_step(name, hand_words(name, args, facts.get("app")), bool(ok and verified is not False),
@@ -2533,6 +2569,10 @@ class Hands:
             # v3.18 (34-review H5): Act is off for that app in Settings: nothing is done there, by anyone
             await params.result_callback({"refused": report[:700], "how_to_handle_it": _ACT_OFF_NOTE.format(
                 app=facts["act_off"])})
+            return
+        if facts.get("refused") == BLOCKED_REFUSAL and not ok:
+            # fHands (k_t3_draft): stopped by something other than a game: said as it is, never as a game
+            await params.result_callback({"refused": report[:700], "how_to_handle_it": _BLOCKED_NOTE})
             return
         if isinstance(facts.get("choose"), dict) and rest:
             # sVoiceFix (F4): several tabs fit, and the tab was only the first step of their request (its then): which
@@ -3917,8 +3957,13 @@ class Hands:
             self._skill_reply_log(params, name, ok, report, facts, ms, hand_id, line=False, fallback=None)
             await self._halted_result(params, report)
             return
-        self.actions.add("your hand", _what(name, args), report[:400], ok=ok, verified=facts.get("verified"),
-                         turn=self._call_safely(self.user_turn, None))
+        record = self._keep_record(params, name, args, report, ok=ok, verified=facts.get("verified"),
+                                   turn=self._call_safely(self.user_turn, None))
+        if record is not None and verified and facts.get("focus_taken"):
+            # fHands (k_tab_close_it): a skill that opened a page leaves no tab identity of its own, so "close it" had
+            # no referent among two tabs titled "GitHub": the tab showing in the window in front once it ran is kept
+            # on its line, read off the reply's path
+            self._place_record(record)
         if self.on_step is not None:
             try:
                 self.on_step(name, hand_words(name, args, facts.get("app")), bool(ok and verified), report[:400], ms)
@@ -4535,8 +4580,9 @@ class Hands:
             return ""
         result = self.backend.focus_window(hwnd)
         if not getattr(result, "ok", False):
+            kind = _detail(result, "refused")
             raise _Refused(f"could not bring window {hwnd} to the front: {getattr(result, 'summary', '')}",
-                           reason="game" if _detail(result, "refused") == "game" else "no_focus")
+                           reason=kind if kind in ("game", BLOCKED_REFUSAL) else "no_focus")
         return "brought it to the front; "
 
     def _foreground(self) -> int | None:
@@ -4724,6 +4770,8 @@ class Hands:
                 facts["refused_at"] = f"{tb.tb_frame.f_code.co_name}:{tb.tb_lineno}"
             if exc.code == "game":
                 facts["refused"], facts["game_front"] = "game", True   # D17(2): said as such, never handed over
+            elif exc.code == BLOCKED_REFUSAL:
+                facts["refused"] = BLOCKED_REFUSAL   # fHands: stopped by something else: said plainly, never a game
             if exc.held is not None:
                 facts["held"] = True   # ... or asks the check's question (v3.18)
                 facts["question"] = exc.held
@@ -5374,6 +5422,8 @@ class Hands:
         facts["shown"] = title   # sVoiceFix (F5): what the step check says is showing (RAM only, never logged)
         if args.get("_picked_of"):
             facts["picked_of"] = int(args["_picked_of"])   # kHands: several fit, the nearest one was shown (logged)
+        if args.get("_picked_own"):
+            facts["picked_own"] = True   # fHands: several fit, the one Yuki put up in this conversation (logged)
         act = getattr(self.backend, "tab", None)
         select = getattr(self.backend, "select_tab", None)
         if not (tab_id and callable(act)) and not callable(select):
@@ -5574,6 +5624,12 @@ class Hands:
                 gathered.extend((t, h) for t in found)   # kHands r1 L10: all of them, in every window looked at
                 continue
             out["window"] = h
+            # fHands (k_tab_close_it): several fit and one of them is the tab Yuki put up in this conversation: that is
+            # the one their words point at ("close it" right after "pull up GitHub", with their own GitHub tab beside)
+            own = self._opened_among(found) if len(found) > 1 else None
+            if own is not None:
+                out["_picked_of"], out["_picked_own"] = len(found), True
+                found = [own]
             if action == "show":
                 pick = next((t for t in found if t.selected), found[0])
                 if len(found) > 1:
@@ -5581,7 +5637,9 @@ class Hands:
                 out["_targets"] = [(pick.index, pick.name, getattr(pick, "tab_id", "") or "", h)]
                 return out
             if len(found) > 1:
-                listed = "; ".join(f'"{t.name[:60]}"' for t in found[:6])
+                # the one showing is marked, so two tabs with one title can be asked about ("the one showing or the
+                # other?"), never by a number
+                listed = "; ".join(f'"{t.name[:60]}"' + (" (showing)" if t.selected else "") for t in found[:6])
                 raise _Refused(f"{len(found)} tabs fit those words: {listed}. Nothing was closed",
                                choose={"count": len(found), "titles": listed}, reason="several")
             out["_targets"] = [(t.index, t.name, getattr(t, "tab_id", "") or "", h) for t in found]
@@ -5697,6 +5755,8 @@ class Hands:
                            reason="no_identity")
         facts["app"] = self._app_at(int(targets[0][3]))
         facts["target"] = "TabItem " + ", ".join(f'"{str(t[1])[:60]}"' for t in targets)
+        if args.get("_picked_own"):
+            facts["picked_of"], facts["picked_own"] = int(args.get("_picked_of") or 0), True   # fHands (logged)
         facts["sent_at"] = time.monotonic()
         closed, failed, lines = [], [], []
         for _n, title, tab_id, hwnd in targets:   # each in its own window (every: kHands r1 L10)
@@ -5802,6 +5862,59 @@ class Hands:
         state = (f"the page has its title (\"{title}\"): loaded" if titled
                  else f"after {_TITLE_WAIT_S:g} s the page still has no title: not loaded yet")
         return ok, f"opened {url}: {where}{state}. ({report})", facts
+
+    def _keep_record(self, params: Any, name: str, args: dict[str, Any], report: str, **fields: Any) -> Any:
+        """The hand's line on the action log (``fields``: ok, verified, turn, and where its effect sits), or ``None``.
+
+        fHands (k-live-A: the hands of 43 of 58 scenarios): the line is a record of what the hand did, never part of
+        the act. One that can't be kept (a stand-in log of another shape raised here, after the act, and each such
+        hand came back "failed and returned no result": the talker retried, pressed next twice, or said nothing) is
+        logged, and the hand's own result goes on."""
+        try:
+            return self.actions.add("your hand", _what(name, args), report[:400], **fields)
+        except Exception as exc:  # noqa: BLE001 - a record never breaks a hand
+            if self.log is not None:
+                self.log.event("hands", op=name, ledger_error=type(exc).__name__, call=params.tool_call_id)
+            return None
+
+    def _place_record(self, record: Any) -> None:
+        """fHands: on a thread of its own (off the reply's path), the window in front and the tab it shows, kept on the
+        action log's ``record`` (:meth:`ActionLog.place`): where a skill run's page landed. Never raises."""
+        place = getattr(self.actions, "place", None)
+        if not callable(place):
+            return
+
+        def run() -> None:
+            try:
+                hwnd = self._foreground()
+                # a browser's window (machine data: :meth:`_is_browser`), or one the last desk read never saw (a
+                # browser the run just started); an app's window has no tab to keep
+                with self._lock:
+                    known = set(self.last.hwnds)
+                tab = self._selected_tab(hwnd) if hwnd and (hwnd not in known or self._is_browser(hwnd)) else None
+                if tab is not None and len(tab) > 3 and tab[3]:
+                    place(record, hwnd, tab[3])
+            except Exception:  # noqa: BLE001 - a record's place is a nicety
+                pass
+
+        threading.Thread(target=run, name="yuki-hands-place", daemon=True).start()
+
+    def _opened_among(self, found: list[Any]) -> Any:
+        """fHands (k_tab_close_it): of several tabs that fit their words, the one Yuki put up in this conversation (the
+        newest such), else ``None``: "close it" after "pull up GitHub" is the GitHub tab Yuki opened, never the user's
+        own GitHub tab beside it. By identity only (the action log's tab ids), never by title."""
+        opened = getattr(self.actions, "opened_tabs", None)
+        if not callable(opened):
+            return None
+        try:
+            mine = [tid for _h, tid in opened() if tid]
+        except Exception:  # noqa: BLE001
+            return None
+        for tid in mine:
+            hit = [t for t in found if str(getattr(t, "tab_id", "") or "") == tid]
+            if hit:
+                return hit[0]
+        return None
 
     def _selected_tab(self, hwnd: Any) -> tuple[int, str, int, str] | None:
         """``(place, name, count, identity)`` of the tab ``hwnd`` shows (identity: its UIA RuntimeId text, ``""``
@@ -6124,8 +6237,12 @@ class Hands:
     def _report(result: Any, lead: str, facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
         ok = bool(getattr(result, "ok", False))
         facts["action_ms"] = round(float(getattr(result, "elapsed_ms", 0.0) or 0.0))
-        if _detail(result, "refused") == "game":
+        kind = _detail(result, "refused")
+        if kind == "game":
             facts["refused"] = "game"   # D17(2): the backstop refused it for a game; never handed to the thinker
+        elif kind == BLOCKED_REFUSAL and not ok:
+            # fHands (k_t3_draft): stopped by something else (never said as a game): said plainly, not handed on
+            facts["refused"], facts["refused_why"] = BLOCKED_REFUSAL, BLOCKED_REFUSAL
         return ok, lead + str(getattr(result, "summary", "")), facts
 
 
