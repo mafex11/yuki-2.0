@@ -231,7 +231,10 @@ _DONE_LINE = {
     "type": "string",
     "description": "Optional: said once verified (\"Done, it's minimized.\"); \"\": nothing; left out: code's own.",
 }
-_NOW = " Instant: call it alone, no words before it."
+#: kHands (two asks in one breath): no words before it; a request of several parts is one call per part in the same
+#: reply, in their order (the hands run them in that order, each with its own result, and the last call's end check
+#: reads every call of the turn: :meth:`Hands._parts_start`).
+_NOW = " Instant: no words before it; one call per part they asked for, in their order."
 #: The spoken acknowledgement of a slow hand (open_url, open_app), said the moment it is written (v3.5).
 _SAY_FIRST = {
     "type": "string",
@@ -702,7 +705,8 @@ HAND_TOOLS: list[dict[str, Any]] = [
             "app": {"type": "string", "description": "The browser they named (\"Arc\"), else leave it out."},
             "action": {"type": "string", "enum": ["show", "close", "new", "reopen"], "description": "Default show."},
             "window": {"type": "integer", "description": "Optional: the window's [hwnd]; new and reopen need it."},
-            "every": {"type": "boolean", "description": "close: true when they meant every tab their words fit."},
+            "every": {"type": "boolean",
+                      "description": "close: true only when their words say all of them (\"all the YouTube tabs\")."},
             "tab": {"type": "integer", "description": "Optional: its number on the tabs line, with named."},
             "url": {"type": "string", "description": "new: the full address to open in it, else \"\"."},
             "expect": {"type": "string", "description": "reopen: the closed tab's title."},
@@ -6169,7 +6173,8 @@ def app_windows(app: str, windows: list[dict[str, Any]]) -> list[int]:
     """The hwnds of ``windows`` (overview dicts, as stacked) whose program is ``app`` as the user said it: a whole
     form equal to theirs first ("arc", "whatsapp", "google chrome"); else one word of its display name ("chrome");
     else a form theirs begins ("t3 code" of "T3 Code (Alpha)"). Identity of names, never a title or a meaning."""
-    want = _squash(app)
+    said = " ".join(str(app or "").split())
+    want = _squash(said[:-4] if said.casefold().endswith(".exe") else said)   # "slack.exe" as given is Slack
     if not want:
         return []
     exact: list[int] = []
