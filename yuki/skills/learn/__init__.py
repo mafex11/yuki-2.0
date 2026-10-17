@@ -1,14 +1,18 @@
 """The skill learner (phase L, ``docs/research/audit-2026-10-09/learner/design.md`` revision 2; decisions D21-D24).
 
-Yuki learns which of its capabilities the user actually uses, with which fixed values, in which program, when, and
-writes each habit as a learned skill: a ``skills`` row the catalog loads (``yuki.skills.catalog``), the Playbook shows,
-the routine miner keys on and the card lane may offer. Nobody writes the user's habits into code or data: this package
+Yuki learns which of its capabilities the user actually uses, with which values, in which program, when, and writes
+ONE record per capability (audit 17 Oct, contract C5): a ``skills`` row (``<capability>#all``) whose spec holds the
+user's known values for it ("your things": the sites, meeting services, playlists, each with counts, days, hours, the
+usual means, heard words and the work flag; :mod:`yuki.skills.learn.values`). A value never becomes a skill of its own;
+the per-value rows written before are retired by the next pass (their user marks carried onto the values), except a
+row a live routine is keyed on (its anchor). The catalog loads the records (``yuki.skills.catalog``), the menu shows
+the values inline on the capability's line, the Playbook lists them, the you-card reads them. Nobody writes the user's habits into code or data: this package
 holds no app key, site, page kind, person, time or default (the capabilities' data and the user's moments say all).
 
 The pipeline (each a module here)::
 
     moments (+ timeline, trace, runs) --occasions--> occasions  (D18 acting filter, late sends, live-kind rules)
-        --bind--> capability per occasion (its serves and bind data)  --group--> habits (split by key values only)
+        --bind--> capability per occasion (its serves and bind data)  --group--> one record per capability (+ values)
         --compile--> rung, executable end, commit (engine D24), probe  --write--> skills rows (+ naming, lName)
         --> occasions.skill_id (the routine miner reads it; one skill per moment by construction)
 
@@ -66,7 +70,6 @@ class Result:
     seen: list[Any] = field(default_factory=list)
     compiled: dict[str, Any] = field(default_factory=dict)
     planned: list[Any] = field(default_factory=list)
-    merges: list[tuple[str, str]] = field(default_factory=list)
     cpu_s: float = 0.0
     wall_s: float = 0.0
     named: int = 0
@@ -111,56 +114,6 @@ def quiet(store: Any, now: float | None = None, *, idle_s: float | None = None,
     except Exception:  # noqa: BLE001
         busy = None
     return busy
-
-
-def _merge_none(groups: list[Any], seen: list[Any], compiled: dict[str, Any], caps: dict[str, Any],
-                browsers: dict[str, int], now: float) -> list[tuple[str, str]]:
-    """Design §4.2's merge: occasions no capability serves whose executable end is a page of a domain (sends in a
-    browser chat on a site: the commit is the user's words, so the end Yuki may reach is that site's page) join the
-    passing site group whose bound site is on the same registrable domain (same capability end, same bound value).
-    A ``none`` group is split by each occasion's own registrable domain first (review r1 L5): each part joins only its
-    own domain's site group; what joins none stays in the ``none`` group (report only)."""
-    from yuki.memory.moments import registrable_domain
-    from yuki.skills.learn import group as G
-    from yuki.skills.learn.bind import NONE
-
-    targets: dict[tuple[str, str], Any] = {}
-    for g in groups:
-        cap = caps.get(g.capability)
-        if cap is None or g.capability == NONE:
-            continue
-        site_slot = next((s for s, src in cap.bind.items() if src == "site"), "")
-        if site_slot and g.values.get(site_slot):
-            targets[(compiled[g.gid].exec_end, registrable_domain(str(g.values[site_slot])))] = g
-    merges: list[tuple[str, str]] = []
-    for pool in (groups, seen):
-        for g in list(pool):
-            if g.capability != NONE or g.end != "message_sent":
-                continue
-            parts: dict[str, list[Any]] = {}
-            for o in g.occasions:
-                if o.src.get("host") and o.app in browsers:
-                    parts.setdefault(registrable_domain(o.src.get("host")), []).append(o)
-            moved: set[int] = set()
-            for domain, its in sorted(parts.items(), key=lambda kv: -len(kv[1])):
-                target = targets.get(("page", domain))
-                if target is None or not domain:
-                    continue
-                target.occasions.extend(its)
-                if g.gid not in target.merged_from:
-                    target.merged_from.append(g.gid)
-                for o in its:
-                    o.group = target
-                    moved.add(id(o))
-                merges.append((g.gid, target.gid))
-            if not moved:
-                continue
-            g.occasions = [o for o in g.occasions if id(o) not in moved]
-            if not g.occasions:
-                pool.remove(g)
-            else:
-                g.bar = G.bar(g.occasions, now)
-    return merges
 
 
 def _occasion_keys(occasions: Sequence[Any], caps: dict[str, Any]) -> None:
@@ -217,7 +170,7 @@ def _run(store: Any, *, now: float | None, name: bool, worker: Any, log: LogFn |
                 if cap is not None:
                     o.capability, o.attrs = cap.key, B.attrs_for(cap, o.src)
         caps = dict(idx.by_key)
-        groups, seen = G.build(built.occasions, caps, store.cipher, now)
+        groups, seen = G.build(built.occasions, caps, store.cipher, now, keep=W.kept_keys(store))
         # a skill run of a learned skill counts on that skill's own group (its key values are the skill's)
         by_key = {G.skill_key(store.cipher, g.capability, g.keys): g for g in groups if g.capability in caps}
         for o in built.occasions:
@@ -225,18 +178,16 @@ def _run(store: Any, *, now: float | None, name: bool, worker: Any, log: LogFn |
             if target is not None and o.group is not target:
                 if o.group is not None and o in o.group.occasions:
                     o.group.occasions.remove(o)
+                    if o.group.usage and not target.usage:
+                        o.group.extra.append(o)     # still counts for the record's values (contract C5)
                 target.occasions.append(o)
                 o.group = target
         for g in groups:
-            g.bar = G.bar(g.occasions, now)
+            g.bar = G.bar([*g.occasions, *g.extra], now)
         for g in groups:
             cap = caps.get(g.capability)
             if cap is not None:
                 res.compiled[g.gid] = C.compile_group(g, cap, store, idx)
-        res.merges = _merge_none(groups, seen, res.compiled, caps, idx.browsers, now)
-        for g in groups:
-            if g.merged_from:
-                g.bar = G.bar(g.occasions, now)
         res.groups, res.seen = groups, seen
         _occasion_keys(built.occasions, caps)
         planned, counts = W.plan(store, groups, caps, res.compiled, now)
@@ -267,7 +218,6 @@ def _run(store: Any, *, now: float | None, name: bool, worker: Any, log: LogFn |
         res.counts["occasions"] = len(built.occasions)
         res.counts["groups"] = len(groups)
         res.counts["seen_groups"] = len(seen)
-        res.counts["merged"] = len(res.merges)
         res.counts["skills"] = sum(1 for p in planned if not p.group.usage)
         res.counts["usage_records"] = sum(1 for p in planned if p.group.usage)
     except Exception as exc:  # noqa: BLE001 - logged; the next night tries again
@@ -324,8 +274,8 @@ def _first_pass_due(store: Any, now: float) -> bool:
 def incremental(store: Any, *, now: float | None = None, log: LogFn | None = None) -> dict[str, Any]:
     """The last :data:`INCREMENTAL_S` of occasions rebuilt and mapped onto the learned skills already written (no new
     skill, no model call; the night pass makes those). An occasion whose key matches no written skill keeps the skill
-    the last full pass gave its end moment (or its asked run): the hold joins, asked-occasion mappings and the
-    ``none`` merges keep their skill until the next night (review r1 L8). On a database no full pass was ever written
+    the last full pass gave its end moment (or its asked run): the hold joins and asked-occasion mappings keep their
+    skill until the next night (review r1 L8). On a database no full pass was ever written
     to (the first start after the install), this slot runs the first full pass instead, then the back-fill (design
     §9.3); the moments hub calls it only when the user is idle, with no game in front and no call. Content-free
     counts; never raises."""
@@ -390,7 +340,11 @@ def _incremental(store: Any, *, now: float, log: LogFn | None) -> dict[str, Any]
                 keys.append((s.name, G.value_digest(store.cipher, s.name, v)))
             if lost:
                 continue
-            sid = ids.get(G.skill_key(store.cipher, cap.key, tuple(sorted(keys))))
+            # a kept per-value row (a routine anchor, a tombstone) first, else the capability's record (contract C5)
+            sid = ids.get(G.skill_key(store.cipher, cap.key, tuple(sorted(keys)))) if keys else None
+            if sid is None:
+                sid = ids.get(G.skill_key(store.cipher, cap.key, ()))
+                keys = []
             if sid is not None:
                 o.group = SimpleNamespace(skill_id=sid, keys=tuple(sorted(keys)))
                 mapped += 1
@@ -444,7 +398,25 @@ def nightly(store: Any, *, now: float | None = None, worker: Any = None, log: Lo
         return None
     res = run(store, now=now, name=True, worker=worker, log=log, write_rows=True)
     _backfill(store, res, worker=worker, log=log)
+    _ways(store, now=now, worker=worker, log=log)
     return res
+
+
+def _ways(store: Any, *, now: float, worker: Any = None, log: LogFn | None = None) -> None:
+    """Lane kWays' learner of the user's own ways (contract C4: ``yuki.skills.learn.ways``, its own module), run
+    after the night's pass when that module is installed: its ``nightly(store, now=, worker=, log=)``. A guarded import
+    (the module lands on its own branch); a failure is logged content-free and never stops the night."""
+    try:
+        from yuki.skills.learn import ways
+    except ImportError:
+        return
+    fn = getattr(ways, "nightly", None)
+    if not callable(fn):
+        return
+    try:
+        fn(store, now=now, worker=worker, log=log)
+    except Exception as exc:  # noqa: BLE001 - the next night tries again
+        _log(log, "error", where="learn.ways", error=type(exc).__name__)
 
 
 def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequence[int] | None = None) -> Any:
@@ -483,7 +455,8 @@ def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequenc
             continue
         key = f"skill:{int(sid)}"
         routine_slot = any(s.role == "fill" and s.routine_key for s in cap.slots)
-        usage = not any(s.role == "key" and s.name in cap.bind for s in cap.slots)
+        # a capability's record (contract C5: ``#all``, its values are data) is a usage record whatever its slots
+        usage = str(skey).endswith("#all")
         if usage and not routine_slot:
             # design section 4.2 (review r1 L1): a usage record (nothing bound: the volume record) makes a routine only
             # through a routine_key fill slot (a playlist), never as itself
