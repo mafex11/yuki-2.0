@@ -11,7 +11,8 @@ The voice learns which of the user's own words it can act on at once, with no mo
 written by ``practice.record_hand_trace``) for the voice's first seeding: the user's repeated hands of the past.
 
 Every function takes the opened :class:`~yuki.memory.store.Store` (the voice reaches it through
-``MemoryAccess.call``), never raises, and logs nothing (the caller logs content-free counts).
+``MemoryAccess.call``) and logs nothing (the caller logs content-free counts). Only :func:`read_state` raises, when the
+store itself cannot be read (review r1 M4: a book not read is never written over).
 """
 
 from __future__ import annotations
@@ -26,13 +27,15 @@ MAX_CHARS = 200_000
 
 
 def read_state(store: Any) -> dict[str, Any] | None:
-    """The voice reflexes' document, decrypted, or ``None`` (none yet, or it cannot be read)."""
+    """The voice reflexes' document, decrypted, or ``None`` (none yet, or a stored value that cannot be decrypted or
+    parsed: the voice starts from nothing and rewrites it). The store's own failure to read (locked, closed) raises:
+    the caller treats it as not read, so nothing is written over the stored book (lSpeed review r1 M4)."""
+    raw = store.nudge_state(STATE_NAME)
+    if not raw:
+        return None
     try:
-        raw = store.nudge_state(STATE_NAME)
-        if not raw:
-            return None
         data = json.loads(store._dec(raw) or "{}")
-    except Exception:  # noqa: BLE001 - unreadable: the voice starts from nothing (and rewrites it)
+    except Exception:  # noqa: BLE001 - unreadable value: the voice starts from nothing (and rewrites it)
         return None
     return data if isinstance(data, dict) else None
 

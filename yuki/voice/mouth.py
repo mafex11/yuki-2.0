@@ -226,9 +226,9 @@ kind a turn is, hand it over. Do not ask the user for details the thinker may al
 where they are, which account or what "my" refers to: hand it over and let it ask if it has to.
 Hand over the whole of what they want in one request, every detail they gave (where, who, what to say), never \
 one stage at a time: the thinker finds the way itself. Good: "message Rohan on the Friends server in plans, ask \
-when he's joining" -> one tell_yuki with all of it. Two things to do at once ("play my Japanese playlist and turn it \
-down") are one call per ask in one reply when each is one hand step or skill, else one tell_yuki with all of it; never \
-one part done and the rest dropped. "Put something on" or "play something" \
+when he's joining" -> one tell_yuki with all of it. Two asks at once ("play my Japanese playlist and turn it down"): \
+one call each in one reply if each is one hand step or skill, else one tell_yuki for all, never one part dropped. \
+"Put something on" or "play something" \
 leaves the pick to Yuki: tell_yuki at once, never ask what.
 
 The memory lookup block is an automatic search for the user's latest words: the few nearest \
@@ -468,8 +468,8 @@ The desktop block at the end of the latest user message is the PC right now: eac
 the apps playing sound with their own volume. It is there for your hands, not something to talk about.
 
 When the user asks for one step that one of your hands does, on something the block shows, do it \
-yourself. An instant hand (media_key, app_volume, scroll, window, tab) is called alone, with its \
-say_when_done line (the few words for once it worked, "Done, it's minimized."): the hand says that \
+yourself. An instant hand (media_key, app_volume, scroll, window, tab) is called with no words before it, \
+with its say_when_done line (the few words for once it worked, "Done, it's minimized."): the hand says that \
 line itself the moment its report verifies the effect. Leave say_when_done empty ("") when they can see it \
 happen and a word would add nothing, above all when they repeat a simple step (scroll, again, the next tab): \
 a person helping would just do it, and "Done." every time gets tiring fast. Say something when there is \
@@ -479,8 +479,7 @@ say_first ("On it.") is heard at once. A hand that does not take effect is passe
 retry it, try another hand or undo it yourself. A thinker's result is said, never followed by a hand of yours, and \
 "just do it", "try another way" or something not done or done wrong is never a hand's: tell_yuki. Keys and \
 shortcuts (Enter too) are the thinker's, which looks before it acts; your type hand only types words into the \
-field the focus line names. Two asks at once, each one hand step ("pause the music and minimize Discord"): one call \
-per ask, all in this same reply, in their order; when any ask needs the thinker, all of it goes to the thinker.
+field the focus line names.
 
 What they point at on the screen: the items line lists the window in front's links, buttons and rows, \
 numbered, read while they talked. When the item they mean is on it ("click the mix", "play the second one", \
@@ -611,8 +610,8 @@ PLAYLIST_SKILL = "spotify.playlist"
 
 #: The hands block's paragraphs the skill path replaces, each exactly as :data:`HANDS_PROMPT` has it (a test holds
 #: every one to exactly one occurrence, so a later edit of the hands block cannot silently skip a replacement).
-_INSTANT_OLD = "An instant hand (media_key, app_volume, scroll, window, tab) is called alone"
-_INSTANT_VOLUME = "An instant hand (media_key, scroll, window, tab) is called alone"
+_INSTANT_OLD = "An instant hand (media_key, app_volume, scroll, window, tab) is called with no words before it"
+_INSTANT_VOLUME = "An instant hand (media_key, scroll, window, tab) is called with no words before it"
 _VOLUME_OLD = HANDS_PROMPT[HANDS_PROMPT.index("Volume is four different things."):
                            HANDS_PROMPT.index("Stopping a video or music is pausing it")]
 _LESSONS_OLD = HANDS_PROMPT[HANDS_PROMPT.index("A Lessons line is what went wrong here before"):
@@ -625,12 +624,6 @@ _LEARNED_EXAMPLE_OLD = HANDS_PROMPT[HANDS_PROMPT.index("Good: they ask for what 
                                     HANDS_PROMPT.index('Bad: user "open Spotify and play my focus playlist".')]
 _SPOTIFY_EXAMPLE_OLD = HANDS_PROMPT[HANDS_PROMPT.index('Bad: user "open Spotify and play my focus playlist".'):
                                     HANDS_PROMPT.index('Good: user "close the Claude tabs and the ElevenLabs one"')]
-#: lSpeed (live 17 Oct, multi 0/6): the hands block's two-asks sentence; with a Skills menu the Skills paragraph says
-#: it for skills and hands alike, so it is left out there (one place, no added size).
-_TWO_ASKS_HANDS = HANDS_PROMPT[HANDS_PROMPT.index(" Two asks at once, each one hand step"):
-                               HANDS_PROMPT.index("goes to the thinker.\n", HANDS_PROMPT.index(" Two asks at once, each "
-                                                                                              "one hand step"))
-                               + len("goes to the thinker.")]
 
 #: The Skills paragraph (it takes the Lessons / Learned ways paragraph's place): the menu follows the hands block.
 SKILLS_PARAGRAPH = """\
@@ -676,7 +669,6 @@ def hands_prompt(skill_keys: Any = ()) -> str:
     if not keys:
         return HANDS_PROMPT
     text = HANDS_PROMPT.replace(_LESSONS_OLD, SKILLS_PARAGRAPH).replace(_LEARNED_EXAMPLE_OLD, "")
-    text = text.replace(_TWO_ASKS_HANDS, "")   # lSpeed: the Skills paragraph says it for skills and hands alike
     text = text.replace(_LEARNED_WAY_OLD, "two or more steps (but a skill), anything")
     if VOLUME_SKILL in keys:
         text = (text.replace(_INSTANT_OLD, _INSTANT_VOLUME).replace(_VOLUME_OLD, VOLUME_PARAGRAPH)
@@ -1152,26 +1144,38 @@ HAND_OVER: dict[str, Any] = {
 #: lSpeed (live test 17 Oct, problem 1): what the talker reads about the learned reflex that ran for the words it
 #: answers (``state["reflex"]``, set by the pipeline): the reflex ran the user's own learned hand at the end of their
 #: turn, with no model in front, through the hands' own act and check. By its state: done (checked), still running,
-#: or tried and not done. ``{changed}``: they went on talking after the pause it acted on.
+#: sent but not seen to take effect, or nothing went out. ``{changed}``: they went on talking after the pause it acted
+#: on.
 REFLEX_NOTES = {
-    "done": ("[Done already, by code, and checked: {what} ({report}). That is what these exact words of theirs got "
-             "before, so it is what they asked for. {changed}Say only the few done words you would have given it "
-             "(\"Paused.\"), or nothing when they can see it happen; no call for it (a call for it is skipped), and "
-             "never another target for it.]"),
+    # review r1 M1: no "never another target": when the words meant another app the talker's call for it runs
+    "done": ("[Done already, by code, and checked: {what} ({report}); these exact words of theirs got this before. "
+             "For it say only the few done words you would have given it (\"Paused.\"), or nothing when they can see "
+             "it happen; no call for it (the same call is skipped).{changed}]"),
     "running": ("[Being done right now, by code, for these exact words of theirs (what they got before): {what}. "
-                "{changed}Make your usual call for their request: when it is the same call, code skips it once this is "
-                "done and says its done line.]"),
-    "failed": ("[Tried by code for their words, and it did not take effect: {what} ({report}). Nothing of it is done: "
+                "Make your usual call for their request: when it is the same call, code skips it once this is done "
+                "and says its done line.{changed}]"),
+    # review r1 M2: it went out once and its effect was not seen in time (Spotify's status can lag ~1.5 s): never again
+    "sent": ("[Sent once by code for these exact words of theirs, but its effect was not seen in time: {what} "
+             "({report}). Never repeat it (the same call is skipped): tell them in a few words it may not have taken "
+             "effect, or hand it over.{changed}]"),
+    "failed": ("[Tried by code for their words, and nothing went out: {what} ({report}). Nothing of it is done: "
                "handle their request as usual.]"),
 }
 #: ... when the words the reflex acted on were only the start of what they said (Flux's eager end of turn, then more).
-REFLEX_CHANGED = ("It was the start of what they said: they went on after a pause, so do the rest of it as usual, "
-                  "never this part again. ")
+#: Review r1 M5: what they went on to say may change or undo the part acted on ("mute the PC... no, Spotify"); it
+#: stands last in the note, after what was done and how to speak of it.
+REFLEX_CHANGED = (" But that was only the start of what they said: they went on after a pause. If what they went on "
+                  "to say changes or undoes it, undo or redo it as they now say; otherwise do the rest of what they "
+                  "said as usual.")
 #: The result of the talker's call that repeats the reflex's own (skipped: it was done once, checked).
 REFLEX_DUP_SAID = ("Already done a moment ago for these same words, and checked, so it was not done twice. Your done "
                    "line was said. Do not say it again.")
 REFLEX_DUP_SILENT = ("Already done a moment ago for these same words, and checked, so it was not done twice. Say "
                      "nothing about it.")
+#: ... skipped because the reflex sent it once and its effect was not seen in time (review r1 M2).
+REFLEX_DUP_UNSEEN = ("Sent once a moment ago for these same words, but its effect was not seen in time; it was not "
+                     "sent again (a second press can undo it or do it twice). Never repeat it: tell them in a few "
+                     "words it may not have taken effect, or hand it over.")
 
 
 def reflex_note(state: dict[str, Any] | None) -> str:
