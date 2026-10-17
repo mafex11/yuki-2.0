@@ -20,10 +20,10 @@ app); with DMs only in apps the routes don't drive, the run says "no route" (the
 route's app comes from its stored service or its threads' programs, matched against the apps' data. The app is the one
 the user named, else the usual route's; the done line names an app the user didn't. A DM memory linked to two people
 goes to the one its chat name names (``contacts.dm_claim``), never to the other (lMsg). A name none of their people
-goes by that is tight to a heard form of theirs the user confirmed ("Kumar" for "quix": that form plus one final
-consonant) is that person for a draft or an open; anything looser, or a send, is asked once ("Did you mean bobsled?";
-:func:`_sounds_alike`), and a send to that person after the answer is typed and left, never sent by sound
-(:func:`_send_gate`, review r1 H1). A send the send check would refuse is refused before the chat opens.
+goes by that sounds like exactly one of them ("hardish" for Hemanth) is that person for a draft or an open, named in
+the done line (ask or act by cost, fMsg); a send is asked once ("Did you mean bobsled?"; :func:`_sounds_alike`), and a
+send to that person after the answer is typed and left, never sent by sound (:func:`_send_gate`, review r1 H1). A send
+the send check would refuse is refused before the chat opens.
 
 **Opening the chat** (rung A, two ways per app, in order):
 
@@ -53,12 +53,13 @@ wording of what the user asked to say (failure fix-plan Item 11, row 4, with the
 after their yes): that very step's grant (:attr:`yuki.skills.engine.RunContext.grant`) lets exactly that text go to
 exactly that person (by their id in the people index), in their own direct message only, and nothing else (Item 11's L2;
 a group chat or channel, even the person's usual one, still needs the user's own words). The opened chat's composer is
-read first (zero-width characters and the BOM are not text: Discord's empty box reads "U+FEFF" and a newline, live 17
-Oct): other text already there (the app's kept draft) means nothing is typed or pressed, said plainly; a composer
-that can't be read gets a send's words typed and its send key never pressed (told to press Enter). A send is "done" only
-when memory captured the user's own message equal to that text in that very chat (the messages table, matched by the
-route's capture thread ids, never by the app's name); "pressed send, couldn't confirm it landed" otherwise, once the
-send key went out (its own step dispatched).
+read first, the field's own text and never the caret context (zero-width characters and the BOM are not text: Discord's
+empty box reads "U+FEFF" and a newline, live 17 Oct): exactly a text Yuki typed there itself (kept as a keyed digest in
+RAM, :func:`note_typed`) is selected and typed over; other text already there (the user's kept draft) means nothing is
+typed or pressed, said plainly; a composer that can't be read gets a send's words typed and its send key never
+pressed (told to press Enter). A send is "done" only when memory captured the user's own message equal to that text
+in that very chat (the messages table, matched by the route's capture thread ids, never by the app's name); "pressed
+send, couldn't confirm it landed" otherwise, once the send key went out (its own step dispatched).
 If Yuki's own check holds the send key after the text was typed, the user is told it's typed and not sent (never
 asked: a "yes" would type it twice).
 A rung that acted on a send is never followed by another (the engine's rule: never twice).
@@ -84,6 +85,9 @@ content-free (code words, counts); names, chat names, links and text stay in RAM
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
 import threading
 import time
 import tomllib
@@ -360,19 +364,20 @@ ASK_ALIKE = "Did you mean {name}?"
 
 def _sounds_alike(store: Any, who: str, mode: str, words: Sequence[str] = ()) -> Target | Asked | None:
     """For a name none of the user's people (nor a group chat or channel) goes by as written: the one person it sounds
-    like (``contacts.sounds_alike``). Tight to a heard form of theirs the user confirmed ("Kumar" for "quix": that form
-    plus one final consonant), for a draft or an open: that person (``by_sound``: the done line names them, so a wrong
-    guess shows). Anything looser, or a send: asked once, "Did you mean bobsled?" (review r1 M2: a loose match never
-    opens a chat unasked; rule 8, x6/xL2Grant: whom a message is sent to is never matched by sound, confirmed first),
-    noted with the user's turns as they stand (``contacts.note_alike_asked``) so only an answer given after it counts
-    (:func:`_answered_alike`). ``None``: nobody alike, the strict rule's match (the resolver asks that), or the
-    question was asked already (the same name again: the answer was no)."""
+    like (``contacts.sounds_alike``). For a draft or an open, that person, tight or loose (fMsg, live 18 Oct: "to
+    hardish" answering "Who to?" was asked "Did you mean Hemanth?" a second time): ask or act by cost (synthesis
+    §6.2): a draft is typed and left and an open only shows a chat, both undone in a moment, and the done line names
+    the person (``by_sound``: "It's typed in your chat with Hemanth, not sent."), so a wrong guess shows. A send: asked
+    once, "Did you mean bobsled?" (rule 8, x6/xL2Grant: whom a message is sent to is never matched by sound, confirmed
+    first), noted with the user's turns as they stand (``contacts.note_alike_asked``) so only an answer given after it
+    counts (:func:`_answered_alike`). ``None``: nobody alike or two people alike, the strict rule's match (the resolver
+    asks that), or the question was asked already (the same name again: the answer was no)."""
     from yuki.memory import contacts as C
 
     alike = C.sounds_alike(store, who)
     if alike is None or alike.strict:
         return None
-    if alike.tight and mode != "send":
+    if mode != "send":
         return _person_target(store, alike.contact, who, by_sound=True)
     if C.note_alike_asked(store, who, int(alike.contact.id), words):
         name = alike.contact.name if alike.confirmed else alike.form
@@ -402,8 +407,8 @@ def find_target(store: Any, person: str, *, mode: str = "", words: Sequence[str]
     whole-word part of it, a misheard form the user corrected; two who fit: a question), with only their own direct
     messages as routes (:func:`_person_target`); else a group chat or channel whose name is those words (identity);
     else, for a run (``mode``: ``send``, ``draft`` or ``open``; ``words``: the user's turns, newest last), the one
-    person the name sounds like (:func:`_sounds_alike`: tight to a confirmed heard form, for a draft or an open; else
-    asked once); else "I don't know who that is". Without ``mode`` (:func:`whom`, the send grant's person, the
+    person the name sounds like (:func:`_sounds_alike`: that person for a draft or an open; a send is asked once);
+    else "I don't know who that is". Without ``mode`` (:func:`whom`, the send grant's person, the
     done-check) never by sound. When the words
     are a group's or channel's whole name, a person whose name only stands inside them is not the one named (the place
     wins), and a person they name as a whole name or a part of one makes it a question, never a guess (review r2
@@ -744,43 +749,157 @@ def _step_verdict(facts: Mapping[str, Any], do: str) -> bool | None:
     return None
 
 
-def _composer_text(hands: Any) -> str | None:
-    """What the text field with the keyboard (the opened chat's composer) holds now, read in RAM and dropped (never
-    logged); ``None`` when no text field has the keyboard or it can't be read. A field that answered neither its Text
-    nor its Value pattern (``text_source`` empty and no value: the focus read can't tell "no pattern" from a Value
-    pattern that read empty) is unread, never "empty" (sWire r1 M1: an unreadable composer may hold the app's kept
-    draft)."""
+#: How long the composer's own text may take to read (s), and how much of it is read (characters; more is "other text").
+FIELD_READ_S = 0.6
+FIELD_CHARS = 4000
+
+
+def _field_text(timeout_s: float = FIELD_READ_S) -> str | None:
+    """The whole text of the field with the keyboard, scoped to that field (fMsg, live 18 Oct): its Value pattern's
+    value when it has one, else its Text pattern's own document range, the very read the composer's contents give
+    (Discord's empty box: "U+FEFF" and a newline). Never the characters around the caret: in a Chromium app (Discord,
+    Slack, WhatsApp's web view) a caret range moved back by characters walks out of the field into the chat's
+    messages above it, so an empty composer read as "unsent text" and nothing was typed (msg_hemanth_vc_draft,
+    msg_hemanth_hinglish_quote). RAM only, never logged; ``None`` when no field has the keyboard, it is a password
+    field, it exposes neither pattern, or UIA doesn't answer within ``timeout_s``."""
+    try:
+        import comtypes
+        import comtypes.client
+
+        from yuki.perception import tree as T
+    except Exception:  # noqa: BLE001 - no UIA here: unread
+        return None
+    out: dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            module = T._uia_core()
+            automation = comtypes.client.CreateObject(T._CUIAUTOMATION_CLSID, interface=module.IUIAutomation)
+            element = automation.GetFocusedElement()
+            if not element:
+                return
+            request = T._build_cache_request(automation, T._TREE_SCOPE_ELEMENT)
+            request.AddProperty(T._P_IS_TEXT_AVAILABLE)
+            request.AddProperty(T._P_IS_PASSWORD)
+            get = element.BuildUpdatedCache(request).GetCachedPropertyValue
+            if T._as_bool(get(T._P_IS_PASSWORD)):
+                return
+            value = get(T._P_VALUE_VALUE) if T._as_bool(get(T._P_IS_VALUE_AVAILABLE)) else None
+            if isinstance(value, str) and value:
+                out["text"] = value[:FIELD_CHARS + 1]
+                return
+            if T._as_bool(get(T._P_IS_TEXT_AVAILABLE)):
+                pattern = element.GetCurrentPattern(T._PATTERN_TEXT).QueryInterface(module.IUIAutomationTextPattern)
+                out["text"] = str(pattern.DocumentRange.GetText(FIELD_CHARS + 1) or "")
+                return
+            if value is not None:
+                out["text"] = str(value or "")
+        except BaseException:  # noqa: BLE001 - unread
+            out.pop("text", None)
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:  # noqa: BLE001
+                pass
+
+    thread = threading.Thread(target=worker, name="yuki-chat-composer", daemon=True)
+    thread.start()
+    thread.join(max(0.05, float(timeout_s)))
+    got = out.get("text")
+    return got if isinstance(got, str) else None
+
+
+def _composer_text(hands: Any) -> tuple[str | None, int]:
+    """What the text field with the keyboard (the opened chat's composer) holds now, and the top-level window it is in,
+    read in RAM and dropped (never logged). The hands' focus read says whether a text field has the keyboard (and never
+    a password field's); its contents are the field's own (:func:`_field_text`), never the caret context. ``None``
+    when no text field has the keyboard or its contents can't be read (sWire r1 M1: an unreadable composer may hold
+    the app's kept draft, so it is never "empty")."""
     read = getattr(hands, "_focus", None)
     if not callable(read):
-        return None
+        return None, 0
     try:
         snap = read(timeout_s=0.4)
     except Exception:  # noqa: BLE001
-        return None
+        return None, 0
     if snap is None or not getattr(snap, "accepts_text", False) or getattr(snap, "is_password", False):
-        return None
-    source = str(getattr(snap, "text_source", "") or "")
-    if source == "text":
-        return f"{getattr(snap, 'before', '') or ''}{getattr(snap, 'after', '') or ''}"
-    value = getattr(snap, "value", None)
-    if value is None and not source:
-        return None
-    return str(value or "")
+        return None, 0
+    return _field_text(), int(getattr(snap, "window", 0) or 0)
 
 
-def _composer_state(hands: Any, text: str) -> str:
-    """The opened chat's composer against the user's words (review r1 L6, r2 H1): ``"empty"`` (nothing but whitespace,
-    zero-width characters and the BOM: Discord's empty message box holds "U+FEFF" and a newline, live test 17 Oct),
-    ``"same_text"`` (it already holds exactly ``text``, whitespace, zero-width characters and case folded: an
-    identity check of the user's own words), ``"other_text"`` (anything else: the app's kept draft) or ``"unread"``."""
+# ---------------------------------------------------------------------------------------------------------------------
+# Yuki's own typing (RAM only): a composer holding exactly a text Yuki typed there is Yuki's draft, never the user's
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: How long a text Yuki typed is known as its own (s): an earlier turn or request of the same sitting.
+TYPED_KEEP_S = 1800.0
+#: The most typed texts kept per window.
+TYPED_PER_WINDOW = 8
+_TYPED_KEY = os.urandom(16)
+_typed_lock = threading.Lock()
+#: window -> [(when, keyed digest of the text as compared)]. RAM only, never logged; a restart forgets it.
+_typed: dict[int, list[tuple[float, bytes]]] = {}
+
+
+def _typed_digest(text: Any) -> bytes:
     from yuki.skills.donecheck import _norm_text
 
-    held = _composer_text(hands)
+    norm = _norm_text(text)
+    return hmac.new(_TYPED_KEY, norm.encode("utf-8"), hashlib.sha256).digest() if norm else b""
+
+
+def note_typed(window: int, text: Any, *, now: float | None = None) -> None:
+    """Keep that Yuki typed ``text`` into a field of the top-level window ``window`` (a keyed digest of the text as
+    compared, in RAM only), so a later run that finds exactly that text in a chat's composer knows it is Yuki's own
+    draft and may replace it (:func:`typed_by_yuki`). Called by this driver's own typing; every other way Yuki types
+    (the voice hands' ``type``, the thinker's ``type_text``) may call it too. Never raises."""
+    try:
+        digest = _typed_digest(text)
+        if not window or not digest:
+            return
+        at = time.time() if now is None else float(now)
+        with _typed_lock:
+            kept = [(t, d) for t, d in _typed.get(int(window), []) if 0.0 <= at - t <= TYPED_KEEP_S and d != digest]
+            _typed[int(window)] = (kept + [(at, digest)])[-TYPED_PER_WINDOW:]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def typed_by_yuki(window: int, held: Any, *, now: float | None = None) -> bool:
+    """Whether ``held`` (a composer's whole text) is exactly a text Yuki typed into the window ``window`` within
+    :data:`TYPED_KEEP_S` (whitespace, zero-width characters and case folded). Text the user typed, or Yuki's text
+    with anything of theirs added, is not. Never raises."""
+    try:
+        digest = _typed_digest(held)
+        if not window or not digest:
+            return False
+        at = time.time() if now is None else float(now)
+        with _typed_lock:
+            return any(d == digest and 0.0 <= at - t <= TYPED_KEEP_S for t, d in _typed.get(int(window), []))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _composer_state(hands: Any, text: str) -> tuple[str, int]:
+    """The opened chat's composer against the words to type (review r1 L6, r2 H1), and its window: ``"empty"``
+    (nothing but whitespace, zero-width characters and the BOM: Discord's empty message box holds "U+FEFF" and a
+    newline, live test 17 Oct), ``"same_text"`` (it already holds exactly ``text``, whitespace, zero-width characters
+    and case folded), ``"yuki_text"`` (it holds exactly another text Yuki typed there itself: :func:`typed_by_yuki`,
+    fMsg), ``"other_text"`` (anything else: the user's kept draft) or ``"unread"``."""
+    from yuki.skills.donecheck import _norm_text
+
+    held, window = _composer_text(hands)
     if held is None:
-        return "unread"
+        return "unread", window
     if not _norm_text(held):
-        return "empty"
-    return "same_text" if text and _norm_text(held) == _norm_text(text) else "other_text"
+        return "empty", window
+    if text and _norm_text(held) == _norm_text(text):
+        return "same_text", window
+    return ("yuki_text" if typed_by_yuki(window, held) else "other_text"), window
 
 
 def _dispatched(facts: Mapping[str, Any], do: str) -> bool:
@@ -788,6 +907,25 @@ def _dispatched(facts: Mapping[str, Any], do: str) -> bool:
     screen watch then saw (review r1 M1: a send key whose watch saw no change was still pressed)."""
     return any(getattr(r, "kind", "") == "action" and bool(getattr(r, "ok", False))
                and getattr(getattr(r, "step", None), "do", "") == do for r in facts.get("results") or [])
+
+
+def _send_dispatched(facts: Mapping[str, Any], keys: Sequence[str], *, kept: bool = False) -> bool:
+    """Whether the send key went out in this run: a keys step with exactly the app's send keys, after the typing or
+    with the words already there (``kept``). The select-all that replaces Yuki's own draft is a keys step too, and is
+    never the send."""
+    want = [str(k).casefold() for k in keys]
+    typed = bool(kept)
+    for r in facts.get("results") or []:
+        step = getattr(r, "step", None)
+        do = getattr(step, "do", "")
+        if getattr(r, "kind", "") != "action":
+            continue
+        if do == "type":
+            typed = typed or bool(getattr(r, "ok", False))
+        elif do == "keys" and bool(getattr(r, "ok", False)) and \
+                [str(k).casefold() for k in getattr(step, "keys", []) or []] == want and typed:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -996,7 +1134,20 @@ def _focus(hwnd: int) -> Any:
     return launch.focus_window(int(hwnd))
 
 
-def _open_uri(uri: str) -> Any:
+#: How long opening a chat's own link may wait for the app's window to change and come forward (s) when the app is
+#: already running (fMsg, live 18 Oct: the generic open waited for a "document" in Discord's window too, up to 6 s
+#: more; the route checks the chat open by memory's thread ids itself, :func:`_wait_chat`).
+LINK_OPEN_S = 2.0
+
+
+def _open_uri(uri: str, *, running: bool = False) -> Any:
+    """The app's own link, opened with its default handler (D17-guarded). With the app already ``running`` only its
+    window is waited for, within :data:`LINK_OPEN_S` (no page or document wait: the chat is checked open by memory's
+    thread ids right after); a cold start keeps the full wait."""
+    if running:
+        from yuki.actions import launch
+
+        return launch.open_url(str(uri or ""), content_timeout_s=0.0, deadline=time.monotonic() + LINK_OPEN_S)
     from yuki.skills.engine import open_uri
 
     return open_uri(uri)
@@ -1119,14 +1270,19 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
         return RouteResult(ran=True, outcome="chat_unconfirmed" if chat is None else "other_chat", app=app,
                            unverified_line=LINE_UNSURE_CHAT.format(app=_title(app), name=name), facts=facts,
                            facts_ram=ram)
-    # The composer is read before anything is typed (review r1 L6, r2 H1). Exactly these words already there (a draft
-    # Yuki typed on an earlier run whose send key was held, kept by the app): never typed a second time; only the send
-    # key, if asked. Any other text there (the chat's own kept draft): nothing typed and nothing pressed, in either mode
-    # (appended, Enter would send that text with the user's words). Unreadable (no pattern answered, the read timed
-    # out, no text field has the keyboard): a draft is typed as before; a send is typed and its send key is never
-    # pressed (sWire r1 M1: a hidden kept draft would go out with the words), and the user is told to press Enter.
-    # The live check settles whether each app's composer can be read.
-    composer = _composer_state(call.ctx.hands, text)
+    # The composer is read before anything is typed (review r1 L6, r2 H1), the field's own text (never the caret
+    # context, fMsg). Exactly these words already there (a draft Yuki typed on an earlier run whose send key was held,
+    # kept by the app): never typed a second time; only the send key, if asked. Exactly another text Yuki typed there
+    # itself (an earlier turn's draft, known by its keyed digest in RAM): selected with the app's own select-all and
+    # typed over (fMsg; an app with no select-all in its data leaves it, as below). Any other text there (the user's
+    # kept draft): nothing typed and nothing pressed, in either mode (appended, Enter would send that text with the
+    # user's words). Unreadable (no pattern answered, the read timed out, no text field has the keyboard): a draft is
+    # typed as before; a send is typed and its send key is never pressed (sWire r1 M1: a hidden kept draft would go out
+    # with the words), and the user is told to press Enter.
+    composer, window = _composer_state(call.ctx.hands, text)
+    select_all = [str(k) for k in data.get("select_all") or []]
+    if composer == "yuki_text" and not select_all:
+        composer = "other_text"
     facts["composer"] = composer
     if composer == "other_text":
         ram.update(typed=False, pressed=False)
@@ -1134,9 +1290,12 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
                            facts={**facts, "typed": "no", "pressed": False}, facts_ram=ram)
     kept = composer == "same_text"
     blind = send and composer == "unread"
+    send_keys = [str(k) for k in data.get("send") or ["enter"]]
     steps: list[dict[str, Any]] = [] if kept else [{"do": "type", "text": text}]
+    if composer == "yuki_text":
+        steps.insert(0, {"do": "keys", "keys": select_all})
     if send and not blind:
-        steps.append({"do": "keys", "keys": [str(k) for k in data.get("send") or ["enter"]]})
+        steps.append({"do": "keys", "keys": send_keys})
     if steps:
         # Item 11's L2 (:func:`_send_decl`): whom by the person's id too, only into their own direct message
         decl, grant = _send_decl(call, target, route, text)
@@ -1146,12 +1305,16 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     else:
         run = {"steps": 0, "steps_done": 0, "results": []}
     facts["kept_draft"] = kept
+    if composer == "yuki_text":
+        facts["replaced"] = "own_draft"
+    if _dispatched(run, "type"):
+        note_typed(window or hwnd, text)
     typed = True if kept else _step_verdict(run, "type")
     if typed is None and not kept and run.get("refused_steps"):
         typed = False
     # review r1 M1: the send key counts as pressed once it went out (its own step dispatched), never from the run's
     # overall ok (a screen watch that saw no change after Enter makes the run "not ok", yet the message may be gone)
-    pressed = bool(send and _dispatched(run, "keys"))
+    pressed = bool(send and _send_dispatched(run, send_keys, kept=kept))
     ram.update(typed=typed, pressed=pressed)
     facts.update(typed={True: "yes", False: "no", None: "unknown"}[typed], pressed=pressed,
                  steps=int(run.get("steps") or len(steps)), steps_done=int(run.get("steps_done") or 0))
@@ -1218,13 +1381,14 @@ def route_open_link(call: RouteCall) -> RouteResult:
         return refused
     if _refused("open_url"):
         return RouteResult(ran=False, held="game", outcome="refused")
+    running = _app_hwnd(data)
     since = time.time()
-    opened = _open_uri(uri)
+    opened = _open_uri(uri, running=bool(running))
     if _held_by_game(opened):
         return RouteResult(ran=False, held="game", outcome="refused")
     if not getattr(opened, "ok", False):
         return RouteResult(ran=False, outcome="not_opened")
-    return _after_open(call, app, data, target, route, via="link", since=since, hwnd=_app_hwnd(data),
+    return _after_open(call, app, data, target, route, via="link", since=since, hwnd=_app_hwnd(data) or running,
                        as_draft=as_draft)
 
 

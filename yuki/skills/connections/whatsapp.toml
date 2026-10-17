@@ -21,6 +21,9 @@ services = ["web.whatsapp.com", "whatsapp.root", "whatsapp"]
 # its chat search (only ever sent into WhatsApp's own window, with no game in front)
 search = ["ctrl", "f"]
 send = ["enter"]
+# select everything in the message box (a draft Yuki typed there itself is typed over, never the user's:
+# yuki/skills/chat.py typed_by_yuki)
+select_all = ["ctrl", "a"]
 
 # A chat's stored handle as a phone number (digits, an optional leading +; checked in code) -> WhatsApp's own link.
 [chat.phone]

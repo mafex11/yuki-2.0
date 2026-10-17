@@ -293,7 +293,8 @@ def route_voice_link(call: RouteCall) -> RouteResult:
         return gate
     if C_._refused("open_url"):
         return RouteResult(ran=False, held="game", outcome="refused")
-    opened = C_._open_uri(uri)
+    # fMsg: with Discord already running only its window is waited for (the join is checked by the microphone)
+    opened = C_._open_uri(uri, running=bool(C_._app_hwnd(data)))
     if C_._held_by_game(opened):
         return RouteResult(ran=False, held="game", outcome="refused")
     if not getattr(opened, "ok", False):
