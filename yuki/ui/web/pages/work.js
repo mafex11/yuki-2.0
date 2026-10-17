@@ -146,12 +146,9 @@
     const meter = h('span', { class: 'fmeter', attrs: { role: 'img', 'aria-label': `${fmt.dur(focus)} so far${usual != null ? `; your usual by now is ${fmt.dur(usual)}` : ''}` } },
       Array.from({ length: all }, (_, i) => h('i', { class: (i < lit ? 'on' : '') + (i === uAt ? ' u' : '') })));
     const L = T.longest;
-    // capC6: a row may carry what the PC checked you got done in that work today ("you saved a file (.pptx) at 4 PM"),
-    // shown as a quiet line under the title; its task and action ids stay in the data, never on the page
-    const worked = (T.worked || []).map(([title, min, ref, ev]) => h('button', { class: 'tw' + (ev && ev.text ? ' ev' : ''), data: { do: 'work-continue', ref },
-      attrs: { type: 'button', title: 'Pick it up: I reopen the windows you had. I type and send nothing.', 'aria-label': `Pick up ${title}, ${fmt.dur(min)} today${ev && ev.text ? `; ${ev.text}` : ''}` } },
-    h('span', { text: title }), h('span', { class: 'mono', text: fmt.dur(min) }), ic('chev'),
-    ev && ev.text ? h('span', { class: 'twe', text: ev.text, title: ev.goal || '' }) : null));
+    const worked = (T.worked || []).map(([title, min, ref]) => h('button', { class: 'tw', data: { do: 'work-continue', ref },
+      attrs: { type: 'button', title: 'Pick it up: I reopen the windows you had. I type and send nothing.', 'aria-label': `Pick up ${title}, ${fmt.dur(min)} today` } },
+    h('span', { text: title }), h('span', { class: 'mono', text: fmt.dur(min) }), ic('chev')));
     const coming = (T.coming || []).map(([when, title]) => h('div', { class: 'tc' }, h('span', { class: 'mono', text: when }), h('span', { text: title, title })));
     return h('div', { class: 'wk-today', data: { k: 'today' } },
       Y.clearing('div', '', h('div', { class: 'label' }, h('span', { text: 'Focus today' }), h('a', { class: 'golink', attrs: { href: '#work/day' } }, 'Your day', ic('chev'))),
@@ -323,90 +320,14 @@
       s.mode === 'full' ? h('span', { class: 'kind', text: 'full screen' }) : null)];
     const meta = apps.length ? h('span', { class: 'mono', text: apps.slice(0, 2).map(([n]) => n).join(', ') + (apps.length > 2 ? ` +${apps.length - 2}` : '') }) : null;
     const words = s.summary || s.full;
-    const tasks = s.tasks || [];
     const body = [words ? h('div', { class: 'd', text: words }) : null,
       apps.length ? h('div', { class: 'perapp' }, apps.map(([n, m]) => h('div', { class: 'pa' }, h('span', { class: 'pa-n', text: n }), Y.bar(m, max, 20), h('span', { class: 'mono', text: fmt.dur(m) }))))
         : h('div', { class: 't2', text: 'No app time measured in this stretch.' }),
-      tasks.length ? h('div', { class: 'tasks', data: { k: 'tasks' } }, Y.label('What you did', tasks.length), tasks.map((t) => taskRow(t, d))) : null,
       p ? h('div', { class: 'meta2' }, Y.fixLine(p)) : null,
       canFix && !Y.fixing(p) ? h('div', { class: 'acts inline' }, Y.correctKey()) : null];
     return Y.fold(sessKey(s), head, meta, body, { cls: 'dayrow',
       data: s.ref ? { cref: s.ref, cpage: page || 'day', kind: 'episode', title: s.title || '', text: words || '' } : null });
   }
-  /* a task inside a session (capC2, decision D5): what you did it for, the apps, the time and whether it got done, in
-     plain words. You can correct it: Rename (your words), Not one task, Not what I did; Undo takes it back. Memory
-     keeps your correction and learns from it; nothing is said or put on a card. */
-  const TASK_SAID = { renamed: 'You renamed this.', not_one: 'You said this wasn’t one task.', not_mine: 'You said this isn’t what you did.' };
-  function taskRow(t, d) {
-    const can = !!(d.can || {}).correct_task && !!t.ref;
-    const meta = [`${t.start}–${t.end}`, (t.apps || []).slice(0, 3).join(', '), t.outcome].filter(Boolean).join(' · ');
-    const said = TASK_SAID[t.verdict];
-    return h('div', { class: 'task' + (t.verdict && t.verdict !== 'renamed' ? ' set' : ''), data: { task: t.ref || '', k: 't:' + (t.ref || t.start) } },
-      h('div', { class: 'tg', text: t.goal || 'A task' }),
-      h('div', { class: 't2 tm2', text: meta }),
-      said ? h('div', { class: 'meta2' }, h('span', { text: said }), can ? Y.key('Undo', { cls: 'xs ghost', data: { do: 'task-undo' }, title: 'Take it back, as it was' }) : null)
-        : can ? h('div', { class: 'acts inline' }, Y.key('Rename', { cls: 'xs', data: { do: 'task-rename' }, title: 'Say what it was, in a few words' }),
-          Y.key('Not one task', { cls: 'xs ghost', data: { do: 'task-verdict', verdict: 'not_one' } }),
-          Y.key('Not what I did', { cls: 'xs ghost', data: { do: 'task-verdict', verdict: 'not_mine' } })) : null);
-  }
-  /* the task's data on the Day page (so the row redraws as memory now has it, before the next build) */
-  function taskData(ref) {
-    for (const s of ((Y.D.pages.day || {}).sessions || [])) for (const t of (s.tasks || [])) if (t.ref === ref) return t;
-    return null;
-  }
-  const taskOf = (el) => el.closest('[data-task]');
-  Y.actions['task-rename'] = (el) => {
-    const row = taskOf(el); if (!row) return;
-    const open = row.querySelector('.fixbox input'); if (open) { open.focus(); return; }
-    const inp = h('input', { class: 'fact-in fix-in', data: { enter: 'task-rename-send', escape: 'task-rename-cancel' }, attrs: { 'aria-label': 'What was it?', placeholder: 'what it was, like “paid the electricity bill”', autocomplete: 'off', maxlength: 200 } });
-    row.append(h('div', { class: 'fx-edit fixbox' }, h('div', { class: 'label' }, ic('edit'), 'What was it?'), h('div', { class: 'fx-edit-r one' }, inp),
-      h('div', { class: 'acts inline' }, Y.key('Save', { cls: 'xs pri', data: { do: 'task-rename-send' } }), Y.key('Cancel', { cls: 'xs ghost', data: { do: 'task-rename-cancel' } }))));
-    row.classList.add('editing');   // a live patch leaves the row alone while you type
-    Y.pop(row.lastChild); inp.focus(); Y.remeasure();
-  };
-  function taskClose(row) {
-    const box = row && row.querySelector('.fixbox');
-    if (box) box.remove();
-    if (row) row.classList.remove('editing');
-    Y.remeasure();
-  }
-  Y.actions['task-rename-cancel'] = (el) => taskClose(taskOf(el));
-  function taskSend(el, verdict, words) {
-    const row = taskOf(el); if (!row) return;
-    const ref = row.dataset.task;
-    el.disabled = true;
-    Y.act('task_correct', { ref, verdict, words: words || '' }).then((r) => {
-      el.disabled = false;
-      if (!r.ok) { Y.toast(r.error || 'Couldn’t save that. Memory didn’t answer.', true); return; }
-      taskClose(row);
-      const t = taskData(ref);
-      if (t) { t.verdict = verdict; if (verdict === 'renamed') t.goal = r.goal || words; }
-      Y.toast(verdict === 'renamed' ? 'Renamed. I’ll learn from it.' : 'Got it. I’ll learn from it.');
-      Y.renderMain();
-    });
-  }
-  Y.actions['task-rename-send'] = (el) => {
-    const row = taskOf(el), inp = row && row.querySelector('.fixbox input');
-    if (!inp || inp.disabled) return;
-    const words = inp.value.replace(/\s+/g, ' ').trim();
-    if (!words) { inp.focus(); return; }
-    taskSend(inp, 'renamed', words);
-  };
-  Y.actions['task-verdict'] = (el) => taskSend(el, el.dataset.verdict, '');
-  Y.actions['task-undo'] = (el) => {
-    const row = taskOf(el); if (!row) return;
-    const ref = row.dataset.task;
-    el.disabled = true;
-    Y.act('task_correct_undo', { ref }).then((r) => {
-      el.disabled = false;
-      if (!r.ok) { Y.toast(r.error || 'Couldn’t take it back.', true); return; }
-      const t = taskData(ref);
-      if (t) { t.verdict = null; if (r.goal) t.goal = r.goal; }
-      Y.toast('Taken back.');
-      Y.renderMain();
-    });
-  };
-
   /* a call today: when, where, who; opened, what was said (the gists, said to you) */
   function callRow(c) {
     const head = [h('span', { class: 'tm', text: `${c.start}–${c.live ? 'now' : c.end}` }), h('span', { class: 'tt' }, h('span', { class: 'tx', text: c.where || c.app || 'Call' }),
