@@ -8,8 +8,10 @@ puts every card idea into one pile and picks at most one per wake:
 2. **the attention policy** (:mod:`yuki.memory.attend`): hard holds from the YouNow snapshot (staleness checked when
    read), the user's switches, one interruption budget;
 3. **the moment test**: ``confidence x timing(class) >= BAR`` (0.30), the timing class read from YouNow at this moment
-   (:func:`moment_class`: just sat down, just switched, just finished a call / game / message, a calm pause, a steady
-   stretch, mid-typing). Mid-typing is never a moment;
+   (:func:`moment_class`). Only natural breaks pass (18 Oct): just sat down after being away, right after a call or a
+   game ended (plus its return hold), a long focus stretch ending (a switch after :data:`FOCUS_END_S` on one thing).
+   A hop between apps, a calm pause, a steady stretch and mid-typing are never a moment. A "no" on a type (Not now,
+   Less of these) rests that type for :data:`NO_REST_S`;
 4. **the type's mode** from **one ledger** (:class:`Ledger`, per ``(kind, trigger)``): ``card`` / ``digest`` (a line of
    the Today card) / ``best`` (only at the best moments, at most one a day) / ``off``;
 5. **the rank**: ``prior x fit`` - acceptance orders candidates and never blocks a young type (fewer than 10 shown);
@@ -23,13 +25,9 @@ sit-down after the user's night (a break of 5 h or more, whatever the clock says
 writer's) and up to 5 code lines, at most 2 of them asking, each line carrying its id. After 3 h away in the day, a
 "While you were away" list shows when at least 2 things wait.
 
-**Shadow** (``[judge] mode = "shadow"``, the default shipped): the old chain shows the cards; the judge decides
-what it *would* have shown and logs it (``judge_decision``, content-free), and makes no model call and writes no card.
-It touches only ``nudge_state['judge_*']`` (its seen-marks, its mode table, its shadow book) and the log.
-``mode = "off"`` skips it entirely (the old first-writer chain, exactly).
-
-**Live** (``[judge] mode = "on"``, jSwitch; a setting, never the shipped default): the judge alone writes the cards and
-the old producers do not run (``NudgeWorker.tick`` stays callable for ``off`` / ``shadow``). :meth:`CardJudge.tick` is
+**Live** (``[judge] mode = "on"``, the shipped default since 18 Oct; the old first-writer chain is gone): the judge
+alone writes the cards. **Shadow** (a setting): no card at all; the judge decides what it *would* have shown and logs it
+(``judge_decision``, content-free), with no model call. ``mode = "off"``: no proactive cards. :meth:`CardJudge.tick` is
 the worker's loop body: the upkeep (:meth:`CardJudge.upkeep`: expiry, the check-in fold, the questions' upkeep, the
 routine lane's learning, at their own pace under any hold but paused or off), then one evaluation when YouNow woke the
 judge or a deadline came. The generators read the items' real state (``live``); B1 and B4 count stored rows
@@ -130,12 +128,21 @@ from yuki.memory.younow import SWITCH_HELD_S, presence_now
 
 #: The moment test's bar (a first guess, tuned from the shadow log; §10.1).
 BAR = 0.30
-#: timing(class), from YouNow at this moment.
-TIMING: dict[str, float] = {"sit_down": 1.0, "switch": 0.8, "after_commit": 0.8, "calm": 0.6, "steady": 0.3,
-                            "burst": 0.1}
+#: timing(class), from YouNow at this moment. Natural breaks only (18 Oct, the user: rare cards at natural breaks, never
+#: mid-focus): sitting down after being away, right after a call or a game ended (plus the return hold), a long focus
+#: stretch ending. A hop between apps, a calm pause, a steady stretch and mid-typing are 0: no confidence passes the
+#: bar there (deadline items go by their own rules; the routine card by :meth:`CardJudge._routine_moment`).
+TIMING: dict[str, float] = {"sit_down": 1.0, "after_commit": 0.9, "focus_end": 0.8, "switch": 0.0, "calm": 0.0,
+                            "steady": 0.0, "burst": 0.0}
+#: The natural breaks (the classes above 0).
+BREAK_CLASSES: tuple[str, ...] = ("sit_down", "after_commit", "focus_end")
 #: sit_down: settled after a return within this long; switch / after_commit: within this long of the breakpoint.
 SIT_DOWN_WITHIN_S = 10 * 60.0
 BREAKPOINT_FRESH_S = 3 * 60.0
+#: focus_end: the switch came after at least this long on one thing (YouNow keeps 30 minutes of ``changed``).
+FOCUS_END_S = 30 * 60.0
+#: A "no" on a card (Not now, Less of these) rests its type this long.
+NO_REST_S = 24 * 3600.0
 #: calm: no input for at least this long; burst: input within this long, in the same window at least BURST_SAME_S.
 CALM_IDLE_S = 30.0
 BURST_IDLE_S = 5.0
@@ -213,14 +220,14 @@ NO_AUTO_STEP: tuple[str, ...] = ("reminder", "asked", "routine", "today", "away"
 class JudgeConfig:
     """The privacy file's ``[judge]`` table."""
 
-    mode: str = "shadow"     # off: the old chain | shadow: the old chain shows, the judge logs | on: the judge alone
+    mode: str = "on"         # on: the judge writes the cards | shadow: no card, the judge logs | off: no cards
     digest: bool = True      # false: no Today card; the check-in head is an ordinary card; digest-only items dropped
 
     @classmethod
     def from_dict(cls, table: dict | None) -> JudgeConfig:
         table = table or {}
-        mode = str(table.get("mode", "shadow")).strip().casefold()
-        return cls(mode=mode if mode in ("off", "shadow", "on") else "shadow", digest=bool(table.get("digest", True)))
+        mode = str(table.get("mode", "on")).strip().casefold()
+        return cls(mode=mode if mode in ("off", "shadow", "on") else "on", digest=bool(table.get("digest", True)))
 
 
 # ---------------------------------------------------------------------------
@@ -234,9 +241,10 @@ def moment_class(you: Any, now: float, idle_s: float | None, *, return_hold_s: f
     * ``burst`` - input within :data:`BURST_IDLE_S` in the same activity for :data:`BURST_SAME_S`: mid-typing, never a
       moment (checked first);
     * ``sit_down`` - the stretch settled within :data:`SIT_DOWN_WITHIN_S` (just sat down);
-    * ``switch`` - a new front app held for ``SWITCH_HELD_S``, within :data:`BREAKPOINT_FRESH_S`;
-    * ``after_commit`` - a message sent, a call ended, or a game ended plus its return hold, within
-      :data:`BREAKPOINT_FRESH_S`;
+    * ``after_commit`` - a call or a game ended, plus the return hold, within :data:`BREAKPOINT_FRESH_S`;
+    * ``focus_end`` - a new front app held for ``SWITCH_HELD_S``, within :data:`BREAKPOINT_FRESH_S`, after at least
+      :data:`FOCUS_END_S` on one thing (the previous switch, else the stretch's start);
+    * ``switch`` - the same, after a shorter stretch (a hop: not a break);
     * ``calm`` - no input for :data:`CALM_IDLE_S` or more;
     * ``steady`` - anything else (active input, no breakpoint), and every case with the input time unknown (the
       fallback reads the breakpoints alone, §10.3).
@@ -246,8 +254,8 @@ def moment_class(you: Any, now: float, idle_s: float | None, *, return_hold_s: f
     pres = (you or {}).get("presence") or {}
     changed = (you or {}).get("changed") or ()
     sess = pres.get("session") or {}
-    switches = [float(c["at"]) for c in changed if c.get("kind") == "switch" and c.get("at") is not None]
-    marks = [x for x in ((max(switches) if switches else None), sess.get("start"), pres.get("at_pc_since"))
+    switches = sorted(float(c["at"]) for c in changed if c.get("kind") == "switch" and c.get("at") is not None)
+    marks = [x for x in ((switches[-1] if switches else None), sess.get("start"), pres.get("at_pc_since"))
              if x is not None]
     same_since = max(float(x) for x in marks) if marks else now
     if idle_s is not None and idle_s < BURST_IDLE_S and now - same_since >= BURST_SAME_S:
@@ -255,17 +263,18 @@ def moment_class(you: Any, now: float, idle_s: float | None, *, return_hold_s: f
     settled_at = pres.get("settled_at")
     if settled_at is not None and 0.0 <= now - float(settled_at) <= SIT_DOWN_WITHIN_S:
         return "sit_down"
-    if switches and 0.0 <= now - (max(switches) + SWITCH_HELD_S) <= BREAKPOINT_FRESH_S:
-        return "switch"
     for c in changed:
         at = c.get("at")
-        if at is None:
+        if at is None or c.get("by") == "yuki":
             continue
-        kind = c.get("kind")
-        if kind in ("message_sent", "call_end") and c.get("by") != "yuki" and 0.0 <= now - float(at) <= BREAKPOINT_FRESH_S:
+        if c.get("kind") in ("call_end", "game_end") and 0.0 <= now - (float(at) + return_hold_s) <= BREAKPOINT_FRESH_S:
             return "after_commit"
-        if kind == "game_end" and 0.0 <= now - (float(at) + return_hold_s) <= BREAKPOINT_FRESH_S:
-            return "after_commit"
+    if switches and 0.0 <= now - (switches[-1] + SWITCH_HELD_S) <= BREAKPOINT_FRESH_S:
+        last = switches[-1]
+        before = [s for s in switches[:-1] if s < last]
+        start = pres.get("at_pc_since")
+        prev = before[-1] if before else (float(start) if start is not None else None)
+        return "focus_end" if prev is not None and last - prev >= FOCUS_END_S else "switch"
     if idle_s is not None and idle_s >= CALM_IDLE_S:
         return "calm"
     return "steady"
@@ -310,6 +319,7 @@ class _TypeStats:
     lines: list[tuple[float, bool]] = field(default_factory=list)   # (shown_at, engaged) of Today lines
     less: list[float] = field(default_factory=list)                 # "Less of these" (reacted_at)
     dismissed: int = 0
+    no_at: float = 0.0                                              # the latest "no" (Not now / Less of these)
     writer_calls: int = 0
     writer_none: int = 0
     writer: list[tuple[float, bool]] = field(default_factory=list)  # (at, none or suppressed) of writer calls
@@ -387,6 +397,8 @@ class Ledger:
                 s.less.append(float(reacted_at))
             elif reaction == "dismissed":
                 s.dismissed += 1
+            if reaction in ("less", "dismissed") and reacted_at is not None:
+                s.no_at = max(s.no_at, float(reacted_at))
         digest = self._json(DIGEST_STATE)
         reactions = self._json(DIGEST_REACTIONS_STATE)
         for nid, lines in digest.items():
@@ -550,6 +562,11 @@ class Ledger:
 
     def multiplier(self, klass: str) -> float:
         return float(self._mult.get(klass, 1.0))
+
+    def resting(self, t: str, now: float) -> float | None:
+        """Until when a "no" on this type (Not now, Less of these) keeps it quiet (:data:`NO_REST_S`), or None."""
+        at = self.stats(t).no_at
+        return at + NO_REST_S if at and now < at + NO_REST_S else None
 
     def feedback(self, t: str) -> str:
         """One line of counts for the writer's CARD FEEDBACK block (content-free)."""
@@ -1337,7 +1354,7 @@ class CardJudge:
         first = holds(you, now, sw, cfg, type="*")
         only = CALL_UNKNOWN_GENERATORS if first.reason == "H3:call_unknown" else None
         ctx = Context(self.store, you, now, cfg, self.seen, live=live, memo=self.memo,
-                      lane=self.lane if live else None)
+                      lane=self.lane if live else None, worker=self.worker if live else None)
         pile = generate(ctx, only=only)
         self.last_pile = pile
         self._tell_errors(now, ctx.errors)
@@ -1378,6 +1395,8 @@ class CardJudge:
             if c.urgency in ("deadline", "asked"):
                 if c.type == "routine":   # B2: the routine keeps its routine_per_day
                     b = budget(hist, now, cfg, type=c.type, urgency=c.urgency)
+                    if b.allow:
+                        b = self._routine_moment(c, now, klass, you)
                     if not b.allow:
                         self._wait(now, cfg, c, b.reason or "budget")
                         deadlines.append(b.retry_at)
@@ -1399,6 +1418,9 @@ class CardJudge:
                 else:
                     self._queue(now, cfg, c)
                     queued_now.add(c.key)
+                continue
+            if self.ledger.resting(c.type, now) is not None and c.type not in ("today", "away"):
+                self._wait(now, cfg, c, "B5:no")   # quiet for that kind after a "no"
                 continue
             fit = c.confidence * timing
             if mode == "best" and (klass not in BEST_CLASSES or hist.shown_today(now, cfg, c.type)):
@@ -1453,6 +1475,24 @@ class CardJudge:
         self._schedule(now, deadlines + self._waiting_deadlines(),
                        waiting=bool(self.waiting) or self._today_wait is not None)
         self._publish(now, cfg, hist)
+
+    @staticmethod
+    def _routine_moment(c: Candidate, now: float, klass: str, you: Any = None) -> Any:
+        """The routine card's moment (18 Oct): its window opens 20 minutes before the usual time so that it waits for
+        the user to sit down. Before ``lead_at`` (the lane's lead before the usual time) it shows only at a natural
+        break (:data:`BREAK_CLASSES`: sitting down, a call or game just over, a long focus stretch ending) or within
+        :data:`SIT_DOWN_WITHIN_S` of coming back to the PC (the policy already held it ``routine_settle_s``); from then
+        on at any moment but mid-typing. Content-free decision (``attend.Decision``)."""
+        from yuki.memory.attend import ALLOW, Decision
+
+        lead_at = (c.refs or {}).get("lead_at")
+        if klass == "burst":
+            return Decision(False, "moment:burst")
+        back = ((you or {}).get("presence") or {}).get("at_pc_since")
+        just_back = back is not None and 0.0 <= now - float(back) <= SIT_DOWN_WITHIN_S
+        if lead_at is not None and now < float(lead_at) and klass not in BREAK_CLASSES and not just_back:
+            return Decision(False, f"moment:{klass}", float(lead_at))
+        return ALLOW
 
     # -- choosing ------------------------------------------------------------------------------------------------
 
@@ -1729,7 +1769,14 @@ class CardJudge:
         (``{"outcome": card | none | suppressed:<why> | error, "text", "offer", "evidence", "mentions", "checkin"}``)."""
         if not c.needs_writer:
             text = resolve(c.text)
-            return {"outcome": "card" if text else "suppressed:no_text", "text": text, "offer": None, "checkin": None,
+            offer = None
+            if text and c.offer is not None:   # a code card's own offer (the "usual" card's run_skill), made after its text
+                try:
+                    offer = c.offer() if callable(c.offer) else c.offer
+                except Exception:  # noqa: BLE001
+                    offer = None
+            return {"outcome": "card" if text else "suppressed:no_text", "text": text,
+                    "offer": offer if isinstance(offer, dict) else None, "checkin": None,
                     "evidence": list(c.evidence), "mentions": []}
         hit = self._cached(c.key, now)
         if hit is not None:

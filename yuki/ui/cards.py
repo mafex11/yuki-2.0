@@ -24,16 +24,19 @@ KIND_TITLES: dict[str, str] = {
 NOTICE_TITLES: dict[str, str] = {
     "notice": "Noticed", "stuck": "Noticed", "recap": "After your call", "followup": "Asking",
     "recall": "From memory", "thread": "Your work", "plans": "Coming up",
-    # the routine card (yuki.memory.routine_offers, PLAN.md Phase R): the user's usual moment, offered by code
-    "routine": "Your usual",
+    # the routine card (yuki.memory.routine_offers, PLAN.md Phase R): the user's usual moment, offered by code; the
+    # card judge's "usual" card (yuki.memory.candidates.gen_usual): their media at their usual time, offered by code
+    "routine": "Your usual", "usual": "Your usual",
     # the card judge's digests (yuki.memory.cardjudge, jSwitch): the Today card without a head question, and the
     # "While you were away" list
     "today": "Today", "away": "While you were away",
 }
 #: The card judge's digest cards (their trigger): numbered lines, each with its id (``lines``).
 DIGEST_TRIGGERS: tuple[str, ...] = ("today", "away")
-#: The routine card's trigger (its heading is :data:`NOTICE_TITLES` ``routine``).
+#: The routine card's trigger (its heading is :data:`NOTICE_TITLES` ``routine``), and the usual card's: both are a
+#: "Your usual" card with a run_skill button.
 ROUTINE_TRIGGER = "routine"
+ROUTINE_TRIGGERS: tuple[str, ...] = (ROUTINE_TRIGGER, "usual")
 #: A check-in's heading by the moment Yuki itself wrote on its card (``yuki.memory.checkins.MOMENTS``; the card's
 #: ``moment``), and the heading of a check-in whose moment is not on its row.
 CHECKIN_TITLES: dict[str, str] = {"day_start": "Today", "new_thread": "Your new thread", "followup": "Following up",
@@ -172,9 +175,9 @@ def offer_lines(nudge: dict[str, Any] | None) -> str:
 
 
 def routine_card(nudge: dict[str, Any] | None) -> bool:
-    """Whether a card is the "Your usual" routine card (an observation card of trigger ``routine``)."""
+    """Whether a card is a "Your usual" card (an observation card of trigger ``routine`` or ``usual``)."""
     n = nudge or {}
-    return str(n.get("kind") or "") == "notice" and str(n.get("trigger") or "") == ROUTINE_TRIGGER
+    return str(n.get("kind") or "") == "notice" and str(n.get("trigger") or "") in ROUTINE_TRIGGERS
 
 
 def offer_why(nudge: dict[str, Any] | None) -> str:
