@@ -331,6 +331,9 @@ class Executor:
         self.acting = False
         self.replans = 0
         self.revision = 0
+        #: kBrain: the lines of parts an earlier plan of this request did, its own skill's check seeing them (a later
+        #: part stopped that plan): said first in the request's line (``done.parts_done``).
+        self._parts_before: list[str] = []
         self.trace: list[dict[str, Any]] = []
         self.numbers: set[int] = set()
         self.typed_pending: dict[int, str] = {}
@@ -395,10 +398,12 @@ class Executor:
 
     def begin(self, head: Any) -> None:
         """A new plan (or a revision): its header (goal .. question) closed in the stream. Steps already done stay
-        done; a revision lists only what is left (or what it redoes)."""
+        done; a revision lists only what is left (or what it redoes). kBrain: the parts the plan before it did and its
+        own skill saw done (a later part stopped it) are kept, so the request's line says them too."""
         self._join_reads()
         if self._result is not None and self._result.status == "mismatch":
             self.replans += 1          # a replan after a mismatch counts; one after the user's own words does not
+            self._parts_before.extend(self._parts_seen())
         self._reset_plan()
         self.revision += 1
         self.head = head
@@ -2127,12 +2132,7 @@ class Executor:
                 result = done.skill_done(deciding.outcome, drafted=deciding.drafted, sends=sends,
                                          type_after=deciding.type_after, typed=deciding.typed)
         else:
-            entry = {"process_name": self.last_act.get("app") or "", "title": self.last_act.get("title") or ""}
-            probe, args, _why = done.plan_done(self.head)
-            # x9: page_at reads the page of the browser this request named (never a page in another browser)
-            result = done.pick_done(self.head, env, hwnd=self.last_act.get("hwnd"), last_window=entry,
-                                    cancelled=self.host.cancelled,
-                                    args=self._probe_args(probe, args) if args is not None else None)
+            result = self._pick_done(env)
         self._last_done = result
         self._emit_log("done_check", check=result.probe, result={True: "done", False: "false", None: "unverified"}[
             result.verdict], level=result.level, covered=len(result.covered), uncovered=len(result.uncovered))
@@ -2154,6 +2154,43 @@ class Executor:
         final = done.outcome(result, self.trace, step_words=self._step_words(), refused=self._refused_count())
         return RunResult("done", plan_id=self.plan_id, statuses=list(self.statuses), done=result, line=result.line,
                          final=True, outcome=final, reads=list(self.read_results))
+
+    def _part(self, run: _SkillRun) -> done.DoneResult:
+        """One ``run_skill`` part of this plan, by its own skill's check."""
+        sends = consent.skill_sends(util.skill(run.key), run.slots, partial=False)
+        return done.part_result(run.outcome, drafted=run.drafted, sends=sends, type_after=run.type_after,
+                                typed=run.typed)
+
+    def _parts_seen(self) -> list[str]:
+        """The lines of this plan's ``run_skill`` parts whose own check saw them done (kept across a replan)."""
+        out: list[str] = []
+        for run in self.skill_outcomes:
+            try:
+                result = self._part(run)
+            except Exception:  # noqa: BLE001 - a part not read is not said
+                continue
+            if result.verdict is True and result.line:
+                out.append(result.line)
+        return out
+
+    def _pick_done(self, env: done.ProbeEnv) -> done.DoneResult:
+        """A plan the planner checks (no skill route, no send or join): each ``run_skill`` part by its own skill's
+        check, and the plan's ``done`` probe for the part done by steps. A plan whose every act step is a skill and
+        whose ``done`` is none is decided by its parts alone (kBrain: "play my Japanese playlist and turn it down",
+        0 of 6 in live test 1, is two parts, each checked)."""
+        parts = [self._part(run) for run in self.skill_outcomes]
+        probe, args, _why = done.plan_done(self.head)
+        only_skills = all(self._verb(s) == "run_skill" for s in self.steps if self._verb(s) in ACT_VERBS)
+        if (parts or self._parts_before) and probe == done.NONE and only_skills:
+            return done.parts_done(parts, before=self._parts_before)
+        entry = {"process_name": self.last_act.get("app") or "", "title": self.last_act.get("title") or ""}
+        # x9: page_at reads the page of the browser this request named (never a page in another browser)
+        result = done.pick_done(self.head, env, hwnd=self.last_act.get("hwnd"), last_window=entry,
+                                cancelled=self.host.cancelled,
+                                args=self._probe_args(probe, args) if args is not None else None)
+        if not parts and not self._parts_before:
+            return result
+        return done.parts_done([*parts, result], before=self._parts_before)
 
     def _deciding_skill(self, cls: str) -> _SkillRun | None:
         """The ``run_skill`` step whose capability's own check decides the plan. A send plan: the last one that sent

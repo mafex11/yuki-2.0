@@ -975,6 +975,57 @@ def skill_done(outcome: Any, *, drafted: bool = False, sends: bool = False, type
                       send="unconfirmed" if sends else None)
 
 
+#: kBrain: a part whose own check couldn't read it, said when its skill gave no line of its own.
+LINE_PART_UNCONFIRMED = "I couldn't confirm the other part"
+#: The same for a part its check read as not done.
+LINE_PART_FAILED = "the other part didn't take"
+
+
+def part_result(outcome: Any, *, drafted: bool = False, sends: bool = False, type_after: bool = False,
+                typed: bool | None = None) -> DoneResult:
+    """kBrain: one part of a plan of several, by its own skill's check (:func:`skill_done`). A part whose skill gave no
+    line of its own is said as a part ("I couldn't confirm the other part"), never the whole request's generic line."""
+    result = skill_done(outcome, drafted=drafted, sends=sends, type_after=type_after, typed=typed)
+    if not (engine_line(outcome) if outcome is not None else "") and not drafted:
+        if result.verdict is None:
+            result.line = LINE_PART_UNCONFIRMED
+        elif result.verdict is False:
+            result.line = LINE_PART_FAILED
+    return result
+
+
+def parts_done(parts: Sequence[DoneResult], *, before: Sequence[str] = ()) -> DoneResult:
+    """kBrain: a request of several parts (one ``run_skill`` step per part, a part done by steps read by the plan's
+    own probe) as one result, each part said in its own words, in order: done only when every part's check saw it
+    (``verified`` when every one is, else ``likely``); one part read as not done fails it (``partial`` when another
+    took); otherwise not confirmed. ``before``: the lines of parts an earlier plan of this request already did (its
+    later part stopped it), said first. One part and nothing before: that part's result as it is."""
+    parts = [p for p in parts if p is not None]
+    if len(parts) == 1 and not before:
+        return parts[0]
+    lines: list[str] = []
+    for line in [*before, *(p.line for p in parts)]:
+        text = " ".join(str(line or "").split()).rstrip(" .")
+        if text and text not in lines:
+            lines.append(text)
+    verdicts = [p.verdict for p in parts]
+    if parts and all(v is True for v in verdicts):
+        verdict = True
+        level = util.VERIFIED if all(p.level == util.VERIFIED for p in parts) else util.LIKELY
+    elif any(v is False for v in verdicts):
+        verdict, level = False, util.FAILED
+    else:
+        verdict, level = None, util.UNVERIFIED
+    line = "; ".join(lines) + "." if lines else ""
+    if line:
+        line = line[0].upper() + line[1:]
+    sends = [p.send for p in parts if p.send]
+    return DoneResult(verdict, level, line, seen="; ".join(p.seen for p in parts if p.seen), probe="parts",
+                      covered=[c for p in parts for c in p.covered], uncovered=[u for p in parts for u in p.uncovered],
+                      recheck=any(p.recheck for p in parts), evidence={"parts": len(parts) + len(before)},
+                      send=sends[-1] if sends else None)
+
+
 def seed_done(seed: Mapping[str, Any], env: ProbeEnv) -> DoneResult:
     """A skill-seeded plan's fixed done-check (the pinned skill's ``done`` spec, its onset ``baseline``): the line is
     the skill's own done words."""
@@ -1218,4 +1269,5 @@ __all__ = ["COMMIT_MOMENTS", "COVERS", "DONE_BUDGET_S", "ENGINE_PROBES", "EXPECT
            "allowed_probes", "as_hwnd", "claim_for", "coverage", "engine_line", "find_named", "line_for",
            "not_confirmed", "outcome", "overview", "own_check", "parse_args", "pick_done", "plan_class", "plan_done",
            "probe_name", "read", "recheck_later", "seed_done", "seen_words", "skill_done", "stuck", "wait_read",
+           "part_result", "parts_done", "LINE_PART_UNCONFIRMED", "LINE_PART_FAILED",
            "window_of", "with_browser", "env_acted", "unread_line", "observe_seed", "PAGE_KIND_WORDS"]
