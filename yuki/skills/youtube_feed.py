@@ -954,10 +954,29 @@ def attributed(store: Any, page_rows: Iterable[Mapping[str, Any]],
     return out
 
 
+#: :func:`by_channel` is kept in RAM this long per store and hour (the chooser asks it on every judged pick).
+BY_CHANNEL_TTL_S = 600.0
+_by_channel_lock = threading.Lock()
+_by_channel_cache: dict[tuple[int, int, int], tuple[float, dict[str, dict[str, Any]]]] = {}
+
+
 def by_channel(store: Any, *, since: float, now: float) -> dict[str, dict[str, Any]]:
     """``{channel_key: {"secs", "videos", "titles"}}``: what the user watched of each channel in ``[since, now)``
-    (watch seconds, how many videos, the titles they watched longest first: RAM only, for the chooser's judgement).
-    Never raises (``{}``)."""
+    (watch seconds, how many videos, the titles they watched longest first: RAM only, for the chooser's judgement),
+    kept :data:`BY_CHANNEL_TTL_S`. Never raises (``{}``)."""
+    key = (id(store), int(since // 3600), int(now // 3600))
+    with _by_channel_lock:
+        got = _by_channel_cache.get(key)
+        if got is not None and time.monotonic() - got[0] < BY_CHANNEL_TTL_S:
+            return got[1]
+    out = _by_channel(store, since=since, now=now)
+    with _by_channel_lock:
+        _by_channel_cache.clear()
+        _by_channel_cache[key] = (time.monotonic(), out)
+    return out
+
+
+def _by_channel(store: Any, *, since: float, now: float) -> dict[str, dict[str, Any]]:
     try:
         seen = watched(store, since=since, now=now)
         vids = {str(v["video_key"]): v for v in store.yt_videos(video_keys=list(seen)) if v.get("channel_key")}

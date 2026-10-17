@@ -66,6 +66,24 @@ playlist a minute after "Japanese" was paired with ネオン; "something chill" 
   say that name by identity or sound. The Spotify driver asks it after its Library read and, once its own check sees
   the row play, keeps those words as another name of the row (:func:`note` ``said_as``): the next time is by identity,
   with no judgement. Content goes to the model only, never to a log.
+
+**Time, not clicks** (kTaste, 17 Oct audit; research 4.3: YouTube says a click misleads): a pick weighs the units of
+what then played (:func:`yuki.skills.youtube_feed.units`, five minutes = one): a watched video its page's media seconds,
+a playlist the app's own playing spans until the next pick, a visit to an entity's own page alone
+:data:`VISIT_UNITS`; a sitting (:data:`SESSION_GAP_S`) sums its picks up to :data:`SESSION_UNITS`. ``n_obs`` is those
+decayed units.
+
+**"Something I'd like"** (kTaste, contract C2, audit 17 Oct decision 2): when the user asks Yuki to choose ("a video I
+like", "something chill", "put something on"; ``run_skill`` slots ``choose = true`` and ``context``), :func:`choose`
+picks like a recommender among the user's own candidates (:data:`CHOOSE_KINDS`: a channel's new or unwatched upload, a
+channel, a playlist): their taste at this hour and kind of day plus a share of their all-time weight, halved per recent
+skip, a video weighted by how new it is; the user's words judged over the best :data:`CHOOSE_N` by the voice's small
+model on what each holds (bounded; the habit order stands when it is late; no word lists). The engine plays the top
+pick and says it with a code-written why (:func:`choice_line`: "Putting on Deji's new one - it's out today, and you
+usually watch them around lunch."); :func:`chosen` keeps it for the conversation, so "another one" / "not that" takes
+the next (another channel first), and notes it, so a pick changed or closed within :data:`SKIP_S` counts as a skip.
+Never with a game in front or in a call (:func:`held_line`). Yuki's own pick is a guess (:data:`GUESS_FILLS`): it
+never feeds the taste it came from.
 """
 
 from __future__ import annotations
@@ -286,7 +304,8 @@ def find(store: Any, kind: str, name: str) -> Taste | None:
 def offered(store: Any, *, now: float | None = None) -> list[Taste]:
     """The fresh uploads named aloud after a request in the last minutes (:func:`yuki.skills.youtube_feed.offered`), as
     tastes: the name said (the channel's), the video's link, its key. What "the Deji one" is matched against, for a
-    slot that :func:`takes_offers` (``web.open_video``'s ``video``: a video nobody picked never plays). Never raises
+    slot that :func:`takes_offers` (``web.open_video``'s ``video``: the taste fill never guesses a video; one nobody
+    named plays only when the user asked Yuki to choose, :func:`choose`). Never raises
     (``[]``)."""
     try:
         from yuki.skills import youtube_feed
@@ -1313,9 +1332,12 @@ TOTAL_W = 0.1
 FRESH_FLOOR = 0.3
 AGE_DAYS = 7.0
 #: A video candidate comes from the feeds of the best this-many channels (read when older than an hour, within
-#: ``youtube_feed.REQUEST_BUDGET_S``), at most two unwatched uploads per channel (the second weighs this much less).
+#: :data:`CHOOSE_FEED_S`), at most two unwatched uploads per channel (the second weighs this much less).
 CHOOSE_CHANNELS = 8
 SECOND_W = 0.7
+#: How long a pick waits for those feeds (a slower one finishes on its own and serves the next pick; feeds are kept an
+#: hour, so only the first pick of an hour waits).
+CHOOSE_FEED_S = 1.0
 #: The judgement of the user's words over the candidates: at most this many, bounded by this long (one small model
 #: call; the habit order stands when it is late).
 CHOOSE_N = 8
@@ -1727,7 +1749,7 @@ def choose(store: Any, kind: str, *, words: Any = (), context: str = "", session
             if kind == "video":
                 from yuki.skills import youtube_feed
 
-                budget = youtube_feed.REQUEST_BUDGET_S if feed_budget_s is None else float(feed_budget_s)
+                budget = CHOOSE_FEED_S if feed_budget_s is None else float(feed_budget_s)
                 cands = _videos(store, cands, now, network=network, log=log, budget_s=budget)
         given = set(state.get("keys") or [])
         left = [c for c in cands if c.key not in given]
