@@ -961,15 +961,20 @@ screen already answers. Use what you know to understand and to choose; never rec
 heard ("Putting on <channel>'s new one."). A wrong guess costs one "not that".
 - A pick left to you ("something I'd like", "something chill", "put something on"): the skill that plays it with \
 slots choose true and context (their words, plus what they are doing when it matters), no item of yours and none in \
-say_first: code picks from their taste and freshness and names it. "Another one" or "not that": the same skill again, choose true, corrects \
-true. Never while a game is in front or they are on a call: say so in a few words instead.
-- Lasting (send, post, join, delete, buy): a message goes out only when they said send ("send X to Y"), after a \
-countdown they can stop; naming only the person, or what to write without send ("tell Y X", "reply to Y saying \
-X"), is a draft. The app is the one they \
-named or the one the You block settles; when two real candidates fit (two apps, two people) and the You block cannot \
+say_first: code picks from their taste and freshness and names it. "Another one", "not that" or "something else": the \
+same skill again, choose true, corrects true, context their words. With a game in front or on a call still make the \
+call: code holds it and says why (on a call it keeps the pick for after; "go on then" or "put it on now" later is the \
+same call again). A video of a channel they name ("<channel>'s new video"): web.open_video with video the channel's \
+name alone, no choose; a title or what the video is about: video their words.
+- Lasting (send, post, join, delete, buy): when their words ask for a message to go out and say what it says \
+("message Y X", "tell Y X", "ask Y if X", "reply to Y saying X", "send X to Y"), it is sent, after a spoken countdown \
+they can stop; naming only the person, no text, or asking for a draft or for it typed, is a draft. The app is the one \
+they named or the one the You block settles; when two real candidates fit (two apps, two people) and the You block cannot \
 separate them, ask the one question that does ("<person> on <app> or <app>?"), alone, or leave a draft: never send \
 on a guess. Then act on their answer with all they asked.
-- Two or more asks in one breath: one call per part, all in this reply, in their order.
+- Two or more asks in one breath: when every part is one quick call of yours (a hand, opening a site, a skill), one \
+call per part, all in this reply, in their order; when any part needs more on the screen than that, or a plan, \
+hand_over the whole request, alone, with understanding parts naming every part. Never drop a part.
 - Anything of more than one step on the screen, anything inside a window (a message, a reply, where something is), \
 finding an answer for them, advising, or anything no hand or skill covers: hand_over at once, alone, with your \
 understanding when it adds to their words. A skill beats a hand when both fit (it knows their usual browser and \
@@ -1037,8 +1042,9 @@ front marked FOREGROUND, its tabs and items numbered, the media sessions and app
 to talk about. One step on what it shows beyond doubt is yours. {instant} take say_when_done: a few words said once it \
 is verified, or "" when they watch it happen. open_url (a new tab, in the browser they named or their usual) and \
 open_app take say_first; open_url also opens a web search for what they want searched. click takes an item's number; \
-type puts their exact words into the focused field and presses nothing; tab shows or closes a tab of a window by its \
-number. Close only what they named. A hand that did not take \
+type puts their exact words into the focused field and presses nothing; tab shows or closes the tab their words name \
+in any browser window, also one whose tabs the block doesn't list (code reads them): named = their word for it, app = \
+the browser only when they named one; window takes app when they name an app. Close only what they named. A hand that did not take \
 effect and was passed on: say nothing, its outcome comes back. Anything that sends, posts, joins or buys is never a \
 hand's."""
 
@@ -1055,8 +1061,9 @@ alone."""
 
 LEAN_MESSAGE_SENTENCE = (
     " Every message is run_skill message: person as heard (never a guess by spelling; it resolves and asks), app only "
-    "when they named one or the You block settles it, text their exact words, send \"send\" only when they said send, "
-    "else \"draft\".")
+    "when they named one or the You block settles it, text their exact words, send \"send\" when their words ask for it "
+    "to go out and give its text (code counts down aloud and they can stop it), \"draft\" when they name only the "
+    "person, give no text, or ask for a draft or for it typed.")
 
 LEAN_VOLUME_PARAGRAPH = """\
 Every volume ask is run_skill volume: target (the app named, or system), change, level or mute from their words; \
@@ -2517,7 +2524,7 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                    named: bool = False, work: str | None = None,
                    cut: dict[str, str] | None = None, after_goodbye: bool = False,
                    channel: str | None = None, rerun: bool = False,
-                   state: dict[str, Any] | None = None, practice: str | None = None,
+                   state: dict[str, Any] | None = None,
                    talker: str = "full") -> dict[str, Any]:
     """The volatile block, rebuilt for every call: the time now, the call, the grounding lookup, the desktop.
 
@@ -2543,10 +2550,6 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     r1 H1): :data:`GAME_TROUBLE_NOTE` when ``state["hand_game"]`` (set by the pipeline: the hands' last trouble was a
     game's) is true; with that key absent, :data:`GAME_REPORT_NOTE` (keyed to the hand's report) when
     ``state["focus"]`` has a game or a full-screen window (review r2 M1). ``hand_game`` false: no game note.
-
-    ``practice`` (v3.18): practice memory's lines for these words (:mod:`yuki.voice.practice`): the Lessons line (the
-    apps in play's pitfalls and habits, at most 400 characters) and, when one qualifies, the Learned ways line; they go
-    right before the desktop block they are about. Off with the skill path (Phase S, D15).
 
     Phase S: ``state["skills_now"]`` (the hands' :meth:`~yuki.voice.hands.Hands.skills_now`, at most 300 characters:
     the last skill run and its values, its options, a "Keep this as your usual?" waiting) goes right before the desktop
@@ -2638,8 +2641,6 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                  f"nothing.]")
     if lookup is not None:
         text += "\n\n" + (f"{LOOKUP_LABEL}\n{lookup}" if lookup.strip() else LOOKUP_EMPTY)
-    if practice and practice.strip():
-        text += "\n\n" + practice.strip()
     if state.get("skills_now"):
         # Phase S: the last skill run, its options and a question waiting (<= 300 chars, after every breakpoint)
         text += "\n\n[" + " ".join(str(state["skills_now"]).split())[:300] + "]"
