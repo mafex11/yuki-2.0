@@ -165,6 +165,10 @@ BAR_BEFORE_S = 0.8
 BAR_BEFORE_WINDOWS = 4
 BAR_BEFORE_WINDOW_S = 0.35
 FIELD_READ_S = 1.5
+#: fSkills: the frame-field reads that may settle (focus not yet on an element, or the climb cut short), read once more
+#: after this long; a timeout or a failed read is not retried (review L3).
+FIELD_SETTLING = ("no_focus", "climb_cut")
+FIELD_SETTLE_S = 0.2
 BAR_PAGE_S = 4.0
 BAR_PAGE_MIN_S = 1.5
 BAR_FLOOR_S = 8.0
@@ -1326,7 +1330,7 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
         return RouteResult(ran=False, outcome="handoff_ignored", facts={"browser_from": source}), \
             name, key, source, {}
     _claim_app(call, key)
-    tabs_before = _tabs_now([h for h, _pid in _app_windows(key)]) if key else {}
+    tabs_before = _tabs_before(key, url) if key else {}
     result = _open_url(url, name if named else None, _launch_deadline(call))
     if _held_by_game(result):
         return RouteResult(ran=False, held="game", outcome="refused"), name, key, source, {}
@@ -1397,15 +1401,13 @@ def page_address(site_word: Any, page_word: Any = None, item: Any = None) -> tup
     page = _words(page_word).casefold()
     if not name:
         return None, {"why": "no_site"}
-    data = site_data(name) if name.replace("_", "").isalnum() else {}
-    if not data and domain_like(name):
-        m = page_of(f"https://{name}/")
-        if m is not None:
-            name, data = m.site, site_data(m.site)
+    filed = site_file(name)
+    data = site_data(filed) if filed else {}
     if not data:
         if domain_like(name) and not page:
             return f"https://{name}/", {"host": name}
         return None, {"why": "no_address"}
+    name = filed
     info = data.get("site") or {}
     if not page or page == "home":
         hosts = [str(h) for h in info.get("hosts") or []]
@@ -1462,11 +1464,13 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
     channel"`` for the user's NDL; both pages were dropped and YouTube's front page opened, or nothing): a site page's
     kind and value as the site's data and the user's own names read them: ``(page kind, item, how)``.
 
-    * a page that is one of the site file's page kinds stays (``kind``: data, like an option of an enum);
-    * a value given as the page that is no page kind (or as the item, with no page) is the item of the site's
-      speakable page kind (``taste.site_kinds``: YouTube's ``handle``) whose user's own names (``taste.candidates``)
-      hold it as written (``listed``), or by sound, the value itself or a run of its words (``heard``,
-      ``taste.heard_as``: "MBL" for NDL, only among their own names); the item then takes that name;
+    * the item given (or a value given as the page that is no page kind) that one of the user's own names of the
+      site's speakable page kind (``taste.site_kinds``: YouTube's ``handle``; ``taste.candidates``) holds as written
+      (``listed``), or by sound, the value itself or a run of its words (``heard``, ``taste.heard_as``'s closed-set
+      tier: "MBL" for NDL, only among their own names), is that page of that name, whatever page kind came with it
+      (review L4: "channel" + "MBL" is their channel NDL's handle page, never a channel id no link gives);
+    * else a page that is one of the site file's page kinds stays (``kind``: data, like an option of an enum), unless
+      its address takes a value and no item came (review L4: ``page = handle`` alone is no page to open);
     * otherwise ``(None, None, "")``: nothing changed.
 
     Never raises."""
@@ -1477,26 +1481,26 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
         name = site_file(site_word)
         if not name:
             return None, None, ""
-        pages = {str(k).casefold() for k in (site_data(name).get("pages") or {})}
+        pages = {str(k).casefold(): str(v) for k, v in (site_data(name).get("pages") or {}).items()}
         page = _words(page_word).casefold()
         item = _words(item_word if not isinstance(item_word, Mapping) else item_word.get("name"))
-        kinds = [(kind, str(pk)) for kind, site, pk, _var in taste.site_kinds() if site == name]
         said = item or ("" if page in pages else _words(page_word))
-        if not said or not kinds:
-            return (page if page in pages else None), None, ("kind" if page in pages else "")
+        kinds = [(kind, str(pk)) for kind, site, pk, _var in taste.site_kinds() if site == name] if said else []
         for kind, pk in kinds:
-            if page in pages and pk != page:
-                continue
             names = [n for n in taste.candidates(store, kind, now=now) if n]
             exact = next((n for n in names if _words(n).casefold() == said.casefold()), None)
             if exact is not None:
                 return pk, exact, "listed"
-            alike = taste.heard_as(names, said)
-            if alike and any(taste.heard_as([alike], str(w)) or _words(alike).casefold() in str(w).casefold()
-                             for w in words if w):
+            alike = taste.heard_as(names, said, loose=True)
+            if alike and any(taste.heard_as([alike], str(w), loose=True)
+                             or _words(alike).casefold() in str(w).casefold() for w in words if w):
                 return pk, alike, "heard"
+        if page not in pages or (not item and "{" in pages[page]):
+            # no page kind, or one whose address needs a value none came with: nothing changed (the resolver checks
+            # the page as given, and drops it unless the words hold it: the site's front page)
+            return None, None, ""
         # none of their names: a page kind given stays (its item is checked by the resolver as given)
-        return (page, None, "kind") if page in pages else (None, None, "")
+        return page, None, "kind"
     except Exception:  # noqa: BLE001 - nothing changed
         return None, None, ""
 
@@ -1750,6 +1754,41 @@ def _tab_moved(ram: Mapping[str, Any], hwnd: int) -> bool | None:
     if not now or not before:
         return None
     return not set(now) & set(before)
+
+
+def _tabs_before(key: str, url: str) -> dict[int, list[str]]:
+    """fSkills review L2: :func:`_tabs_now` of the browser's top window(s), only when its title (the selected page's
+    own) may show the asked address's site: it holds the site's name (the registrable domain's first label, letters
+    and digits, case aside), or it can't be read. That is the one case the done-check needs the tab's identity for (a
+    new tab on an address already showing); any other open skips the tab walk (~110 ms, up to
+    :data:`FRONT_READ_S`). A title that hides the name only costs that case its identity (the old rule: unchanged)."""
+    windows = [h for h, _pid in _app_windows(key)][:TABS_BEFORE_WINDOWS]
+    if not windows:
+        return {}
+    try:
+        from yuki.memory.moments import registrable_domain
+        from yuki.memory.store import url_host
+
+        label = "".join(ch for ch in registrable_domain(url_host(url) or "").split(".")[0] if ch.isalnum())
+    except Exception:  # noqa: BLE001 - no name to look for: read
+        label = ""
+    worth = [h for h in windows if _title_may_show(h, label)]
+    return _tabs_now(worth) if worth else {}
+
+
+def _title_may_show(hwnd: int, label: str) -> bool:
+    """Whether window ``hwnd``'s title holds ``label`` (letters and digits run together, case aside), or can't tell
+    (no label, no title): a fixed comparison of two spellings, never a list of sites."""
+    if not label:
+        return True
+    try:
+        import win32gui
+
+        title = str(win32gui.GetWindowText(int(hwnd)) or "")
+    except Exception:  # noqa: BLE001
+        return True
+    letters = "".join(ch for ch in title.casefold() if ch.isalnum())
+    return not letters or label in letters
 
 
 def _tabs_now(hwnds: Sequence[int]) -> dict[int, list[str]]:
@@ -2021,10 +2060,12 @@ def route_address_bar(call: RouteCall) -> RouteResult:
         _log_open(call, "address_bar", seen, "other_window")
         return RouteResult(ran=False, outcome="other_window", facts=facts)
     ok, why = frame_field(pid)
-    if ok is None and why in ("timeout", "unread", "no_focus", "climb_cut"):
-        # fSkills (live 18 Oct, Arc: "timeout" right after its command bar opened, then the thinker by steps, 17 s):
-        # read once more after the bar has settled (structure only; still never typed unless it is the frame's field)
-        time.sleep(0.2)
+    if ok is None and why in FIELD_SETTLING:
+        # fSkills (live 18 Oct, Arc: its command bar just opened, then the thinker by steps, 17 s): a read that found
+        # focus still moving is read once more after the bar has settled (structure only; still never typed unless it
+        # is the frame's field). A read that timed out or failed is not (review L3: a blocked provider would only
+        # leave another UIA thread behind and stretch the rung toward 3.2 s): the longer first read covers it
+        time.sleep(FIELD_SETTLE_S)
         ok, why = frame_field(pid)
     facts["stage"] = why
     if ok is not True:

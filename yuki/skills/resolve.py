@@ -323,7 +323,8 @@ def _site_page_given(skill: Skill, given: Mapping[str, Any], words: Sequence[str
     site_slot = next((k for k, v in bind.items() if v == SITE_BIND), None)
     page_slot = next((k for k, v in bind.items() if v == "page"), None)
     item_slot = next((k for k, v in bind.items() if v == "entity"), None)
-    if not (site_slot and page_slot and item_slot) or site_slot not in given or             (page_slot not in given and item_slot not in given):
+    if not (site_slot and page_slot and item_slot) or site_slot not in given or \
+            (page_slot not in given and item_slot not in given):
         return {}
     try:
         from yuki.skills.web_route import site_page
@@ -389,14 +390,15 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
                 told: Any = None, people: Callable[[str], dict[str, Any] | None] | None = None,
                 heard_person: Callable[[str, Sequence[str]], str | None] | None = None,
                 app_names: Callable[[str], tuple[str, list[str]]] | None = None,
-                site: bool = False) -> tuple[bool, Any]:
+                site: bool = False, loose: bool = False) -> tuple[bool, Any]:
     """``(valid, canonical value)`` of one given slot value (step 1). Identity and whole-word spans, plus checks on
     the user's own data: ``heard_person(name, words) -> the person's name | None`` (a person slot, or a text slot
     bound to a contact: the people index resolves the name to exactly one person whom the words name as heard, a
     transliteration or a close mishearing; the value becomes that person's own name, so "Hemant" for "हेमंत" runs
     as Hemanth), ``app_names(value) -> (key, names)`` (an app slot: the app's known names, any of which may stand in
     the words, or be heard there by sound; the app's key is kept) and ``site`` (a text slot the capability binds to a
-    site: the site's identity may stand in the words instead, :func:`_site_said`)."""
+    site: the site's identity may stand in the words instead, :func:`_site_said`). ``loose``: a listed name may also be
+    heard by :func:`yuki.skills.taste.heard_as`'s closed-set tier (the caller's taste slots only; review M2)."""
     if value is None or value == "":
         return False, None
     t = slot.type
@@ -474,8 +476,8 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
         # which the words do hold by sound ("Put on Lumin on Spotify"): that listed name
         from yuki.skills.taste import heard_as
 
-        alike = heard_as(menu_names, text)
-        if alike and any(heard_as([alike], str(w)) for w in words if w):
+        alike = heard_as(menu_names, text, loose=loose)
+        if alike and any(heard_as([alike], str(w), loose=loose) for w in words if w):
             return True, {"name": alike}
     return False, None
 
@@ -1408,7 +1410,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             ok, value = check_value(slot, given[slot.name], sources, menu_names=menu_names or offered,
                                     told=told.get(slot.name), people=people,
                                     heard_person=heard_person if _person_bound(skill, slot) else None,
-                                    app_names=app_names, site=skill.bind.get(slot.name) == SITE_BIND)
+                                    app_names=app_names, site=skill.bind.get(slot.name) == SITE_BIND,
+                                    loose=bool(slot.taste))
             if ok:
                 if slot.taste and isinstance(value, dict) and store is not None:
                     hit = taste.find(store, slot.taste, value.get("name", ""))
@@ -1416,7 +1419,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                         # lSkills (live 17 Oct): "Lumin" heard for lumen, with [playlist: lumen | ネオン] on the menu:
                         # a heard value no row is called that sounds like exactly one of the user's own listed names
                         # is that one (contacts' sound key, onset and spelling distance: data, never a word list)
-                        alike = taste.heard_as(menu_names, value.get("name", ""))
+                        alike = taste.heard_as(menu_names, value.get("name", ""), loose=True)
                         if alike:
                             hit = taste.find(store, slot.taste, alike)
                     if hit is not None:

@@ -357,13 +357,18 @@ class Meant:
     ms: float = 0.0
 
 
-def heard_as(names: Any, said: Any) -> str | None:
+def heard_as(names: Any, said: Any, *, loose: bool = False) -> str | None:
     """lSkills (live 17 Oct: "Lumin" heard for lumen while the talker's menu listed ``[playlist: lumen | ネオン]``):
     the one of ``names`` (the user's own names: the menu's taste candidates, the rows an app showed) that ``said``
     sounds like, or ``None`` (none, two, or ``said`` is one of them as written). Sound only, through the people
     index's own reading of names (:func:`yuki.memory.contacts.sounds_in` with ``short``: the same sound key and onset
     and spellings close enough, "Lumin"/"lumen" 0.25); a name in another script, or with digits, never matches. Data,
-    never a list of words."""
+    never a list of words.
+
+    ``loose`` (fSkills; review M2): with the strict rule finding none, the closed-set tier (:func:`_closest_heard`:
+    spelled initialisms, "soccer" for lumen). Opt-in, only where a wrong pick is named at once and harms nothing (the
+    resolver's taste lookups of the user's own playlists and channels, a site page's channel); never for a call join
+    (Discord's voice channels: a wrong join opens the mic to people the user didn't name) or the judge's name guard."""
     text = " ".join(str(said or "").split())
     if not text:
         return None
@@ -385,7 +390,7 @@ def heard_as(names: Any, said: Any) -> str | None:
             continue
     if hits:
         return next(iter(hits.values())) if len(hits) == 1 else None
-    return _closest_heard(pool, text)
+    return _closest_heard(pool, text) if loose else None
 
 
 #: fSkills (live 18 Oct: "MBL's YouTube channel" heard for the user's channel NDL): how each Latin letter is said when
