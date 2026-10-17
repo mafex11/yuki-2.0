@@ -5,8 +5,9 @@ user used in its value slot (the sites they open, the meeting services whose tab
 they play) are data on that record, never skills of their own. Each value carries:
 
 * ``id`` - a keyed digest of the value (stable across passes; the Playbook's handle; never the value itself);
-* ``slot`` / ``value`` / ``name`` - the slot it fills, the value as the route takes it, and its display name (data: a
-  site's dominant host, the value itself; the user's Rename wins);
+* ``slot`` / ``value`` / ``label`` / ``name`` - the slot it fills, the value as the occasions carried it, its label
+  from data (a site's dominant host, else the value: what a request passes for it) and its name (the label, or the
+  user's Rename);
 * ``n`` / ``days`` / ``said`` / ``first_at`` / ``last_at`` - how often the user did it, on how many days, how often
   they asked Yuki for it, when first and last;
 * ``hours`` (24 counts, local) and ``weekdays`` (7 counts, Monday first) - when;
@@ -170,7 +171,7 @@ def build(group: Any, cap: Any, store: Any, now: float, old: dict[str, dict[str,
                 heard.append(said[:40])
         last = max(o.at for o in its)
         out.append({
-            "id": vid, "slot": ident.name, "value": raw[vid],
+            "id": vid, "slot": ident.name, "value": raw[vid], "label": name,
             "name": prior.get("name") if prior.get("named_by") == "user" and prior.get("name") else name,
             "named_by": prior.get("named_by"),
             "n": len(user), "days": len(days), "said": len(asked),

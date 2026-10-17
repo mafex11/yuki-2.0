@@ -1,108 +1,93 @@
-/* Playbook: how you do things, from practice memory (E13). NEW proposals (a way seen once, or a question Yuki would
-   like to ask) with Save / Edit / No - Edit is your own words, which memory re-distills into the next version;
-   procedures ("How you do things", the 4 Oct item W7: a title and numbered steps per goal, then the app, uses, how
-   sure, where it came from); app choices said plainly ("YouTube: usually Chrome", never the counts behind them);
-   lessons (how you want things, in your own words; a short title and one line, the rest on a click; a mistake of
-   Yuki's is never shown here as something learned, appLearn: only what worked is); standing rules. The blocks under
-   the procedures sit in two columns kept about as tall as each other. Every choice goes to memory's own workflow_edit
-   through Python; nothing here edits memory. Without practice memory: the know-how Yuki keeps today. */
+/* Playbook (audit 17 Oct, learning.md §9.4): what Yuki can do, what it knows you use, your routines, your own ways,
+   then your standing rules. Four sections from memory's playbook() (yuki.skills.playbook.page), said plainly:
+   - What Yuki can do: the built-in skills, one line each, with how often you used each;
+   - What Yuki knows you use: your things by kind (sites, meeting tabs, playlists...), each with how often, when and
+     which app, and Rename / Not mine / This is work (Not work on a work one); the channels and playlists you pick
+     are listed read-only;
+   - Your routines: when, how sure, and the card each leads to;
+   - Your own ways: the multi-step things Yuki learned from you (Rename / Not mine); a plain empty state until then.
+   The buttons live in pages/skills.js and go to memory's own skill_edit through Python; nothing here edits memory.
+   The old practice sections (procedures, proposals, lessons) are gone from the page. */
 (function () {
   'use strict';
-  const Y = window.Yk, { h, ic, key, fmt } = Y;
+  const Y = window.Yk, { h, ic, key } = Y;
 
-  function proposal(p) {
-    const question = p.kind === 'question';
-    const el = Y.clearing('section', 'proposal',
-      h('div', null, h('span', { class: 'newtag' }, ic('plus'), question ? 'New · a question for you' : 'New · learned from watching you'),
-        h('h3', { class: 'ltx', text: p.title }),
-        p.basis ? h('div', { class: 't2', text: p.basis }) : null,
-        (p.steps || []).length ? h('div', { class: 'steps-inline' }, p.steps.map((s, i) => h('span', null, h('span', { class: 'doto', text: i + 1 }), s))) : null),
-      h('div', { class: 'pacts' },
-        question ? key('Answer', { cls: 'pri', data: { do: 'learn-edit' } }) : key('Save', { cls: 'pri', data: { do: 'learn-save' } }),
-        question ? null : key('Edit', { data: { do: 'learn-edit' } }),
-        key(question ? 'Skip' : 'No', { cls: 'ghost', data: { do: 'learn-no' } })));
-    el.dataset.learned = ''; el.dataset.ref = p.ref || ''; el.dataset.kind = p.kind || '';
-    return el;
+  function capRow(c) {
+    return h('div', { class: 'choice', data: { k: 'cap:' + c.key } },
+      h('div', { class: 'c1', text: c.line }), c.used ? h('div', { class: 'c2', text: c.used }) : null);
   }
-  /* a procedure (the 4 Oct item W7a): its goal as the title, the steps numbered 1, 2, 3; one quiet line under them
-     (the app, how often I used it, how sure I am, where it came from) */
-  function procedure(p) {
-    const steps = p.steps || [];
-    return h('div', { class: 'proc2' + (p.disabled ? ' off' : '') + (p.tentative ? ' tent' : ''), data: { k: p.ref || p.title } },
-      h('h4', { text: p.title }), p.when ? h('div', { class: 'when', text: p.when }) : null,
-      steps.length ? h('ol', { class: 'nsteps' }, steps.map((s, i) => h('li', null, h('span', { class: 'n doto', text: i + 1 }), h('span', { class: 's', text: s }))))
-        : h('div', { class: 't3 nosteps', text: 'No steps written down yet.' }),
-      h('div', { class: 'pmeta' }, p.app ? h('b', { text: p.app }) : null,
-        h('span', { text: `used ${fmt.plural(p.uses || 0, 'time')}${p.last ? ', last ' + p.last : ''}` }),
-        p.conf != null ? h('span', { class: 'cf' }, Y.meter(p.conf), ' ', p.disabled ? 'off' : (p.conf_word || '')) : (p.conf_word ? h('span', { text: p.conf_word }) : null)),
-      p.learned ? h('div', { class: 'plearn t3', text: p.learned }) : null);
+
+  function thingRow(t, editable) {
+    const meta = [t.seen, t.when ? 'mostly ' + t.when : '', t.app ? 'in ' + t.app : '', t.last ? 'last ' + t.last : '']
+      .filter(Boolean).join(' · ');
+    const tags = [t.work ? 'work: never offered' : '', t.not_mine ? 'not yours: left out' : '', t.your_name ? 'your name' : '']
+      .filter(Boolean).join(' · ');
+    return h('div', { class: 'proc2' + (t.not_mine ? ' off' : ''), data: editable ? { thing: '', ref: t.ref, name: t.name } : { k: 'n:' + t.name } },
+      h('h4', { text: t.name }),
+      meta ? h('div', { class: 'when', text: meta }) : null,
+      tags ? h('div', { class: 'pmeta' }, h('span', { text: tags })) : null,
+      editable ? h('div', { class: 'acts inline' },
+        key('Rename', { cls: 'xs', data: { do: 'thing-rename' }, title: 'Call it what you call it' }),
+        t.not_mine ? key('Restore', { cls: 'xs ghost', data: { do: 'thing-restore' }, title: 'It is yours after all' })
+          : key('Not mine', { cls: 'xs ghost', data: { do: 'thing-notmine' }, title: 'Leave it out' }),
+        t.work ? key('Not work', { cls: 'xs ghost', data: { do: 'thing-everyday' }, title: 'Yuki may offer it' })
+          : key('This is work', { cls: 'xs ghost', data: { do: 'thing-work' }, title: 'Only when you ask; never offered' })) : null);
   }
-  function howto(k) {
-    return h('div', { class: 'proc2 howto2', data: { k: k.title } }, h('h4', { text: k.title }), k.line ? h('div', { class: 'when', text: k.line }) : null,
-      h('div', { class: 'pmeta' }, k.app ? h('b', { text: k.app }) : null, h('span', { text: k.since ? 'learned ' + k.since : 'learned from a run that worked' })));
+
+  function thingGroup(g) {
+    const items = g.items || [];
+    return Y.k(Y.sec(g.title, items.length, h('div', { class: 'procs' }, items.map((t) => thingRow(t, !!g.editable))),
+      g.editable ? null : Y.rightLabel('what you pick')), 'things:' + g.key);
   }
-  /* an app choice (W7b): "YouTube: usually Chrome", what it settles under it when that says more; never counts */
-  function choice(c) {
-    const line = c.line || c.subject || c.title;
-    const settles = c.title && c.title !== c.subject ? c.title.charAt(0).toUpperCase() + c.title.slice(1) : '';
-    const sub = [settles, c.tentative ? 'seen once' : ''].filter(Boolean).join(' · ');
-    return h('div', { class: 'choice' + (c.disabled ? ' off' : '') + (c.tentative ? ' tent' : ''), data: { k: c.ref || line } },
-      h('div', { class: 'c1', text: line }), sub ? h('div', { class: 'c2', text: sub }) : null);
+
+  function routineRow(r) {
+    return h('div', { class: 'proc2' + (r.state === 'active' ? '' : ' off'), data: { k: 'r:' + r.title + r.when } },
+      h('h4', { text: r.title }),
+      h('div', { class: 'when', text: [r.when, r.sure].filter(Boolean).join(' · ') }),
+      r.card ? h('div', { class: 'when t2', text: r.card }) : null,
+      r.state && r.state !== 'active' ? h('div', { class: 'pmeta' }, h('span', { text: r.state === 'candidate' ? 'still checking' : 'resting' })) : null);
   }
-  /* a lesson (W7c): a short title and one line; the rest (what to do, how often it was used, where it came from) on
-     a click */
-  function lesson(l) {
-    const head = h('span', { class: 'tx' }, h('b', { class: 'lt', text: l.dont }), l.because ? h('span', { class: 'ln', text: l.because }) : null);
-    const body = [l.because ? h('div', { class: 'd', text: l.because }) : null, l.do ? h('div', { class: 'z' }, h('b', { text: 'Do: ' }), l.do) : null,
-      h('div', { class: 'meta2' }, [l.tentative ? 'tentative, seen once' : '', `used ${fmt.plural(l.used || 0, 'time')}`,
-        l.from ? l.from.charAt(0).toLowerCase() + l.from.slice(1) : ''].filter(Boolean).map((x) => h('span', { text: x })))];
-    return Y.fold('lesson:' + (l.ref || l.dont), head, null, body, { cls: 'lesson2' + (l.disabled ? ' off' : '') });
+
+  function wayRow(w) {
+    return h('div', { class: 'proc2', data: { thing: '', ref: w.ref, name: w.name } },
+      h('h4', null, w.name, w.your_name ? h('span', { class: 't3', text: ' · your name' }) : null),
+      [w.seen, w.used].filter(Boolean).length ? h('div', { class: 'when', text: [w.seen, w.used].filter(Boolean).join(' · ') }) : null,
+      h('div', { class: 'acts inline' },
+        key('Rename', { cls: 'xs', data: { do: 'thing-rename' }, title: 'Call it what you call it' }),
+        key('Not mine', { cls: 'xs ghost', data: { do: 'thing-notmine' }, title: 'This isn’t something I do' })));
   }
+
   function ruleRow(r, i) {
     return h('div', { class: 'rule', data: { fact: '', ref: r.ref, kind: r.kind === 'standing' ? 'standing' : 'rule', text: r.text } },
       h('span', { class: 'doto', text: i + 1 }), h('span', { text: r.text }), h('span', { class: 'src', text: r.since || '' }),
       h('div', { class: 'acts' }, key(r.kind === 'standing' ? 'Stop' : 'Forget', { cls: 'xs ghost', data: { do: 'rule-forget' } })));
   }
 
-  /* the blocks under the procedures go to two columns so both stay about as tall while you scroll (W7d): each block,
-     in order, to the shorter column, by a rough height (rows and their text; deterministic, so a live patch never
-     moves a block between columns unless its rows changed) */
-  function balance(blocks) {
-    const cols = [[], []], height = [0, 0];
-    blocks.forEach((b) => { const i = height[1] < height[0] ? 1 : 0; cols[i].push(b.el); height[i] += b.weight; });
-    return cols;
-  }
-
   function build(d) {
-    const props = d.proposals || [], procs = d.procedures || [], know = d.know_how || [], les = d.lessons || [], ch = d.choices || [];
+    const caps = d.can_do || [], groups = d.things || [], rts = d.routines || [], ways = d.ways || [];
     const rules = (d.rules || []).concat((d.standing || []).map((s) => Object.assign({ kind: 'standing' }, s)));
-    const practice = !!d.workflows_available;
-    const nProc = practice ? procs.length : know.length;
-    const meta = [h('span', { text: 'How you do things' }),
-      h('span', null, h('b', { text: nProc }), practice ? (nProc === 1 ? ' procedure, ' : ' procedures, ') : ' things learned, ', h('b', { text: les.length }),
-        les.length === 1 ? ' lesson, ' : ' lessons, ', h('b', { text: props.length }), ' new')];
-    const how = practice
-      ? Y.sec('How you do things', procs.length, procs.length ? h('div', { class: 'procs' }, procs.map(procedure))
-        : Y.empty('Nothing yet. When something works on this PC, how it was done lands here, with how often I used it.'), null, 'how-sec')
-      : Y.sec('What I learned to do', know.length, know.length ? h('div', { class: 'procs' }, know.map(howto))
-        : Y.empty('Nothing yet. When something works on this PC, how it was done lands here.'), null, 'how-sec');
-    const blocks = [];
-    if (practice) {
-      blocks.push({ weight: 3 + (ch.length ? ch.length * 1.7 : 2),
-        el: Y.k(Y.sec('Which app you use', ch.length, ch.length ? ch.map(choice) : Y.empty('Nothing yet. When you keep doing something in the same app, I note it here.'), Y.rightLabel('when you don’t say')), 'choices') });
-    }
-    blocks.push({ weight: 3 + (les.length ? les.length * 2 : 2),
-      el: Y.k(Y.sec('Lessons', les.length, les.length ? h('div', { class: 'lessons2' }, les.map(lesson)) : Y.empty('No lessons yet. When you tell me how you want something done, it lands here, and I show it when I use it.'), les.length ? Y.rightLabel('click one for more') : null), 'lessons') });
-    blocks.push({ weight: 3 + (rules.length ? rules.reduce((n, r) => n + 1.6 + String(r.text || '').length / 70, 0) : 2),
-      el: Y.k(Y.sec('Standing rules', rules.length, rules.length ? rules.map(ruleRow) : Y.empty('No rules yet. Say “always…” or “never…” and it lands here.')), 'rules') });
-    const [left, right] = balance(blocks);
+    const nThings = groups.filter((g) => g.editable).reduce((n, g) => n + (g.items || []).length, 0);
+    const meta = [h('span', { text: 'What Yuki knows about how you do things' }),
+      h('span', null, h('b', { text: nThings }), nThings === 1 ? ' thing of yours, ' : ' things of yours, ',
+        h('b', { text: rts.length }), rts.length === 1 ? ' routine, ' : ' routines, ', h('b', { text: ways.length }),
+        ways.length === 1 ? ' way of yours' : ' ways of yours')];
+    const can = Y.sec('What Yuki can do', caps.length, caps.length ? caps.map(capRow)
+      : Y.empty('Nothing loaded yet.'), Y.rightLabel('built in, for anyone'));
+    const know = groups.length ? groups.map(thingGroup)
+      : [Y.sec('What Yuki knows you use', 0, Y.empty('Nothing yet. The sites, playlists and tabs you use on 2 different days land here, with when and in which app.'))];
+    const routines = Y.sec('Your routines', rts.length, rts.length ? h('div', { class: 'procs' }, rts.map(routineRow))
+      : Y.empty('None yet. When you do the same thing at about the same time on most days, it lands here with the card it leads to.'));
+    const own = Y.sec('Your own ways', ways.length, ways.length ? h('div', { class: 'procs' }, ways.map(wayRow))
+      : Y.empty('None yet. When you do the same multi-step thing your own way on 3 different days, Yuki learns it here and does it your way when you ask.'));
+    const rulesSec = Y.sec('Standing rules', rules.length, rules.length ? rules.map(ruleRow)
+      : Y.empty('No rules yet. Say “always…” or “never…” and it lands here.'));
     // data-k: the blocks' keys for the live patch (app.js patchInto)
-    return [Y.k(Y.head('Playbook', meta, Y.numFig(nProc, practice ? (nProc === 1 ? 'procedure' : 'procedures') : 'learned')), 'head'),
-      props.map(proposal),
-      Y.k(how, 'how'),
-      h('div', { class: 'grid2 pb-grid', data: { k: 'grid' } },
-        h('div', { class: 'col', data: { k: 'left' } }, left),
-        h('div', { class: 'col', data: { k: 'right' } }, right))];
+    return [Y.k(Y.head('Playbook', meta, Y.numFig(nThings, nThings === 1 ? 'thing' : 'things')), 'head'),
+      Y.k(h('div', { class: 'grid2 pb-grid' },
+        h('div', { class: 'col', data: { k: 'left' } }, Y.k(can, 'can')),
+        h('div', { class: 'col', data: { k: 'right' } }, Y.k(routines, 'routines'), Y.k(rulesSec, 'rules'))), 'grid'),
+      Y.k(h('div', null, Y.k(h('div', { class: 'sec-h' }, h('div', { class: 'label' }, ic('dash'), 'What Yuki knows you use')), 'know-h'), know), 'know'),
+      Y.k(own, 'ways')];
   }
 
   /* Forget a rule / stop a standing request: 10 s to undo (Me's Forget), then memory's own op */

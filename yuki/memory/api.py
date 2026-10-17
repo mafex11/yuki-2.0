@@ -106,9 +106,11 @@ Practice memory (migration 29, yuki.memory.practice; learned by the service's pr
     memory.record_hand_trace(session_id, name, args, ok, verified, report, ms, app=, target=, words=,
                              injected=, cited=, control=) -> dict
     memory.practice(words, apps=, open_apps=, detail=False) -> dict    # ways / habits and pitfalls for the apps in play
-    memory.workflows() -> dict                           # the window's Playbook page (+ "skills": what Yuki learned)
+    memory.workflows() -> dict                           # practice ways for the run card's chips
     memory.workflow_edit(ref, "save" | "edit" | "disable" | "enable" | "forget", words="") -> dict
-    memory.skill_edit("skill:N", "rename" | "forget" | "not_mine", words="") -> dict   # a learned skill (phase L)
+    memory.playbook() -> dict                            # the window's Playbook page (audit 17 Oct)
+    memory.skill_edit("value:<cap>:<id>" | "skill:N", action, words="") -> dict   # the Playbook's buttons
+    memory.you_card(purpose="talker" | "planner" | "judge") -> str   # what Yuki knows about the user (contract C1)
     memory.run_ledger(since=None, until=None) -> list[dict]   # what Yuki did: requests and their acting steps
 
 The 3 Oct feedback (migration 33; docs/research/revamp-2026-10-02/38 and 43-build-appA-memory.md). Direct ops, no model
@@ -4681,33 +4683,31 @@ class MemoryClient:
         out["ms"] = round((time.perf_counter() - started) * 1000, 1)
         return out
 
-    def workflows(self, *, skills: bool = True) -> dict:
-        """The Yuki window's Playbook page (``yuki.memory.practice.workflows``): ``{"available", "procedures",
-        "lessons", "proposals", "workflows", "learning"}`` - what Yuki learned to do on this PC, the lessons from its
-        mistakes and what it is not sure of yet (tentative objects, teach-back questions), each with its uses, last use,
-        confidence and state - and, with ``skills``, ``"skills"``: the section "Skills Yuki learned from you" (phase L
-        design §4.9, :func:`yuki.skills.playbook.learned_section`: each learned skill with where it came from, how it
-        runs, when, its trust and whether it is offered; its own ``available`` is False before the learner's
-        migration). A caller that reads only the practice part (the run card's chips) passes ``skills=False``. Never
-        raises."""
+    def workflows(self, *, skills: bool = False) -> dict:
+        """Practice memory's ways (``yuki.memory.practice.workflows``) for the run card's chips (``skills`` is accepted
+        and ignored: the Playbook page reads :meth:`playbook`). Never raises."""
         from yuki.memory import practice as _p
 
-        out = _p.workflows(self.store)
-        if skills:
-            try:
-                from yuki.skills.playbook import learned_section
+        return _p.workflows(self.store)
 
-                out["skills"] = learned_section(self.store)
-            except Exception as exc:  # noqa: BLE001 - the practice part still shows
-                out["skills"] = {"available": False, "items": [], "error": type(exc).__name__}
-        return out
+    def playbook(self) -> dict:
+        """The Yuki window's Playbook page (audit 17 Oct; :func:`yuki.skills.playbook.page`): ``can_do`` (the
+        capabilities, one line each, with how often the user used each), ``things`` (what Yuki knows the user uses, by
+        kind: each value with how often, when and in which app, and the taste names read-only), ``routines`` (with
+        the card each leads to) and ``ways`` (the user's own ways, contract C4). Never raises."""
+        from yuki.skills.playbook import page
+
+        try:
+            return page(self.store)
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "error": type(exc).__name__}
 
     def skill_edit(self, ref: Any, action: str, words: str = "") -> dict:
-        """The user's say over one learned skill on the Playbook page (phase L design §4.9, Q12;
-        :func:`yuki.skills.playbook.skill_edit`): ``rename`` (their ``words`` become its name, kept as told so no naming
-        pass replaces them), ``forget`` (never in the menu, never offered, never proposed again) or ``not_mine`` (as
-        forget, and what it was learned from is not theirs). One write on the skill's row, never a model call and never
-        a hand edit; the catalog follows on its next load. Never raises."""
+        """The user's say on the Playbook page (:func:`yuki.skills.playbook.skill_edit`): on a thing of theirs
+        (``value:<capability>:<id>``) ``rename``, ``not_mine``, ``work`` (never offered), ``everyday`` or ``restore``;
+        on a learned row (``skill:N``: a way of theirs, a routine's anchor) ``rename``, ``forget`` or ``not_mine``. One
+        small write, never a model call and never a hand edit; the catalog and the menu follow on their next load.
+        Never raises."""
         from yuki.skills.playbook import skill_edit
 
         try:
@@ -5243,8 +5243,11 @@ _STAMP_SQL: dict[str, str] = {
     # Needs your reply clears when your reply is captured (a newer message in that chat)
     "messages": "SELECT max(id) FROM messages",
     "playbooks": "SELECT max(id), max(updated_at) FROM playbooks",
-    # the Playbook's "Skills Yuki learned from you" (phase L): a learned row written, renamed or forgotten
-    "skills": "SELECT max(id), max(updated_at) FROM skills WHERE origin = 'learned'",
+    # the Playbook's things and ways (audit 17 Oct): a learned record or way written, renamed or marked
+    "skills": "SELECT max(id), max(updated_at) FROM skills WHERE origin != 'capability'",
+    # the Playbook's routines and the taste names it lists (audit 17 Oct)
+    "routines": "SELECT max(id), max(updated_at) FROM routines",
+    "tastes": "SELECT max(id), max(updated_at) FROM tastes",
     "standing_requests": "SELECT max(id), max(updated_at) FROM standing_requests",
     "knowhow": "SELECT max(id), max(valid_to) FROM knowhow",
     "runs": "SELECT max(id) FROM runs",

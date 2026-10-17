@@ -138,7 +138,10 @@ def values_part(skill: Skill, store: Any, *, now: float | None = None, rank: str
             u = usual_of.get(str(v.get("id")))
             if u and u != shared:
                 notes.append(f"in {_app_name(store, u, names)}")
-            bits.append(_value(v.get("name")) + (f" ({', '.join(notes)})" if notes else ""))
+            label = v.get("label") or v.get("value") or v.get("name")
+            if v.get("named_by") == "user" and _value(v.get("name")) != _value(label):
+                notes.insert(0, f"they call it {_value(v.get('name'))}")   # the slot takes the label itself
+            bits.append(_value(label) + (f" ({', '.join(notes)})" if notes else ""))
         parts.append("theirs: " + ", ".join(bits) + (f" · usually in {_app_name(store, shared, names)}" if shared
                                                        else ""))
     try:
@@ -159,7 +162,13 @@ def values_part(skill: Skill, store: Any, *, now: float | None = None, rank: str
                     parts.append(f"{site} {page}: {' | '.join(got)}")
     except Exception:  # noqa: BLE001
         pass
-    return _clip(" · ".join(parts), chars) if parts else ""
+    if not parts:
+        return ""
+    # each part keeps a share of the budget (the learner's values the most), so one long list never hides the others
+    room = max(0, chars - 3 * (len(parts) - 1))
+    first = room if len(parts) == 1 else int(room * 0.6)
+    rest = (room - first) // max(1, len(parts) - 1)
+    return " · ".join(_clip(part, first if i == 0 else rest) for i, part in enumerate(parts))
 
 
 def way_lines(store: Any, *, limit: int = WAYS_N) -> list[str]:

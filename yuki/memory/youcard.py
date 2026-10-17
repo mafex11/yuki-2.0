@@ -258,13 +258,16 @@ def _things(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, wide:
         for v in sites[:SITES_N[i]]:
             usual = _browser_name(store, str((v.get("usual") or {}).get("browser") or ""), names)
             work = " [work]" if v.get("everyday") is False else ""
-            bits.append(f"{_clip(v.get('name'), 28)}{work}" + (f" in {usual}" if usual else "")
+            label = v.get("label") or v.get("value") or v.get("name")
+            called = (f" (they call it {_clip(v.get('name'), 24)})" if v.get("named_by") == "user"
+                      and v.get("name") != label else "")
+            bits.append(f"{_clip(label, 28)}{called}{work}" + (f" in {usual}" if usual else "")
                         + f" ({_sure_days(int(v.get('days') or 0))})")
         out.append("Sites they open: " + ", ".join(bits))
     tabs = vals.get("browser.site_tab") or []
     if tabs:
         out.append("Meeting tabs they bring up: " + ", ".join(
-            f"{_clip(v.get('name'), 28)}" + (f" in {_browser_name(store, str(v['usual']['browser']), names)}"
+            f"{_clip(v.get('label') or v.get('name'), 28)}" + (f" in {_browser_name(store, str(v['usual']['browser']), names)}"
                                              if (v.get("usual") or {}).get("browser") else "")
             + f" ({_sure_days(int(v.get('days') or 0))})" for v in tabs[:4]))
     try:
