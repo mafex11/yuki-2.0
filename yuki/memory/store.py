@@ -3596,11 +3596,27 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX IF NOT EXISTS taste_events_at ON taste_events(at, kind);
     """,
+    # 45 (2026-10-18, kClean; docs/research/audit-2026-10-17/00-SYNTHESIS.md section 8, decision 3): data only, no
+    # schema change. The old learners are switched off and deleted; their Playbook rows (origins in
+    # RETIRED_PLAYBOOK_ORIGINS) are retired (state and valid_to), their per-app state rows in nudge_state removed, and
+    # what the live test harness left is purged (yuki.memory.testtag.purge). The Python step does it all
+    # (Store._migrate_45); the counts go to nudge_state CLEANUP_STATE, content-free. The old task tables stay.
+    """
+    SELECT 1;
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
 #: -> the :class:`Store` method's name): data moves that need the store's key (an HMAC identity, a decryption).
-PY_MIGRATIONS: dict[int, str] = {26: "_migrate_27"}
+PY_MIGRATIONS: dict[int, str] = {26: "_migrate_27", 44: "_migrate_45"}
+#: Migration 45: the playbook origins the old learners wrote (the demo learner, the habit miner, the old loop's
+#: session pitfalls and slider ways, the run learner's post-mortems and distills, the know-how intake). All retired.
+RETIRED_PLAYBOOK_ORIGINS: tuple[str, ...] = ("demo", "miner", "session", "postmortem", "knowhow", "distill", "slider")
+#: Migration 45: the old learners' state rows in nudge_state (names, and prefixes ending in ":").
+RETIRED_STATE_ROWS: tuple[str, ...] = ("trace:demos", "trace:demos_state", "trace:go_tos_served", "trace:habits",
+                                       "trace:habits:app:", "trace:learn", "trace:tasks", "trace:tasks:noise")
+#: Where migration 45 leaves its counts (JSON, content-free).
+CLEANUP_STATE = "cleanup:v45"
 #: When the timeline began judging meetings by call evidence live (written by migration 27): meeting rows that ended
 #: before it are checked against the call rows when read (:meth:`Store._meetings_proven`).
 MEETING_GATE_CHECKPOINT = "meeting_evidence_since"
@@ -3935,6 +3951,35 @@ class Store:
         ("captures", "thread_id"), ("journal", "thread_id"), ("journal_batches", "thread_id"), ("calls", "thread_id"),
         ("work_thread_events", "thread_id"), ("links_seen", "capture_thread_id"),
     )
+
+    def _migrate_45(self, conn: sqlite3.Connection) -> dict[str, int]:
+        """Migration 45's data step (inside its transaction): every live playbook of the old learners retired, their
+        state rows gone, and the live test's leftovers purged (:func:`yuki.memory.testtag.purge`). Counts only, kept
+        in ``nudge_state`` :data:`CLEANUP_STATE`; idempotent (a database without these rows changes nothing)."""
+        from yuki.memory import testtag
+
+        now = time.time()
+        marks = ",".join("?" * len(RETIRED_PLAYBOOK_ORIGINS))
+        out: dict[str, int] = {}
+        try:
+            out["playbooks_retired"] = int(conn.execute(
+                f"UPDATE playbooks SET state = 'retired', valid_to = ?, updated_at = ? WHERE valid_to IS NULL AND"
+                f" origin IN ({marks})", (now, now, *RETIRED_PLAYBOOK_ORIGINS)).rowcount or 0)
+        except sqlite3.OperationalError:   # an older database without practice memory
+            out["playbooks_retired"] = 0
+        gone = 0
+        for name in RETIRED_STATE_ROWS:
+            if name.endswith(":"):
+                gone += int(conn.execute("DELETE FROM nudge_state WHERE name >= ? AND name < ?",
+                                         (name, name[:-1] + chr(ord(":") + 1))).rowcount or 0)
+            else:
+                gone += int(conn.execute("DELETE FROM nudge_state WHERE name = ?", (name,)).rowcount or 0)
+        out["state_rows"] = gone
+        out.update({f"test_{k}": v for k, v in testtag.purge(conn, self._dec, now=now).items()})
+        conn.execute("INSERT INTO nudge_state(name, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE"
+                     " SET value = excluded.value, updated_at = excluded.updated_at",
+                     (CLEANUP_STATE, json.dumps(out, sort_keys=True), now))
+        return out
 
     def _migrate_27(self, conn: sqlite3.Connection) -> dict[str, int]:
         """Migration 27's data step (inside its transaction): every capture thread gets its identity key
