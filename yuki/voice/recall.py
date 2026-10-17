@@ -43,6 +43,7 @@ import weakref
 from datetime import datetime
 from typing import Any
 
+from yuki.memory.talker_digest import PART_EPISODES as DAY_PART_EPISODES
 from yuki.memory.talker_digest import PARTS as DAY_PARTS
 
 #: How far back the start-of-conversation view reaches (s).
@@ -423,7 +424,7 @@ def _turns(client: Any, since: float, until: float, limit: int) -> list[dict[str
 
 
 def fetch_recent(memory: Any, *, now: float | None = None, timeout_s: float = RECENT_TIMEOUT_S,
-                 failed: Any = None) -> Any:
+                 failed: Any = None, digest_wait_s: float | None = None) -> Any:
     """:func:`recent_view` read from memory now (blocking, bounded by ``timeout_s``; call it off the voice loop).
 
     ``memory`` is :class:`~yuki.agent.memory.MemoryAccess` (its ``call``). Never raises: ``None`` when the hour holds
@@ -432,7 +433,12 @@ def fetch_recent(memory: Any, *, now: float | None = None, timeout_s: float = RE
 
     lThink: the view is followed by their days at a glance (:func:`fetch_digest`, its own block text after
     :data:`RECENT_END`), so the talker's conversation-fixed block carries both; with nothing in the hour the digest
-    alone is returned. A clock given in ``now`` (a replay) reads the digest at that time, uncached."""
+    alone is returned. A clock given in ``now`` (a replay) reads the digest at that time, uncached.
+
+    Review r1 L1: the digest adds at most :data:`DIGEST_WAIT_S` (none kept) or :data:`DIGEST_STALE_WAIT_S` (a kept one
+    stands in) after the last hour's read, so a wake's refresh still makes the first call's gate and the cold build
+    path gains at most that. ``digest_wait_s`` lets a caller off every critical path (the dormant standby build) wait
+    longer for a first read."""
     call = getattr(memory, "call", None)
     if not callable(call):
         return failed
@@ -454,7 +460,8 @@ def fetch_recent(memory: Any, *, now: float | None = None, timeout_s: float = RE
         return failed
     view = recent_view(turns, todos, rules, now=now)
     left = max(0.05, float(timeout_s) - (time.monotonic() - started))
-    days = fetch_digest(memory, now=given, wait_s=min(left, DIGEST_WAIT_S))
+    wait = DIGEST_WAIT_S if digest_wait_s is None else max(0.0, float(digest_wait_s))
+    days = fetch_digest(memory, now=given, wait_s=min(left, wait))
     blocks = [b for b in (view, days) if b]
     return "\n\n".join(blocks) if blocks else None
 
@@ -476,17 +483,21 @@ DIGEST_MAX_AGE_S = 3 * 3600.0
 #: How long a caller waits for a digest read when none is kept (s). Measured 17 Oct on copies of the user's memory:
 #: the whole read takes 0.16-0.6 s warm (the parts of the day ~0.09 s, calls of 30 days ~0.06 s, the people index
 #: 0.01-0.17 s), up to 1.8 s on a cold first read. The read starts alongside the last hour's (:func:`fetch_recent`), so
-#: most of it is done by the time that one is.
-DIGEST_WAIT_S = 1.0
-#: How long a caller waits for a fresh read when an older kept one could stand in (s).
-DIGEST_STALE_WAIT_S = 0.3
+#: a warm one is mostly done by the time that one is. Review r1 L1: kept short because :func:`fetch_recent` runs on a
+#: woken conversation's refresh (all of it must land within the first call's 0.4 s gate after the user's speech, or
+#: the refreshed view is dropped) and on the cold build path; a read that misses it lands in the background and is kept
+#: for the next conversation. The dormant standby build may ask for longer (``fetch_recent(digest_wait_s=...)``).
+DIGEST_WAIT_S = 0.25
+#: How long a caller waits for a fresh read when an older kept one could stand in (s): a warm read started alongside
+#: the last hour's often lands within it; else the kept one (labelled with its read time) is used at once.
+DIGEST_STALE_WAIT_S = 0.15
 #: The bound on one digest read in the background (s): a slow memory never holds a thread longer.
 DIGEST_READ_S = 6.0
 #: Longest episode title, place, chat name in the digest (whole words); names per list; episodes per part at most.
 DIGEST_TITLE_CHARS = 52
 DIGEST_PLACE_CHARS = 48
 DIGEST_PEOPLE = 5
-DIGEST_PART_EPISODES = 4
+DIGEST_PART_EPISODES = DAY_PART_EPISODES   # review r1 L4: the most the read returns per part
 #: A taste's hours are shown for its first this many (most picked) entities.
 DIGEST_HOURS_FOR = 2
 #: The parts of days always kept (the newest), however tight the budget.
@@ -582,10 +593,32 @@ def _talked_with(data: dict[str, Any]) -> str:
 
 
 def _facts(data: dict[str, Any]) -> list[str]:
-    """The digest's short facts: what they pick most (each taste kind), who they talked with in their day so far (by
-    app: direct messages and calls), and where their calls were over the last weeks."""
+    """The digest's short facts: who they talked with in their day so far (by app: direct messages and calls), where
+    their calls were over the last weeks, and what they pick most (each taste kind, the kinds picked most first).
+
+    Review r1 L2: in that order because :func:`digest_view`'s last resort cuts from the end: with more taste kinds than
+    fit, the least picked kind goes first, never the talked-with or usual-voice-channel lines."""
     out: list[str] = []
-    for u in data.get("usuals") or []:
+    talked = _talked_with(data)
+    if talked:
+        out.append(talked)
+    voice = data.get("voice") or {}
+    if voice.get("places"):
+        places = "; ".join(
+            f"{_clip(v['place'], DIGEST_PLACE_CHARS)}: {v['n']} call{'s' if v['n'] != 1 else ''} ({v['night']} at "
+            f"night, from ~{int(v['hour']):02d}:00, last {datetime.fromtimestamp(v['last']):%d %b})"
+            for v in voice["places"])
+        who = _who(list(voice.get("people") or []))
+        out.append(f"Where their calls were, last 30 days, most first: {places}."
+                   + (f" On calls with them most: {who}." if who else ""))
+
+    def picks(u: dict[str, Any]) -> float:
+        try:
+            return -sum(float(it.get("n") or 0.0) for it in u.get("items") or [])
+        except (TypeError, ValueError):
+            return 0.0
+
+    for u in sorted(data.get("usuals") or [], key=picks):
         items = []
         for i, it in enumerate(u.get("items") or []):
             notes = [] if i else ["most"]
@@ -599,18 +632,6 @@ def _facts(data: dict[str, Any]) -> list[str]:
         if items:
             now_pick = f"; at this hour: {u['now']}" if u.get("now") else ""
             out.append(f"Their {str(u['kind']).replace('_', ' ')}s, most picked first: {', '.join(items)}{now_pick}.")
-    talked = _talked_with(data)
-    if talked:
-        out.append(talked)
-    voice = data.get("voice") or {}
-    if voice.get("places"):
-        places = "; ".join(
-            f"{_clip(v['place'], DIGEST_PLACE_CHARS)}: {v['n']} call{'s' if v['n'] != 1 else ''} ({v['night']} at "
-            f"night, from ~{int(v['hour']):02d}:00, last {datetime.fromtimestamp(v['last']):%d %b})"
-            for v in voice["places"])
-        who = _who(list(voice.get("people") or []))
-        out.append(f"Where their calls were, last 30 days, most first: {places}."
-                   + (f" On calls with them most: {who}." if who else ""))
     return out
 
 

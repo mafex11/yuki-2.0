@@ -516,6 +516,10 @@ class RequestPack:
 #: lThink: guards the request numbers whose skill runs a second check found not done (``Agent._skill_log``, written
 #: from the skill engine's recheck threads, read on the loop's).
 _SKILL_FALSE_LOCK = threading.Lock()
+#: lThink review r1 H1: the skill engine's own second check of a run's done (``engine._after_done``'s ``done_recheck``
+#: ``recheck`` code words). Its ``"user"`` false_done (the user corrected or repeated the last run) is about an earlier
+#: request's run and never counts against the request running now.
+SKILL_SECOND_CHECKS = frozenset({"same_source", "second_source"})
 
 
 def _voice_note(text: str) -> bool:
@@ -1492,9 +1496,9 @@ class Agent:
         self._skill_bounces = 0
         self._skill_unconfirmed = False
         self._skill_sent_unconfirmed = False
-        #: lThink: whether this request's skill runs found not done by their own second check (noted from the recheck's
+        #: lThink: how many of this request's "not done" second checks on its skill runs (noted from the recheck's
         #: thread under the request's number, :meth:`_skill_log`) were applied on the loop's (:meth:`_skill_recheck_applied`).
-        self._skill_recheck_done = False
+        self._skill_recheck_seen = 0
         self._requests += 1
         # phase S: this request's run_skill tool (its menu, refreshed when the registry changed) and what it needs
         self._skills_block = self._skills_tools()
@@ -2928,9 +2932,12 @@ class Agent:
         counts as acted on with a verified result, as a verified click's does. Live, the claim check held that done as
         "neither read nor acted on" (the skill's report names no window), which cost one more Sonnet call and then
         "I tried, but I couldn't confirm it worked" after an open the skill had checked. Its second check (the recheck,
-        on its own thread) saying "not done" withdraws this (:meth:`_skill_recheck_applied`). Logged without words."""
-        if self._skill_found_false():
-            return
+        on its own thread) saying "not done" withdraws this (:meth:`_skill_recheck_applied`). Logged without words.
+
+        Review r1 L3: a second check that already said an earlier run of this request was not done is applied first
+        (that run's step is not in the trace yet for this one), so a verified retry in the same request still backs its
+        window; a later "not done" is applied again."""
+        self._skill_recheck_applied()
         try:
             front = self.dispatcher.foreground_hwnd()
         except Exception:  # noqa: BLE001 - no window known: nothing more is backed
@@ -2943,28 +2950,36 @@ class Agent:
         """lThink: the skill engine's log for the thinker's ``run_skill`` (``skill_context["log"]``, made per request
         with its number), passed through to this agent's log; a second check that disagrees (``done_recheck``
         ``false_done``, the engine's own code word, from its recheck thread, maybe after the request ended) is noted
-        under that request's number, for the loop to apply on its own thread while that request runs."""
-        if event == "done_recheck" and fields.get("result") == "false_done":
+        under that request's number, for the loop to apply on its own thread while that request runs.
+
+        Review r1 H1: only the engine's own D19 second check counts (``recheck`` ``same_source`` / ``second_source``,
+        code words that survive ``content_free``). The engine's ``recheck="user"`` false_done (``_note_false_done``: the
+        user corrected or repeated the skill's last run) is logged at the start of a new run and is about an earlier
+        request's run, which the ledger already marks: it never demotes this request's own verified run."""
+        if (event == "done_recheck" and fields.get("result") == "false_done"
+                and fields.get("recheck") in SKILL_SECOND_CHECKS):
             with _SKILL_FALSE_LOCK:
-                found = self.__dict__.setdefault("_skill_false_requests", set())
-                found.add(int(request_no))
+                found = self.__dict__.setdefault("_skill_false_requests", {})
+                found[int(request_no)] = int(found.get(int(request_no), 0)) + 1
                 for old in [n for n in found if n < int(request_no) - 8]:
-                    found.discard(old)   # only the last few requests' are ever asked about
+                    found.pop(old, None)   # only the last few requests' are ever asked about
         self.logger.log(event, **fields)
 
-    def _skill_found_false(self) -> bool:
-        """lThink: whether a skill run of the request running now was found not done by its own second check."""
+    def _skill_false_count(self) -> int:
+        """lThink: how many times a skill run of the request running now was found not done by its own second check."""
         with _SKILL_FALSE_LOCK:
-            return int(getattr(self, "_requests", 0) or 0) in (getattr(self, "_skill_false_requests", None) or ())
+            found = getattr(self, "_skill_false_requests", None) or {}
+            return int(found.get(int(getattr(self, "_requests", 0) or 0), 0))
 
     def _skill_recheck_applied(self) -> None:
         """lThink: once the skill's second check said its done was false, nothing of this request rests on its skill
-        runs any more (the log names no skill, so every one of them): the windows they backed lose that evidence, and
-        their verified steps in the run trace become "not confirmed" (a later step can still put them right). On the
-        loop's own thread, once per request."""
-        if getattr(self, "_skill_recheck_done", False) or not self._skill_found_false():
+        runs so far any more (the log names no skill or run, so every one of them): the windows they backed lose that
+        evidence, and their verified steps in the run trace become "not confirmed" (a later step can still put them
+        right). On the loop's own thread, once per "not done" noted (review r1 L3: a later one is applied again)."""
+        count = self._skill_false_count()
+        if count <= int(getattr(self, "_skill_recheck_seen", 0) or 0):
             return
-        self._skill_recheck_done = True
+        self._skill_recheck_seen = count
         for hwnd in [h for h, how in self._evidence.items() if how == "skill"]:
             self._evidence.pop(hwnd, None)
         for step in getattr(self, "_trace", None) or []:
