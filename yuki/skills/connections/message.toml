@@ -48,12 +48,13 @@ bind = { person = "contact", app = "app" }
 # ("hey meant" for Hemanth), a transliteration ("हेमंत") or a close mishearing by sound - and runs it as that
 # person's own name. A name two people fit is dropped and asked; a group chat or channel still needs its name said.
 # A name the user said that none of their people goes by, but that sounds like exactly one of them, is asked ("Did you
-# mean Hemanth?"), never swapped for that person. One that is a heard form of theirs the user confirmed plus one final
-# consonant ("Kumar" for the user's "quix": a final "r" speech recognition adds) is that person for a draft or an open
-# (the done line names them); anything looser, or a send, is asked first ("Did you mean bobsled?"), and after the
-# answer a send to that person is typed and left for them, since whom a message is sent to is never matched by sound
-# (yuki/memory/contacts.py sounds_alike, alike_answered; yuki/skills/chat.py find_target, _send_gate). Each such
-# question is asked once: the same name given again is "I don't know who that is".
+# mean Hemanth?"), never swapped for that person, unless it is a draft or an open and the name is either tight to a
+# heard form of theirs the user confirmed ("Kumar" for "quix": that form plus one final consonant) or the user's answer
+# to Yuki's own "Who to?" ("to hardish"): then it is that person, and the done line names them. A send is always asked
+# first, and after the answer a send to that person is typed and left for them, since whom a message is sent to is
+# never matched by sound (yuki/memory/contacts.py sounds_alike, alike_answered; yuki/skills/chat.py find_target,
+# _sounds_alike, _send_gate). Each such question is asked once: the same name given again is "I don't know who that
+# is".
 [[capability.message.slot]]
 name = "person"
 type = "text"

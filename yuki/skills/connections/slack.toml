@@ -20,6 +20,9 @@ services = ["app.slack.com", "slack"]
 switcher = ["ctrl", "k"]
 open = ["enter"]
 send = ["enter"]
+# select everything in the message box (a draft Yuki typed there itself is typed over, never the user's:
+# yuki/skills/chat.py typed_by_yuki)
+select_all = ["ctrl", "a"]
 
 # A chat's own address -> its deep link (Slack's documented URL and URI shapes; fixed machine formats).
 [[chat.links]]
