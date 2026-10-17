@@ -47,8 +47,11 @@ words sounding like it, two signals agreeing), and then only when no group chat 
 default a literal name nobody in the index has stays nobody's: the chat driver says it doesn't know who that is, and
 never sends to someone who merely sounds alike. Fixed format rules over the user's own data, never a word list.
 For that "nobody" case only, :func:`sounds_alike` names the one person the name loosely sounds like (:func:`_alike`:
-one consonant class apart, "Kumar" for the user's "quix", live test 17 Oct) and whether the form it matched is a heard
-form the user confirmed: the chat driver then uses it for a draft, or asks once; never for a send.
+one consonant class apart) and whether it is tight to a heard form the user confirmed (:func:`_alike_tight`: that form
+plus one final consonant, "Kumar" for the user's "quix", live test 17 Oct): the chat driver uses only a tight one for a
+draft or an open without asking, and asks once about the rest ("Did you mean Hemanth?", recorded by
+:func:`note_alike_asked`; its answer, :func:`alike_answered`, lets the person's name through :func:`names_person`);
+never for a send.
 
 Lightweight: the model call runs only when memory changed since the last run (after the nightly audit, or by hand);
 nothing here is on a request's path but SQL.
@@ -75,7 +78,9 @@ Public API (the memory API wraps it: ``MemoryClient.contact``, ``people_director
                                                         # by_sound=False: a send's recipient, by sound)
     transliterated(store, name) -> Contact | None       # the one person a name in a Brahmic script reads as
     sounds_alike(store, name) -> Alike | None           # a name nobody goes by: the one person it (loosely) sounds
-                                                        # like, the form matched, whether the user confirmed that form
+                                                        # like, the form matched, confirmed form?, tight?
+    note_alike_asked(store, said, person_id, words) -> bool   # the chat driver's "Did you mean X?" (RAM; once)
+    alike_answered(store, person_id, words) -> str | None     # the name it asked about, once the user spoke since
     dm_claim(contact, route, others) -> str             # whose DM a route two people hold is ("own"/"other"/"shared")
     sounds_in(name, texts, short=False) -> str | None   # the words in ``texts`` that sound like ``name`` (an app)
     contacts_of_threads(store, thread_ids) -> {thread id: [(Contact, Route)]}
@@ -500,8 +505,8 @@ def heard_people(found: Sequence[Any], text: str | None, *, single: bool = False
 # ---------------------------------------------------------------------------
 
 #: The looser sound match (:func:`_alike`), used only for a name that no one of the user's people goes by as written
-#: and the strict rule (:func:`_sound_ok`) reads as nobody: its answer is a question, or, for a draft, a heard form the
-#: user confirmed (never a send by sound). Two Latin spellings at most this far apart ("kumar" / "quix" 0.4; "rohan" /
+#: and the strict rule (:func:`_sound_ok`) reads as nobody: its answer is a question (the chat driver's "Did you mean
+#: Hemanth?"), never a send by sound. Two Latin spellings at most this far apart ("kumar" / "quix" 0.4; "rohan" /
 #: "rahul" 0.6 is refused)...
 ALIKE_MAX_DISTANCE = 0.45
 #: ...whose sound keys differ by at most this many consonant classes (one left out, added or changed: a final "r" an
@@ -509,6 +514,23 @@ ALIKE_MAX_DISTANCE = 0.45
 ALIKE_KEY_EDITS = 1
 #: ...with the same onset, and at least this many letters each (a shorter name matches only as written).
 ALIKE_MIN_LETTERS = 4
+#: The tight rule (:func:`_alike_tight`, the only sound match used without a question, for a draft or an open): a heard
+#: form the user confirmed with a sound key at least this long (classes)...
+TIGHT_MIN_KEY = 2
+#: ...ending in one of these letters (a vowel)...
+TIGHT_VOWELS = frozenset("aeiou")
+#: ...heard with this one sound class added at the very end: the final "r" speech recognition adds (or an accent leaves
+#: unsaid) after a name's final vowel ("quix" heard "Kumar", live 17 Oct). Measured on the user's index (review r1 M2):
+#: any final consonant also took "Komlal" to Komal and "Brams" to Bram unasked; with "r" only, the silent matches of
+#: 117 common names and words were Kumar, Qumar, Gumar, Komlar, Tippar, Tibbar and "broker".
+TIGHT_ADDED = "R"
+#: How long the chat driver's sound-alike question ("Did you mean bobsled?") waits for its answer (the exchange's
+#: span, as the skill resolver's ``CONFIRM_ONCE_S``): asked once per name within it, and the answer counts within it.
+ALIKE_ANSWER_S = 120.0
+_ALIKE_LOCK = threading.Lock()
+#: (database, the name as said, folded) -> (when asked, the person's id, the name as said, the user's turns then, the
+#: newest turn then). RAM only; never logged.
+_ALIKE_ASKED: dict[tuple[str, str], tuple[float, int, str, int, str]] = {}
 
 
 def _key_edits(a: str, b: str) -> int:
@@ -534,25 +556,67 @@ def _alike(run: Heard, name: Heard) -> bool:
         _distance(run.letters, name.letters) <= ALIKE_MAX_DISTANCE
 
 
+def _alike_tight(run: Heard, form: Heard) -> bool:
+    """Whether one Latin word is ``form`` (a heard form the user confirmed) with a final "r" added: "Kumar" for "quix",
+    the sound speech recognition adds after a name that ends in a vowel (live test 17 Oct). The same onset; ``form``
+    of :data:`ALIKE_MIN_LETTERS` letters, ending in one of :data:`TIGHT_VOWELS`, with a sound key of
+    :data:`TIGHT_MIN_KEY` classes or more; the word's key exactly ``form``'s plus :data:`TIGHT_ADDED` at its end, the
+    word ending on those consonant letters; and its letters before them spelled within :data:`HEARD_MAX_DISTANCE` of
+    ``form``'s. A changed sound, a sound left out, any other added sound or the same short key is never tight ("Nick",
+    "Nisha" or "niece" for "niche", "Papa" for "Pippa", "Binod" for "Barun", "Kumari" for "quix": review r1 M2,
+    measured on the user's own index); those are asked. A fixed format rule."""
+    if run.script or form.script or run.onset != form.onset or len(form.letters) < ALIKE_MIN_LETTERS:
+        return False
+    if form.letters[-1] not in TIGHT_VOWELS or len(form.key) < TIGHT_MIN_KEY:
+        return False
+    if run.key != form.key + TIGHT_ADDED:
+        return False
+    head = run.letters
+    while head and sound_key(head) != form.key:
+        head = head[:-1]
+    tail = run.letters[len(head):]
+    if not tail or any(ch in TIGHT_VOWELS or ch == "y" for ch in tail):
+        return False
+    return len(head) >= ALIKE_MIN_LETTERS and _distance(head, form.letters) <= HEARD_MAX_DISTANCE
+
+
+def _one_word(text: str) -> Heard | None:
+    """How ``text`` sounds when it is one Latin word (the tight rule's only input), else ``None``."""
+    words = spoken_words(text)
+    return heard_of([words[0][1]]) if len(words) == 1 else None
+
+
+def _tight_to(word: Heard | None, contact: Contact) -> bool:
+    """Whether ``word`` is tight (:func:`_alike_tight`) to one of the heard forms ``contact``'s user confirmed."""
+    if word is None:
+        return False
+    forms = [f for f in (heard_form(h) for h in contact.heard()) if f is not None and f.key]
+    return any(_alike_tight(word, f) for f in forms)
+
+
 @dataclass(frozen=True)
 class Alike:
     """The one person a name nobody goes by sounds like (:func:`sounds_alike`): the contact, the name or alias it
     sounds like as memory keeps it (``form``), whether that form is a heard form the user confirmed (``confirmed``: a
-    ``name_aliases`` correction, ``how = "heard"``; the person's own name or a handle seen in their chats is not), and
-    whether the strict rule (:func:`resolve` with ``heard``, which the skill resolver asks about) finds them too."""
+    ``name_aliases`` correction, ``how = "heard"``; the person's own name or a handle seen in their chats is not),
+    whether the strict rule (:func:`resolve` with ``heard``, which the skill resolver asks about) finds them too, and
+    whether the name is tight to a confirmed heard form of theirs (``tight``, :func:`_alike_tight`: the chat driver's
+    only match without a question, for a draft or an open)."""
 
     contact: Contact
     form: str
     confirmed: bool
     strict: bool
+    tight: bool = False
 
 
 def sounds_alike(store: Store, name: str | None) -> Alike | None:
     """The one person ``name`` sounds like when none of the user's people goes by it as written (:func:`resolve` finds
     nobody) and no group chat or channel is called exactly that: one of their names or aliases matched by the strict
-    rule (:func:`_sound_ok`) or the looser one (:func:`_alike`), and nobody else's. ``None`` when anyone fits as
-    written, none or two people sound alike, or memory can't say. For the chat driver's question ("Did you mean
-    quix?") and, for a draft, a confirmed heard form; never whom a send goes to. Never raises."""
+    rule (:func:`_sound_ok`), the looser one (:func:`_alike`) or the tight one (:func:`_alike_tight`, a confirmed
+    heard form), and nobody else's. ``None`` when anyone fits as written, none or two people sound alike, or memory
+    can't say. For the chat driver's question ("Did you mean bobsled?") and, only when ``tight``, a draft or an open
+    without one; never whom a send goes to. Never raises."""
     try:
         text = " ".join(str(name or "").split())
         form = heard_form(text)
@@ -561,24 +625,80 @@ def sounds_alike(store: Store, name: str | None) -> Alike | None:
         want = tokens(text)
         if any(tokens(r.chat) == want for r in places(store)):
             return None
-        hits: list[tuple[float, Contact, str, bool, bool]] = []
+        word = _one_word(text)
+        hits: list[tuple[bool, float, Contact, str, bool, bool]] = []
         for c in people(store):
             heard = {" ".join(tokens(h)) for h in c.heard()}
             for n in c.names:
                 f = heard_form(n)
                 if f is None or not f.key:
                     continue
+                confirmed = " ".join(tokens(n)) in heard
                 strict = _sound_ok(form, f)
-                if strict or _alike(form, f):
-                    hits.append((_distance(form.letters, f.letters), c, n, " ".join(tokens(n)) in heard, strict))
-        if not hits or len({c.id for _d, c, _n, _h, _s in hits}) != 1:
+                tight = confirmed and word is not None and _alike_tight(word, f)
+                if strict or tight or _alike(form, f):
+                    hits.append((tight, _distance(form.letters, f.letters), c, n, confirmed, strict))
+        if not hits or len({h[2].id for h in hits}) != 1:
             return None
-        hits.sort(key=lambda h: (h[0], not h[3]))
-        _d, c, n, confirmed, _s = hits[0]
+        hits.sort(key=lambda h: (not h[0], h[1], not h[4]))
+        tight, _d, c, n, confirmed, _s = hits[0]
         return Alike(contact=c, form=" ".join(str(n).split()), confirmed=confirmed,
-                     strict=any(s for *_x, s in hits))
+                     strict=any(h[5] for h in hits), tight=tight)
     except Exception:
         return None
+
+
+def _turns(words: Sequence[str] | str | None) -> list[str]:
+    return [str(w) for w in ([words] if isinstance(words, str) else list(words or [])) if str(w or "").strip()]
+
+
+def note_alike_asked(store: Store, said: str, person_id: int, words: Sequence[str] | str | None, *,
+                     now: float | None = None) -> bool:
+    """Note that the chat driver asked whether ``said`` (the user's name, "Kumar") meant the person ``person_id``
+    ("Did you mean bobsled?"), with the user's turns as they stood (``words``: the exchange's turns, newest last).
+    ``False`` when the same name was asked about within :data:`ALIKE_ANSWER_S` (the same name given again means the
+    answer was no: never asked twice). RAM only. Never raises."""
+    now = time.time() if now is None else float(now)
+    turns = _turns(words)
+    try:
+        key = (_db_key(store), " ".join(tokens(said)))
+    except Exception:
+        return False
+    with _ALIKE_LOCK:
+        for k in [k for k, v in _ALIKE_ASKED.items() if not (0.0 <= now - v[0] <= ALIKE_ANSWER_S)]:
+            _ALIKE_ASKED.pop(k, None)
+        if key in _ALIKE_ASKED:
+            return False
+        _ALIKE_ASKED[key] = (now, int(person_id), " ".join(str(said).split()), len(turns), turns[-1] if turns else "")
+        return True
+
+
+def alike_answered(store: Store, person_id: int | None, words: Sequence[str] | str | None, *,
+                   now: float | None = None) -> str | None:
+    """The user's name for ``person_id`` that the chat driver's sound-alike question asked about within
+    :data:`ALIKE_ANSWER_S` ("Kumar", asked "Did you mean bobsled?"), when the user has spoken since (a turn newer than
+    the question stands in ``words``), their newest turn doesn't give that same name again (the resolver's own "the
+    same name again is a no") and the name still stands in their turns. Whether they said yes is the talker's
+    judgement (it names the person again only on a yes); a run for that person after it may open their chat or type a
+    draft there, never send (review r1 H1: never by sound alone; confirmed first). ``None`` otherwise."""
+    if person_id is None:
+        return None
+    now = time.time() if now is None else float(now)
+    turns = _turns(words)
+    if not turns:
+        return None
+    try:
+        db = _db_key(store)
+    except Exception:
+        return None
+    with _ALIKE_LOCK:
+        asked = [v for (d, _s), v in _ALIKE_ASKED.items()
+                 if d == db and v[1] == int(person_id) and 0.0 <= now - v[0] <= ALIKE_ANSWER_S]
+    for _at, _p, said, n, last in asked:
+        newer = len(turns) > n or turns[-1] != last
+        if newer and not span_in(said, turns[-1]) and any(span_in(said, t) for t in turns[:-1]):
+            return said
+    return None
 
 
 def _clean(value: Any, cap: int) -> str:
@@ -1737,9 +1857,11 @@ def names_person(store: Store, name: str | None, texts: Sequence[str] | str | No
     name the user said is checked as said (the resolver keeps it, and :func:`resolve` without ``heard`` finds nobody
     for a name not theirs).
 
-    With ``by_sound``, failing all that, a run of Latin words that loosely sounds like one of the person's names or
-    aliases (:func:`_alike`: "Kumar" for "quix") and like no one else's: the answer to the chat driver's "Did you mean
-    quix?" (a yes gives the person's name back), or the talker naming the person it heard. Never a send's recipient
+    With ``by_sound``, failing all that (review r1 M3: never a loose sound on its own): the person the chat driver's
+    sound-alike question asked about, once the user has answered it (:func:`alike_answered`: "Did you mean bobsled?"
+    about their "Kumar", and a turn of theirs since; a yes gives the person's name back); or one word of ``texts``
+    that is tight to a heard form of theirs the user confirmed (:func:`_alike_tight`: "Kumar" for "quix", the same
+    rule the chat driver takes without a question) and that nobody goes by or sounds like. Never a send's recipient
     (``by_sound=False``).
 
     ``by_sound=False`` (a send's recipient: whom a message goes to): no Latin by sound at all, neither for ``name``
@@ -1757,23 +1879,25 @@ def names_person(store: Store, name: str | None, texts: Sequence[str] | str | No
                 return target
             if by_sound and any(c.id == target.id for _s, c, _w in heard_people(found, text, single=True)):
                 return target
-        if by_sound and _loosely_named(found, target, texts):
+        if by_sound and (alike_answered(store, target.id, texts) or _tightly_named(store, found, target, texts)):
             return target
     except Exception:
         return None
     return None
 
 
-def _loosely_named(found: Sequence[Contact], target: Contact, texts: Sequence[str]) -> bool:
-    """Whether a run of 1 to :data:`HEARD_MAX_WORDS` Latin words of ``texts`` loosely sounds like one of ``target``'s
-    names or aliases (:func:`_alike`) and like none of anyone else's."""
-    mine = [f for f in (heard_form(n) for n in target.names) if f is not None and f.key]
-    if not mine:
+def _tightly_named(store: Store, found: Sequence[Contact], target: Contact, texts: Sequence[str]) -> bool:
+    """Whether one Latin word of ``texts`` is tight (:func:`_alike_tight`) to a heard form of ``target``'s the user
+    confirmed, sounds like none of anyone else's names (strict or loose) and is nobody's name as written."""
+    if not target.heard():
         return False
     others = [f for c in found if c.id != target.id for f in (heard_form(n) for n in c.names) if f is not None]
     for text in texts:
-        for _start, _words, run in heard_spans(text):
-            if any(_alike(run, f) for f in mine) and not any(_alike(run, f) or _sound_ok(run, f) for f in others):
+        for _start, w in spoken_words(text):
+            word = heard_of([w])
+            if word is None or not _tight_to(word, target):
+                continue
+            if not any(_alike(word, f) or _sound_ok(word, f) for f in others) and not resolve(store, w):
                 return True
     return False
 
