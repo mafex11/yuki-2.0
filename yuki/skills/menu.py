@@ -123,7 +123,7 @@ def values_part(skill: Skill, store: Any, *, now: float | None = None, rank: str
     """The user's own values for one capability, in at most ``chars`` (``""`` when none): the learner's known values
     (contract C5; their usual means when one is shared by most: "usually in Chrome", others named per value; a work
     value marked), each entity slot's taste names (``[playlist: a | b]``), and for a capability that opens site pages,
-    each site page kind's taste names ("youtube handle: Sidemen | NDL"). Never raises."""
+    each site page kind's taste names ("site youtube page handle item: Sidemen | NDL"). Never raises."""
     from collections import Counter
 
     try:
@@ -185,7 +185,9 @@ def values_part(skill: Skill, store: Any, *, now: float | None = None, rank: str
             for kind, site, page, _var in taste.site_kinds():
                 got = [_value(n) for n in taste.candidates(store, kind, now=now, by=rank)[:NAMES_N] if n]
                 if got:
-                    parts.append(f"{site} {page}: {' | '.join(got)}")
+                    # fSkills (live 18 Oct): said as the slots take them ("site youtube page handle item: Sidemen |
+                    # NDL"); "youtube handle: ..." had the talker pass page = "Deji" and page = "MBL channel"
+                    parts.append(f"site {site} page {page} item: {' | '.join(got)}")
     except Exception:  # noqa: BLE001
         pass
     if not parts:

@@ -267,7 +267,78 @@ def _site_said(value: str, words: Sequence[str]) -> bool:
             forms.append(registrable_domain(ident).split(".")[0])
         except Exception:  # noqa: BLE001
             pass
-    return any(f and f != _words(value).casefold() and _said(f, words) for f in dict.fromkeys(forms))
+    if any(f and f != _words(value).casefold() and _said(f, words) for f in dict.fromkeys(forms)):
+        return True
+    # fSkills (live 18 Oct: "Pourbex caladra" for Excalidraw, "eleven labs" for elevenlabs.io, "Justaname" for
+    # justanime.to, "chat BP" for chatgpt.com, "my GitHub Pages site" for <name>.github.io all dropped as unheard and
+    # handed to the thinker, 10-30 s): a name of the site (a label of its domain) whose letters stand in the words'
+    # letters, spaces and case aside, within a spelling distance (:func:`_letters_near`)
+    labels = [p for p in (ident or _words(value).casefold()).split(".") if p.isalpha() and len(p) >= SITE_NEAR_MIN]
+    return any(_letters_near(p, words) for p in dict.fromkeys(labels))
+
+
+#: fSkills: a site's name heard inside the words (:func:`_letters_near`): at least this many letters...
+SITE_NEAR_MIN = 5
+#: ...found among the words' letters (spaces, case and punctuation aside) with at most this share of its letters
+#: changed, added or left out (one in five letters: "excaladra" for excalidraw 0.2; two of seven: "chatbp" for chatgpt
+#: 0.29), a longer name allowing a little more (:data:`SITE_NEAR_LONG`).
+SITE_NEAR_DISTANCE = 0.2
+SITE_NEAR_LONG = (7, 0.3)
+
+
+def _letters_near(form: str, words: Sequence[str]) -> bool:
+    """Whether the Latin letters of ``form`` (a site's name) stand, approximately, in one turn's letters run together
+    (an approximate substring: the edit distance of ``form`` to the closest stretch of that turn's letters over
+    ``form``'s length, within :data:`SITE_NEAR_DISTANCE`, or :data:`SITE_NEAR_LONG` for a long name). Speech recognition
+    splits a long name ("eleven labs") or glues a word onto it ("Pourbex caladra"); this reads through both. A fixed
+    format rule on the spellings, never a list of words."""
+    from yuki.memory.contacts import romanize
+
+    want = "".join(ch for ch in str(form or "").casefold() if "a" <= ch <= "z")
+    if len(want) < SITE_NEAR_MIN:
+        return False
+    limit = SITE_NEAR_LONG[1] if len(want) >= SITE_NEAR_LONG[0] else SITE_NEAR_DISTANCE
+    for turn in words:
+        text = "".join(romanize(w) for w in str(turn or "").split())
+        if not text:
+            continue
+        prev = [0] * (len(text) + 1)        # a match may start anywhere in the turn
+        for i, ch in enumerate(want, 1):
+            cur = [i] + [0] * len(text)
+            for j, tj in enumerate(text, 1):
+                cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ch != tj))
+            prev = cur
+        if min(prev) / len(want) <= limit:
+            return True
+    return False
+
+
+def _site_page_given(skill: Skill, given: Mapping[str, Any], words: Sequence[str], store: Any,
+                     now: float) -> dict[str, Any]:
+    """fSkills: for a capability that binds a site, a page kind and an entity (web.open_page), the page and item values
+    :func:`yuki.skills.web_route.site_page` reads from what the caller gave (a page kind of that site as data; a name
+    given as the page, or an item, that is one of the user's own names for that site's pages, as written or by sound
+    in their words). ``{slot: value}`` for the slots it settled; ``{}`` for any other capability. Never raises."""
+    bind = dict(getattr(skill, "bind", None) or {})
+    site_slot = next((k for k, v in bind.items() if v == SITE_BIND), None)
+    page_slot = next((k for k, v in bind.items() if v == "page"), None)
+    item_slot = next((k for k, v in bind.items() if v == "entity"), None)
+    if not (site_slot and page_slot and item_slot) or site_slot not in given or \
+            (page_slot not in given and item_slot not in given):
+        return {}
+    try:
+        from yuki.skills.web_route import site_page
+
+        kind, item, _how = site_page(store, given[site_slot], given.get(page_slot), given.get(item_slot), words,
+                                     now=now)
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, Any] = {}
+    if kind:
+        out[page_slot] = kind
+    if item:
+        out[item_slot] = {"name": item}
+    return out
 
 
 def _truth(value: Any) -> bool | None:
@@ -319,14 +390,15 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
                 told: Any = None, people: Callable[[str], dict[str, Any] | None] | None = None,
                 heard_person: Callable[[str, Sequence[str]], str | None] | None = None,
                 app_names: Callable[[str], tuple[str, list[str]]] | None = None,
-                site: bool = False) -> tuple[bool, Any]:
+                site: bool = False, loose: bool = False) -> tuple[bool, Any]:
     """``(valid, canonical value)`` of one given slot value (step 1). Identity and whole-word spans, plus checks on
     the user's own data: ``heard_person(name, words) -> the person's name | None`` (a person slot, or a text slot
     bound to a contact: the people index resolves the name to exactly one person whom the words name as heard, a
     transliteration or a close mishearing; the value becomes that person's own name, so "Hemant" for "हेमंत" runs
     as Hemanth), ``app_names(value) -> (key, names)`` (an app slot: the app's known names, any of which may stand in
     the words, or be heard there by sound; the app's key is kept) and ``site`` (a text slot the capability binds to a
-    site: the site's identity may stand in the words instead, :func:`_site_said`)."""
+    site: the site's identity may stand in the words instead, :func:`_site_said`). ``loose``: a listed name may also be
+    heard by :func:`yuki.skills.taste.heard_as`'s closed-set tier (the caller's taste slots only; review M2)."""
     if value is None or value == "":
         return False, None
     t = slot.type
@@ -404,8 +476,8 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
         # which the words do hold by sound ("Put on Lumin on Spotify"): that listed name
         from yuki.skills.taste import heard_as
 
-        alike = heard_as(menu_names, text)
-        if alike and any(heard_as([alike], str(w)) for w in words if w):
+        alike = heard_as(menu_names, text, loose=loose)
+        if alike and any(heard_as([alike], str(w), loose=loose) for w in words if w):
             return True, {"name": alike}
     return False, None
 
@@ -1258,6 +1330,9 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     sources = [str(w) for w in earlier or [] if str(w).strip()] + heard
     # an empty value is no value given (``"text": ""`` = nothing to write), never a value dropped
     given = {k: v for k, v in dict(slots or {}).items() if v is not None and v != ""}
+    # fSkills (live 18 Oct): a site page's kind and item as the site's data and the user's own names read them
+    # (``page = "Deji"`` is the handle page of their channel Deji; "MBL" heard for their channel NDL)
+    derived = _site_page_given(skill, given, sources, store, now)
     told = told_values(store, skill.key)
     people = people or _person(store)
     heard_person = heard_person or _heard_person(store)
@@ -1312,6 +1387,9 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             # kTaste (C2): the engine's pick for this run (the user asked Yuki to choose, or named only the channel)
             values[slot.name], filled[slot.name] = chosen[slot.name], str(chosen_from or FROM_CHOSEN)
             continue
+        if slot.name in derived:
+            values[slot.name], filled[slot.name] = derived[slot.name], "words"
+            continue
         way_slot = cap == WAY_CAPABILITY and slot.name == WAY_SLOT and slot.type == "entity" and store is not None
         if way_slot and slot.name in given:
             # kWays merge note 1: a live way of theirs named by its key or name (the menu line's ``way = <key>``)
@@ -1332,7 +1410,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             ok, value = check_value(slot, given[slot.name], sources, menu_names=menu_names or offered,
                                     told=told.get(slot.name), people=people,
                                     heard_person=heard_person if _person_bound(skill, slot) else None,
-                                    app_names=app_names, site=skill.bind.get(slot.name) == SITE_BIND)
+                                    app_names=app_names, site=skill.bind.get(slot.name) == SITE_BIND,
+                                    loose=bool(slot.taste))
             if ok:
                 if slot.taste and isinstance(value, dict) and store is not None:
                     hit = taste.find(store, slot.taste, value.get("name", ""))
@@ -1340,7 +1419,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                         # lSkills (live 17 Oct): "Lumin" heard for lumen, with [playlist: lumen | ネオン] on the menu:
                         # a heard value no row is called that sounds like exactly one of the user's own listed names
                         # is that one (contacts' sound key, onset and spelling distance: data, never a word list)
-                        alike = taste.heard_as(menu_names, value.get("name", ""))
+                        alike = taste.heard_as(menu_names, value.get("name", ""), loose=True)
                         if alike:
                             hit = taste.find(store, slot.taste, alike)
                     if hit is not None:

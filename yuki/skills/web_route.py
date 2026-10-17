@@ -164,10 +164,18 @@ OPEN_FLOOR_S = 3.0
 BAR_BEFORE_S = 0.8
 BAR_BEFORE_WINDOWS = 4
 BAR_BEFORE_WINDOW_S = 0.35
-FIELD_READ_S = 0.6
+FIELD_READ_S = 1.5
+#: fSkills: the frame-field reads that may settle (focus not yet on an element, or the climb cut short), read once more
+#: after this long; a timeout or a failed read is not retried (review L3).
+FIELD_SETTLING = ("no_focus", "climb_cut")
+FIELD_SETTLE_S = 0.2
 BAR_PAGE_S = 4.0
 BAR_PAGE_MIN_S = 1.5
 BAR_FLOOR_S = 8.0
+#: fSkills: the done-check's second reader of a window's page (the rungs' page-only pass) when the Documents' read
+#: found none (Arc), and how many of a browser's windows have their selected tab read before the open rung acts.
+PAGE_READ_S = 0.6
+TABS_BEFORE_WINDOWS = 1
 #: How long the window a rung opened a page in is kept for the next rung of the same run (RAM only).
 NOTE_KEEP_S = 30.0
 #: Review r2 H1: how far back "a browser Yuki itself just acted in" reaches (:func:`_just_acted`), before the request
@@ -1322,10 +1330,12 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
         return RouteResult(ran=False, outcome="handoff_ignored", facts={"browser_from": source}), \
             name, key, source, {}
     _claim_app(call, key)
+    tabs_before = _tabs_before(key, url) if key else {}
     result = _open_url(url, name if named else None, _launch_deadline(call))
     if _held_by_game(result):
         return RouteResult(ran=False, held="game", outcome="refused"), name, key, source, {}
     seen = _launch_seen(result)
+    seen["tabs_before"] = tabs_before
     if seen["hwnd"]:
         _note_window(call, key or _app_key(seen["process"]), seen["hwnd"])
     facts = {"browser_from": source, "via": seen["via"]}
@@ -1334,7 +1344,9 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
             # page_blank (review r1 M1): a browser whose protocol activation Windows refused came up showing no page
             # at all (a cold Arc drops the address): not opened either, so the address-bar rung types it now instead
             # of the done-check waiting 6 s on nothing and handing the request to the thinker
-            if named and seen["state"] == "same":
+            if named and seen["state"] in ("same", "blank"):
+                # fSkills (live 18 Oct: Arc refused the address and came up blank, 3.4 s, before the address bar):
+                # a blank window is the address ignored too, so after IGNORED_AFTER of them the bar runs at once
                 _note_ignored(key, True)
             _log_open(call, "protocol", seen, seen["reason"])
             return RouteResult(ran=False, outcome=seen["reason"], facts={**facts, "state": seen["state"]}), \
@@ -1360,7 +1372,7 @@ def _opened_result(line: str, key: str, source: str, seen: Mapping[str, Any], ra
     the engine's done-check must see it before ``already_line`` is said, else the next rung runs)."""
     facts_ram = {**ram, "browser": key, "hwnd": int(seen.get("hwnd") or 0), "before": str(seen.get("before") or ""),
                  "befores": dict(seen.get("befores") or {}), "arrived": seen.get("verified") is True,
-                 "cold": seen.get("cold") is True}
+                 "cold": seen.get("cold") is True, "tabs_before": dict(seen.get("tabs_before") or {})}
     facts = {"browser_from": source, "via": str(seen.get("via") or "")}
     if seen.get("already"):
         return RouteResult(ran=False, already=True, outcome="already", app=key or None, say=already_line or line,
@@ -1389,15 +1401,13 @@ def page_address(site_word: Any, page_word: Any = None, item: Any = None) -> tup
     page = _words(page_word).casefold()
     if not name:
         return None, {"why": "no_site"}
-    data = site_data(name) if name.replace("_", "").isalnum() else {}
-    if not data and domain_like(name):
-        m = page_of(f"https://{name}/")
-        if m is not None:
-            name, data = m.site, site_data(m.site)
+    filed = site_file(name)
+    data = site_data(filed) if filed else {}
     if not data:
         if domain_like(name) and not page:
             return f"https://{name}/", {"host": name}
         return None, {"why": "no_address"}
+    name = filed
     info = data.get("site") or {}
     if not page or page == "home":
         hosts = [str(h) for h in info.get("hosts") or []]
@@ -1429,6 +1439,70 @@ def page_address(site_word: Any, page_word: Any = None, item: Any = None) -> tup
         return None, {"why": "needs_link" if names == ["id"] and not ref else "no_value"}
     url = fill_url(name, page, **{names[0]: value})
     return (url, {"site": name, "kind": page, "entity": value}) if url else (None, {"why": "no_template"})
+
+
+def site_file(site_word: Any) -> str:
+    """The site file's name (``yuki/connect/sites/<name>.toml``) a site value names: the name itself, or the site whose
+    hosts a domain is one of; ``""`` when none (a host-scope site, or no site). Data only."""
+    from yuki.connect.templates import page_of, site as site_data
+
+    name = _words(site_word).casefold()
+    if not name:
+        return ""
+    if name.replace("_", "").isalnum() and site_data(name):
+        return name
+    if domain_like(name):
+        m = page_of(f"https://{name}/")
+        if m is not None and site_data(m.site):
+            return str(m.site)
+    return ""
+
+
+def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words: Sequence[str], *,
+              now: float | None = None) -> tuple[str | None, str | None, str]:
+    """fSkills (live 18 Oct: the talker gave ``page = "Deji"`` for "Deezy's YouTube channel" and ``page = "MBL
+    channel"`` for the user's NDL; both pages were dropped and YouTube's front page opened, or nothing): a site page's
+    kind and value as the site's data and the user's own names read them: ``(page kind, item, how)``.
+
+    * the item given (or a value given as the page that is no page kind) that one of the user's own names of the
+      site's speakable page kind (``taste.site_kinds``: YouTube's ``handle``; ``taste.candidates``) holds as written
+      (``listed``), or by sound, the value itself or a run of its words (``heard``, ``taste.heard_as``'s closed-set
+      tier: "MBL" for NDL, only among their own names), is that page of that name, whatever page kind came with it
+      (review L4: "channel" + "MBL" is their channel NDL's handle page, never a channel id no link gives);
+    * else a page that is one of the site file's page kinds stays (``kind``: data, like an option of an enum), unless
+      its address takes a value and no item came (review L4: ``page = handle`` alone is no page to open);
+    * otherwise ``(None, None, "")``: nothing changed.
+
+    Never raises."""
+    try:
+        from yuki.connect.templates import site as site_data
+        from yuki.skills import taste
+
+        name = site_file(site_word)
+        if not name:
+            return None, None, ""
+        pages = {str(k).casefold(): str(v) for k, v in (site_data(name).get("pages") or {}).items()}
+        page = _words(page_word).casefold()
+        item = _words(item_word if not isinstance(item_word, Mapping) else item_word.get("name"))
+        said = item or ("" if page in pages else _words(page_word))
+        kinds = [(kind, str(pk)) for kind, site, pk, _var in taste.site_kinds() if site == name] if said else []
+        for kind, pk in kinds:
+            names = [n for n in taste.candidates(store, kind, now=now) if n]
+            exact = next((n for n in names if _words(n).casefold() == said.casefold()), None)
+            if exact is not None:
+                return pk, exact, "listed"
+            alike = taste.heard_as(names, said, loose=True)
+            if alike and any(taste.heard_as([alike], str(w), loose=True)
+                             or _words(alike).casefold() in str(w).casefold() for w in words if w):
+                return pk, alike, "heard"
+        if page not in pages or (not item and "{" in pages[page]):
+            # no page kind, or one whose address needs a value none came with: nothing changed (the resolver checks
+            # the page as given, and drops it unless the words hold it: the site's front page)
+            return None, None, ""
+        # none of their names: a page kind given stays (its item is checked by the resolver as given)
+        return page, None, "kind"
+    except Exception:  # noqa: BLE001 - nothing changed
+        return None, None, ""
 
 
 def page_matches(url: Any, expect: Mapping[str, Any]) -> bool:
@@ -1617,25 +1691,116 @@ def _shown_page(ctx: Any, matches: Callable[[str], bool]) -> tuple[bool | None, 
     if not hwnd:
         return (None if how == "front" else False), {"status": "unread" if how == "front" else "no_window", "via": how}
     ev: dict[str, Any] = {"via": how, "process": _window_image(hwnd)}
+    ram = _ram(ctx)
     urls = _front_urls(hwnd)
-    if urls is None:
-        return None, {**ev, "status": "timeout"}
     if not urls:
-        return None, {**ev, "status": "no_document"}
+        # fSkills (live 18 Oct, Arc: "no_document" on 17 reads over 6 s after the address-bar rung saw the page arrive,
+        # then "couldn't confirm"): the Documents' own read found none, so the page-only pass the rungs watch with
+        # reads the window's main page (another reader of the same window, never the window in front)
+        page = _first_page(lambda: [hwnd], bool, PAGE_READ_S)
+        url = str(getattr(page, "url", "") or "")
+        if url:
+            urls, ev["reader"] = [url], "page_pass"
+        elif ram.get("arrived") is True and _ram_hwnd(ram) == hwnd:
+            # neither reader reads this window's page, and the rung itself saw the page newly arrive in this very
+            # window after it acted (a page-only read of it, RAM ``arrived``): that sighting stands
+            return True, {**ev, "status": "arrived"}
+        else:
+            return None, {**ev, "status": "timeout" if urls is None else "no_document"}
     hits = [url for url in urls if matches(url)]
     if not hits:
         return False, {**ev, "status": "other_page"}
-    ram = _ram(ctx)
     if ram.get("already") is True:
         return True, {**ev, "status": "already"}
     if ram.get("arrived") is not True:
         before = _before_of(ram, hwnd)
         if before and all(_page_key(url) == _page_key(before) for url in hits):
+            # fSkills (live 18 Oct: YouTube asked for while the window's tab showed YouTube: "unchanged" for 6 s, the
+            # rung charged a false contradiction and, with the user's next request, disabled): the page alone can't
+            # tell a new tab on the same address from the old one, so the selected tab's identity does (its UIA
+            # RuntimeId, read before the rung acted): another tab selected now, showing the page, is the page opened
+            moved = _tab_moved(ram, hwnd)
+            if moved is True:
+                return True, {**ev, "status": "new_tab"}
+            if moved is None and _tabs_known(ram, hwnd):
+                return None, {**ev, "status": "tabs_unread"}     # known before, unreadable now: never a contradiction
             return False, {**ev, "status": "unchanged"}
         address = str(ram.get("address") or "")
         if before is None and all(_past_root(address, url) for url in hits):
             return None, {**ev, "status": "not_known"}
     return True, {**ev, "status": "page"}
+
+
+def _ram_hwnd(ram: Mapping[str, Any]) -> int:
+    try:
+        return int(ram.get("hwnd") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _tabs_known(ram: Mapping[str, Any], hwnd: int) -> bool:
+    tabs = ram.get("tabs_before")
+    return isinstance(tabs, Mapping) and isinstance(tabs.get(hwnd), list)
+
+
+def _tab_moved(ram: Mapping[str, Any], hwnd: int) -> bool | None:
+    """Whether window ``hwnd``'s selected tab is another tab than the one selected before the rung acted (RAM
+    ``tabs_before``: ``{hwnd: [RuntimeIds]}``, :func:`_tabs_now`): ``True`` another, ``False`` the same, ``None``
+    unknown (not read before, or unreadable now)."""
+    if not _tabs_known(ram, hwnd):
+        return None
+    before = [str(t) for t in ram["tabs_before"][hwnd]]
+    now = _selected_tabs(hwnd)
+    if not now or not before:
+        return None
+    return not set(now) & set(before)
+
+
+def _tabs_before(key: str, url: str) -> dict[int, list[str]]:
+    """fSkills review L2: :func:`_tabs_now` of the browser's top window(s), only when its title (the selected page's
+    own) may show the asked address's site: it holds the site's name (the registrable domain's first label, letters
+    and digits, case aside), or it can't be read. That is the one case the done-check needs the tab's identity for (a
+    new tab on an address already showing); any other open skips the tab walk (~110 ms, up to
+    :data:`FRONT_READ_S`). A title that hides the name only costs that case its identity (the old rule: unchanged)."""
+    windows = [h for h, _pid in _app_windows(key)][:TABS_BEFORE_WINDOWS]
+    if not windows:
+        return {}
+    try:
+        from yuki.memory.moments import registrable_domain
+        from yuki.memory.store import url_host
+
+        label = "".join(ch for ch in registrable_domain(url_host(url) or "").split(".")[0] if ch.isalnum())
+    except Exception:  # noqa: BLE001 - no name to look for: read
+        label = ""
+    worth = [h for h in windows if _title_may_show(h, label)]
+    return _tabs_now(worth) if worth else {}
+
+
+def _title_may_show(hwnd: int, label: str) -> bool:
+    """Whether window ``hwnd``'s title holds ``label`` (letters and digits run together, case aside), or can't tell
+    (no label, no title): a fixed comparison of two spellings, never a list of sites."""
+    if not label:
+        return True
+    try:
+        import win32gui
+
+        title = str(win32gui.GetWindowText(int(hwnd)) or "")
+    except Exception:  # noqa: BLE001
+        return True
+    letters = "".join(ch for ch in title.casefold() if ch.isalnum())
+    return not letters or label in letters
+
+
+def _tabs_now(hwnds: Sequence[int]) -> dict[int, list[str]]:
+    """``{hwnd: [the selected tabs' RuntimeIds]}`` of a browser's windows right before a rung acts (fSkills: the
+    identity :func:`_shown_page` tells a new tab on the same address by), at most :data:`TABS_BEFORE_WINDOWS` windows,
+    each one bounded UIA read; a window whose tabs can't be read is left out."""
+    out: dict[int, list[str]] = {}
+    for hwnd in list(dict.fromkeys(int(h) for h in hwnds if h))[:TABS_BEFORE_WINDOWS]:
+        got = _selected_tabs(hwnd)
+        if got:
+            out[hwnd] = list(got)
+    return out
 
 
 def probe_page_shown(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
@@ -1895,6 +2060,13 @@ def route_address_bar(call: RouteCall) -> RouteResult:
         _log_open(call, "address_bar", seen, "other_window")
         return RouteResult(ran=False, outcome="other_window", facts=facts)
     ok, why = frame_field(pid)
+    if ok is None and why in FIELD_SETTLING:
+        # fSkills (live 18 Oct, Arc: its command bar just opened, then the thinker by steps, 17 s): a read that found
+        # focus still moving is read once more after the bar has settled (structure only; still never typed unless it
+        # is the frame's field). A read that timed out or failed is not (review L3: a blocked provider would only
+        # leave another UIA thread behind and stretch the rung toward 3.2 s): the longer first read covers it
+        time.sleep(FIELD_SETTLE_S)
+        ok, why = frame_field(pid)
     facts["stage"] = why
     if ok is not True:
         # focus is not on the browser's own address field (or it couldn't be read): never typed into, so never sent
