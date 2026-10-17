@@ -579,7 +579,8 @@ def _said_for(store: Any) -> Callable[[str, Sequence[str]], tuple[str, str, int]
 
 
 def _note_asked(store: Any, said: str, person_id: int, turns: Sequence[str], now: float) -> bool:
-    """Note the R4 question with the user's turns as they stand (:func:`yuki.memory.contacts.note_alike_asked`, the
+    """Note the R4 question with the user's turns as they stand, in time order and the very list the answer is
+    validated against (``resolve``'s ``sources``; :func:`yuki.memory.contacts.note_alike_asked`, the
     chat driver's own record of its sound-alike question), so an answer given after it counts
     (``contacts.alike_answered``: the caller's same name then validates through ``names_person``, and the chat driver
     types a send to that person and leaves it, never sends by sound). ``False`` when the same words were asked about
@@ -680,6 +681,15 @@ def _first_confirm(key: tuple[str, str, str], now: float) -> bool:
             return False
         _confirms[key] = now
         return True
+
+
+def _confirm_asked(key: tuple[str, str, str], now: float) -> bool:
+    """Whether the confirm question about ``key`` was asked within :data:`CONFIRM_ONCE_S` (a read-only peek: nothing
+    noted). lResolve r1 L1: the same words given again after it mean the answer was no, so a draft never runs them as
+    that person unasked even when their closest sound is a heard form the user confirmed."""
+    with _confirm_lock:
+        at = _confirms.get(key)
+    return at is not None and 0.0 <= now - at <= CONFIRM_ONCE_S
 
 
 def _identity(slot: Slot | None, value: Any) -> str:
@@ -1154,8 +1164,10 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
         return Held(skill.key, live.game)
     heard = [words] if isinstance(words, str) else [str(w) for w in words or [] if w]
     # validation reads every turn of the exchange and the older turns the caller passed (IF-words); filling from the
-    # words (an app they named) reads the exchange only, newest turn first
-    sources = heard + [str(w) for w in earlier or [] if str(w).strip()]
+    # words (an app they named) reads the exchange only, newest turn first. lResolve r1 M1: in time order (the older
+    # turns first, as the brain passes them, then the exchange, newest last), the order contacts' sound-alike answer
+    # record reads ("spoken since" = a newer last turn), so a call in the same request as a question is no yes
+    sources = [str(w) for w in earlier or [] if str(w).strip()] + heard
     # an empty value is no value given (``"text": ""`` = nothing to write), never a value dropped
     given = {k: v for k, v in dict(slots or {}).items() if v is not None and v != ""}
     told = told_values(store, skill.key)
@@ -1251,13 +1263,15 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                         # and the chat driver says it doesn't know who that is (never the same question twice; an
                         # eval's replay, ``until``, asks every time: its phrasings are separate requests)
                         alike = sounds_like(value)
-                        if alike is not None and drafting and heard_confirmed(value, alike[1]):
+                        confirm_key = (skill.capability or skill.key, slot.name, _words(value).casefold())
+                        if alike is not None and drafting and heard_confirmed(value, alike[1]) and \
+                                (until is not None or not _confirm_asked(confirm_key, now)):
                             # lResolve (lMsg's what's left 3): its closest sound is a heard form of that very person
                             # the user confirmed ("hey mean" near their "hey meant"), on a draft or an open: that
-                            # person, unasked (the done line names them, so a wrong one shows); a send still asks
+                            # person, unasked (the done line names them, so a wrong one shows); a send still asks,
+                            # and once asked within CONFIRM_ONCE_S the same words again are a no (r1 L1)
                             value, relaxed = alike[0], True
-                        elif alike is not None and (until is not None or _first_confirm(
-                                (skill.capability or skill.key, slot.name, _words(value).casefold()), now)):
+                        elif alike is not None and (until is not None or _first_confirm(confirm_key, now)):
                             return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=alike[0]), [alike[0]],
                                        dropped=list(dropped))
                 values[slot.name], filled[slot.name] = value, "words"
@@ -1284,11 +1298,12 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 # talker's "Hemanth" for the heard "Hemish"), and a run of the user's own words sounds like that very
                 # person and nobody else: asked, never handed to the thinker and never run as them unasked. The given
                 # name is the question's answer, so the slot is not in ``dropped`` and the engine keeps the question
-                # (x5's ``_dropped``). Noted with the user's turns, so their answer counts once they've spoken; a
-                # repeat of the same words within the exchange is a no and falls through to the hand-off
+                # (x5's ``_dropped``). Noted with the very turns the answer is checked against (``sources``, r1 M1),
+                # so it counts only once they've spoken since; a repeat of the same words within the exchange is a no
+                # and falls through to the hand-off
                 heard_as = said_for(given[slot.name], heard)
-                if heard_as is not None and (until is not None or _note_asked(store, heard_as[1], heard_as[2], heard,
-                                                                              now)):
+                if heard_as is not None and (until is not None or _note_asked(store, heard_as[1], heard_as[2],
+                                                                              sources, now)):
                     return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=heard_as[0]), [heard_as[0]],
                                dropped=list(dropped))
             dropped.append(slot.name)
