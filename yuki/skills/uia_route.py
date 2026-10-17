@@ -71,7 +71,10 @@ the user's words: a held step stops the run and the user is asked.
 **Never a send unless the user's words plainly said what goes to whom.** The talker declares ``sends`` for a way that
 sends, posts or replies (its judgement, as the thinker declares ``risk``); then ``to`` and ``what`` must each be the
 user's own words (a whole-word span of what they said), else nothing is run and the thinker gets it. Whatever is typed
-must be their words or the way's own: the talker cannot compose text.
+must be their words or the way's own: the talker cannot compose text. Two exceptions, both for the chat driver's own
+steps only: a send the brain's consent grant covers whole (:func:`granted_send`), and a draft the skill resolver kept
+in Yuki's own wording for a run that doesn't send (:func:`note_draft`, lResolve: the 10 Oct decision, "a message Yuki
+words itself stays a draft"), typed by a run that is that one typing step and nothing after it, so it is never sent.
 
 Every run is kept as a run trace (``MemoryAccess.record_run``: source ``hand``, one step per action, the way cited), so
 the ledger counts the use and the learners see how it went. No regex, no keyword list, no per-app branch: strings are
@@ -415,14 +418,73 @@ def check_picks_for_send(steps: list[SkillStep], args: dict[str, Any]) -> str | 
     return None
 
 
-def check_texts(steps: list[SkillStep], words: list[str], way_text: str, *, granted: str = "") -> str | None:
+#: lResolve (the 10 Oct decision: "a message Yuki words itself stays a draft"): how long a draft the skill resolver kept
+#: in Yuki's own wording (:func:`note_draft`) may be typed by that skill's own steps. The run starts right after the
+#: resolve, and its chat may take a few seconds to open (the request's budget is 5 s; two rungs may try it).
+DRAFT_KEEP_S = 60.0
+_drafts_lock = threading.Lock()
+#: (the skill's own steps' ref, the text folded) -> when the resolver kept it (monotonic). RAM only, never logged.
+_drafts: dict[tuple[str, str], float] = {}
+
+
+def _skill_ref(key: Any) -> str:
+    """The ref a skill's own steps run under (``chat.run_steps`` and :func:`run_route` give ``skill:<key>``)."""
+    return f"skill:{_words(key)}"
+
+
+def note_draft(skill: str, text: str) -> None:
+    """The skill resolver kept ``text``, Yuki's own wording of a message (not a span of the user's words), for a run of
+    the capability ``skill`` that doesn't send (``yuki.skills.resolve``, filled ``worded``: the 10 Oct decision, "a
+    message Yuki words itself stays a draft"). For :data:`DRAFT_KEEP_S` a run of that skill's own steps may type
+    exactly it (:func:`draft_of`, :func:`check_texts`'s ``draft``): a run that is that one typing step and nothing
+    else, so no key, click or line break ever sends it, and never a run that declares a send or a learned way. RAM
+    only; never logged."""
+    folded = _folded(text)
+    if not folded or not _words(skill):
+        return
+    now = time.monotonic()
+    with _drafts_lock:
+        for k in [k for k, at in _drafts.items() if not (0.0 <= now - at <= DRAFT_KEEP_S)]:
+            _drafts.pop(k, None)
+        _drafts[(_skill_ref(skill), folded)] = now
+
+
+def draft_of(steps: list[SkillStep], item: Mapping[str, Any], args: Mapping[str, Any]) -> str:
+    """The text this run may type as a draft Yuki worded (folded; :func:`check_texts`'s ``draft``), else ``""``. All
+    of these must hold: the run is a skill's own steps (no demo, trace, trial or parts: never a learned way), it
+    declares no send (``args.sends``, ``item.sends``), it is exactly one ``type`` step (nothing pressed, clicked or
+    picked after it) whose text is one line as the resolver kept it (no line break or tab that could send it), and the
+    resolver noted that very text for this skill's own steps within :data:`DRAFT_KEEP_S` (:func:`note_draft`).
+    Identity and structure only."""
+    if args.get("sends") is True or item.get("sends") or any(item.get(k) for k in ("demo", "trace", "trial", "parts")):
+        return ""
+    if len(steps) != 1 or steps[0].do != "type":
+        return ""
+    text = steps[0].text
+    if not text or text != _words(text):
+        return ""
+    key = (str(item.get("ref") or ""), _folded(text))
+    now = time.monotonic()
+    with _drafts_lock:
+        at = _drafts.get(key)
+    return key[1] if at is not None and 0.0 <= now - at <= DRAFT_KEEP_S else ""
+
+
+def check_texts(steps: list[SkillStep], words: list[str], way_text: str, *, granted: str = "",
+                draft: str = "") -> str | None:
     """Why a step's text may not be typed (``None``: all may): only the user's own words or the way's own words
     (``way_text`` ``""`` for a way learned from what the user did: decision D8, its typing is always their words), or
     ``granted``: the whole text of a send the brain's consent grant covers (:func:`granted_send`), typed as it is
-    (case and spaces aside), never a part of it."""
+    (case and spaces aside), never a part of it; or ``draft`` (:func:`draft_of`, lResolve: the 10 Oct decision, "a
+    message Yuki words itself stays a draft"): the whole text the skill resolver kept in Yuki's wording for a run that
+    doesn't send, only in a run of type steps alone (nothing pressed or clicked after it), one line, never a part of
+    it."""
     granted = _folded(granted)
+    draft = _folded(draft) if steps and all(s.do == "type" for s in steps) else ""
     for step in steps:
         if step.do == "type" and granted and _folded(step.text) == granted:
+            continue
+        if step.do == "type" and draft and step.text == _words(step.text) and _folded(step.text) == draft:
             continue
         if step.do == "type" and not said(step.text, [*words, way_text]):
             return (f"step {step.i} would type \"{step.text[:60]}\", which is neither their words nor the learned "
@@ -1659,9 +1721,13 @@ class SkillRunner:
         # instruction, though Yuki worded it; never a learned way's (a demo, its parts) and never a part of the text
         granted = str(args.get("what") or "") if (not demo and args.get("sends") is True
                                                     and granted_send(args, grant)) else ""
+        # lResolve, the 10 Oct decision ("a message Yuki words itself stays a draft"): the draft the skill resolver kept
+        # in Yuki's wording, typed by this skill's own one typing step and nothing after it; never a learned way's
+        draft = "" if demo else draft_of(steps, item, args)
         why = check_sends(args, words, grant=grant if not demo else None) or (
             check_picks_for_send(steps, args) if item.get("sends") or args.get("sends") is True else None) or \
-            check_texts(steps, words, "" if demo else way_text, granted=granted)   # V9: a demo's typing: their words
+            check_texts(steps, words, "" if demo else way_text, granted=granted,
+                        draft=draft)   # V9: a demo's typing: their words
         if why:
             raise SkillRefused(why)
         # capC4: where each part ends (the index of its last step in ``steps``) and the checked state it ends on
@@ -2737,4 +2803,4 @@ __all__ = ["RUN_SKILL_TOOL", "SkillRunner", "SkillRefused", "SkillStep", "parse_
            "fit_to_way", "fill_slots", "way_step", "said", "trace_steps", "SKILL_DOS", "MAX_PARTS", "site",
            "PATTERNS", "Found", "Pressed", "app_window", "search", "find_in", "apply_pattern", "press", "route_steps",
            "run_route", "use_learned", "set_use_learned", "way_steps", "way_path", "recorded_path", "DeskHands",
-           "granted_send", "grant_person", "send_grant", "GRANT_KIND"]
+           "granted_send", "grant_person", "send_grant", "GRANT_KIND", "DRAFT_KEEP_S", "note_draft", "draft_of"]

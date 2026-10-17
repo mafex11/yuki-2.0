@@ -29,14 +29,27 @@ eval). Step by step:
    runs as the one person it reads as ("हेमंत" as Hemanth: a conversion). A Latin name the user said that none of
    their people goes by as written but that sounds like exactly one of them is asked about once
    (:data:`CONFIRM_PERSON`: "Did you mean Hemanth?"), never swapped: sound only confirms a name the talker or thinker
-   inferred, and the same name given again within the exchange runs as said. An app may also be one whose known
-   names (its key, a web address's name, a chat app's title, the names the user's timeline shows it under) stand in
-   the words, or are heard there by sound ("this card" for Discord, "Ark" for Arc); a site (a text slot bound to a
-   site) one whose identity stands there ("youtube.com" for "YouTube"). A value that fails is dropped and its slot
-   name returned (``dropped``), never "corrected". One exception, on the new brain only: a text (the message, the
-   person) that is exactly what the brain's consent rule allowed and counted down for this very run (``granted``,
-   failure fix-plan Item 11's L2: Yuki's wording of what the user asked to say) is kept as given, filled
-   :data:`FROM_GRANT`.
+   inferred, and the same name given again within the exchange runs as said. lResolve (live test 17 Oct, problem 4):
+   on a draft or an open (a capability that may send, on a run that doesn't), a name whose closest sound is a heard
+   form of that person the user confirmed (:func:`yuki.memory.contacts.sounds_alike` ``confirmed``: "hey mean" near
+   their confirmed "hey meant") runs as that person unasked, the done line naming them; a send still asks. A person
+   the caller gave that the words don't hold (the talker's "Hemanth" for the heard "Hemish") is asked about
+   (:data:`CONFIRM_PERSON`) when a run of the user's own words sounds like that person and nobody else
+   (``sounds_alike``), never handed to the thinker; the question is noted with the user's turns
+   (:func:`yuki.memory.contacts.note_alike_asked`), so the caller's same name after their answer is that person
+   (``names_person``), and a send to them is typed and left by the chat driver, never sent by sound. An app may also
+   be one whose known names (its key, a web address's name, a chat app's title, the names the user's timeline shows
+   it under) stand in the words, or are heard there by sound ("this card" for Discord, "Ark" for Arc); a site (a
+   text slot bound to a site) one whose identity stands there ("youtube.com" for "YouTube"). A value that fails is
+   dropped and its slot name returned (``dropped``), never "corrected". One exception, on the new brain only: a text
+   (the message, the person) that is exactly what the brain's consent rule allowed and counted down for this very run
+   (``granted``, failure fix-plan Item 11's L2: Yuki's wording of what the user asked to say) is kept as given, filled
+   :data:`FROM_GRANT`. And the 10 Oct decision, "a message Yuki words itself stays a draft" (lResolve): the free text
+   of a capability that may send (what to write: a text slot bound to nothing), given in the caller's own wording, on a
+   run that doesn't send (its ``sends_when`` data on the values, ``send = "draft"``), is kept as given, filled
+   :data:`FROM_WORDED`, and noted for the step runner (:func:`yuki.skills.uia_route.note_draft`), which types exactly
+   it in a run that only types (never one that sends or presses anything after it). A send stays the user's words or
+   the brain's grant.
 2. **Fill what is missing**, in :data:`FILL_ORDER`: what the user said always first (an app their words name, the
    newest turn that names one, for an app slot; :func:`named_app`; never an app Yuki itself just acted in
    (:func:`just_acted`: a turn may name it to complain), and with a call live, for a slot that asks in a call, only
@@ -47,7 +60,8 @@ eval). Step by step:
    numbers within 10 minutes) -> told -> a live fact (``playing``: the app playing now; two playing is a question)
    -> the preference
    (:func:`yuki.skills.prefs.choose`) -> taste (:func:`yuki.skills.taste.top`) -> the connection's default. A text
-   the caller gave for what to write that the words don't hold is asked about, never replaced by its default.
+   the caller gave for what to write that the words don't hold is asked about on a send (a draft keeps it, step 1),
+   never replaced by its default.
 3. **Name what was not said.** A value from a preference that is not the usual, from taste or from a default is
    named in the done line (the slot's ``say``), so one word corrects it.
 4. **Pick the rungs:** each route's ``when`` conditions on the values, its trust (:func:`yuki.skills.registry.usable`)
@@ -84,6 +98,14 @@ FILL_ORDER: tuple[str, ...] = ("words", "again", "told", "live", "pref", "taste"
 #: exactly it (``resolve``'s ``granted``; failure fix-plan Item 11's L2): kept in the given slot's own place in the slot
 #: loop, right after "words" and before every fill, so it is never a guess and never fills an empty slot.
 FROM_GRANT = "granted"
+#: Where a given value came from when it is the caller's own wording of what to write (a text the words don't hold) and
+#: the run doesn't send (lResolve; the 10 Oct decision, "a message Yuki words itself stays a draft"): kept in the given
+#: slot's own place, right after "words" and before every fill, so it is never a guess and never fills an empty slot;
+#: the step runner types it as a draft only (:func:`yuki.skills.uia_route.note_draft`). A code word in the logs.
+FROM_WORDED = "worded"
+#: The slot types code checks with no words at all (an option, a number, a switch): how a ``sends_when`` slot's given
+#: value is read before the slot loop (:func:`_sends`).
+CODE_TYPES: tuple[str, ...] = ("enum", "number", "points", "bool")
 #: The user's apps as their timeline shows them (:func:`known_apps`) are read again at most this often per database.
 APPS_TTL_S = 600.0
 #: The bind source that marks a text slot as a person (``message``'s ``bind = { person = "contact" }``).
@@ -465,13 +487,13 @@ def _heard_person(store: Any) -> Callable[[str, Sequence[str]], str | None]:
     return check
 
 
-def _sounds_like(store: Any) -> Callable[[str], str | None]:
-    """``name -> the one person it sounds like | None`` for a name the user said literally: ``None`` when the people
-    index finds anyone by that name as written (:func:`yuki.memory.contacts.resolve`, the chat driver's own lookup) or
-    a group chat or channel goes by it; else the one person it sounds like (``resolve(..., heard=True)``), whom the
-    resolver asks about (:data:`CONFIRM_PERSON`) rather than run a name the chat driver doesn't know or send to a
-    person the user may not have meant."""
-    def check(name: str) -> str | None:
+def _sounds_like(store: Any) -> Callable[[str], tuple[str, int] | None]:
+    """``name -> (the one person it sounds like, their id) | None`` for a name the user said literally: ``None`` when
+    the people index finds anyone by that name as written (:func:`yuki.memory.contacts.resolve`, the chat driver's own
+    lookup) or a group chat or channel goes by it; else the one person it sounds like (``resolve(..., heard=True)``),
+    whom the resolver asks about (:data:`CONFIRM_PERSON`) rather than run a name the chat driver doesn't know or send
+    to a person the user may not have meant."""
+    def check(name: str) -> tuple[str, int] | None:
         if store is None:
             return None
         try:
@@ -484,9 +506,145 @@ def _sounds_like(store: Any) -> Callable[[str], str | None]:
             return None
         if len({c.id for c in got}) != 1:
             return None
-        return " ".join(str(getattr(got[0], "name", "") or "").split()) or None
+        who = " ".join(str(getattr(got[0], "name", "") or "").split())
+        pid = getattr(got[0], "id", None)
+        return (who, int(pid)) if who and isinstance(pid, int) and not isinstance(pid, bool) else None
 
     return check
+
+
+def _heard_confirmed(store: Any) -> Callable[[str, int], bool]:
+    """``(name, person id) -> bool``: whether the name's closest sound among the user's people is a heard form of that
+    very person the user confirmed (:func:`yuki.memory.contacts.sounds_alike`, lMsg: ``confirmed`` is a
+    ``name_aliases`` correction, ``how = "heard"``, never their own name or a handle), and nobody else sounds like it.
+    lResolve (live test 17 Oct, problem 4): "hey mean" near the confirmed "hey meant" is Hemanth, so a run that doesn't
+    send never asks "Did you mean Hemanth?" about it again. Data only (memory's aliases and the fixed sound rules).
+    Never raises (``False``)."""
+    def check(name: str, person_id: int) -> bool:
+        if store is None:
+            return False
+        try:
+            from yuki.memory.contacts import sounds_alike
+
+            got = sounds_alike(store, name)
+        except Exception:  # noqa: BLE001
+            return False
+        return got is not None and bool(got.confirmed) and int(got.contact.id) == int(person_id)
+
+    return check
+
+
+def _said_for(store: Any) -> Callable[[str, Sequence[str]], tuple[str, str, int] | None]:
+    """R4 (lMsg's report, "What's left after round 1" item 3): ``(name, turns) -> (the person's own name, the user's
+    words for them, their id) | None`` for a person-bound value the caller gave that the words don't hold (the
+    talker's "Hemanth" for the heard "Hemish"): the one person ``name`` names as written
+    (:func:`yuki.memory.contacts.resolve`), when a run of one to three of the user's own Latin words in ``turns``
+    (newest turn first, then in reading order) sounds like that person and nobody else
+    (:func:`yuki.memory.contacts.sounds_alike`: the strict, loose or tight sound rule over memory's names and heard
+    forms; no one's name as written, no group chat's or channel's). Each run is first compared with that person's own
+    names only (the same rules), so the people-wide lookup runs once per likely run, not once per run of words. A run
+    in a Brahmic script is left out: a transliteration already counts as naming them (``names_person``). Never raises
+    (``None``)."""
+    def check(name: str, turns: Sequence[str]) -> tuple[str, str, int] | None:
+        if store is None:
+            return None
+        try:
+            from yuki.memory import contacts as C
+
+            who = {int(c.id): c for c in C.resolve(store, name)}
+            if len(who) != 1:
+                return None
+            person = next(iter(who.values()))
+            forms = [f for f in (C.heard_form(n) for n in person.names) if f is not None and f.key]
+            if not forms:
+                return None
+            for text in reversed([str(t) for t in turns or () if str(t or "").strip()]):
+                for _start, said, run in C.heard_spans(text):
+                    if run.script:
+                        continue
+                    one = len(C.spoken_words(said)) == 1
+                    # contacts' own sound rules (the ones sounds_alike applies), on this person's names only
+                    if not any(C._sound_ok(run, f) or C._alike(run, f) or (one and C._alike_tight(run, f))
+                               for f in forms):
+                        continue
+                    got = C.sounds_alike(store, said)
+                    if got is not None and int(got.contact.id) == int(person.id):
+                        own = " ".join(str(person.name or "").split())
+                        return (own, " ".join(said.split()), int(person.id)) if own else None
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    return check
+
+
+def _note_asked(store: Any, said: str, person_id: int, turns: Sequence[str], now: float) -> bool:
+    """Note the R4 question with the user's turns as they stand, in time order and the very list the answer is
+    validated against (``resolve``'s ``sources``; :func:`yuki.memory.contacts.note_alike_asked`, the
+    chat driver's own record of its sound-alike question), so an answer given after it counts
+    (``contacts.alike_answered``: the caller's same name then validates through ``names_person``, and the chat driver
+    types a send to that person and leaves it, never sends by sound). ``False`` when the same words were asked about
+    within ``contacts.ALIKE_ANSWER_S`` (the same name again: the answer was no) or memory can't say. RAM only."""
+    if store is None:
+        return False
+    try:
+        from yuki.memory.contacts import note_alike_asked
+
+        return bool(note_alike_asked(store, said, int(person_id), [str(t) for t in turns or () if t], now=now))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _sends(skill: Skill, given: Mapping[str, Any], told: Mapping[str, Any]) -> bool:
+    """Whether this run sends (the capability's own ``sends`` / ``sends_when`` data,
+    :func:`yuki.skills.connection.sends_with`), read before the slot loop fills its slots: each ``sends_when`` slot as
+    the loop will fill it, a given value code checks alone (:data:`CODE_TYPES`: an option, a number, a switch), else a
+    told value, else its default; a given value of any other type is read as given (erring toward "sends"). The slot
+    loop's own values are checked again after it (``resolve``: a mismatch resolves again with nothing relaxed). Data
+    only, never the words."""
+    from yuki.skills.connection import sends_with
+
+    if not getattr(skill, "sends", False):
+        return False
+    values: dict[str, Any] = {}
+    for cond in getattr(skill, "sends_when", ()) or ():
+        name = str(cond.get("slot") or "") if isinstance(cond, Mapping) else ""
+        slot = skill.slot(name) if name else None
+        if slot is None:
+            continue
+        raw = given.get(name)
+        value: Any = None
+        if raw is not None and raw != "":
+            if slot.type in CODE_TYPES:
+                ok, got = check_value(slot, raw, [])
+                value = got if ok else None
+            else:
+                value = raw
+        if value is None and slot.told and name in told:
+            value = told[name]
+        if value is None:
+            value = slot.default
+        values[name] = value
+    return sends_with(skill, values)
+
+
+def _worded_slot(skill: Skill, slot: Slot) -> bool:
+    """A slot whose given value may be the caller's own wording on a run that doesn't send: the free text of a
+    capability that may send (its data's ``sends``): a text slot bound to nothing (``message``'s ``text``: what to
+    write), filled from the request (role ``fill``). Data only."""
+    return bool(getattr(skill, "sends", False)) and slot.type == "text" and slot.role == "fill" \
+        and not skill.bind.get(slot.name)
+
+
+def _note_draft(skill_key: str, text: Any) -> None:
+    """Tell the step runner the draft Yuki worded may be typed (:func:`yuki.skills.uia_route.note_draft`). Never
+    raises."""
+    try:
+        from yuki.skills.uia_route import note_draft
+
+        note_draft(skill_key, _words(text))
+    except Exception:  # noqa: BLE001 - not noted: the steps refuse to type it, and nothing is typed or sent
+        pass
 
 
 def _written(store: Any) -> Callable[[str], str | None]:
@@ -523,6 +681,15 @@ def _first_confirm(key: tuple[str, str, str], now: float) -> bool:
             return False
         _confirms[key] = now
         return True
+
+
+def _confirm_asked(key: tuple[str, str, str], now: float) -> bool:
+    """Whether the confirm question about ``key`` was asked within :data:`CONFIRM_ONCE_S` (a read-only peek: nothing
+    noted). lResolve r1 L1: the same words given again after it mean the answer was no, so a draft never runs them as
+    that person unasked even when their closest sound is a heard form the user confirmed."""
+    with _confirm_lock:
+        at = _confirms.get(key)
+    return at is not None and 0.0 <= now - at <= CONFIRM_ONCE_S
 
 
 def _identity(slot: Slot | None, value: Any) -> str:
@@ -965,7 +1132,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             people: Callable[[str], dict[str, Any] | None] | None = None,
             default_step: float = 10.0, earlier: Sequence[str] | None = None,
             heard_person: Callable[[str, Sequence[str]], str | None] | None = None,
-            granted: Mapping[str, str] | None = None) -> Result:
+            granted: Mapping[str, str] | None = None, _strict: bool = False) -> Result:
     """Fill ``skill_key``'s slots and pick its rungs (see the module docstring). ``words``: the user's own words, each
     turn exactly as heard or typed (the current exchange: their turns since the last finished job, newest last);
     ``earlier``: older turns of this conversation (their own words too), a source for validating a value the caller
@@ -975,7 +1142,13 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     consent rule allowed for this very run (the engine's :func:`~yuki.skills.engine.granted_values`: a send it allowed
     and counted down, or the user's yes to it; failure fix-plan Item 11's L2): a given text value of that slot that the
     words don't hold but equals it (case and spaces aside) is kept as given (filled :data:`FROM_GRANT`), never
-    dropped; nothing is ever filled from it, and it changes nothing for a value the words already hold."""
+    dropped; nothing is ever filled from it, and it changes nothing for a value the words already hold.
+
+    lResolve: on a draft or an open (a capability that may send, on a run that doesn't: :func:`_sends`, read before
+    the slot loop and checked again on its values), the caller's own wording of what to write is kept as a draft
+    (:data:`FROM_WORDED`) and a person whose closest sound is a heard form the user confirmed runs unasked
+    (:func:`_heard_confirmed`). ``_strict`` (internal): neither of those, every run as a send (the loop's values sent
+    after all, so it resolves again)."""
     from yuki.skills import prefs, taste
 
     now = time.time() if now is None else float(now)
@@ -991,8 +1164,10 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
         return Held(skill.key, live.game)
     heard = [words] if isinstance(words, str) else [str(w) for w in words or [] if w]
     # validation reads every turn of the exchange and the older turns the caller passed (IF-words); filling from the
-    # words (an app they named) reads the exchange only, newest turn first
-    sources = heard + [str(w) for w in earlier or [] if str(w).strip()]
+    # words (an app they named) reads the exchange only, newest turn first. lResolve r1 M1: in time order (the older
+    # turns first, as the brain passes them, then the exchange, newest last), the order contacts' sound-alike answer
+    # record reads ("spoken since" = a newer last turn), so a call in the same request as a question is no yes
+    sources = [str(w) for w in earlier or [] if str(w).strip()] + heard
     # an empty value is no value given (``"text": ""`` = nothing to write), never a value dropped
     given = {k: v for k, v in dict(slots or {}).items() if v is not None and v != ""}
     told = told_values(store, skill.key)
@@ -1000,6 +1175,17 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     heard_person = heard_person or _heard_person(store)
     sounds_like = _sounds_like(store)
     written = _written(store)
+    heard_confirmed = _heard_confirmed(store)
+    said_for = _said_for(store)
+    # lResolve: whether this run sends (rule 8), from the capability's own data before any slot fills. ``drafting``: a
+    # capability that may send, on a run that doesn't (a draft or an open): it may keep Yuki's wording of the message
+    # and run a confirmed heard form unasked (a skill that never sends but reaches people otherwise, such as a call
+    # join, keeps every question). ``relaxed``: one of those was used, so the loop's own values must not send (checked
+    # after it)
+    sending = True if _strict else _sends(skill, given, told)
+    drafting = bool(getattr(skill, "sends", False)) and not sending
+    relaxed = False
+    worded: str | None = None
     # what Yuki just did (:func:`just_acted`), read once and only for an app slot: the windows its steps brought up,
     # and the apps runs of this skill's capability (the capability and its learned skills) drove
     acted: set[str] | None = None
@@ -1077,9 +1263,16 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                         # and the chat driver says it doesn't know who that is (never the same question twice; an
                         # eval's replay, ``until``, asks every time: its phrasings are separate requests)
                         alike = sounds_like(value)
-                        if alike and (until is not None or _first_confirm(
-                                (skill.capability or skill.key, slot.name, _words(value).casefold()), now)):
-                            return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=alike), [alike],
+                        confirm_key = (skill.capability or skill.key, slot.name, _words(value).casefold())
+                        if alike is not None and drafting and heard_confirmed(value, alike[1]) and \
+                                (until is not None or not _confirm_asked(confirm_key, now)):
+                            # lResolve (lMsg's what's left 3): its closest sound is a heard form of that very person
+                            # the user confirmed ("hey mean" near their "hey meant"), on a draft or an open: that
+                            # person, unasked (the done line names them, so a wrong one shows); a send still asks,
+                            # and once asked within CONFIRM_ONCE_S the same words again are a no (r1 L1)
+                            value, relaxed = alike[0], True
+                        elif alike is not None and (until is not None or _first_confirm(confirm_key, now)):
+                            return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=alike[0]), [alike[0]],
                                        dropped=list(dropped))
                 values[slot.name], filled[slot.name] = value, "words"
                 ask_keep = keep_check(slot, value) or ask_keep
@@ -1090,6 +1283,29 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 # will come"), never dropped to an Ask and handed back as a draft
                 values[slot.name], filled[slot.name] = _words(given[slot.name]), FROM_GRANT
                 continue
+            if drafting and _worded_slot(skill, slot) and isinstance(given[slot.name], str) and \
+                    _words(given[slot.name]):
+                # lResolve, the 10 Oct decision: "a message Yuki words itself stays a draft". What to write, in the
+                # caller's own wording ("when you joining vc" for "asking when he'll join the VC"), on a run that
+                # doesn't send: kept as given, never dropped and handed to the thinker (30-98 s live). The step runner
+                # types exactly it and nothing after it (uia_route.note_draft, below); a send stays the user's words
+                # or the brain's grant
+                values[slot.name], filled[slot.name] = _words(given[slot.name]), FROM_WORDED
+                worded, relaxed = slot.name, True
+                continue
+            if _person_bound(skill, slot) and isinstance(given[slot.name], str):
+                # R4 (lMsg, what's left after round 1, item 3): the caller gave a person the words don't hold (the
+                # talker's "Hemanth" for the heard "Hemish"), and a run of the user's own words sounds like that very
+                # person and nobody else: asked, never handed to the thinker and never run as them unasked. The given
+                # name is the question's answer, so the slot is not in ``dropped`` and the engine keeps the question
+                # (x5's ``_dropped``). Noted with the very turns the answer is checked against (``sources``, r1 M1),
+                # so it counts only once they've spoken since; a repeat of the same words within the exchange is a no
+                # and falls through to the hand-off
+                heard_as = said_for(given[slot.name], heard)
+                if heard_as is not None and (until is not None or _note_asked(store, heard_as[1], heard_as[2],
+                                                                              sources, now)):
+                    return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=heard_as[0]), [heard_as[0]],
+                               dropped=list(dropped))
             dropped.append(slot.name)
         # FILL_ORDER "words" (2): an app their own words name, before any live guess, preference, fill policy or
         # bound default (the volume of "Spotify", not of the app playing). Never an app Yuki itself just acted in (a
@@ -1161,9 +1377,9 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 continue
         # A text the caller gave for what to write ("when will you come?", worded by the thinker for "ask him when he
         # will come") that the user's words don't hold is never swapped for the slot's default ("" = just open the
-        # chat): that would run another request and call it done. Asked instead, with the slot dropped, so the engine
-        # can hand a value its caller gave to the thinker (fix-plan IF-handoff), which does it by steps where the send
-        # rule judges the wording
+        # chat): that would run another request and call it done. On a send (a draft kept it above, FROM_WORDED) it is
+        # asked instead, with the slot dropped, so the engine can hand a value its caller gave to the thinker
+        # (fix-plan IF-handoff), which does it by steps where the send rule judges the wording
         if slot.name in dropped and slot.type == "text" and slot.role == "fill" and slot.default is not None:
             return Ask(skill.key, slot.name, slot.ask or f"Which {slot.name}?", [], dropped=list(dropped))
         # FILL_ORDER "default" (a learned skill's bound value is its slot's default)
@@ -1175,6 +1391,16 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
         if slot.required:
             return Ask(skill.key, slot.name, slot.ask or f"Which {slot.name}?", list(slot.options),
                        dropped=list(dropped))
+    if relaxed:
+        from yuki.skills.connection import sends_with
+
+        if sends_with(skill, values):
+            # lResolve: a draft's relaxations were taken for a run whose filled values send after all (a fill
+            # :func:`_sends` didn't foresee): resolved again with none of them, so Yuki's wording is dropped and a
+            # sound match asked, as before (rule 8)
+            return resolve(skill_key, slots, words, store=store, live=live, loaded=loaded, now=now, until=until,
+                           again=again, disable_after=disable_after, people=people, default_step=default_step,
+                           earlier=earlier, heard_person=heard_person, granted=granted, _strict=True)
     # What the user said wins over a learned skill's bound value too: its routes carry that value in their arguments,
     # so a value they said for a bound slot that is another one runs its capability instead (a learned skill never
     # hides its capability; the engine's request_key does the same for a given key slot before this)
@@ -1183,7 +1409,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 _identity(skill.slot(name), bound) for name, bound in (skill.bound or {}).items()):
         return resolve(skill.capability, slots, words, store=store, live=live, loaded=loaded, now=now, until=until,
                        again=again, disable_after=disable_after, people=people, default_step=default_step,
-                       earlier=earlier, heard_person=heard_person, granted=granted)
+                       earlier=earlier, heard_person=heard_person, granted=granted, _strict=_strict)
     # a direction with no amount: the user's own step for it (a preference), else the default step
     for slot in skill.slots:
         v = values.get(slot.name)
@@ -1200,6 +1426,10 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
         if skill.handoff:
             return Handoff(skill, values, filled, why="no_route", skipped=skipped, dropped=list(dropped))
         return Refused(skill.key, "no_route")
+    if worded is not None:
+        # lResolve: the draft Yuki worded may be typed by this skill's own steps for a short while, and only as a draft
+        # (uia_route.check_texts: a run that types it and does nothing else)
+        _note_draft(cap, values.get(worded))
     return Plan(skill=skill, values=values, filled=filled, named=named, routes=routes, skipped=skipped,
                 dropped=dropped, game=live.game, ask_keep=ask_keep, handoff=skill.handoff and not live.game)
 
@@ -1365,7 +1595,8 @@ def eval_resolver(db_path: Any, *, client: Any = None, model: str | None = None,
     return EvalResolver(Store.open(path), client=client, model=model, prompt=prompt, loaded=loaded)
 
 
-__all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "FROM_GRANT", "CONFIRM_PERSON", "JUST_ACTED_S",
+__all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "FROM_GRANT", "FROM_WORDED", "CODE_TYPES",
+           "CONFIRM_PERSON", "JUST_ACTED_S",
            "CONFIRM_ONCE_S", "Live", "Plan", "Ask", "Held", "Handoff", "Refused", "app_name", "app_identity",
            "known_apps", "named_app", "just_acted", "call_apps", "check_value", "bool_option", "pref_option",
            "from_pref",
