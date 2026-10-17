@@ -12,8 +12,10 @@ Four sections, all from data, said plainly (:func:`page`, through ``MemoryClient
    work value shows **Not work** instead);
 3. **Your routines** - the routine miner's routines (active first) with their time, days, how sure, and the card they
    lead to;
-4. **Your own ways** - lane kWays' learned ways (contract C4: ``origin = 'learned_way'`` rows) with how often and
-   their buttons (Rename, Not mine); a plain empty state until they exist.
+4. **Your own ways** - lane kWays' learned ways (contract C4: ``origin = 'learned_way'`` rows, as the route reads
+   them) with how they were learned, how often Yuki ran them and the user's things in them (their projects), and their
+   buttons (Rename; Delete: ``forget``, a tombstone the way learner never brings back); a plain empty state until
+   they exist.
 
 The old practice sections (procedures, proposals, workflows, lessons) are not on the page any more: the old learners'
 entries are retired by code (lane kClean). Nothing here writes a value, a routine or a way except the buttons: one
@@ -272,28 +274,39 @@ def routines(store: Any, now: float) -> list[dict[str, Any]]:
 
 
 def ways(store: Any, now: float) -> list[dict[str, Any]]:
-    """Section 4: the user's own ways (contract C4), most used first."""
+    """Section 4: the user's own ways (contract C4: ``origin = 'learned_way'`` rows, not retired, not deleted), most
+    used first: the same rows the menu lists and the route runs (``yuki.skills.learn.ways.live_ways``). Each with its
+    name, app, how it was learned (its provenance: demonstrations, days, first and last; or the user told it), how
+    often Yuki ran it, and the user's things in it (``spec["item"]["things"]``: their projects); never offered."""
     try:
-        from yuki.skills.catalog import LIVE_STATES
+        from yuki.skills.learn.ways import app_title, live_ways
 
-        # the same rows the menu lists (``menu.way_lines``): a way on the page is one Yuki can run
-        rows = store._query("SELECT id, name_ciphertext, provenance, uses, last_used_at, state FROM skills WHERE"
-                            " origin = ? AND deleted_at IS NULL AND retired_at IS NULL AND state IN ("
-                            + ",".join("?" * len(LIVE_STATES)) + ") ORDER BY uses DESC, updated_at DESC LIMIT 20",
-                            (WAY_ORIGIN, *LIVE_STATES))
+        rows = live_ways(store)
     except Exception:  # noqa: BLE001
         return []
     out = []
-    for rid, name_ct, prov, uses, last, state in rows:
-        name = _text(store, name_ct)
-        if not name:
-            continue
-        p = _prov(prov)
-        seen = (f"Seen {_plural(int(p['n']), 'time')} on {_plural(int(p.get('days') or 0), 'day')}"
-                if p.get("n") else "")
-        used = f"used {_plural(int(uses or 0), 'time')}" + (f", last {_day_words(last, now)}" if last else "")
-        out.append({"ref": f"{REF_PREFIX}{int(rid)}", "name": _clip(name, 60), "seen": seen, "used": used,
-                    "state": str(state or ""), "your_name": p.get(NAMED_BY) == NAMED_BY_USER})
+    for w in rows:
+        name = " ".join(str(w.get("name") or "").split())
+        p = w.get("prov") or {}
+        if p.get("told"):
+            seen = "You showed Yuki once"
+        elif p.get("demos"):
+            seen = (f"Learned from {_plural(int(p['demos']), 'time')} you did it, on {_plural(int(p.get('days') or 0), 'day')}"
+                    + (f", last {_day_words(p['last'], now)}" if p.get("last") else ""))
+        else:
+            seen = ""
+        uses, last = int(w.get("uses") or 0), w.get("last_used_at")
+        used = (f"Yuki ran it {_plural(uses, 'time')}" + (f", last {_day_words(last, now)}" if last else "")
+                if uses else "Runs when you ask; never offered")
+        spec = w.get("spec") or {}
+        noun = str(spec.get("item_noun") or p.get("item_noun") or "thing")
+        things = [t for t in ((spec.get("item") or {}).get("things") or []) if isinstance(t, dict) and t.get("name")]
+        out.append({"ref": f"{REF_PREFIX}{int(w['id'])}", "name": _clip(name or "Your way", 60),
+                    "app": app_title(str(w.get("app") or "")), "seen": seen, "used": used,
+                    "things_title": f"Your {noun} groups" if things else "",
+                    "things": [_clip(t["name"], 40) + (f" · {_plural(int(t['days']), 'day')}" if t.get("days") else "")
+                               for t in things[:12]],
+                    "your_name": p.get(NAMED_BY) == NAMED_BY_USER})
     return out
 
 

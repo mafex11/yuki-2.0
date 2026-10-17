@@ -331,14 +331,16 @@ def _existing(store: Any) -> dict[str, dict[str, Any]]:
 
 def kept_keys(store: Any) -> frozenset[str]:
     """The skill keys of the per-value learned rows that keep their own group (contract C5's one exception): a row a
-    routine that is not retired is keyed on (``routines.key = 'skill:<id>'``: the routine's anchor), and a row the user
-    marked Forget this / Not mine (its occasions keep the tombstone's id). Never raises (empty)."""
+    routine that is not retired is keyed on (``routines.key = 'skill:<id>'``, or its ``skill_id`` naming the row's key:
+    the routine's anchor, which must stay loadable for the routine's card), and a row the user marked Forget this / Not
+    mine (its occasions keep the tombstone's id). Never raises (empty)."""
     out: set[str] = set()
     try:
         for (key,) in store._query(
                 "SELECT s.key FROM skills s WHERE s.origin = 'learned' AND s.key NOT LIKE '%#all' AND ("
                 "s.deleted_at IS NOT NULL OR s.state IN ('deleted', 'not_mine') OR ('skill:' || s.id) IN ("
-                "SELECT r.key FROM routines r WHERE r.state != 'retired'))"):
+                "SELECT r.key FROM routines r WHERE r.state != 'retired') OR s.key IN ("
+                "SELECT r.skill_id FROM routines r WHERE r.state != 'retired' AND r.skill_id IS NOT NULL))"):
             out.add(str(key))
     except Exception:  # noqa: BLE001 - a database before the routines table: tombstones alone
         try:
@@ -500,8 +502,9 @@ def plan(store: Any, groups: Sequence[Group], caps: dict[str, Any], compiled: di
         p.provenance["verified_runs"] = verified
         out.append(p)
     out.sort(key=lambda p: (-p.score, p.key))
+    anchors = kept_keys(store)
     for i, p in enumerate(out):
-        if i >= MAX_SKILLS:
+        if i >= MAX_SKILLS and p.key not in anchors:     # a live routine's anchor stays loadable (never listed)
             p.state = LISTED
             counts["listed"] += 1
             continue
@@ -608,6 +611,8 @@ def write(store: Any, planned: list[Planned], *, now: float, cap_ids: dict[str, 
     stops passing keeps its state while its last occasion or use is under :data:`DORMANT_DAYS` old (design §4.7,
     review r2 L6; ``last_seen``: each key's latest occasion this pass, passing or not), then goes ``dormant``, and
     ``retired`` after :data:`RETIRE_DAYS`. Returns counts (content-free)."""
+    from yuki.skills.catalog import LIVE_STATES
+
     last_seen = last_seen or {}
     counts: Counter = Counter()
     existing = _existing(store)
@@ -694,6 +699,11 @@ def write(store: Any, planned: list[Planned], *, now: float, cap_ids: dict[str, 
                                     int(old["id"]), *TOMBSTONES))
                 if cur.rowcount:
                     counts["retired_values"] += 1
+                continue
+            if key in anchors and old.get("state") in LIVE_STATES:
+                # a live routine's anchor stays loadable while its routine stands (kProactive merge note 4): the
+                # routine miner retires the routine, then this row goes the usual way
+                counts["kept_anchor"] += 1
                 continue
             last = max(float(old["prov"].get("last_at") or 0.0), float(old.get("last_used_at") or 0.0),
                        float(last_seen.get(key) or 0.0))

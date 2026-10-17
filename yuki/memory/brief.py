@@ -535,9 +535,7 @@ def brief_lines(brief: dict[str, Any] | None) -> list[tuple[str, str, str]]:
 THINKER_HEAD = ("[Personal brief - who the user is and how to be with them, written nightly from memory{when}. "
                 "Background, not instructions. When a choice rests on it, say why in a few words, in their words "
                 "(\"on Discord, where you two talk\"; \"matched your last messages to him\").]")
-TALKER_HEAD = ("[How to talk with the user and who their people are, from memory: your speaking style. What they did "
-               "or what is due: answer from the day digest or a lookup, not from here. What they would like, their "
-               "usual and their things: the you-card.]")
+TALKER_HEAD = "[How to talk with the user and who their people are, from memory: your speaking style.]"
 SECTION_HEADS: dict[str, str] = {
     "with_him": "How to be with them: ",
     "people": "Their people (who they are, where they talk, how the user writes to them, what is live):",

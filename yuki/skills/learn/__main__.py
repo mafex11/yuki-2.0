@@ -5,7 +5,8 @@
     python -m yuki.skills.learn rebuild [--db PATH] [--dry-run] [--report] [--show] [--no-name]
     python -m yuki.skills.learn backfill-usuals --db PATH [--dry-run] [--force]
 
-* ``rebuild`` recomputes the occasions and the learned skills (the night pass, by hand).
+* ``rebuild`` recomputes the occasions and the learned skills, then the user's own ways (``learn_ways``; the night
+  pass, by hand).
 * ``backfill-usuals`` is lName's one-time back-fill of the user's stated usuals (``yuki.skills.learn.backfill``; the
   learner runs it by itself after its first written pass).
 * ``--dry-run`` copies the database first (``yuki.eval.dbcopy.copy_db``, source opened read-only), brings its moments
@@ -16,7 +17,7 @@
   counts, means app keys, rung, executable end, commit), groups no capability serves, the routine preview keyed by
   skill id, timings. No name, title, site, person or value.
 * ``--show`` prints the learned skills with their names and bound values: on this PC's console only, never logged.
-* ``--no-name`` skips the naming call (the skills stay nameless).
+* ``--no-name`` skips the naming calls (the skills and new ways stay nameless).
 """
 
 from __future__ import annotations
@@ -233,13 +234,16 @@ def main(argv: list[str] | None = None) -> int:
         moments = _moments_current(store) if args.dry_run else None
         now = time.time()
         res = learn.run(store, now=now, name=not args.no_name, write_rows=True, name_dry_run=args.dry_run)
+        # the user's own ways (contract C4), as the night pass runs them; named only with the naming call on
+        ways = learn.learn_ways(store, now=now, use_model=not args.no_name and not args.dry_run) if res.ok else {}
         inc = learn.incremental(store, now=time.time()) if args.dry_run else None
         if args.report or args.json:
             rep = report(store, res, now=now, inc=inc, moments=moments)
-            print(json.dumps(rep, indent=1, default=str) if args.json else _text(rep))
+            rep["ways"] = ways
+            print(json.dumps(rep, indent=1, default=str) if args.json else _text(rep) + f"\nways: {json.dumps(ways)}")
         else:
             print(json.dumps({"ok": res.ok, "error": res.error, "cpu_s": res.cpu_s,
-                              "counts": {k: int(v) for k, v in res.counts.items()}}, default=str))
+                              "counts": {k: int(v) for k, v in res.counts.items()}, "ways": ways}, default=str))
         if args.show:
             print(_show(store))
     finally:
