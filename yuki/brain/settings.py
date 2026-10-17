@@ -1,8 +1,10 @@
 """The brain's settings, read from :class:`yuki.config.Settings` with ``getattr`` defaults.
 
-bWire adds the real fields to ``yuki/config.py`` (``brain``, ``brain_effort_voice``, ``brain_effort_typed``,
-``brain_max_replans``, ``check_model``); until then every value here has its default, so the new files need no config
-edit. Read once per request (:meth:`BrainSettings.read`): effort is pinned per channel and never changes mid-request.
+Read once per request (:meth:`BrainSettings.read`): effort is pinned per channel and never changes mid-request.
+
+kBrain (18 Oct): the plan-first brain is THE brain. Its shipped mode is ``all`` (typed and spoken); ``loop`` stays only
+as the rollback value. The planner runs on :data:`PLANNER_MODEL` (Sonnet 5.5) unless ``brain_model`` names another;
+the tray's model switch (``Settings.model``) belongs to the old loop and no longer reaches the planner.
 """
 
 from __future__ import annotations
@@ -12,8 +14,14 @@ from typing import Any
 
 from yuki.config import EFFORT_LEVELS
 
-#: ``Settings.brain``: which requests the new brain takes (bWire's switch; read here only for the log).
+#: ``Settings.brain``: which requests the new brain takes (``loop`` is the rollback value only).
 BRAIN_MODES: tuple[str, ...] = ("loop", "typed", "all")
+#: The shipped mode: the brain takes typed requests and the voice's hand-overs.
+DEFAULT_MODE = "all"
+#: The planner's model when ``brain_model`` is unset: Sonnet 5.5 (measured 18 Oct on this PC's Bedrock, ap-south-1:
+#: first token 0.77-0.92 s on an 8k-character system prompt, warm). Adaptive thinking at ``low`` effort skips thinking
+#: on simple asks and thinks on harder ones by itself.
+PLANNER_MODEL = "global.anthropic.claude-sonnet-5-5"
 
 
 def _get(settings: Any, name: str, default: Any) -> Any:
@@ -31,8 +39,8 @@ class BrainSettings:
     """One request's view of the settings (the design's numbers as defaults).
 
     Attributes:
-        mode: ``Settings.brain`` (``loop`` | ``typed`` | ``all``).
-        model: The planner's model (``brain_model``, else ``Settings.model``: Sonnet 5 today).
+        mode: ``Settings.brain`` (``loop`` | ``typed`` | ``all``; anything else reads as ``all``).
+        model: The planner's model (``brain_model``, else :data:`PLANNER_MODEL`).
         effort_voice / effort_typed: The planner's effort per channel (adaptive thinking on both; design L9).
         max_tokens: The planner's output ceiling (a plan is ~100-600 tokens plus thinking; streamed).
         thinking_display: ``summarized`` (the island's thinking line) or ``omitted``.
@@ -58,8 +66,8 @@ class BrainSettings:
         takeover_stop_s: A pause nobody resumes ends the request after this long (``takeover_idle_stop_s``).
     """
 
-    mode: str = "loop"
-    model: str = ""
+    mode: str = DEFAULT_MODE
+    model: str = PLANNER_MODEL
     effort_voice: str = "low"
     effort_typed: str = "low"
     max_tokens: int = 16000
@@ -88,10 +96,10 @@ class BrainSettings:
     @classmethod
     def read(cls, settings: Any) -> "BrainSettings":
         """The values in force now (``settings``: a :class:`yuki.config.Settings`, or anything with its fields)."""
-        mode = str(_get(settings, "brain", "loop")).strip().lower()
+        mode = str(_get(settings, "brain", DEFAULT_MODE)).strip().lower()
         return cls(
-            mode=mode if mode in BRAIN_MODES else "loop",
-            model=str(_get(settings, "brain_model", "") or _get(settings, "model", "")),
+            mode=mode if mode in BRAIN_MODES else DEFAULT_MODE,
+            model=str(_get(settings, "brain_model", "") or PLANNER_MODEL),
             effort_voice=_effort(_get(settings, "brain_effort_voice", "low"), "low"),
             effort_typed=_effort(_get(settings, "brain_effort_typed", "low"), "low"),
             max_tokens=int(_get(settings, "brain_max_tokens", 16000)),
@@ -130,4 +138,4 @@ class BrainSettings:
                 "max_replans": self.max_replans, "act_calls": self.act_calls, "answer_calls": self.answer_calls}
 
 
-__all__ = ["BRAIN_MODES", "BrainSettings"]
+__all__ = ["BRAIN_MODES", "DEFAULT_MODE", "PLANNER_MODEL", "BrainSettings"]

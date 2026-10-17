@@ -51,6 +51,9 @@ from yuki.brain.context import (
     look_report,
     one_line,
     part_rest_report,
+    read_card,
+    read_menu,
+    read_profile_parts,
     read_report,
     REST_DONE_WORD,
     request_turn,
@@ -58,7 +61,6 @@ from yuki.brain.context import (
     seed_block,
     seed_memory,
     sends_fn,
-    skill_rest_report,
     step_report,
     steer_blocks,
     swap_blocks,
@@ -66,6 +68,7 @@ from yuki.brain.context import (
     tool_result,
     unconfirmed_report,
 )
+from yuki.brain.done import with_parts
 from yuki.brain.plan import (
     ACT_VERBS,
     PLAN_TOOL,
@@ -81,7 +84,7 @@ from yuki.brain.plan import (
     skill_family,
 )
 from yuki.brain.planner import CallCancelled, CallResult, ModelCall, PlanStream, build_params
-from yuki.brain.prompt import ANSWER_PROMPT, ANSWER_TOOL, system_blocks
+from yuki.brain.prompt import ANSWER_PROMPT, ANSWER_TOOL, profile_text, system_blocks
 from yuki.brain.settings import BrainSettings
 from yuki.brain.tools import PRIVATE_READS, ToolRun, run_fetch, run_look, run_memory, run_remember
 from yuki.log.events import (
@@ -113,8 +116,8 @@ LEVEL_LABELS: dict[str, str] = {"verified": "Checked on screen", "likely": "Like
 LINE_UNCONFIRMED = "I tried, but I couldn't confirm it worked."
 #: ``where``: " " and the step in plain words (" partway" when that step is unknown), or "" when nothing ran.
 LINE_STUCK = "I got stuck{where}{why}. Try another way?"
-#: sBrainFix (F2): a skill route's line, held while the planner did the rest of the request, when the budget or the
-#: replans ran out before the planner said it was all done: what the skill's check saw, and that the rest isn't.
+#: A part's line, held while the planner did the rest of the request, when the budget or the replans ran out before
+#: the planner said it was all done: what the part's check saw, and that the rest isn't.
 LINE_REST_UNDONE = "{line}; I couldn't get the rest done."
 #: The executor's own code words a stuck line may say, in plain words (x10). A consent refusal's code word is said only
 #: in the consent rule's own plain words (``consent.plain_why``, x11), and any other reason is left out: a reason is a
@@ -169,17 +172,15 @@ LOOK_BACKS_MAX = 2
 #: (review r1 L6: also ``unverified`` when an act step of the request ran: the driver's own finish gate judges it).
 OBSERVE_LEVELS: frozenset[str] = frozenset({"verified", "likely"})
 OBSERVE_ACTED_LEVELS: frozenset[str] = frozenset({"unverified"})
-#: sBrainFix (F2, review r1 M1): how many skill routes that ended done go back to the planner in one request for what
-#: is left of the request, and the model calls each such turn adds to the act budget (it is code's question: the
-#: planner's look at what the skill left, then its plan).
-SKILL_RESTS_MAX = 1
-SKILL_REST_CALLS = 2
 #: pBrain (17 Oct e2e2 B14 / bRound2 B28 r0: [ctrl+t, open_url youtube.com, look] with done "YouTube's home page",
 #: ended "Youtube's home page is open in Arc; I couldn't check the rest." and nothing put on): a steps plan that ended
 #: on a look (the core prompt's own sign of a plan doing a part) and whose done read true while covering only part of
-#: the target (level likely) goes back to the planner once with what the look read, its line held as a skill route's
-#: is (``part_rest``); each such turn adds SKILL_REST_CALLS to the act budget, as code's own question.
+#: the target (level likely) goes back to the planner once with what the look read, its line held (``part_rest``);
+#: each such turn adds PART_REST_CALLS to the act budget, as code's own question. (kBrain, 18 Oct: a skill route no
+#: longer gets such a turn: a request of several parts is one plan with a part per skill, each checked by its own
+#: skill, so a skill route is only ever a whole request, and its done line is said at once.)
 PART_RESTS_MAX = 1
+PART_REST_CALLS = 2
 #: pBrain (17 Oct e2e2 B14 r2: the done read "another page is showing" and the planner replied "Tell me what you want
 #: to watch and I'll put it on."): an act request not confirmed done whose planner answers in plain text gets one
 #: more planner turn before it ends (:func:`text_back`), adding TEXT_BACK_CALLS to the act budget (code's question).
@@ -199,6 +200,12 @@ SAID_BEFORE_S = 600.0
 SAID_BEFORE_TURNS = 16
 SAID_BEFORE_WAIT_S = 0.4
 SAID_BEFORE_TO: tuple[str | None, ...] = ("yuki",)
+
+#: kBrain: the planner's stable layers are kept an hour (``prompt.CACHE_CONTROL``): a warm-up is worth its call only
+#: when no planner call or warm-up ran for this long (s), or none yet in this app run.
+WARM_AFTER_S = 3000.0
+#: The warm-up's one user turn (code's words; one token comes back and is dropped).
+WARM_TEXT = "(Yuki is starting up: no request yet. Reply with one word.)"
 
 _END = object()
 
@@ -224,6 +231,9 @@ class _Request:
     #: The window in front when the user called Yuki up (typed: the ask bar or the chat page is in front by the time
     #: the request runs). Code facts only: an hwnd number.
     origin_hwnd: int | None = None
+    #: kBrain (contract C3): the voice talker's reading of the words, a seed shown labelled (never an order, never
+    #: quotable); ``None`` for typed requests.
+    understanding: dict[str, Any] | None = None
     started: float = field(default_factory=time.monotonic)
     started_at: datetime = field(default_factory=datetime.now)
     epoch: float = field(default_factory=time.time)
@@ -271,11 +281,7 @@ class _State:
     retried_unconfirmed: bool = False
     #: sBrainFix (F9): act plans that only looked and were sent back to the planner with what they read.
     look_backs: int = 0
-    #: sBrainFix (F2): skill routes that ended done and went back to the planner for the rest of the request, and
-    #: those skills' ids (never run again in this request: they did their part).
-    skill_rests: int = 0
-    skills_done: set[str] = field(default_factory=set)
-    #: The held ending that turn put up (:attr:`held` while no other ending replaced it).
+    #: The held ending a part's turn put up (:attr:`held` while no other ending replaced it).
     rest_held: tuple[str, dict[str, Any]] | None = None
     #: pBrain: steps plans that ended on a look with a done that read only part of the target (:func:`part_rest`),
     #: sent back to the planner for the rest; and the plain-text replies to an unconfirmed act request sent back
@@ -684,6 +690,11 @@ class Brain:
         self._host_ref: Host | None = None
         self._menu_lines = ""
         self._last_exec_s = 0.0
+        #: kBrain: when the planner's prefix was last written or read (a planner call or a warm-up; monotonic, 0:
+        #: never in this app run), for :meth:`warm_cache`.
+        self._warm_at = 0.0
+        self._warming = False
+        self._warm_lock = threading.Lock()
         self._reset_accounting()
         #: The ``request_summary`` of the last request that ended (``None`` while one runs).
         self.last_summary: dict[str, Any] | None = None
@@ -793,10 +804,67 @@ class Brain:
         return True
 
     def warm_cache(self, effort: str | None = None, thinking: bool | None = None) -> bool | None:
-        """No pre-warm (design 6, M11): the prefix is about 4k tokens; a warm is added only if the logs show it
-        matters. Kept for the runtime's interface."""
-        self.logger.log("model_prewarm", skipped="brain: no pre-warm")
-        return None
+        """kBrain: write the planner's cached prefix (tools, core, profile and rules, menu) and open its connection
+        ahead of a request: one call with the same tools, system blocks, effort and streaming as a typed request, one
+        token out. The logs said it matters (18 Oct, Bedrock, Sonnet 5.5): a process's first planner call reached its
+        first token in about 4 s, a cold cache write in 13.4 s (10 Oct: 12.4 s); after a warm-up, 0.96 s. Only when
+        no planner call or warm-up ran in the last :data:`WARM_AFTER_S`, and never while a request runs. Runs on the
+        caller's thread (callers use a background one); ``effort`` / ``thinking`` are the old loop's interface and are
+        not used (the planner's own effort is). ``True`` when it ran, ``False`` when skipped, ``None`` when the call
+        failed (the next call may try again). Its spend is a ``startup_cost`` record, which the day's spend counts
+        (``yuki.core.cost``), never a request's. Content-free log; never raises."""
+        with self._warm_lock:
+            if self._running or self._warming or (
+                    self._warm_at and time.monotonic() - self._warm_at < WARM_AFTER_S):
+                self.logger.log("model_prewarm", skipped="brain: warm or busy")
+                return False
+            self._warming = True
+        started = time.perf_counter()
+        try:
+            return self._warm()
+        except Exception as exc:  # noqa: BLE001 - only an optimisation
+            self.logger.log("model_prewarm", ok=False, error=type(exc).__name__,
+                            ms=round((time.perf_counter() - started) * 1000, 1))
+            return None
+        finally:
+            self._warming = False
+
+    def _warm(self) -> bool:
+        """:meth:`warm_cache`'s call and its accounting (raises on a failed call)."""
+        started = time.perf_counter()
+        bs = BrainSettings.read(self.settings)
+        names = list(getattr(self.settings, "user_names", []) or [])
+        card = read_card(self.memory)
+        brief, rules = read_profile_parts(self.memory)
+        # the same bytes as the request's breakpoint 2 and 3 (context.gather composes them the same way)
+        profile = profile_text(names=names, brief=None if card else brief, rules=rules, limit=bs.profile_chars)
+        menu, _lines, _keys = read_menu(self.memory, self.settings, limit=bs.menu_chars)
+        params = build_params(model=bs.model, max_tokens=1, system=system_blocks(profile, menu),
+                              messages=[{"role": "user", "content": [{"type": "text", "text": WARM_TEXT}]}],
+                              effort=bs.effort_typed, thinking_display=bs.thinking_display, stream=bs.stream,
+                              eager=bs.eager)
+        if bs.stream:
+            with self.client.messages.stream(**params) as stream:
+                for _event in stream:
+                    pass
+                message = stream.get_final_message()
+        else:
+            message = self.client.messages.create(**params)
+        self._warm_at = time.monotonic()   # review L2: only a warm-up that ran holds the next one off
+        ms = round((time.perf_counter() - started) * 1000, 1)
+        model = self._used_model(bs.model)
+        tokens = usage_tokens(getattr(message, "usage", None))
+        try:
+            cost = self.settings.estimate_cost(model, tokens)
+        except Exception:  # noqa: BLE001
+            cost = None
+        self.logger.log("model_prewarm", ok=True, model=model, ms=ms, tokens=tokens)
+        # review L2: the day's spend reads warm-ups from ``startup_cost`` records (``yuki.core.cost``), as the old
+        # loop's; a request's own totals never hold it
+        self.logger.log("startup_cost", kind="model_prewarm", lane=self.lane, model=model,
+                        elapsed_s=round(ms / 1000, 2), tokens=tokens,
+                        cost_usd=None if cost is None else round(cost, 6))
+        return True
 
     @property
     def idle_s(self) -> float:
@@ -1322,14 +1390,16 @@ class Brain:
     # -- the request --------------------------------------------------------------------------------------------------
 
     def run(self, request: str, *, user_words: list[str], context: str = "", channel: str, request_id: str,
-            plan_seed: dict | None = None, origin_hwnd: int | None = None) -> Iterator[AgentEvent]:
+            plan_seed: dict | None = None, origin_hwnd: int | None = None,
+            understanding: Mapping[str, Any] | None = None) -> Iterator[AgentEvent]:
         """Handle one request (design 2). ``user_words``: the typed text or the heard turns, from the runtime or the
         bridge only; when none come, nothing is quotable (fail closed, M2) and ``request`` is shown as context only;
         ``context``: card / coach / where-typed text, shown labelled and never quotable; ``channel``: ``voice`` |
         ``typed``; ``request_id``: the id every log record of it carries; ``plan_seed``: a skill's hand-off (rung C);
         ``origin_hwnd``: the window in front when the user called Yuki up (a typed request runs with Yuki's own box in
         front): told to the planner as a code line (the hwnd only), and the executor's stand-in for the foreground.
-        Yields events; pauses on :class:`AskUser`; ends with exactly one :class:`Final` or :class:`ErrorEvent`."""
+        ``understanding``: the voice talker's reading of the words (contract C3: goal, parts, choose, context), shown
+        to the planner labelled as a seed: their exact words win. Yields events; pauses on :class:`AskUser`; ends with exactly one :class:`Final` or :class:`ErrorEvent`."""
         self._begin(request, user_words, channel)
         words = [str(w).strip() for w in (user_words or []) if str(w).strip()]
         context = str(context or "")
@@ -1354,7 +1424,9 @@ class Brain:
         req = _Request(request=str(request or ""), words=words, context=context,
                        channel="voice" if channel == "voice" else "typed", request_id=str(rid or request_id or ""),
                        seed=dict(plan_seed) if isinstance(plan_seed, Mapping) else None, number=self._requests,
-                       origin_hwnd=origin)
+                       origin_hwnd=origin,
+                       understanding=dict(understanding) if isinstance(understanding, Mapping) and understanding
+                       else None)
         self._req = req
         self._acting_words = req.shown
         if not words:
@@ -1537,7 +1609,8 @@ class Brain:
         sends = sends_fn(catalog)
         conv = Conversation(request_turn(words=req.words, channel=req.channel, context=req.context,
                                          gathered=gathered, history=list(self._history), seed=req.seed, limits=bs,
-                                         nonce=nonce, seed_hint=hint_box[0] if hint_box else None))
+                                         nonce=nonce, seed_hint=hint_box[0] if hint_box else None,
+                                         understanding=req.understanding))
         system = system_blocks(gathered.profile, gathered.menu)
         effort = bs.effort_for(req.channel)
         self._effort = effort
@@ -1546,6 +1619,7 @@ class Brain:
                         overview_chars=len(gathered.overview), you_chars=len(gathered.you),
                         people_chars=len(gathered.people), profile_chars=len(gathered.profile),
                         menu_chars=len(gathered.menu), skills=len(gathered.skill_keys or ()),
+                        card_chars=len(gathered.card), understanding=req.understanding is not None,
                         private_read=state.private_read, gather_ms=round(self._gather_ms, 1),
                         parts_ms=gathered.parts_ms)
         host.nonce = nonce
@@ -1575,12 +1649,12 @@ class Brain:
             pass
 
     def _budget_left(self, state: _State, bs: BrainSettings, req: _Request) -> bool:
-        """Act plans: at most ``act_calls`` model calls, plus :data:`SKILL_REST_CALLS` for each turn code itself asked
-        for after a skill route ended done (sBrainFix F2: ``skill_rests``) or a steps plan's part did (pBrain:
-        ``part_rests``), and :data:`TEXT_BACK_CALLS` for each plain reply sent back (pBrain: ``text_backs``); code's
-        questions, never the planner's spending. Answers: ``answer_calls`` or ``answer_s`` of work."""
+        """Act plans: at most ``act_calls`` model calls, plus :data:`PART_REST_CALLS` for each turn code itself asked
+        for after a steps plan's part was done (pBrain: ``part_rests``), and :data:`TEXT_BACK_CALLS` for each plain
+        reply sent back (pBrain: ``text_backs``); code's questions, never the planner's spending. Answers:
+        ``answer_calls`` or ``answer_s`` of work."""
         if state.kind == "act":
-            return state.calls < (bs.act_calls + (state.skill_rests + state.part_rests) * SKILL_REST_CALLS
+            return state.calls < (bs.act_calls + state.part_rests * PART_REST_CALLS
                                   + state.text_backs * TEXT_BACK_CALLS)
         work_s = time.monotonic() - req.started - self._waited_s
         return state.calls < bs.answer_calls and work_s < bs.answer_s
@@ -1599,7 +1673,7 @@ class Brain:
             checks = Checks(plan_id=plan_id, channel=req.channel, seed=req.seed, skills=gathered.skill_keys,
                             sends=sends, failed_step=state.failed_step, repeat_rejected=state.repeat_rejected,
                             current_plan=state.current.id if state.current is not None else None,
-                            spent_skills=frozenset(state.spent), done_skills=frozenset(state.skills_done),
+                            spent_skills=frozenset(state.spent),
                             words=tuple(host.user_words), text_bounced=state.text_bounced)
             params = build_params(model=bs.model, max_tokens=state.max_tokens or bs.max_tokens, system=system,
                                   messages=conv.messages(), effort=effort, thinking_display=bs.thinking_display,
@@ -1901,7 +1975,8 @@ class Brain:
             "verdict": getattr(found, "verdict", None) if found is not None else None,
             "probe": str(getattr(found, "probe", "") or "") if found is not None else "",
             "line": str(getattr(got, "line", "") or ""), "check_calls": checks,
-            "outcome": getattr(got, "outcome", None), "final": bool(getattr(got, "final", False))}
+            "outcome": getattr(got, "outcome", None), "final": bool(getattr(got, "final", False)),
+            "parts": [str(p) for p in getattr(got, "parts", None) or [] if str(p or "").strip()]}
         status = str(getattr(got, "status", "") or "error")
         if status == "done":
             # "done" only when the check saw it; any other reading is said as not confirmed, with the executor's line
@@ -2080,34 +2155,16 @@ class Brain:
                 conv.add_user([tool_result(tool_id, held_report(result, plan, line)), *extra,
                                *self._steer_turn(host)])
                 return False
-            if status == "done" and skill_rest(plan) and state.skill_rests < SKILL_RESTS_MAX:
-                # sBrainFix (F2, review r1 M1): a skill route checks only the skill's own part ("Open YouTube home"
-                # for "open a new tab of YouTube and put something on", 10 and 16 Oct: "Youtube is up." and nothing
-                # put on). Whether their words ask for more is the planner's to read, never code's: its line is held
-                # and the planner gets one turn with what the skill did, to plan the rest by steps or give the one-word
-                # reply that all is done (the held line then stands: code's line, never the model's words; any other
-                # reply, or the budget running out, says the rest isn't done: LINE_REST_UNDONE). Not a replan after a
-                # failure: SKILL_RESTS_MAX bounds it, and each such turn adds SKILL_REST_CALLS to the act budget (it is
-                # code's question; in the 16 Oct review run of B28 two memory reads had used the budget, so the look
-                # after it was the last call). A send or a join ends here (rule 8: nothing is planned on a send's
-                # back), and that skill is not run again in this request.
-                state.skill_rests += 1
-                state.skills_done.add(str(plan.skill))
-                state.held = state.rest_held = (line, outcome)
-                self.logger.log("brain_skill_rest", n=state.skill_rests, skill=skill_family(plan.skill))
-                conv.add_user([tool_result(tool_id, skill_rest_report(plan, line)), *extra,
-                               *self._steer_turn(host)])
-                return False
             if (status == "done" and line != LINE_DRAFTED and part_rest(plan, result, outcome)
                     and state.part_rests < PART_RESTS_MAX):
                 # pBrain (17 Oct e2e2 B14 r0, bRound2 B28 r0): the plan ended on a look, which the core prompt asks of
                 # steps doing a part, and its done read true while covering only part of the target (likely): a done
                 # that reads the first part ("YouTube's home page" for "...and put something on from the front
-                # page"). Whether more is left is the planner's to read from their words, never code's: as after a
-                # skill route, its line is held and the planner gets one turn with what the look read, to plan the
-                # rest by steps or give the one-word reply that all is done (the held line then stands; any other
-                # reply, or the budget running out, says the rest isn't done). PART_RESTS_MAX bounds it, and the
-                # turn adds SKILL_REST_CALLS to the act budget. Never after a send or a join (part_rest).
+                # page"). Whether more is left is the planner's to read from their words, never code's: its line is
+                # held and the planner gets one turn with what the look read, to plan the rest by steps or give the
+                # one-word reply that all is done (the held line then stands; any other reply, or the budget running
+                # out, says the rest isn't done). PART_RESTS_MAX bounds it, and the turn adds PART_REST_CALLS to the
+                # act budget. Never after a send or a join (part_rest).
                 state.part_rests += 1
                 state.held = state.rest_held = (line, outcome)
                 self.logger.log("brain_done_part", n=state.part_rests, reads=len(result.reads),
@@ -2119,8 +2176,9 @@ class Brain:
             return True
         if result.final and result.line and status in ("refused", "stopped") and not self._cancelled.is_set():
             # the executor ends the run here with its own line (a game in front: "after the round?"; the desk busy):
-            # no replan routes around it
-            self._final(result.line, self._result_outcome(result, state, plan, result.line))
+            # no replan routes around it; the parts already done are said first (review M2)
+            line = with_parts(result.parts, result.line)
+            self._final(line, self._result_outcome(result, state, plan, line))
             return True
         if status == "stopped":
             self._push(self._cancel_event())
@@ -2298,8 +2356,8 @@ class Brain:
             return False
         if state.held is not None:
             if state.held is state.rest_held and not rest_done_reply(text):
-                # sBrainFix (F2): after a skill route did its part, the planner neither planned the rest nor gave the
-                # one-word reply that all is done (context.REST_DONE_WORD): the skill's line, and that the rest isn't
+                # after a part was done (part_rest), the planner neither planned the rest nor gave the one-word reply
+                # that all is done (context.REST_DONE_WORD): the part's line, and that the rest isn't
                 self._finish_stuck(state)
                 return True
             # a plan ended and its line was held for the user's addition; the model changed nothing: the line stands
@@ -2308,8 +2366,11 @@ class Brain:
                 self._final(*state.held)
                 return True
         if last is not None and last.line and last.status in ("refused", "mismatch", "error"):
-            # the executor's own line for why it stopped (a refusal's "after the round?") wins over the model's words
-            self._final(last.line, self._outcome(state, level="failed" if state.acted else "answer", line=last.line))
+            # the executor's own line for why it stopped (a refusal's "after the round?") wins over the model's words;
+            # the parts already done are said first (review M2)
+            line = with_parts(last.parts, last.line)
+            self._final(line, self._outcome(state, level="failed" if state.acted else "answer", line=line,
+                                            partial=bool(last.parts)))
             return True
         if state.acted or (state.kind == "act" and last is not None
                            and last.status in ("refused", "mismatch", "error")):
@@ -2323,9 +2384,8 @@ class Brain:
 
     def _finish_stuck(self, state: _State, *, budget: bool = False) -> None:
         """The code line for an act plan that could not get there, or an answer that ran out of budget. A held ending
-        (no plan ran after it) is said as it was; a skill route's, held for the rest of the request (sBrainFix F2),
-        says that the rest isn't done (:data:`LINE_REST_UNDONE`, level failed, partial): the planner never said it was
-        all done."""
+        (no plan ran after it) is said as it was; a part's, held for the rest of the request (pBrain), says that the
+        rest isn't done (:data:`LINE_REST_UNDONE`, level failed, partial): the planner never said it was all done."""
         if state.held is not None and state.held is state.rest_held:
             held_line, held_outcome = state.held
             base = " ".join(str(held_line or "").split())
@@ -2360,6 +2420,8 @@ class Brain:
             why = plain_reason(last.reason, refused=last.status == "refused")
         line = (last.line if last is not None and last.line and last.status in ("mismatch", "refused") else
                 LINE_STUCK.format(where=f" {where}" if where else "", why=f": {why}" if why else ""))
+        # review M2: the parts already done (their own skill's check saw them) are said before where it stopped
+        line = with_parts(last.parts if last is not None else (), line)
         self._final(line, self._outcome(state, level="failed" if state.acted else "answer", line=line,
                                         partial=state.acted))
 
@@ -2455,6 +2517,7 @@ class Brain:
     def _record_call(self, resp: CallResult, call: ModelCall, *, exec_s: float = 0.0) -> None:
         """One planner call's accounting (its time without the steps the executor ran while it streamed)."""
         model = self._used_model(resp.model)
+        self._warm_at = time.monotonic()   # the planner's prefix was just read (or written): warm for an hour
         self._model_s += max(0.0, resp.ms / 1000 - exec_s)
         self._account(model, resp.usage, ms=resp.ms, role="planner")
         used = usage_tokens(resp.usage)
@@ -2613,18 +2676,10 @@ def typed_draft(plan: Plan | None, seed: Mapping[str, Any] | None) -> bool:
 
 
 def rest_done_reply(text: Any) -> bool:
-    """The planner's reply after a skill route did its part is the one word code asked for when all is done
-    (``context.REST_DONE_WORD``, :func:`yuki.brain.context.skill_rest_report`): an exact reply format code set, never a
+    """The planner's reply after a part was done is the one word code asked for when all is done
+    (``context.REST_DONE_WORD``, :func:`yuki.brain.context.part_rest_report`): an exact reply format code set, never a
     reading of the model's words (any other reply, "I can't pick one" or a sentence, is not it: the safe side)."""
     return " ".join(str(text or "").split()).strip(" .!").casefold() == REST_DONE_WORD
-
-
-def skill_rest(plan: Plan | None) -> bool:
-    """A skill route whose skill ended done may have left part of the request undone (sBrainFix, F2): it goes back to
-    the planner for the rest. Not for a send or a join (rule 8: the capability's own ending stands). Code facts only
-    (the route, the declared commit)."""
-    return (plan is not None and plan.kind == "act" and bool(plan.skill)
-            and plan.consent.commit not in ("send", "join"))
 
 
 def _same_check(a: Any, b: Any) -> bool:
@@ -2747,6 +2802,7 @@ def _as_result(got: Any) -> ExecResult:
     for key, default in (("seen", ""), ("view", ""), ("line", ""), ("probe", ""), ("reason", ""), ("expected", "")):
         data[key] = str(data.get(key) or default)
     data["reads"] = [str(r) for r in data.get("reads") or []]
+    data["parts"] = [str(p) for p in data.get("parts") or [] if str(p or "").strip()]
     data["acted"] = bool(data.get("acted"))
     data["check_calls"] = int(data.get("check_calls") or 0)
     return ExecResult(**data)
@@ -2754,5 +2810,5 @@ def _as_result(got: Any) -> ExecResult:
 
 __all__ = ["Brain", "Host", "CANCELLED", "WITHDRAWN", "PARKED", "PAUSE_STOP_LINE", "LEVEL_LABELS", "OUTCOME_KEYS",
            "STEP_WORDS", "REASON_WORDS", "plain_reason", "typed_draft", "with_watch_steps", "look_only",
-           "LOOK_BACKS_MAX", "OBSERVE_LEVELS", "OBSERVE_ACTED_LEVELS", "SKILL_RESTS_MAX", "SKILL_REST_CALLS",
-           "skill_rest", "rest_done_reply", "LINE_REST_UNDONE"]
+           "LOOK_BACKS_MAX", "OBSERVE_LEVELS", "OBSERVE_ACTED_LEVELS", "PART_RESTS_MAX", "PART_REST_CALLS",
+           "rest_done_reply", "LINE_REST_UNDONE"]
