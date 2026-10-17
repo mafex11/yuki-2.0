@@ -64,7 +64,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from yuki.skills.connection import (Check, Route, Skill, fill, fill_value, sends_with, strictest, template_names,
                                     window_state_reader)
-from yuki.skills.resolve import HELD_LINE, Ask, Handoff, Held, Live, Plan, Refused, canonical, done_line
+from yuki.skills.resolve import FROM_CHOSEN, HELD_LINE, Ask, Handoff, Held, Live, Plan, Refused, canonical, done_line
 
 #: The time a request may take from the words to the done line (PLAN.md §5: p90 <= 5 s).
 BUDGET_S = 5.0
@@ -115,6 +115,15 @@ HANDOFF_ORIGINS: tuple[str, ...] = ("voice", "thinker")
 #: the words either; a given value that is one is ``words``, as the resolver says it.
 FROM_UNHEARD = "unheard"
 FROM_GIVEN = "given"
+#: kTaste (contract C2; audit 17 Oct decision 2): the slots a decider adds when the user asks Yuki to choose ("a video I
+#: like", "something chill", "put something on"): ``choose`` (true) and ``context`` (their words or the understanding's,
+#: free text, for the judgement only). Never a skill's own slots: taken out before the resolver.
+CHOICE_SLOTS: tuple[str, ...] = ("choose", "context")
+#: How long the pick may take (the feeds within ``youtube_feed.REQUEST_BUDGET_S``, then one small model call bounded by
+#: ``taste.CHOOSE_WAIT_S``); a late pick leaves the request to the normal way.
+CHOOSE_TIMEOUT_S = 4.5
+#: The outcome of a pick held because a call is live (decision 2: never during a call, said so instead).
+HELD_CALL = "held_call"
 #: At most this many names a route read on screen ride on a seed (``seen``, RAM only), each at most this long.
 SEEN_MAX = 40
 SEEN_NAME_CHARS = 80
@@ -334,6 +343,8 @@ class SkillResult:
             return f"Ask them: {self.ask}"
         if self.outcome == "held_game":
             return f"Held: a game is in front, nothing was sent. Say: {self.say}"
+        if self.outcome == HELD_CALL:
+            return f"Held: a call is live, so nothing was put on. Say: {self.say}"
         if self.outcome == "handed_over":
             why = (self.handoff or {}).get("why")
             if why == TO_PLANNER:
@@ -386,7 +397,8 @@ class SkillResult:
                  "ask": self.ask, "options": list(self.options), "held": self.held, "ask_keep": self.ask_keep,
                  "handoff_skill": self.handoff, "skill": self.skill, "outcome": self.outcome, "route": self.route,
                  "run_key": self.run_key,
-                 "settled": self.outcome in ("held_game", "other_device", "unverified", "asked", "already")}
+                 "settled": self.outcome in ("held_game", HELD_CALL, "other_device", "unverified", "asked",
+                                             "already")}
         if self.held:
             facts["refused"] = "game"
         return self.done, self.report(), facts
@@ -1691,6 +1703,118 @@ def _thinker_grant(grant: Any, ctx: RunContext, skill_key: str, slots: Mapping[s
     return held
 
 
+@dataclass
+class _Pick:
+    """A request the engine fills with Yuki's pick (:func:`_choice_request`): the skill to run, the slots left, the
+    chosen values for the resolver and where they came from, the pick itself and the taste kind it was read from."""
+
+    skill_key: str
+    slots: dict[str, Any]
+    chosen: dict[str, Any]
+    chosen_from: str
+    choice: Any
+    taste_kind: str
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().casefold() in ("true", "yes", "1")
+    return bool(value)
+
+
+def _choice_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunContext, live: Live,
+                    settings: Any = None) -> "_Pick | SkillResult | None":
+    """kTaste (contract C2; audit 17 Oct decision 2): when the user asked Yuki to choose (``slots.choose``), or named
+    only a channel for a video ("put on Deji's new video"), Yuki picks like a recommender
+    (:func:`yuki.skills.taste.choose`) and the run plays its pick: a video (``web.open_video``; ``web.open_page`` on
+    YouTube's front page asked to choose becomes it: "put something on YouTube" plays), a channel's page
+    (``web.open_page`` on a channel page kind), a playlist of the user's own (``spotify.playlist``). With a game in
+    front or a call live nothing is put on: the result says so and names the pick for later (:func:`taste.held_line`).
+    ``None``: not such a request, no pick (nothing of theirs to pick from, memory too slow), or a value the user named
+    for the slot (theirs wins); the request then runs the normal way with the choice slots taken out."""
+    from yuki.skills import taste
+    from yuki.skills.catalog import load
+    from yuki.skills.connection import scope_value
+
+    given = dict(slots or {})
+    asked = _truthy(given.get("choose"))
+    context = " ".join(str(given.get("context") or "").split())
+    rest = {k: v for k, v in given.items() if k not in CHOICE_SLOTS}
+    skill = load().get(str(skill_key or ""))
+    if skill is None:
+        return None
+    cap = skill.capability or skill.key
+    kind = taste.CHOOSE_KINDS.get(cap)
+    if kind is None:
+        return None
+    bound = dict(getattr(skill, "bound", None) or {})
+    only = ""
+    key = skill.key
+    if cap == "web.open_page":
+        from yuki.skills.youtube_feed import CHANNEL_PAGE, HANDLE_PAGE, HOME_PAGE, SITE
+
+        page = " ".join(str(rest.get("page") or bound.get("page") or "").split()).casefold()
+        if not asked or scope_value(rest.get("site") or bound.get("site")) != SITE or rest.get("item"):
+            return None
+        if page in ("", HOME_PAGE):
+            kind, key = "video", "web.open_video"
+            rest = {k: v for k, v in rest.items() if k == "browser"}
+        elif page in (HANDLE_PAGE, CHANNEL_PAGE):
+            kind = "channel"
+            rest.pop("page", None)
+        else:
+            return None
+    elif cap == "web.open_video":
+        video = rest.get("video")
+        name = _given_text(video) if not (isinstance(video, Mapping) and video.get("ref")) else ""
+        if name:
+            from yuki.skills.uia_route import said
+
+            if not said(name, ctx.words) or _offered_pick(ctx, name):
+                return None        # not the user's words, or an offered upload they picked ("the Deji one")
+            only = name
+        elif not asked:
+            return None
+        rest.pop("video", None)
+    elif not asked or _given_text(rest.get(taste.CHOOSE_SLOTS[kind])):
+        return None
+    slot = (load().get(key) or skill).slot(taste.CHOOSE_SLOTS[kind])
+    taste_kind = str(getattr(slot, "taste", "") or "")
+    hold = "game" if live.game else ("call" if _in_call(ctx.hands, ctx.memory) else "")
+
+    def pick(client: Any) -> Any:
+        return taste.choose(_store_of(client), kind, words=list(ctx.words), context=context,
+                            session=ctx.session_id, only=only, taste_kind=taste_kind, settings=settings, log=ctx.log,
+                            network=not hold, judge_wait_s=0.0 if hold else taste.CHOOSE_WAIT_S)
+
+    choice = _mem(ctx.memory, "taste_choose", pick, timeout_s=CHOOSE_TIMEOUT_S)
+    if hold and (asked or choice is not None):
+        say = taste.held_line(choice, hold)
+        _emit(ctx, "skill_run", skill=key, result="held_game" if hold == "game" else HELD_CALL, choose=True,
+              origin=ctx.origin)
+        return SkillResult(skill=key, outcome="held_game" if hold == "game" else HELD_CALL, say=say,
+                           held=live.game or None)
+    if choice is None:
+        return None
+    chosen = {choice.slot: choice.value, **choice.extra}
+    return _Pick(key, {k: v for k, v in rest.items() if k not in chosen}, chosen,
+                 "words" if only and not asked else FROM_CHOSEN, choice, taste_kind)
+
+
+def _offered_pick(ctx: RunContext, name: str) -> bool:
+    """Whether ``name`` picks one of the uploads just offered aloud ("the Deji one": the offer's own path)."""
+    from yuki.skills import taste
+
+    got = _mem(ctx.memory, "taste_offered", lambda c: taste.find_offered(_store_of(c), name), timeout_s=0.5)
+    return got is not None
+
+
+def _pick_where(line: str) -> str:
+    """The route's own browser words at the end of its done line (" in Arc"), to keep in the pick's line."""
+    m = re.search(r" in ([^.]+)\.$", str(line or "").strip())
+    return f" in {m.group(1)}" if m else ""
+
+
 def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list[str], ctx: RunContext, *,
                     again: bool = False, live: Live | None = None, settings: Any = None, corrects: bool = False,
                     game_answer: str | None = None, earlier: Sequence[str] | None = None) -> SkillResult:
@@ -1716,6 +1840,15 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         wants_media = bool(skill and any(s.live == "playing" for s in skill.slots))
         live = _live_now(str(game_answer) if game_answer is not None else ctx.game_now(), ctx.hands,
                          media=wants_media, skill=skill, memory=ctx.memory)
+    # kTaste (C2): the user asked Yuki to choose, or named only a channel: Yuki's pick fills the slot (or a game or a
+    # call holds it, said so); the choice slots never reach the resolver
+    picked = _choice_request(str(skill_key or ""), slots, ctx, live, settings)
+    if isinstance(picked, SkillResult):
+        return picked
+    if picked is not None:
+        skill_key, slots = picked.skill_key, picked.slots
+    elif slots and any(k in slots for k in CHOICE_SLOTS):
+        slots = {k: v for k, v in slots.items() if k not in CHOICE_SLOTS}
     step = float(setting(settings, "skills_volume_step") or 10)
     disable_after = int(setting(settings, "skills_disable_after") or 2)
     catalog: dict[str, Any] = {}
@@ -1739,6 +1872,8 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         extra: dict[str, Any] = {"earlier": [str(w) for w in earlier if w]} if earlier else {}
         if granted:
             extra["granted"] = dict(granted)
+        if picked is not None:
+            extra.update(chosen=dict(picked.chosen), chosen_from=picked.chosen_from)
         return res_mod.resolve(key, slots, words, store=_store_of(client) if client is not None else None,
                                live=live, again=again, default_step=step, disable_after=disable_after, **extra)
 
@@ -1762,7 +1897,7 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     # tTaste merge note 1 (phase T): a run that opens YouTube's home with no game in front ranks the fresh uploads on a
     # short thread of their own while the page opens; they are named (and noted, so "the B one" can pick one) only
     # after the run's checked done and a non-empty wait; a run that fails, asks or times out names nothing. A card's
-    # run never offers. Nothing plays here.
+    # run never offers. The offer plays nothing; a request that asked Yuki to choose plays its pick instead (above).
     pending = None
     if isinstance(resolved, Plan) and (resolved.skill.capability or resolved.skill.key) == "web.open_page" \
             and ctx.origin != "card":
@@ -1774,6 +1909,14 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         except Exception:  # noqa: BLE001 - the offer is extra; the run goes on without it
             pending = None
     result = run(resolved, ctx)
+    if picked is not None and result.done:
+        # the pick played and its done-check saw it: the line names it and why (code-written), and the conversation
+        # keeps it ("another one" takes the next; a quick change counts as a skip)
+        from yuki.skills import taste
+
+        result.done_line = taste.choice_line(picked.choice, where=_pick_where(result.done_line))
+        _mem(ctx.memory, "taste_chosen", lambda c: taste.chosen(_store_of(c), picked.choice, session=ctx.session_id,
+                                                                taste_kind=picked.taste_kind), timeout_s=0.5)
     if pending is not None and result.done:
         try:
             offers = pending.wait()          # at most Settings.youtube_feed_budget_s
@@ -1837,4 +1980,4 @@ __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_O
            "HANDOFF_ORIGINS", "FROM_UNHEARD", "FROM_GIVEN", "SEEN_MAX", "COMMIT_BY_END", "COMMIT_BY_NEED", "commit_for",
            "run_commit", "served_commit", "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult",
            "VERB_FUNCS", "open_uri", "pinned", "SEED_KEYS", "plan_seed", "run", "resolve_and_run", "run_for_voice",
-           "run_for_thinker", "granted_values"]
+           "run_for_thinker", "granted_values", "CHOICE_SLOTS", "CHOOSE_TIMEOUT_S", "HELD_CALL"]
