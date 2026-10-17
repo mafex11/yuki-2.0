@@ -289,12 +289,54 @@ def _things(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, wide:
             out.append("Discord voice channels they join: " + ", ".join(_clip(n, 30) for n in voice))
     except Exception:  # noqa: BLE001
         pass
+    out += _places(store, 4 if not wide else 6)
     ways = _ways(store, 3 if not wide else 6)
     if ways:
         out.append("Their own ways (learned): " + "; ".join(ways))
     usuals = _usuals(store, 4 if not wide else 8)
     if usuals:
         out.append("Usual means: " + "; ".join(usuals))
+    return out
+
+
+def _places(store: Any, n: int) -> list[str]:
+    """The servers of the apps that join calls (catalog data: ``end = "call_join"``; their processes from the chat
+    data, as ``yuki.brain.context.read_places``): the part before ": " of their chats' scopes (the capture's own
+    "<server>: <channel>" form), most recently seen first. RAM only."""
+    try:
+        from yuki.memory.store import app_key
+        from yuki.skills.catalog import capabilities
+        from yuki.skills.chat import app_data
+
+        apps = sorted({str(s.app) for s in capabilities().skills if str(getattr(s, "end", "")) == "call_join" and
+                       s.app})
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for app in apps:
+        try:
+            keys = sorted({app_key(str(p)) or "" for p in app_data(app).get("processes") or []} - {""})
+            if not keys:
+                continue
+            rows = store._query(f"SELECT scope_ciphertext FROM threads WHERE process IN ({','.join('?' * len(keys))})"
+                                " AND merged_into IS NULL AND kind = 'conversation' AND scope_ciphertext IS NOT NULL"
+                                " ORDER BY last_seen DESC LIMIT 200", keys)
+        except Exception:  # noqa: BLE001
+            continue
+        servers: list[str] = []
+        for (ct,) in rows:
+            try:
+                scope = " ".join(str(store._dec(ct) or "").split())
+            except Exception:  # noqa: BLE001
+                continue
+            head, sep, _rest = scope.partition(": ")
+            if sep and head and head not in servers:
+                servers.append(head)
+            if len(servers) >= n:
+                break
+        if servers:
+            out.append(f"{app.capitalize()} servers they chat in (recent first): " + ", ".join(_clip(x, 30)
+                                                                                           for x in servers))
     return out
 
 

@@ -583,9 +583,9 @@ class MemoryClient:
 
     def brief_for(self, consumer: str = "thinker") -> str:
         """The brief cut for one consumer, as a plain string ("" when there is none yet): ``thinker`` the whole
-        brief (the agent's profile layer), ``talker`` tone and names only, at most ~2,100 characters, labelled
-        "tone and names, never news" (the voice talker's prompt, builder 3b), ``cards`` the whole brief as ABOUT THE
-        USER lines."""
+        brief (the agent's profile layer), ``talker`` the speaking style (tone and names), at most ~2,100
+        characters (choosing for the user reads :meth:`you_card`), ``cards`` the whole brief as ABOUT THE USER
+        lines."""
         return str(self.brief_slice(consumer).get("text") or "")
 
     def you_card(self, purpose: str = "talker") -> str:

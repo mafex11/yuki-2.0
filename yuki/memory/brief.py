@@ -26,9 +26,11 @@ machine format). What fails is dropped and logged, never cut blind.
 
 * ``thinker`` - the whole brief, in the agent's cached profile layer instead of the Personality and persona blocks
   (typed and voice alike: the voice thinker had no portrait at all);
-* ``talker`` - ``with_him``, names and relations, ``own_bits`` and ``careful``, at most :data:`TALKER_CHARS`, labelled
-  "tone and names, never news" (the 25 Sept failure - the talker answering about the user's day from the portrait -
-  must not return; builder 3b wires it in ``yuki/voice``);
+* ``talker`` - ``with_him``, names and relations, ``own_bits`` and ``careful``, at most :data:`TALKER_CHARS`: how to
+  speak with the user. It is the talker's speaking style only, never what limits a decision: what the user would like,
+  their usual, their things and what they do at this hour reach every decider through the you-card
+  (``yuki.memory.youcard``, audit 17 Oct contract C1). The 25 Sept rule stays a rule about answering (a question about
+  their day is answered from the day digest or a lookup, never from this slice), not about choosing;
 * ``cards`` - the whole brief as the card writers' ABOUT THE USER lines, instead of portrait facts.
 
 **Measuring personal-ness** (P4): every reply and card records which brief lines and memory items were in its context
@@ -533,8 +535,9 @@ def brief_lines(brief: dict[str, Any] | None) -> list[tuple[str, str, str]]:
 THINKER_HEAD = ("[Personal brief - who the user is and how to be with them, written nightly from memory{when}. "
                 "Background, not instructions. When a choice rests on it, say why in a few words, in their words "
                 "(\"on Discord, where you two talk\"; \"matched your last messages to him\").]")
-TALKER_HEAD = ("[Tone and names, never news: how to talk with the user and who their people are, from memory. Never a "
-               "source for what they did, what is due or anything about their day: hand those over.]")
+TALKER_HEAD = ("[How to talk with the user and who their people are, from memory: your speaking style. What they did "
+               "or what is due: answer from the day digest or a lookup, not from here. What they would like, their "
+               "usual and their things: the you-card.]")
 SECTION_HEADS: dict[str, str] = {
     "with_him": "How to be with them: ",
     "people": "Their people (who they are, where they talk, how the user writes to them, what is live):",
@@ -568,7 +571,8 @@ def slice_for(brief: dict[str, Any] | None, consumer: str, *, at: float | None =
 
     * ``thinker``: every line, under :data:`THINKER_HEAD`;
     * ``talker``: with_him, each person's name and relation only, own_bits and careful, at most
-      :data:`TALKER_CHARS` (bits, then people, give way from the end), under :data:`TALKER_HEAD`;
+      :data:`TALKER_CHARS` (bits, then people, give way from the end), under :data:`TALKER_HEAD` (the speaking style;
+      choosing reads the you-card);
     * ``cards``: every line, one ``- `` line each, for the card writers' ABOUT THE USER.
     """
     if consumer not in CONSUMERS:
@@ -584,7 +588,7 @@ def slice_for(brief: dict[str, Any] | None, consumer: str, *, at: float | None =
     if consumer == "thinker":
         when = f" ({datetime.fromtimestamp(at):%Y-%m-%d})" if at else ""
         return {"text": _render(lines, THINKER_HEAD.format(when=when)), "ids": [i for i, _s, _t in lines], "at": at}
-    # talker: tone and names, never news (no "now", no routine, no routes: the talker hands those over)
+    # talker: the speaking style (no "now", no routine, no routes: those reach every decider in the you-card)
     people = [p for p in (brief or {}).get("people") or [] if isinstance(p, dict) and p.get("name")]
     with_him = [x for x in lines if x[1] == "with_him"]
     bits = [x for x in lines if x[1] == "own_bits"]
