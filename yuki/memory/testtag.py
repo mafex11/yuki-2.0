@@ -24,7 +24,9 @@ resting on test material only, Yuki's run traces and their playbook events, skil
 ``last_used_at`` back to the latest real run), surfaced cards, moments and asked occasions of test requests.
 By the test sessions' own span (the harness drove the desktop while the user was away; these rows carry no tag): the
 know-how, the "said" taste pairings, the misheard-name aliases, the episodes, Yuki's own journal facts, the moments
-and occasions (with the preference observations fed from them) learned inside it. Kept: what the screen showed in the
+and occasions (with the preference observations fed from them) learned inside it, and the corrections said in it
+(ended, with the journal and portrait changes their pass made undone). The standing rules a test session made are
+conversation facts resting on its exchanges only, so they go with them. Kept: what the screen showed in the
 span (screen journal facts, links seen, the hour counts of "observed" tastes), which may be real incoming content.
 
 **Live lookups still see test runs** (review r1 M2): they say how a route or a control behaves on this PC, whoever
@@ -252,6 +254,80 @@ def _in_spans(column: str, spans: Sequence[tuple[float, float]]) -> tuple[str, l
     return "(" + " OR ".join(f"({column} >= ? AND {column} <= ?)" for _ in spans) + ")", [x for s in spans for x in s]
 
 
+def _purge_corrections(conn: sqlite3.Connection, dec: Callable[[Any], str | None],
+                       spans: Sequence[tuple[float, float]], *, now: float) -> dict[str, int]:
+    """The corrections made inside the test's span (``portrait_facts`` of kind ``correction``, origin ``user``: the
+    harness's scripted "that's wrong" through the voice tools; a correction carries no session) are ended, not deleted
+    (as a correction the user takes back), and their correction pass is undone where it can be exactly: the journal
+    facts it rewrote or retired (its own batch, ``journal_batches.model = 'correction:<id>'``: the new versions go and
+    the old rows are current again) and the portrait facts it rewrote or retired (the pass's own change record: old and
+    new ids). A pass not yet run is skipped. Changes on other surfaces (to-dos, episodes, threads, questions, the
+    persona, conversation facts) are kept and counted. Idempotent: an ended correction is never read again. Counts."""
+    out: dict[str, int] = {}
+    if not spans or not _has(conn, "portrait_facts", "kind"):
+        return out
+    cond, params = _in_spans("valid_from", spans)
+    rows = conn.execute(f"SELECT id FROM portrait_facts WHERE kind = 'correction' AND origin = 'user' AND valid_to IS"
+                        f" NULL AND {cond}", params).fetchall()
+    for (cid,) in [tuple(r) for r in rows]:
+        cid = int(cid)
+        conn.execute("UPDATE portrait_facts SET valid_to = ?, expired_at = ? WHERE id = ?", (now, now, cid))
+        out["corrections_ended"] = out.get("corrections_ended", 0) + 1
+        run = conn.execute("SELECT status, started_at, changes_ciphertext FROM correction_passes WHERE"
+                           " correction_id = ?", (cid,)).fetchone() if _has(conn, "correction_passes") else None
+        if run is None:
+            continue
+        if run[0] in ("queued", "applying", "failed"):
+            conn.execute("UPDATE correction_passes SET status = 'skipped', updated_at = ? WHERE correction_id = ?",
+                         (now, cid))
+            continue
+        # the journal: the pass's own batch
+        batches = _ids(conn.execute("SELECT id FROM journal_batches WHERE model = ?", (f"correction:{cid}",))) if (
+            _has(conn, "journal_batches", "model")) else []
+        if batches:
+            marks = ",".join("?" * len(batches))
+            new = _ids(conn.execute(f"SELECT id FROM journal WHERE batch_id IN ({marks})", batches))
+            later = _ids(conn.execute(f"SELECT id FROM journal WHERE batch_id IN ({marks}) AND superseded_at IS NOT"
+                                      f" NULL", batches))
+            if later:   # a version the pass wrote was itself corrected since: the chain is kept as it is
+                out["correction_changes_kept"] = out.get("correction_changes_kept", 0) + len(new)
+            else:
+                _delete_ids(conn, "journal_vec", "journal_id", new)
+                n_new = _delete_ids(conn, "journal", "id", new)
+                back = conn.execute(f"UPDATE journal SET superseded_at = NULL, superseded_by = NULL WHERE superseded_by"
+                                    f" IN ({marks})", batches).rowcount
+                out["correction_journal_undone"] = out.get("correction_journal_undone", 0) + max(
+                    n_new, int(back or 0))
+        # the portrait and the other surfaces: the pass's own change record (old and new ids; decrypted in RAM only)
+        try:
+            changes = json.loads(dec(run[2]) or "[]") if run[2] else []
+        except Exception:  # noqa: BLE001 - an unreadable record: nothing more is undone
+            changes = []
+        started = float(run[1] or 0.0)
+        for ch in changes if isinstance(changes, list) else []:
+            if not isinstance(ch, dict) or not ch.get("ok") or ch.get("surface") == "journal":
+                continue
+            old, new_id = ch.get("old_id"), ch.get("new_id")
+            if ch.get("surface") != "portrait" or old is None:
+                out["correction_changes_kept"] = out.get("correction_changes_kept", 0) + 1
+                continue
+            if new_id is not None:
+                cur = conn.execute("SELECT 1 FROM portrait_facts WHERE id = ? AND valid_to IS NULL",
+                                   (int(new_id),)).fetchone()
+                if cur is None:   # the rewritten fact changed again since: kept
+                    out["correction_changes_kept"] = out.get("correction_changes_kept", 0) + 1
+                    continue
+                _delete_ids(conn, "portrait_fact_vec", "fact_id", [int(new_id)])
+                conn.execute("DELETE FROM portrait_facts WHERE id = ?", (int(new_id),))
+                n = conn.execute("UPDATE portrait_facts SET valid_to = NULL, expired_at = NULL, superseded_by = NULL"
+                                 " WHERE id = ? AND superseded_by = ?", (int(old), int(new_id))).rowcount
+            else:   # retired by the pass (ended at or after its start, superseded by nothing)
+                n = conn.execute("UPDATE portrait_facts SET valid_to = NULL, expired_at = NULL WHERE id = ? AND"
+                                 " superseded_by IS NULL AND valid_to >= ?", (int(old), started)).rowcount
+            out["correction_portrait_undone"] = out.get("correction_portrait_undone", 0) + int(n or 0)
+    return out
+
+
 def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: float) -> dict[str, int]:
     """Delete what the live test left and what was learned from it (module docstring), inside the caller's write
     transaction (``conn``; ``dec`` decrypts a stored field). Idempotent: a second run finds nothing. Counts per kind,
@@ -326,6 +402,9 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
                 facts.append(int(r["id"]))
         _delete_ids(conn, "conversation_fact_vec", "fact_id", facts)
         count("conversation_facts", _delete_ids(conn, "conversation_facts", "id", facts))
+    # the user's corrections said inside the test's span (a correction carries no session) and what their pass changed
+    for kind, n in _purge_corrections(conn, dec, spans, now=now).items():
+        count(kind, n)
     # the test sessions' own records
     if _has(conn, "session_summaries", "session_id"):
         sums = _ids(conn.execute("SELECT id FROM session_summaries WHERE session_id >= ? AND session_id < ?", (lo, hi)))

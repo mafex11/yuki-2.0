@@ -738,9 +738,12 @@ You are Yuki, the user's own assistant on their Windows PC: one Yuki, never a co
 {identity} You write one short card that appears in the corner of their screen at a pause in their day. They did \
 not ask for it, so it has to be worth the glance; when it is not, you say none.
 
-What you get: THE CARD (its type and why it came up now, measured by code), its EVIDENCE (lines with ids) and YOU \
-NOW (where they are in their day, what they are working on, how to be with them), all inside the untrusted-data \
-markers; then CARD FEEDBACK (how they took this type of card lately) and OFFERS ALLOWED NOW.
+What you get: THE CARD (its type and why it came up now, measured by code), its EVIDENCE (lines with ids), YOU \
+NOW (where they are in their day, what they are working on, how to be with them) and WHO THEY ARE (what Yuki knows \
+of them: their work, their usual things at this hour, their people, what is open), all inside the untrusted-data \
+markers; then CARD FEEDBACK (how they took this type of card lately) and OFFERS ALLOWED NOW. WHO THEY ARE is there \
+so the card sounds like someone who knows them (their names for things, their usual, their people); it is never \
+evidence on its own and never a reason for a card.
 
 How to write it:
 - One or two short sentences, at most 300 characters, in plain words, the way a friend who sat next to them all day \
@@ -844,6 +847,17 @@ TYPE_WORDS: dict[str, str] = {
 }
 
 
+def _you_card(store: Any, now: float) -> str:
+    """The judge's view of the user (contract C1): :func:`yuki.memory.youcard.build_you_card` with purpose ``judge``,
+    built by code in this process (cached there); ``""`` when nothing is known or it can't be built."""
+    try:
+        from yuki.memory.youcard import build_you_card
+
+        return build_you_card(store, purpose="judge", now=now) or ""
+    except Exception:  # noqa: BLE001 - the card is written without it
+        return ""
+
+
 class CardWriter:
     """The one writer call for the one chosen candidate (§4.6): one prompt for every card, ``write_card`` (never
     ``run_skill``; ``draft`` absent from the offers and refused by ``validate_offer``), checked in code. Built here and
@@ -882,10 +896,12 @@ class CardWriter:
         mentions = {i.ref for i in items} | {k for k in ids if k[:1] == "G" and k[1:].isdigit()}
         allowed = self.allowed(c, config, now)
         head = c.text if isinstance(c.text, str) else None
+        card = _you_card(self.store, now)
         data = "\n".join([
             "EVIDENCE:", *(lines or ["(none)"]),
             *([f"THE ITEM'S OWN WORDS (code text): {safe(head, 300)}"] if head else []),
             "", safe(render(you, "cards", now=now), 2500), "",
+            *(["WHO THEY ARE:", safe(card, 3000), ""] if card else []),
             *deadline_lines(self.store, items, now, safe),
         ])
         day = datetime.fromtimestamp(now)

@@ -538,7 +538,8 @@ def habit_keys(skill: Any) -> tuple[str, ...]:
 
 def _pooled_last(store: Any, keys: tuple[str, ...], n: int) -> list[int]:
     """The newest ``n`` decided runs and rung tries of these ledger keys together, newest first (1 verified, 0 not):
-    the registry's own "last 5" read, over two keys."""
+    the registry's own "last 5" read, over two keys. A rung try that is also its run's last rung (the same run key,
+    rung, variant and via in ``skill_runs``) counts once, as the run."""
     marks = ",".join("?" * len(keys))
     from yuki.memory.testtag import sql_real_route_try, sql_real_skill_run
 
@@ -547,7 +548,10 @@ def _pooled_last(store: Any, keys: tuple[str, ...], n: int) -> list[int]:
             f"SELECT checked, recheck FROM (SELECT checked, recheck, coalesce(t_done, t0) AS t, id FROM skill_runs WHERE"
             f" skill IN ({marks}) AND checked IS NOT NULL AND rung IS NOT NULL AND {sql_real_skill_run()} UNION ALL"
             f" SELECT checked, NULL, at, id FROM skill_route_tries WHERE skill IN ({marks}) AND checked IS NOT NULL"
-            f" AND {sql_real_route_try()}) ORDER BY t DESC, id DESC LIMIT ?", (*keys, *keys, int(n)))
+            f" AND {sql_real_route_try()} AND NOT EXISTS (SELECT 1 FROM skill_runs r WHERE"
+            f" r.run_key = skill_route_tries.run_key AND r.rung = skill_route_tries.rung AND"
+            f" r.variant IS skill_route_tries.variant AND r.via = skill_route_tries.via))"
+            f" ORDER BY t DESC, id DESC LIMIT ?", (*keys, *keys, int(n)))
     except Exception:  # noqa: BLE001
         return []
     return [1 if int(c) == 1 and r != 0 else 0 for c, r in rows]
@@ -652,6 +656,50 @@ def skill_offerable(store: Any, skill: Any, *, meta: dict[str, Any] | None = Non
     return True, "ok"
 
 
+#: The record's own verdicts a value routine replaces with its value's (:func:`routine_gate`): the learner's static
+#: part (a ``judged`` record's ``everyday`` is per value) and the record's naming verdict.
+VALUE_OWNS: tuple[str, ...] = ("static", "nameless", "may_be_work")
+
+
+def routine_value(store: Any, key: Any) -> tuple[str, dict[str, Any]] | None:
+    """``(capability key, value)`` of a routine on one value of a capability's record (``skill:<record id>|<value
+    id>``, contract C5; :func:`yuki.skills.learn.values.routine_value`), else ``None``. Never raises."""
+    if not key or "|" not in str(key):
+        return None
+    try:
+        from yuki.skills.learn.values import routine_value as _value
+
+        return _value(store, key)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def routine_gate(store: Any, skill: Any, key: Any = None, *, meta: dict[str, Any] | None = None,
+                 value: tuple[str, dict[str, Any]] | None = None) -> tuple[bool, str]:
+    """The offer gate of a routine keyed ``key`` on ``skill``: :func:`skill_offerable`, and for a routine on one value
+    of a capability's record (:func:`routine_value`; ``value`` when the caller read it already) the value's own gate
+    (``yuki.skills.learn.values.routine_offerable``: its everyday and Not mine) in place of the record's naming verdict
+    (:data:`VALUE_OWNS`). The record's live state, sends, commit, class, rung and won't line stay. ``(ok, why)``."""
+    meta = skill_meta(store, skill) if meta is None and skill is not None else meta
+    ok, why = skill_offerable(store, skill, meta=meta)
+    value = value if value is not None else routine_value(store, key)
+    if value is None or (not ok and why not in VALUE_OWNS):
+        return ok, why
+    if why == "static":
+        # skill_offerable stopped before its rung check: the rung is the record's own
+        rung = str(((meta or {}).get("prov") or {}).get("rung") or "")
+        if rung not in OFFER_RUNGS or (rung == "B" and not _rung_b_verified(store, habit_keys(skill))):
+            return False, "rung"
+    if not ok and skill_wont_line(skill) is None:
+        return False, "unknown_wont"
+    try:
+        from yuki.skills.learn.values import routine_offerable
+
+        return routine_offerable(value[1])
+    except Exception:  # noqa: BLE001
+        return False, "no_value"
+
+
 def card_question(store: Any, skill: Any, *, fallback: str = "", meta: dict[str, Any] | None = None) -> str:
     """The routine card's question: the learned skill's own name as a question ("<name>?") when it has a real one
     (the naming call's or the user's), else ``fallback`` (the lane's fixed words for its end kind); ``""``: none."""
@@ -670,17 +718,19 @@ def routine_offer(store: Any, routine: Any, now: float | None = None, *, expires
                   question: str = "") -> tuple[dict[str, Any] | None, str]:
     """The ``run_skill`` offer of a routine card, built by code (no model), or ``(None, why)``:
 
-    * ``no_skill`` (the routine's skill isn't loaded); the offer gate's own words (:func:`skill_offerable`:
+    * ``no_skill`` (the routine's skill isn't loaded); the offer gate's own words (:func:`routine_gate`:
       ``not_learned``, ``not_live``, ``sends``, ``commit``, ``offer_class``, ``static``, ``rung``, ``nameless``,
-      ``may_be_work``, ``unknown_wont``); ``no_preview`` (no card question: ``question``, else
-      :func:`card_question` with no fallback); ``bad_params`` (a bound parameter the skill has no slot for);
+      ``may_be_work``, ``unknown_wont``; a value routine's ``not_mine``, ``work``, ``may_be_work``); ``no_preview``
+      (no card question: ``question``, else :func:`card_question` with no fallback); ``bad_params`` (a bound
+      parameter the skill has no slot for);
     * ``not_ready``: its route isn't trusted for offers (:func:`offer_trusted`: ``yuki.skills.registry.offer_ready``,
       D14: 2 verified runs for opening things, 5 and none failed in the last 5 for changing things; a usage record's
       runs pooled with its capability's);
     * ``unavailable``: the skill's own availability check, last because it reads the screen (``available(skill)``:
       a site tab census; ``None`` = couldn't read counts as not available).
 
-    ``routine``: a :class:`yuki.memory.routine_offers.Routine` (``id``, ``skill_id``, ``params``, ``offer_mode``).
+    ``routine``: a :class:`yuki.memory.routine_offers.Routine` (``id``, ``key``, ``skill_id``, ``params``,
+    ``offer_mode``).
     ``ready`` / ``skills`` replace the registry check and the skill loader (tests, replays)."""
     now = time.time() if now is None else float(now)
     key = str(getattr(routine, "skill_id", "") or "")
@@ -697,7 +747,7 @@ def routine_offer(store: Any, routine: Any, now: float | None = None, *, expires
     if skill is None:
         return None, "no_skill"
     meta = skill_meta(store, skill)
-    ok, why_not = skill_offerable(store, skill, meta=meta)
+    ok, why_not = routine_gate(store, skill, getattr(routine, "key", None), meta=meta)
     if not ok:
         return None, why_not
     preview = _squash(question or card_question(store, skill, meta=meta), STEP_MAX)
@@ -879,7 +929,8 @@ def _act_run_skill(store: Any, n: Any, offer: dict[str, Any], now: float) -> dic
         from yuki.skills.catalog import load
 
         skill = load(store=store).get(str(offer["skill"]))
-        ready = bool(skill is not None and skill_offerable(store, skill)[0] and offer_trusted(store, skill, now=now))
+        ready = bool(skill is not None and routine_gate(store, skill, r.key)[0]
+                     and offer_trusted(store, skill, now=now))
     except Exception:
         ready = False
     if not ready:
@@ -1106,7 +1157,7 @@ __all__ = [
     "WONT_LINES", "SKILL_WONT_LINES", "RUN_OUTCOMES", "OFFER_SCHEMA", "JUDGE_OFFER_PROPERTIES",
     "OFFER_RULES", "WEIGHTS", "OFF_AT", "LEARN_WINDOW_S", "STOP_WITHIN_S", "resolve_ref", "validate_offer",
     "stored_offer", "card_offer_view", "skill_wont_line", "skill_meta", "named", "usage_capability", "habit_keys",
-    "offer_trusted", "skill_offerable", "card_question",
+    "offer_trusted", "skill_offerable", "VALUE_OWNS", "routine_value", "routine_gate", "card_question",
     "OFFER_COMMITS", "OFFER_RUNGS", "routine_offer", "act", "offer_result", "undo",
     "record_outcome", "channel_of", "signal", "offer_scores", "allowed_dos", "offer_allowed", "outcome_words",
     "feedback_lines",

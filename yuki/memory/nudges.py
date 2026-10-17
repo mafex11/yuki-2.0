@@ -894,8 +894,6 @@ class NudgeWorker:
         clock: Callable[[], float] = time.time,
         event_name: str = NUDGE_EVENT_NAME,
         log: Any = None,
-        attention: Any = None,   # unused since 18 Oct (the judge's one policy); the service still passes it
-        screen_fn: Any = None,   # unused since 18 Oct (no recall cards); the service still passes it
         embedder: Any = None,
         you_fn: Callable[[], Any] | None = None,
     ) -> None:
