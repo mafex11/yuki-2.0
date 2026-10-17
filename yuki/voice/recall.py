@@ -19,14 +19,31 @@ Two parts, both content (never logged; the voice log gets sizes and counts only)
   it, read today's talk, or search memory, in a moment, through the memory API calls that exist
   (``MemoryClient.todos`` / ``add_todo`` / ``turns_on`` / ``recall``). Its report says what to tell them, so "what's
   on my list" and "make a to-do list of this" are one turn each, and "I don't have that" comes only after a look.
+
+lThink (17 Oct 2026, the first live test, problem 9): memory questions ("what was I doing yesterday evening", "who did
+I talk to on Discord today", "which VC do I usually hop in at night", "what's my usual playlist") took 17-29 s through
+the Sonnet thinker: the answers are in the episodes, calls, chats and tastes, which the quick look never read. Two more
+parts, built in code from memory (:mod:`yuki.memory.talker_digest`), never a model:
+
+* :func:`fetch_digest` / :func:`digest_view`: **their days at a glance**, a block after the last hour's exchanges in the
+  same conversation-fixed system block (so ``mouth.py`` needs no new block): the last day by parts, who they messaged
+  and the calls in their day so far, their usual voice channels and with whom, and what they pick most of each taste
+  kind with its hours. Read off the voice loop and kept a few minutes (:data:`DIGEST_TTL_S`), so a woken conversation
+  never waits for it.
+* ``quick_memory`` ``day``: one day or part of it in more detail (the episodes' summaries, calls, people), for a
+  question about another day: one quick look instead of a hand-over.
 """
 
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
+import weakref
 from datetime import datetime
 from typing import Any
+
+from yuki.memory.talker_digest import PARTS as DAY_PARTS
 
 #: How far back the start-of-conversation view reaches (s).
 RECENT_S = 3600.0
@@ -72,15 +89,19 @@ QUICK_MEMORY: dict[str, Any] = {
     "name": "quick_memory",
     "description": (
         "Look into memory, after a few words in the same reply (\"Let me look.\"). todos: their to-dos. add_todos: put "
-        "items on it when they ask, one each, their words. today: today's chat. search: memory for query."
+        "items on it when they ask, one each, their words. today: today's chat. search: memory for query. day: what "
+        "they did on a day the Their days block doesn't cover, or in more detail (day, part optional): what they did, "
+        "apps, calls, who they messaged."
     ),
     "properties": {
-        "action": {"type": "string", "enum": ["todos", "add_todos", "today", "search"]},
+        "action": {"type": "string", "enum": ["todos", "add_todos", "today", "search", "day"]},
         "items": {"type": "array", "items": {"type": "object", "properties": {
             "text": {"type": "string"},
             "due": {"type": "string", "description": "If given: YYYY-MM-DD[ HH:MM]"}},
             "required": ["text"]}},
         "query": {"type": "string"},
+        "day": {"type": "string", "description": "For day: YYYY-MM-DD (the Now line has today's date)"},
+        "part": {"type": "string", "enum": [p[0] for p in DAY_PARTS]},
     },
     "required": ["action"],
 }
@@ -178,6 +199,42 @@ NOTHING_NOTE = ("Nothing found in {where}. Say that plainly, naming where you lo
 WHOSE_NOTE = ("A hit marked as another AI tool's text, or whose from line says someone else said it, is never theirs: "
               "never give it as their own words or plans. When none is theirs, say what you found and whose it is "
               "(\"someone on your Discord call said that, not you\"), and offer to dig further.")
+#: lThink: the report of a ``day`` look.
+DAY_NOTE = ("For you, not to read out: what memory measured of that time. Answer what they asked from it in a few words "
+            "(what they did, with whom, when), as you would tell a friend; never list it all. When it does not hold "
+            "what they mean, say where you looked ({where}) and offer to dig further, which is a hand-over.")
+#: A day look's report is cut to this (characters).
+DAY_CHARS = 3_000
+DAY_SUMMARY_CHARS = 180
+
+
+def day_text(report: dict[str, Any]) -> str:
+    """A ``day`` look's report for the talker: per part of the day its activities with most time, its episodes with
+    their summaries, its calls; then who they messaged and where they wrote. At most :data:`DAY_CHARS`."""
+    lines: list[str] = []
+    for p in report.get("parts") or []:
+        _name, h0, h1 = next((x for x in DAY_PARTS if x[0] == p["part"]), (p["part"], 0, 0))
+        apps = ", ".join(f"{label} {_mins(s)}" for label, s in p.get("apps") or [])
+        lines.append(f"{p['date']} {p['part']} ({_span(h0, h1)}{', so far' if p.get('so_far') else ''})"
+                     + (f": {apps}" if apps else ""))
+        for e in p.get("episodes") or []:
+            summary = _clip(e.get("summary"), DAY_SUMMARY_CHARS)
+            lines.append(f"- {datetime.fromtimestamp(e['start']):%H:%M}-{datetime.fromtimestamp(e['end']):%H:%M} "
+                         f"{_clip(e['title'], DIGEST_TITLE_CHARS)}" + (f": {summary}" if summary else ""))
+        lines += [f"- {_call_text(c)}" for c in p.get("calls") or []]
+    people = report.get("people") or []
+    if people:
+        lines.append("Messaged (direct messages): " + "; ".join(
+            f"{p['name']} ({p['app']}, {p['mine'] + p['theirs']} messages, last "
+            f"{datetime.fromtimestamp(p['last']):%a %H:%M})" for p in people) + ".")
+    chats = report.get("chats") or []
+    if chats:
+        lines.append("Wrote in: " + "; ".join(f"{c['app']} {c.get('kind') or 'chat'} \"{_clip(c['chat'], 40)}\""
+                                             for c in chats) + ".")
+    text = "\n".join(lines)
+    if len(text) > DAY_CHARS:
+        text = text[:DAY_CHARS].rsplit("\n", 1)[0] + "\n(more in memory: a hand-over can dig further)"
+    return text
 
 
 class _OutOfTime(Exception):
@@ -371,10 +428,15 @@ def fetch_recent(memory: Any, *, now: float | None = None, timeout_s: float = RE
 
     ``memory`` is :class:`~yuki.agent.memory.MemoryAccess` (its ``call``). Never raises: ``None`` when the hour holds
     nothing; ``failed`` (default ``None``) without memory, on a failure or past the bound, so a caller that already has
-    a view can keep it rather than take a failed read for an empty hour (review F4)."""
+    a view can keep it rather than take a failed read for an empty hour (review F4).
+
+    lThink: the view is followed by their days at a glance (:func:`fetch_digest`, its own block text after
+    :data:`RECENT_END`), so the talker's conversation-fixed block carries both; with nothing in the hour the digest
+    alone is returned. A clock given in ``now`` (a replay) reads the digest at that time, uncached."""
     call = getattr(memory, "call", None)
     if not callable(call):
         return failed
+    given = now
     now = time.time() if now is None else float(now)
 
     def read(client: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -383,11 +445,273 @@ def fetch_recent(memory: Any, *, now: float | None = None, timeout_s: float = RE
         rules = client.rules() if callable(getattr(client, "rules", None)) else []
         return turns, list(todos or []), list(rules or [])
 
+    started = time.monotonic()
+    if given is None:
+        fetch_digest(memory, wait_s=0.0)   # lThink: its read starts now, alongside the last hour's
     try:
         turns, todos, rules = call("recent talk", read, timeout_s=timeout_s)
     except Exception:  # noqa: BLE001 - the talker starts without it
         return failed
-    return recent_view(turns, todos, rules, now=now)
+    view = recent_view(turns, todos, rules, now=now)
+    left = max(0.05, float(timeout_s) - (time.monotonic() - started))
+    days = fetch_digest(memory, now=given, wait_s=min(left, DIGEST_WAIT_S))
+    blocks = [b for b in (view, days) if b]
+    return "\n\n".join(blocks) if blocks else None
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Their days at a glance (lThink): the digest built in code from memory, for the talker's conversation-fixed block
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: The digest's whole size cap (characters, label included): ~520 tokens at most. The short facts (what they pick, who
+#: they messaged, where their calls were) always go in; the parts of the day fill the rest, the newest first, with
+#: fewer episodes each before a part is left out. Measured 17 Oct on the user's memory at 03:50: ~2,000 characters
+#: with the evening and the night so far.
+DIGEST_CHARS = 2_100
+#: A digest read this recently is used as it is; one older is read again, and while that read runs a kept one up to
+#: :data:`DIGEST_MAX_AGE_S` old stands in (its block says when it was read, and that what came after is not in it).
+#: Read only when a conversation is built or woken: never on a timer (Yuki stays light).
+DIGEST_TTL_S = 300.0
+DIGEST_MAX_AGE_S = 3 * 3600.0
+#: How long a caller waits for a digest read when none is kept (s). Measured 17 Oct on copies of the user's memory:
+#: the whole read takes 0.16-0.6 s warm (the parts of the day ~0.09 s, calls of 30 days ~0.06 s, the people index
+#: 0.01-0.17 s), up to 1.8 s on a cold first read. The read starts alongside the last hour's (:func:`fetch_recent`), so
+#: most of it is done by the time that one is.
+DIGEST_WAIT_S = 1.0
+#: How long a caller waits for a fresh read when an older kept one could stand in (s).
+DIGEST_STALE_WAIT_S = 0.3
+#: The bound on one digest read in the background (s): a slow memory never holds a thread longer.
+DIGEST_READ_S = 6.0
+#: Longest episode title, place, chat name in the digest (whole words); names per list; episodes per part at most.
+DIGEST_TITLE_CHARS = 52
+DIGEST_PLACE_CHARS = 48
+DIGEST_PEOPLE = 5
+DIGEST_PART_EPISODES = 4
+#: A taste's hours are shown for its first this many (most picked) entities.
+DIGEST_HOURS_FOR = 2
+#: The parts of days always kept (the newest), however tight the budget.
+DIGEST_MIN_PARTS = 2
+DIGEST_LABEL = ("[Their days at a glance (memory, read {read}; local times; their day starts at 04:00, so \"today\" is "
+                "since {start}, and hours after midnight belong to the night before). Asked what they did, their "
+                "calls, who they talked to or what they usually pick: answer from here in a few words, no hand-over. "
+                "Not here (another day, after {read}, more detail): quick_memory day, else hand it over. Never bring "
+                "it up yourself.]")
+DIGEST_END = "[End of their days]"
+
+_digest_lock = threading.Lock()
+#: memory -> {"at": wall time of the read, "text": the block or None, "running": the read's Event or None}: RAM only,
+#: dropped with the memory object.
+_digests: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+
+
+def _span(h0: int, h1: int) -> str:
+    return f"{h0 % 24:02d}-{h1 % 24:02d}"
+
+
+def _mins(seconds: float) -> str:
+    m = int(round(float(seconds) / 60.0))
+    return f"{m // 60} h {m % 60:02d}" if m >= 60 else f"{m} min"
+
+
+def _who(names: list[str], n: int = DIGEST_PEOPLE) -> str:
+    names = [" ".join(str(x).split()) for x in names if str(x).strip()]
+    if not names:
+        return ""
+    more = len(names) - n
+    return ", ".join(names[:n]) + (f" +{more}" if more > 0 else "")
+
+
+def _clock(at: float | None) -> str:
+    return f"{datetime.fromtimestamp(at):%H:%M}" if at else ""
+
+
+def _call_text(c: dict[str, Any], *, people: int = DIGEST_PEOPLE) -> str:
+    """One call as the digest says it: where (or the app), when, with whom."""
+    where = _clip(c.get("place") or c.get("app") or "a call", DIGEST_PLACE_CHARS)
+    start, end = c.get("start"), c.get("end")
+    when = f"{_clock(start)}-{_clock(end)}" if start and end else ""
+    if c.get("ongoing"):
+        when = f"since {_clock(start)} (still on)" if start else "still on"
+    who = _who(list(c.get("people") or []), people) if people > 0 else ""
+    kind = "game voice chat" if c.get("kind") == "game" else "call"
+    return f"{kind} {where} {when}".strip() + (f" with {who}" if who else "")
+
+
+def _hours_text(peaks: list[Any]) -> str:
+    out = []
+    for a, b in peaks or []:
+        out.append(f"{int(a):02d}h" if a == b else f"{int(a):02d}-{(int(b) + 1) % 24:02d}h")
+    return " and ".join(out)
+
+
+def _call_key(c: dict[str, Any]) -> tuple[int, str]:
+    return round(float(c.get("start") or 0.0)), str(c.get("app") or "")
+
+
+def _part_line(p: dict[str, Any], episodes: int, listed: set[tuple[int, str]] | frozenset = frozenset()) -> str:
+    """One part of a day: its activities with most time, its longest episodes (by their own titles, in time order) and
+    its calls (who was on one is said once: a call of their day so far is with its people on the talked-with line,
+    ``listed``)."""
+    _name, h0, h1 = next((x for x in DAY_PARTS if x[0] == p["part"]), (p["part"], 0, 0))
+    head = f"{p['date']} {p['part']} ({_span(h0, h1)}{', so far' if p.get('so_far') else ''}):"
+    bits = []
+    if p.get("apps"):
+        bits.append(", ".join(f"{label} {_mins(s)}" for label, s in p["apps"]))
+    eps = sorted(sorted(p.get("episodes") or [], key=lambda e: -(e["end"] - e["start"]))[:max(0, episodes)],
+                 key=lambda e: e["start"])
+    bits += [f"{_clip(e['title'], DIGEST_TITLE_CHARS)} {_clock(e['start'])}-{_clock(e['end'])}" for e in eps]
+    bits += [_call_text(c, people=0 if _call_key(c) in listed else 4) for c in p.get("calls") or []]
+    return f"{head} {'; '.join(bits)}" if bits else ""
+
+
+def _talked_with(data: dict[str, Any]) -> str:
+    """Who they talked with in their day so far, by app: the people they messaged directly (either way) and the calls
+    they were on with who was seen on each, so "who did I talk to on Discord today" is one line."""
+    by_app: dict[str, dict[str, Any]] = {}
+    for p in data.get("people") or []:
+        app = str(p.get("app") or "")
+        by_app.setdefault(app.casefold(), {"app": app, "bits": []})["bits"].append(
+            f"{p['name']} (DM, {p['mine'] + p['theirs']} msgs both ways, last {_clock(p['last'])})")
+    for c in data.get("calls_today") or []:
+        app = str(c.get("app") or "")
+        by_app.setdefault(app.casefold(), {"app": app, "bits": []})["bits"].append(_call_text(c))
+    if not by_app:
+        return ""
+    return "Talked with in their day so far: " + " ".join(
+        f"{v['app']}: {'; '.join(v['bits'])}." for v in by_app.values())
+
+
+def _facts(data: dict[str, Any]) -> list[str]:
+    """The digest's short facts: what they pick most (each taste kind), who they talked with in their day so far (by
+    app: direct messages and calls), and where their calls were over the last weeks."""
+    out: list[str] = []
+    for u in data.get("usuals") or []:
+        items = []
+        for i, it in enumerate(u.get("items") or []):
+            notes = [] if i else ["most"]
+            hours = _hours_text(it.get("peaks") or []) if i < DIGEST_HOURS_FOR else ""
+            if hours:
+                notes.append(f"mostly {hours}")
+            said = [x for x in it.get("said") or [] if x and x.casefold() != str(it["name"]).casefold()]
+            if said:
+                notes.append("they've called it " + " or ".join(f"\"{_clip(x, 30)}\"" for x in said))
+            items.append(_clip(it["name"], 48) + (f" ({'; '.join(notes)})" if notes else ""))
+        if items:
+            now_pick = f"; at this hour: {u['now']}" if u.get("now") else ""
+            out.append(f"Their {str(u['kind']).replace('_', ' ')}s, most picked first: {', '.join(items)}{now_pick}.")
+    talked = _talked_with(data)
+    if talked:
+        out.append(talked)
+    voice = data.get("voice") or {}
+    if voice.get("places"):
+        places = "; ".join(
+            f"{_clip(v['place'], DIGEST_PLACE_CHARS)}: {v['n']} call{'s' if v['n'] != 1 else ''} ({v['night']} at "
+            f"night, from ~{int(v['hour']):02d}:00, last {datetime.fromtimestamp(v['last']):%d %b})"
+            for v in voice["places"])
+        who = _who(list(voice.get("people") or []))
+        out.append(f"Where their calls were, last 30 days, most first: {places}."
+                   + (f" On calls with them most: {who}." if who else ""))
+    return out
+
+
+def digest_view(data: dict[str, Any] | None, *, chars: int = DIGEST_CHARS) -> str | None:
+    """The talker's block for :func:`yuki.memory.talker_digest.digest`'s rows, at most ``chars``; ``None`` when memory
+    measured nothing. Fixed words over stored rows (titles, names, counts, times), never a judgement. The short facts
+    always go in; the parts of the day fill the rest, the newest first (:data:`DIGEST_CHARS`)."""
+    if not isinstance(data, dict):
+        return None
+    now = float(data.get("now") or time.time())
+    start = data.get("day_start")
+    label = DIGEST_LABEL.format(read=f"{datetime.fromtimestamp(now):%a %d %b %H:%M}",
+                                start=f"{datetime.fromtimestamp(start):%a %d %b %H:%M}" if start else "04:00")
+    facts = _facts(data)
+    listed = {_call_key(c) for c in data.get("calls_today") or []}
+    parts = [p for p in data.get("parts") or [] if _part_line(p, DIGEST_PART_EPISODES, listed)]
+    if not parts and not facts:
+        return None
+
+    def build(ps: list[dict[str, Any]], episodes: int) -> str:
+        return "\n".join([label, *(_part_line(p, episodes, listed) for p in ps), *facts, DIGEST_END])
+
+    kept: list[dict[str, Any]] = []
+    for p in reversed(parts):                    # the newest part first, while it fits with all its episodes
+        if len(kept) >= DIGEST_MIN_PARTS and len(build([p, *kept], DIGEST_PART_EPISODES)) > chars:
+            break
+        kept.insert(0, p)
+    episodes = DIGEST_PART_EPISODES
+    text = build(kept, episodes)
+    while len(text) > chars and episodes > 1:
+        episodes -= 1                            # the shorter episodes of each part go before the newest parts do
+        text = build(kept, episodes)
+    while len(text) > chars and len(kept) > 1:
+        kept = kept[1:]
+        text = build(kept, episodes)
+    if len(text) > chars:
+        text = text[:chars - len(DIGEST_END) - 3].rsplit("\n", 1)[0] + "\n" + DIGEST_END
+    return text
+
+
+def _read_digest(memory: Any, now: float | None, timeout_s: float) -> str | None:
+    from yuki.memory.talker_digest import digest
+
+    data = memory.call("talker digest", lambda c: digest(c, now=now), timeout_s=timeout_s)
+    return digest_view(data)
+
+
+def fetch_digest(memory: Any, *, now: float | None = None, wait_s: float = DIGEST_WAIT_S) -> str | None:
+    """Their days at a glance for the talker (:func:`digest_view`), or ``None`` without memory or before a read lands.
+
+    Kept per memory for :data:`DIGEST_TTL_S`; older, a fresh one is read on its own thread (one at a time) and the
+    caller waits for it at most ``wait_s`` (at most :data:`DIGEST_STALE_WAIT_S` when a kept one up to
+    :data:`DIGEST_MAX_AGE_S` old can stand in; a woken conversation's first call waits only ~0.4 s for this whole
+    block), then gets the freshest it has. ``wait_s=0`` only starts the read. A clock given in ``now`` (a replay)
+    reads at that time, never kept. Never raises; logs nothing (the caller logs the block's size)."""
+    if not callable(getattr(memory, "call", None)):
+        return None
+    if now is not None:
+        try:
+            return _read_digest(memory, float(now), max(0.05, float(wait_s)))
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        with _digest_lock:
+            entry = _digests.setdefault(memory, {"at": 0.0, "text": None, "running": None})
+    except TypeError:   # a memory stand-in that takes no weak reference: read now, uncached
+        if float(wait_s) <= 0:
+            return None
+        try:
+            return _read_digest(memory, None, max(0.05, float(wait_s)))
+        except Exception:  # noqa: BLE001
+            return None
+    age = time.time() - float(entry["at"] or 0.0)
+    if entry["at"] and age <= DIGEST_TTL_S:
+        return entry["text"]
+    kept = bool(entry["at"]) and age <= DIGEST_MAX_AGE_S
+    with _digest_lock:
+        running = entry["running"]
+        if running is None:
+            running = entry["running"] = threading.Event()
+
+            def work(done: threading.Event = running) -> None:
+                try:
+                    text = _read_digest(memory, None, DIGEST_READ_S)
+                    with _digest_lock:
+                        entry["at"], entry["text"] = time.time(), text
+                except Exception:  # noqa: BLE001 - the kept one stays
+                    pass
+                finally:
+                    with _digest_lock:
+                        entry["running"] = None
+                    done.set()
+
+            threading.Thread(target=work, name="yuki-voice-digest", daemon=True).start()
+    # the read running now, for at most the caller's bound (shorter when a kept one can stand in); then the freshest
+    running.wait(max(0.0, min(float(wait_s), DIGEST_STALE_WAIT_S) if kept else float(wait_s)))
+    with _digest_lock:
+        at, text = entry["at"], entry["text"]
+    if at and time.time() - float(at) <= DIGEST_MAX_AGE_S:
+        return text
+    return None
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -525,8 +849,38 @@ class QuickMemory:
             return self._today(time.time() if now is None else float(now))
         if action == "search":
             return self._search(str(args.get("query") or "").strip())
+        if action == "day":
+            return self._day(args, time.time() if now is None else float(now))
         return ({"failed": f"no such action {action!r}", "how_to_handle_it": "Call it again with one of its actions."},
                 {"ok": False})
+
+    def _day(self, args: dict[str, Any], now: float) -> tuple[dict[str, Any], dict[str, Any]]:
+        """lThink: one day (or part of it) as memory measured it (:func:`yuki.memory.talker_digest.day_report`)."""
+        day = " ".join(str(args.get("day") or "").split())[:10]
+        part = " ".join(str(args.get("part") or "").split()).casefold() or None
+        if part not in (None, *(p[0] for p in DAY_PARTS)):
+            part = None   # a part it does not know: the whole day
+        try:
+            datetime.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            return ({"failed": "no day given as YYYY-MM-DD",
+                     "how_to_handle_it": "Call it again with day as YYYY-MM-DD (the Now line has today's date)."},
+                    {"ok": False})
+        call = getattr(self.memory, "call", None)
+        try:
+            from yuki.memory.talker_digest import day_report
+
+            report = call("day look", lambda c: day_report(c, day, part, now=now), timeout_s=QUICK_TIMEOUT_S) \
+                if callable(call) else None
+        except Exception as exc:  # noqa: BLE001
+            return ({"failed": f"that day could not be read ({type(exc).__name__})",
+                     "how_to_handle_it": NOTHING_NOTE.format(where="memory")}, {"ok": False})
+        where = f"memory for {day}" + (f" {part}" if part else "")
+        text = day_text(report) if isinstance(report, dict) and report.get("found") else ""
+        if not text:
+            return {"found": "", "how_to_handle_it": NOTHING_NOTE.format(where=where)}, {"ok": True, "items": 0}
+        items = sum(len(p.get("episodes") or []) for p in report.get("parts") or []) + len(report.get("people") or [])
+        return ({"found": text, "how_to_handle_it": DAY_NOTE.format(where=where)}, {"ok": True, "items": items})
 
     def _todos(self) -> tuple[dict[str, Any], dict[str, Any]]:
         try:
@@ -644,5 +998,6 @@ class QuickMemory:
                 {"ok": True, "items": len(lines)})
 
 
-__all__ = ["QUICK_MEMORY", "QuickMemory", "RECENT_LABEL", "fetch_recent", "natural_when", "recent_view",
+__all__ = ["DIGEST_LABEL", "QUICK_MEMORY", "QuickMemory", "RECENT_LABEL", "day_text", "digest_view", "fetch_digest",
+           "fetch_recent", "natural_when", "recent_view",
            "todo_report"]

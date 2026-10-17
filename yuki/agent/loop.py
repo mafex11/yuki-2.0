@@ -513,6 +513,25 @@ class RequestPack:
         return time.monotonic() - self.built_at
 
 
+#: lThink: guards the request numbers whose skill runs a second check found not done (``Agent._skill_log``, written
+#: from the skill engine's recheck threads, read on the loop's).
+_SKILL_FALSE_LOCK = threading.Lock()
+
+
+def _voice_note(text: str) -> bool:
+    """lThink: whether a text added to a running request is Yuki's voice's own note about it (the references the
+    conversation resolved, the app they named, that it is to be kept: ``yuki.voice.bridge`` ``_adopt``), by the note's
+    fixed label (``yuki.agent.frame.VOICE_NOTE_LABEL``, our own words, never the user's), not the user's words."""
+    return str(text or "").lstrip().startswith(task_frame.VOICE_NOTE_LABEL)
+
+
+def _steers_by(blocks: list[dict[str, Any]]) -> str:
+    """lThink: who added the steering blocks (:meth:`Agent._steer_blocks`), for the line that holds a closing message:
+    Yuki's voice when every one is its own note (:func:`_voice_note`), else the user."""
+    texts = [str(b.get("text") or "") for b in blocks or [] if isinstance(b, dict)]
+    return "Yuki's voice" if texts and all(_voice_note(t) for t in texts) else "the user"
+
+
 class Agent:
     """Yuki's brain: drives the model, runs tools, and talks to the caller.
 
@@ -635,6 +654,10 @@ class Agent:
         #: Corrections and additions the user made while a request runs
         #: (:meth:`steer`), drained at the next step boundary.
         self._steers: queue.SimpleQueue[str] = queue.SimpleQueue()
+        #: lThink: how many of the inbox's texts are the user's own words (Yuki's voice's notes are not), so only their
+        #: words stop a read (:meth:`_race`); counted under this lock with the inbox.
+        self._steer_lock = threading.Lock()
+        self._user_steers = 0
         #: appPT: the send countdown (``SendPending``): seconds to stop or swap a plain send before it goes; 0 (the
         #: default: the CLI, evals, tests) never waits. The desktop runtime turns it on (yuki.ui.runtime).
         self.send_countdown_s = 0.0
@@ -1033,10 +1056,25 @@ class Agent:
         as the user's words. A request about to finish takes one more step
         when the inbox is not empty, so a correction made during the last model
         call is not dropped. Logged as ``steer``.
+
+        lThink: a note from Yuki's voice (its fixed label, :func:`_voice_note`)
+        rides the same inbox but is context, not the user's words: it is shown
+        under its own label, the judge reads it as Yuki's reading, and it never
+        stops a read that is running (:meth:`_race`).
         """
         text = (text or "").strip()
         if text:
-            self._steers.put(text)
+            with self._steer_guard():
+                self._steers.put(text)
+                if not _voice_note(text):
+                    self._user_steers = getattr(self, "_user_steers", 0) + 1
+
+    def _steer_guard(self) -> Any:
+        """The inbox's lock (made on first use for an agent built without ``__init__``, a stand-in)."""
+        lock = getattr(self, "_steer_lock", None)
+        if lock is None:
+            lock = self.__dict__.setdefault("_steer_lock", threading.Lock())
+        return lock
 
     def set_app_named(self, app: str | None) -> None:
         """V4: the app or route the user named for the request running now (a voice hand-off whose thinker started
@@ -1047,25 +1085,31 @@ class Agent:
     def take_steers(self) -> list[str]:
         """Everything in the steering inbox, emptying it (what arrived too late for a request)."""
         out: list[str] = []
-        while True:
-            try:
-                out.append(self._steers.get_nowait())
-            except queue.Empty:
-                return out
+        with self._steer_guard():
+            while True:
+                try:
+                    out.append(self._steers.get_nowait())
+                except queue.Empty:
+                    self._user_steers = 0
+                    return out
 
     def _steer_blocks(self) -> list[dict[str, Any]]:
         """The inbox as text blocks for the next message (empty when nothing arrived)."""
         texts = self.take_steers()
         if not texts:
             return []
-        self.logger.log("steer", texts=texts, count=len(texts))
+        notes = sum(1 for text in texts if _voice_note(text))
+        self.logger.log("steer", texts=texts, count=len(texts), **({"notes": notes} if notes else {}))
         if isinstance(getattr(self, "_steer_texts", None), list):
             self._steer_texts.extend(texts)   # the user's own words mid-run: a post-mortem's evidence
         for text in texts:
-            self._note_words(text, how="added")   # and the authorization judge's
-        blocks = [{"type": "text", "text": f"{STEER_LABEL}: {text}"} for text in texts]
+            # and the authorization judge's; lThink: Yuki's voice's own note (the references it resolved, the app they
+            # named) is context, Yuki's reading, never the user's words (the judge's own label for it)
+            self._note_words(text, how="reading" if _voice_note(text) else "added")
+        # lThink: a voice note carries its own label ("From Yuki's voice ..."), never "the user added"
+        blocks = [{"type": "text", "text": text if _voice_note(text) else f"{STEER_LABEL}: {text}"} for text in texts]
         left = self._tasks_left()
-        if left:
+        if left and notes < len(texts):
             # N10 (report 47): what they add mid-run never drops the rest of their list silently
             blocks.append({"type": "text", "text": (
                 f"{CHECK_LABEL}: your list still has, in order: {'; '.join(left)}. What they just added comes first "
@@ -1448,6 +1492,9 @@ class Agent:
         self._skill_bounces = 0
         self._skill_unconfirmed = False
         self._skill_sent_unconfirmed = False
+        #: lThink: whether this request's skill runs found not done by their own second check (noted from the recheck's
+        #: thread under the request's number, :meth:`_skill_log`) were applied on the loop's (:meth:`_skill_recheck_applied`).
+        self._skill_recheck_done = False
         self._requests += 1
         # phase S: this request's run_skill tool (its menu, refreshed when the registry changed) and what it needs
         self._skills_block = self._skills_tools()
@@ -2552,8 +2599,9 @@ class Agent:
                 if turn.finished and steers:
                     # The user added something before the closing message went
                     # out: it is not sent, and the model takes one more step.
+                    # lThink: a note from Yuki's voice alone is said as that, never as the user's words
                     steers.insert(0, {"type": "text", "text": (
-                        "Your done message was not sent: the user added this before it went "
+                        f"Your done message was not sent: {_steers_by(steers)} added this before it went "
                         "out. Take it into account, then finish with a new done."
                     )})
                     self.logger.log("steer", held_final=turn.finished[0])
@@ -2593,7 +2641,7 @@ class Agent:
                 # was being written, so it is not the last word yet.
                 self.logger.log("steer", held_final=text)
                 self.context.add_note(
-                    "Your reply above was not sent: the user added this before it went out. "
+                    f"Your reply above was not sent: {_steers_by(steers)} added this before it went out. "
                     "Take it into account, then finish with done.\n"
                     + "\n".join(block["text"] for block in steers)
                 )
@@ -2791,9 +2839,14 @@ class Agent:
             raw = [user_words] if isinstance(user_words, str) else list(user_words or [])
             words = [str(w.get("text") if isinstance(w, dict) else w) for w in raw]
             words = [w for w in words if w.strip()] or [split_envelope(request or "")[0]]
+            request_no = int(getattr(self, "_requests", 0) or 0)
+
+            def skill_log(event: str, **fields: Any) -> None:
+                self._skill_log(request_no, event, **fields)   # lThink: under this request's number
+
             self.dispatcher.skill_context = {
                 "memory": self.memory if self.memory.installed else None, "words": words,
-                "request_id": getattr(self.logger, "request_id", None), "log": self.logger.log,
+                "request_id": getattr(self.logger, "request_id", None), "log": skill_log,
                 "settings": self.settings}
         except Exception:  # noqa: BLE001 - run_skill then runs on the files alone
             pass
@@ -2851,6 +2904,7 @@ class Agent:
         trace and the closing message's unbacked claims, logged (counts and levels only) and carried on its ``Final``.
         Never raises: ``None`` when it cannot be made."""
         try:
+            self._skill_recheck_applied()
             by_action = bool(getattr(self, "_finished_by_action", False))
             verdict = finish_gate.outcome_verdict(getattr(self, "_trace", None) or [],
                                                   unbacked=list(getattr(self, "_unbacked", None) or [])
@@ -2868,8 +2922,59 @@ class Agent:
         self._last_verdict = verdict
         return verdict
 
+    def _skill_backs(self) -> None:
+        """lThink (live 17 Oct, problem 8): a ``run_skill`` whose own done-check saw the result ("Done and checked:
+        Mafex11.github.io is up") backs what the closing message says of the window it left in front: that window
+        counts as acted on with a verified result, as a verified click's does. Live, the claim check held that done as
+        "neither read nor acted on" (the skill's report names no window), which cost one more Sonnet call and then
+        "I tried, but I couldn't confirm it worked" after an open the skill had checked. Its second check (the recheck,
+        on its own thread) saying "not done" withdraws this (:meth:`_skill_recheck_applied`). Logged without words."""
+        if self._skill_found_false():
+            return
+        try:
+            front = self.dispatcher.foreground_hwnd()
+        except Exception:  # noqa: BLE001 - no window known: nothing more is backed
+            front = None
+        if front:
+            self._evidence[int(front)] = "skill"
+            self.logger.log("skill_backed", hwnd=int(front))
+
+    def _skill_log(self, request_no: int, event: str, **fields: Any) -> None:
+        """lThink: the skill engine's log for the thinker's ``run_skill`` (``skill_context["log"]``, made per request
+        with its number), passed through to this agent's log; a second check that disagrees (``done_recheck``
+        ``false_done``, the engine's own code word, from its recheck thread, maybe after the request ended) is noted
+        under that request's number, for the loop to apply on its own thread while that request runs."""
+        if event == "done_recheck" and fields.get("result") == "false_done":
+            with _SKILL_FALSE_LOCK:
+                found = self.__dict__.setdefault("_skill_false_requests", set())
+                found.add(int(request_no))
+                for old in [n for n in found if n < int(request_no) - 8]:
+                    found.discard(old)   # only the last few requests' are ever asked about
+        self.logger.log(event, **fields)
+
+    def _skill_found_false(self) -> bool:
+        """lThink: whether a skill run of the request running now was found not done by its own second check."""
+        with _SKILL_FALSE_LOCK:
+            return int(getattr(self, "_requests", 0) or 0) in (getattr(self, "_skill_false_requests", None) or ())
+
+    def _skill_recheck_applied(self) -> None:
+        """lThink: once the skill's second check said its done was false, nothing of this request rests on its skill
+        runs any more (the log names no skill, so every one of them): the windows they backed lose that evidence, and
+        their verified steps in the run trace become "not confirmed" (a later step can still put them right). On the
+        loop's own thread, once per request."""
+        if getattr(self, "_skill_recheck_done", False) or not self._skill_found_false():
+            return
+        self._skill_recheck_done = True
+        for hwnd in [h for h, how in self._evidence.items() if how == "skill"]:
+            self._evidence.pop(hwnd, None)
+        for step in getattr(self, "_trace", None) or []:
+            if isinstance(step, dict) and step.get("tool") == "run_skill" and step.get("verdict") is True:
+                step["verdict"], step["why"], step["expected"] = None, finish_gate.SKILL_RECHECK_WHY, False
+        self.logger.log("skill_recheck_applied")
+
     def _claim_gaps(self, turn: _Turn) -> list[str]:
         """What this response's ``done`` asserts without evidence from this request's calls, in words for the brain."""
+        self._skill_recheck_applied()
         gaps = [f"{tool}'s report does not show that it took effect ({why})"
                 for tool, verified, why in turn.verdicts if verified is not True and not finish_gate.is_expected(why)]
         gaps += [f"it says how window {hwnd} is now, but this request has neither read it nor acted on it with a "
@@ -3613,6 +3718,8 @@ class Agent:
                     self._evidence[target_hwnd] = "verified"
                 else:
                     self._evidence.pop(target_hwnd, None)
+            elif name == "run_skill" and verdict[0] is True:
+                self._skill_backs()
             elif name in ("run_powershell", "hotkey", "press"):
                 self._evidence.clear()   # aimed at no window it names: any window may have changed
             self.logger.log("action_verdict", tool=name, verified=verdict[0], why=verdict[1], target=target_hwnd,
@@ -3791,8 +3898,8 @@ class Agent:
                            payload={"abandoned": why}, elapsed_ms=elapsed)
 
     def _race(self, name: str, run: Any) -> tuple[Any, str | None]:
-        """``(run()'s value, None)``, or ``(None, why)`` when a cancel or the user's words came first (then ``run``
-        goes on unwatched: only ever a read). Logged ``read_abandoned``."""
+        """``(run()'s value, None)``, or ``(None, why)`` when a cancel or the user's own words came first (then ``run``
+        goes on unwatched: only ever a read; a note from Yuki's voice never stops it). Logged ``read_abandoned``."""
         done = threading.Event()
         box: dict[str, Any] = {}
 
@@ -3807,8 +3914,11 @@ class Agent:
         started = time.perf_counter()
         threading.Thread(target=work, name=f"yuki-read-{name}", daemon=True).start()
         while not done.wait(self.ABORT_POLL_S):
+            # lThink (live 17 Oct, problem 8): only the user's own words stop a read; Yuki's voice's note (the
+            # talker's adoption of a router-started job) is context for the next call, and stopping the read for it
+            # cost a model call to read memory again
             why = ("the user stopped the request" if self._cancelled.is_set() else
-                   "the user said something more" if not self._steers.empty() else None)
+                   "the user said something more" if getattr(self, "_user_steers", 0) > 0 else None)
             if why is not None:
                 self.logger.log("read_abandoned", tool=name, why=why,
                                 after_ms=round((time.perf_counter() - started) * 1000))
