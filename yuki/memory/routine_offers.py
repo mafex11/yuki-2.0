@@ -1206,8 +1206,11 @@ def first_onset(store: Any, skill: Any, since: float, until: float, *, include_r
             ran = habit_run_done(store, skill, since, until, entity=entity)
         else:
             try:
+                from yuki.memory.testtag import sql_real_skill_run
+
+                # lBrain: a live test's run never counts as the habit done
                 rows = store._query("SELECT min(coalesce(t_done, t0)) FROM skill_runs WHERE skill=? AND t0 >= ? AND"
-                                    " t0 <= ? AND outcome IN ('done', 'already')",
+                                    " t0 <= ? AND outcome IN ('done', 'already') AND " + sql_real_skill_run(),
                                     (skill.key, float(since), float(until) + 1.0))
                 ran = rows[0][0] if rows else None
             except sqlite3.Error:

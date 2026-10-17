@@ -183,7 +183,11 @@ def statements(store: Any) -> list[Any]:
     """The user's kept statements: active conversation facts of :data:`KINDS` with a quote of their own words, newest
     first, within :data:`MAX_FACTS` and :data:`MAX_CHARS` (quote and line as they will be sent)."""
     try:
-        facts = store.conversation_facts(kinds=list(KINDS), statuses=("active",))
+        from yuki.memory import testtag
+
+        tests = testtag.test_turn_ids(store)   # lBrain: a live test's scripted words are never the user's statements
+        facts = [f for f in store.conversation_facts(kinds=list(KINDS), statuses=("active",))
+                 if not testtag.is_test_fact(f, tests)]
     except Exception:  # noqa: BLE001 - a database without conversation memory: nothing was said
         return []
     picked: list[Any] = []

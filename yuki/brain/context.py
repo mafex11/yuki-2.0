@@ -6,7 +6,7 @@
     system [core prompt]  <- bp 1   [profile + standing rules]  <- bp 2   [menu]  <- bp 3
     user   [last two requests: their words + Yuki's final answer] [channel] [their exact words]
            [context: card / coach text, labelled, not quotable] [time] [you right now] [people named]
-           [overview] [plan seed]                                                            <- bp 4
+           [their places] [overview] [plan seed]                                             <- bp 4
     assistant [thinking + plan]   user [step statuses + screen diff (+ the window's view on a mismatch)]  ...
 
 * **Append-only.** :class:`Conversation` keeps one request's messages; it appends, never edits or deletes an earlier
@@ -20,6 +20,10 @@
   (``format_now``), as before. It is text for the planner only; the consent rule reads its facts itself.
 * **People named** in the user's words: memory's people index (``frame_facts`` names them, ``contact`` gives routes
   and the user's own last messages, dated), so the planner can ask about a reworded repeat (M12).
+* **Their places** (lBrain, live problem 11): the pages they watch on each site and the voice channels they joined,
+  from memory's tastes and capture threads (:func:`read_places`), with the rule that a channel they name is a place to
+  watch first and a join goes only to a channel memory has seen; the plan validator checks a join against the same
+  read (:func:`channel_known`).
 * Window text, the Now picture and memory captures are fenced as untrusted data.
 
 Everything here is gathered by code from data; nothing reads the words for meaning.
@@ -149,6 +153,8 @@ class Gathered:
         payload: The overview as data (the executor's window facts).
         you: The "you right now" text (``render(you, "thinker")``, or the Now board as a stand-in).
         people: People named and their last messages.
+        places: The user's places from memory (:func:`read_places`: the pages they watch, the voice channels they
+            joined), with the rule for a channel they name.
         profile: Breakpoint 2's text; ``menu``: breakpoint 3's; ``skill_keys``: the live catalog's ids.
         parts_ms: How long each part took (content-free, for the log).
     """
@@ -158,6 +164,7 @@ class Gathered:
     payload: Any = None
     you: str = ""
     people: str = ""
+    places: str = ""
     profile: str = ""
     menu: str = ""
     menu_lines: str = ""
@@ -295,6 +302,200 @@ def read_people(memory: Any, words: str, *, limit: int, nonce: str) -> str:
     return clip(text, limit)
 
 
+#: lBrain (live test 17 Oct, problem 11: "open NDLS channel" was planned as a Discord voice join; NDL is the user's most
+#: watched YouTube channel): the request turn's places block. Code's words; the names after it are fenced (they are
+#: page titles and chat names: outside text).
+PLACES_LABEL = ("[Their places, from memory: the pages they watch most on each site, and voice channels they joined. "
+                "A channel or page they name is a place to watch first: open its page when it is one of these or "
+                "sounds like one. Join a voice channel only when their words plainly ask to join one; code itself "
+                "refuses a channel memory has never seen]")
+#: Names per site page kind in the block, the block's room (label and fence included: measured 17 Oct on the user's
+#: copy, one site kind with 6 names, 825 characters, about 200 tokens), how long its read may take, and how long the
+#: read stays good for the join check (:func:`channel_known`).
+PLACE_NAMES = 6
+#: How many noted voice channels the join check reads per app (``yuki.skills.chat.channel_known`` reads as many).
+VOICE_CHECK_NAMES = 50
+PLACES_CHARS = 900
+PLACES_WAIT_S = 0.8
+PLACES_FRESH_S = 900.0
+
+
+@dataclass(frozen=True)
+class Places:
+    """What memory knows of the user's places (RAM only, never logged).
+
+    ``text``: the request turn's block (:data:`PLACES_LABEL`, then the names fenced); ``""`` when memory knows none.
+    ``voice``: per app of a capability that joins a call (the catalog's ``end = "call_join"``), what memory has seen of
+    that app's voice channels: the channels a join was noted for (tastes ``<app>_voice``), and the app's capture
+    threads' chat headers (with a voice-channel label in the app's data, ``[chat.labels.<lang>] voice_channel``, only
+    the headers that start with it; without one, every title and header, lMsg's ``chat.channel_known`` rule).
+    ``at``: when it was read (``time.monotonic``)."""
+
+    text: str = ""
+    voice: Mapping[str, tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]] = field(default_factory=dict)
+    at: float = field(default_factory=time.monotonic)
+
+
+#: The newest :class:`Places` read (user-level data, the same for every request and lane): the plan validator's join
+#: check reads it (:func:`channel_known`), since a plan is validated as it streams, with no memory call of its own.
+_places_lock = threading.Lock()
+_places: Places | None = None
+
+
+def _voice_label_words(data: Mapping[str, Any]) -> list[list[str]]:
+    """The app's own words for a voice channel's header (``[chat.labels.<lang>] voice_channel``), as word lists."""
+    from yuki.memory.contacts import tokens
+
+    out: list[list[str]] = []
+    labels = data.get("labels") if isinstance(data.get("labels"), Mapping) else {}
+    for lang in labels.values():
+        value = lang.get("voice_channel") if isinstance(lang, Mapping) else None
+        for label in [value] if isinstance(value, str) else list(value or []):
+            words = tokens(str(label or ""))
+            if words and words not in out:
+                out.append(words)
+    return out
+
+
+def _joining_apps() -> list[str]:
+    """The apps of the capabilities that join a call (catalog data: ``end = "call_join"``), sorted."""
+    loaded = load_catalog()
+    apps = {str(getattr(s, "app", "") or "") for s in getattr(loaded, "skills", ()) or ()
+            if str(getattr(s, "end", "") or "") == "call_join"}
+    return sorted(a for a in apps if a)
+
+
+def _voice_seen(store: Any, app: str) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    """``(the voice channel names to show, the word lists a channel's name is checked against)`` for one app: the
+    channels a join was noted for (tastes ``<app>_voice``), and its capture threads' headers and titles
+    (:class:`Places`). Decrypted in RAM only. Raises when memory's threads can't be read (the caller: unknown)."""
+    from yuki.memory.contacts import tokens
+    from yuki.skills.chat import app_data
+    from yuki.memory.store import app_key
+
+    data = app_data(app)
+    keys = sorted({app_key(str(p)) or "" for p in data.get("processes") or []} - {""})
+    labels = _voice_label_words(data)
+    shown: list[str] = []
+    texts: list[tuple[str, ...]] = []
+    try:
+        from yuki.skills import taste
+
+        # every channel a join was noted for counts for the check (lMsg's rung check reads as many); the block
+        # shows the most joined few
+        for name in taste.candidates(store, f"{app}_voice", limit=VOICE_CHECK_NAMES, by="n_obs")[:VOICE_CHECK_NAMES]:
+            if str(name or "").strip():
+                if len(shown) < PLACE_NAMES:
+                    shown.append(one_line(name, 40))
+                texts.append(tuple(tokens(str(name))))
+    except Exception:  # noqa: BLE001 - no tastes: the threads still say
+        pass
+    if keys:
+        marks = ",".join("?" * len(keys))
+        rows = store._query(f"SELECT title_ciphertext, scope_ciphertext FROM threads WHERE process IN ({marks})"
+                            " AND merged_into IS NULL", keys)
+        for title_ct, scope_ct in rows:
+            for blob, is_scope in ((scope_ct, True), (title_ct, False)):
+                if not blob or (labels and not is_scope):
+                    continue
+                try:
+                    words = tokens(str(store._dec(blob) or ""))
+                except Exception:  # noqa: BLE001 - a row the key can't read
+                    continue
+                if not words:
+                    continue
+                if labels:
+                    lab = next((lb for lb in labels if words[:len(lb)] == lb), None)
+                    if lab is None:
+                        continue
+                    rest = tuple(words[len(lab):])
+                    if rest:
+                        texts.append(rest)
+                        name = " ".join(rest)
+                        if len(shown) < PLACE_NAMES and name not in shown:
+                            shown.append(one_line(name, 40))
+                else:
+                    texts.append(tuple(words))
+    return tuple(shown), tuple(dict.fromkeys(texts))
+
+
+def read_places(memory: Any, *, limit: int = PLACES_CHARS, nonce: str = "") -> Places | None:
+    """The user's places from memory (lBrain, live problem 11), for the request turn and the join check: per site page
+    kind (``taste.site_kinds``: the site files' speakable page templates, a YouTube channel's handle page among them)
+    the names they watch most (tastes, most seen first), and per app that joins calls what memory has seen of its
+    voice channels (:func:`_voice_seen`). Data only, never a reading of their words. ``None`` when memory can't say
+    (then nothing is refused for it). Kept for :func:`channel_known`. Never raises."""
+    global _places
+    if memory is None or not getattr(memory, "installed", False):
+        return None
+    call = getattr(memory, "call", None)
+    if not callable(call):
+        return None
+    apps = _joining_apps()
+
+    def go(client: Any) -> tuple[list[tuple[str, str, list[str]]], dict[str, Any]]:
+        store = getattr(client, "store", client)
+        pages: list[tuple[str, str, list[str]]] = []
+        try:
+            from yuki.skills import taste
+
+            for kind, site, page, _var in taste.site_kinds():
+                names = [one_line(n, 40) for n in taste.candidates(store, kind, limit=PLACE_NAMES, by="n_obs")
+                         if str(n or "").strip()][:PLACE_NAMES]
+                if names:
+                    pages.append((site, page, names))
+        except Exception:  # noqa: BLE001 - no pages: the voice channels still say
+            pages = []
+        voice: dict[str, Any] = {}
+        for app in apps:
+            try:
+                voice[app] = _voice_seen(store, app)
+            except Exception:  # noqa: BLE001 - this app's channels unknown: its joins are judged as before
+                continue
+        return pages, voice
+
+    try:
+        pages, voice = call("brain_places", go, timeout_s=PLACES_WAIT_S)
+    except Exception:  # noqa: BLE001
+        return None
+    lines = [f"- {site} {page} pages: {', '.join(names)}" for site, page, names in pages]
+    for app, (shown, _texts) in voice.items():
+        if shown:
+            lines.append(f"- {app} voice channels they joined: {', '.join(shown)}")
+    text = ""
+    if lines:
+        source, tag = "the names of their places in memory (page titles, chat names)", nonce or "places"
+        room = max(120, int(limit) - len(PLACES_LABEL) - len(fence("x", source=source, nonce=tag)))
+        text = PLACES_LABEL + "\n" + fence(clip("\n".join(lines), room), source=source, nonce=tag)
+    got = Places(text=text, voice=dict(voice))
+    with _places_lock:
+        _places = got
+    return got
+
+
+def channel_known(name: Any, app: str | None = None, *, now: float | None = None) -> bool | None:
+    """Whether memory has seen a voice channel by ``name`` (the plan's words for it) in ``app`` (``None``: any app
+    that joins calls): its words stand whole and in order in one of the names :func:`read_places` kept (a channel a
+    join was noted for, a capture thread's header or title: lMsg's ``chat.channel_known`` rule on the same data).
+    ``None`` when it can't be said (no read yet, the read is older than :data:`PLACES_FRESH_S`, or that app's channels
+    couldn't be read): the join is then judged as before. Identity of the words in memory's own data; never raises."""
+    from yuki.memory.contacts import span_in, tokens
+
+    with _places_lock:
+        got = _places
+    clock = time.monotonic() if now is None else float(now)
+    if got is None or clock - got.at > PLACES_FRESH_S:
+        return None
+    want = tokens(str(name or ""))
+    if not want:
+        return None
+    apps = [app] if app else list(got.voice)
+    seen = [got.voice[a] for a in apps if a in got.voice]
+    if not seen:
+        return None
+    return any(span_in(want, list(words)) for _shown, texts in seen for words in texts)
+
+
 def read_profile(memory: Any, names: Sequence[str], *, limit: int) -> str:
     """Breakpoint 2: the user's names, the brief's thinker slice (``brief_for("thinker")``) and the standing rules and
     preferences (``standing_parts``, fetched fresh: a rule saved a moment ago must show). Never raises."""
@@ -400,10 +601,11 @@ def gather(*, dispatcher: Any, memory: Any, settings: Any, words: str, names: Se
     if not keep_rest:
         jobs["you"] = lambda: read_you(dispatcher, limit=limits.you_chars)
         jobs["people"] = lambda: read_people(memory, words, limit=limits.people_chars, nonce=nonce)
+        jobs["places"] = lambda: read_places(memory, limit=PLACES_CHARS, nonce=nonce)
         jobs["profile"] = lambda: read_profile(memory, names, limit=limits.profile_chars)
         jobs["menu"] = lambda: read_menu(memory, settings, limit=limits.menu_chars)
     waits = {"overview": OVERVIEW_WAIT_S, "you": YOU_WAIT_S + 0.2, "people": PEOPLE_WAIT_S + 0.2,
-             "profile": PROFILE_WAIT_S * 2 + 0.2, "menu": MENU_WAIT_S + 0.5}
+             "places": PLACES_WAIT_S + 0.2, "profile": PROFILE_WAIT_S * 2 + 0.2, "menu": MENU_WAIT_S + 0.5}
     results: dict[str, Any] = {}
     if jobs:
         pool = ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="yuki-brain-read")
@@ -423,12 +625,14 @@ def gather(*, dispatcher: Any, memory: Any, settings: Any, words: str, names: Se
         out.overview, out.payload = results["overview"]
         out.overview_at = time.monotonic()
     if keep_rest and reuse is not None:
-        out.you, out.people, out.profile = reuse.you, reuse.people, reuse.profile
+        out.you, out.people, out.profile, out.places = reuse.you, reuse.people, reuse.profile, reuse.places
         out.menu, out.menu_lines, out.skill_keys = reuse.menu, reuse.menu_lines, reuse.skill_keys
     else:
         you = results.get("you")
         out.you = YOU_UNKNOWN if you is None else str(you)   # missed its wait: fails closed
         out.people = str(results.get("people") or "")
+        places = results.get("places")
+        out.places = places.text if isinstance(places, Places) else ""
         out.profile = str(results.get("profile") or "") or profile_text(names=names, brief=None, rules=None,
                                                                         limit=limits.profile_chars)
         menu = results.get("menu")
@@ -664,6 +868,8 @@ def request_turn(*, words: Sequence[str], channel: str, context: str, gathered: 
                                                                     "going on now)", nonce=nonce))
     if gathered.people:
         texts.append(gathered.people)
+    if gathered.places:
+        texts.append(gathered.places)
     if gathered.overview:
         texts.append(fence(gathered.overview, source="the window list and what the windows show", nonce=nonce))
     else:
@@ -985,7 +1191,8 @@ def answer_report(question: str, answer: str | None) -> str:
     return f"{CHECK_LABEL} You asked: {question}\n{ANSWER_LABEL}: {answer}"
 
 
-__all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "read_profile", "read_menu",
+__all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "read_places", "Places", "channel_known",
+           "PLACES_LABEL", "read_profile", "read_menu",
            "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "seed_memory", "seed_memory_text",
            "request_turn", "Conversation",
            "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report",

@@ -12,7 +12,8 @@ capabilities (:mod:`yuki.skills.connection`); the tables of migration 41 hold wh
   of that app and kind inside ``[t0, t_done + lag]`` are Yuki's), and finished with the done-check's verdict:
   ``checked`` 1 (seen), 0 (contradicted), NULL (couldn't read); ``recheck`` 0 marks a false done (D19).
 
-Trust is computed from the ledger, never stored (:func:`trust`):
+Trust is computed from the ledger, never stored (:func:`trust`); a live test harness's runs are never part of it
+(lBrain, :mod:`yuki.memory.testtag`):
 
 * rung A is usable at once; rung B after one verified run (its own or imported evidence); rung C always (it is the
   thinker, gated by the engine);
@@ -406,13 +407,16 @@ def trust(store: Any, skill_key: str, *, now: float | None = None, until: float 
                                 hash_changed_at=float(changed_at) if changed_at is not None else None)
         hi = float(until) if until is not None else now + 1.0
         lo = now - TRUST_DAYS * 86400.0
+        # lBrain (live test 17 Oct): a live test harness's runs never count for or against a rung (yuki.memory.testtag)
+        from yuki.memory.testtag import sql_real_route_try, sql_real_skill_run
+
         rows = store._query(
             "SELECT rung, variant, via, checked, recheck, t, ms FROM ("
             "SELECT rung, variant, via, checked, recheck, coalesce(t_done, t0) AS t, ms, id FROM skill_runs "
             "WHERE skill = ? AND rung IS NOT NULL AND t0 >= ? AND t0 < ? AND outcome NOT IN ('running', 'held_game', "
-            "'asked', 'refused', 'cancelled', 'other_device') "
+            "'asked', 'refused', 'cancelled', 'other_device') AND " + sql_real_skill_run() + " "
             "UNION ALL SELECT rung, variant, via, checked, NULL, at, ms, id FROM skill_route_tries "
-            "WHERE skill = ? AND at >= ? AND at < ?) ORDER BY t DESC, id DESC",
+            "WHERE skill = ? AND at >= ? AND at < ? AND " + sql_real_route_try() + ") ORDER BY t DESC, id DESC",
             (skill_key, lo, hi, skill_key, lo, hi))
     except Exception:  # noqa: BLE001 - no trust yet
         return out
@@ -482,10 +486,13 @@ def offer_ready(store: Any, skill: Skill | str, route: Route | str | None = None
 
 def _merged_last5(store: Any, key: str) -> list[int]:
     try:
+        from yuki.memory.testtag import sql_real_route_try, sql_real_skill_run
+
         rows = store._query(
             "SELECT checked, recheck FROM (SELECT checked, recheck, coalesce(t_done, t0) AS t, id FROM skill_runs "
-            "WHERE skill = ? AND checked IS NOT NULL AND rung IS NOT NULL UNION ALL SELECT checked, NULL, at, id FROM "
-            "skill_route_tries WHERE skill = ? AND checked IS NOT NULL) ORDER BY t DESC, id DESC LIMIT ?",
+            "WHERE skill = ? AND checked IS NOT NULL AND rung IS NOT NULL AND " + sql_real_skill_run()
+            + " UNION ALL SELECT checked, NULL, at, id FROM skill_route_tries WHERE skill = ? AND checked IS NOT NULL"
+            " AND " + sql_real_route_try() + ") ORDER BY t DESC, id DESC LIMIT ?",
             (key, key, CHANGE_WINDOW))
     except Exception:  # noqa: BLE001
         return []

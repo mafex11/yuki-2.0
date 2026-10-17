@@ -3,8 +3,10 @@
 ``check(step, plan, user_words, live, check_verdict) -> allow | ask | refuse | draft``, row by row, the first row that
 applies decides:
 
-1. **Game in front** (the Now board's ``game_front``, else the local foreground read, D9; unknown from both counts as a
-   game) and the step takes focus, sends input, restores, launches or opens a link: **refuse** ("after the round?").
+1. **Game in front** (the Now board's ``game_front``, else the local foreground read, D9; unknown when the step's facts
+   were read is read again from the game gate's own check, :func:`game_holds`, and counts as a game only when that
+   read fails too) and the step takes focus, sends input, restores, launches or opens a link: **refuse** ("after the
+   round?").
    The D17 backstop in ``yuki/actions`` still guards underneath. A ``run_skill`` is not refused here: the skill engine
    applies each rung's own game rule (a no-focus rung, the mixer or the media session, may run mid-game).
 2. The step's app has its "Act" switch off, or one of its kinds is "just suggest" (``util.PolicyReader``,
@@ -225,9 +227,10 @@ class Call:
 class Live:
     """Code facts at the moment a step runs.
 
-    ``game``: the game in front (``""`` none, its name, ``None`` unknown: counted as a game). ``calling``: the windows
-    the Now board lists in ``calling_tabs``. ``typed_pending``: windows holding text Yuki typed and has not sent (a
-    set of hwnds, or the executor's own map of hwnd to the text waiting there, which a question then shows).
+    ``game``: the game in front (``""`` none, its name, ``None`` unknown: row 1 reads the game gate again,
+    :func:`game_holds`). ``calling``: the windows the Now board lists in ``calling_tabs``. ``typed_pending``:
+    windows holding text Yuki typed and has not sent (a set of hwnds, or the executor's own map of hwnd to the text
+    waiting there, which a question then shows).
     ``reads``: what this request has read so far (``file``, ``clipboard``, ``memory``: M9). ``join_controls``: the
     (role, name) pairs capabilities declare as their join control, casefolded. ``recent``: the user's own last messages
     to the person the send names (``{"text", "at"}``). ``people_in(text)``: memory's people index, the names of each
@@ -1158,8 +1161,9 @@ def takes_screen(call: Call) -> bool:
 
 def game_now(board: Mapping[str, Any] | None = None) -> str | None:
     """D9: the game in front: the Now board's ``game_front`` when fresh (its name, or ``"game"``), else the local read
-    of the foreground program (``gamegate.game_in_front``). ``""``: none; ``None``: neither could tell (counts as a
-    game). Never raises."""
+    of the foreground program (``gamegate.game_in_front``). ``""``: none; ``None``: neither could tell (row 1 then
+    reads the game gate again at the step, :func:`game_holds`, and counts it as a game only if that fails too). Never
+    raises."""
     try:
         from yuki.memory.now import game_in_front as board_game
 
@@ -1264,9 +1268,26 @@ def screen_gate(step: Call, live: Live) -> Verdict | None:
     return _rows_1_2(step, live, step_traits(step, live))
 
 
+def game_holds(live: Live) -> bool:
+    """Row 1's game state for this step. ``live.game`` as read when the step's facts were gathered (:func:`game_now`:
+    the Now board when fresh, else the local foreground read); when that was unknown (``None``), the game gate's own
+    check of the program in front is read now, directly (``gamegate.game_in_front``: the foreground window's program
+    against the gate's machine facts, the registered board source included), so an unreadable board or a read that
+    failed a moment ago never counts as a game by itself (live test 17 Oct: "You're in a game: after the round?" with
+    no game running). Only when that read fails too is it a game (fail closed). Never raises."""
+    if live.game is not None:
+        return bool(live.game)
+    try:
+        from yuki.memory.gamegate import game_in_front
+
+        return bool(game_in_front())
+    except Exception:  # noqa: BLE001 - neither could tell: counted as a game
+        return True
+
+
 def _rows_1_2(step: Call, live: Live, traits: Traits) -> Verdict | None:
-    # row 1: a game in front
-    if takes_screen(step) and (live.game is None or live.game):
+    # row 1: a game in front (unknown: the game gate's own check decides, :func:`game_holds`)
+    if takes_screen(step) and game_holds(live):
         return Verdict(REFUSE, 1, "game", line=LINE_GAME, final=True)
 
     # row 2: the app's Act switch off, or a kind set to "just suggest"
@@ -1497,8 +1518,9 @@ def after_ask(verdict: Verdict) -> Verdict:
 __all__ = ["ALLOW", "ASK", "CHAT_KIND", "COMMITS", "DRAFT", "EFFECTS", "LINE_ASK_SEND", "LINE_DRAFTED", "LINE_GAME",
            "NAME_GAP", "PLAIN_WHY", "REFUSE", "RESULTS", "SAID_SHARE", "SAID_SPAN", "Call", "Live", "Verdict",
            "after_ask", "ask_send_question", "spoken_name", "calling_windows", "chat_window", "check", "draft_slots",
-           "failed_question", "field_of", "game_now", "in_words", "is_join_control", "join_controls", "may_commit",
-           "maybe_send_question", "near_duplicate", "person_slot", "plain_why", "plan_consent", "policy_holds",
+           "failed_question", "field_of", "game_holds", "game_now", "in_words", "is_join_control", "join_controls",
+           "may_commit", "maybe_send_question", "near_duplicate", "person_slot", "plain_why", "plan_consent",
+           "policy_holds",
            "quote_in_words", "quote_turns", "said_share", "screen_gate", "send_slots", "sends_now", "skill_commit",
            "skill_input", "skill_joins", "skill_sends", "step_traits", "takes_screen", "text_slot", "traits_of",
            "typed_address", "navigates", "waiting_text", "window_kind", "window_page"]

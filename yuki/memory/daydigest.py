@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Sequence
 
+from yuki.memory import testtag
 from yuki.memory.store import PortraitRunStats
 from yuki.memory.titles import SHOWN_RULES, clean_shown, natural_day, natural_time
 
@@ -150,11 +151,12 @@ def gather(store: Any, day: str) -> DayData:
     start, end = day_window(day)
     data = DayData(day)
     try:
-        data.summaries = store.session_summaries(since=start, until=end)[-MAX_SUMMARIES:]
+        # lBrain: a live test's sessions are never the user's day (yuki.memory.testtag)
+        data.summaries = testtag.keep_real(store.session_summaries(since=start, until=end))[-MAX_SUMMARIES:]
     except Exception:
         pass
     try:
-        data.exchanges = len(store.turn_times(start, end))
+        data.exchanges = sum(1 for _at, sid in store.turn_times(start, end) if not testtag.is_test_session(sid))
     except Exception:
         pass
     try:
@@ -169,10 +171,12 @@ def gather(store: Any, day: str) -> DayData:
     except Exception:
         pass
     try:
+        tests = testtag.test_turn_ids(store)
         data.made = [f for f in store.conversation_facts(("commitment",), statuses=None)
-                     if start <= f.valid_from < end][:MAX_COMMITMENTS]
+                     if start <= f.valid_from < end and not testtag.is_test_fact(f, tests)][:MAX_COMMITMENTS]
         data.done = [f for f in store.conversation_facts_ended(start, ("commitment",))
-                     if f.status == "done" and start <= float(f.valid_to or f.expired_at or 0.0) < end][:MAX_COMMITMENTS]
+                     if f.status == "done" and start <= float(f.valid_to or f.expired_at or 0.0) < end
+                     and not testtag.is_test_fact(f, tests)][:MAX_COMMITMENTS]
     except Exception:
         pass
     try:

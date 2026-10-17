@@ -30,6 +30,11 @@ Yuki writes every exchange with :meth:`yuki.memory.api.MemoryClient.log_turn`
   another session. Each ended run gets a 2-4 sentence summary (Haiku,
   ``save_session_summary``), embedded and stored with its span.
 
+**Live tests are not the user** (lBrain, 17 Oct): the live test harness's exchanges (session ids
+``livetest-...``, :mod:`yuki.memory.testtag`) are never extracted or summarised, and the rules,
+preferences, commitments and journal facts an earlier build drew from them are never shown as
+the user's current items; the rows stay (``python -m yuki.memory.testtag`` lists them).
+
 Exchanges are data, never instructions: they are fenced with per-request
 ``===BEGIN/END_UNTRUSTED_DATA_<uuid>===`` markers after scrubbing, as in
 :mod:`yuki.memory.journal`. Every model call is logged to
@@ -72,6 +77,7 @@ from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.journal import HAIKU_MODEL, _calendar, sanitize_untrusted, user_identity
 from yuki.memory.personality import NATURE_GUIDANCE, NATURES, nature_mark, normalize_nature
+from yuki.memory import testtag
 from yuki.memory.provenance import chat_source
 from yuki.memory.titles import KNOWHOW_SUMMARY_FIELD, KNOWHOW_TITLE_FIELD, TITLE_FIELD, clean as clean_label
 from yuki.memory.questions import (
@@ -1643,11 +1649,15 @@ class ConversationWorker:
                       skipped="said to someone else", cost_usd=0.0)
             return ExtractResult(batch_id, session_id, turn_ids, True, cost_usd=0.0)
         try:
-            current = self.store.conversation_facts(STANDING_KINDS)
-            ended = self.store.conversation_facts_ended(now - ENDED_DAYS * 86400.0, STANDING_KINDS)
+            # lBrain: what an earlier build drew from the live test's exchanges is never shown as the user's items
+            tests = testtag.test_turn_ids(self.store)
+            current = [f for f in self.store.conversation_facts(STANDING_KINDS) if not testtag.is_test_fact(f, tests)]
+            ended = [f for f in self.store.conversation_facts_ended(now - ENDED_DAYS * 86400.0, STANDING_KINDS)
+                     if not testtag.is_test_fact(f, tests)]
             context = [t for t in self.store.turns_for_session(session_id, before=turns[0].at, limit=CONTEXT_TURNS)
                        if t.id not in set(turn_ids)]
-            journal = self.store.journal_for_thread(self.store.conversation_thread_id(), limit=12)
+            journal = [j for j in self.store.journal_for_thread(self.store.conversation_thread_id(), limit=12)
+                       if not testtag.is_test_journal(j, tests)]
             cards = self.cards_for(turns)
             later = self.later_for(session_id, turns)
             user = self.build_extract_message(turns, current, ended, context, journal, now, cards=cards, later=later)
@@ -1902,8 +1912,9 @@ class ConversationWorker:
         the rest get one small Haiku call. One that was not said to Yuki (dictation into another program, talk
         to someone else) ends as a wrong capture. Logged; never raises. Returns what it decided."""
         try:
+            tests = testtag.test_turn_ids(self.store)
             todo = [f for f in self.store.conversation_facts(("commitment",))
-                    if f.owner is None and f.id not in self._owners_tried]
+                    if f.owner is None and f.id not in self._owners_tried and not testtag.is_test_fact(f, tests)]
         except Exception:
             return []
         if not todo:
@@ -1970,7 +1981,7 @@ class ConversationWorker:
         ``session_idle_s`` passed since its last exchange, or when a later
         exchange belongs to another session.
         """
-        turns = self.store.turns_unsummarized(self.max_attempts)
+        turns = testtag.keep_real(self.store.turns_unsummarized(self.max_attempts))   # lBrain: never a live test's
         if not turns:
             return []
         latest = self.store.latest_turn()
@@ -2155,7 +2166,7 @@ class ConversationWorker:
             result = PassResult()
             wall = time.time()
             if force or wall >= self._retry_at:
-                pending = self.store.turns_pending(self.max_attempts)
+                pending = testtag.keep_real(self.store.turns_pending(self.max_attempts))   # lBrain: never a live test's
                 if force or self.extraction_due(pending, wall):
                     for sid, turns in self.batches(pending):
                         hold = None if force else self.held_until(turns, pending)
@@ -2179,7 +2190,7 @@ class ConversationWorker:
         if now < self._retry_at:
             candidates.append(self._retry_at - now)
         else:
-            pending = self.store.turns_pending(self.max_attempts)
+            pending = testtag.keep_real(self.store.turns_pending(self.max_attempts))
             if pending:
                 due = now if len(pending) >= self.min_turns else min(t.created_at for t in pending) + self.max_wait_s
                 holds = [self.held_until(b, pending) for _sid, b in self.batches(pending)]
@@ -2188,7 +2199,7 @@ class ConversationWorker:
                 if due <= now:
                     return 0.0
                 candidates.append(due - now)
-            for t in self.store.turns_unsummarized(self.max_attempts)[-1:]:
+            for t in testtag.keep_real(self.store.turns_unsummarized(self.max_attempts))[-1:]:
                 candidates.append(t.at + self.session_idle_s - now)
         return max(1.0, min(candidates))
 

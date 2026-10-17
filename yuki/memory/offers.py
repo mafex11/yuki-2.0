@@ -535,12 +535,14 @@ def _pooled_last(store: Any, keys: tuple[str, ...], n: int) -> list[int]:
     """The newest ``n`` decided runs and rung tries of these ledger keys together, newest first (1 verified, 0 not):
     the registry's own "last 5" read, over two keys."""
     marks = ",".join("?" * len(keys))
+    from yuki.memory.testtag import sql_real_route_try, sql_real_skill_run
+
     try:
         rows = store._query(
             f"SELECT checked, recheck FROM (SELECT checked, recheck, coalesce(t_done, t0) AS t, id FROM skill_runs WHERE"
-            f" skill IN ({marks}) AND checked IS NOT NULL AND rung IS NOT NULL UNION ALL SELECT checked, NULL, at, id"
-            f" FROM skill_route_tries WHERE skill IN ({marks}) AND checked IS NOT NULL) ORDER BY t DESC, id DESC"
-            " LIMIT ?", (*keys, *keys, int(n)))
+            f" skill IN ({marks}) AND checked IS NOT NULL AND rung IS NOT NULL AND {sql_real_skill_run()} UNION ALL"
+            f" SELECT checked, NULL, at, id FROM skill_route_tries WHERE skill IN ({marks}) AND checked IS NOT NULL"
+            f" AND {sql_real_route_try()}) ORDER BY t DESC, id DESC LIMIT ?", (*keys, *keys, int(n)))
     except Exception:  # noqa: BLE001
         return []
     return [1 if int(c) == 1 and r != 0 else 0 for c, r in rows]
@@ -573,9 +575,11 @@ def _rung_b_verified(store: Any, keys: tuple[str, ...] | str) -> bool:
     keys = (keys,) if isinstance(keys, str) else tuple(keys)
     if not keys:
         return False
+    from yuki.memory.testtag import sql_real_skill_run
+
     try:
         rows = store._query(f"SELECT 1 FROM skill_runs WHERE skill IN ({','.join('?' * len(keys))}) AND rung = 'B' AND"
-                            " checked = 1 AND coalesce(recheck, 1) != 0 LIMIT 1", keys)
+                            f" checked = 1 AND coalesce(recheck, 1) != 0 AND {sql_real_skill_run()} LIMIT 1", keys)
     except Exception:  # noqa: BLE001
         return False
     return bool(rows)

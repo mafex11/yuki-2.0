@@ -714,6 +714,9 @@ class PersonalJudge:
     def items(self, now: float, limit: int = JUDGE_MAX_ITEMS) -> list[dict[str, Any]]:
         """The rows to judge with their text: cards and replies alternately, newest first, at most ``limit``."""
         rows = self.store.surfaced(now - JUDGE_WINDOW_S, now + 1.0, unjudged=True)
+        from yuki.memory import testtag
+
+        rows = testtag.keep_real(rows)   # lBrain: what a live test surfaced is never judged as the user's
         cards = [r for r in reversed(rows) if r["kind"] == "card"]
         replies = [r for r in reversed(rows) if r["kind"] == "reply"]
         picked: list[dict[str, Any]] = []

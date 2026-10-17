@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
 
+from yuki.memory import testtag
 from yuki.memory.journal import sanitize_untrusted
 from yuki.memory.store import PortraitRunStats
 
@@ -146,8 +147,10 @@ class PersonaWriter:
     def inputs(self, now: float) -> tuple[list[dict[str, Any]], list[Any], list[Any], list[Any]]:
         since = now - self.days * 86400.0
         items = self.store.persona_items()
-        turns = self.store.turns_between(since, now)[-MAX_TURNS:]
-        rules = self.store.conversation_facts(("rule", "preference"))
+        # lBrain: the live test harness's exchanges, and rules drawn from them, are never the user's reactions
+        turns = testtag.keep_real(self.store.turns_between(since, now))[-MAX_TURNS:]
+        tests = testtag.test_turn_ids(self.store)
+        rules = [r for r in self.store.conversation_facts(("rule", "preference")) if not testtag.is_test_fact(r, tests)]
         cards = [n for n in self.store.nudges(since, now) if n.shown_at or n.reaction or n.reply]
         return items, turns, rules, cards
 

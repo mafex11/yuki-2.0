@@ -33,6 +33,10 @@ time label counts for demand and means only (no steps, no time context); level m
 first read, never a read of music already playing when the timeline began, never the playlist that app's previous read
 showed less than :data:`RESUME_GAP_S` before this start: listening that goes on; review r2 M2).
 
+**Live tests are not the user** (lBrain, 17 Oct; :mod:`yuki.memory.testtag`): a live test harness's skill runs make
+no asked occasion, its requests are never the request before a user occasion, and its failed requests tag none; its
+acting steps and skill runs still exclude the ends they made (they are Yuki's).
+
 **Asked occasions** (design §4.8, D22): a request whose run reached a checked end with no correction within
 :data:`CORRECTION_S` (skill runs: ``checked = 1`` and the re-check never disagreed; older thinker runs: an acting step
 with ``verdict = 1`` of a verb in :data:`VERB_ENDS`, not followed by a ``user_corrected`` event on its run or by
@@ -57,6 +61,7 @@ from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
+from yuki.memory.testtag import sql_real_request as _real_request, sql_real_session as _real_session
 from yuki.skills.learn.group import step_token
 
 #: The end kinds (``yuki.skills.connection.SERVE_ENDS``).
@@ -489,9 +494,10 @@ class Builder:
         calls = Spans((float(a), float(b or c or self.until), None) for a, b, c in _q(
             self.store, "SELECT detected_at, ended_at, last_alive_at FROM calls WHERE kind = 'call' AND detected_at <= ?",
             (self.until,)))
+        # lBrain: a live test's request is never the request before one of the user's occasions
         turns = sorted((float(at), int(i)) for i, at in _q(
-            self.store, "SELECT id, at FROM conversation_turns WHERE at >= ? AND at <= ?",
-            (self.since - TURN_BEFORE_S, self.until)))
+            self.store, "SELECT id, at FROM conversation_turns WHERE at >= ? AND at <= ? AND "
+            + _real_session("session_id"), (self.since - TURN_BEFORE_S, self.until)))
         turn_at = [t for t, _i in turns]
         self._threads = {int(r[0]): (str(r[1] or "").casefold(), r[2]) for r in _q(
             self.store, "SELECT id, host, url_ciphertext FROM threads")}
@@ -760,8 +766,11 @@ class Builder:
                 self.counts["asked_corrected"] += 1
             out.append(o)
         # asked, then did it himself: a cancelled or failed request, then the user's own occasion in an app it acted
+        # lBrain: a live test's failed request never tags the user's own occasion after it (its acting steps still
+        # hold their ends: they are Yuki's, never the user's)
         heads = {str(r[0]): str(r[1] or "") for r in _q(self.store, "SELECT run_key, outcome FROM runs WHERE step = 0"
-                                                                    " AND at >= ?", (self.since - 3600.0,))}
+                                                                    " AND at >= ? AND " + _real_session("session_id"),
+                                                       (self.since - 3600.0,))}
         failed_apps: list[tuple[float, str, str]] = sorted(
             (float(d["t1"]), d["app"], str(d["run_key"])) for d in steps
             if d["app"] and heads.get(str(d["run_key"])) in ("cancelled", "error", "withdrawn"))
@@ -793,7 +802,8 @@ class Builder:
                               " u.recheck, u.rung, u.variant, u.via, u.request_id, c.key AS capability FROM skill_runs u"
                               " LEFT JOIN"
                               " skills s ON s.id = u.skill_id LEFT JOIN skills c ON c.id = coalesce(s.capability_id,"
-                              " s.id) WHERE u.t0 >= ? AND u.t0 <= ?", (self.since, self.until))
+                              " s.id) WHERE u.t0 >= ? AND u.t0 <= ? AND " + _real_session("u.session_id") + " AND "
+                              + _real_request("u.request_id"), (self.since, self.until))
         out = []
         for r in rows:
             d = dict(r)
