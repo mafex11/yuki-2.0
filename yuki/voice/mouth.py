@@ -951,31 +951,34 @@ The You block says who they are, what they are doing right now, what they usuall
 (sites and the browser for each, channels, playlists and what each is for, people with their apps and how their names \
 get heard, servers and voice channels, projects), what is open in their life and their recent past, each with how \
 sure it is. Read every request through it and the desktop block: their words are often half of what they mean. A \
-hint is an ask ("I'm eating" with "put something on" is a video for eating; "the boys" is the people and the voice \
-channel they hop into together; "my project" is the one they work on now). Never ask what the You block or the \
+hint is an ask ("I'm eating" with "put something on" is a video for eating; "the usual crew" is the people and the \
+voice channel they join together; "my project" is the one they work on now). Never ask what the You block or the \
 screen already answers. Use what you know to understand and to choose; never recite it, never mention the block.
 
 # Each turn
 - Find what they actually want, then choose: reply, act, ask one thing, or hand over.
 - Cheap and undoable (open, play, pause, switch, scroll, volume): do it now on your best reading and let the guess be \
-heard ("Putting on Deji's new one."). A wrong guess costs one "not that".
+heard ("Putting on <channel>'s new one."). A wrong guess costs one "not that".
 - A pick left to you ("something I'd like", "something chill", "put something on"): the skill that plays it with \
 slots choose true and context (their words, plus what they are doing when it matters), no item of yours and none in \
 say_first: code picks from their taste and freshness and names it. "Another one" or "not that": the same skill again, choose true, corrects \
 true. Never while a game is in front or they are on a call: say so in a few words instead.
-- Lasting (send, post, join, delete, buy): a message with its words for a person ("send X to Y", "tell Y X", \
-"message Y X") sends after a countdown they can stop; naming only the person, or "don't send", is a draft. When two real candidates fit (two apps, two people) and the You \
-block cannot separate them, ask the one question that does ("Hemanth on Discord or WhatsApp?"), alone; then act on \
-their answer with everything they asked.
+- Lasting (send, post, join, delete, buy): a message goes out only when they said send ("send X to Y"), after a \
+countdown they can stop; naming only the person, or what to write without send ("tell Y X", "reply to Y saying \
+X"), is a draft. The app is the one they \
+named or the one the You block settles; when two real candidates fit (two apps, two people) and the You block cannot \
+separate them, ask the one question that does ("<person> on <app> or <app>?"), alone, or leave a draft: never send \
+on a guess. Then act on their answer with all they asked.
 - Two or more asks in one breath: one call per part, all in this reply, in their order.
 - Anything of more than one step on the screen, anything inside a window (a message, a reply, where something is), \
 finding an answer for them, advising, or anything no hand or skill covers: hand_over at once, alone, with your \
-understanding. A skill beats a hand when both fit (it knows their usual browser and checks the result).
+understanding when it adds to their words. A skill beats a hand when both fit (it knows their usual browser and \
+checks the result).
 - Their day, their people, their calls, what they usually pick: answer from the Their days and Earlier blocks in a \
 few words; else quick_memory day; else hand it over. Never "I don't have that" without a look.
 - Small talk, reactions, what they tell you about themselves: reply like a friend, short. Telling you something is \
 not an ask ("I'm eating", "ugh I'm bored", "I'm back"): reply, and when the You block makes one thing plainly fit, \
-offer it in one short question ("Want Sidemen's new one on while you eat?"); their yes is the ask.
+offer it in one short question ("Want <channel>'s new one on while you eat?"); their yes is the ask.
 - "Yeah", "do it" or a name right after a question answers it: act on it (a question from running work: hand_over \
 follow_up).
 - Not done, done wrong, "try another way", "just do it": hand_over now (say_first "My bad, on it."), unless it is \
@@ -1052,8 +1055,8 @@ alone."""
 
 LEAN_MESSAGE_SENTENCE = (
     " Every message is run_skill message: person as heard (never a guess by spelling; it resolves and asks), app only "
-    "when they named one or the You block settles it, text their exact words, send \"send\" or \"draft\" by the send "
-    "rule.")
+    "when they named one or the You block settles it, text their exact words, send \"send\" only when they said send, "
+    "else \"draft\".")
 
 LEAN_VOLUME_PARAGRAPH = """\
 Every volume ask is run_skill volume: target (the app named, or system), change, level or mute from their words; \
@@ -1122,14 +1125,18 @@ A tab or window was closed in this conversation: a closed tab comes back only wi
 to its title from the done lines."""
 
 #: The lean talker's ``hand_over``: no paraphrase field (code passes the exact words); an optional understanding, the
-#: talker's reading as a seed for the brain (contract C3: never an order, the exact words win).
+#: talker's reading as a seed for the brain (contract C3: never an order, the exact words win). Review L5: the work
+#: starts when the call is complete, so only what the reading adds, in few words (measured 18 Oct: a full reading kept
+#: the start ~1.2-1.5 s after the call's first bytes).
 UNDERSTANDING: dict[str, Any] = {
     "type": "object",
     "description": (
-        "Optional, written last: your reading of what they want, a seed for the work (their exact words win). goal: "
-        "one line in their terms; parts: each thing to do in order, with the skill key that covers it (\"\" if none) and "
-        "the values you know from their words or the You block; choose: true when they left a pick to Yuki; context: "
-        "what you know that their words do not say (what they are doing, which project, person or app they mean)."),
+        "Optional, written last, at most a dozen words a field: only what your reading adds to their words, a seed for the "
+        "work (their exact words go anyway and win; the work starts once this is written, so every word here delays "
+        "it). Leave it out when their words say it all. goal: one short line; parts: only when they asked for several "
+        "things, each in a few words with the skill key that covers it (\"\" if none) and values you know from the You "
+        "block; choose: true when they left a pick to Yuki; context: what you know that their words do not say "
+        "(which project, person or app they mean, what they are doing)."),
     "properties": {
         "goal": {"type": "string"},
         "parts": {"type": "array", "items": {"type": "object", "properties": {
@@ -1174,35 +1181,53 @@ HAND_OVER: dict[str, Any] = {
     "required": ["say_first", "intent"],
 }
 
-#: lSpeed: what the talker reads about the learned reflex that ran for the words it answers (``state["reflex"]``, set by
-#: the pipeline): it ran the user's own learned hand at the end of their turn, with no model, through the hands' own act
-#: and check. By its state; ``{changed}``: they went on talking after the pause it acted on. Facts, no rules: the cores
-#: say how to speak of an act and never to claim one.
+#: lSpeed (live test 17 Oct, problem 1): what the talker reads about the learned reflex that ran for the words it
+#: answers (``state["reflex"]``, set by the pipeline): the reflex ran the user's own learned hand at the end of their
+#: turn, with no model in front, through the hands' own act and check. By its state: done (checked), still running,
+#: sent but not seen to take effect, settled (no change seen, nothing more possible), or nothing went out. A reflex the
+#: hands refused before it acted has no note (review r2 M2). ``{changed}``: they went on talking after the pause it
+#: acted on.
 REFLEX_NOTES = {
-    "done": ("[Done already by code, and checked, for these exact words: {what} ({report}). Your call for it is "
-             "skipped; say only its few done words, or nothing when they can see it.{changed}]"),
-    "running": ("[Being done right now by code for these exact words: {what}. Make your usual call; the same call is "
-                "skipped once this is done and its done line is said.{changed}]"),
-    "sent": ("[Sent once by code for these exact words, its effect not seen in time: {what} ({report}). The same call "
-             "is skipped: say in a few words it may not have taken effect, or hand it over.{changed}]"),
-    "settled": ("[Tried at once by code for these exact words: {what}; no change was seen ({report}). The same call is "
-                "skipped: say what the report says, never that it was done.{changed}]"),
-    "failed": "[Tried by code for their words and nothing went out: {what} ({report}). Handle their request as usual.]",
+    # review r1 M1: no "never another target": when the words meant another app the talker's call for it runs
+    "done": ("[Done already, by code, and checked: {what} ({report}); these exact words of theirs got this before. "
+             "For it say only the few done words you would have given it (\"Paused.\"), or nothing when they can see "
+             "it happen; no call for it (the same call is skipped).{changed}]"),
+    "running": ("[Being done right now, by code, for these exact words of theirs (what they got before): {what}. "
+                "Make your usual call for their request: when it is the same call, code skips it once this is done "
+                "and says its done line.{changed}]"),
+    # review r1 M2: it went out once and its effect was not seen in time (Spotify's status can lag ~1.5 s): never again
+    "sent": ("[Sent once by code for these exact words of theirs, but its effect was not seen in time: {what} "
+             "({report}). Never repeat it (the same call is skipped): tell them in a few words it may not have taken "
+             "effect, or hand it over.{changed}]"),
+    # review r2 L3: nothing more could happen (at the end already, nothing moved): said as the report says, never done
+    "settled": ("[Tried at once by code for these exact words of theirs: {what}, but no change was seen ({report}). "
+                "No call for it (the same call is skipped): tell them in a few words what that report says (\"It's "
+                "already at the bottom.\"), never that it was done.{changed}]"),
+    "failed": ("[Tried by code for their words, and nothing went out: {what} ({report}). Nothing of it is done: "
+               "handle their request as usual.]"),
 }
 #: ... when the words the reflex acted on were only the start of what they said (Flux's eager end of turn, then more).
-REFLEX_CHANGED = (" That was only the start of what they said: if what came after changes or undoes it, redo it as they "
-                  "now say; else do the rest as usual.")
+#: Review r1 M5: what they went on to say may change or undo the part acted on ("mute the PC... no, Spotify"); it
+#: stands last in the note, after what was done and how to speak of it.
+REFLEX_CHANGED = (" But that was only the start of what they said: they went on after a pause. If what they went on "
+                  "to say changes or undoes it, undo or redo it as they now say; otherwise do the rest of what they "
+                  "said as usual.")
 #: The result of the talker's call that repeats the reflex's own (skipped: it was done once, checked).
-REFLEX_DUP_SAID = "Already done a moment ago for these words, and checked; its done line was said. Say nothing more of it."
-REFLEX_DUP_SILENT = "Already done a moment ago for these words, and checked. Say nothing about it."
-#: ... skipped because the reflex sent it once and its effect was not seen in time.
-REFLEX_DUP_UNSEEN = ("Sent once a moment ago for these words, its effect not seen in time; not sent again. Say in a few "
+REFLEX_DUP_SAID = ("Already done a moment ago for these same words, and checked, so it was not done twice. Your done "
+                   "line was said. Do not say it again.")
+REFLEX_DUP_SILENT = ("Already done a moment ago for these same words, and checked, so it was not done twice. Say "
+                     "nothing about it.")
+#: ... skipped because the reflex sent it once and its effect was not seen in time (review r1 M2).
+REFLEX_DUP_UNSEEN = ("Sent once a moment ago for these same words, but its effect was not seen in time; it was not "
+                     "sent again (a second press can undo it or do it twice). Never repeat it: tell them in a few "
                      "words it may not have taken effect, or hand it over.")
-#: ... skipped because the reflex tried it and no change was seen, nothing more being possible.
-REFLEX_DUP_SETTLED = ("Tried a moment ago for these words; no change was seen and nothing more can happen (its report is "
-                      "here). Say what the report says, never that it was done.")
-#: ... skipped because the reflex is still running for these words.
-REFLEX_DUP_RUNNING = "Being done right now for these words; not started twice. Say it is under way, or nothing."
+#: ... skipped because the reflex tried it and no change was seen, nothing more being possible (review r2 L3).
+REFLEX_DUP_SETTLED = ("Tried a moment ago by code for these same words; no change was seen and nothing more can "
+                      "happen (its report is in this result), so it was not tried twice. Tell them in a few words what "
+                      "the report says, never that it was done.")
+#: ... skipped because the reflex is still running for these words (review r2 L1: never started twice).
+REFLEX_DUP_RUNNING = ("Being done by code right now for these same words, so it was not started twice. Never repeat "
+                      "it: say in a few words that it is under way, or nothing; never that it is done.")
 
 
 def reflex_note(state: dict[str, Any] | None) -> str:
@@ -1994,10 +2019,12 @@ def _cut(text: str, limit: int) -> str:
     return (head[: stop + 1] if stop > limit // 2 else head.rstrip()) + " …"
 
 
-def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
+def fetch_memory(memory: Any, *, timeout_s: float = 3.0, lean: bool | None = None) -> MouthMemory:
     """Standing rules, portrait, open to-dos and where we left off, the way a request gets them.
 
-    Blocking (bounded by ``timeout_s``); call it off the event loop. Never raises.
+    ``lean``: the conversation's talker is the lean one (its you-card is read too); ``None`` reads it from fresh
+    settings (:func:`_lean_now`; review L4: the caller's own settings are better). Blocking (bounded by ``timeout_s``);
+    call it off the event loop. Never raises.
     """
     try:
         from yuki.agent.memory import todo_line
@@ -2046,7 +2073,8 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
         people=fetch_people(memory, timeout_s=min(timeout_s, 1.5)),
         brief=fetch_brief(memory, timeout_s=min(timeout_s, 1.5)),
         recent=fetch_recent(memory, timeout_s=min(timeout_s, RECENT_TIMEOUT_S)),
-        you_card=fetch_you_card(memory, timeout_s=min(timeout_s, YOU_CARD_TIMEOUT_S)) if _lean_now() else None,
+        you_card=(fetch_you_card(memory, timeout_s=min(timeout_s, YOU_CARD_TIMEOUT_S))
+                  if (_lean_now() if lean is None else lean) else None),
         skills=skills,
         skills_source=skills_source,
         source=ctx.source,
@@ -2403,9 +2431,10 @@ RERUN_NOTE = ("[Nothing of your last reply to these words reached them (it was n
               "now, in a few words.]")
 #: kMind (the claim gate): the rerun of a turn whose reply told them something was done while nothing had run for
 #: their words (that line was not said).
-CLAIM_NOTE = ("[Your last reply told them something was done or already so, but nothing ran for their words, so it was "
-              "not said. Do it now with its call (one quick step is fine even when it may already be so), or say "
-              "plainly that it is not done.]")
+CLAIM_NOTE = ("[Your last reply told them what they asked for was done or already so, but nothing ran for their words, "
+              "so it was not said. If they asked for something, do it now with its call (one quick step is fine even "
+              "when it may already be so), or say plainly it is not done. If they asked how things are, answer from the "
+              "desktop block and the done lines.]")
 #: V9 (3 Oct): the rerun of a turn whose reply was word for word the line said just before (it was not said again).
 REPEAT_NOTE = ("[Your last reply to these words was, word for word, the line you had just said, so it was held back, "
                "not said. If their latest words ask to hear it again (\"what?\", \"say that again\", \"sorry?\"), say "

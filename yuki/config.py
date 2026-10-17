@@ -205,14 +205,13 @@ DEFAULT_PRICING: dict[str, dict[str, float]] = {
         "cache_read": 0.10,
     },
 }
-# kMind: the 5.5 generation, priced at its tier's rates (Sonnet 5.5 the lean voice talker, measured on this PC 18 Oct)
-for _id, _tier in (("global.anthropic.claude-sonnet-5-5", MODEL_ALIASES["sonnet"]),
-                   ("us.anthropic.claude-sonnet-5-5", MODEL_ALIASES["sonnet"]),
-                   ("global.anthropic.claude-opus-5-5", MODEL_ALIASES["opus"]),
-                   ("us.anthropic.claude-opus-5-5", MODEL_ALIASES["opus"]),
-                   ("global.anthropic.claude-haiku-5-5", "global.anthropic.claude-haiku-4-5-20251001-v1:0"),
-                   ("us.anthropic.claude-haiku-5-5", "global.anthropic.claude-haiku-4-5-20251001-v1:0")):
-    DEFAULT_PRICING[_id] = dict(DEFAULT_PRICING[_tier])
+# kMind: the 5.5 generation at its own list rates (Sonnet 5.5 the lean voice talker, measured on this PC 18 Oct; Opus
+# 5.5 cache reads as listed, Haiku 5.5's cache rates at the usual 1.25x / 0.1x of its input)
+for _family, _rates in (("sonnet-5-5", {"input": 2.00, "output": 10.00, "cache_write": 2.50, "cache_read": 0.20}),
+                        ("opus-5-5", {"input": 4.00, "output": 20.00, "cache_write": 5.00, "cache_read": 0.20}),
+                        ("haiku-5-5", {"input": 0.10, "output": 0.50, "cache_write": 0.125, "cache_read": 0.01})):
+    for _profile in ("global", "us"):
+        DEFAULT_PRICING[f"{_profile}.anthropic.claude-{_family}"] = dict(_rates)
 
 #: The voice mouth (docs/VOICE.md §5). Claude Haiku 4.5 is Active on Bedrock with
 #: an end-of-life "no sooner than 2026-10-16" and no Haiku successor listed
@@ -223,14 +222,14 @@ DEFAULT_VOICE_MOUTH_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 #: :data:`DEFAULT_VOICE_MOUTH_MODEL`.
 DEFAULT_VOICE_LEAN_MODEL = "global.anthropic.claude-sonnet-5-5"
 
-#: How "thinking off" is asked of a model (data, by id): the 5.5 generation refuses ``{"type": "disabled"}`` and takes
-#: ``{"type": "between_tools"}`` (no thinking before the reply; short updates between tool calls come back as thinking
-#: blocks, never spoken). Every other model: ``disabled``.
+#: How "thinking off" is asked of a model (data, by id). Sonnet 5.5 refuses ``{"type": "disabled"}`` (HTTP 400) and
+#: takes ``{"type": "between_tools"}`` (no thinking before the reply; notes between tool calls come back as thinking
+#: blocks, which the voice drops unheard); no other model takes ``between_tools`` (HTTP 400, verified 18 Oct for Haiku
+#: 5.5 and Opus 5.5). Every other model: ``disabled`` (Haiku 5.5 takes it at its default effort). Opus 5.5 cannot turn
+#: thinking off at all, so it is not supported as the voice talker.
 THINKING_OFF: dict[str, dict[str, str]] = {
     model: {"type": "between_tools"}
-    for model in ("global.anthropic.claude-sonnet-5-5", "us.anthropic.claude-sonnet-5-5",
-                  "global.anthropic.claude-haiku-5-5", "us.anthropic.claude-haiku-5-5",
-                  "global.anthropic.claude-opus-5-5", "us.anthropic.claude-opus-5-5")
+    for model in ("global.anthropic.claude-sonnet-5-5", "us.anthropic.claude-sonnet-5-5")
 }
 
 

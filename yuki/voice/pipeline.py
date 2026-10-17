@@ -70,6 +70,24 @@ def _with_text(event: Any, text: str) -> Any:
         return SimpleNamespace(type=getattr(event, "type", "content_block_delta"), index=getattr(event, "index", 0),
                                delta=SimpleNamespace(type="text_delta", text=text))
 
+
+async def read_head(stream: Any) -> tuple[list[Any], bool]:
+    """The talker's stream up to its first content block (``message_start``, pings), and whether the reply was
+    declined before any output (kMind, review M2: a ``message_delta`` with ``stop_reason`` ``refusal`` before any
+    content). A failure the stream reports on its way there raises here, where the failover catches it."""
+    head: list[Any] = []
+    while True:
+        try:
+            event = await stream.__anext__()
+        except StopAsyncIteration:
+            return head, False
+        head.append(event)
+        kind = getattr(event, "type", "")
+        if kind == "message_delta":
+            return head, getattr(getattr(event, "delta", None), "stop_reason", None) == "refusal"
+        if kind in ("content_block_start", "message_stop"):
+            return head, False
+
 #: Default voices per provider when ``Settings.voice_tts_voice`` is empty.
 DEFAULT_VOICES = {"elevenlabs": "cgSgspJ2msm6clMCkdW9", "deepgram": "aura-2-thalia-en"}
 
@@ -1178,17 +1196,24 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             params.result_callback = settle
             await super()._cancel_tool_handler(params)
 
-        async def _yuki_open(self, api_call: Any, params: Any) -> tuple[Any, Any]:
-            """Open the reply's stream and read its first event, with failover (v3.5).
+        async def _yuki_open(self, api_call: Any, params: Any) -> tuple[Any, list[Any]]:
+            """Open the reply's stream and read its head (the events before its first content block), with failover
+            (v3.5).
 
             The mouth had none (the reliability builder's note, 2026-09-27). As ``yuki.agent.failover``
             does for the brain: a failure that says nothing about the request (throttled, overloaded, 5xx,
             timeout, no connection) is retried once on the same target after a short backoff, a missing
             model or profile (404/424) moves on at once, then the chain of ``Settings.model_fallbacks`` for
-            the mouth's model (the global profile from us-east-1, the US profile, then Sonnet). The first
-            event is read here because Bedrock often reports throttling as the stream's first event. A
+            the mouth's model (the global profile from us-east-1, the US profile, then Sonnet). The head
+            is read here because Bedrock often reports throttling as the stream's first event. A
             target that worked is kept for ``failover_sticky_s``. Logged ``model_retry`` /
             ``model_failover`` (content-free).
+
+            kMind (review M2): a reply the model declined before any output (Sonnet 5.5's safety classifiers: HTTP 200,
+            ``stop_reason`` ``refusal``, no content) is run once more on the first target of the chain with another
+            model (thinking off as that model takes it), never made sticky (a decline is about this request); logged
+            ``model_refusal`` (content-free). With no other model, or a second decline, the declined reply goes on as
+            before (silent: the reply watch answers the turn again).
             """
             from yuki.agent.failover import adapt_params, classify
 
@@ -1200,8 +1225,12 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             moved = bool(callable(routed) and routed())
             tries = 1 if moved else 2
             last: BaseException | None = None
+            declined: tuple[str, Any, list[Any]] | None = None   # (the model, its stream, its head)
             for index in range(start, len(chain)):
                 target = chain[index]
+                model = str((target or {}).get("model") or params.get("model") or "")
+                if declined is not None and model == declined[0]:
+                    continue   # the same model declines the same request again
                 for attempt in range(tries if index == 0 else 1):
                     try:
                         if target is None and moved:
@@ -1219,12 +1248,16 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                                 moved_params["thinking"] = thinking_off(target["model"])   # kMind: each model's own
                             response = await client.beta.messages.create(**moved_params)
                         stream = response.__aiter__()
-                        try:
-                            first = await stream.__anext__()
-                        except StopAsyncIteration:
-                            first = None
-                        hooks.model_ok(index, target)
-                        return stream, first
+                        head, refused = await read_head(stream)
+                        if refused and declined is None:
+                            declined = (model, stream, head)
+                            hook("model_declined", "declined", target)
+                            break   # once, on the next target with another model
+                        if declined is not None:
+                            hook("model_declined", "refused_again" if refused else "answered", target)
+                        else:
+                            hooks.model_ok(index, target)
+                        return stream, head
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:  # noqa: BLE001 - classified from the SDK's own types
@@ -1237,6 +1270,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                             await asyncio.sleep(0.4)
                             continue
                         break
+            if declined is not None:
+                return declined[1], declined[2]   # no other model answered: the declined reply, as before
             assert last is not None
             raise last
 
@@ -1244,11 +1279,11 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             call = self._yuki_call
             if call is not None:
                 call.sent = time.monotonic()
-            stream, first = await self._yuki_open(api_call, params)
+            stream, head = await self._yuki_open(api_call, params)
 
             async def events() -> Any:
-                if first is not None:
-                    yield first
+                for event in head:
+                    yield event
                 async for event in stream:
                     yield event
 
@@ -1268,12 +1303,24 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 tool_id, args, said = None, "", True
                 early_wait = False  # a tell_yuki whose early thinker start waits for its screen field (v3.9)
                 last_text: Any = None   # the latest text delta (the shape a channel's leftover words go out in)
+                thoughts: set[Any] = set()   # kMind (review L1): the indexes of thinking blocks, dropped
                 try:
                     async for event in response:
                         now = time.monotonic()
                         if call.first_event is None:
                             call.first_event = now
                         kind = getattr(event, "type", "")
+                        if kind == "content_block_start" and getattr(event.content_block, "type", "") in (
+                                "thinking", "redacted_thinking"):
+                            # kMind (review L1): Sonnet 5.5's notes between tool calls (``between_tools``) are never
+                            # spoken, and kept out of the conversation: its history is edited every turn (volatile
+                            # block, markers, chronological order), and a replayed thinking block after an edit is
+                            # a 400 on accounts that enforce the history check; without the blocks there is none
+                            thoughts.add(getattr(event, "index", None))
+                            continue
+                        if kind in ("content_block_delta", "content_block_stop") and thoughts and \
+                                getattr(event, "index", None) in thoughts:
+                            continue
                         if call.first_content is None and kind in ("content_block_start", "content_block_delta"):
                             call.first_content = now
                         if channel is not None:
@@ -1517,9 +1564,15 @@ def _clause_tts(base: type, *, strip_marks: bool = False) -> type:
         async def process_frame(self, frame: Any, direction: Any) -> None:
             from pipecat.frames.frames import (
                 FunctionCallsStartedFrame, InterruptionFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame,
+                TTSSpeakFrame,
             )
 
-            if isinstance(frame, LLMFullResponseStartFrame):
+            if isinstance(frame, TTSSpeakFrame):
+                # kMind (review L6): words said by code, not the talker's reply: never held by the claim check
+                note = getattr(getattr(self, "_yuki_guard", None), "code_line", None)
+                if callable(note):
+                    note(strip_tags(str(getattr(frame, "text", "") or "")))
+            elif isinstance(frame, LLMFullResponseStartFrame):
                 # A new reply: a look flagged after the last reply's end (a speculative reply's held calls run once
                 # the turn is confirmed, after its end has passed) is not this reply's (review fixes).
                 self._yuki_answer_next = False
@@ -2581,6 +2634,12 @@ class _Hooks:
         where = "primary" if target is None else f"{target.get('model')}@{target.get('region') or 'home'}"
         self.c.log.event("model_retry" if kind == "retry" and index == 0 else "model_failover", target=where,
                          kind=kind, status=getattr(exc, "status_code", None), error=type(exc).__name__)
+
+    def model_declined(self, op: str, target: dict[str, Any] | None) -> None:
+        """kMind (review M2): the reply was declined before any output (``declined``), and how the run on another model
+        went (``answered`` / ``refused_again``). Content-free."""
+        where = "primary" if target is None else f"{target.get('model')}@{target.get('region') or 'home'}"
+        self.c.log.event("model_refusal", op=op, target=where)
 
     def model_ok(self, index: int, target: dict[str, Any] | None) -> None:
         if index:

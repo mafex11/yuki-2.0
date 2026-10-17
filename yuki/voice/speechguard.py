@@ -42,11 +42,15 @@ reply. A leak of reasoning into speech is then a measured number (its ``shadow_c
 them a reply that ran nothing ("Excalidraw's open in Chrome"). For the lean talker (``code_only``), while the
 conversation's ``claim_open()`` says nothing was done for the user's current turn (no hand or skill of the talker's
 verified anything, no reflex did it, no call in this turn yet), each line the talker writes gets one isolated check by
-the fast model (:data:`CLAIM_PROMPT`, one word: ``CLAIM`` or ``OK``) and its audio waits for it (``blocks``): a line
-that tells them something was done, or is already so, is dropped in every mode (``why`` ``claim``), ``on_claim`` is
-told (the conversation then answers the turn again, told so), and the rest of the reply goes too. No verdict in time or
-an error says the line (fail open: a false claim is rarer than every other line). A model's judgement, never a word
-list. Lines said by code (done lines, results) are not the talker's and never checked.
+the fast model (:data:`CLAIM_PROMPT`, one word: ``CLAIM`` or ``OK``) and its audio waits for it (``blocks``). The check
+reads the line against their latest words: only a line that tells them what they asked for is done, or already so, is
+a claim; a truthful answer to "is it paused?" or "did it send?" is not (review H1). A claim is dropped in every mode
+(``why`` ``claim``), ``on_claim`` is told (the conversation then answers the turn again, told so), and the rest of the
+reply goes too. No verdict in time or an error says the line (fail open: a false claim is rarer than every other line).
+A model's judgement, never a word list. Lines said by code are not the talker's and never claim-checked: owed outcomes
+and results pass the guard (``unguard``), and every other line code says (a hand's or skill's done line, a step line,
+an acknowledgement) is told to the guard as it goes to the voice (:meth:`SpeechGuard.code_line`), so its pieces skip the
+claim check (the internal-word and repeat checks still apply).
 """
 
 from __future__ import annotations
@@ -68,14 +72,20 @@ REPEAT_S = 20.0
 #: What the check may answer when it drops a line.
 REASONS = ("reasoning", "about_user", "internals", "fragment", "repeat", "claim")   # "repeat": the exact-repeat check
 
-#: kMind: the claim gate's check (module docstring): one line, nothing done yet for the user's latest words.
+#: kMind: the claim gate's check (module docstring): one line, judged against the user's latest words, for which nothing
+#: was done yet. Review H1 (18 Oct): a truthful answer to "is it paused?" or "did it send?" is no claim.
 CLAIM_PROMPT = """\
-You check one line that Yuki, a voice assistant on the user's PC, is about to say out loud. Nothing has been done on \
-their PC for their latest words: no action ran. Answer CLAIM when the line tells them that something on the PC was \
-done, changed or is so now because of Yuki, or is already so: opened, up, playing, paused, sent, closed, muted, set, \
-switched, "done", "there you go", "it's on", "already open". Answer OK for everything else: a question, an answer \
-from memory or general knowledge, small talk, sympathy, a joke, an offer, saying Yuki is on it or about to do it, \
-saying it can't, saying it is not done or did not work. One word: CLAIM or OK."""
+You check one line that Yuki, a voice assistant on the user's PC, is about to say out loud, against the user's latest \
+words. Nothing has been done on their PC for those words yet: no action ran for them.
+Answer CLAIM only when their latest words ask Yuki to do or change something (open, play, pause, send, close, switch, \
+set, show) and the line tells them it is done or that it is already so: "Done.", "There you go.", "Sent.", "It's up \
+in Chrome.", "Already playing."
+Answer OK for everything else. An answer to their question about how things are now, or about what was done \
+earlier, is OK ("is spotify running?" -> "Yep, it's running."; "did the email go?" -> "Yes, it went out earlier."; \
+"what did you change?" -> "I closed the tab and turned it down."). So is a \
+question, small talk, sympathy, a joke, an offer, saying Yuki is on it or about to do it, saying it can't, or saying \
+it is not done or did not work. When unsure, OK.
+One word: CLAIM or OK."""
 
 GUARD_PROMPT = """\
 You check one line that Yuki, a voice assistant on the user's PC, is about to say out loud to the user. The line \
@@ -194,6 +204,8 @@ class SpeechGuard:
         #: ``()``: a line was dropped as a claim of something not done (set by the conversation).
         self.on_claim: Callable[[], None] | None = None
         self._waits: set[Any] = set()   # futures whose audio waits for the verdict in every mode (the claim gate)
+        #: kMind (review L6): lines code sent to the voice lately, ``(at, normalised)``: never claim-checked
+        self._code_lines: deque[tuple[float, str]] = deque(maxlen=16)
         self._said: deque[tuple[float, str, str]] = deque(maxlen=12)   # (at, words, normalised) of lines let through
         self._turn: set[str] = set()   # the lines said since the user last spoke (normalised): exact repeats
         #: The same lines in words, for the model's repeat judgement: only what answers the user's latest words (a
@@ -243,7 +255,7 @@ class SpeechGuard:
         written = [t for at, t in self._written if now - at < REPEAT_S]
         self._written.append((now, text.strip()))
         if self.code_only:
-            if self._claim_open():
+            if self._claim_open() and not self._by_code(norm, now):
                 # kMind: nothing done for their words yet: the line waits for the claim check (module docstring)
                 self._pending.add(norm)
                 self._waits.add(fut)
@@ -267,6 +279,21 @@ class SpeechGuard:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return fut
+
+    #: A line code sent to the voice is matched to its spoken pieces for this long (s).
+    CODE_LINE_S = 30.0
+
+    def code_line(self, text: str) -> None:
+        """kMind (review L6): ``text`` goes to the voice from code (a ``TTSSpeakFrame``: a done line, a step line, an
+        acknowledgement), not from the talker's reply: its pieces are never claim-checked."""
+        norm = _norm(text)
+        if norm:
+            self._code_lines.append((time.monotonic(), norm))
+
+    def _by_code(self, norm: str, now: float) -> bool:
+        """Whether a piece is (part of) a line code sent to the voice in the last :data:`CODE_LINE_S` seconds."""
+        piece = f" {norm} "
+        return any(now - at < self.CODE_LINE_S and piece in f" {line} " for at, line in self._code_lines)
 
     def _claim_open(self) -> bool:
         fn = self.claim_open
