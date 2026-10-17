@@ -61,7 +61,9 @@ NAME_KINDS = ("person", "work", "interest")
 MAX_WORDS = 3
 MAX_CHARS = 32
 #: Characters across the whole memory list at most (Deepgram: 500 tokens across all keyterms, the screen names
-#: included; ~2-4 characters a token for names, so this keeps the list and up to 10 screen names well under it).
+#: included; ~2-4 characters a token for names). This bounds memory's part of the total of 80 terms: up to 65 memory
+#: terms within these characters, beside 15 or more screen names of at most 32 characters each (the worst case is
+#: unchanged by the move from 50 + 10).
 MAX_TOTAL_CHARS = 520
 #: The timeline read for the apps and sites the user had in front lately, and how fast a use fades (half after
 #: this many days): the user's present, not last month's (an app left two weeks ago weighs a quarter).
