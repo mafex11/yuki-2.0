@@ -56,14 +56,17 @@ def hand_traces(store: Any, *, since: float, skip_sessions: Iterable[str] = ()) 
     """The voice hand traces since ``since`` (epoch s), oldest first: ``{"at", "session", "words", "tool", "app",
     "input", "ok", "verified"}``. ``words`` is what the user said for the hand (the trace keeps their last one or two
     turns joined by " / "; the newest one is given), ``input`` the hand's arguments as the trace kept them (window ids
-    and spoken lines are never in it), ``app`` the process it acted in (memory's app key). Runs of a session whose id
-    starts with one of ``skip_sessions`` are left out (the live test harness's own sessions). Only runs of one step (a
-    hand), never a learned way's several. Never raises (``[]``)."""
+    and spoken lines are never in it), ``app`` the process it acted in (memory's app key). The live test harness's runs
+    are always left out (xGlue: ``testtag.sql_real_run``, its session id or the tag in its run key, the one predicate
+    every learner uses), and so are runs of a session whose id starts with one of ``skip_sessions``. Only runs of one
+    step (a hand), never a learned way's several. Never raises (``[]``)."""
+    from yuki.memory.testtag import sql_real_run
+
     skip = tuple(str(s) for s in (skip_sessions or ()) if str(s or ""))
     try:
         heads = store._query(
             "SELECT run_key, session_id, at, input_ciphertext FROM runs WHERE source='hand' AND step=0 AND at >= ?"
-            " ORDER BY at", (float(since),))
+            f" AND {sql_real_run()} ORDER BY at", (float(since),))
         keys = [h["run_key"] for h in heads if not (skip and str(h["session_id"] or "").startswith(skip))]
         if not keys:
             return []

@@ -1897,12 +1897,15 @@ class Hands:
     REFLEX_SAME_S = 10.0
 
     def reflex_done(self, name: str, args: dict[str, Any]) -> None:
-        """lVoice (a hook for lSpeed's reflex path, which acts at the eager end of turn, before the user turn is
-        counted): this step (the hand or skill ``name`` with ``args``, as a talker call would give them) was just run
-        for the words being heard. The talker's own call for the same step (:func:`_step_key`: its arguments but its
-        words) within :attr:`REFLEX_SAME_S` is answered as already done, with no second act and no second line. Run
-        the reflex's call itself through :meth:`handle` (the order gate, the trace, the action log); call this right
-        after it. Never raises."""
+        """lVoice, a backstop for lSpeed's reflex path (which acts at the eager end of turn, before the user turn is
+        counted). The reflex calls the hands' own act directly (:meth:`_acting_run`, or :meth:`_skill_hand` for the
+        volume skill), never :meth:`handle`; ``pipeline._reflex_dup`` answers the talker's duplicate call before
+        :meth:`handle`, and ``pipeline._reflex_note`` files the act under its user turn (:meth:`_note_call`) once the
+        turn is counted. This is called only for an effect that was seen done (the reflex's ``done``; never ``sent``,
+        ``settled`` or ``skipped``): the step (the hand or skill ``name`` with ``args``, as a talker call would give
+        them) then answers a talker call for the same step that still reaches :meth:`handle` (:func:`_step_key`: its
+        arguments but its words) within :attr:`REFLEX_SAME_S` as already done, with no second act and no second line.
+        Never raises."""
         try:
             now = time.monotonic()
             self._reflex = {k: t for k, t in self._reflex.items() if now - t < self.REFLEX_SAME_S}

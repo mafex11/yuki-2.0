@@ -40,7 +40,7 @@ from typing import Any, Callable
 from yuki.config import Settings
 from yuki.voice.expressive import strip_tags
 from yuki.voice.keys import DEEPGRAM, ELEVENLABS, GOOGLE, get_key
-from yuki.voice.keyterms import vocabulary
+from yuki.voice.keyterms import name_terms, vocabulary
 from yuki.voice.hands import talker_hand_tools
 from yuki.voice.recall import QUICK_MEMORY
 from yuki.voice.mouth import (
@@ -718,6 +718,25 @@ def user_present(within_s: float = PRESENT_S) -> bool:
         return idle_ms / 1000.0 < within_s
     except Exception:  # noqa: BLE001
         return True
+
+
+def near_terms(user_names: Any, keyterms: Any, cap: int, names: Any = ()) -> list[str]:
+    """The names a heard word may be a mishearing of (the Speech line's near test, :func:`heard_note`): xGlue (lKeys
+    review r1 L1, its interface note for this file) the people's names and the corrections' right names among this
+    conversation's keyterms (``names``: :func:`yuki.voice.keyterms.name_terms`, the last read's tags), plus the user's
+    own names; with none of them tagged (no read yet, or a read that fell back to ``speech_names``) the whole
+    :func:`~yuki.voice.keyterms.vocabulary`, as before. Measured on the user's 858 turns: 76 -> 48 flagged, the brand
+    near-matches on plain commands gone ("you turn" ~ YouTube), each of which held a hand and skipped the early router
+    start. Identity of our own lists, never a reading of words."""
+    def fold(term: Any) -> str:
+        return " ".join(str(term or "").split()).casefold()
+
+    near = vocabulary(user_names, keyterms, cap)
+    tagged = {fold(t) for t in (names or ())} & {fold(t) for t in (keyterms or ())}
+    if not tagged:
+        return near
+    own = {fold(n) for n in (user_names or ())}
+    return [t for t in near if fold(t) in tagged or fold(t) in own]
 
 
 def keyterm_list(base: list[str], extra: list[str], cap: int) -> list[str]:
@@ -3392,8 +3411,9 @@ class Conversation:
         # (v3.6: live 04:46:47 "yucky" was flagged as close to Yuki, the mouth asked about it and held the
         # action; a word like the name is the user calling her, and the wake word's timing keeps the name
         # itself out of what recognition hears).
-        self.observer.keyterms = [t for t in vocabulary(settings.user_names, self.keyterms,
-                                                        settings.voice_keyterms_max)
+        # xGlue (lKeys review r1 L1): the near-name doubt reads the names only (near_terms)
+        self.observer.keyterms = [t for t in near_terms(settings.user_names, self.keyterms, settings.voice_keyterms_max,
+                                                        name_terms())
                                   if t.casefold() != WAKE_NAME.casefold()]
         self.worker: Any = None
         #: The spoken-line check (yuki.voice.speechguard, v3.10), made with the services.
@@ -3897,12 +3917,24 @@ class Conversation:
 
         return VOLUME_SKILL in tuple(getattr(getattr(self.bridge, "hands", None), "skill_keys", ()) or ())
 
+    def _reflex_skip_sessions(self) -> tuple[str, ...]:
+        """The session id prefixes whose conversations never teach the book: the live test harness's own
+        (``testtag.TEST_SESSION_PREFIX``, the one predicate every learner uses: lBrain), plus any extra prefix in
+        ``voice_reflex_seed_skip``."""
+        from yuki.memory.testtag import TEST_SESSION_PREFIX
+
+        extra = tuple(str(p) for p in (getattr(self.settings, "voice_reflex_seed_skip", ()) or ()) if str(p or ""))
+        return (TEST_SESSION_PREFIX, *[p for p in extra if p != TEST_SESSION_PREFIX])
+
     def _reflex_test(self) -> bool:
-        """Review r2 L5: this conversation is the live test harness's own (its session id starts with one of
-        ``voice_reflex_seed_skip``): the book learns, runs and takes corrections in RAM as usual (the test needs a
-        second go to be a reflex), but nothing of it is ever written to the user's memory."""
-        skip = tuple(getattr(self.settings, "voice_reflex_seed_skip", ("livetest-",)) or ())
-        return any(str(self.session or "").startswith(str(p)) for p in skip if str(p))
+        """This conversation is the live test harness's own (``testtag.is_test_session``, or a session id that starts
+        with an extra prefix of ``voice_reflex_seed_skip``). xGlue (lBrain's merge note, the lead's decision):
+        reflexes are never learned from a test session, live or seeded; the stored book is only read (it still runs
+        and takes corrections in RAM), and nothing of it is ever written to the user's memory (review r2 L5)."""
+        from yuki.memory.testtag import is_test_session
+
+        session = str(self.session or "")
+        return is_test_session(session) or any(session.startswith(p) for p in self._reflex_skip_sessions())
 
     def _reflex_start(self) -> float:
         """The start of speech of the words being finished now (the observer's), the identity of an utterance here."""
@@ -3924,7 +3956,7 @@ class Conversation:
         s, memory, log = self.settings, self.memory, self.log
         volume = self._reflex_volume()
         days = float(getattr(s, "voice_reflex_seed_days", 30.0) or 0.0)
-        skip = tuple(getattr(s, "voice_reflex_seed_skip", ("livetest-",)) or ())
+        skip = self._reflex_skip_sessions()   # xGlue: testtag's prefix always (reflexkv also applies testtag's SQL)
         keep = not self._reflex_test()   # review r2 L5: the live test harness's sessions never write the book
         # review r2 L4: the write after the read goes through the ordered worker, as every other save does
         shared().submit(lambda: reflexes.load(memory, volume_skill=volume, seed_days=days, skip_sessions=skip,
@@ -4376,6 +4408,13 @@ class Conversation:
         name = params.function_name
         if meta is None or name not in REFLEX_TOOLS or meta.get("asked") or meta.get("job") or meta.get("reflexed"):
             return params
+        if self._reflex_test():
+            # xGlue (lBrain's merge note, the lead's call): a live test session never teaches the book; nothing is
+            # watched, so no naming check (a model call) runs for it either
+            if not meta.get("test_logged"):
+                meta["test_logged"] = True
+                self.log.event("reflex", op="not_learned", session=self.session, tool=name, why="test_session")
+            return params
         call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
         user_run = (bool(getattr(call, "user_turn", False)) if call is not None
                     else _last_role(getattr(params, "context", None)) == "user")
@@ -4463,7 +4502,9 @@ class Conversation:
 
         why = ""
         names = cand.get("names")
-        if int(meta.get("acts") or 0) != 1:
+        if self._reflex_test():
+            why = "test_session"   # xGlue: never learned from a live test session (a backstop; the watch skips it)
+        elif int(meta.get("acts") or 0) != 1:
             why = "more_than_one"
         elif meta.get("multi"):
             why = "multi_utterance"   # review r1 M1: the reply answered more than these words
@@ -5420,8 +5461,11 @@ class Conversation:
     #: How often the names on the screen in front are looked at again (s): a cheap look at the window list,
     #: and one bounded window read only when the window in front, its title or the action log changed.
     SCREEN_TERMS_EVERY_S = 1.5
-    #: Speech recognition's keyterms are at most this many in all (the memory names, then the screen's).
-    KEYTERMS_TOTAL_MAX = 60
+    #: Speech recognition's keyterms are at most this many in all (the memory names, then the screen's). xGlue (lKeys
+    #: what's left 1): 80, with memory's list at ``voice_keyterms_max`` 65, so at least 15 screen names fit. Deepgram
+    #: takes at most 100 terms and 500 tokens: memory's list stays under ``keyterms.MAX_TOTAL_CHARS`` (520) and each
+    #: screen name under ``screennames.MAX_CHARS`` (32) of at most ``voice_screen_terms`` (30), as before.
+    KEYTERMS_TOTAL_MAX = 80
 
     async def _screen_terms_loop(self) -> None:
         """Keep the names on the screen in front as recognition's keyterms and the talker's (v3.10).
