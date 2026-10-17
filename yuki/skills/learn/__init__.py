@@ -47,6 +47,10 @@ INCREMENTAL_S = 3600.0
 #: Its absence also means no full pass was ever written: the first incremental slot runs the first full pass instead
 #: (design §9.3: at first start the learner rebuilds over the days on disk), at most every :data:`FIRST_RETRY_S`.
 BROWSERS_STATE = "learn:browsers"
+#: Set by the first full pass written since one record per capability (contract C5) shipped: until then the per-site
+#: rows written before still stand and no record holds the user's values (menus, the Playbook and the you-card would
+#: show none), so the first idle incremental slot runs that pass once (review M2), as on a fresh database.
+RECORDS_STATE = "learn:records"
 BROWSERS_FRESH_S = 26 * 3600.0
 FIRST_RETRY_S = 3600.0
 DAY_S = 86400.0
@@ -116,15 +120,28 @@ def quiet(store: Any, now: float | None = None, *, idle_s: float | None = None,
     return busy
 
 
-def _occasion_keys(occasions: Sequence[Any], caps: dict[str, Any]) -> None:
-    """Each occasion's group key digest and its means value (content-free columns of ``occasions``)."""
+def _occasion_keys(occasions: Sequence[Any], caps: dict[str, Any], cipher: Any) -> None:
+    """Each occasion's key digest and its means value (content-free columns of ``occasions``). On a capability's record
+    (no key of its own) the digest is its value's id (:func:`yuki.skills.learn.values.value_id`: the record spec's
+    ``values[].id``), so the routine miner tells the record's values apart (``skill:<record>|<value id>``); on a kept
+    per-value row, a digest of the row's keys."""
     import hashlib
+
+    from yuki.skills.learn import values as V
 
     for o in occasions:
         g = o.group
-        if g is not None:
-            o.key_value_digest = hashlib.sha256(json.dumps(list(g.keys), separators=(",", ":")).encode()).hexdigest()[:16]
         cap = caps.get(o.capability)
+        if g is not None:
+            o.key_value_digest = None
+            if not g.keys and cap is not None:
+                ident, _others = V.value_slots(cap)
+                raw = (o.attrs or {}).get(ident.name) if ident is not None else None
+                if raw not in (None, ""):
+                    o.key_value_digest = V.value_id(cipher, ident.name, raw)
+            elif g.keys:
+                o.key_value_digest = hashlib.sha256(json.dumps(list(g.keys), separators=(",", ":")).encode()
+                                                    ).hexdigest()[:16]
         if cap is not None:
             for s in cap.slots:
                 if s.role == "means" and s.name in cap.bind and o.attrs.get(s.name):
@@ -189,7 +206,7 @@ def _run(store: Any, *, now: float | None, name: bool, worker: Any, log: LogFn |
             if cap is not None:
                 res.compiled[g.gid] = C.compile_group(g, cap, store, idx)
         res.groups, res.seen = groups, seen
-        _occasion_keys(built.occasions, caps)
+        _occasion_keys(built.occasions, caps, store.cipher)
         planned, counts = W.plan(store, groups, caps, res.compiled, now)
         res.planned = planned
         res.counts.update(counts)
@@ -213,6 +230,7 @@ def _run(store: Any, *, now: float | None, name: bool, worker: Any, log: LogFn |
                                                    prune=True)
             try:
                 store.set_nudge_state(BROWSERS_STATE, json.dumps({"at": now, "browsers": built.browsers}))
+                store.set_nudge_state(RECORDS_STATE, json.dumps({"at": now, "v": 1}))
             except Exception:  # noqa: BLE001
                 pass
         res.counts["occasions"] = len(built.occasions)
@@ -261,12 +279,13 @@ def _backfill(store: Any, res: Result | None, *, worker: Any = None, log: LogFn 
 
 
 def _first_pass_due(store: Any, now: float) -> bool:
-    """No full pass was ever written on this database (:data:`BROWSERS_STATE` is absent), and none was tried in the
+    """No full pass was ever written on this database (:data:`BROWSERS_STATE` is absent) or none since the records
+    shipped (:data:`RECORDS_STATE` absent: the one-time move from per-site rows to values), and none was tried in the
     last :data:`FIRST_RETRY_S` by this process."""
     if now - _first_tried_at < FIRST_RETRY_S:
         return False
     try:
-        return not store.nudge_state(BROWSERS_STATE)
+        return not store.nudge_state(BROWSERS_STATE) or not store.nudge_state(RECORDS_STATE)
     except Exception:  # noqa: BLE001 - unknown: the incremental pass, as usual
         return False
 
@@ -348,7 +367,7 @@ def _incremental(store: Any, *, now: float, log: LogFn | None) -> dict[str, Any]
             if sid is not None:
                 o.group = SimpleNamespace(skill_id=sid, keys=tuple(sorted(keys)))
                 mapped += 1
-        _occasion_keys(built.occasions, idx.by_key)
+        _occasion_keys(built.occasions, idx.by_key, store.cipher)
         # the full pass's joins (a hold with no service, an asked run, a merged send) carried over by end moment / run
         by_moment: dict[int, tuple[int, Any]] = {}
         by_run: dict[str, tuple[int, Any]] = {}
@@ -424,8 +443,10 @@ def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequenc
     ``routines.keyed_onsets`` to it): day-onsets per ``skill:<id>`` (``|<entity key>`` for a capability whose fill slot
     is a ``routine_key``, a playlist) from the user's own timed occasions (never Yuki's or asked ones, never a late
     send's, never a skill whose run commits: sends and joins), the seen ones apart from hold joins (D7). One skill per
-    moment by construction: no ``ambiguous`` key. A usage record (no key value bound) gives onsets only through a
-    ``routine_key`` fill slot (design §4.2)."""
+    moment by construction: no ``ambiguous`` key. A capability's record (``#all``, contract C5) gives onsets per value:
+    ``skill:<record id>|<value id>`` (``occasions.key_value_digest``, the record spec's ``values[].id``: one site, one
+    meeting service; :func:`yuki.skills.learn.values.routine_value` reads it back), or per entity through a
+    ``routine_key`` fill slot (a playlist); a record with no value slot (volume) makes no routine (design §4.2)."""
     from yuki.memory import routines as R
     from yuki.skills.catalog import capabilities
 
@@ -433,7 +454,8 @@ def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequenc
     wanted = {int(i) for i in skill_ids} if skill_ids is not None else None
     lo = since - R.ONSET_GAP_S
     try:
-        rows = store._query("SELECT o.skill_id, o.at, o.kind, o.app, o.entity_key, o.facts, o.capability, s.key"
+        rows = store._query("SELECT o.skill_id, o.at, o.kind, o.app, o.entity_key, o.facts, o.capability, s.key,"
+                            " o.key_value_digest"
                             " FROM occasions o JOIN skills s ON s.id = o.skill_id WHERE o.skill_id IS NOT NULL AND"
                             " o.by = 'user' AND o.context_known = 1 AND o.at >= ? AND o.at < ? ORDER BY o.at",
                             (float(lo), float(until)))
@@ -444,7 +466,9 @@ def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequenc
     out = R.Inputs()
     from yuki.skills.engine import run_commit
 
-    for sid, at, kind, app, ekey, facts, cap_key, skey in rows:
+    from yuki.skills.learn.values import value_slots
+
+    for sid, at, kind, app, ekey, facts, cap_key, skey, kvd in rows:
         if wanted is not None and int(sid) not in wanted:
             continue
         cap = caps.get(str(cap_key))
@@ -455,21 +479,27 @@ def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequenc
             continue
         key = f"skill:{int(sid)}"
         routine_slot = any(s.role == "fill" and s.routine_key for s in cap.slots)
-        # a capability's record (contract C5: ``#all``, its values are data) is a usage record whatever its slots
-        usage = str(skey).endswith("#all")
-        if usage and not routine_slot:
-            # design section 4.2 (review r1 L1): a usage record (nothing bound: the volume record) makes a routine only
-            # through a routine_key fill slot (a playlist), never as itself
-            out.unmapped[f"{kind}|usage"] += 1
-            continue
+        # a capability's record (contract C5: ``#all``): its routines are per value (a site, a meeting service)
+        entity: str | None = None
         if routine_slot:
             if not ekey:
                 out.unmapped[f"{kind}|no_entity"] += 1
                 continue
-            key += f"|{str(ekey)[:16]}"
+            entity = str(ekey)[:16]
+        elif str(skey).endswith("#all"):
+            if value_slots(cap)[0] is None:
+                # design section 4.2 (review r1 L1): a record with no value (volume) makes no routine as itself
+                out.unmapped[f"{kind}|usage"] += 1
+                continue
+            if not kvd:
+                out.unmapped[f"{kind}|no_value"] += 1
+                continue
+            entity = str(kvd)[:16]
+        if entity:
+            key += f"|{entity}"
         if key not in out.keys:
-            out.keys[key] = R.KeyInfo(key, str(skey), str(app or ""), str(kind), str(ekey)[:16] if routine_slot else None,
-                                      False, str(getattr(cap, "kind", "change")))
+            out.keys[key] = R.KeyInfo(key, str(skey), str(app or ""), str(kind), entity, False,
+                                      str(getattr(cap, "kind", "change")))
         out.moments += 1
         every[key].append(float(at))
         try:
@@ -484,5 +514,5 @@ def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequenc
     return out
 
 
-__all__ = ["INCREMENTAL_S", "BROWSERS_STATE", "FIRST_RETRY_S", "Result", "quiet", "run", "rebuild", "incremental",
+__all__ = ["INCREMENTAL_S", "BROWSERS_STATE", "RECORDS_STATE", "FIRST_RETRY_S", "Result", "quiet", "run", "rebuild", "incremental",
            "nightly", "routine_inputs"]

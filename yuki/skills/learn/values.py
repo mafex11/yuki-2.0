@@ -14,13 +14,20 @@ they play) are data on that record, never skills of their own. Each value carrie
 * ``parts`` - the other key slots' values with counts (a site's page kinds: ``{"page": {"watch": 645, ...}}``);
 * ``means`` / ``usual`` - the means slots' options with counts (the browser per site) and the one the user uses
   (>= :data:`USUAL_SHARE` of its uses);
-* ``heard`` - the words an asked run carried for it when they differ from its name;
 * ``everyday`` - ``True`` / ``False`` / ``None`` (unknown): ``False`` is work (never offered, still resolved on
   request); carried from a retired per-value row's naming verdict, and set by the user's "This is work";
 * ``mark`` - the user's say: ``"not_mine"`` (left off the menu, the card and the you-card) or ``None``.
 
 The value bar is light (values are cheap): seen on :data:`MIN_DAYS` days, or asked once. Names come from data, never a
 model call. The record's spec holds them encrypted (``spec_ciphertext``); logs carry counts only.
+
+The user's say outlives a value's idle days: the record's spec also keeps ``marks`` (``{value id: {name, named_by,
+everyday, mark}}``, :func:`marks_of`) for every value that holds a Rename, Not mine or a work / everyday verdict, so a
+value that drops out for a month comes back with its marks (a "This is work" site is never offered when it returns).
+
+Routines on a value (the routine miner keys a record's occasions ``skill:<record id>|<value id>``, the occasions'
+``key_value_digest``): :func:`routine_value` reads the value back, :func:`routine_slots` gives the card run its slot,
+:func:`routine_offerable` its gate (work and not-mine never), :func:`value_onsets` when the user reached it.
 
 Public::
 
@@ -29,6 +36,7 @@ Public::
     known(store, capability=None, *, now=None) -> {cap: [value dicts]}   # RAM-cached by the learned version
     ranked(values, now) -> [value dicts]                          # recency-weighted, this hour first
     mark(store, capability, value_id, action, words="") -> dict   # the Playbook's Rename / Not mine / This is work
+    routine_value(store, key) / routine_slots(store, key) / routine_offerable(value) / value_onsets(store, key, ...)
 """
 
 from __future__ import annotations
@@ -53,6 +61,10 @@ MAX_VALUES = 60
 HALF_LIFE_DAYS = 10.0
 #: The marks the user can set (the Playbook).
 MARKS = ("not_mine",)
+#: A value's fields that are the user's say (or the naming call's work verdict): kept in the record's ``marks``.
+MARK_FIELDS = ("name", "named_by", "everyday", "mark")
+#: At most this many kept marks per record (the values present first).
+MAX_MARKS = 300
 DAY_S = 86400.0
 
 _lock = threading.Lock()
@@ -163,12 +175,7 @@ def build(group: Any, cap: Any, store: Any, now: float, old: dict[str, dict[str,
             top, k = c.most_common(1)[0]
             if k >= 2 and k / sum(c.values()) >= USUAL_SHARE:
                 usual[s.name] = top
-        heard: list[str] = []
         name = _display(cap, ident, raw[vid], its)
-        for o in asked:
-            said = _clean((o.facts or {}).get("said") or "")
-            if said and said.casefold() != name.casefold() and said not in heard:
-                heard.append(said[:40])
         last = max(o.at for o in its)
         out.append({
             "id": vid, "slot": ident.name, "value": raw[vid], "label": name,
@@ -177,7 +184,6 @@ def build(group: Any, cap: Any, store: Any, now: float, old: dict[str, dict[str,
             "n": len(user), "days": len(days), "said": len(asked),
             "first_at": round(min(o.at for o in its), 1), "last_at": round(last, 1),
             "hours": hours, "weekdays": weekdays, "parts": parts, "means": means, "usual": usual,
-            "heard": (list(prior.get("heard") or []) + heard)[:4] if prior.get("heard") else heard[:4],
             "everyday": prior.get("everyday"), "mark": prior.get("mark"),
             "score": round(recency(its, now), 3),
         })
@@ -200,7 +206,8 @@ def recency(occasions: Sequence[Any], now: float) -> float:
 
 
 def hour_weight(value: dict[str, Any], now: float | None = None) -> float:
-    """How much of a value's use falls within an hour of now (0..1), weekday-aware when the weekdays say."""
+    """How much of a value's use falls within an hour of now (0..1), from its hour histogram (weekdays and weekends
+    together: the histogram is not split by day)."""
     now = time.time() if now is None else float(now)
     hours = list(value.get("hours") or [])
     if len(hours) != 24 or not sum(hours):
@@ -220,12 +227,13 @@ def ranked(values: Sequence[dict[str, Any]], now: float | None = None, *, everyd
                                        -int(v.get("n") or 0), str(v.get("id"))))
 
 
-def _records(store: Any) -> list[tuple[int, str, str, dict[str, Any], str]]:
-    """``(row id, key, capability, spec, provenance json)`` of the live values records (decrypted, RAM only)."""
+def _records(store: Any, rid: int | None = None) -> list[tuple[int, str, str, dict[str, Any], str]]:
+    """``(row id, key, capability, spec, provenance json)`` of the live values records (decrypted, RAM only); ``rid``:
+    that row only."""
     rows = store._query(
         "SELECT s.id, s.key, c.key, s.spec_ciphertext, s.provenance FROM skills s JOIN skills c ON c.id ="
         " s.capability_id WHERE s.origin = 'learned' AND s.deleted_at IS NULL AND s.retired_at IS NULL AND"
-        " s.key LIKE '%#all'")
+        " s.key LIKE '%#all'" + (" AND s.id = ?" if rid is not None else ""), (int(rid),) if rid is not None else ())
     out = []
     for rid, key, cap_key, spec_ct, prov in rows:
         try:
@@ -311,6 +319,7 @@ def mark(store: Any, capability: str, vid: str, action: str, words: str = "") ->
                     v["everyday"] = True
                 else:
                     v["mark"] = None
+                spec["marks"] = marks_of(spec.get("marks"), vals)
                 spec_json = json.dumps(spec, sort_keys=True, ensure_ascii=False, default=str)
                 conn.execute("UPDATE skills SET spec_ciphertext = ?, updated_at = ? WHERE id = ?",
                              (store.cipher.encrypt(spec_json), time.time(), int(rid)))
@@ -328,5 +337,135 @@ def mark(store: Any, capability: str, vid: str, action: str, words: str = "") ->
     return done
 
 
-__all__ = ["MIN_DAYS", "MIN_ASKED", "USUAL_SHARE", "MAX_VALUES", "MARKS", "value_slots", "value_id", "build",
-           "recency", "hour_weight", "ranked", "known", "all_values", "mark"]
+def not_mine_ids(store: Any) -> dict[int, set[str]]:
+    """``{record id: the value ids the user marked Not mine}`` (its values and its kept marks): their occasions feed no
+    preference (``yuki.skills.prefs.feed_observed``). Never raises (``{}``)."""
+    out: dict[int, set[str]] = {}
+    try:
+        for rid, _key, _cap, spec, _prov in _records(store):
+            ids = {str(v.get("id")) for v in spec.get("values") or [] if isinstance(v, dict) and v.get("mark") in MARKS}
+            kept = spec.get("marks")
+            ids |= {str(k) for k, f in (kept.items() if isinstance(kept, dict) else ())
+                    if isinstance(f, dict) and f.get("mark") in MARKS}
+            if ids:
+                out[int(rid)] = ids
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
+def holds_mark(v: Any) -> bool:
+    """A value (or a kept mark) that holds the user's say: a Rename, Not mine, or a work / everyday verdict."""
+    return isinstance(v, dict) and bool(v.get("mark") or v.get("everyday") is not None or v.get("named_by") == "user")
+
+
+def marks_of(kept: Any, vals: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """The record's ``marks``: the kept marks (``{value id: fields}``) updated by the current values (a value present
+    now says its own say: a restore lifts its kept mark), at most :data:`MAX_MARKS`, the values present first."""
+    out: dict[str, dict[str, Any]] = {}
+    present = {str(v.get("id")): v for v in vals if isinstance(v, dict) and v.get("id")}
+    for vid, v in present.items():
+        if holds_mark(v):
+            out[vid] = {k: v.get(k) for k in MARK_FIELDS}
+    for vid, f in (kept.items() if isinstance(kept, dict) else ()):
+        if len(out) >= MAX_MARKS:
+            break
+        if str(vid) not in present and holds_mark(f):
+            out[str(vid)] = {k: f.get(k) for k in MARK_FIELDS}
+    return out
+
+
+def _split(key: Any) -> tuple[int, str] | None:
+    """``(record id, value id)`` of a routine key ``skill:<id>|<value id>``, else ``None``."""
+    parts = str(key or "").split("|")
+    if len(parts) != 2 or not parts[0].startswith("skill:") or not parts[1]:
+        return None
+    try:
+        return int(parts[0][6:]), parts[1]
+    except ValueError:
+        return None
+
+
+def routine_value(store: Any, key: Any) -> tuple[str, dict[str, Any]] | None:
+    """For a routine on one value of a capability's record (``skill:<record id>|<value id>``, as
+    ``yuki.skills.learn.routine_inputs`` keys it): ``(capability key, the value as stored)``, marked ones too; ``None``
+    for any other key (a playlist routine's ``|<entity key>``, a per-value row's ``skill:<id>``). Never raises."""
+    got = _split(key)
+    if got is None:
+        return None
+    rid, vid = got
+    try:
+        for _rid, _key, cap_key, spec, _prov in _records(store, rid):
+            for v in spec.get("values") or []:
+                if isinstance(v, dict) and v.get("id") == vid:
+                    return cap_key, v
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def routine_slots(store: Any, key: Any) -> dict[str, Any]:
+    """The card run's slot for a value routine (:func:`routine_value`): ``{value slot: its label}`` (what a request
+    passes for it, the menu's "theirs"), RAM only; ``{}`` for any other key."""
+    got = routine_value(store, key)
+    if got is None:
+        return {}
+    _cap, v = got
+    value = v.get("label") or v.get("value")
+    return {str(v.get("slot")): value} if v.get("slot") and value else {}
+
+
+def routine_offerable(value: dict[str, Any] | None) -> tuple[bool, str]:
+    """A value routine's own gate: never a value the user marked Not mine, never work (``everyday`` False), and only
+    one known to be everyday (``None``: unknown, maybe work). ``(ok, why)``."""
+    if not isinstance(value, dict):
+        return False, "no_value"
+    if value.get("mark") in MARKS:
+        return False, "not_mine"
+    if value.get("everyday") is False:
+        return False, "work"
+    if value.get("everyday") is not True:
+        return False, "may_be_work"
+    return True, "ok"
+
+
+def value_onsets(store: Any, key: Any, since: float, until: float) -> list[float]:
+    """When the user reached a value routine's end in ``[since, until]``, oldest first, never Yuki's own (D18): the
+    record's user occasions of that value (``occasions.key_value_digest``), and the user's own end moments whose bound
+    value is that one (the occasions lag the moments by up to the incremental pass). ``[]`` for any other key. Never
+    raises."""
+    got = _split(key)
+    if got is None:
+        return []
+    rid, vid = got
+    out: set[float] = set()
+    try:
+        for (at,) in store._query("SELECT at FROM occasions WHERE skill_id = ? AND key_value_digest = ? AND by = 'user'"
+                                  " AND at >= ? AND at <= ?", (rid, vid, float(since), float(until))):
+            out.add(float(at))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from yuki.skills.catalog import capabilities
+        from yuki.skills.learn.bind import attrs_for
+        from yuki.skills.learn.occasions import moment_src
+
+        row = store._query("SELECT c.key FROM skills s JOIN skills c ON c.id = s.capability_id WHERE s.id = ?", (rid,))
+        cap = capabilities().get(str(row[0][0])) if row else None
+        ident = value_slots(cap)[0] if cap is not None else None
+        kind = str(getattr(cap, "end", "") or "") if cap is not None else ""
+        if ident is not None and kind:
+            for m in store.moments_between(float(since), float(until) + 1.0, kinds=[kind]):
+                if str(m.get("by") or "user") == "yuki":
+                    continue
+                raw = attrs_for(cap, moment_src(m)).get(ident.name)
+                if raw not in (None, "") and value_id(store.cipher, ident.name, raw) == vid:
+                    out.add(float(m["at"]))
+    except Exception:  # noqa: BLE001
+        pass
+    return sorted(out)
+
+
+__all__ = ["MIN_DAYS", "MIN_ASKED", "USUAL_SHARE", "MAX_VALUES", "MARKS", "MARK_FIELDS", "value_slots", "value_id",
+           "build", "recency", "hour_weight", "ranked", "known", "all_values", "mark", "holds_mark", "marks_of",
+           "not_mine_ids", "routine_value", "routine_slots", "routine_offerable", "value_onsets"]

@@ -178,9 +178,11 @@ def way_lines(store: Any, *, limit: int = WAYS_N) -> list[str]:
     if store is None:
         return []
     try:
+        from yuki.skills.catalog import LIVE_STATES
+
         rows = store._query("SELECT key, name_ciphertext FROM skills WHERE origin = ? AND deleted_at IS NULL AND"
-                            " retired_at IS NULL AND state IN ('candidate', 'trusted') ORDER BY uses DESC,"
-                            " updated_at DESC LIMIT ?", (WAY_ORIGIN, int(limit)))
+                            " retired_at IS NULL AND state IN (" + ",".join("?" * len(LIVE_STATES)) + ") ORDER BY"
+                            " uses DESC, updated_at DESC LIMIT ?", (WAY_ORIGIN, *LIVE_STATES, int(limit)))
     except Exception:  # noqa: BLE001
         return []
     out = []
@@ -226,15 +228,20 @@ def menu_lines(loaded: Loaded, *, store: Any = None, now: float | None = None, c
 
 #: The talker's heading (its menu follows).
 TALKER_HEAD = ("Skills (run_skill with the key; slots only from their words or a name listed). After a line, "
-               "\"theirs\" lists the user's own values for it, best first: match their words to one, or pick one "
-               "when they ask you to choose. An app.way line is a way of theirs: run app.way with its way value:")
+               "\"theirs\" lists the user's own values for it, best first: use it to match their words to one. When "
+               "they leave the choice to Yuki (something they'd like, something chill), never pick from it yourself: "
+               "pass slots choose: true and context: their words, and Yuki picks by their taste (when even the kind is "
+               "left open, the skill they usually use around now). An app.way line is a way of theirs: run app.way "
+               "with its way value:")
 
 
 #: The planner's heading (bSkill): what a line is and how its slots are filled. Generic: no app, no skill, no case.
 #: The route (``skill:<id>``) and the step value's shape are in the core prompt and the plan tool; a send slot left
 #: out is refused by the consent rule (bExec merge note 3), so the heading says to fill it.
 PLANNER_HEAD = ("Each line: - <id>: what it does [slot] or [slot: option | option], then \"theirs\": the user's own "
-                "values for it, best first (an app.way line is a way of theirs: route app.way with its way value). "
+                "values for it, best first, to match their words (an app.way line is a way of theirs: route app.way "
+                "with its way value). When they leave the choice to Yuki, never pick from \"theirs\": give choose: "
+                "true and context: their words, and Yuki picks by their taste. "
                 "Slots only from their words or a listed name or option; leave the rest out (Yuki fills them). A skill that "
                 "sends: its send slot takes the sending option only with consent.commit send, else the other.")
 
@@ -333,10 +340,11 @@ def talker_tool(keys: list[str] | tuple[str, ...]) -> dict[str, Any]:
 
 #: The thinker's tool's fixed head (its menu follows).
 THINKER_HEAD = ("Run a skill: a built-in way to do something on this PC (\"theirs\" after a line lists the user's "
-                "own values for it, best first), or a way of the user's own (an app.way line: run app.way with its "
-                "way value). It takes the route that works on this PC, checked by the PC before it counts as done. Give slots only from "
-                "their words or a name listed; leave the rest out (Yuki fills them from their usuals). Done only when "
-                "its check saw the result. Skills:")
+                "own values for it, best first, to match their words), or a way of the user's own (an app.way line: "
+                "run app.way with its way value). It takes the route that works on this PC, checked by the PC before "
+                "it counts as done. Give slots only from their words or a name listed; leave the rest out (Yuki fills "
+                "them from their usuals). When they leave the choice to Yuki, never pick from \"theirs\": give "
+                "choose: true and context: their words. Done only when its check saw the result. Skills:")
 
 
 def thinker_tool(menu: str, keys: list[str] | tuple[str, ...]) -> dict[str, Any]:

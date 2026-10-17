@@ -351,13 +351,21 @@ def kept_keys(store: Any) -> frozenset[str]:
 
 
 def _own_values(store: Any, existing: dict[str, dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
-    """The record's own last values by id (the user's Rename, marks and the work verdict carry over). RAM only."""
+    """The record's own say by value id: its kept ``marks`` (values idle for a while keep theirs), then its last values
+    (the user's Rename, Not mine and the work verdict carry over). RAM only."""
+    from yuki.skills.learn.values import MARK_FIELDS
+
     old = existing.get(key)
     out: dict[str, dict[str, Any]] = {}
     if old is not None:
-        for v in _old_spec(store, old).get("values") or []:
+        spec = _old_spec(store, old)
+        kept = spec.get("marks")
+        for vid, f in (kept.items() if isinstance(kept, dict) else ()):
+            if isinstance(f, dict):
+                out[str(vid)] = {k: f.get(k) for k in MARK_FIELDS}
+        for v in spec.get("values") or []:
             if isinstance(v, dict) and v.get("id"):
-                out[str(v["id"])] = {k: v.get(k) for k in ("name", "named_by", "everyday", "mark", "heard")}
+                out[str(v["id"])] = {k: v.get(k) for k in MARK_FIELDS}
     return out
 
 
@@ -446,6 +454,10 @@ def plan(store: Any, groups: Sequence[Group], caps: dict[str, Any], compiled: di
             if vals:
                 p.spec["values"] = vals
                 counts["values"] += len(vals)
+            # the user's say outlives a value's idle days (review M1): kept by value id, applied when it comes back
+            marks = V.marks_of(own, vals)
+            if marks:
+                p.spec["marks"] = marks
         p.provenance = provenance(g, cap, p.compiled, store, now)
         if scorer is not None:
             try:

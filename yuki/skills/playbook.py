@@ -247,6 +247,12 @@ def routines(store: Any, now: float) -> list[dict[str, Any]]:
             if got:
                 name = _text(store, got[0][0])
                 bound = dict(_json(store, got[0][1]).get("bound") or {})
+            from yuki.skills.learn.values import routine_value
+
+            one = routine_value(store, r.get("key"))
+            if one is not None:
+                # a routine on one value of a capability's record (a site at lunch): named by that value
+                name, bound = "", {str(one[1].get("slot")): one[1].get("name") or one[1].get("label")}
         except Exception:  # noqa: BLE001
             pass
         cap = caps.get(key.split("#", 1)[0])
@@ -268,9 +274,13 @@ def routines(store: Any, now: float) -> list[dict[str, Any]]:
 def ways(store: Any, now: float) -> list[dict[str, Any]]:
     """Section 4: the user's own ways (contract C4), most used first."""
     try:
+        from yuki.skills.catalog import LIVE_STATES
+
+        # the same rows the menu lists (``menu.way_lines``): a way on the page is one Yuki can run
         rows = store._query("SELECT id, name_ciphertext, provenance, uses, last_used_at, state FROM skills WHERE"
-                            " origin = ? AND deleted_at IS NULL AND retired_at IS NULL ORDER BY uses DESC,"
-                            " updated_at DESC LIMIT 20", (WAY_ORIGIN,))
+                            " origin = ? AND deleted_at IS NULL AND retired_at IS NULL AND state IN ("
+                            + ",".join("?" * len(LIVE_STATES)) + ") ORDER BY uses DESC, updated_at DESC LIMIT 20",
+                            (WAY_ORIGIN, *LIVE_STATES))
     except Exception:  # noqa: BLE001
         return []
     out = []

@@ -391,12 +391,13 @@ def _usuals(store: Any, n: int) -> list[str]:
 
 def _people(store: Any, wide: bool) -> list[str]:
     try:
-        from yuki.memory.contacts import directory
+        from yuki.memory.contacts import DIRECTORY_HEAD, directory
 
-        text = directory(store, chars=PEOPLE_CHARS[1 if wide else 0])
+        text = directory(store, chars=PEOPLE_CHARS[1 if wide else 0]).strip()
+        if text.startswith(DIRECTORY_HEAD):
+            text = text[len(DIRECTORY_HEAD):].strip()     # one header: this card's own
     except Exception:  # noqa: BLE001
         return []
-    text = text.strip()
     return [f"People (who, how their name is heard, where they talk):\n{text}"] if text else []
 
 
@@ -440,12 +441,15 @@ def _slow(store: Any, purpose: str, now: float) -> list[tuple[int, str]]:
     vals = _values(store)
     lines: list[tuple[int, str]] = []
     if wide:
-        lines += [(5, x) for x in _who(store)]
+        lines += [(3, x) for x in _who(store)]
     lines += [(1, x) for x in _usually_now(store, vals, now, wide)]
     lines += [(2, x) for x in _things(store, vals, now, wide)]
     lines += [(3, x) for x in _people(store, wide)]
-    lines += [(4, x) for x in _open(store, 3)]
-    lines += [(4, x) for x in _lately(store)]
+    if wide:
+        # the planner and the judge only: the talker answers "what's due / what did I do" by a lookup (25 Sept), so a
+        # nightly slice of open items is never on its card
+        lines += [(4, x) for x in _open(store, 3)]
+        lines += [(4, x) for x in _lately(store)]
     return lines
 
 
