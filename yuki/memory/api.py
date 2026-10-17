@@ -588,6 +588,20 @@ class MemoryClient:
         USER lines."""
         return str(self.brief_slice(consumer).get("text") or "")
 
+    def you_card(self, purpose: str = "talker") -> str:
+        """The you-card (audit 17 Oct, contract C1; :func:`yuki.memory.youcard.build_you_card`): one compact,
+        code-built page of what Yuki knows about the user for a decider - who they are, what they are doing right now,
+        what they usually do at this hour, their things (sites and usual browser, channels, playlists and what they
+        mean, people with app and heard names, voice channels, their own ways), open loops, a two-line recent past;
+        each line says how sure. ``purpose``: ``talker`` (<= ~1,800 chars), ``planner`` or ``judge`` (<= ~3,000). No
+        model call; cached in RAM. ``""`` on any failure; never raises."""
+        try:
+            from yuki.memory.youcard import build_you_card
+
+            return build_you_card(self.store, purpose=str(purpose or "talker"))
+        except Exception:  # noqa: BLE001
+            return ""
+
     def record_surfaced(self, kind: str, ref: str, brief_ids: Any = (), fact_ids: Any = (), *,
                         session_id: str | None = None, at: float | None = None,
                         brief_at: float | None = None) -> int:

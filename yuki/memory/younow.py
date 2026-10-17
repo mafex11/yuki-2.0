@@ -2050,6 +2050,21 @@ def _render_thinker(you: Any, now: float) -> list[tuple[int, str]]:
     return lines
 
 
+def now_lines(you: Any, now: float | None = None, *, wide: bool = False) -> list[str]:
+    """The you-card's "right now" (contract C1, ``yuki.memory.youcard``): the focus, the day and what just changed;
+    ``wide`` (the planner's and the judge's card) adds the thread now. The thinker render's own lines (priority <= 2),
+    content in RAM only. ``[]`` with no record."""
+    if not you:
+        return []
+    now = time.time() if now is None else float(now)
+    out = []
+    for prio, text in _render_thinker(you, now):
+        if prio > 2 or (not wide and text.startswith("Thread now")):
+            continue
+        out.append(text)
+    return out
+
+
 def _usual_words(u: Any) -> str:
     what = u.get("what") or "their usual"
     name = u.get("name")
@@ -2202,7 +2217,7 @@ __all__ = [
     "SCHEMA_V", "STALE_S", "SECTIONS", "SECTION_CAPS", "RECORD_CAP", "RENDER_CAPS", "CHANGED_KINDS", "SYNTH_KINDS",
     "THINKER_SECTIONS", "TALKER_SECTIONS", "CHANGE_WORDS", "YouConfig", "YouBuilder", "focus_game", "focus_holds",
     "holds_now", "presence_now", "day_began", "day_began_from", "meeting_audio", "render", "change_words", "thaw",
-    "content_free", "live_builder",
+    "content_free", "live_builder", "now_lines",
 ]
 
 
