@@ -1514,7 +1514,14 @@ def _in_call(hands: Any, memory: Any) -> bool:
         return bool(getattr(hands, "in_call", False))
     if memory is None:
         return False
-    calls = _mem(memory, "current_calls", lambda c: c.current_calls(), timeout_s=0.3)
+    # lMsg merge note 5: memory's open calls checked against the live microphone (a call memory still showed open
+    # hours after it ended made the volume ask "whose volume?")
+    try:
+        from yuki.skills.chat import _current_calls
+
+        calls = _current_calls(memory)
+    except Exception:  # noqa: BLE001 - memory's word as before
+        calls = _mem(memory, "current_calls", lambda c: c.current_calls(), timeout_s=0.3)
     return bool(calls) if isinstance(calls, list) else False
 
 

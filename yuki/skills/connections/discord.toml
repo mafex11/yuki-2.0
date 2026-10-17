@@ -47,6 +47,8 @@ uri = "discord://-/channels/{guild}/{channel}"
 # Discord's UI labels per display language (the button shown in an opened voice channel before joining).
 [chat.labels.en]
 join_voice = ["Button", "Join Voice"]
+# the header Discord shows on a voice channel; memory's capture keeps it before the channel's name in the scope
+voice_channel = ["Voice Channel"]
 
 # What is asked before a join while a call is live (review r2 M2): Discord's own call -> it switches channel by itself;
 # any other call (Meet, a WhatsApp call, a Slack huddle, or one memory can't name) stays live, so the join is "as well".
