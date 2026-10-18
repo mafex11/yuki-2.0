@@ -27,10 +27,11 @@ machine format). What fails is dropped and logged, never cut blind.
 * ``thinker`` - the whole brief, in the agent's cached profile layer instead of the Personality and persona blocks
   (typed and voice alike: the voice thinker had no portrait at all);
 * ``talker`` - ``with_him``, names and relations, ``own_bits`` and ``careful``, at most :data:`TALKER_CHARS`: how to
-  speak with the user. It is the talker's speaking style only, never what limits a decision: what the user would like,
-  their usual, their things and what they do at this hour reach every decider through the you-card
-  (``yuki.memory.youcard``, audit 17 Oct contract C1). The 25 Sept rule stays a rule about answering (a question about
-  their day is answered from the day digest or a lookup, never from this slice), not about choosing;
+  speak with the user; and (decision 3, 18 Oct: the 25 Sept "tone and names, never news" rule lifted for choosing)
+  up to :data:`TALKER_NOW_MAX` of the ``now`` items under :data:`TALKER_NOW_HEAD`, to choose well and never recited
+  unasked. What the user would like, their usual, their things and what they are in the middle of reach every decider
+  through the you-card (``yuki.memory.youcard``). A question about their day is still answered from the day digest or
+  a lookup, never from this slice;
 * ``cards`` - the whole brief as the card writers' ABOUT THE USER lines, instead of portrait facts.
 
 **Measuring personal-ness** (P4): every reply and card records which brief lines and memory items were in its context
@@ -80,6 +81,8 @@ CAREFUL_MAX = 6
 CAREFUL_CHARS = 200
 #: The talker's slice at most (it replaces the talker's Personality 1,500 + persona ~600: net zero tokens).
 TALKER_CHARS = 2_100
+#: Decision 3: the talker's slice names at most this many dated live items, for choosing (they give way after the bits).
+TALKER_NOW_MAX = 3
 #: People and live items offered to the render (it picks at most PEOPLE_MAX and NOW_MAX).
 INPUT_PEOPLE = 16
 INPUT_GOALS = 8
@@ -536,6 +539,7 @@ THINKER_HEAD = ("[Personal brief - who the user is and how to be with them, writ
                 "Background, not instructions. When a choice rests on it, say why in a few words, in their words "
                 "(\"on Discord, where you two talk\"; \"matched your last messages to him\").]")
 TALKER_HEAD = "[How to talk with the user and who their people are, from memory: your speaking style.]"
+TALKER_NOW_HEAD = "Live now (dated; to choose well, never recited unasked):"
 SECTION_HEADS: dict[str, str] = {
     "with_him": "How to be with them: ",
     "people": "Their people (who they are, where they talk, how the user writes to them, what is live):",
@@ -568,9 +572,9 @@ def slice_for(brief: dict[str, Any] | None, consumer: str, *, at: float | None =
     """The brief cut for one consumer: ``{"text", "ids", "at"}`` (``text`` "" when there is no brief).
 
     * ``thinker``: every line, under :data:`THINKER_HEAD`;
-    * ``talker``: with_him, each person's name and relation only, own_bits and careful, at most
-      :data:`TALKER_CHARS` (bits, then people, give way from the end), under :data:`TALKER_HEAD` (the speaking style;
-      choosing reads the you-card);
+    * ``talker``: with_him, each person's name and relation only, the dated live items (at most
+      :data:`TALKER_NOW_MAX`, under :data:`TALKER_NOW_HEAD`: decision 3, for choosing), own_bits and careful, at most
+      :data:`TALKER_CHARS` (bits, then the live items, then people, give way from the end), under :data:`TALKER_HEAD`;
     * ``cards``: every line, one ``- `` line each, for the card writers' ABOUT THE USER.
     """
     if consumer not in CONSUMERS:
@@ -586,11 +590,13 @@ def slice_for(brief: dict[str, Any] | None, consumer: str, *, at: float | None =
     if consumer == "thinker":
         when = f" ({datetime.fromtimestamp(at):%Y-%m-%d})" if at else ""
         return {"text": _render(lines, THINKER_HEAD.format(when=when)), "ids": [i for i, _s, _t in lines], "at": at}
-    # talker: the speaking style (no "now", no routine, no routes: those reach every decider in the you-card)
+    # talker: the speaking style and (decision 3) the dated live items for choosing; no routine, no routes: those reach
+    # every decider in the you-card
     people = [p for p in (brief or {}).get("people") or [] if isinstance(p, dict) and p.get("name")]
     with_him = [x for x in lines if x[1] == "with_him"]
     bits = [x for x in lines if x[1] == "own_bits"]
     careful = [x for x in lines if x[1] == "careful"]
+    live = [x for x in lines if x[1] == "now"][:TALKER_NOW_MAX]
     names = [(f"people.{n}", p) for n, p in enumerate(people, 1)]
 
     def compose() -> str:
@@ -599,6 +605,9 @@ def slice_for(brief: dict[str, Any] | None, consumer: str, *, at: float | None =
         if names:
             parts.append("Their people: " + ", ".join(p["name"] + (f" ({p['relation']})" if p.get("relation") else "")
                                                       for _i, p in names))
+        if live:
+            parts.append(TALKER_NOW_HEAD)
+            parts += [f"- {t}" for _i, _s, t in live]
         if bits:
             parts.append(SECTION_HEADS["own_bits"])
             parts += [f"- {t}" for _i, _s, t in bits]
@@ -606,9 +615,11 @@ def slice_for(brief: dict[str, Any] | None, consumer: str, *, at: float | None =
         return "\n".join(parts)
 
     text = compose()
-    while len(text) > TALKER_CHARS and (bits or names):
+    while len(text) > TALKER_CHARS and (bits or live or names):
         if bits:
-            bits.pop()          # the bits give way from the end first, then the people
+            bits.pop()          # the bits give way from the end first, then the live items, then the people
+        elif live:
+            live.pop()
         else:
             names.pop()
         text = compose()
@@ -616,8 +627,8 @@ def slice_for(brief: dict[str, Any] | None, consumer: str, *, at: float | None =
         room = max(120, TALKER_CHARS - (len(text) - len(with_him[0][2])))
         with_him = [(with_him[0][0], "with_him", _fit(with_him[0][2], room))]
         text = compose()
-    ids = [i for i, _s, _t in with_him] + [i for i, _p in names] + [i for i, _s, _t in bits] + \
-        [i for i, _s, _t in careful]
+    ids = [i for i, _s, _t in with_him] + [i for i, _p in names] + [i for i, _s, _t in live] + \
+        [i for i, _s, _t in bits] + [i for i, _s, _t in careful]
     return {"text": text[:TALKER_CHARS], "ids": ids, "at": at}
 
 

@@ -18,7 +18,8 @@ request turn and the voice talker's one line, over the Now pipe (below).
 * ``changed`` - what just changed (≤ 12, last 30 min): moments of the known kinds (``page`` left out, unknown kinds
   ignored) plus four transitions this module synthesises: ``call_end``, ``game_end``, ``sit_down``, ``switch``.
 * ``work`` - the thread now (``stands``: where it stands), ≤ 5 active threads, ≤ 5 goals, ≤ 6 items due in 24 h or
-  overdue, the list's size, the work board's counts (``board(replies=False)``), ≤ 3 plans in the next 24 h (the
+  overdue, the list's size, the work board's counts (``board(replies=False)``; ``waiting_on`` counts the open loops
+  judged "waiting") and ``waiting`` (who those are, ≤ 2 names, newest first), ≤ 3 plans in the next 24 h (the
   events scan's dated events). ``overdue`` is right as of the build (a rebuild is due when it turns); readers that
   care compare ``due_at`` with their own now, as :func:`render` does.
 * ``usual`` (yUsual) - the user's routines (``yuki.memory.routines``, mined nightly from the skill learner's
@@ -84,8 +85,11 @@ re-ask instead of polling. The voice wake path never reads it.
 **Renderers** (pure; content in RAM only, never logged): ``render(you, "cards")`` (the card writer, ≤ 2,500),
 ``render(you, "thinker")`` (the brain's request turn, ≤ 1,200: focus and the day, what just changed for "that" / "it",
 the thread now and the top threads with next steps, due and overdue items, the usual now and the confirmed usuals),
-``render(you, "talker")`` (one line, ≤ 300: focus words and up to three just-changed items; never to-dos, threads,
-news or the usual now: the 25 Sept rule).
+``render(you, "talker")`` (one line, ≤ 300: focus words, up to three just-changed items and, when room is left, the
+thread now by its title). Decision 3 (18 Oct) replaced the 25 Sept rule for choosing: :func:`middle_words` (the
+talker's you-card) says what the user is in the middle of (the thread now, up to three items due soon, who they wait
+on), marked :data:`MIDDLE_LABEL`: to choose well, never recited unasked. A question about their day is still answered
+by a lookup.
 
 **Publishing** swaps an immutable snapshot by reference: sections are frozen (``MappingProxyType`` and tuples) and
 never changed after publishing; :func:`thaw` gives plain dicts and lists (JSON).
@@ -155,6 +159,7 @@ Public API::
     day_began(clips, config, since=, sessions=None) -> (start, gap) | None
     day_began_from(store, now, config) -> (start, gap) | None
     render(you, "cards" | "thinker" | "talker", now=None) -> str   # <= 2,500 / 1,200 / 300 characters (RAM only)
+    middle_words(you, now=None) -> str       # "In the middle of (...): ..." for the talker's card, or ""
     live_builder() -> YouBuilder | None      # this process's live builder (the Now pipe's op "you")
     thaw(you) -> plain dicts and lists
 """
@@ -232,7 +237,7 @@ RECORD_CAP = 12 * 1024
 RENDER_CAPS: dict[str, int] = {"cards": 2500, "thinker": 1200, "talker": 300}
 #: The sections each out-of-process reader asks for (a consumer reads only the sections it renders, §11).
 THINKER_SECTIONS: tuple[str, ...] = ("focus", "presence", "changed", "work", "usual", "prefs")
-TALKER_SECTIONS: tuple[str, ...] = ("focus", "changed")
+TALKER_SECTIONS: tuple[str, ...] = ("focus", "changed", "work")
 #: The talker's line is left out when the record's last beat is older than this when it is read (s): its cache is
 #: refreshed in the background, and a stalled service must not put an old "in VALORANT" in the talker's mouth.
 TALKER_STALE_S = 15.0
@@ -240,6 +245,13 @@ TALKER_STALE_S = 15.0
 THINKER_CHANGED, TALKER_CHANGED = 5, 3
 #: The thinker's threads besides the thread now.
 THINKER_THREADS = 3
+#: Decision 3 (18 Oct): what the user is in the middle of, for the talker to choose well (never recited unasked): the
+#: label both the talker's card and its line carry, the items due soon it names at most, the people they wait on at
+#: most (``work.waiting``: names of the open loops judged "waiting", newest first), and a title's room in it.
+MIDDLE_LABEL = "In the middle of (to choose well; never recited unasked)"
+MIDDLE_DUE_N = 3
+WAITING_MAX = 2
+MIDDLE_TITLE_CHARS = 60
 #: The sections, in the order a beat rebuilds them (focus and presence synthesise transitions ``changed`` shows).
 SECTIONS: tuple[str, ...] = ("focus", "presence", "changed", "work", "usual", "prefs", "about", "cards")
 #: The sections the database probe can mark.
@@ -1517,12 +1529,23 @@ class YouBuilder:
         except Exception:  # noqa: BLE001
             known = False
         board = {"replies_owed": 0, "waiting_on": 0, "coming_up_n": 0}
+        waiting: list[str] = []
         try:
             from yuki.memory import workboard
 
             b = workboard.board(self.store, now, replies=False)
-            board["waiting_on"] = sum(1 for d in (b.get("loops") or {}).values()
-                                      if isinstance(d, dict) and d.get("kind") == "waiting")
+            # the loops still open, newest first: who they wait on (names, as the board's judgment validated them)
+            opened = {lp.id: float(lp.opened_at or 0.0) for lp in self.store.open_loops("open")}
+            waits = sorted(((opened[lid], d) for lid, d in (b.get("loops") or {}).items()
+                            if lid in opened and isinstance(d, dict) and d.get("kind") == "waiting"),
+                           key=lambda x: -x[0])
+            board["waiting_on"] = len(waits)
+            for _at, d in waits:
+                who = _text(d.get("who"), LABEL_CHARS)
+                if who and who.casefold() not in {w.casefold() for w in waiting}:
+                    waiting.append(who)
+                if len(waiting) >= WAITING_MAX:
+                    break
             board["coming_up_n"] = len(b.get("meetings") or [])
             for m in b.get("meetings") or []:   # a meeting leaves "coming up" when it ends (the board's own rule)
                 if isinstance(m, dict) and isinstance(m.get("at"), (int, float)):
@@ -1550,7 +1573,7 @@ class YouBuilder:
         if turns:
             self._due_at("work", min(turns))
         return {"thread_now": thread_now, "threads": threads, "goals": goals, "due": due, "list_n": list_n,
-                "board": board, "plans": plans}, known
+                "board": board, "waiting": waiting, "plans": plans}, known
 
     # -- usual / prefs (yUsual, after phase L) -------------------------------------------------
 
@@ -2050,19 +2073,48 @@ def _render_thinker(you: Any, now: float) -> list[tuple[int, str]]:
     return lines
 
 
-def now_lines(you: Any, now: float | None = None, *, wide: bool = False) -> list[str]:
-    """The you-card's "right now" (contract C1, ``yuki.memory.youcard``): the focus, the day and what just changed;
-    ``wide`` (the planner's and the judge's card) adds the thread now. The thinker render's own lines (priority <= 2),
-    content in RAM only. ``[]`` with no record."""
+def now_lines(you: Any, now: float | None = None) -> list[str]:
+    """The planner's and the judge's you-card "right now" (contract C1, ``yuki.memory.youcard``): the focus, the day,
+    what just changed and the thread now. The thinker render's own lines (priority <= 2), content in RAM only. ``[]``
+    with no record. (The talker's card has :func:`middle_words` instead: its own line carries the focus and the
+    changes every turn.)"""
     if not you:
         return []
     now = time.time() if now is None else float(now)
-    out = []
-    for prio, text in _render_thinker(you, now):
-        if prio > 2 or (not wide and text.startswith("Thread now")):
-            continue
-        out.append(text)
-    return out
+    return [text for prio, text in _render_thinker(you, now) if prio <= 2]
+
+
+def _when_due(d: Any, now: float) -> str:
+    if d["due_at"] < now:
+        return "overdue"
+    day = datetime.fromtimestamp(d["due_at"])
+    gap = (day.date() - datetime.fromtimestamp(now).date()).days
+    when = "today" if gap <= 0 else "tomorrow" if gap == 1 else day.strftime("%a")
+    return when if d.get("all_day") else f"{when} {day:%H:%M}"
+
+
+def middle_words(you: Any, now: float | None = None) -> str:
+    """Decision 3 (18 Oct): what the user is in the middle of, for the talker's you-card, under :data:`MIDDLE_LABEL`
+    (to choose well; never recited unasked): the thread now by its title, up to :data:`MIDDLE_DUE_N` items due soon or
+    overdue by their titles, how many more are open on their list, and who they wait on (:data:`WAITING_MAX` names).
+    Titles and names only (never where a thread stands, never a message). ``""`` with nothing to say. RAM only."""
+    work = (you or {}).get("work") or {}
+    now = time.time() if now is None else float(now)
+    parts = []
+    tn = work.get("thread_now") or {}
+    if tn.get("title"):
+        parts.append(f"the thread \"{_text(tn['title'], MIDDLE_TITLE_CHARS)}\"")
+    due = list(work.get("due") or ())[:MIDDLE_DUE_N]
+    if due:
+        parts.append("due: " + ", ".join(f"\"{_text(d.get('title'), MIDDLE_TITLE_CHARS) or 'an untitled item'}\" "
+                                         f"({_when_due(d, now)})" for d in due))
+    more = int(work.get("list_n") or 0) - len(due)
+    if more > 0:
+        parts.append(f"{more} more open on their list")
+    waiting = [w for w in work.get("waiting") or () if w][:WAITING_MAX]
+    if waiting:
+        parts.append("waiting on " + " and ".join(waiting))
+    return f"{MIDDLE_LABEL}: " + "; ".join(parts) + "." if parts else ""
 
 
 def _usual_words(u: Any) -> str:
@@ -2075,9 +2127,11 @@ def _usual_words(u: Any) -> str:
 
 
 def _render_talker(you: Any, now: float) -> str:
-    """The talker's one volatile line (§3.5): focus words and up to :data:`TALKER_CHANGED` just-changed items, as of
-    the record's last beat (its cache is refreshed in the background); ``""`` when nothing holds and nothing changed,
-    or when the record is older than :data:`TALKER_STALE_S`. Never to-dos, threads, news or the usual now."""
+    """The talker's one volatile line (§3.5): focus words, up to :data:`TALKER_CHANGED` just-changed items and, in the
+    room left, the thread now by its title under :data:`MIDDLE_LABEL` (decision 3; the card names the rest), as of the
+    record's last beat (its cache is refreshed in the background); ``""`` when nothing holds, nothing changed and no
+    thread is open, or when the record is older than :data:`TALKER_STALE_S`. Never to-dos' or threads' contents, news
+    or the usual now."""
     try:
         beat_at = float(you["beat_at"])
     except (KeyError, TypeError, ValueError):
@@ -2096,7 +2150,12 @@ def _render_talker(you: Any, now: float) -> str:
             break   # the older items give way
         items.append(item)
     tail = ("Just now: " + "; ".join(items) + ".") if items else ""
-    return f"{head} {tail}".strip()
+    text = f"{head} {tail}".strip()
+    title = " ".join(str(((you.get("work") or {}).get("thread_now") or {}).get("title") or "").split())
+    room = cap - len(text) - len(MIDDLE_LABEL) - 6   # ' ...: "' + '".'
+    if title and room >= 16:   # the thread gives way first: a few words of a title say too little
+        text = f'{text} {MIDDLE_LABEL}: "{_text(title, min(room, MIDDLE_TITLE_CHARS))}".'.strip()
+    return text
 
 
 def render(you: Any, kind: str = "cards", *, now: float | None = None) -> str:
@@ -2104,8 +2163,8 @@ def render(you: Any, kind: str = "cards", *, now: float | None = None) -> str:
     lines give way by priority. ``cards``: the card writer's context (focus, presence and session, work, plans, about,
     today's cards). ``thinker``: the brain's request turn (focus and the day, just changed, thread now and top threads,
     due, the usual now and confirmed usuals; a stale record says "not known", fail closed). ``talker``: one line, focus
-    words and up to three just-changed items (``""`` when there is nothing to say or the record is stale). ``""`` with
-    no record."""
+    words, up to three just-changed items and the thread now in the room left (``""`` when there is nothing to say or
+    the record is stale). ``""`` with no record."""
     if kind not in RENDER_CAPS:
         raise ValueError(f"kind must be one of {', '.join(RENDER_CAPS)}, not {kind!r}")
     if not you:
@@ -2217,7 +2276,7 @@ __all__ = [
     "SCHEMA_V", "STALE_S", "SECTIONS", "SECTION_CAPS", "RECORD_CAP", "RENDER_CAPS", "CHANGED_KINDS", "SYNTH_KINDS",
     "THINKER_SECTIONS", "TALKER_SECTIONS", "CHANGE_WORDS", "YouConfig", "YouBuilder", "focus_game", "focus_holds",
     "holds_now", "presence_now", "day_began", "day_began_from", "meeting_audio", "render", "change_words", "thaw",
-    "content_free", "live_builder", "now_lines",
+    "content_free", "live_builder", "now_lines", "middle_words", "MIDDLE_LABEL",
 ]
 
 

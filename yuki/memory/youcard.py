@@ -2,30 +2,37 @@
 contract C1; reasoning.md §8.2 item 1).
 
 The voice talker, the brain's planner and the card judge each decided blind to the user (reasoning.md §4): the talker
-got "tone and names, never news", the planner a menu with no names, nobody "what does he usually do at this hour".
-This module builds ONE card from the stores that already hold the answer, by code, with no model call:
+got "tone and names, never news" (the 25 Sept rule; lifted for choosing by decision 3, 18 Oct), the planner a menu
+with no names, nobody "what does he usually do at this hour". This module builds ONE card from the stores that
+already hold the answer, by code, with no model call:
 
 * **Who** - the portrait's work and interests, first sentence each (planner and judge);
-* **Right now** - the you-now record (``yuki.memory.younow``: focus, the day, what just changed, the thread now);
+* **Right now** (planner and judge) - the you-now record (``yuki.memory.younow``: focus, the day, what just changed,
+  the thread now);
+* **In the middle of** (talker; decision 3, 18 Oct) - from the same record: the thread now by its title, up to three
+  items due soon, who they wait on (``younow.middle_words``, labelled ``younow.MIDDLE_LABEL``: to choose well, never
+  recited unasked). The talker's own per-turn line carries the focus and what just changed, and its profile layer the
+  people directory, so its card repeats neither;
 * **Usually now** - the active routines due around this hour, the sites, channels and playlists the user picks most
   at this hour (``yuki.skills.learn.values`` hour histograms, ``yuki.skills.taste.top``);
 * **Your things** - sites with their usual browser and a work mark, YouTube channels (by display name, most watched
   first), Spotify playlists with what the user calls them, meeting tabs, the voice channels and servers of the apps
   that join calls (``yuki.skills.discord_route.voice_channels``), the things inside their own ways' apps (their
   projects) and the ways themselves (contract C4 rows: run only when asked, never offered), usual means (``prefs``),
-  and the people block (``yuki.memory.contacts.directory``: names, how each is heard, their app); their weekly
-  routines with days and times (every active one, whatever the day: "what time's my meeting tomorrow");
+  (planner and judge) the people block (``yuki.memory.contacts.directory``: names, how each is heard, their app);
+  their weekly routines with days and times (every active one, whatever the day: "what time's my meeting tomorrow");
 * **Where they left off** (planner only) - per site they come back to, the last page they had in front there, with its
   title and address (``Store.links``), so "put my anime back on" is one open;
-* **Open** - the brief's live items (dated goals, loops, plans), top 3;
-* **Lately** - the last two day digests, one short line each.
+* **Open** (planner and judge; the talker's brief slice carries them) - the brief's live items (dated goals, loops,
+  plans), top 3;
+* **Lately** (planner and judge) - the last two day digests, one short line each.
 
 Every line says how sure it is ("often", "some days", "once", "you said", "dated"). Sizes: talker at most
-:data:`TALKER_CHARS`, planner and judge at most :data:`WIDE_CHARS`; parts give way from the end (lately, then open,
-then who). The slow part (everything but "right now") is cached in RAM per database and purpose for
-:data:`CACHE_S` and rebuilt sooner when the learned rows, routines, tastes, prefs, contacts or portrait change (one
-stamp query); "right now" is read fresh on every call (the you-now record is in RAM). Never written to disk, never
-logged (logs carry sizes only), never in the MCP.
+:data:`TALKER_CHARS`, planner and judge at most :data:`WIDE_CHARS`; the deciding lines come first and parts give way
+from the end (lately, then open, then who). The slow part (everything but the live line) is cached in RAM per database
+and purpose for :data:`CACHE_S` and rebuilt sooner when the learned rows, routines, tastes, prefs, contacts or portrait
+change (one stamp query); the live line ("right now", or the talker's "in the middle of") is read fresh on every call
+(the you-now record is in RAM). Never written to disk, never logged (logs carry sizes only), never in the MCP.
 
 Public::
 
@@ -44,7 +51,7 @@ from typing import Any
 
 PURPOSES: tuple[str, ...] = ("talker", "planner", "judge")
 #: The voice talker reads the card cut at a line boundary to 2,200 chars (kMind: ``mouth.fetch_you_card``): the card
-#: fits it whole, the lines that decide most first (right now, usually now, their things), so nothing is cut there.
+#: fits it whole, the lines that decide most first (in the middle of, usually now, their things): nothing is cut there.
 TALKER_CHARS = 2_200
 WIDE_CHARS = 3_000
 CACHE_S = 60.0
@@ -53,7 +60,8 @@ SITES_N = (8, 10)
 CHANNELS_N = (6, 10)
 PLAYLISTS_N = (5, 8)
 VOICE_N = (4, 6)
-PEOPLE_CHARS = (480, 700)
+#: The people block (planner and judge; the talker's profile layer has the directory at 900).
+PEOPLE_CHARS = 700
 #: A routine is "due around now" within this many minutes of its usual time.
 ROUTINE_NEAR_MIN = 90.0
 #: A value counts as "usual at this hour" when this share of its use falls within an hour of now.
@@ -69,6 +77,8 @@ LEFT_OFF_DAYS = 14.0
 LEFT_OFF_MIN_DAYS = 2
 LEFT_OFF_URL_CHARS = 140
 LEFT_OFF_QUERY_CHARS = 40
+#: The talker's "in the middle of" line at most (a thread, three due titles, two names).
+MIDDLE_CHARS = 420
 
 _lock = threading.Lock()
 #: ``(db path, purpose) -> (built_at, stamp, text)``
@@ -157,17 +167,22 @@ def _you_record(store: Any) -> Any:
         return None
 
 
-def _right_now(store: Any, purpose: str, now: float) -> list[str]:
+def _live(store: Any, purpose: str, now: float) -> list[str]:
+    """The live line: the talker's "in the middle of" (decision 3: its own per-turn line has the focus and the changes),
+    the planner's and the judge's "right now"."""
     you = _you_record(store)
     if not you:
         return []
     try:
-        from yuki.memory.younow import now_lines
+        from yuki.memory.younow import middle_words, now_lines
 
-        lines = now_lines(you, now, wide=purpose != "talker")
+        if purpose == "talker":
+            text = middle_words(you, now)
+            return [_clip(text, MIDDLE_CHARS)] if text else []
+        lines = now_lines(you, now)
     except Exception:  # noqa: BLE001
         return []
-    return [f"Right now (live): {_clip(' '.join(lines), 420 if purpose == 'talker' else 700)}"] if lines else []
+    return [f"Right now (live): {_clip(' '.join(lines), 700)}"] if lines else []
 
 
 def _routines_near(store: Any, now: float) -> list[str]:
@@ -498,9 +513,10 @@ def _live_ways(store: Any) -> list[dict[str, Any]]:
 
 
 def _way_things(ways: Sequence[dict[str, Any]], n: int) -> list[str]:
-    """The user's things inside their ways' apps (a way's item slot: ``spec["item"]["things"]``, the group labels of
-    the rows they pick, e.g. their projects in a coding app), most days first, one line per app."""
-    from yuki.skills.learn.ways import app_title
+    """The user's things inside their ways' apps (a way's item slot: ``spec["item"]["things"]``, the groups the rows
+    they pick sit under, e.g. their projects in a coding app, by the naming call's noun), most days first, one line per
+    app."""
+    from yuki.skills.learn.ways import app_title, group_words
 
     by_app: dict[str, tuple[str, list[dict[str, Any]]]] = {}
     for w in ways:
@@ -508,7 +524,7 @@ def _way_things(ways: Sequence[dict[str, Any]], n: int) -> list[str]:
         things = [t for t in ((spec.get("item") or {}).get("things") or []) if isinstance(t, dict) and t.get("name")]
         if not things:
             continue
-        noun, have = by_app.setdefault(str(w.get("app") or ""), (str(spec.get("item_noun") or "thing"), []))
+        noun, have = by_app.setdefault(str(w.get("app") or ""), (group_words(spec), []))
         names = {t["name"] for t in have}
         have.extend(t for t in things if t["name"] not in names)
     out = []
@@ -516,8 +532,7 @@ def _way_things(ways: Sequence[dict[str, Any]], n: int) -> list[str]:
         things.sort(key=lambda t: (-int(t.get("days") or 0), -int(t.get("picks") or 0)))
         bits = [_clip(t["name"], 28) + (f" ({_sure_days(int(t.get('days') or 0))})" if t.get("days") else "")
                 for t in things[:n]]
-        out.append(f"Their {noun} groups in {app_title(app)} (the ones they pick in; most days first): "
-                   + ", ".join(bits))
+        out.append(f"Their {noun} in {app_title(app)} (the ones they pick in; most days first): " + ", ".join(bits))
     return out
 
 
@@ -556,11 +571,11 @@ def _usuals(store: Any, n: int) -> list[str]:
     return out
 
 
-def _people(store: Any, wide: bool) -> list[str]:
+def _people(store: Any) -> list[str]:
     try:
         from yuki.memory.contacts import DIRECTORY_HEAD, directory
 
-        text = directory(store, chars=PEOPLE_CHARS[1 if wide else 0]).strip()
+        text = directory(store, chars=PEOPLE_CHARS).strip()
         if text.startswith(DIRECTORY_HEAD):
             text = text[len(DIRECTORY_HEAD):].strip()     # one header: this card's own
     except Exception:  # noqa: BLE001
@@ -613,10 +628,10 @@ def _slow(store: Any, purpose: str, now: float) -> list[tuple[int, str]]:
     lines += [(2, x) for x in _things(store, vals, now, wide)]
     if purpose == "planner":
         lines += [(2, x) for x in _left_off(store, now, LEFT_OFF_N)]
-    lines += [(3, x) for x in _people(store, wide)]
     if wide:
-        # the planner and the judge only: the talker answers "what's due / what did I do" by a lookup (25 Sept), so a
-        # nightly slice of open items is never on its card
+        # the talker has the people directory in its profile layer (900 chars), what it is in the middle of on its live
+        # line and the brief's dated items in its brief slice (decision 3, for choosing); "what did I do" stays a lookup
+        lines += [(3, x) for x in _people(store)]
         lines += [(4, x) for x in _open(store, 3)]
         lines += [(4, x) for x in _lately(store)]
     return lines
@@ -637,7 +652,7 @@ def _fit(lines: Sequence[tuple[int, str]], cap: int) -> str:
 
 def build_you_card(store: Any, *, purpose: str = "talker", now: float | None = None) -> str:
     """The you-card for one decider (``purpose`` in :data:`PURPOSES`): ``""`` when nothing is known. Model-free; the
-    slow part cached in RAM (:data:`CACHE_S`, or until a store it reads changes); "right now" read fresh. Raises
+    slow part cached in RAM (:data:`CACHE_S`, or until a store it reads changes); the live line read fresh. Raises
     ``ValueError`` for an unknown purpose only."""
     if purpose not in PURPOSES:
         raise ValueError(f"purpose must be one of {', '.join(PURPOSES)}, not {purpose!r}")
@@ -653,7 +668,7 @@ def build_you_card(store: Any, *, purpose: str = "talker", now: float | None = N
         slow = _slow(store, purpose, now)
         with _lock:
             _cache[key] = (now, stamp, json.dumps(slow, ensure_ascii=False))
-    live = [(0, x) for x in _right_now(store, purpose, now)]
+    live = [(0, x) for x in _live(store, purpose, now)]
     return _fit([*live, *[(int(p), str(t)) for p, t in slow]], cap)
 
 
