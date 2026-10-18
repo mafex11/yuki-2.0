@@ -67,12 +67,17 @@ STATUS_WORDS: dict[str, str] = {
     FAILED: "failed", REFUSED: "not done", ASKED: "needs their yes", STOPPED: "stopped by them",
     CHANGED: "not sent: they changed it", BUSY: "not done: the desk is busy", STARTING: "starting",
     READ: "read", WRITTEN: "kept", DRIVER: "allowed", NOT_DONE: "not done"}
-#: The statuses a call may settle on (with nothing flagged and no then).
+#: The statuses a call may settle on (with nothing flagged and no then; ``already`` only once code's line for it was
+#: heard: else the agent words it, as the talker does under ``all``).
 CLEAN: frozenset[str] = frozenset({DONE, ALREADY, WRITTEN, STOPPED})
 #: Tools the drivers run themselves after the gate allowed them (the conversation's controls, the voice's quick memory
 #: read, the typed ask): the runner returns ``driver`` with the decision.
 DRIVER_TOOLS: frozenset[str] = frozenset({"stay_quiet", "end_conversation", "go_quiet", "more_of_result",
                                           "quick_memory", "ask_user"})
+#: The driver tools that end the agent's say (it chose quiet, or to end the conversation): their ``driver`` result
+#: settles like a clean one (no model round after the agent chose to be quiet). The others' results are the agent's
+#: to read (``more_of_result``, ``quick_memory``, ``ask_user``): never settling.
+QUIET_TOOLS: frozenset[str] = frozenset({"stay_quiet", "end_conversation", "go_quiet"})
 #: How long the desk lease is waited for (s) (``executor.LEASE_WAIT_S``).
 LEASE_WAIT_S = 5.0
 #: The After text's room (``voice.hands.AFTER_CHARS``) and the result text's (``hands``' report cap).
@@ -119,8 +124,10 @@ class OneResult:
     words; ``flags`` / ``flagged``: the diff's three flags. ``then``: what of their request the call left for later.
     ``question``: an ask's question (the agent asks it; their yes is a code fact). ``line``: a refusal's own line (said
     by code when ``final``) or the settle line. ``settle``: code ends the turn (``run_llm`` false), ``silent``: with
-    nothing said. ``countdown``: a send's countdown state; ``swap``: a chip the user tapped. ``decision``: the gate's
-    (RAM only). ``payload``: a driver tool's input, a read's payload (RAM only)."""
+    nothing said. ``heard``: code's line for this call (its done line, its refusal's or the settle line) was heard
+    this turn, said for it now or the very same line earlier (``said`` is ``""`` then: never said twice).
+    ``countdown``: a send's countdown state; ``swap``: a chip the user tapped. ``decision``: the gate's (RAM only).
+    ``payload``: a driver tool's input, a read's payload (RAM only)."""
 
     name: str
     status: str
@@ -138,6 +145,7 @@ class OneResult:
     final: bool = False
     settle: bool = False
     silent: bool = False
+    heard: bool = False
     tidy: bool = False
     countdown: str = ""
     swap: Mapping[str, str] | None = None
@@ -153,8 +161,13 @@ class OneResult:
 
     @property
     def clean(self) -> bool:
-        """It took and leaves nothing: it may settle (:func:`settles`): done, already so, a memory write kept, or a
-        send they stopped; nothing flagged; no ``then``."""
+        """It took and leaves nothing: it may settle (:func:`settles`): done, already so (once code's line for it was
+        heard: an "already" nobody heard is the agent's to word), a memory write kept, or a send they stopped; nothing
+        flagged; no ``then``. The agent's own quiet or end of the conversation (:data:`QUIET_TOOLS`) settles too."""
+        if self.status == DRIVER:
+            return self.name in QUIET_TOOLS
+        if self.status == ALREADY and not self.heard:
+            return False
         return self.status in CLEAN and self.verified is not False and not self.flagged and not self.then
 
     def for_model(self) -> dict[str, Any]:
@@ -189,7 +202,8 @@ class OneResult:
                 "verdict": getattr(decision, "kind", None), "reason": getattr(decision, "reason", None),
                 "row": getattr(decision, "row", None), "flagged": self.flagged,
                 **{f"flag_{k}": bool(v) for k, v in self.flags.items()}, "then": bool(self.then),
-                "said": bool(self.said), "settle": self.settle, "silent": self.silent, "tidy": self.tidy,
+                "said": bool(self.said), "heard": self.heard, "settle": self.settle, "silent": self.silent,
+                "tidy": self.tidy,
                 "countdown": self.countdown or None, "result_chars": len(self.result), "after_chars": len(self.after),
                 "evidence": len(self.evidence), "ms": round(self.ms, 1)}
 
@@ -201,7 +215,8 @@ class OneResult:
 
 def settles(results: Sequence[OneResult]) -> bool:
     """Whether code ends the turn on one reply's results (addendum must-fix 2): a forced settle among them (the budget,
-    the second refusal), or every call clean (took, nothing flagged, no ``then``). No results: no."""
+    the second refusal), or every call clean (took, nothing flagged, no ``then``; an "already so" only once its line
+    was heard; the agent's own ``stay_quiet`` / ``end_conversation`` / ``go_quiet``). No results: no."""
     got = [r for r in results or () if isinstance(r, OneResult)]
     if not got:
         return False
@@ -251,7 +266,8 @@ class Reply:
             return ReplyEnd(True, "", "round")
         forced = next((r for r in got if r.settle), None)
         if forced is not None:
-            line = "" if forced.silent or forced.said == forced.line else forced.line
+            # its line once: not when it was said for it, nor when the same line was heard earlier this turn (``heard``)
+            line = "" if forced.silent or forced.heard or forced.said == forced.line else forced.line
             return ReplyEnd(False, line, "settled")
         return ReplyEnd(False, "", "clean")
 
@@ -348,6 +364,9 @@ class CallContext:
         self.before: Any = None
         #: ``run_skill``: the skill's own app (its Act switch is read on every step of the run).
         self.skill_app = ""
+        #: ``run_skill`` on the hands' own skill path (not the desk hands): the windows this run's own steps typed
+        #: into, hwnd -> the text the desk's registry holds there that is this run's alone (:func:`skill_step`).
+        self.run_typed: dict[int, str] = {}
         #: When the call began (wall clock: an effect read looks at what happened since).
         self.started_wall = time.time()
         self._lock = threading.RLock()
@@ -455,7 +474,13 @@ def skill_step(hands: Any, tool: str, tool_input: Mapping[str, Any], target: Map
     request's desk hands (``uia_route.DeskHands``: the capability's own steps and the gate's grant) with the gate on
     their lasting steps (the send key once for exactly the counted text; the join press on their plain words), or for
     any other hands the gate itself. Typing a send's own text marks it as Yuki's unsent text in that window (the gate
-    reads it at the send key). Fails closed."""
+    reads it at the send key). Fails closed.
+
+    The hands' own skill path (no desk hands: a capability that can neither send nor join, its learned ways): the
+    run's own typing (a search box, a quick switcher) is the run's. While the desk's registry holds that text alone,
+    the run's own next key or click in that window is judged by the gate's commit check with that text known (as the
+    hands judge it under ``all``: ``typed_pending``), not refused as a send by code; held, the text is put back.
+    Text that waited there before the run, or that joined the run's own, keeps the registry's rule."""
     ctx = ctx if ctx is not None else current()
     if ctx is None:
         return SimpleNamespace(allowed=False, question="", source="no_check", why="no ONE call on this thread",
@@ -486,8 +511,64 @@ def skill_step(hands: Any, tool: str, tool_input: Mapping[str, Any], target: Map
             if not getattr(gated, "allowed", False):
                 return gated
         return None
-    verdict = ctx.authorize(tool, tool_input, facts, earlier, force=force)
-    return None if getattr(verdict, "allowed", False) else verdict
+    return _own_run_step(ctx, tool, tool_input, facts, earlier, force=force)
+
+
+def _hwnd_of(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return out or None
+
+
+def _submits(tool: str, tool_input: Mapping[str, Any]) -> bool:
+    """The gate's own reading of a step that sends what waits in its window (``policy._submits``: any click, Enter,
+    typing with Enter); unsure: not (the registry's rule then stands)."""
+    try:
+        return bool(policy._submits(str(tool), dict(tool_input or {})))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _own_run_step(ctx: CallContext, tool: str, tool_input: Mapping[str, Any], facts: dict[str, Any],
+                  earlier: Sequence[str] | None, *, force: bool) -> Any:
+    """One step of a run on the hands' own skill path through the gate (inner), the run's own typing kept as the run's
+    (:func:`skill_step`'s docstring). ``None`` allowed, else the verdict."""
+    hwnd = _hwnd_of(facts.get("hwnd") if facts.get("hwnd") is not None else (tool_input or {}).get("hwnd"))
+    released: str | None = None
+    if hwnd is not None and hwnd in ctx.run_typed and _submits(tool, tool_input):
+        waiting = policy.typed_text(hwnd)
+        if waiting is not None and waiting == ctx.run_typed[hwnd]:
+            # only this run's own typing waits there: its own key or click is the commit check's, with the text known
+            policy.clear_typed(hwnd)
+            released = waiting
+            facts["typed_pending"], facts["typed_text"] = True, waiting
+        else:
+            ctx.run_typed.pop(hwnd, None)   # other text joined it, or it expired: the registry's rule stands
+    before = policy.typed_text(hwnd) if hwnd is not None and tool == "type_text" and released is None else None
+    try:
+        verdict = ctx.authorize(tool, tool_input, facts, earlier, force=force)
+    except Exception:  # noqa: BLE001 - fail closed
+        verdict = SimpleNamespace(allowed=False, question="", source="error", why=policy.LINE_ERROR,
+                                  handover=False, act_off="", row=0)
+    allowed = bool(getattr(verdict, "allowed", False))
+    if released is not None:
+        ctx.run_typed.pop(hwnd, None)
+        if not allowed:
+            if policy.typed_text(hwnd) is None:
+                policy.mark_typed(hwnd, released)   # held: it still waits there, Yuki's, unsent
+        elif tool == "type_text" and policy.typed_text(hwnd):
+            ctx.run_typed[hwnd] = str(policy.typed_text(hwnd))   # what the gate marked after it: the run's alone
+    elif tool == "type_text" and hwnd is not None and allowed:
+        now = policy.typed_text(hwnd)
+        if now and (before is None or before == ctx.run_typed.get(hwnd)):
+            ctx.run_typed[hwnd] = now   # the registry's text there is this run's alone
+        else:
+            ctx.run_typed.pop(hwnd, None)
+    return None if allowed else verdict
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -536,7 +617,10 @@ class Runner:
         countdown: The one send countdown host (``yuki.one.countdown.Countdown``); ``None``: a send is refused (never
             sent unseen).
         memory: The memory the reads, writes and skills use (``None``: the verbs').
-        dispatcher: The Dispatcher reads, ``look`` ids and a send's skill run go through (``None``: the verbs').
+        dispatcher: The Dispatcher reads, ``look`` ids and a send's skill run go through (``None``: the verbs'). It must
+            be the verbs' own (``Verbs.dispatcher``, the hands' ``_dispatcher``) when given: a ``click`` / ``type`` /
+            ``slider`` by ``[id]`` reads the ids from the verbs' dispatcher's latest window read, so ``look window``
+            through any other dispatcher leaves ids no verb finds. Leave it ``None`` unless a check needs a stand-in.
         log: ``log(event, **fields)``, content-free.
         speak: ``speak(text)``: code's lines (the verified done line, a final refusal's line, the settle line), said
             the moment they are known; called on the worker thread (voice: a thread-safe push, :func:`speaker`).
@@ -658,15 +742,15 @@ class Runner:
         settle = bool(getattr(decision, "settle", False))
         silent = bool(getattr(decision, "silent", False))
         final = bool(getattr(decision, "final", False))
-        said = ""
+        said, heard = "", False
         if line and not silent and (final or settle):
-            said = self._say(line, say, state)
+            said, heard = self._speak(line, say, state)
         focus = getattr(decision, "focus", None)
         if focus and getattr(decision, "kind", "") == policy.REFUSE and turn is not None:
             self._bring_forward(int(focus), turn)
         return OneResult(name, status, verified=None, result=line if not final else "",
                          question=str(getattr(decision, "question", "") or ""), line=line, final=final,
-                         settle=settle, silent=silent, said=said, decision=decision,
+                         settle=settle, silent=silent, said=said, heard=heard, decision=decision,
                          verb=str(getattr(decision, "verb", "") or ""), tidy=bool(getattr(decision, "tidy", False)))
 
     def _bring_forward(self, hwnd: int, turn: policy.Turn) -> None:
@@ -686,19 +770,25 @@ class Runner:
             self._emit("one_forward", ok=False, error=type(exc).__name__)
 
     def _say(self, line: str, say: Any, state: RunState) -> str:
-        """Code's line, said once a turn (``""``: nothing said)."""
+        """Code's line, said once a turn (``""``: nothing said now)."""
+        return self._speak(line, say, state)[0]
+
+    @staticmethod
+    def _speak(line: str, say: Any, state: RunState) -> tuple[str, bool]:
+        """Code's line, said once a turn: ``(said now, heard)``; ``heard`` is also true when the very same line was
+        said earlier this turn (not said again). No speaker, or one that failed: neither (the driver reads ``line``)."""
         text = _words(line)
         if not text or say is None:
-            return ""
+            return "", False
         key = text.casefold()
         if key in state.lines:
-            return ""
+            return "", True
         try:
             say(text)
         except Exception:  # noqa: BLE001 - not said: the driver reads ``line``
-            return ""
+            return "", False
         state.lines.add(key)
-        return text
+        return text, True
 
     # -- reads and writes ----------------------------------------------------------------------------------------------
 
@@ -720,9 +810,9 @@ class Runner:
             return self._refused(name, decision, say, state, turn)
         if name == "keep_usual":
             ok, line, facts = self.verbs.run("keep_usual", args)
-            said = self._say(line, say, state) if ok and line else ""
+            said, heard = self._speak(line, say, state) if ok and line else ("", False)
             return OneResult(name, WRITTEN if ok else FAILED, verified=True if ok else None, result=line,
-                             said=said, decision=decision, verb="keep_usual")
+                             said=said, heard=heard, decision=decision, verb="keep_usual")
         try:
             from yuki.brain.tools import run_remember
 
@@ -772,33 +862,45 @@ class Runner:
         resolved = dict(ctx.resolved or args)
         then = T.then_of(args)
         verified = facts.get("verified")
-        status = self._status(ok, verified, facts)
+        # a skill's own question (its resolver's: who to, which one): theirs to answer, never a miss of the step
+        asked = isinstance(facts.get("_asked"), str)
+        status = ASKED if asked else self._status(ok, verified, facts)
         probe_note: dict[str, Any] = {}
         if status == NOT_CONFIRMED and ok and verified is None and not facts.get("refused"):
             status, verified, probe_note = self._effect(name, resolved, facts, ctx)
         if decision is None and status not in (DONE, ALREADY):
             # the verb refused before any gate (its own shape, a window not shown, a stale read): nothing was done
             status = REFUSED if facts.get("refused") or not facts.get("sent_at") else status
-        said = ""
+        said, heard = "", False
         line = ""
         late = budget is not None and budget.late()   # closed by the hard stop while it ran: nothing more is said
         if status == DONE and not then and not late:
             given = args.get("say_when_done") if name != "run_skill" else None
             line = (done_line if done_line is not None else
                     (_words(given) if given is not None else self.verbs.code_line(name, resolved, facts)))
-            said = self._say(line, say, state) if line else ""
+            if not line and done_line is None:
+                # a window or tab step the hands said their own step line for (what it left showing: "Arc is showing
+                # ..."), as they do under ``all``: never a silent focus
+                line = _words(facts.get("step_line"))
+            said, heard = self._speak(line, say, state) if line else ("", False)
+        elif status == ALREADY and not then and not late:
+            # already so: only the hand's own fixed line for it (else the agent words it: it does not settle unheard)
+            line = _words(facts.get("say"))
+            said, heard = self._speak(line, say, state) if line else ("", False)
         # a read's text was capped before its fence (a shell's output): never cut again, so the fence stays whole
         text = str(report or "") if facts.get("read") else str(report or "")[:RESULT_CHARS]
-        result = OneResult(name, status, verified=verified, result=text, said=said, then=then, decision=decision,
-                           verb=verb, tidy=bool(getattr(decision, "tidy", False)))
-        if status not in CLEAN and status not in (NO_CHANGE, STARTING, READ):
+        result = OneResult(name, status, verified=verified, result=text, said=said, heard=heard, then=then,
+                           decision=decision, verb=verb, tidy=bool(getattr(decision, "tidy", False)))
+        if asked:
+            result.question = str(facts.get("_asked") or "")
+        elif status not in CLEAN and status not in (NO_CHANGE, STARTING, READ):
             result.evidence = self._evidence(name, resolved, ok, status, report, facts, probe_note)
             result.owed = str(facts.get("say") or "") or OWED_LINES.get(
                 "blocked" if facts.get("refused") == "blocked" else status, "")
             if facts.get("refused") == "game" and status == REFUSED:
                 # a game in front held it (the verb's backstop, or the skill's own hold): said as it is, by code
                 result.final, result.line = True, _words(facts.get("say")) or policy.LINE_GAME
-                result.said = self._say(result.line, say, state)
+                result.said, result.heard = self._speak(result.line, say, state)
             if facts.get("held") and facts.get("question"):
                 result.status, result.question = ASKED, str(facts.get("question") or "")
         acted = facts.get("sent_at") is not None or status in (DONE, NOT_CONFIRMED, FAILED)
@@ -806,7 +908,9 @@ class Runner:
             self._diff(name, resolved, facts, ctx, result, turn, state, scope=scope)
         if acted:
             state.acted = True
-            if budget is not None and decision is not None:
+            if budget is not None and decision is not None and result.status != ASKED:
+                # an ask (the skill's own question, a hold with a question) is theirs to answer, not a miss: no retry
+                # window opened, the step not barred, a lasting act not stopped for it
                 budget.after_call(name, ctx.first_args or args, acts=True,
                                   ok=status in (DONE, ALREADY, NO_CHANGE, STARTING), lasting=lasting)
             try:
@@ -905,7 +1009,9 @@ class Runner:
             result.flagged = bool(d.any_flag)
             if not d.empty:
                 result.after = desk_diff.render(d, max_chars=AFTER_CHARS)
-            if result.flagged:
+            if result.flagged and not result.tidy:
+                # a new flagged diff opens a tidy-up on its windows; a tidy step's own flagged diff never renews it
+                # (its two steps per flagged diff stay counted)
                 attention = [h for h in [*list(d.attention or []), d.focus_from] if h]
                 turn.flag(own=sorted(own), attention=attention)
             self._emit("one_diff", tool=name, **d.facts())
@@ -965,9 +1071,13 @@ class Runner:
                 return self._not_sent(got, decision, say, state)
             counted = bool(got.counted)
         run_slots = dict(run_args.get("slots") or {}) if isinstance(run_args.get("slots"), Mapping) else {}
-        desk_path = bool(decision.countdown or drafted or decision.join or (
-            sk is not None and rule.skill_sends(sk, run_slots, partial=True))) or not getattr(self.verbs, "skills_on",
-                                                                                              False)
+        # a capability that can send or join runs on the desk hands whatever its slots (a draft, an "open my chat with
+        # Hemanth"): its own steps (the quick switcher's keys, the chat's name, the row's pick) are its data's there;
+        # on the hands' own path every step is the gate's, and the run's own typing would hold its own Enter
+        can_send = sk is not None and (bool(getattr(sk, "sends", False)) or rule.skill_joins(sk)
+                                       or rule.skill_sends(sk, run_slots, partial=True))
+        desk_path = bool(decision.countdown or drafted or decision.join or can_send) \
+            or not getattr(self.verbs, "skills_on", False)
         scope = None
         with _Lease(turn, wanted=self.lease, wait_s=self.lease_wait_s) as lease:
             if not lease.got:
@@ -1003,12 +1113,12 @@ class Runner:
         line = _words(facts.get("done_line")) if facts.get("verified") is True else ""
         if drafted and facts.get("verified") is True and not line:
             line = rule.LINE_DRAFTED   # a draft is never "sent": consent's own words
+        if str(facts.get("outcome") or "") == "asked":
+            # the skill's own question (its resolver's: which one, who to): theirs to answer, the agent asks it; not a
+            # failed step (``_finish`` books no miss for it)
+            facts["_asked"] = _words(facts.get("ask")) or _words(str(report or "").split("\n", 1)[0])
         result = self._finish("run_skill", args, turn, ctx, ok, report, facts, say, state, done_line=line,
                               scope=scope, lasting=bool(decision.countdown or decision.join))
-        if facts.get("outcome") == "asked":
-            # the skill's own question (its resolver's: which one, who to): theirs to answer, the agent asks it
-            question = _words(facts.get("ask")) or _words(str(report or "").split("\n", 1)[0])
-            result.status, result.question = ASKED, question
         if counted:
             result.countdown = "sent"
         if prefs is not None:
@@ -1040,12 +1150,12 @@ class Runner:
                              countdown="busy", decision=decision, verb="run_skill",
                              evidence={"why": "another send was counting down; nothing was sent"})
         if got.state == "cancelled":
-            said = self._say(LINE_STOPPED_SEND, say, state)
-            return OneResult("run_skill", STOPPED, verified=True, result=LINE_STOPPED_SEND, said=said,
+            said, heard = self._speak(LINE_STOPPED_SEND, say, state)
+            return OneResult("run_skill", STOPPED, verified=True, result=LINE_STOPPED_SEND, said=said, heard=heard,
                              line=LINE_STOPPED_SEND, countdown="cancelled", decision=decision, verb="run_skill")
         if getattr(got, "line", ""):
-            said = self._say(got.line, say, state)
-            return OneResult("run_skill", REFUSED, result="", line=got.line, final=True, said=said,
+            said, heard = self._speak(got.line, say, state)
+            return OneResult("run_skill", REFUSED, result="", line=got.line, final=True, said=said, heard=heard,
                              countdown="changed", decision=decision, verb="run_skill",
                              evidence={"why": "held when the countdown ran out", "stuck": why})
         swap = dict(got.swap) if getattr(got, "swap", None) else None
@@ -1089,6 +1199,15 @@ class Runner:
             return False, "no dispatcher to run the skill through; nothing was done", {"refused": True}
         desk = DeskHands(dispatcher, memory=self.memory, words=list(turn.words), earlier=list(turn.earlier),
                          checker=turn.checker(), log=self.log)
+        try:
+            from yuki.voice.hands import _AppVolumeBackend
+
+            if isinstance(desk.backend, _AppVolumeBackend):
+                # the voice hands' backend is the real desk's with the mixer added: the desk hands read the real one
+                # (its Now board: the popups a skill's search sees; their own steps' dispatcher over it)
+                desk.backend = desk.backend._inner
+        except Exception:  # noqa: BLE001 - the wrapped backend still acts; only the popups go unseen
+            pass
         grant = policy.skill_grant(turn, run_args, decision, counted=counted,
                                    person_id=self._grant_person(run_args, decision, sk, to))
         desk.grant = dict(grant)

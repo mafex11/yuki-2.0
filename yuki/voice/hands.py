@@ -7441,7 +7441,9 @@ class Verbs:
             self._gate("shell", args, {})
         except _Refused as exc:
             return self._refusal(exc)
-        command = " ".join(str(args.get("command") or "").split())
+        # the very command the gate's commit check was shown (``tools.as_verb``: the agent's own text), ends trimmed
+        # only: its lines and the spacing inside its strings are the command's own
+        command = str(args.get("command") or "").strip()
         facts: dict[str, Any] = {"sent_at": time.monotonic(), "verified": None}
         with self.hands._acting("shell"):
             outcome = self.dispatcher.dispatch("run_powershell", {"command": command})
