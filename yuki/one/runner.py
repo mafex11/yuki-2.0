@@ -90,6 +90,8 @@ LINE_NO_COUNTDOWN = "Not sent: there's no countdown to stop it here, so nothing 
 LINE_COUNTDOWN_BUSY = "Not sent: another message is counting down right now; nothing was sent."
 #: The desk lease was held by another hand past the wait.
 LINE_BUSY = "Not done: another hand of Yuki's is using the mouth and keyboard right now; nothing was done."
+#: The runner was driven while the brain is not ``one`` (a wiring slip): nothing is done.
+LINE_NOT_ONE = "Not done: Yuki's ONE brain is not switched on here, so nothing was done."
 #: A drafted message whose chat Yuki couldn't see open (``executor.LINE_CHAT_UNCONFIRMED``).
 LINE_CHAT_UNCONFIRMED = "I couldn't confirm the chat is open, so I didn't type anything."
 #: The skill engine's outcomes after which a send did not go (``executor.NOT_SENT_OUTCOMES``).
@@ -616,6 +618,14 @@ class Runner:
     # -- one call ----------------------------------------------------------------------------------------------------
 
     def _run(self, name: str, args: dict[str, Any], turn: policy.Turn, say: Any, state: RunState) -> OneResult:
+        from yuki.one.modes import is_one
+
+        if not is_one(self.settings):
+            # the hands listen to the runner only while the brain is one: a runner driven under another brain (a
+            # wiring slip, e.g. settings that coerced "one" away) refuses everything rather than act on another
+            # brain's checks
+            self._emit("one_run_mode", tool=name, mode="not_one")
+            return OneResult(name, REFUSED, result=LINE_NOT_ONE, line=LINE_NOT_ONE, verb=name)
         spec = T.spec_of(name)
         budget = getattr(turn, "budget", None)
         if spec is None or turn.channel not in spec.channels or (budget is not None and budget.closed):
