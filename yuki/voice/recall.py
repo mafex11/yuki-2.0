@@ -502,11 +502,13 @@ DIGEST_PART_EPISODES = DAY_PART_EPISODES   # review r1 L4: the most the read ret
 DIGEST_HOURS_FOR = 2
 #: The parts of days always kept (the newest), however tight the budget.
 DIGEST_MIN_PARTS = 2
+#: Phase 3 (3.4): the last sentence was "Never bring it up yourself.", softened (the user, 18 Oct) so the talker can
+#: join their day to the moment; the label stays no longer than it was (412 -> 410 characters).
 DIGEST_LABEL = ("[Their days at a glance (memory, read {read}; local times; their day starts at 04:00, so \"today\" is "
-                "since {start}, and hours after midnight belong to the night before). Asked what they did, their "
-                "calls, who they talked to or what they usually pick: answer from here in a few words, no hand-over. "
-                "Not here (another day, after {read}, more detail): quick_memory day, else hand it over. Never bring "
-                "it up yourself.]")
+                "since {start}, after midnight counts as the night before). Asked what they did, their calls, who "
+                "they talked to or what they usually pick: answer from here briefly, no hand-over. Not here (another "
+                "day, after {read}, more detail): quick_memory day, else hand over. Bring it up only when it changes "
+                "what you do.]")
 DIGEST_END = "[End of their days]"
 
 _digest_lock = threading.Lock()

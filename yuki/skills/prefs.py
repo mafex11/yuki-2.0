@@ -140,6 +140,27 @@ def choose(store: Any, slot: str, *, context: str = "", now: float | None = None
     return None
 
 
+def settled(store: Any, slot: str, *, context: str = "", now: float | None = None) -> Choice | None:
+    """The option Yuki uses for ``slot`` without naming it as a guess: :func:`choose`'s rule 1 (the user's confirmed
+    usual) or rule 2 (a clear observed choice); ``None`` below that bar (rule 3's recent choice is a guess, named
+    aloud). The one truth every place that shows "their usual" reads (audit 18 Oct, phase 3.1: the you-card said one
+    browser for a site while this table chose another): ``yuki.skills.learn.values.known`` shows it as a value's
+    ``usual``. Read only; never raises."""
+    choice = choose(store, slot, context=context, now=now)
+    return choice if choice is not None and choice.source in ("usual", "observed") else None
+
+
+def version(store: Any) -> tuple[Any, ...]:
+    """What :func:`settled` depends on, cheaply: the prefs rows' count and newest update, the newest event id, and the
+    day (observed choices decay). ``()`` on a database without the tables. Content-free."""
+    try:
+        row = store._query("SELECT (SELECT count(*) || ':' || coalesce(max(updated_at), 0) FROM prefs),"
+                           " (SELECT coalesce(max(id), 0) FROM pref_events)")
+        return (*tuple(row[0]), int(time.time() // 86400)) if row else ()
+    except Exception:  # noqa: BLE001
+        return ()
+
+
 def usual(store: Any, slot: str, *, context: str = "") -> str | None:
     """The confirmed usual of ``slot``, if any (read only)."""
     try:
@@ -1024,7 +1045,8 @@ class FillPolicyScorer:
         return means, summary
 
 
-__all__ = ["HALF_LIFE_DAYS", "SHARE", "MIN_N", "CONTRADICT_N", "EVENT_WEIGHTS", "Choice", "choose", "usual", "record",
+__all__ = ["HALF_LIFE_DAYS", "SHARE", "MIN_N", "CONTRADICT_N", "EVENT_WEIGHTS", "Choice", "choose", "settled", "version",
+           "usual", "record",
            "keep_usual", "KEEP_QUESTION", "KEEP_PENDING_S", "CORRECTION_S", "QUESTION_ORIGIN", "QUESTION_IMPORTANCE",
            "CHOICES_MAX", "keep_line", "run_sources", "note_correction", "UsualChoice", "usual_choices",
            "parse_choice", "usual_question", "propose", "question_target", "pending_question", "confirm_question",

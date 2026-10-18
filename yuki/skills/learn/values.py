@@ -12,8 +12,10 @@ they play) are data on that record, never skills of their own. Each value carrie
   they asked Yuki for it, when first and last;
 * ``hours`` (24 counts, local) and ``weekdays`` (7 counts, Monday first) - when;
 * ``parts`` - the other key slots' values with counts (a site's page kinds: ``{"page": {"watch": 645, ...}}``);
-* ``means`` / ``usual`` - the means slots' options with counts (the browser per site) and the one the user uses
-  (>= :data:`USUAL_SHARE` of its uses);
+* ``means`` / ``usual`` - the means slots' options with counts (the browser per site) and the one the user uses: for
+  a means slot that reads a preference (a site's browser), the preference's own answer (``yuki.skills.prefs.settled``,
+  read by :func:`known` and :func:`all_values`: one truth, phase 3.1), else the option with >= :data:`USUAL_SHARE` of
+  its uses;
 * ``everyday`` - ``True`` / ``False`` / ``None`` (unknown): ``False`` is work (never offered, still resolved on
   request); carried from a retired per-value row's naming verdict, and set by the user's "This is work";
 * ``mark`` - the user's say: ``"not_mine"`` (left off the menu, the card and the you-card) or ``None``.
@@ -33,7 +35,8 @@ Public::
 
     value_slots(cap) -> (identity slot, other key slots)
     build(group, cap, store, now, old) -> [value dicts]          # the learner's pass (write.plan)
-    known(store, capability=None, *, now=None) -> {cap: [value dicts]}   # RAM-cached by the learned version
+    known(store, capability=None, *, now=None) -> {cap: [value dicts]}   # RAM-cached by the learned + prefs version
+    with_prefs(store, {cap: [values]}) -> same, a preference slot's usual from the preference
     ranked(values, now) -> [value dicts]                          # recency-weighted, this hour first
     mark(store, capability, value_id, action, words="") -> dict   # the Playbook's Rename / Not mine / This is work
     routine_value(store, key) / routine_slots(store, key) / routine_offerable(value) / value_onsets(store, key, ...)
@@ -68,7 +71,7 @@ MAX_MARKS = 300
 DAY_S = 86400.0
 
 _lock = threading.Lock()
-#: ``(learned version, {capability: [values]})`` as last read.
+#: ``(learned version | preferences version, {capability: [values]})`` as last read.
 _cache: tuple[str, dict[str, list[dict[str, Any]]]] = ("", {})
 
 
@@ -83,6 +86,19 @@ def value_slots(cap: Any) -> tuple[Any | None, list[Any]]:
     ent = next((s for s in cap.slots if s.role == "fill" and s.type == "entity" and bind.get(s.name) == "entity"),
                None)
     return ent, []
+
+
+def _means_slots(cap: Any) -> list[Any]:
+    """The means slots a values record counts (``means``): the ones the capability binds from an occasion."""
+    bind = getattr(cap, "bind", None) or {}
+    return [s for s in getattr(cap, "slots", ()) or () if s.role == "means" and s.name in bind]
+
+
+def _pref_slots(cap: Any) -> list[Any]:
+    """Of :func:`_means_slots`, the ones that read a preference (a site's browser): their ``usual`` is the
+    preference's own answer. One predicate for :func:`build` (which leaves their usual out) and :func:`with_prefs`
+    (which fills exactly these), so no slot loses its usual between the two."""
+    return [s for s in _means_slots(cap) if getattr(s, "pref", "")]
 
 
 def _clean(v: Any) -> str:
@@ -125,14 +141,15 @@ def build(group: Any, cap: Any, store: Any, now: float, old: dict[str, dict[str,
     if ident is None:
         return []
     old = old or {}
-    means_slots = [s for s in cap.slots if s.role == "means" and s.name in (cap.bind or {})]
+    means = _means_slots(cap)
+    from_pref = {s.name for s in _pref_slots(cap)}
     lo = now - BAR_DAYS * DAY_S
     per: dict[str, list[Any]] = defaultdict(list)
     raw: dict[str, str] = {}
     every = [*group.occasions, *extra]
     # the means the user's own occasions of this capability used (their browsers): an asked run through another
     # program (a file path "opened" in an editor) gives no value
-    own_means = {_clean((o.attrs or {}).get(s.name)) for o in every if o.by == "user" for s in means_slots}
+    own_means = {_clean((o.attrs or {}).get(s.name)) for o in every if o.by == "user" for s in means}
     for o in every:
         v = _clean((o.attrs or {}).get(ident.name))
         if not v or not o.counts or o.at < lo or o.at > now + 1.0:
@@ -148,7 +165,7 @@ def build(group: Any, cap: Any, store: Any, now: float, old: dict[str, dict[str,
         prior = old.get(vid) or {}
         # asked once counts when that run was checked done and not corrected (a misheard value never becomes a thing)
         said_ok = [o for o in asked if (o.facts or {}).get("verified") and not (o.facts or {}).get("corrected")]
-        if not user and all(any(_clean((o.attrs or {}).get(s.name)) not in own_means | {""} for s in means_slots)
+        if not user and all(any(_clean((o.attrs or {}).get(s.name)) not in own_means | {""} for s in means)
                             for o in asked):
             continue        # only ever asked through a program the user never used for it: not a thing of theirs
         if len(days) < MIN_DAYS and len(said_ok) < MIN_ASKED and not prior.get("named_by"):
@@ -165,13 +182,15 @@ def build(group: Any, cap: Any, store: Any, now: float, old: dict[str, dict[str,
             c = Counter(_clean((o.attrs or {}).get(s.name)) or "" for o in its)
             if c:
                 parts[s.name] = dict(c.most_common(8))
-        means: dict[str, dict[str, int]] = {}
+        used: dict[str, dict[str, int]] = {}
         usual: dict[str, str] = {}
-        for s in means_slots:
+        for s in means:
             c = Counter(_clean((o.attrs or {}).get(s.name)) for o in user if _clean((o.attrs or {}).get(s.name)))
             if not c:
                 continue
-            means[s.name] = dict(c.most_common(5))
+            used[s.name] = dict(c.most_common(5))
+            if s.name in from_pref:
+                continue    # its usual is the preference's (:func:`with_prefs`, read in :func:`known`)
             top, k = c.most_common(1)[0]
             if k >= 2 and k / sum(c.values()) >= USUAL_SHARE:
                 usual[s.name] = top
@@ -183,7 +202,7 @@ def build(group: Any, cap: Any, store: Any, now: float, old: dict[str, dict[str,
             "named_by": prior.get("named_by"),
             "n": len(user), "days": len(days), "said": len(asked),
             "first_at": round(min(o.at for o in its), 1), "last_at": round(last, 1),
-            "hours": hours, "weekdays": weekdays, "parts": parts, "means": means, "usual": usual,
+            "hours": hours, "weekdays": weekdays, "parts": parts, "means": used, "usual": usual,
             "everyday": prior.get("everyday"), "mark": prior.get("mark"),
             "score": round(recency(its, now), 3),
         })
@@ -245,38 +264,81 @@ def _records(store: Any, rid: int | None = None) -> list[tuple[int, str, str, di
     return out
 
 
+def with_prefs(store: Any, table: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
+    """``table`` with each value's ``usual`` for a means slot that reads a preference (a site's browser) taken from
+    the preference itself (:func:`yuki.skills.prefs.settled`: the user's confirmed usual, else a clear observed
+    choice; none below that bar), so every place that shows "their usual" says what the engine will use (audit 18 Oct,
+    phase 3.1: the you-card said one browser for a site, the preference another). The record's own counts stay in
+    ``means``. New dicts; never raises (``table`` as it was)."""
+    try:
+        from yuki.skills import prefs
+        from yuki.skills.catalog import capabilities
+
+        caps = {c.key: c for c in capabilities().capabilities}
+    except Exception:  # noqa: BLE001
+        return table
+    out: dict[str, list[dict[str, Any]]] = {}
+    for cap_key, vals in table.items():
+        cap = caps.get(cap_key)
+        slots = _pref_slots(cap) if cap is not None else []
+        if not slots:
+            out[cap_key] = vals
+            continue
+        names = {s.name for s in slots}
+        fresh = []
+        for v in vals:
+            usual = {k: o for k, o in (v.get("usual") or {}).items() if k not in names}
+            for s in slots:
+                try:
+                    key = s.pref_key(cap_key, {str(v.get("slot") or ""): v.get("value")})
+                    got = prefs.settled(store, key) if "{" not in key else None
+                except Exception:  # noqa: BLE001
+                    got = None
+                if got is not None:
+                    usual[s.name] = got.option
+            fresh.append({**v, "usual": usual})
+        out[cap_key] = fresh
+    return out
+
+
 def known(store: Any, capability: str | None = None, *, now: float | None = None) -> dict[str, list[dict[str, Any]]]:
     """``{capability: [values]}`` from the values records (as the learner last wrote them), each list best first by
-    :func:`ranked` (marked not-mine left out). RAM-cached until the learned rows change (one count query). Never
+    :func:`ranked` (marked not-mine left out), a preference slot's ``usual`` read from the preference
+    (:func:`with_prefs`). RAM-cached until the learned rows or the preferences change (two count queries). Never
     raises (``{}``)."""
     global _cache
     try:
         from yuki.skills.catalog import learned_version
+        from yuki.skills.prefs import version as prefs_version
 
         version = learned_version(store)
+        stamp = f"{version}|{prefs_version(store)}" if version else ""
     except Exception:  # noqa: BLE001
         return {}
     with _lock:
         hit = _cache
-    if hit[0] != version or not version:
+    if hit[0] != stamp or not stamp:
         table: dict[str, list[dict[str, Any]]] = {}
         try:
             for _rid, _key, cap_key, spec, _prov in _records(store):
                 table[cap_key] = [v for v in spec.get("values") or [] if isinstance(v, dict) and v.get("id")]
         except Exception:  # noqa: BLE001
             table = {}
+        table = with_prefs(store, table)
         with _lock:
-            _cache = (version, table)
+            _cache = (stamp, table)
         hit = _cache
     out = {k: ranked(v, now) for k, v in hit[1].items() if capability is None or k == capability}
     return out
 
 
 def all_values(store: Any, capability: str | None = None) -> dict[str, list[dict[str, Any]]]:
-    """Every value as stored, the marked ones too (the Playbook shows and un-marks them). Never raises."""
+    """Every value as stored, the marked ones too (the Playbook shows and un-marks them), a preference slot's
+    ``usual`` read from the preference (:func:`with_prefs`). Never raises."""
     try:
-        return {cap_key: [v for v in spec.get("values") or [] if isinstance(v, dict) and v.get("id")]
-                for _rid, _key, cap_key, spec, _prov in _records(store) if capability is None or cap_key == capability}
+        return with_prefs(store, {
+            cap_key: [v for v in spec.get("values") or [] if isinstance(v, dict) and v.get("id")]
+            for _rid, _key, cap_key, spec, _prov in _records(store) if capability is None or cap_key == capability})
     except Exception:  # noqa: BLE001
         return {}
 
@@ -467,5 +529,5 @@ def value_onsets(store: Any, key: Any, since: float, until: float) -> list[float
 
 
 __all__ = ["MIN_DAYS", "MIN_ASKED", "USUAL_SHARE", "MAX_VALUES", "MARKS", "MARK_FIELDS", "value_slots", "value_id",
-           "build", "recency", "hour_weight", "ranked", "known", "all_values", "mark", "holds_mark", "marks_of",
-           "not_mine_ids", "routine_value", "routine_slots", "routine_offerable", "value_onsets"]
+           "build", "recency", "hour_weight", "ranked", "known", "with_prefs", "all_values", "mark", "holds_mark",
+           "marks_of", "not_mine_ids", "routine_value", "routine_slots", "routine_offerable", "value_onsets"]

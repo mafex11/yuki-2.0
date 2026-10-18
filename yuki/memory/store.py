@@ -3611,6 +3611,54 @@ MIGRATIONS: tuple[str, ...] = (
     """
     SELECT 1;
     """,
+    # 47 (2026-10-18, bMeaning; phase 3.2, contract M1): what the user's things mean to them (yuki.memory.meanings).
+    # One row per thing (kind: site | playlist | channel | way_group | server | voice_channel | person | app | browser;
+    # name_key: a keyed digest of the kind and the name's words), written by the nightly meanings pass: the name, the
+    # stored aliases (JSON list) and the meaning (at most 8 words; NULL: the evidence gives none) encrypted; the
+    # confidence (said 0.9, clear 0.75, inferred 0.6); sources (JSON, content-free: "c:<conversation fact id>",
+    # "p:<portrait fact id>", "t:<turn id>"); the signature of what was sent (asked again only when it changes); the
+    # model and the portrait run. state: live | gone (its evidence is gone). Not exposed by the MCP. Additive only; one
+    # self-contained entry (renumber freely at a merge).
+    """
+    CREATE TABLE IF NOT EXISTS meanings (
+        id                  INTEGER PRIMARY KEY,
+        kind                TEXT NOT NULL,
+        name_key            TEXT NOT NULL,
+        name_ciphertext     TEXT NOT NULL,
+        aliases_ciphertext  TEXT,
+        meaning_ciphertext  TEXT,
+        confidence          REAL,
+        sources             TEXT,
+        signature           TEXT NOT NULL,
+        model               TEXT,
+        run_id              INTEGER,
+        state               TEXT NOT NULL DEFAULT 'live',
+        created_at          REAL NOT NULL,
+        updated_at          REAL NOT NULL,
+        UNIQUE(kind, name_key)
+    );
+    CREATE INDEX IF NOT EXISTS meanings_state ON meanings(state, updated_at);
+    """,
+    # 48 (2026-10-18, bDesk; phase 3.3, docs/research/audit-2026-10-18/builds/bDesk.md): the desk record. One row per
+    # stretch of the desk staying the same (yuki.memory.timeline.DeskRecord): the monitor setup (``screens``, e.g.
+    # "1920x1080@0,0;2560x1440@1920,0"), and per window on a monitor (JSON ``windows``: ``[[app key, monitor index,
+    # how (max | full | win), plays (0/1), seconds in front, seconds mostly visible], ...]``), whether the user was
+    # away, and whether Yuki was acting. Content-free (app keys, numbers, code words; never a title), like the
+    # timeline's ``process`` column. Mined nightly into desk habits (yuki.memory.deskhabits); rows older than 60 days
+    # are deleted there. Additive only; idempotent.
+    """
+    CREATE TABLE IF NOT EXISTS desk_stretches (
+        id          INTEGER PRIMARY KEY,
+        started_at  REAL NOT NULL,
+        ended_at    REAL NOT NULL,
+        screens     TEXT NOT NULL,
+        windows     TEXT NOT NULL,
+        away        INTEGER NOT NULL DEFAULT 0,
+        by_yuki     INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS desk_stretches_at ON desk_stretches(started_at);
+    CREATE INDEX IF NOT EXISTS desk_stretches_end ON desk_stretches(ended_at);
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`

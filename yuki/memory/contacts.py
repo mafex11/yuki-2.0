@@ -70,7 +70,8 @@ Public API (the memory API wraps it: ``MemoryClient.contact``, ``people_director
     resolve(store, ref, near_thread=None, heard=False) -> list[Contact]   # heard: also by sound (names_person)
     rank_routes(store, contact, now=None, near_thread=None) -> Ranking
     card(store, contact, now=None, near_thread=None, samples=STYLE_SAMPLES) -> dict
-    directory(store, now=None, chars=DIRECTORY_CHARS) -> str
+    directory(store, now=None, chars=DIRECTORY_CHARS, head=True) -> str   # closest first (work counts a quarter)
+    work_marks(store) -> WorkMarks                      # the hosts and names the user's work verdicts mark
     named_in(store, text) -> list[(Contact, words)]     # contacts the text names: a name or alias as written, or
                                                         # (one person only) its transliteration
     names_person(store, name, texts, by_sound=True) -> Contact | None  # the one person ``name`` is, when ``texts``
@@ -141,6 +142,13 @@ ROUTE_HALF_LIFE_DAYS = 10.0
 ROUTE_MARGIN = 0.35
 #: Their messages count this much of a route's weight for ranking people in the directory (the user's own count 1).
 THEIRS_WEIGHT = 0.25
+#: One call the person was on counts as this many of the user's own messages in the directory's personal ranking
+#: (decayed like them, :data:`ROUTE_HALF_LIFE_DAYS`): an evening on a call with someone is more than one line to them.
+CALL_WEIGHT = 5.0
+#: In the directory's ranking, use on a work service or in a work app (:func:`work_marks`) counts this share of
+#: personal use: the people the user talks to outside work come first, and a colleague they deal with all day still
+#: outranks someone they wrote to twice (measured on the 18 Oct copy: the brother 6th, the busiest colleague 9th of 12).
+WORK_SHARE = 0.25
 #: Style samples: the user's last own messages per route (decrypted when read, for the resolved person only).
 STYLE_SAMPLES = 5
 SAMPLE_CHARS = 160
@@ -156,9 +164,8 @@ _CACHE_LOCK = threading.Lock()
 #: Per thread, the other senders' counts as of its newest message id (group shares; decrypted once, incrementally).
 _SENDERS: dict[tuple[str, int], tuple[int, dict[str, list[float]]]] = {}
 
-DIRECTORY_HEAD = ("People the user talks to (memory's people index; where they talk, most used first; \"heard as\": "
-                  "speech wrote their name so and the user confirmed it: that person, never ask; about(name) for "
-                  "more):")
+DIRECTORY_HEAD = ("People the user talks to (closest first: chats and calls outside work count most; \"heard as\": "
+                  "speech wrote the name so and the user confirmed it: that person, never ask; about(name) for more):")
 PLACES_HEAD = "Group chats the user writes in most:"
 
 
@@ -904,7 +911,8 @@ def gather(store: Store, *, now: float | None = None, settings_names: Sequence[s
 
 def call_people_seen(store: Store, limit: int = MAX_CALL_PEOPLE) -> dict[str, dict[str, Any]]:
     """Who the call digests saw on the user's calls (their own validated reading of the call's screen): per name, how
-    many calls, how, the last one and where. Never raises."""
+    many calls, how, the last one and where, and each call's app and start (``on``: ``[(app, started_at)]``, for
+    :func:`directory`'s personal ranking). Never raises."""
     out: dict[str, dict[str, Any]] = {}
     try:
         rows = store._query("SELECT call_id, app, started_at, context_ciphertext FROM call_digests"
@@ -921,12 +929,13 @@ def call_people_seen(store: Store, limit: int = MAX_CALL_PEOPLE) -> dict[str, di
             if not name:
                 continue
             g = out.setdefault(name.casefold(), {"name": name, "count": 0, "how": {}, "last": None, "where": [],
-                                                 "calls": []})
+                                                 "calls": [], "on": []})
             g["count"] += 1
             how = str(p.get("how") or "")
             g["how"][how] = g["how"].get(how, 0) + 1
             g["last"] = max(g["last"] or 0.0, float(r["started_at"] or 0.0)) or None
             g["calls"].append(int(r["call_id"]))
+            g["on"].append((str(r["app"] or ""), float(r["started_at"] or 0.0)))
             where = " ".join(str(ctx.get("where") or "").split())
             if where and where not in g["where"] and len(g["where"]) < 3:
                 g["where"].append(where)
@@ -2416,20 +2425,127 @@ def card_text(c: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def directory(store: Store, *, now: float | None = None, chars: int = DIRECTORY_CHARS) -> str:
-    """The compact people block (<= ``chars``): per person their name, relation, the heard forms the user confirmed,
-    their routes (their own direct messages first), then aliases and how the user writes to them while room lasts;
-    then the group chats the user writes in most. No counts or dates (it sits in a cached prompt layer and should
-    change only when the people or their order do). ``""`` when the index is empty. Never raises.
+@dataclass(frozen=True)
+class WorkMarks:
+    """What the user's work verdicts mark (:func:`work_marks`): the hosts and the names (folded words) of their things
+    marked work (``everyday`` False on a learned value: the naming call's verdict or their own "This is work"), and the
+    apps memory knows those hosts as (:func:`service_app`). Data joins only (a route's host, a call's app), never
+    words about work."""
+
+    hosts: frozenset[str] = frozenset()
+    names: frozenset[str] = frozenset()
+
+    def route(self, r: Route) -> bool:
+        """A route on a work service: its host is marked work, or its app is one a work host is known as."""
+        host = (r.service or "").strip().lower()
+        return bool(host and host in self.hosts) or bool(r.app and " ".join(tokens(r.app)) in self.names)
+
+    def call(self, app: str | None) -> bool:
+        """A call in a work app (the call digest's app is a thing marked work, e.g. a meeting service's tab)."""
+        return bool(app) and " ".join(tokens(app)) in self.names
+
+    def page(self, host: str | None) -> bool:
+        """A page on a work site: its host, or a domain it sits under, is marked work (a value's site is its domain,
+        e.g. a work chat's ``slack.com`` holds its team's own host)."""
+        labels = str(host or "").strip().strip(".").casefold().split(".")
+        return any(".".join(labels[i:]) in self.hosts for i in range(len(labels) - 1))
+
+
+def work_marks(store: Store) -> WorkMarks:
+    """The user's work marks from their learned values (``yuki.skills.learn.values.known``: RAM-cached), for
+    :func:`directory`'s personal ranking. A value's label or value with a dot and no space is a host; anything else a
+    name. Empty when nothing is marked (everyone counts as personal then). Never raises."""
+    try:
+        from yuki.skills.learn.values import known
+
+        vals = known(store)
+    except Exception:
+        return WorkMarks()
+    hosts: set[str] = set()
+    names: set[str] = set()
+    for items in vals.values():
+        for v in items:
+            if v.get("everyday") is not False:
+                continue
+            for x in (v.get("label"), v.get("value")):
+                text = " ".join(str(x or "").split()).lower()
+                if not text:
+                    continue
+                if "." in text and " " not in text:
+                    hosts.add(text)
+                elif tokens(text):
+                    names.add(" ".join(tokens(text)))
+    for h in sorted(hosts):
+        try:
+            app = service_app(store, h)
+        except Exception:
+            app = None
+        if app and tokens(app):
+            names.add(" ".join(tokens(app)))
+    return WorkMarks(frozenset(hosts), frozenset(names))
+
+
+def _calls_weight(c: Contact, seen: dict[str, dict[str, Any]], work: WorkMarks, now: float
+                  ) -> tuple[float, float, str]:
+    """``(outside work, in work apps, app)``: the calls the person was on (:func:`call_people_seen`'s ``on``), each
+    :data:`CALL_WEIGHT` decayed like a message, split by :meth:`WorkMarks.call`, and the app most of the calls outside
+    work were in (``""`` with none)."""
+    calls: dict[int, tuple[str, float]] = {}
+    for g in seen.values():
+        if any(tokens(n) and tokens(n) == tokens(g["name"]) for n in c.names):
+            for cid, (app, at) in zip(g.get("calls") or (), g.get("on") or ()):
+                calls[int(cid)] = (app, at)
+    apps: dict[str, int] = {}
+    personal = at_work = 0.0
+    for app, at in calls.values():
+        if work.call(app):
+            at_work += CALL_WEIGHT * _decay(now - at)
+            continue
+        personal += CALL_WEIGHT * _decay(now - at)
+        if app:
+            apps[app] = apps.get(app, 0) + 1
+    return personal, at_work, (max(apps.items(), key=lambda kv: kv[1])[0] if apps else "")
+
+
+#: ``yuki.memory.meanings.meaning_of`` (contract M1) once imported, ``False`` when the module is absent (a failed
+#: import is not cached by Python and costs a path scan each time).
+_MEANING_OF: Any = None
+
+
+def _meaning(store: Store, kind: str, name: str) -> str:
+    """What a thing means to the user (``yuki.memory.meanings.meaning_of``, contract M1), one line; ``""`` without."""
+    global _MEANING_OF
+    if _MEANING_OF is None:
+        try:
+            from yuki.memory.meanings import meaning_of as _MEANING_OF
+        except Exception:
+            _MEANING_OF = False
+    if not _MEANING_OF:
+        return ""
+    try:
+        return " ".join(str(_MEANING_OF(store, kind, name) or "").split())
+    except Exception:
+        return ""
+
+
+def directory(store: Store, *, now: float | None = None, chars: int = DIRECTORY_CHARS, head: bool = True) -> str:
+    """The compact people block (<= ``chars``): per person their name, relation (or, with none, what they are to the
+    user from memory's meanings, contract M1), the heard forms the user confirmed, their routes (their own direct
+    messages first), then aliases and how the user writes to them while room lasts; then the group chats the user
+    writes in most. No counts or dates (it sits in a cached prompt layer and should change only when the people or their
+    order do). ``head``: the :data:`DIRECTORY_HEAD` line first, inside ``chars`` (a caller with its own header passes
+    ``False`` and the people get the whole room). ``""`` when the index is empty. Never raises.
 
     **Who comes first** (live test 17 Oct: the user's best friend, 141 messages that week, was left out while two
-    colleagues' lines filled the block): the people the user names to Yuki (a heard form of their name the user
-    confirmed, :meth:`Contact.heard`) and talks to, then everyone else, each by how much the user deals with them
-    lately: their routes' own-message weight plus :data:`THEIRS_WEIGHT` of the person's messages, a direct message
-    that memory also linked to someone else counted by :func:`dm_claim` (its chat names the other person: none of it;
-    neither or both: a share). **Fitting**: every line first at its shortest (name, relation, heard forms, the apps of
-    their direct messages), as many people as fit in that order; then, while room lasts, the fuller lines for the
-    first ones (aliases and the chats' names, then the tone)."""
+    colleagues' lines filled the block; audit 18 Oct: again, through the card): the people the user is closest to, by
+    use: their routes' own-message weight plus :data:`THEIRS_WEIGHT` of the person's messages, plus the calls they were
+    on (:data:`CALL_WEIGHT` each, decayed), where use on a work service or in a work app (:func:`work_marks`) counts
+    :data:`WORK_SHARE`; ties: the ones the user names to Yuki (a heard form the user confirmed, :meth:`Contact.heard`)
+    first, then by all their use. A direct message that memory also linked
+    to someone else is counted by :func:`dm_claim` (its chat names the other person: none of it; neither or both: a
+    share). **Fitting**: every line first at its shortest (name, relation, heard forms, the apps of their direct
+    messages), as many people as fit in that order; then, while room lasts, the fuller lines for the first ones
+    (aliases and the chats' names, then the tone)."""
     now = time.time() if now is None else float(now)
     try:
         found = people(store)
@@ -2438,12 +2554,17 @@ def directory(store: Store, *, now: float | None = None, chars: int = DIRECTORY_
     if not found:
         return ""
     holders = _dm_holders(found)
-    ranked: list[tuple[bool, float, Contact, list[Route], bool]] = []
+    work = work_marks(store)
+    try:
+        seen = call_people_seen(store, limit=200)
+    except Exception:
+        seen = {}
+    ranked: list[tuple[float, bool, float, Contact, list[Route], bool, str]] = []
     for c in found:
         try:
             ranking = rank_routes(store, c, now=now)
             claims = _claims(c, ranking.routes, holders)
-            weight = 0.0
+            weight = personal = at_work = 0.0
             for r in ranking.routes:
                 claim = claims.get(r.id, CLAIM_OWN)
                 if claim == CLAIM_OTHER:
@@ -2452,44 +2573,53 @@ def directory(store: Store, *, now: float | None = None, chars: int = DIRECTORY_
                 if claim == CLAIM_SHARED:
                     share = 1.0 / (1 + len({o.id for t in r.thread_ids for o in holders.get(int(t), [])
                                             if o.id != c.id}))
-                weight += share * (r.score + THEIRS_WEIGHT * r.weight_theirs)
+                w = share * (r.score + THEIRS_WEIGHT * r.weight_theirs)
+                weight += w
+                if work.route(r):
+                    at_work += w
+                else:
+                    personal += w
+            on_calls, work_calls, call_app = _calls_weight(c, seen, work, now)
+            close_by = personal + on_calls + WORK_SHARE * (at_work + work_calls)
             order = {CLAIM_OWN: 0, CLAIM_SHARED: 1}
             shown = sorted((r for r in ranking.routes if claims.get(r.id, CLAIM_OWN) != CLAIM_OTHER),
                            key=lambda r: (r.kind != "dm", order.get(claims.get(r.id, CLAIM_OWN), 2)))
             close = ranking.close and not ranking.preferred and len(shown) > 1 and shown[:2] == ranking.routes[:2]
         except Exception:
             continue
-        ranked.append((bool(c.heard()) and weight > 0, weight, c, shown, close))
-    ranked.sort(key=lambda x: (not x[0], -x[1], x[2].name.casefold()))
+        ranked.append((round(close_by, 4), bool(c.heard()) and weight > 0, weight, c, shown, close, call_app))
+    ranked.sort(key=lambda x: (-x[0], not x[1], -x[2], x[3].name.casefold()))
     try:
         group = [measure_route(store, r, None, now) for r in places(store)]
     except Exception:
         group = []
     # the group chat the user writes in most on each app (work channels would otherwise fill the line)
     per_service: dict[str, Route] = {}
-    for r in sorted(group, key=lambda r: -r.score):
+    for r in sorted(group, key=lambda r: (work.route(r), -r.score)):     # personal ones first, like the people
         if r.score > 0 and r.service not in per_service:
             per_service[r.service] = r
     group = list(per_service.values())[:DIRECTORY_PLACES]
     places_line = (PLACES_HEAD + " " + "; ".join(_short_route(r) for r in group)) if group else ""
-    room = chars - len(DIRECTORY_HEAD) - (len(places_line) + 1 if places_line else 0)
+    room = chars - (len(DIRECTORY_HEAD) if head else 0) - (len(places_line) + 1 if places_line else 0)
     # 1. as many people as fit, each at its shortest line, in their order (a line too long for the room left is
     # skipped, and a shorter one after it may still fit)
     kept: list[list[Any]] = []
-    for _heard, weight, c, shown, close in ranked:
-        line = _directory_line(c, shown, weight, detail=0, close=close)
+    for _close_by, _heard, weight, c, shown, close, call_app in ranked:
+        meaning = "" if c.relation else _meaning(store, "person", c.name)
+        line = _directory_line(c, shown, weight, detail=0, close=close, meaning=meaning, call_app=call_app)
         if len(line) + 1 <= room:
-            kept.append([c, shown, weight, close, line])
+            kept.append([c, shown, weight, close, line, meaning, call_app])
             room -= len(line) + 1
     # 2. the fuller lines for the first people while room lasts: aliases and chat names for each, then the tone
     for detail in (1, 2):
         for item in kept:
-            c, shown, weight, close, line = item
-            fuller = _directory_line(c, shown, weight, detail=detail, close=close)
+            c, shown, weight, close, line, meaning, call_app = item
+            fuller = _directory_line(c, shown, weight, detail=detail, close=close, meaning=meaning,
+                                     call_app=call_app)
             if len(fuller) - len(line) <= room:
                 room -= len(fuller) - len(line)
                 item[4] = fuller
-    lines = [DIRECTORY_HEAD] + [item[4] for item in kept]
+    lines = ([DIRECTORY_HEAD] if head else []) + [item[4] for item in kept]
     if places_line:
         lines.append(places_line)
     return "\n".join(lines) if kept or places_line else ""
@@ -2504,15 +2634,16 @@ def _short_route(r: Route) -> str:
 
 
 def _directory_line(c: Contact, routes: Sequence[Route], weight: float, *, detail: int = 2,
-                    close: bool = False) -> str:
-    """One person's directory line. ``detail`` 0: name, relation, the heard forms the user confirmed (up to
-    :data:`DIRECTORY_HEARD`; the talker takes them as that person, never asks), and where a message to them goes:
-    the apps of their own direct messages ("Discord DM > WhatsApp DM"), or with none, their first group chat or
-    channel by name; 1: also their other aliases and their first two routes with the chats' names; 2: also how the
-    user writes to them."""
+                    close: bool = False, meaning: str = "", call_app: str = "") -> str:
+    """One person's directory line. ``detail`` 0: name, relation (else ``meaning``: what they are to the user, from
+    memory's meanings), the heard forms the user confirmed (up to :data:`DIRECTORY_HEARD`; the talker takes them as
+    that person, never asks), and where a message to them goes: the apps of their own direct messages ("Discord DM >
+    WhatsApp DM"), or with none, their first group chat or channel by name, or with no chat, the app of their calls
+    (``call_app``); 1: also their other aliases and their first two routes with the chats' names; 2: also how the user
+    writes to them."""
     bits = []
-    if c.relation:
-        bits.append(_words_clip(c.relation, 36))
+    if c.relation or meaning:
+        bits.append(_words_clip(c.relation or meaning, 36))
     if detail >= 1:
         aka = [a["name"] for a in c.aliases if a.get("how") != "heard"][:2]
         if aka:
@@ -2530,6 +2661,8 @@ def _directory_line(c: Contact, routes: Sequence[Route], weight: float, *, detai
         line += ": " + " > ".join(_short_route(r) for r in routes[:2])
         if close and len(routes) > 1:
             line += " (about even)"
+    elif call_app:
+        line += f": on calls in {_words_clip(call_app, 24)} (no chat seen)"
     elif weight <= 0:
         line += ": no chat seen"
     if detail >= 2 and c.tone:

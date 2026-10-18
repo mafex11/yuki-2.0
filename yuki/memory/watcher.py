@@ -316,6 +316,26 @@ EVENT_OBJECT_UNCLOAKED = 0x8018
 #: Events that change what is on screen (a window shown, hidden, cloaked, minimised, moved).
 SURFACE_EVENTS = frozenset({EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
                             EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED})
+
+#: Phase 3.3 (bDesk): who else gets each layout the watcher measures (the timeline's desk record), so the desk is
+#: measured once per change for both. Called on the hook thread with the :class:`yuki.perception.visibility.Layout`
+#: right after the measure; a listener must return at once (the timeline keeps a reference and posts itself a
+#: message). Same process only; never raises into the watcher.
+_layout_listeners: list[Callable[[Any], None]] = []
+
+
+def add_layout_listener(fn: Callable[[Any], None]) -> None:
+    if fn not in _layout_listeners:
+        _layout_listeners.append(fn)
+
+
+def remove_layout_listener(fn: Callable[[Any], None]) -> None:
+    try:
+        _layout_listeners.remove(fn)
+    except ValueError:
+        pass
+
+
 EVENT_OBJECT_FOCUS = 0x8005
 EVENT_OBJECT_NAMECHANGE = 0x800C
 WINEVENT_OUTOFCONTEXT = 0x0000
@@ -1639,6 +1659,11 @@ class Watcher:
         layout = _visibility.layout(foreground=self._fg or None)
         self._layout = layout
         self._layout_ms.append(round(layout.elapsed_ms, 2))
+        for listener in tuple(_layout_listeners):
+            try:
+                listener(layout)
+            except Exception as exc:  # noqa: BLE001 - a listener never breaks capture
+                self._log_error("layout_listener", exc)
         with self._bg_lock:
             self._bg_stats["layouts"] += 1
         share = self.settings.visible_min_share
