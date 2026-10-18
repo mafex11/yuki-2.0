@@ -2884,7 +2884,7 @@ class Hands:
     #: their line (:data:`SKILL_SAID_PLAIN`) is said by code only when no fallback may go (a skill that may already have
     #: sent or joined, data that never hands over, a real question, no thinker to take it).
     SKILL_SAID = ("held_game", "held_call", "other_device")
-    SKILL_SAID_PLAIN = ("unverified", "failed", "asked", "refused", "error")
+    SKILL_SAID_PLAIN = ("unverified", "failed", "asked", "refused", "error", "blocked")
     #: x3 (3c): the outcomes that fall back to the normal way (look at the screen, click, type) when they may.
     SKILL_FALLBACK = ("handed_over", "unverified", "failed", "asked", "refused", "error", "timeout")
     #: x3 (3d): a run_skill still running after this long (s) counts as not finished (far past any designed run).
