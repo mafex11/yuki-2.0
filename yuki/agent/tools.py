@@ -770,6 +770,11 @@ SKILL_SEND_TRAITS = Traits(("click_type", "send_messages"), "input", reaches=Tru
 OP_TRAITS: dict[tuple[str, str], Traits] = {
     ("window_action", "close"): Traits(("open_apps",), "window", destroys=True),
     ("window_action", "focus"): Traits(("open_apps",), "focus"),
+    # P1.4 (yuki.actions.place, run by the brain's executor and the voice hands): undoable, journaled for "put it
+    # back"; they move or show a window and never send input, so they neither destroy nor reach (allowed with no check)
+    ("window_action", "place"): Traits(("open_apps",), "window"),
+    ("window_action", "focus_back"): Traits(("open_apps",), "focus"),
+    ("window_action", "undo"): Traits(("open_apps",), "window"),
     ("tab", "close"): Traits(("open_apps",), "window", destroys=True),
     ("type_text", "submit"): Traits(("click_type", "send_messages"), "input", reaches=True),
 }

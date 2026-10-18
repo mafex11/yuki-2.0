@@ -214,13 +214,87 @@ class Gathered:
         return time.monotonic() - self.overview_at if self.overview_at else 1e9
 
 
+#: P1.1 (18 Oct free-thinker plan): the desk in plain words for the planner (``yuki.perception.situation``, planner
+#: purpose: per monitor, top window first, what covers what, what plays where, maximised or full screen, where the
+#: keyboard is, each window's [hwnd] and rectangle, the monitors' work areas), in place of the raw window list; at most
+#: this many characters, the Now block (what the windows show) after it in the rest of the overview's room.
+SITUATION_CHARS = 1400
+#: The same for a ``look desktop`` (the planner asked for the whole desk).
+SITUATION_LOOK_CHARS = 3000
+#: The window list's own lines the plain-words desk does not say, kept beside it: a window a dialog blocks or that is
+#: disabled (and the dialog), and the apps running with no window (``windows.format_overview``'s fixed markers).
+_LIST_FLAGS = (" BLOCKED by [", " DISABLED", " DIALOG for [")
+_LIST_BACKGROUND = "running with no open window:"
+#: Review L4: the windows a busy desk's plain words left out keep their ids, in one line of at most this many
+#: characters ("Also open: [id] App, [id] App (minimised), ... and N more").
+ALSO_OPEN_CHARS = 400
+
+
+def also_open(windows: Sequence[Any], limit: int = ALSO_OPEN_CHARS) -> str:
+    """One line naming ``windows`` (the desk's windows its plain words left out) by id and app, so the hands can still
+    aim at them; ``""`` when there are none. Never raises."""
+    try:
+        from yuki.perception.situation import name_of
+
+        names = [name_of(w, title=False) + (" (minimised)" if getattr(w, "minimized", False) else "")
+                 for w in windows]
+    except Exception:  # noqa: BLE001
+        return ""
+    head, out = "Also open: ", []
+    for i, name in enumerate(names):
+        more = len(names) - i - 1
+        tail = f" and {more} more" if more else ""
+        if len(head) + len(", ".join([*out, name])) + len(tail) > limit:
+            return f"{head}{', '.join(out)} and {len(names) - i} more" if out else ""
+        out.append(name)
+    return f"{head}{', '.join(out)}" if out else ""
+
+
+def desk_text(text: str, payload: Any, *, limit: int, situation_chars: int = SITUATION_CHARS) -> str:
+    """The overview for the planner (P1.1): the window list's header line (screen, cursor, locale), the desk in plain
+    words (``situation_chars``), the list's lines that say more (:data:`_LIST_FLAGS`, the background apps), then
+    the Now block in the room left of ``limit``. The window list and the Now block are split where the Dispatcher
+    joins them (one blank line: the list has none). The old list as it was when the desk can't be said. Never
+    raises."""
+    text = str(text or "")
+    try:
+        from yuki.perception import situation
+
+        head, _, now = text.partition("\n\n")
+        media = None
+        try:
+            from yuki.perception.system import media_sessions
+
+            media = media_sessions(timeout_s=situation.MEDIA_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 - said without what plays
+            media = None
+        state = situation.from_overview(dict(payload), media=media, audio=None, holds="")
+        desk = situation.render(state, purpose="planner", max_chars=situation_chars)
+        if not desk.strip():
+            return clip(text, limit)
+        lines = head.splitlines()
+        keep = [ln for ln in lines[1:] if ln.startswith("[") and any(f in ln for f in _LIST_FLAGS)]
+        keep += [ln for ln in lines[1:] if ln.startswith(_LIST_BACKGROUND)]
+        also = also_open([w for w in state.windows if f"[{w.hwnd}]" not in desk], ALSO_OPEN_CHARS)
+        body = "\n".join([*lines[:1], desk, *([also] if also else []), *keep])
+        room = limit - len(body) - 2
+        if now.strip() and room > 200:
+            body = f"{body}\n\n{clip(now, room)}"
+        return body
+    except Exception:  # noqa: BLE001 - the window list as it was
+        return clip(text, limit)
+
+
 def read_overview(dispatcher: Any, *, limit: int) -> tuple[str, Any]:
-    """The window list and the Now picture, capped. ``("", None)`` when it could not be read."""
+    """The desk in plain words and the Now picture (:func:`desk_text`), capped. ``("", None)`` when it could not be
+    read."""
     try:
         text, payload, _ms = dispatcher.overview_text()
     except Exception:  # noqa: BLE001 - the planner goes on without it (it can look)
         return "", None
-    return clip(str(text or ""), limit), payload
+    if not isinstance(payload, Mapping) or not payload.get("windows"):
+        return clip(str(text or ""), limit), payload
+    return desk_text(str(text or ""), payload, limit=limit), payload
 
 
 #: The "you right now" slot when nothing could be read: it fails closed (state design 11: ``None`` counts as held).
@@ -998,7 +1072,7 @@ def request_turn(*, words: Sequence[str], channel: str, context: str, gathered: 
     if gathered.places:
         texts.append(gathered.places)
     if gathered.overview:
-        texts.append(fence(gathered.overview, source="the window list and what the windows show", nonce=nonce))
+        texts.append(fence(gathered.overview, source="the desk and what the windows show", nonce=nonce))
     else:
         texts.append("[The window list could not be read just now: look before acting.]")
     seed_text = seed_block(seed, limit=limits.seed_chars, nonce=nonce, hint=seed_hint)
@@ -1272,6 +1346,27 @@ def answer_part_report(result: ExecResult | Mapping[str, Any], plan: Plan | None
     return "\n".join(lines)
 
 
+#: P1.3 (18 Oct free-thinker plan): the one principle of the look after acting (the talker's look says the same).
+KEEP_THEIRS = ("Keep their screen theirs: undo your own side effects with one undoable step and say it in a few words; "
+               "otherwise stay quiet.")
+
+
+def tidy_report(plan: Plan | None, line: str, after: str, *, nonce: str, ask: bool = False, steps: int = 2) -> str:
+    """P1.3: a done plan's acts took something the user had (the executor's after-look: a window in front, playing or
+    with the keyboard covered, the front taken, a pop-up left). Code's line was just said; the planner gets the
+    "After:" block (fenced: it holds window titles) and the principle, for one reply: at most ``steps`` undoable window
+    steps on its own windows, or the one word that nothing needs undoing. ``ask``: the user's tidy dial asks first.
+    Code-written."""
+    pid = plan.id if plan else "null"
+    told = "they are asked first, " if ask else ""
+    return "\n".join([
+        f"{CHECK_LABEL} Plan {pid} is done; Yuki said: {one_line(line, 200)}",
+        fence(after, source="the desk before and after your acts", nonce=nonce),
+        f"{KEEP_THEIRS} A change marked (not from your act) is theirs. One reply: to undo one of yours, plan kind act, "
+        f"at most {steps} window_action steps (place a window your acts brought up, focus_back the one that was in "
+        f"front), done none; {told}code says each in a few words. Else the one word {REST_DONE_WORD}."])
+
+
 def text_back_report(plan: Plan | None, line: str) -> str:
     """pBrain: an act request not confirmed done got a plain reply from the planner: it was not said, and the planner
     gets one more turn with where it stands (code's own line) to finish by steps or ask as a plan. Code-written."""
@@ -1317,7 +1412,8 @@ def answer_report(question: str, answer: str | None) -> str:
     return f"{CHECK_LABEL} You asked: {question}\n{ANSWER_LABEL}: {answer}"
 
 
-__all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "read_places", "Places", "channel_known",
+__all__ = ["ALSO_OPEN_CHARS", "KEEP_THEIRS", "SITUATION_CHARS", "also_open", "desk_text", "tidy_report",
+           "Gathered", "gather", "read_overview", "read_you", "read_people", "read_places", "Places", "channel_known",
            "PLACES_LABEL", "read_profile_parts", "read_card", "beside_card", "CARD_LABEL", "understanding_block",
            "UNDERSTANDING_LABEL", "read_menu",
            "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "seed_memory", "seed_memory_text",

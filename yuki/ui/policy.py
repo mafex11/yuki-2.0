@@ -5,7 +5,7 @@ Stored as ``%LOCALAPPDATA%\\Yuki\\autonomy.json`` and exposed over the window's 
 the levels and the per-app "Act" switches); nothing here decides anything at run time, it only stores what the user
 chose and keeps it inside the user's fixed rules.
 
-Six kinds of action, four levels each (the rungs of the Lattice dial, least to most on its own):
+Seven kinds of action, four levels each (the rungs of the Lattice dial, least to most on its own):
 
 =================  =====================================================================
 ``suggest``        Just suggest: say what could be done, do nothing.
@@ -13,6 +13,9 @@ Six kinds of action, four levels each (the rungs of the Lattice dial, least to m
 ``ask``            Ask before doing: one yes/no, then do it.
 ``do_and_tell``    Do it and tell me: act, then say what was done (with Undo where it can).
 =================  =====================================================================
+
+``tidy`` (P1.5) is the dial for tidy-ups inside a request: ``do_and_tell`` does them and says so, ``ask`` and
+``show_plan`` ask first, ``suggest`` is off (:data:`LEVEL_WORDS_BY_KIND` gives its rungs' words).
 
 The defaults are the Lattice design's (Settings, 2026-10-02) and the user's standing rules:
 
@@ -66,8 +69,18 @@ KINDS: tuple[Kind, ...] = (
          "Always asks first, and only when you say what to send and to whom."),
     Kind("files", "Files", "show_plan", "do_and_tell"),
     Kind("money", "Money", "suggest", "ask", "Never on its own."),
+    # P1.5 (18 Oct): after doing what was asked, undo Yuki's own side effects (a window it brought up over what they
+    # had, the focus it took) with one undoable step, and say so. Only "Just suggest" reads as off; the rungs between
+    # ask first.
+    Kind("tidy", "Tidy-ups inside my requests", "do_and_tell", "do_and_tell",
+         "Only what my own act changed (a window moved to your other screen, focus given back); never your work, never "
+         "a game. Just suggest turns it off."),
 )
 BY_KEY: dict[str, Kind] = {k.key: k for k in KINDS}
+#: Rung words of a kind whose rungs read differently (Settings shows these for that kind's row when given).
+LEVEL_WORDS_BY_KIND: dict[str, dict[str, str]] = {
+    "tidy": {"suggest": "Off", "show_plan": "Ask first", "ask": "Ask first", "do_and_tell": "Do it and tell me"},
+}
 DEFAULTS: dict[str, str] = {k.key: k.default for k in KINDS}
 
 #: Rules no setting changes, stored with the policy so the agent reads them in the same place.
@@ -199,10 +212,13 @@ def describe(levels: dict[str, str] | None = None, path: Path | None = None) -> 
         "version": VERSION,
         "levels": [{"key": lv, "words": LEVEL_WORDS[lv]} for lv in LEVELS],
         "kinds": [{"key": k.key, "words": k.words, "level": levels.get(k.key, k.default), "default": k.default,
-                   "max": k.ceiling, "note": k.note} for k in KINDS],
+                   "max": k.ceiling, "note": k.note,
+                   **({"level_words": dict(LEVEL_WORDS_BY_KIND[k.key])} if k.key in LEVEL_WORDS_BY_KIND else {})}
+                  for k in KINDS],
         "fixed_rules": list(FIXED_RULES),
     }
 
 
-__all__ = ["LEVELS", "LEVEL_WORDS", "KINDS", "BY_KEY", "DEFAULTS", "FIXED_RULES", "Kind", "PolicyError", "app_acts", "set_app_act",
+__all__ = ["LEVELS", "LEVEL_WORDS", "LEVEL_WORDS_BY_KIND",
+           "KINDS", "BY_KEY", "DEFAULTS", "FIXED_RULES", "Kind", "PolicyError", "app_acts", "set_app_act",
            "policy_path", "load", "save", "set_level", "reset", "describe", "clean"]

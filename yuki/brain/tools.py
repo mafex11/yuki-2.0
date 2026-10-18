@@ -38,7 +38,7 @@ PLAN_DESCRIPTION = "Verbs:\n" + _VERB_LINES + "\n" + probe_args_text()
 
 LOOK_TOOL: dict[str, Any] = {
     "name": "look",
-    "description": "Read the screen. desktop: the window list; window: a window's controls, with ids; page: a page's "
+    "description": "Read the screen. desktop: the desk; window: a window's controls, with ids; page: a page's "
                    "text; tabs: a tab strip; focus: what has focus; clipboard; system: time and load.",
     "input_schema": _obj({"what": {"type": "string", "enum": list(LOOK_WHATS)},
                           "window": {"type": "integer", "description": "The hwnd."},
@@ -84,14 +84,14 @@ MEMORY_TOOL: dict[str, Any] = {
 FETCH_TOOL: dict[str, Any] = {
     "name": "fetch",
     "description": "Read a web page (url) or a text file on this PC (path, from start_line) in the background; "
-                   "nothing opens on screen.",
+                   "nothing opens.",
     "input_schema": _obj({"url": {"type": "string"}, "path": {"type": "string"},
                           "start_line": {"type": "integer"}}),
 }
 
 ASK_USER_TOOL: dict[str, Any] = {
     "name": "ask_user",
-    "description": "Ask the user one short question and wait; their reply is the result.",
+    "description": "Ask the user one short question; their reply is the result.",
     "input_schema": _obj({"question": {"type": "string"}}, ["question"]),
 }
 
@@ -135,6 +135,8 @@ TOOL_NAMES: tuple[str, ...] = (PLAN_TOOL, "look", "memory", "fetch", "ask_user",
 READ_TOOLS: frozenset[str] = frozenset({"look", "memory", "fetch"})
 #: The ceiling on the whole block's schema characters (design 5).
 SCHEMA_CHARS = 8000
+#: A ``look desktop``'s room: the desk in plain words and the Now block (P1.1).
+DESK_LOOK_CHARS = 6000
 
 
 def plan_tool() -> dict[str, Any]:
@@ -237,6 +239,11 @@ def run_look(dispatcher: Any, tool_input: Mapping[str, Any], *, nonce: str) -> T
     except Exception as exc:  # noqa: BLE001 - the Dispatcher never raises for tool problems; this is a stand-in's
         return ToolRun("look", inner, False, f"{type(exc).__name__}", input=call)
     text = outcome_text(outcome)
+    payload = getattr(outcome, "payload", None)
+    if what == "desktop" and getattr(outcome, "ok", False) and isinstance(payload, Mapping) and payload.get("windows"):
+        from yuki.brain.context import SITUATION_LOOK_CHARS, desk_text
+
+        text = desk_text(text, payload, limit=DESK_LOOK_CHARS, situation_chars=SITUATION_LOOK_CHARS)   # P1.1: the desk in plain words, then the Now block
     source = {"window": f"the window {call.get('hwnd')}", "page": f"the page in window {call.get('hwnd')}",
               "tabs": f"the tabs of window {call.get('hwnd')}", "clipboard": "the clipboard",
               "focus": "what has focus"}.get(what, "the desktop")

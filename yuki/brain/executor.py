@@ -51,6 +51,21 @@ data (``yuki.agent.untrusted``), capped before the fence goes on; it never goes 
 **The done-check** (``yuki.brain.done``): the required probe for the plan's class, the code line from its evidence,
 coverage, and a background re-check for probes that can flip.
 
+**The after-look** (P1.2-P1.3, 18 Oct free-thinker plan): the desk is read (``yuki.perception.situation.snapshot``,
+a few ms, no screenshot) right before the request's first act step, after its consent and any countdown, and again when
+a plan ends done; ``yuki.perception.diff.compare`` says what the request's acts did to it, with what the request was
+about (``acted``: the windows its open, switch and window steps aimed at) and what its acts brought up (``touched``:
+every act step's window, a skill run's own window or app). When a flag is up (a window that was in front, playing or
+holding the keyboard got covered, the front was taken, a pop-up was left), the result carries an "After:" block
+(:attr:`RunResult.after`) and the Brain gives the planner one tidy-up turn. Yuki's own windows stand for the window
+the user called it from (they are never what the user had). **The tidy-up turn** (:meth:`Executor.tidy_up`): only
+undoable window steps (``plan.TIDY_ACTIONS``: place, focus back), at most :data:`TIDY_STEPS`, and only on what the
+request's own acts changed (:meth:`Executor._tidy_mine`: place a window its acts brought up, give the front back to
+the window that was in front or held their attention), through the same consent rule, asked first when the user's tidy
+dial says ask; never bracketed again (one look per request); no done-check: the steps' own read-back decides, and
+code's words for each step that changed something (:data:`LINE_TIDY`, from what the step's report read back, never the
+model's) are said after the request's line.
+
 **Run rows** (D18): ``MemoryAccess.record_run`` in the shape the old loop writes, each step in its ``_trace_step``
 shape with ``tool`` the Dispatcher name that ran, the run's verdict from the done-check.
 
@@ -98,12 +113,12 @@ PRIMARY_FIELD: dict[str, str] = {"launch_app": "query", "open_url": "url", "wind
 #: from the step's own fields and its resolution).
 VALUE_FIELDS: dict[str, frozenset[str]] = {
     "launch_app": frozenset({"query", "args"}), "open_url": frozenset({"url", "app"}),
-    "window_action": frozenset({"action"}), "tab": frozenset({"action"}),
+    "window_action": frozenset({"action", "monitor", "how"}), "tab": frozenset({"action"}),
     "click": frozenset({"button", "clicks", "toggle_to"}), "type_text": frozenset({"text", "clear", "accept_suggestion"}),
     "hotkey": frozenset({"keys"}), "press": frozenset({"key", "times"}), "scroll": frozenset({"dy", "dx", "until_stopped"}),
     "set_slider": frozenset({"to", "by", "keys"}), "app_volume": frozenset({"app", "change", "level", "mute"}),
     "run_powershell": frozenset({"command"}), "write_clipboard": frozenset({"text"}),
-    "run_skill": frozenset({"skill", "slots"}), "open_yuki": frozenset({"page"}),
+    "run_skill": frozenset({"skill", "slots", "place"}), "open_yuki": frozenset({"page"}),
 }
 #: A ``click``'s plain value (bCore's validator: ``left``, ``right``, ``middle``, ``double``) as the click tool's input.
 CLICK_VALUES: dict[str, dict[str, Any]] = {"left": {}, "right": {"button": "right"}, "middle": {"button": "middle"},
@@ -137,6 +152,54 @@ NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "
 #: kBrain review M1: the skill engine's code words for a run it held before acting: a game in front, a call live
 #: (decision 2: a pick is never put on then). Settled: the run ends on the engine's own line, never a replan.
 HELD_OUTCOMES = {"held_game": "game", "held_call": "call"}
+#: P1.3: the after-look's room: the diff's words and the desk after it (characters).
+AFTER_DIFF_CHARS = 500
+AFTER_DESK_CHARS = 700
+#: P1.3: a tidy-up turn takes at most this many act steps (``plan.TIDY_ACTIONS``).
+TIDY_STEPS = 2
+#: A tidy-up step's words, said after the request's line once the step's own read-back saw it change something (code's
+#: words from its report, never the model's; ``{app}``: the window's app as Windows names it, ``{where}``:
+#: :data:`TIDY_WHERE`).
+LINE_TIDY: dict[str, str] = {"place": "I moved {app} to {where}.", "place_here": "I moved {app}.",
+                             "focus_back": "I put {app} back in front."}
+#: The same as a question, when the user's tidy dial says ask first.
+LINE_TIDY_ASK: dict[str, str] = {"place": "Should I move {app} to {where}?", "place_here": "Should I move {app}?",
+                                 "focus_back": "Should I put {app} back in front?"}
+#: A tidy-up step's window when Windows names no app for it.
+TIDY_NO_APP = "that window"
+#: Where a placed window went, in words: another monitor, else a half of the same one (else ``place_here``).
+TIDY_WHERE: dict[str, str] = {"other": "your other screen", "left": "the left half", "right": "the right half"}
+#: The verbs whose acts the after-look is about (a clipboard write changes nothing on the desk).
+DESK_VERBS = frozenset(ACT_VERBS) - {"write_clipboard"}
+#: The verbs whose step aims at the window it ends on: that window is what the request was about (``acted``).
+ASKED_VERBS = frozenset({"launch_app", "focus_window", "open_url", "window_action", "tab", "open_yuki"})
+_WARMED = False
+
+def _warm_desk() -> None:
+    """Once per process: the after-look's first desk read pays the media and mixer reads' cold start in the background
+    (``situation.warm``), so the read before the first act is ms."""
+    global _WARMED
+    if _WARMED:
+        return
+    _WARMED = True
+    try:
+        from yuki.perception import situation
+
+        situation.warm()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _foreground_now() -> int:
+    """The window in front now (one read-only Win32 call), ``0`` when it can't be read."""
+    try:
+        import ctypes
+
+        return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 #: How long a pause waits for the user to resume before the run stops quietly (s; ``takeover_idle_stop_s``).
 PAUSE_LIMIT_S = 600.0
 
@@ -279,6 +342,10 @@ class RunResult:
     final: bool = False
     outcome: dict[str, Any] | None = None
     parts: list[str] = field(default_factory=list)
+    #: P1.3: on a done run whose acts took something the user had (a diff flag), the "After:" block for the planner's
+    #: tidy-up turn (``""``: nothing flagged, no turn); ``after_facts``: the diff's content-free facts.
+    after: str = ""
+    after_facts: dict[str, Any] = field(default_factory=dict)
 
     def statuses_text(self) -> str:
         """The step statuses in one block, for the replan message."""
@@ -417,6 +484,18 @@ class Executor:
         #: x9 (review r1 M1): the programs that are browsers by machine data, read once per request
         #: (:meth:`_browsers`; ``None``: not read yet)
         self._browser_rows: list[dict[str, Any]] | None = None
+        #: P1.2: the desk right before this request's first act (the after-look's baseline), and the windows or apps
+        #: its acts aimed at (``acted``) and brought up (``touched``)
+        self._desk_first: Any = None
+        self._desk_asked: set[Any] = set()
+        self._desk_touched: set[Any] = set()
+        #: P1.3: the after-look's diff when a flag was up (what a tidy-up may touch: :meth:`_tidy_mine`), and how many
+        #: tidy steps changed something (a done re-check that reads after one is not a false done)
+        self._after_diff: Any = None
+        self._tidy_changed = 0
+        #: P1.3: the tidy-up turn, while it runs (:meth:`tidy_up`): ``{"mode", "acts", "words"}``; ``None`` otherwise
+        self.tidy: dict[str, Any] | None = None
+        _warm_desk()
         self._reset_plan()
         self._skill_context()
 
@@ -492,6 +571,10 @@ class Executor:
         call, why = self._resolve(index, step)
         if call is None:
             return self._stop_if(self._mismatch_result(index, why))
+        if self.tidy is not None:
+            bounded = self._tidy_gate(index, call)   # before any commit check is spent on it
+            if bounded is not None:
+                return self._stop_if(bounded)
         live = self._live(call)
         if consent.may_commit(call, live, self.head):
             self.holding = True
@@ -545,7 +628,15 @@ class Executor:
         if result is not None:
             return self._finished(result)
         self._join_reads()
-        return self._finished(self._done_check())
+        if self.tidy is not None:
+            # the tidy-up's steps were read back by their own act (place verifies the monitor and the state): their
+            # words, said after the request's line; no done-check, no after-look again
+            said = " ".join(w for w in self.tidy["words"] if w)
+            return self._finished(RunResult("done", line=said, final=True, outcome={}))
+        result = self._done_check()
+        if result.status == "done":
+            result.after, result.after_facts = self.after_look()
+        return self._finished(result)
 
     def run(self, plan: Any, *, stop_reason: str | None = None) -> RunResult:
         """A whole plan at once (not streamed): :meth:`begin`, each step, :meth:`finish`."""
@@ -585,6 +676,190 @@ class Executor:
             threading.Thread(target=later, name="yuki-brain-run-row", daemon=True).start()
             return
         self._write_run({**run, **self._recheck_verdict})
+
+    # -- the after-look and the tidy-up turn (P1.2-P1.3) -------------------------------------------------------------
+
+    def tidy_up(self, mode: str) -> None:
+        """The Brain's tidy-up turn begins (the next plan): only undoable window steps (``plan.TIDY_ACTIONS``), at most
+        :data:`TIDY_STEPS`, each asked first when ``mode`` is ``util.TIDY_ASK``; their words are the run's line."""
+        self.tidy = {"mode": str(mode or util.TIDY_DO), "acts": 0, "words": []}
+
+    def after_look(self) -> tuple[str, dict[str, Any]]:
+        """What this request's acts did to the desk (module docstring): ``(the "After:" block, the diff's facts)``;
+        the block is ``""`` when no flag is up (no turn, no cost). Logged content-free. Never raises."""
+        if self.tidy is not None or self._desk_first is None:
+            return "", {}
+        try:
+            from yuki.perception import diff as desk_diff
+            from yuki.perception import situation
+
+            after = self._desk_now()
+            if after is None:
+                return "", {}
+            d = desk_diff.compare(self._desk_first, after, acted=tuple(self._desk_asked),
+                                  touched=tuple(self._desk_touched))
+            facts = d.facts()
+            self._emit_log("after_look", ms=round(float(getattr(after, "ms", 0.0) or 0.0), 1), **facts)
+            if not d.any_flag:
+                return "", facts
+            self._after_diff = d
+            text = desk_diff.render(d, max_chars=AFTER_DIFF_CHARS)
+            desk = situation.render(after, purpose="planner", max_chars=AFTER_DESK_CHARS)
+            return f"After:\n{text}\n\nThe desk now:\n{desk}", facts
+        except Exception as exc:  # noqa: BLE001 - no look: the request ends as before
+            self._emit_log("after_look", error=type(exc).__name__)
+            return "", {}
+
+    def _desk_now(self) -> Any:
+        """The desk now (``situation.snapshot``: windows, visible shares, the keyboard, media, the mixer; the holds are
+        not needed for a diff), with Yuki's own windows standing aside for :meth:`_own_aside`. ``None`` when it can't
+        be read."""
+        try:
+            from yuki.perception import situation
+
+            return self._own_aside(situation.snapshot(holds=""))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _own_aside(self, state: Any) -> Any:
+        """Yuki's own windows (the ask bar, the chat page) are never what the user had: in front or with the keyboard,
+        the window the user called Yuki up from (``host.origin_hwnd``, when listed) stands for them."""
+        own = {int(w.hwnd) for w in state.windows if _is_own_window(w.hwnd)}
+        if not own:
+            return state
+        origin = done.as_hwnd(getattr(self.host, "origin_hwnd", None))
+        listed = {int(w.hwnd) for w in state.windows}
+        stand_in = origin if origin is not None and origin in listed and origin not in own else None
+        if int(state.foreground or 0) in own:
+            state.foreground = stand_in
+        if int(state.keyboard or 0) in own:
+            state.keyboard = stand_in
+        for w in state.windows:
+            if int(w.hwnd) in own:
+                w.foreground = w.keyboard = False
+            elif stand_in is not None and int(w.hwnd) == stand_in:
+                w.foreground = w.foreground or state.foreground == stand_in
+                w.keyboard = w.keyboard or state.keyboard == stand_in
+        return state
+
+    def _desk_note(self, call: Call, outcome: Any) -> None:
+        """What one act aimed at and brought up, for the after-look: the step's window, the window its report names
+        (a launch, a skill run's chat), else a skill run's app by its connection data; a window step's own target is
+        what the request was about. Never raises."""
+        try:
+            payload = outcome.payload if isinstance(getattr(outcome, "payload", None), dict) else {}
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            hwnds = {h for h in (done.as_hwnd(call.hwnd), done.as_hwnd(details.get("hwnd"))) if h}
+            self._desk_touched |= hwnds
+            if call.tool == "run_skill":
+                key, slots = consent.skill_input(call, self.head)
+                if not hwnds:
+                    self._desk_touched |= set(self._skill_programs(payload, key, slots))
+            elif call.tool in ASKED_VERBS:
+                self._desk_asked |= hwnds
+                if call.tool == "launch_app" and not hwnds and words(call.input.get("query")):
+                    self._desk_asked.add(words(call.input.get("query")))
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            pass
+
+    def _tidy_gate(self, index: int, call: Call) -> RunResult | None:
+        """The tidy-up turn's bounds: an undoable window step (``plan.TIDY_ACTIONS``) on a window :meth:`_tidy_mine`
+        allows, at most :data:`TIDY_STEPS` of them. Anything else ends the turn there (the request's own line
+        stands)."""
+        from yuki.brain.plan import TIDY_ACTIONS
+
+        tidy = self.tidy or {}
+        action = str(call.input.get("action") or "") if call.tool == "window_action" else ""
+        why = ("tidy_only" if action not in TIDY_ACTIONS else "tidy_steps" if int(tidy.get("acts", 0)) >= TIDY_STEPS
+               else "" if self._tidy_mine(action, call.hwnd) else "tidy_not_ours")
+        if not why:
+            return None
+        status = self.statuses[index]
+        status.state, status.why = "refused", why
+        self._emit_log("tidy", verb=call.tool, state="refused", why=why)
+        return RunResult("refused", line="", final=True)
+
+    def _tidy_mine(self, action: str, hwnd: Any) -> bool:
+        """Review M1 (P1.5: a tidy-up touches only what Yuki's own act changed), from the after-look's diff: a place
+        only on a window this request's acts brought up (a step's window or its report's, a new window, the act's
+        window over one of theirs, the front its acts took); a focus back only to the window that was in front, or
+        one that held their attention (playing, the keyboard), before the acts."""
+        target = done.as_hwnd(hwnd)
+        d = self._after_diff
+        if target is None or d is None:
+            return False
+        if action == "focus_back":
+            return target == done.as_hwnd(d.focus_from) or target in {done.as_hwnd(h) for h in d.attention}
+        ours = {h for h in self._desk_touched if isinstance(h, int) and not isinstance(h, bool)}
+        ours |= {done.as_hwnd(n.get("hwnd")) for n in d.new_windows}
+        ours |= {done.as_hwnd(c.get("by")) for c in d.covered if c.get("by_act")}
+        if d.focus_by_act:
+            ours.add(done.as_hwnd(d.focus_to))
+        return target in ours
+
+    @staticmethod
+    def _tidy_line(call: Call, details: Mapping[str, Any] | None, table: Mapping[str, str]) -> str:
+        """Code's words for a tidy-up step (:data:`LINE_TIDY` or :data:`LINE_TIDY_ASK`): the app as Windows names it
+        (:data:`TIDY_NO_APP` when none), and for a place where it went (another monitor, by what the step read back
+        when it ran, else as asked; a half of the same one)."""
+        action = str(call.input.get("action") or "")
+        details = details or {}
+        raw = str(details.get("app") or call.app or "").strip()
+        app = util.app_name(raw) if raw else TIDY_NO_APP
+        if action != "place":
+            return table.get(action, "").format(app=app)
+        before = details.get("from_monitor")
+        after = details.get("to_monitor_seen", details.get("to_monitor"))
+        asked = str(call.input.get("monitor") or "other")
+        other = before != after if before is not None and after is not None else not asked.startswith("with:")
+        where = TIDY_WHERE["other"] if other else TIDY_WHERE.get(str(call.input.get("how") or "keep"), "")
+        return table["place"].format(app=app, where=where) if where else table["place_here"].format(app=app)
+
+    def _tidy_ask(self, call: Call) -> bool:
+        """The tidy dial says ask: the step in code's words as a yes/no question (the desk lease freed while it
+        waits)."""
+        question = self._tidy_line(call, None, LINE_TIDY_ASK)
+        if not question:
+            return False
+        self.lease.release()
+        try:
+            yes = bool(self.host.ask(question))
+        except Exception:  # noqa: BLE001 - no answer is a no
+            yes = False
+        return self.lease.take() and yes
+
+    def _place_act(self, call: Call) -> Any:
+        """A place, focus back or put back step (``yuki.actions.place``), as the Dispatcher's outcome shape. The
+        group is the request, so one "put it back" undoes the whole tidy-up. ``details["changed"]``: whether it changed
+        the desk (review L1: a place that found the window already there, a focus back to the window already in
+        front, change nothing and get no words)."""
+        from yuki.actions import place
+
+        action = str(call.input.get("action") or "")
+        group = getattr(self.host, "request_id", None) or self.plan_id
+        if action == "place":
+            result = place.place_window(int(call.hwnd or 0), monitor=call.input.get("monitor") or "other",
+                                        how=str(call.input.get("how") or "keep"), activate=False, group=group)
+            changed = bool(result.ok) and "to_monitor_seen" in (result.details or {})   # read back after a move
+        elif action == "focus_back":
+            front = _foreground_now()
+            result = place.focus_back(int(call.hwnd or 0), group=group)
+            changed = bool(result.ok) and front != int(call.hwnd or 0)
+        else:
+            result = place.undo_last()
+            changed = bool(result.ok)
+        if isinstance(getattr(result, "details", None), dict):
+            result.details["changed"] = changed
+        wrap = getattr(self.dispatcher, "_from_action", None)
+        if callable(wrap):
+            return wrap("window_action", result)
+        from yuki.agent.tools import ToolOutcome
+
+        details = dict(getattr(result, "details", None) or {})
+        return ToolOutcome(name="window_action", ok=bool(result.ok), summary=str(result.summary or ""),
+                           content=[{"type": "text", "text": str(result.summary or "")}],
+                           payload={"ok": bool(result.ok), "summary": str(result.summary or ""), "details": details},
+                           elapsed_ms=float(getattr(result, "elapsed_ms", 0.0) or 0.0))
 
     # -- budgets and status ------------------------------------------------------------------------------------------
 
@@ -866,6 +1141,10 @@ class Executor:
         elif self.lease.owner != threading.get_ident():
             status.state, status.why = "skipped", "wrong thread"
             return RunResult("refused", line=LINE_BUSY, final=True)
+        if self.tidy is not None:
+            bounded = self._tidy_gate(index, call)
+            if bounded is not None:
+                return bounded
         live = self._live(call)
         refused = self._who_guard(index, call, live)
         if refused is not None:
@@ -922,6 +1201,9 @@ class Executor:
             return self._mismatch_result(index, verdict.why, refused=True, seen=verdict.line)
         if verdict.result == consent.DRAFT:
             return self._run_draft(index, step, call, verdict)
+        if self.tidy is not None and self.tidy.get("mode") == util.TIDY_ASK and not self._tidy_ask(call):
+            status.state, status.why = "declined", "tidy_declined"
+            return RunResult("declined", line="", final=True)
         if call.tool == "run_skill" and send_key is None and self._grant_sends(call, verdict):
             person_id, send_key = self._send_person(call)    # an allowed send no question came before
         self._counted = False
@@ -1068,9 +1350,13 @@ class Executor:
                 self.acting = True
             except Exception:  # noqa: BLE001 - the marker never breaks a run
                 pass
-        say = words(field_of(step, "say", "")) if speak else ""
+        # a tidy-up's words are said after the request's line, never as the step starts
+        say = words(field_of(step, "say", "")) if speak and self.tidy is None else ""
         if say and getattr(self.host, "channel", "") == "voice":
             self._emit(Say(say[:120]))
+        if self.tidy is None and call.tool in DESK_VERBS and self._desk_first is None:
+            # P1.2: the desk right before the request's first act (after its consent and any countdown)
+            self._desk_first = self._desk_now()
         about = self._about(call)
         desk = None
         if call.tool == "run_skill":
@@ -1087,9 +1373,14 @@ class Executor:
                 desk.words = list(self.words)
         self._emit(ToolCall(call.tool, {**call.input, "_about": about}))
         started_at, t0 = time.time(), time.perf_counter()
+        from yuki.brain.plan import PLACE_ACTIONS
+
         try:
             with self._dispatch_lock:
-                outcome = self.dispatcher.dispatch(call.tool, call.input)
+                if call.tool == "window_action" and str(call.input.get("action") or "") in PLACE_ACTIONS:
+                    outcome = self._place_act(call)   # P1.4: yuki.actions.place (the Dispatcher has no such op)
+                else:
+                    outcome = self.dispatcher.dispatch(call.tool, call.input)
         finally:
             if desk is not None:
                 desk.grant = {}
@@ -1100,6 +1391,8 @@ class Executor:
         ms = round((time.perf_counter() - t0) * 1000, 1)
         self._emit(ToolResult(call.tool, bool(outcome.ok), str(outcome.summary or "")[:300], payload=outcome.payload,
                               about=about))
+        if self.tidy is None and call.tool in DESK_VERBS:
+            self._desk_note(call, outcome)
         self._note_numbers(call, outcome)
         self._read_cache.pop(int(call.hwnd or 0), None)
         if call.tool == "open_url" and _web_host(call.input.get("url")):
@@ -1177,6 +1470,16 @@ class Executor:
                     what=STOPPED_WHAT.get(call.tool, "there")), final=True)
             return self._mismatch_result(index, why, seen=shown, call=call, seen_fenced=external and bool(body))
         status.state, status.why = "ok", why
+        if self.tidy is not None:
+            self.tidy["acts"] = int(self.tidy.get("acts", 0)) + 1
+            payload = outcome.payload if isinstance(outcome.payload, dict) else {}
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            changed = bool(details.get("changed"))
+            if changed:   # review L1: words only for what the step's own read-back saw change
+                self._tidy_changed += 1
+                self.tidy["words"].append(self._tidy_line(call, details, LINE_TIDY))
+            self._emit_log("tidy", verb=call.tool, action=str(call.input.get("action") or ""), state="ok",
+                           changed=changed)
         return None
 
     def _skill_result(self, index: int, step: Any, call: Call, outcome: Any) -> RunResult | None:
@@ -1695,6 +1998,11 @@ class Executor:
         elif ref and hwnd is None:
             return None, "no single window fits that window"
         front = self._front(payload)
+        from yuki.brain.plan import WINDOWLESS_ACTIONS
+
+        windowless = verb == "window_action" and str(tool_input.get("action") or "") in WINDOWLESS_ACTIONS
+        if windowless:
+            return Call(tool=verb, input=tool_input, index=index), ""   # undo: whatever the journal holds
         if hwnd is None and verb in ELEMENT_VERBS | {"hotkey", "press", "window_action", "tab", "focus_window"}:
             hwnd = front
             entry = next((w for w in payload.get("windows") or [] if isinstance(w, dict)
@@ -1831,7 +2139,14 @@ class Executor:
             out.update({k: v for k, v in obj.items() if k in allowed})
         elif value not in (None, ""):
             text = str(value)
-            if verb in PRIMARY_FIELD:
+            from yuki.brain.plan import place_spec
+
+            spec = place_spec(text) if verb == "window_action" else None
+            if spec is not None:
+                out.update(action="place", monitor=spec[0], how=spec[1])   # P1.4: place:<monitor>[:<how>]
+            elif verb == "window_action":
+                out["action"] = " ".join(text.split()).casefold()
+            elif verb in PRIMARY_FIELD:
                 out[PRIMARY_FIELD[verb]] = text
             elif verb == "hotkey":
                 out["keys"] = [k.strip() for k in text.split("+") if k.strip()]
@@ -1867,8 +2182,11 @@ class Executor:
             out["press_enter"] = bool(field_of(step, "submit", False))   # Enter only by the plan's own submit
         if verb == "run_skill":
             slots = obj.get("slots") if obj is not None and isinstance(obj.get("slots"), dict) else (
-                {k: v for k, v in (obj or {}).items() if k != "skill"} if obj is not None else {})
+                {k: v for k, v in (obj or {}).items() if k not in ("skill", "place")} if obj is not None else {})
             out = {"skill": words((obj or {}).get("skill")), "slots": slots}
+            if words((obj or {}).get("place")):
+                # P1.4: where the skill's app window goes before anything is typed (``engine.place_hint``)
+                out["place"] = words((obj or {}).get("place"))
         return out
 
     def _fetch_call(self, index: int, step: Any) -> Call | None:
@@ -2210,6 +2528,12 @@ class Executor:
         ms = round((time.perf_counter() - t0) * 1000, 1)
         text = "\n".join(str(b.get("text") or "") for b in getattr(outcome, "content", None) or []
                          if isinstance(b, dict) and b.get("type") == "text")
+        payload = getattr(outcome, "payload", None)
+        if tool == "look_at_desktop" and getattr(outcome, "ok", False) and isinstance(payload, Mapping) \
+                and payload.get("windows"):
+            from yuki.brain.context import SITUATION_LOOK_CHARS, desk_text
+
+            text = desk_text(text, payload, limit=READ_CHARS, situation_chars=SITUATION_LOOK_CHARS)   # P1.1: the desk in plain words, then the Now block
         text = (text or str(getattr(outcome, "summary", "") or ""))[:READ_CHARS]
         if tool in EXTERNAL_TEXT_TOOLS:   # capped first, so the fence stays whole
             text = wrap(text, source=source_for(tool, tool_input), nonce=self.nonce)
@@ -2476,6 +2800,10 @@ class Executor:
         """The second look for a probe that can flip; a disagreement is one correcting line and a false done logged."""
         def on_result(verdict: bool | None) -> None:
             word = {True: "agrees", False: "false_done", None: "unverified"}[verdict]
+            if verdict is False and self._tidy_changed:
+                # review L6: a tidy-up step (place, focus back) changed the desk after the done: a probe that reads the
+                # front or a window's state reads that, not a false done
+                word, verdict = "after_tidy", None
             self._recheck_verdict = {"recheck": word}
             self._emit_log("done_recheck", check=result.probe, result=word)
             if verdict is False:

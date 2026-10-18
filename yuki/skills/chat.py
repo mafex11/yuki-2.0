@@ -1267,6 +1267,14 @@ def _open_uri(uri: str, *, running: bool = False) -> Any:
     return open_uri(uri)
 
 
+def _place(ctx: Any, hwnd: int, *, activate: bool) -> bool:
+    """P1.4: the app's window where the run's place hint says (``engine.place_for``; nothing without a hint). Never
+    types, never sends: every send safety after it is unchanged."""
+    from yuki.skills.engine import place_for
+
+    return place_for(ctx, hwnd, activate=activate)
+
+
 def _held_by_game(result: Any) -> str | None:
     """The refusal kind an action's result carries (fHands, ``yuki.actions.gate.carried``): ``"game"`` or
     ``"blocked"``, else ``None``."""
@@ -1287,13 +1295,15 @@ def _press(hwnd: int, role: str, name: str) -> str:
     return press(int(hwnd), role=role, name=name, pattern="invoke").outcome
 
 
-def _focus_app(data: Mapping[str, Any]) -> tuple[int, RouteResult | None]:
-    """The app's own window, brought forward (guarded): ``(hwnd, None)`` or ``(0, a result: not open, refused...)``."""
+def _focus_app(data: Mapping[str, Any], ctx: Any = None) -> tuple[int, RouteResult | None]:
+    """The app's own window, brought forward (guarded): ``(hwnd, None)`` or ``(0, a result: not open, refused...)``.
+    P1.4: with the run's place hint (``ctx.place``) it is put on that screen first, so it comes forward there."""
     hwnd = _app_hwnd(data)
     if not hwnd:
         return 0, RouteResult(ran=False, outcome="not_open")
     if kind := _refused("focus", hwnd=hwnd):
         return 0, RouteResult(ran=False, held=kind, outcome="refused")
+    _place(ctx, hwnd, activate=False)
     result = _focus(hwnd)
     if kind := _held_by_game(result):
         return 0, RouteResult(ran=False, held=kind, outcome="refused")
@@ -1532,12 +1542,17 @@ def route_open_link(call: RouteCall) -> RouteResult:
     if kind := _refused("open_url"):
         return RouteResult(ran=False, held=kind, outcome="refused")
     running = _app_hwnd(data)
+    # P1.4: an open window is put on the hint's screen first (the link brings it forward there); a cold start, or a
+    # window that couldn't be placed yet (minimised), as soon as the link has brought it up
+    placed = bool(running) and _place(call.ctx, running, activate=False)
     since = time.time()
     opened = _open_uri(uri, running=bool(running))
     if kind := _held_by_game(opened):
         return RouteResult(ran=False, held=kind, outcome="refused")
     if not getattr(opened, "ok", False):
         return RouteResult(ran=False, outcome="not_opened")
+    if not placed:
+        _place(call.ctx, _app_hwnd(data) or running, activate=True)
     return _after_open(call, app, data, target, route, via="link", since=since, hwnd=_app_hwnd(data) or running,
                        as_draft=as_draft)
 
@@ -1563,7 +1578,7 @@ def route_switcher(call: RouteCall) -> RouteResult:
     as_draft, refused = _send_gate(call, target, route)
     if refused is not None:
         return refused
-    hwnd, failed = _focus_app(data)
+    hwnd, failed = _focus_app(data, call.ctx)
     if failed is not None:
         return failed
     since = time.time()
