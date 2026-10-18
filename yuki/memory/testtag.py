@@ -25,7 +25,13 @@ resting on test material only, Yuki's run traces and their playbook events, skil
 By the test sessions' own span (the harness drove the desktop while the user was away; these rows carry no tag): the
 know-how, the "said" taste pairings, the misheard-name aliases, the episodes, Yuki's own journal facts, the moments
 and occasions (with the preference observations fed from them) learned inside it, and the corrections said in it
-(ended, with the journal and portrait changes their pass made undone). The standing rules a test session made are
+(ended, with the journal and portrait changes their pass made undone). **Except what real use confirmed** (phase 3,
+3.4; dots audit 18 Oct: the purge took "lumen = chill" and the Japanese playlist's meaning, learned in test sessions):
+a "said" taste row (a pairing of the user's words with a playlist, or a pick they named) or a name alias still in
+force is kept when a real exchange (no test session) holds its words - the alias's heard form said after it was
+learned - and a real skill run finished done or already within :data:`CONFIRM_RUN_S` after it (:func:`real_uses`).
+Still in force is the "no correction afterwards": a correction drops a pairing (``taste.unsay``) or ends an alias.
+A pick row that a kept pairing (or a pairing outside the span) points at is kept too. Only test-only rows go. The standing rules a test session made are
 conversation facts resting on its exchanges only, so they go with them. Kept: what the screen showed in the
 span (screen journal facts, links seen, the hour counts of "observed" tastes), which may be real incoming content.
 
@@ -201,6 +207,58 @@ def is_test_fact(fact: Any, turn_ids: frozenset[int] | set[int]) -> bool:
 #: Test sessions closer than this (s) are one span; a span is padded by :data:`SPAN_PAD_S` on each side.
 SPAN_JOIN_S = 300.0
 SPAN_PAD_S = 120.0
+#: Real use that confirms a "said" pairing or a name alias (phase 3, 3.4): a real exchange holding its words, then a
+#: real skill run done or already within this long (s; the exchange's own request), read back this many days.
+CONFIRM_RUN_S = 180.0
+CONFIRM_DAYS = 60
+#: The kind suffix of the taste rows that keep what the user called an entity (``yuki.skills.taste.SAID_SUFFIX``).
+SAID_SUFFIX = "@said"
+
+
+def _fold(value: Any) -> str:
+    """Case, spacing and punctuation folded, padded: identity of the user's own words, never meaning."""
+    text = "".join(ch if ch.isalnum() else " " for ch in str(value or "").casefold())
+    return " " + " ".join(text.split()) + " "
+
+
+def real_uses(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: float
+              ) -> list[tuple[float, str]]:
+    """``(at, folded words)`` of the user's real exchanges of the last :data:`CONFIRM_DAYS` (no test session) that a
+    real skill run finishing done or already followed within :data:`CONFIRM_RUN_S`: the uses that confirm a pairing
+    or an alias whose words they hold. Decrypted in RAM only; ``[]`` when the tables or the key are missing."""
+    if not (_has(conn, "conversation_turns", "user_ciphertext") and _has(conn, "skill_runs", "outcome")):
+        return []
+    since = now - CONFIRM_DAYS * 86400.0
+    runs = sorted(float(r[0]) for r in conn.execute(
+        f"SELECT coalesce(t0, at) FROM skill_runs WHERE outcome IN ('done', 'already') AND coalesce(t0, at) >= ? AND"
+        f" {sql_real_skill_run()}", (since,)).fetchall() if r[0] is not None)
+    if not runs:
+        return []
+    lo, hi = _session_range()
+    out: list[tuple[float, str]] = []
+    import bisect
+
+    for r in conn.execute("SELECT at, user_ciphertext FROM conversation_turns WHERE at >= ? AND NOT (session_id >= ?"
+                          " AND session_id < ?) AND user_ciphertext IS NOT NULL", (since, lo, hi)).fetchall():
+        at = float(r[0])
+        i = bisect.bisect_left(runs, at - 5.0)
+        if i >= len(runs) or runs[i] > at + CONFIRM_RUN_S:
+            continue
+        try:
+            words = dec(r[1])
+        except Exception:  # noqa: BLE001 - unreadable: no evidence
+            continue
+        if words:
+            out.append((at, _fold(words)))
+    return out
+
+
+def _confirmed(words: str | None, uses: Sequence[tuple[float, str]], after: float | None = None) -> bool:
+    """Whether a real use (:func:`real_uses`) holds ``words`` as whole words (``after``: only a use after it)."""
+    folded = _fold(words)
+    if not folded.strip():
+        return False
+    return any(folded in said and (after is None or at > after) for at, said in uses)
 
 
 def _has(conn: sqlite3.Connection, table: str, column: str | None = None) -> bool:
@@ -481,13 +539,65 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
             kh = _ids(conn.execute(f"SELECT id FROM knowhow WHERE {cond}", params))
             _delete_ids(conn, "knowhow_vec", "knowhow_id", kh)
             count("knowhow", _delete_ids(conn, "knowhow", "id", kh))
+        uses: list[tuple[float, str]] | None = None
         if _has(conn, "tastes", "source"):
+            # phase 3 (3.4): a pairing or a named pick the user's real use confirmed is kept; only test-only rows go
             cond, params = _in_spans("last_at", spans)
-            count("taste_said_pairings", conn.execute(f"DELETE FROM tastes WHERE source = 'said' AND {cond}",
-                                                      params).rowcount)
+            rows = conn.execute(f"SELECT id, kind, name_ciphertext, ref_ciphertext FROM tastes WHERE source = 'said'"
+                                f" AND {cond}", params).fetchall()
+            if rows:
+                uses = real_uses(conn, dec, now=now)
+            gone_rows: list[int] = []
+            kept_targets: set[tuple[str, str]] = set()
+            picks: list[tuple[int, str, str | None]] = []
+            for r in rows:
+                kind = str(r[1] or "")
+                try:
+                    name = dec(r[2]) if r[2] else None
+                    target = dec(r[3]) if r[3] else None
+                except Exception:  # noqa: BLE001 - unreadable: not provably the user's
+                    name = target = None
+                if not kind.endswith(SAID_SUFFIX):
+                    picks.append((int(r[0]), kind, name))
+                elif _confirmed(name, uses or []):
+                    kept_targets.add((kind[: -len(SAID_SUFFIX)], _fold(target)))
+                    count("taste_said_kept", 1)
+                else:
+                    gone_rows.append(int(r[0]))
+            # the pairings that stay (outside the span, or confirmed) point at real picks too
+            going = set(gone_rows)
+            if picks:
+                for r in conn.execute("SELECT id, kind, ref_ciphertext FROM tastes WHERE kind LIKE ? AND"
+                                      " ref_ciphertext IS NOT NULL", (f"%{SAID_SUFFIX}",)).fetchall():
+                    if int(r[0]) in going:
+                        continue
+                    try:
+                        kept_targets.add((str(r[1])[: -len(SAID_SUFFIX)], _fold(dec(r[2]))))
+                    except Exception:  # noqa: BLE001
+                        continue
+            for rid, kind, name in picks:
+                if (kind, _fold(name)) in kept_targets or _confirmed(name, uses or []):
+                    count("taste_said_kept", 1)
+                else:
+                    gone_rows.append(rid)
+            count("taste_said_pairings", _delete_ids(conn, "tastes", "id", gone_rows))
         if _has(conn, "name_aliases", "created_at"):
             cond, params = _in_spans("created_at", spans)
-            count("name_aliases", conn.execute(f"DELETE FROM name_aliases WHERE {cond}", params).rowcount)
+            gone_aliases: list[int] = []
+            rows = conn.execute(f"SELECT id, heard_ciphertext, created_at, ended_at FROM name_aliases WHERE {cond}",
+                                params).fetchall()
+            if rows and uses is None:
+                uses = real_uses(conn, dec, now=now)
+            for r in rows:
+                try:
+                    heard = dec(r[1]) if r[1] else None
+                except Exception:  # noqa: BLE001
+                    heard = None
+                if r[3] is None and _confirmed(heard, uses or [], after=float(r[2] or 0.0)):
+                    count("name_aliases_kept", 1)
+                else:
+                    gone_aliases.append(int(r[0]))
+            count("name_aliases", _delete_ids(conn, "name_aliases", "id", gone_aliases))
         if _has(conn, "episodes", "started_at"):
             # an episode wholly inside the span narrates the harness's desktop
             ep = _ids(conn.execute("SELECT id FROM episodes WHERE " + " OR ".join(
@@ -722,7 +832,7 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = ["TEST_SESSION_PREFIX", "is_test_session", "is_test_request", "is_test_item", "keep_real",
            "sql_real_session", "sql_real_request", "sql_real_run", "sql_real_skill_run", "sql_real_route_try",
            "test_turn_ids", "is_test_journal", "is_test_fact", "test_spans", "purge", "report", "format_report",
-           "main"]
+           "main", "real_uses", "CONFIRM_RUN_S", "CONFIRM_DAYS"]
 
 
 if __name__ == "__main__":

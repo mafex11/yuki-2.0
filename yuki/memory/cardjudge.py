@@ -22,8 +22,9 @@ puts every card idea into one pile and picks at most one per wake:
 Deadline and asked items (a reminder at its time, a standing request) go at the first allowed moment, first in order,
 never tested against the bar. The things that are not time-bound wait for **the Today card**, at the first settled
 sit-down after the user's night (a break of 5 h or more, whatever the clock says; §4.7): a check-in head line (the
-writer's) and up to 5 code lines, at most 2 of them asking, each line carrying its id. After 3 h away in the day, a
-"While you were away" list shows when at least 2 things wait.
+writer's) and up to 3 code lines, at most 2 of them asking, each line carrying its id; today's dated items lead
+(phase 3, 3.4: ``Candidate.lead``, :func:`yuki.memory.candidates.dated_today`), the rest by rank. After 3 h away in
+the day, a "While you were away" list shows when at least 2 things wait.
 
 **Live** (``[judge] mode = "on"``, the shipped default since 18 Oct; the old first-writer chain is gone): the judge
 alone writes the cards. **Shadow** (a setting): none of Yuki's own cards; the judge decides what it *would* have shown
@@ -149,8 +150,9 @@ NO_REST_S = 24 * 3600.0
 CALM_IDLE_S = 30.0
 BURST_IDLE_S = 5.0
 BURST_SAME_S = 2 * 60.0
-#: The Today card: at most this many lines, at most this many of them asking.
-TODAY_LINES = 5
+#: The Today card: at most this many lines (phase 3, 3.4: 5 -> 3, short; today's dated items first), at most this many
+#: of them asking.
+TODAY_LINES = 3
 TODAY_ASKING = 2
 #: "While you were away": after this long away in the day, with at least this many lines waiting.
 AWAY_MIN_S = 3 * 3600.0
@@ -1613,12 +1615,15 @@ class CardJudge:
         return out
 
     def _lines(self, now: float, cfg: Any) -> list[Candidate]:
-        """The Today card's lines: up to :data:`TODAY_LINES` from the queue by rank (prior x confidence), at most
-        :data:`TODAY_ASKING` of them asking, plus one weekly probe line of a type the ledger turned off."""
+        """The Today card's lines: up to :data:`TODAY_LINES` from the queue, today's dated items first (``lead``, by
+        their time: phase 3, 3.4), then by rank (prior x confidence), at most :data:`TODAY_ASKING` of them asking,
+        plus one weekly probe line of a type the ledger turned off when there is room."""
         ranked = sorted((c for c, _first in self.queue.values()
                          if (c.expires_at is None or c.expires_at > now) and c.digest_line is not None
                          and type_on(c.type, cfg) and self.ledger.mode(c.type) != "off"),   # B3, §4.8: the switch now
-                        key=lambda c: (-self.ledger.prior(c.type) * c.confidence, c.created_at))
+                        key=lambda c: (not getattr(c, "lead", False),
+                                       0.0 if getattr(c, "lead", False) else -self.ledger.prior(c.type) * c.confidence,
+                                       c.created_at))   # stable: the leads keep their own order
         out: list[Candidate] = []
         asking = 0
         types: set[str] = set()
