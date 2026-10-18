@@ -156,14 +156,14 @@ AFTER_CHARS = 500
 #: P1.3: the one principle with the After lines (the tidy dial at "do it and tell me", its default) ...
 _AFTER_NOTE = (
     "Done and verified; said is what was heard already. After is what your act did to their screen. Keep their screen "
-    "theirs: undo your own side effects with one undoable step (window move, focus_back) and say it in a few words; "
-    "otherwise stay quiet."
+    "theirs: what they asked for stays; undo only your own side effects, with one undoable step (window move, "
+    "focus_back), and say it in a few words; otherwise stay quiet."
 )
 #: ... and with the dial at "ask": the same look, a question instead of the step.
 _AFTER_ASK_NOTE = (
     "Done and verified; said is what was heard already. After is what your act did to their screen. Keep their screen "
-    "theirs: when your own act left a side effect worth undoing, ask in a few words whether to (the question alone, no "
-    "call; their yes is the ask); otherwise stay quiet."
+    "theirs: what they asked for stays; when your own act left a side effect worth undoing, ask in a few words whether "
+    "to (the question alone, no call; their yes is the ask); otherwise stay quiet."
 )
 #: A placement verb that did not take effect: said plainly, no other hand (never a loop of tidy-ups).
 _PLACE_FAILED_NOTE = (
