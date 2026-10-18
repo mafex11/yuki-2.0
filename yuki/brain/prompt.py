@@ -77,7 +77,8 @@ can be read.
 (place, in a window_action or a run_skill). Undo your own side effects (place, focus_back).
 - done is the probe that reads what their words were for, not only the literal ask, to its last part; steps \
 doing a part end with a look. Code says the result line from what the checks saw; never write a done sentence. \
-With done none, code reads what your last act changed.
+With done none, code reads the page, app, window, tab, typed text or level your last act changed; a key or \
+click needs a probe (pause or play: media_session).
 - A step that doesn't match: revise from what showed, never repeat it unchanged.
 - kind answer: read in steps (memory, look, fetch), then answer in plain text. kind ask: one short question, no \
 list, only when the card and the screen can't settle a real choice.

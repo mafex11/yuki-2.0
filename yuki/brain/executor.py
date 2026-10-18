@@ -183,7 +183,10 @@ DERIVED_WINDOW_STATES: dict[str, str] = {"minimize": "minimized", "maximize": "m
                                          "restore": "normal"}
 #: aBrain (phase 2.3): a done's target fields its probe didn't read, in words for the evidence (``ending_facts``).
 UNCHECKED_WORDS: dict[str, str] = {"app": "the app", "window": "the window or page", "person": "the person",
-                                   "item": "the thing itself"}
+                                   "item": "the thing itself", "steps": "the steps before the last"}
+#: Review M1: the "field" a derived done read leaves uncovered when an earlier act step wasn't seen to take
+#: (:meth:`Executor._derived_rest`); no target field is called this.
+DERIVED_REST = "steps"
 #: The verbs whose acts the after-look is about (a clipboard write changes nothing on the desk).
 DESK_VERBS = frozenset(ACT_VERBS) - {"write_clipboard"}
 #: The verbs whose step aims at the window it ends on: that window is what the request was about (``acted``).
@@ -2681,6 +2684,8 @@ class Executor:
         result = done.pick_done(self.head, env, hwnd=self.last_act.get("hwnd"), last_window=entry,
                                 cancelled=self.host.cancelled, args=args,
                                 probe=probe if derived is not None else None)
+        if derived is not None and result.verdict is True:
+            result = self._derived_rest(result)
         if derived is not None and result.verdict is False:
             # the planner didn't pick this read, so a "not so" from it is evidence for the line, never a replan
             result = done.DoneResult(None, util.UNVERIFIED, done.not_confirmed(
@@ -2705,23 +2710,46 @@ class Executor:
         wrote done none: ``(probe, args)`` from that step's verb, its closed values and the call's own facts (its
         window, its process), the arguments as the check reads them. ``None`` when that step has no readable effect (a
         click, a key, a command: their own verdicts stand), or its program can't be told. Code facts only."""
-        ran = [i for i in sorted(self._ran_calls) if i < len(self.statuses) and self.statuses[i].state == "ok"]
-        if not ran:
+        index = self._last_ran()
+        if index is None:
             return None
         # only the last act step: a later step (a click after typing, a focus back after a focus) may have changed
         # what an earlier one did, so an earlier step's read would check something that no longer holds
-        index = ran[-1]
         got = _effect_probe(self._ran_calls[index], self.steps[index] if index < len(self.steps) else None,
                             self._open_images.get(index, ""))
         if got is None:
             return None
-        if got[0] == "page_at" and len(self._seen_pages() or ()) > 1:
-            return None   # several pages, each seen by its own step's report: _steps_seen says them all
+        if got[0] == "page_at" and (index in self._open_pages or len(self._seen_pages() or ()) > 1):
+            # its own report confirmed the page (review L: a redirect or a page still loading would read "not so"),
+            # or several pages each seen by their own step's report: _steps_seen says them, as before
+            return None
         resolved = self._probe_args(*got)
         image = str(resolved.get("process") or "").casefold()
         if "process" in done.PROBE_ARGS.get(got[0], ((), ()))[0] and not image.endswith(".exe"):
             return None   # an app name no listed window resolves to its program would never match the one in front
         return got[0], resolved
+
+    def _last_ran(self) -> int | None:
+        """The index of this plan's last act step that ran and took (its call kept), ``None`` when none did."""
+        ran = [i for i in sorted(self._ran_calls) if i < len(self.statuses) and self.statuses[i].state == "ok"]
+        return ran[-1] if ran else None
+
+    def _derived_rest(self, result: done.DoneResult) -> done.DoneResult:
+        """Review M1: a derived read that read true reads only the last act step. The plan is ``verified`` only when
+        that step is its only act step (``run_skill`` parts aside: their own checks say them) or every other act step
+        was seen to take by its own report (``status.verdict`` True); else ``likely`` with done's "...; I couldn't
+        check the rest." and :data:`DERIVED_REST` uncovered, so the evidence says what wasn't read. Code facts only."""
+        index = self._last_ran()
+        others = [i for i, step in enumerate(self.steps) if i != index and self._verb(step) in ACT_VERBS
+                  and self._verb(step) != "run_skill"]
+        if all(i < len(self.statuses) and self.statuses[i].verdict is True for i in others):
+            return result
+        if not result.uncovered:   # a likely one says "I couldn't check the rest." already
+            result.line = done.LINE_REST.format(line=str(result.line or "").rstrip(". "))
+        result.uncovered = [*result.uncovered, DERIVED_REST]
+        result.level = util.LIKELY
+        self._emit_log("done_derived_rest", steps=len(others))
+        return result
 
     def ending_facts(self) -> dict[str, str]:
         """aBrain (phase 2.3): what a request that didn't end done can say from the evidence, in plain words for the
@@ -3132,10 +3160,18 @@ class Executor:
 
     def _step_said(self, step: Any, *, done: bool = False) -> str:
         """A step in the island's words (``yuki.ui.step_words.describe_plan_step``: its verb, its control's role and
-        name, the plan's target app; never its free text), as it runs or (``done``) as done. ``""`` when none come."""
+        name, the plan's target app; never its free text), as it runs or (``done``) as done. ``""`` when none come.
+        Typing is said without its Enter (review r1 M2, as the old ``plan.step_line``: "Typed in the Search box", never
+        "Typed and sent a message": Enter in an address bar sends nothing, and the brain never sends by raw typing)."""
         try:
+            from dataclasses import is_dataclass, replace
+
             from yuki.ui.step_words import describe_plan_step
 
+            if isinstance(step, dict) and step.get("submit"):
+                step = {**step, "submit": False}
+            elif is_dataclass(step) and getattr(step, "submit", False):
+                step = replace(step, submit=False)
             app = field_of(field_of(self.head, "target", None), "app", None) if self.head is not None else None
             return " ".join(str(describe_plan_step(step, app=app, done=done) or "").split())
         except Exception:  # noqa: BLE001 - presentation only
