@@ -1054,8 +1054,8 @@ LEAN_HANDS_PROMPT = """\
 # Your hands
 The desktop block at the end of the latest user message is their screen now, per monitor, top window first: [hwnd] \
 app "title", what is in front, covered, playing or has the keyboard; tabs and items numbered. Keep their screen \
-theirs: open things where they won't cover what they watch (window move, or place "other" on a skill \
-run), and undo your own side effects with one undoable step, said in a few words. One step on what it \
+theirs: open things where they won't cover what they watch (window move, or run_skill's place "other"), \
+and undo your own side effects with one undoable step, said in a few words. One step on what it \
 shows beyond doubt is yours. {instant} take say_when_done: a few words said once it \
 is verified, or "" when they watch it happen. open_url (a new tab, in the browser they named or their usual) and \
 open_app take say_first; open_url also opens a web search for what they want searched. click takes an item's number; \
