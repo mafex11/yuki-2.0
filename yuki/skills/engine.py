@@ -35,18 +35,22 @@
    (``RouteResult.facts["missing"]``: the slot; ``facts_ram["seen"]``: the names it read there, RAM only): the seed
    carries both (``missing``, ``seen``), and the missing value is left out of its done-check, so the user's own word
    for a thing ("Japanese") is never required as its name on screen;
-6. a slot value the talker or the thinker gave that the resolver dropped (not in the words as heard, e.g. a misheard
-   name) and then asked for is never asked back: rung C with the given values (why ``dropped``), where the thinker
-   checks them against the words and memory. Sends still go through the consent rule there;
+6. a slot value the talker or the thinker gave that the resolver dropped (Phase 2.1: only a person, or a slot of a
+   lasting run, is ever dropped as not in the words as heard; an undoable slot's reading is taken as given and its done
+   line names the guess) and then asked for is never asked back: rung C with the given values (why ``dropped``), where
+   the thinker checks them against the words and memory. Sends still go through the consent rule there; "not that"
+   to a guess runs the next of the user's own candidates, never the same guess again (:data:`LINE_WHICH` when none);
 7. a run that broke partway goes to rung C too (why ``error``), unless it may have sent, a rung's data says nothing
    may follow it or it is a relative change; a refusal before anything ran because no skill has that key, skills
    are off or memory was too slow to know the user's usuals tells the caller to do it by steps. Every other non-done
    end is a game in front, a question only the user can answer, a step that is only the user's, a skill that sends
    (rule 8: never a second try), a rung whose data forbids a second try, a relative change that couldn't be
    confirmed, a result that took somewhere else or a state already there, or an eval or a card (they never start an
-   agent run).
+   agent run). Phase 2.3: every such end carries its evidence (:attr:`SkillResult.evidence`: what was tried, what the
+   check saw, what is missing), so the talker words it in one short line; the code's line is only the fallback.
 
-Logs (D12, content-free through ``yuki.log.events.content_free``): ``skill_resolve``, ``route_try``, ``done_check``,
+Logs (D12, content-free through ``yuki.log.events.content_free``): ``skill_resolve`` (Phase 2.1: ``source``, where the
+given values came from, and ``guessed_slots``, as code words and schema names), ``route_try``, ``done_check``,
 ``done_recheck``, ``skill_run``, ``skill_handoff`` (the slots the resolver dropped, or a route found missing, by their
 schema names: ``dropped_slots`` / ``missing_slots``, never their values). ``open_uri`` lives here (L14): an app URI
 opened by ``yuki.actions.launch.open_url`` with no app, i.e. its guarded ``os.startfile``.
@@ -64,7 +68,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 from yuki.skills.connection import (Check, Route, Skill, fill, fill_value, sends_with, strictest, template_names,
                                     window_state_reader)
-from yuki.skills.resolve import FROM_CHOSEN, HELD_LINE, Ask, Handoff, Held, Live, Plan, Refused, canonical, done_line
+from yuki.skills.resolve import (FROM_CARD, FROM_CHOSEN, FROM_MENU, HELD_LINE, Ask, Handoff, Held, Live, Plan, Refused,
+                                 canonical, done_line, shown_value)
 
 #: The time a request may take from the words to the done line (PLAN.md §5: p90 <= 5 s).
 BUDGET_S = 5.0
@@ -119,6 +124,19 @@ FROM_GIVEN = "given"
 #: like", "something chill", "put something on"): ``choose`` (true) and ``context`` (their words or the understanding's,
 #: free text, for the judgement only). Never a skill's own slots: taken out before the resolver.
 CHOICE_SLOTS: tuple[str, ...] = ("choose", "context")
+#: Phase 2.1/2.2: the run's own notes a caller may add (at the top of ``run_skill``'s arguments, or inside its slots
+#: when the skill has no slot of that name; :func:`note_args`): ``why``, a pick's code-made why that the caller passes
+#: back from the candidates it chose from (said in the done line, ``resolve.WHY_LINE``), and ``from``, the caller's
+#: word for where a value it gave came from (``resolve.CALLER_SOURCES``: card / screen / menu / reading; one word, or a
+#: slot -> word map). Never a skill's own slots: taken out before the resolver.
+NOTE_SLOTS: tuple[str, ...] = ("why", "from")
+#: Phase 2.1: "not that" right after a guess (the caller's correction giving that same guessed value again) never runs
+#: it again: the next of the user's own candidates runs, else this question (rule 149: one line, one other way).
+LINE_WHICH = "Not that one, then. Which did you mean?"
+#: How long Yuki's guesses are kept for "not that" (RAM only; about one exchange, as :data:`REPEAT_HANDOFF_S`).
+GUESS_KEEP_S = 120.0
+#: Phase 2.3: at most this many names read on screen ride on a result's evidence for the talker.
+EVIDENCE_SEEN = 8
 #: How long the pick may take (the feeds within ``youtube_feed.REQUEST_BUDGET_S``, then one small model call bounded by
 #: ``taste.CHOOSE_WAIT_S``); a late pick leaves the request to the normal way.
 CHOOSE_TIMEOUT_S = 4.5
@@ -289,6 +307,11 @@ class RunContext:
     #: (``(monitor, how)``: :func:`place_hint`), so an app opens on the screen the user isn't watching; ``None``: where
     #: the app puts itself.
     place: tuple[str, str] | None = None
+    #: Phase 2.2: a pick's code-made why the caller passed back (:data:`NOTE_SLOTS`), said in the done line.
+    why: str = ""
+    #: Phase 2.1: the caller's word for where the values it gave came from (:data:`NOTE_SLOTS` ``from``), for the
+    #: resolver's ``given_from``.
+    given_from: Any = None
 
     def game_now(self) -> str:
         """D9, read now (fails closed: a check that raised counts as a game)."""
@@ -337,6 +360,13 @@ class SkillResult:
     #: Why a run was refused before anything ran (the resolver's code word: ``unknown_skill``, ``skills_off``, ...),
     #: or ``repeat`` on a hand-off that ran no rung because the same thing ran unconfirmed moments ago.
     why: str = ""
+    #: Phase 2.1: the values Yuki guessed (the caller's reading, a listed name, one of their known things), each
+    #: ``{"slot", "value" (as said), "from" (resolve.GUESS_SOURCES)}``: the done line names them; RAM only.
+    guessed: list[dict[str, Any]] = field(default_factory=list)
+    #: Phase 2.3: what a run that didn't end in a checked done tried, saw and is missing (:func:`_evidence`), so the
+    #: talker words that outcome itself in one short line; ``say`` stays the code's fallback line. RAM only (the
+    #: values and the names read on screen are the user's).
+    evidence: dict[str, Any] = field(default_factory=dict)
 
     @property
     def done(self) -> bool:
@@ -344,9 +374,19 @@ class SkillResult:
         return self.outcome in ("done", "already") and self.verified is True
 
     def report(self) -> str:
-        """For the model that called it (the talker or the thinker): what happened, in plain words. A hand-off always
-        says the rest is done by steps and the skill is not run again (x5Fallback: the old "follow it" sent the thinker
-        back into the skill that had just failed)."""
+        """For the model that called it (the talker or the thinker): what happened, in plain words, and on any other
+        end than a checked done a last line with the evidence (:func:`evidence_words`), the first line's shape kept
+        (``brain.done.engine_line`` reads it)."""
+        text = self._report()
+        if not self.done and self.evidence and self.outcome != "asked":    # a question needs only its words
+            words = evidence_words(self.evidence)
+            if words:
+                text = f"{text}\n{words}"
+        return text
+
+    def _report(self) -> str:
+        """:meth:`report`'s first lines. A hand-off always says the rest is done by steps and the skill is not run
+        again (x5Fallback: the old "follow it" sent the thinker back into the skill that had just failed)."""
         if self.outcome == "already" and self.verified is True:
             return f"Nothing to change: the PC shows it was already so. Say: {self.done_line or self.say}"
         if self.done:
@@ -414,6 +454,12 @@ class SkillResult:
                  "run_key": self.run_key,
                  "settled": self.outcome in ("held_game", HELD_CALL, HELD_BLOCKED, "other_device", "unverified",
                                              "asked", "already")}
+        # Phase 2.1 / 2.3 (RAM only): the guesses the done line names, and on any other end the evidence the talker
+        # words it from (``say`` is the code's fallback line)
+        if self.guessed:
+            facts["guessed"] = [dict(g) for g in self.guessed]
+        if self.evidence and not self.done:
+            facts["evidence"] = dict(self.evidence)
         if self.outcome == HELD_BLOCKED:
             facts["refused"] = HELD_BLOCKED      # fHands: never said as a game (``held`` stays empty)
         elif self.held:
@@ -873,11 +919,14 @@ def _missing_slot(skill: Skill, name: Any) -> str | None:
 def _drop_for(skill: Skill, missing: Any, filled: Mapping[str, str] | None = None) -> tuple[str, ...]:
     """The slots whose arguments leave the seed's done-check, **entities** only: one a route found missing, and one
     whose value the caller gave but the words as heard don't hold (a dropped hand-off: :data:`FROM_UNHEARD` /
-    :data:`FROM_GIVEN`, the model's own reading of a word nobody heard). An entity's name is the user's own word for a
-    thing that may be named otherwise on screen ("Japanese" for ネオン), or a guess at it, so the check never holds
-    the thinker to it; a person, an app or a text keeps its check (a message is never confirmed against "any chat")."""
+    :data:`FROM_GIVEN`, the model's own reading of a word nobody heard; Phase 2.1: a reading taken as given,
+    ``resolve.FROM_READING``). An entity's name is the user's own word for a thing that may be named otherwise on
+    screen ("Japanese" for ネオン), or a guess at it, so the check never holds the thinker to it; a person, an app or a
+    text keeps its check (a message is never confirmed against "any chat")."""
+    from yuki.skills.resolve import FROM_READING
+
     names = [_missing_slot(skill, missing)]
-    names += [k for k, src in (filled or {}).items() if src in (FROM_UNHEARD, FROM_GIVEN)]
+    names += [k for k, src in (filled or {}).items() if src in (FROM_UNHEARD, FROM_GIVEN, FROM_READING)]
     out: list[str] = []
     for name in names:
         slot = skill.slot(name) if name else None
@@ -897,6 +946,99 @@ def _seen_names(names: Any) -> list[str]:
         if len(out) >= SEEN_MAX:
             break
     return out
+
+
+def _check_status(evidence: Any, depth: int = 0) -> str:
+    """The code word a done-check's evidence gives for what it read (its ``status``, else its ``reason``: "no_window",
+    "other_page", "unread"), at any depth of an ``all`` check's parts; ``""`` when none."""
+    if not isinstance(evidence, Mapping) or depth > 3:
+        return ""
+    for key in ("status", "reason"):
+        word = evidence.get(key)
+        if isinstance(word, str) and _SLOT_NAME.fullmatch(word):
+            return word
+    for value in evidence.values():
+        got = _check_status(value, depth + 1)
+        if got:
+            return got
+    return ""
+
+
+def _evidence(skill: Skill, values: Mapping[str, Any] | None, tried: Sequence[Mapping[str, Any]], *, acted: bool,
+              route: Route | None = None, waited: Any = None, missing: str | None = None, seen: Any = (),
+              sources: Mapping[str, str] | None = None, reason: str = "", line: str = "") -> dict[str, Any]:
+    """Phase 2.3: what a run that didn't end in a checked done tried, saw and is missing, for the talker to word in one
+    short line (never the code's template): ``asked`` (the values as said), ``from`` (where each given value came
+    from), ``tried`` (each rung: its key, verb and outcome code), ``acted`` (whether anything on the PC was touched),
+    ``check`` (the last done-check: its probe, ``done`` / ``not_so`` / ``could_not_read``, and the status it read),
+    ``missing`` (the slot no item was found for), ``seen`` (up to :data:`EVIDENCE_SEEN` names read there instead),
+    ``reason`` (a code word: why it stopped) and ``fallback_line`` (the code's own line, said only if the talker can't).
+    RAM only. Never raises."""
+    ev: dict[str, Any] = {"acted": bool(acted)}
+    try:
+        asked = {k: shown_value(skill, k, v) for k, v in dict(values or {}).items()}
+        asked = {k: v for k, v in asked.items() if v}
+        if asked:
+            ev["asked"] = asked
+        if sources:
+            ev["from"] = {str(k): str(v) for k, v in sources.items()}
+        steps = [{"route": t.get("route"), "via": t.get("via"), "outcome": t.get("outcome")}
+                 for t in tried or () if isinstance(t, Mapping)]
+        if route is not None and not any(s.get("route") == route.key for s in steps):
+            steps.append({"route": route.key, "via": route.via, "outcome": "acted"})
+        if steps:
+            ev["tried"] = steps[-6:]
+        if waited is not None:
+            check = {"probe": (route.done.probe if route is not None and route.done is not None else "read_back"),
+                     "saw": {True: "done", False: "not_so", None: "could_not_read"}.get(waited.verdict,
+                                                                                     "could_not_read")}
+            status = _check_status(getattr(waited, "evidence", None))
+            if status:
+                check["status"] = status
+            ev["check"] = check
+        if missing:
+            ev["missing"] = str(missing)
+        names = _seen_names(seen)[:EVIDENCE_SEEN]
+        if names:
+            ev["seen"] = names
+        if reason:
+            ev["reason"] = str(reason)
+        if line:
+            ev["fallback_line"] = " ".join(str(line).split())
+    except Exception:  # noqa: BLE001 - what was gathered so far
+        pass
+    return ev
+
+
+def evidence_words(ev: Mapping[str, Any] | None) -> str:
+    """The evidence (:func:`_evidence`) as one line for the model that words the outcome: "Evidence: asked site
+    excalidraw.com; tried open_url (open_url: opened); the PC was touched; the check tab_url could_not_read
+    (no_window); ...". ``""`` for none."""
+    if not isinstance(ev, Mapping) or not ev:
+        return ""
+    parts: list[str] = []
+    asked = ev.get("asked") if isinstance(ev.get("asked"), Mapping) else {}
+    if asked:
+        src = ev.get("from") if isinstance(ev.get("from"), Mapping) else {}
+        parts.append("asked " + ", ".join(
+            f"{k} {v}" + (f" (from {src[k]})" if src.get(k) and src[k] != "words" else "") for k, v in asked.items()))
+    tried = [t for t in ev.get("tried") or [] if isinstance(t, Mapping)]
+    if tried:
+        parts.append("tried " + ", ".join(f"{t.get('route')} ({t.get('via')}: {t.get('outcome')})" for t in tried))
+    parts.append("the PC was touched" if ev.get("acted") else "nothing on the PC was touched")
+    check = ev.get("check") if isinstance(ev.get("check"), Mapping) else None
+    if check:
+        status = f" ({check['status']})" if check.get("status") else ""
+        parts.append(f"the check {check.get('probe')} {check.get('saw')}{status}")
+    if ev.get("missing"):
+        parts.append(f"no item found for {ev['missing']}")
+    if ev.get("seen"):
+        parts.append("seen there instead: " + " | ".join(str(n) for n in ev["seen"]))
+    if ev.get("reason"):
+        parts.append(f"stopped: {ev['reason']}")
+    if ev.get("fallback_line"):
+        parts.append(f"code's fallback line: \"{ev['fallback_line']}\"")
+    return "Evidence: " + "; ".join(parts) + "."
 
 
 def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], tried: list[dict[str, Any]],
@@ -994,8 +1136,13 @@ def run(resolved: Any, ctx: RunContext | None = None) -> SkillResult:
             return handed
         _ledger_finish(ctx, state.get("run_key"), outcome="error", checked=None, error=type(exc).__name__,
                        acted=bool(state.get("acted")))
+        tried = [dict(t) for t in state.get("tried") or [] if isinstance(t, Mapping)]
+        ev: dict[str, Any] = {"acted": bool(state.get("acted")), "reason": "error", "fallback_line": LINE_FAILED}
+        if tried:
+            ev["tried"] = [{"route": t.get("route"), "via": t.get("via"), "outcome": t.get("outcome")}
+                           for t in tried][-6:]
         return SkillResult(skill=key, outcome="error", say=LINE_FAILED,
-                           ms=round((ctx.clock() - started) * 1000.0, 1))
+                           ms=round((ctx.clock() - started) * 1000.0, 1), evidence=ev)
 
 
 def _error_handoff(resolved: Any, ctx: RunContext, started: float,
@@ -1216,7 +1363,9 @@ def _commit_gate(skill: Skill, ctx: RunContext, started: float) -> SkillResult |
     commit = run_commit(skill)
     if commit == "user" or (commit != "none" and ctx.origin == "card"):
         _emit(ctx, "skill_resolve", skill=skill.key, result="refused", reason=f"commit_{commit}")
-        return _simple(skill.key, "refused", ctx, started, say=LINE_COMMIT_USER if commit == "user" else LINE_FAILED)
+        line = LINE_COMMIT_USER if commit == "user" else LINE_FAILED
+        return _simple(skill.key, "refused", ctx, started, say=line,
+                       evidence={"acted": False, "reason": f"commit_{commit}", "fallback_line": line})
     return None
 
 
@@ -1224,15 +1373,17 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
     if isinstance(resolved, Ask):
         _emit(ctx, "skill_resolve", skill=resolved.skill, result="asked", slot_source="ask")
         return _simple(resolved.skill, "asked", ctx, started, ask=resolved.question, options=list(resolved.options),
-                       say=resolved.question)
+                       say=resolved.question, evidence={"acted": False, "reason": "asked",
+                                                        "fallback_line": resolved.question})
     if isinstance(resolved, Held):
         _emit(ctx, "skill_resolve", skill=resolved.skill, result="held_game", gate="game")
-        return _simple(resolved.skill, "held_game", ctx, started, held="game", say=resolved.say)
+        return _simple(resolved.skill, "held_game", ctx, started, held="game", say=resolved.say,
+                       evidence={"acted": False, "reason": "game", "fallback_line": resolved.say})
     if isinstance(resolved, Refused):
         _emit(ctx, "skill_resolve", skill=resolved.skill, result="refused", reason=resolved.why)
-        return _simple(resolved.skill, "refused", ctx, started,
-                       say=LINE_MEMORY_SLOW if resolved.why == "memory_slow" else LINE_FAILED,
-                       why=str(resolved.why or ""))
+        line = LINE_MEMORY_SLOW if resolved.why == "memory_slow" else LINE_FAILED
+        return _simple(resolved.skill, "refused", ctx, started, say=line, why=str(resolved.why or ""),
+                       evidence={"acted": False, "reason": str(resolved.why or "refused"), "fallback_line": line})
     state = state if state is not None else {}
     if isinstance(resolved, (Handoff, Plan)):
         refused = _commit_gate(resolved.skill, ctx, started)
@@ -1259,16 +1410,29 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
     t0 = time.time()
     run_app = _first_app(skill, plan.routes, plan.values)
     run_key = _ledger_start(ctx, skill, plan.values, plan.filled, t0, app=run_app)
+    sources = dict(plan.sources)
+    guessed = list(plan.guessed)
+    # Phase 2.1: where each given value came from (code words: words / heard / menu / card / screen / reading ...) and
+    # which slots are Yuki's guess, by their schema names only
     _emit(ctx, "skill_resolve", skill=skill.key, result="plan", routes=len(plan.routes),
           slot_source=sorted(set(plan.filled.values())), slots=len(plan.filled), named=len(plan.named),
           dropped=len(plan.dropped), dropped_slots=_slot_flags(plan.dropped), skipped=len(plan.skipped),
-          origin=ctx.origin)
+          source=sorted(set(sources.values())) or None, guessed_slots=_slot_flags(guessed), origin=ctx.origin)
     deadline = started + float(ctx.budget_s)
     tried: list[dict[str, Any]] = []
     state.update(run_key=run_key, tried=tried, acted=False)
     focus_taken = False
     acted = False
     sends = sends_with(skill, plan.values)
+    guesses = [{"slot": k, "value": shown_value(skill, k, plan.values.get(k)), "from": sources.get(k, "")}
+               for k in guessed]
+    last_wait: Any = None     # the last done-check read (Phase 2.3's evidence when every rung failed)
+    last_route: Route | None = None
+
+    def evidence(*, route: Route | None = None, waited: Any = None, reason: str = "", line: str = "") -> dict[str, Any]:
+        return _evidence(skill, plan.values, tried, acted=acted, route=route, waited=waited, missing=missing,
+                         seen=seen, sources=sources, reason=reason, line=line)
+
     # IF-seed: the slot a rung found no item for on screen, and the names it read there (RAM only)
     missing: str | None = None
     seen: list[str] = []
@@ -1322,8 +1486,10 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result=HELD_BLOCKED, ms=route_ms)
             _ledger_finish(ctx, run_key, outcome="refused", checked=None, route=route, ms=route_ms, app=app_done,
                            acted=acted)
-            return _simple(skill.key, HELD_BLOCKED, ctx, started, say=LINE_BLOCKED_PARTWAY if acted else LINE_BLOCKED,
-                           tried=tried, run_key=run_key, route=route.key, focus_taken=focus_taken, sends=sends)
+            line = LINE_BLOCKED_PARTWAY if acted else LINE_BLOCKED
+            return _simple(skill.key, HELD_BLOCKED, ctx, started, say=line, tried=tried, run_key=run_key,
+                           route=route.key, focus_taken=focus_taken, sends=sends,
+                           evidence=evidence(reason=HELD_BLOCKED, line=line))
         if res.held:
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "held_game"})
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result="held_game", ms=route_ms)
@@ -1334,7 +1500,7 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                     _ledger_finish(ctx, run_key, outcome="held_game", checked=None, route=route, ms=route_ms,
                                    app=app_done, acted=True)
                     return _simple(skill.key, "held_game", ctx, started, held="game", say=HELD_LINE, tried=tried,
-                                   run_key=run_key, route=route.key)
+                                   run_key=run_key, route=route.key, evidence=evidence(reason="game", line=HELD_LINE))
             continue
         if res.outcome == TO_PLANNER:
             # bSkill (bTalk merge note 4): the consent rule stopped a step of this rung that would send or join, with
@@ -1345,20 +1511,21 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             _ledger_try(ctx, run_key, route, None, "refused", route_ms)
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result=TO_PLANNER, ms=route_ms)
             return _to_planner(skill, plan, tried, ctx, started, run_key=run_key, acted=acted, missing=missing,
-                               seen=seen)
+                               seen=seen, evidence=evidence(route=route, reason=TO_PLANNER))
         if res.ask:
             _ledger_finish(ctx, run_key, outcome="asked", checked=None, route=route, ms=route_ms, app=app_done,
                            acted=acted)
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result="asked", ms=route_ms)
             return _simple(skill.key, "asked", ctx, started, ask=res.ask, options=list(res.options), say=res.ask,
-                           run_key=run_key, route=route.key, tried=tried)
+                           run_key=run_key, route=route.key, tried=tried,
+                           evidence=evidence(route=route, reason=res.outcome or "asked", line=res.ask))
         if res.outcome == "other_device":
             say = res.say or LINE_OTHER_DEVICE.format(app=_app_title(skill.app))
             _ledger_finish(ctx, run_key, outcome="other_device", checked=None, route=route, ms=route_ms,
                            app=app_done, acted=acted)
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result="other_device", ms=route_ms)
             return _simple(skill.key, "other_device", ctx, started, say=say, run_key=run_key, route=route.key,
-                           tried=tried)
+                           tried=tried, evidence=evidence(route=route, reason="other_device", line=say))
         probe_ctx = _probe_ctx(ctx, t0, plan.values, res, base)
         if res.already:
             # a true no-op: the end state was already there; still checked before it is said (never a fresh "done")
@@ -1388,7 +1555,10 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
               result={True: "done", False: "contradicted", None: "unverified"}[waited.verdict], ms=waited.ms,
               reads=waited.reads, observed=waited.evidence)
         if waited.verdict is True:
-            line = done_line(skill, plan.values, plan.named, route=route, say=res.say)
+            # Phase 2.1/2.2: a guessed value is named (one word corrects it); a pick the caller made from the
+            # candidates says its why instead
+            line = done_line(skill, plan.values, plan.named, route=route, say=res.say, guessed=guessed, why=ctx.why,
+                             picked=[k for k in guessed if sources.get(k) in (FROM_MENU, FROM_CARD)])
             # kHands brief item 6: every rung tried is in skill_route_tries, the last one too (the counters leave a
             # run's last rung out of that table: registry.TRY_NOT_LAST)
             _ledger_try(ctx, run_key, route, True, "done", route_ms)
@@ -1397,7 +1567,7 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                            evidence={"numbers": _numbers(plan.values), "check": waited.evidence})
             result = SkillResult(skill=skill.key, outcome="done", verified=True, done_line=line, say=line,
                                  route=route.key, tried=tried, ask_keep=plan.ask_keep, run_key=run_key,
-                                 values=dict(plan.values), focus_taken=focus_taken)
+                                 values=dict(plan.values), focus_taken=focus_taken, guessed=guesses)
             try:
                 _after_done(ctx, skill, route, plan, probe_ctx, result)
             except Exception:  # noqa: BLE001 - the usual's question and the second probe are extras: done stays done
@@ -1422,7 +1592,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                                 run_key=run_key, acted=True, routes=list(plan.routes), unconfirmed=True,
                                 missing=missing, seen=seen, focus_taken=focus_taken,
                                 ledger={"route": route, "ms": route_ms, "value": res.value, "app": app_done,
-                                        "evidence": {"numbers": _numbers(plan.values), "check": waited.evidence}})
+                                        "evidence": {"numbers": _numbers(plan.values), "check": waited.evidence}},
+                                evidence=evidence(route=route, waited=waited, reason=WHY_UNVERIFIED))
             say = res.unverified_line or LINE_UNVERIFIED
             _ledger_try(ctx, run_key, route, None, "unverified", route_ms)
             _ledger_finish(ctx, run_key, outcome="unverified", checked=None, route=route, ms=route_ms,
@@ -1430,30 +1601,38 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                            evidence={"numbers": _numbers(plan.values), "check": waited.evidence})
             return _simple(skill.key, "unverified", ctx, started, verified=None, say=say, route=route.key,
                            tried=tried, run_key=run_key, values=dict(plan.values), focus_taken=focus_taken,
-                           sends=sends)
+                           sends=sends, guessed=guesses,
+                           evidence=evidence(route=route, waited=waited,
+                                             reason="settled" if _settled(res, waited.evidence) else "", line=say))
         tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "contradicted"})
+        last_wait, last_route = waited, route
         if sends or not route.retry_after_acting:
             # review M3: a rung that acted on a skill that sends (or one whose data says so) is never followed by
             # another acting rung or a hand-off: the message may have gone anyway, and a second try would send twice
             _ledger_try(ctx, run_key, route, False, "failed", route_ms)
             _ledger_finish(ctx, run_key, outcome="failed", checked=False, route=route, ms=route_ms, app=app_done,
                            evidence={"numbers": _numbers(plan.values), "check": waited.evidence})
-            return _simple(skill.key, "failed", ctx, started, say=LINE_SEND_FAILED if sends else LINE_FAILED,
-                           route=route.key, tried=tried, run_key=run_key, values=dict(plan.values),
-                           focus_taken=focus_taken, sends=sends)
+            line = LINE_SEND_FAILED if sends else LINE_FAILED
+            return _simple(skill.key, "failed", ctx, started, say=line, route=route.key, tried=tried,
+                           run_key=run_key, values=dict(plan.values), focus_taken=focus_taken, sends=sends,
+                           guessed=guesses, evidence=evidence(route=route, waited=waited, reason="contradicted",
+                                                              line=line))
         _ledger_try(ctx, run_key, route, False, "failed", route_ms)
     # every rung failed or could not run
     game = ctx.game_now()
     if game:
         _ledger_finish(ctx, run_key, outcome="held_game", checked=None, route=None, acted=acted)
         return _simple(skill.key, "held_game", ctx, started, held="game", say=HELD_LINE, tried=tried,
-                       run_key=run_key)
+                       run_key=run_key, evidence=evidence(reason="game", line=HELD_LINE))
     if plan.handoff and skill.handoff and ctx.origin != "eval":
         return _handoff(skill, plan.values, plan.filled, tried, ctx, started, why="routes_failed", run_key=run_key,
-                        acted=acted, routes=list(plan.routes), missing=missing, seen=seen)
+                        acted=acted, routes=list(plan.routes), missing=missing, seen=seen,
+                        evidence=evidence(route=last_route, waited=last_wait, reason="routes_failed"))
     # the run's own row names no rung: each rung's verdict is already in its try row (never counted twice)
     _ledger_finish(ctx, run_key, outcome="failed", checked=False if acted else None, route=None)
-    return _simple(skill.key, "failed", ctx, started, say=LINE_FAILED, tried=tried, run_key=run_key)
+    return _simple(skill.key, "failed", ctx, started, say=LINE_FAILED, tried=tried, run_key=run_key,
+                   guessed=guesses, evidence=evidence(route=last_route, waited=last_wait, reason="routes_failed",
+                                                      line=LINE_FAILED))
 
 
 def _baseline(route: Route, values: Mapping[str, Any], ctx: RunContext) -> dict[str, Any]:
@@ -1599,19 +1778,23 @@ def _handoff(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str],
              ctx: RunContext, started: float, *, why: str, run_key: str | None, acted: bool = False,
              routes: list[Route] | None = None, unconfirmed: bool = False, missing: str | None = None,
              seen: Any = (), partial: bool = False, focus_taken: bool = False,
-             ledger: Mapping[str, Any] | None = None, repeat: bool = False) -> SkillResult:
+             ledger: Mapping[str, Any] | None = None, repeat: bool = False,
+             evidence: Mapping[str, Any] | None = None) -> SkillResult:
     """Rung C: never with a game in front (D17(2)), re-read right here. The pinned skill is the old loop's pin and the
     new brain's plan seed alike (:func:`pinned`), held to the done-check of the routes this run took (``routes``),
     with IF-seed's ``missing`` (its value left out of that check) and ``seen``. ``unconfirmed``: the last rung acted
     and its check couldn't read (x5Fallback): the run's row is never marked contradicted for it. ``partial``: the
     values are only what the caller gave (a dropped value handed over). ``ledger``: more of the run row's facts (the
     rung that acted, its value, app and the check's evidence: content-free). ``repeat``: the same thing handed over
-    unconfirmed moments ago, so no rung ran this time (:func:`_recent_handoff`)."""
+    unconfirmed moments ago, so no rung ran this time (:func:`_recent_handoff`). ``evidence``: what the run tried
+    and saw (Phase 2.3, :func:`_evidence`; built here from ``tried`` when the caller has none)."""
+    ev = dict(evidence) if evidence else _evidence(skill, values, tried, acted=acted, missing=missing, seen=seen,
+                                                   sources=None, reason=why)
     game = ctx.game_now()
     if game:
         _ledger_finish(ctx, run_key, outcome="held_game", checked=None, acted=acted)
         return _simple(skill.key, "held_game", ctx, started, held="game", say=HELD_LINE, tried=tried,
-                       run_key=run_key)
+                       run_key=run_key, evidence={**ev, "reason": "game", "fallback_line": HELD_LINE})
     # the onset probes' states right before the thinker acts (its finish gate compares with them, review M4), on the
     # very check the seed carries (a missing entity's argument left out)
     spec = _done_spec(skill, values, routes, drop=_drop_for(skill, missing, filled))
@@ -1632,20 +1815,22 @@ def _handoff(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str],
           missing_slots=_slot_flags([pin["missing"]] if pin.get("missing") else []), seen=len(pin.get("seen") or []),
           repeat=True if repeat else None, origin=ctx.origin)
     return _simple(skill.key, "handed_over", ctx, started, handoff=pin, tried=tried, run_key=run_key,
-                   values=dict(values), focus_taken=focus_taken, why="repeat" if repeat else "")
+                   values=dict(values), focus_taken=focus_taken, why="repeat" if repeat else "", evidence=ev)
 
 
 def _to_planner(skill: Skill, plan: Plan, tried: list[dict[str, Any]], ctx: RunContext, started: float, *,
-                run_key: str | None, acted: bool, missing: str | None = None, seen: Any = ()) -> SkillResult:
+                run_key: str | None, acted: bool, missing: str | None = None, seen: Any = (),
+                evidence: Mapping[str, Any] | None = None) -> SkillResult:
     """A rung whose step the consent rule handed over (:data:`TO_PLANNER`; that step did not run): rung C with the
     plan seed when the skill's data lets it hand over (never with a game in front: :func:`_handoff` reads it again).
     A skill whose data says it is never handed over (it would only search), or an eval run, stops there with the
     user's-step line: nothing more is done, and no next rung tries the same step."""
     if skill.handoff and ctx.origin != "eval":
         return _handoff(skill, plan.values, plan.filled, tried, ctx, started, why=TO_PLANNER, run_key=run_key,
-                        acted=acted, routes=list(plan.routes), missing=missing, seen=seen)
+                        acted=acted, routes=list(plan.routes), missing=missing, seen=seen, evidence=evidence)
     _ledger_finish(ctx, run_key, outcome="refused", checked=None, acted=acted)
-    return _simple(skill.key, "refused", ctx, started, say=LINE_COMMIT_USER, tried=tried, run_key=run_key)
+    return _simple(skill.key, "refused", ctx, started, say=LINE_COMMIT_USER, tried=tried, run_key=run_key,
+                   evidence={**dict(evidence or {}), "reason": TO_PLANNER, "fallback_line": LINE_COMMIT_USER})
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1971,7 +2156,9 @@ def _choice_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunCon
             taste.keep_for_later(choice, session=ctx.session_id)
         outcome = "held_game" if hold == "game" else HELD_CALL
         _emit(ctx, "skill_run", skill=key, result=outcome, choose=True, origin=ctx.origin)
-        return SkillResult(skill=key, outcome=outcome, say=taste.held_line(choice, hold), held=live.game or None)
+        line = taste.held_line(choice, hold)
+        return SkillResult(skill=key, outcome=outcome, say=line, held=live.game or None,
+                           evidence={"acted": False, "reason": hold, "fallback_line": line})
     if choice is None:
         return None
     chosen = {choice.slot: choice.value, **choice.extra}
@@ -1985,6 +2172,131 @@ def _offered_pick(ctx: RunContext, name: str) -> bool:
 
     got = _mem(ctx.memory, "taste_offered", lambda c: taste.find_offered(_store_of(c), name), timeout_s=0.5)
     return got is not None
+
+
+def note_args(skill_key: str, args: Mapping[str, Any], slots: Mapping[str, Any] | None
+              ) -> tuple[str, Any, dict[str, Any]]:
+    """Phase 2.1/2.2: a run's own notes (:data:`NOTE_SLOTS`) and its slots without them: ``args["why"]`` /
+    ``args["from"]`` (the planner's run_skill), else ``slots["why"]`` / ``slots["from"]`` (the talker's free-form
+    slots) when the skill has no slot of that name; those entries then leave the slots, so the resolver never reads one
+    as a value. ``(why, from, slots)``: the why as one line (``""``: none), the from as given (one word or a slot ->
+    word map; ``None``: none). Never raises."""
+    rest = dict(slots or {})
+    own: set[str] = set()
+    try:
+        if any(name in rest for name in NOTE_SLOTS):
+            from yuki.skills.catalog import load
+
+            skill = load().get(str(skill_key or ""))
+            own = {getattr(sl, "name", "") for sl in skill.slots} if skill is not None else set()
+    except Exception:  # noqa: BLE001 - unknown: the slots stay slots
+        own = set(NOTE_SLOTS)
+    got: dict[str, Any] = {name: args.get(name) if isinstance(args, Mapping) else None for name in NOTE_SLOTS}
+    for name in NOTE_SLOTS:
+        if name in rest and name not in own:
+            value = rest.pop(name)
+            if got.get(name) in (None, ""):
+                got[name] = value
+    why = " ".join(got["why"].split()) if isinstance(got.get("why"), str) else ""
+    src = got.get("from")
+    return why, (src if isinstance(src, (str, Mapping)) and src else None), rest
+
+
+#: Phase 2.1: the runs of the last :data:`GUESS_KEEP_S` that held a guess of Yuki's, oldest first: (monotonic time, the
+#: capability, every slot's value identity in that run, the guessed slots). RAM only, this process; never logged.
+_GUESSES: list[tuple[float, str, dict[str, str], frozenset[str]]] = []
+_guess_lock = threading.Lock()
+#: At most this many such runs are kept.
+GUESS_RUNS = 8
+
+
+def _value_id(value: Any) -> str:
+    """A slot value as one identity to compare guesses by (its name for an entity, :func:`scope_value`)."""
+    from yuki.skills.connection import scope_value
+
+    try:
+        return str(scope_value(value.get("name") if isinstance(value, Mapping) else value) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _run_ids(plan: Plan) -> dict[str, str]:
+    """Every slot value of a resolved run as its identity (:func:`_value_id`), empty ones left out."""
+    ids = {str(k): _value_id(v) for k, v in plan.values.items()}
+    return {k: v for k, v in ids.items() if v}
+
+
+def _guess_runs(cap: str) -> list[tuple[dict[str, str], frozenset[str]]]:
+    """``cap``'s runs that held a guess within :data:`GUESS_KEEP_S` (oldest first): (their value identities, their
+    guessed slots)."""
+    now = time.monotonic()
+    with _guess_lock:
+        return [(ids, guessed) for t, c, ids, guessed in _GUESSES if c == cap and now - t <= GUESS_KEEP_S]
+
+
+def _guessed_before(cap: str, slot: str) -> list[str]:
+    """The identities guessed for ``cap``'s ``slot`` within :data:`GUESS_KEEP_S` (oldest first)."""
+    got = [ids.get(slot, "") for ids, guessed in _guess_runs(cap) if slot in guessed]
+    return [i for i in dict.fromkeys(got) if i]
+
+
+def _note_guesses(plan: Plan) -> None:
+    """Keep a run that held a guess (:attr:`Plan.guessed`), with every value it ran, for "not that". Never raises."""
+    try:
+        cap = plan.skill.capability or plan.skill.key
+        now = time.monotonic()
+        entry = (now, cap, _run_ids(plan), frozenset(plan.guessed))
+        with _guess_lock:
+            _GUESSES[:] = [g for g in _GUESSES if now - g[0] <= GUESS_KEEP_S][-(GUESS_RUNS - 1):] + [entry]
+    except Exception:  # noqa: BLE001 - nothing kept: "not that" then runs what the caller gives
+        pass
+
+
+def _rejected_slot(resolved: Any) -> str | None:
+    """Phase 2.1: on a correction, the slot whose value is again Yuki's guess (``resolve.GUESS_SOURCES``) in a request
+    that is otherwise the very run of moments ago that guessed it (every other slot's value the same, review H1): the
+    caller re-sent the same request, so the only thing the user can have said "not that" to is that guess. ``None``
+    otherwise: a correction that changed any other value ("no, lower, like 10"; "no, in Chrome") runs as given, and a
+    value now in their words ("no, I said Excalidraw") is theirs."""
+    if not isinstance(resolved, Plan):
+        return None
+    cap = resolved.skill.capability or resolved.skill.key
+    now_ids = _run_ids(resolved)
+    runs = _guess_runs(cap)
+    for slot in resolved.guessed:
+        ident = now_ids.get(slot)
+        if not ident:
+            continue
+        rest = {k: v for k, v in now_ids.items() if k != slot}
+        for ids, guessed in runs:
+            if slot in guessed and ids.get(slot) == ident and {k: v for k, v in ids.items() if k != slot} == rest:
+                return slot
+    return None
+
+
+def _next_own(ctx: RunContext, skill: Skill, slot_name: str, skip: Sequence[str]) -> str | None:
+    """The user's next own candidate for a taste slot (:func:`yuki.skills.taste.top` at this hour, then
+    :func:`yuki.skills.taste.candidates`), none of ``skip`` (identities already guessed or rejected). ``None`` for any
+    other slot or none left."""
+    slot = skill.slot(slot_name)
+    if slot is None or not slot.taste or ctx.memory is None:
+        return None
+    from yuki.skills import taste
+
+    gone = set(skip)
+
+    def pick(c: Any) -> str | None:
+        store = _store_of(c)
+        for t in taste.top(store, slot.taste, n=8):
+            if t.name and _value_id(t.name) not in gone:
+                return t.name
+        for n in taste.candidates(store, slot.taste):
+            if n and _value_id(n) not in gone:
+                return str(n)
+        return None
+
+    got = _mem(ctx.memory, "taste_other", pick, timeout_s=0.5)
+    return str(got) if got else None
 
 
 def _pick_where(line: str) -> str:
@@ -2005,13 +2317,23 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     of a "done" (as a correction, or not ``again``) mark that run a false done first (D19, review r2 M2), taken back
     when the new run finds the PC already so (fSkills review M1: :func:`_note_false_done`).
     ``ctx.grant`` (the brain's validated consent grant, :func:`run_for_thinker`): the resolver keeps the granted text
-    and person as given (``granted=``) instead of dropping them; with none, nothing changes."""
+    and person as given (``granted=``) instead of dropping them; with none, nothing changes.
+    Phase 2.1: the caller's notes (:data:`NOTE_SLOTS`) leave ``slots`` here for every origin (:func:`note_args`; the
+    context's own, read from a caller's arguments, first): ``ctx.given_from`` (the caller's word for where its values
+    came from) goes to the resolver's ``given_from``, and ``ctx.why`` (a pick's why) makes a listed name it gave its own
+    pick (``own_pick``) and is said in the done line. A correction that sends again the very request of moments ago
+    whose guess the user turned down (:func:`_rejected_slot`: every other value the same) runs the user's next own
+    candidate instead (:func:`_next_own`), else asks (:data:`LINE_WHICH`), never the same guess twice; each run that
+    held a guess is kept for that (:func:`_note_guesses`)."""
     from yuki.skills import enabled, setting
     from yuki.skills import resolve as res_mod
 
     if not enabled(settings):
         # the off switch (Settings.skills = false): the old paths run instead; nothing here acts
         return run(Refused(str(skill_key or ""), "skills_off"), ctx)
+    # Phase 2.1/2.2 (review M1): the caller's notes (``why``, ``from``) leave the slots on every path (the voice's
+    # hands, a card, the thinker), the context's own (a caller that read them from its arguments) first
+    ctx.why, ctx.given_from, slots = note_args(str(skill_key or ""), {"why": ctx.why, "from": ctx.given_from}, slots)
     if live is None:
         from yuki.skills.catalog import load
 
@@ -2053,6 +2375,10 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
             extra["granted"] = dict(granted)
         if picked is not None:
             extra.update(chosen=dict(picked.chosen), chosen_from=picked.chosen_from)
+        if ctx.given_from:
+            extra["given_from"] = ctx.given_from
+        if ctx.why:
+            extra["own_pick"] = True        # a listed name it gave is its own pick from the candidates (a guess)
         return res_mod.resolve(key, slots, words, store=_store_of(client) if client is not None else None,
                                live=live, again=again, default_step=step, disable_after=disable_after, **extra)
 
@@ -2064,6 +2390,26 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         return run(Refused(str(skill_key or ""), "memory_slow"), ctx)
     if resolved is None:
         resolved = go(None)
+    rejected = _rejected_slot(resolved) if corrects and picked is None else None
+    if rejected is not None:
+        # Phase 2.1: "not that" to Yuki's own guess, and the caller gave that same guess again: the user's next own
+        # candidate for the slot (never one guessed already), else one short question; never the same guess twice
+        cap = resolved.skill.capability or resolved.skill.key
+        skip = [*_guessed_before(cap, rejected), _value_id(resolved.values.get(rejected))]
+        nxt = _next_own(ctx, resolved.skill, rejected, skip)
+        _emit(ctx, "skill_resolve", skill=resolved.skill.key, result="not_that", reason="next" if nxt else "asked",
+              guessed_slots=_slot_flags([rejected]), origin=ctx.origin)
+        redo = None
+        if nxt:
+            ctx.why = ""            # the caller's why was for the value the user just turned down
+            again_slots = {**dict(slots or {}), rejected: nxt}
+            src = {**(dict(ctx.given_from) if isinstance(ctx.given_from, Mapping) else {}), rejected: FROM_MENU}
+            redo = _mem(ctx.memory, "skill_resolve", lambda c: res_mod.resolve(
+                resolved.skill.key, again_slots, words, store=_store_of(c) if c is not None else None, live=live,
+                again=again, default_step=step, disable_after=disable_after, given_from=src,
+                **({"earlier": [str(w) for w in earlier if w]} if earlier else {})), timeout_s=1.0) \
+                if ctx.memory is not None else None
+        resolved = redo if redo is not None else Ask(resolved.skill.key, rejected, LINE_WHICH, [])
     noted = _note_false_done(resolved, ctx, corrects=bool(corrects), again=bool(again))
     handed = _dropped_handoff(resolved, slots, words, catalog.get("loaded"), ctx)
     if handed is not None:
@@ -2098,6 +2444,9 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         except Exception:  # noqa: BLE001 - the offer is extra; the run goes on without it
             pending = None
     result = run(resolved, ctx)
+    if isinstance(resolved, Plan) and resolved.guessed and result.outcome not in (
+            "asked", "held_game", HELD_CALL, HELD_BLOCKED, "refused"):
+        _note_guesses(resolved)      # Phase 2.1: "not that" next takes another, never this one again
     _withdraw_false_done(ctx, noted, result, getattr(getattr(resolved, "skill", None), "key", str(skill_key or "")))
     other = None if picked is not None else _other_than_corrected(resolved, result, ctx, corrects=bool(corrects))
     if other is not None:
@@ -2108,6 +2457,8 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         # with Yuki's own pick (``picked``: its done line and taste note name that pick)
         again_slots = {**dict(slots or {}), other[0]: other[1]}
         extra: dict[str, Any] = {"earlier": [str(w) for w in earlier if w]} if earlier else {}
+        extra["given_from"] = {**(dict(ctx.given_from) if isinstance(ctx.given_from, Mapping) else {}),
+                               other[0]: FROM_MENU}
         regranted = granted_values(ctx.grant, again_slots) if ctx.origin == "thinker" else None
         if regranted:
             extra["granted"] = dict(regranted)
@@ -2116,6 +2467,7 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
             again=again, default_step=step, disable_after=disable_after, **extra), timeout_s=1.0) \
             if ctx.memory is not None else None
         if isinstance(redo, Plan):
+            ctx.why = ""            # the caller's why was for the value the PC already showed
             result = run(redo, ctx)
     if picked is not None and result.done:
         # the pick played and its done-check saw it: the line names it and why (code-written), and the conversation
@@ -2181,9 +2533,11 @@ def run_for_voice(hands: Any, args: Mapping[str, Any], words: list[str], *, game
     acting marker, published only right before a rung that takes focus (sound-only rungs publish none, D18)."""
     key = str(args.get("skill") or "")
     hint, slots = place_arg(key, args, args.get("slots") if isinstance(args.get("slots"), Mapping) else {})
+    why, given_from, slots = note_args(key, args, slots)
     ctx = RunContext(origin="voice", words=[str(w) for w in words or []], memory=getattr(hands, "memory", None),
                      hands=hands, log=log, request_id=request_id, on_focus=on_focus,
-                     session_id=getattr(getattr(hands, "memory", None), "session_id", None), place=hint)
+                     session_id=getattr(getattr(hands, "memory", None), "session_id", None), place=hint, why=why,
+                     given_from=given_from)
     result = resolve_and_run(key, slots, ctx.words, ctx, again=bool(args.get("again")), settings=settings, live=live,
                              corrects=bool(args.get("corrects")), game_answer=game)
     ok, report, facts = result.as_voice()
@@ -2209,8 +2563,10 @@ def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = 
     (:attr:`RunContext.grant`, failure fix-plan Item 11's L2)."""
     hint, slots = place_arg(str(args.get("skill") or ""), args,
                             args.get("slots") if isinstance(args.get("slots"), Mapping) else {})
+    why, given_from, slots = note_args(str(args.get("skill") or ""), args, slots)
     ctx = RunContext(origin="thinker", words=[str(w) for w in words or []], memory=memory, log=log,
-                     request_id=request_id, game=game, verbs=dict(verbs or {}), hands=hands, place=hint)
+                     request_id=request_id, game=game, verbs=dict(verbs or {}), hands=hands, place=hint, why=why,
+                     given_from=given_from)
     ctx.grant = _thinker_grant(grant, ctx, str(args.get("skill") or ""), slots)
     return resolve_and_run(str(args.get("skill") or ""), slots, ctx.words, ctx, again=bool(args.get("again")),
                            settings=settings, corrects=bool(args.get("corrects")), earlier=earlier)
@@ -2223,4 +2579,5 @@ __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_O
            "run_commit", "served_commit", "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult",
            "VERB_FUNCS", "open_uri", "pinned", "SEED_KEYS", "plan_seed", "run", "resolve_and_run", "run_for_voice",
            "run_for_thinker", "granted_values", "place_arg", "place_hint", "place_for",
-           "CHOICE_SLOTS", "CHOOSE_TIMEOUT_S", "HELD_CALL", "asks_choice"]
+           "CHOICE_SLOTS", "CHOOSE_TIMEOUT_S", "HELD_CALL", "asks_choice", "NOTE_SLOTS", "LINE_WHICH",
+           "GUESS_KEEP_S", "note_args", "evidence_words"]

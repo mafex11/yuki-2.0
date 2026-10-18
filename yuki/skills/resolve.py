@@ -41,8 +41,11 @@ eval). Step by step:
    (``names_person``), and a send to them is typed and left by the chat driver, never sent by sound. An app may also
    be one whose known names (its key, a web address's name, a chat app's title, the names the user's timeline shows
    it under) stand in the words, or are heard there by sound ("this card" for Discord, "Ark" for Arc); a site (a
-   text slot bound to a site) one whose identity stands there ("youtube.com" for "YouTube"). A value that fails is
-   dropped and its slot name returned (``dropped``), never "corrected". One exception, on the new brain only: a text
+   text slot bound to a site) one whose identity stands there ("youtube.com" for "YouTube"). **Phase 2.1:** on an
+   undoable run (no send, no commit) a value that fails these checks is the caller's reading and is accepted as given,
+   tagged where it came from (:attr:`Plan.sources`, :data:`GUESS_SOURCES`) and named in the done line; on a lasting
+   run (a send, a join), and for a person on any run, a value that fails is dropped and its slot name returned
+   (``dropped``), never "corrected". One exception, on the new brain only: a text
    (the message, the person) that is exactly what the brain's consent rule allowed and counted down for this very run
    (``granted``, failure fix-plan Item 11's L2: Yuki's wording of what the user asked to say) is kept as given, filled
    :data:`FROM_GRANT`. And the 10 Oct decision, "a message Yuki words itself stays a draft" (lResolve): the free text
@@ -113,12 +116,30 @@ FROM_CHOSEN = "chosen"
 #: today only ``app.way``'s ``way`` naming none of the user's live ways (kWays review L1: the route asks "Which of your
 #: ways?", never runs another way in its place). The engine's word for a given value too (``engine.FROM_GIVEN``).
 FROM_GIVEN = "given"
-#: fBrain merge note (contract C5, live 18 Oct k_resume_anime: "put my anime back on" with ``site = JustAnime`` from the
-#: understanding and the card was dropped as unheard, a 3.8 s hand-off): a given site value the words don't hold that
-#: is one of the user's own known sites (the learner's values, :func:`yuki.skills.learn.values.known`, the you-card's
-#: "Sites they open"; Not mine left out), kept as that known value in the slot's own place right after "words". Never
-#: a guess for taste (not in ``taste.ASKED_FILLS`` or ``GUESS_FILLS``). A code word in the logs.
-FROM_KNOWN = "known"
+#: Phase 2.1 (18 Oct "free thinker", reasoning.md 1.2 D: five correct readings vetoed in test A, open_excalidraw 16.9 s
+#: to a fail): where a value the caller gave came from, each a code word in RAM (:attr:`Plan.sources`) and in the logs.
+#: ``words``: it stands in the user's words (as written, or its identity: "youtube.com" for "YouTube"); ``heard``: it
+#: is heard there by sound or a learned heard form ("Ark" for Arc, "Lumin" for lumen, "hey meant" for Hemanth); ``menu``:
+#: the caller's own pick of a name the menu or the card lists for that slot, the words not holding it (it passed the
+#: pick's why, or said ``menu``; a listed name the user pointed at, "the second one", stays ``words``); ``card``: one of
+#: the user's own known sites or things the words only hint at ("my anime" -> justanime.to); ``screen``: the caller
+#: read it on screen (its own word, :data:`CALLER_SOURCES`); ``reading``: the model's own reading of their words that
+#: nothing above holds ("Pourbex caladra" -> excalidraw.com). On an undoable run the last four are accepted as given
+#: (the model's reading wins: a slip costs one "not that") and named in the done line (:data:`GUESS_SOURCES`); on a
+#: lasting run (a send, a join) and for a person they are never accepted.
+FROM_WORDS = "words"
+FROM_HEARD = "heard"
+FROM_MENU = "menu"
+FROM_CARD = "card"
+FROM_SCREEN = "screen"
+FROM_READING = "reading"
+#: The sources that are Yuki's guess at what they meant: the done line names the value (:func:`done_line`), "not
+#: that" takes the next one (the engine), and none of them is ever counted as the user's own word by the ledger
+#: (``skill_runs.filled`` keeps the word itself: never ``words``).
+GUESS_SOURCES: tuple[str, ...] = (FROM_MENU, FROM_CARD, FROM_SCREEN, FROM_READING)
+#: The words a caller may give for where a value it gave came from (``resolve``'s ``given_from``): only ever a tag on
+#: a value the words don't hold, never a reason to accept one on a lasting run.
+CALLER_SOURCES: tuple[str, ...] = (FROM_CARD, FROM_SCREEN, FROM_MENU, FROM_READING)
 #: ``app.way``'s slots (connections/ways.toml, contract C4): which way (a live way's key or name), and where in the app
 #: (a control's label the menu lists, one of their things, or an item's own words).
 WAY_CAPABILITY = "app.way"
@@ -133,6 +154,9 @@ APPS_TTL_S = 600.0
 PERSON_BIND = "contact"
 #: The bind source that marks a text slot as a site (``web.open_page``'s ``bind = { site = "site" }``).
 SITE_BIND = "site"
+#: The bind source that marks a text slot as one of a site's page kinds (``web.open_page``'s ``page``): data, never a
+#: reading (Phase 2.1).
+PAGE_BIND = "page"
 #: The question when the user said a name none of their people (nor a group chat or channel) goes by, and it sounds
 #: like exactly one of them: asked, never swapped (a message to someone who merely sounds alike is a wrong send).
 CONFIRM_PERSON = "Did you mean {name}?"
@@ -170,10 +194,19 @@ class Plan:
     game: str = ""
     ask_keep: dict[str, Any] | None = None
     handoff: bool = True
+    #: Phase 2.1: each slot the caller gave a value for -> where that value came from (:data:`FROM_WORDS` ...
+    #: :data:`FROM_READING`, or a fill word such as ``granted`` / ``worded`` / ``given`` / ``chosen``). RAM and code
+    #: words only.
+    sources: dict[str, str] = field(default_factory=dict)
 
     @property
     def kind(self) -> str:
         return "plan"
+
+    @property
+    def guessed(self) -> list[str]:
+        """The slots whose value is Yuki's guess at what they meant (:data:`GUESS_SOURCES`), in slot order."""
+        return [k for k, src in self.sources.items() if src in GUESS_SOURCES]
 
 
 @dataclass
@@ -273,50 +306,9 @@ def _site_said(value: str, words: Sequence[str]) -> bool:
             forms.append(registrable_domain(ident).split(".")[0])
         except Exception:  # noqa: BLE001
             pass
-    if any(f and f != _words(value).casefold() and _said(f, words) for f in dict.fromkeys(forms)):
-        return True
-    # fSkills (live 18 Oct: "Pourbex caladra" for Excalidraw, "eleven labs" for elevenlabs.io, "Justaname" for
-    # justanime.to, "chat BP" for chatgpt.com, "my GitHub Pages site" for <name>.github.io all dropped as unheard and
-    # handed to the thinker, 10-30 s): a name of the site (a label of its domain) whose letters stand in the words'
-    # letters, spaces and case aside, within a spelling distance (:func:`_letters_near`)
-    labels = [p for p in (ident or _words(value).casefold()).split(".") if p.isalpha() and len(p) >= SITE_NEAR_MIN]
-    return any(_letters_near(p, words) for p in dict.fromkeys(labels))
-
-
-#: fSkills: a site's name heard inside the words (:func:`_letters_near`): at least this many letters...
-SITE_NEAR_MIN = 5
-#: ...found among the words' letters (spaces, case and punctuation aside) with at most this share of its letters
-#: changed, added or left out (one in five letters: "excaladra" for excalidraw 0.2; two of seven: "chatbp" for chatgpt
-#: 0.29), a longer name allowing a little more (:data:`SITE_NEAR_LONG`).
-SITE_NEAR_DISTANCE = 0.2
-SITE_NEAR_LONG = (7, 0.3)
-
-
-def _letters_near(form: str, words: Sequence[str]) -> bool:
-    """Whether the Latin letters of ``form`` (a site's name) stand, approximately, in one turn's letters run together
-    (an approximate substring: the edit distance of ``form`` to the closest stretch of that turn's letters over
-    ``form``'s length, within :data:`SITE_NEAR_DISTANCE`, or :data:`SITE_NEAR_LONG` for a long name). Speech recognition
-    splits a long name ("eleven labs") or glues a word onto it ("Pourbex caladra"); this reads through both. A fixed
-    format rule on the spellings, never a list of words."""
-    from yuki.memory.contacts import romanize
-
-    want = "".join(ch for ch in str(form or "").casefold() if "a" <= ch <= "z")
-    if len(want) < SITE_NEAR_MIN:
-        return False
-    limit = SITE_NEAR_LONG[1] if len(want) >= SITE_NEAR_LONG[0] else SITE_NEAR_DISTANCE
-    for turn in words:
-        text = "".join(romanize(w) for w in str(turn or "").split())
-        if not text:
-            continue
-        prev = [0] * (len(text) + 1)        # a match may start anywhere in the turn
-        for i, ch in enumerate(want, 1):
-            cur = [i] + [0] * len(text)
-            for j, tj in enumerate(text, 1):
-                cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ch != tj))
-            prev = cur
-        if min(prev) / len(want) <= limit:
-            return True
-    return False
+    # Phase 2.1: a site the words only approximate ("Pourbex caladra" for Excalidraw) is no longer guessed by string
+    # distance here; the caller's reading is accepted on an undoable run and named as a guess (``resolve``)
+    return any(f and f != _words(value).casefold() and _said(f, words) for f in dict.fromkeys(forms))
 
 
 def _site_page_given(skill: Skill, given: Mapping[str, Any], words: Sequence[str], store: Any,
@@ -397,16 +389,30 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
                 heard_person: Callable[[str, Sequence[str]], str | None] | None = None,
                 app_names: Callable[[str], tuple[str, list[str]]] | None = None,
                 site: bool = False, loose: bool = False) -> tuple[bool, Any]:
-    """``(valid, canonical value)`` of one given slot value (step 1). Identity and whole-word spans, plus checks on
-    the user's own data: ``heard_person(name, words) -> the person's name | None`` (a person slot, or a text slot
-    bound to a contact: the people index resolves the name to exactly one person whom the words name as heard, a
-    transliteration or a close mishearing; the value becomes that person's own name, so "Hemant" for "हेमंत" runs
-    as Hemanth), ``app_names(value) -> (key, names)`` (an app slot: the app's known names, any of which may stand in
-    the words, or be heard there by sound; the app's key is kept) and ``site`` (a text slot the capability binds to a
-    site: the site's identity may stand in the words instead, :func:`_site_said`). ``loose``: a listed name may also be
-    heard by :func:`yuki.skills.taste.heard_as`'s closed-set tier (the caller's taste slots only; review M2)."""
+    """``(valid, canonical value)`` of one given slot value (step 1): :func:`_check` without where it was found."""
+    ok, got, _how = _check(slot, value, words, menu_names=menu_names, told=told, people=people,
+                           heard_person=heard_person, app_names=app_names, site=site, loose=loose)
+    return ok, got
+
+
+def _check(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Sequence[str] = (),
+           told: Any = None, people: Callable[[str], dict[str, Any] | None] | None = None,
+           heard_person: Callable[[str, Sequence[str]], str | None] | None = None,
+           app_names: Callable[[str], tuple[str, list[str]]] | None = None,
+           site: bool = False, loose: bool = False) -> tuple[bool, Any, str]:
+    """``(valid, canonical value, where it was found)`` of one given slot value (step 1). Identity and whole-word
+    spans, plus checks on the user's own data: ``heard_person(name, words) -> the person's name | None`` (a person
+    slot, or a text slot bound to a contact: the people index resolves the name to exactly one person whom the words
+    name as heard, a transliteration or a close mishearing; the value becomes that person's own name, so "Hemant" for
+    "हेमंत" runs as Hemanth), ``app_names(value) -> (key, names)`` (an app slot: the app's known names, any of which
+    may stand in the words, or be heard there by sound; the app's key is kept) and ``site`` (a text slot the capability
+    binds to a site: the site's identity may stand in the words instead, :func:`_site_said`). ``loose``: a listed name
+    may also be heard by :func:`yuki.skills.taste.heard_as`'s closed-set tier (the caller's taste slots only; review
+    M2). Where: :data:`FROM_WORDS` (as written, an identity, a told value, an option or a number), :data:`FROM_HEARD`
+    (by sound or a heard form) or :data:`FROM_MENU` (a name listed for the slot that the words don't hold); ``""``
+    when not valid."""
     if value is None or value == "":
-        return False, None
+        return False, None, ""
     t = slot.type
     if t == "enum":
         want = _words(value).casefold()
@@ -415,68 +421,71 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
             # lSkills (live 17 Oct): the talker sent ``mute: true`` (a JSON boolean) for options on / off, the value
             # was dropped and the volume skill asked "Louder, quieter, or to what level?"
             hit = bool_option(slot.options, value)
-        return (hit is not None), hit
+        return (hit is not None), hit, (FROM_WORDS if hit is not None else "")
     if t == "number":
         x = _num(value)
         if x is None or (slot.min is not None and x < slot.min) or (slot.max is not None and x > slot.max):
-            return False, None
-        return True, x
+            return False, None, ""
+        return True, x, FROM_WORDS
     if t == "points":
         if isinstance(value, str) and _words(value).casefold() in DIRECTIONS:
-            return True, _words(value).casefold()
+            return True, _words(value).casefold(), FROM_WORDS
         x = _num(value)
-        return (x is not None and x != 0.0), x
+        ok = x is not None and x != 0.0
+        return ok, x, (FROM_WORDS if ok else "")
     if t == "bool":
         # a JSON boolean only (review r1 L5): the one shipped bool slot is discord.voice's join_in_call, a join gate
         # (true leaves the current call), so no string spelling ("yes", "on", "1") ever answers it
         if isinstance(value, bool):
-            return True, value
-        return False, None
+            return True, value, FROM_WORDS
+        return False, None, ""
     text = _words(value)
     if t == "app":
         if any(text.casefold() == o.casefold() for o in slot.options):
-            return True, next(o for o in slot.options if o.casefold() == text.casefold())
+            return True, next(o for o in slot.options if o.casefold() == text.casefold()), FROM_WORDS
         # the app's identity and every name it goes by ("Discord.exe" / "discord.com" for "Discord", "Google Chrome"
         # for "Chrome"); kept by its key, the form the routes and the mixer compare
         key, names = app_names(text) if app_names is not None else (app_name(text), [text])
         key = key or app_name(text)
         if _said(text, words) or any(_said(n, words) for n in names):
-            return True, key
+            return True, key, FROM_WORDS
         if any(_heard(n, words) for n in names):       # by sound: "this card" for Discord
-            return True, key
-        return False, None
+            return True, key, FROM_HEARD
+        return False, None, ""
     if t == "text":
         if _said(text, words):
-            return True, text
+            return True, text, FROM_WORDS
         who = heard_person(text, words) if heard_person is not None else None
         if who:
-            return True, who
+            return True, who, FROM_HEARD
         if site and _site_said(text, words):
-            return True, text
+            return True, text, FROM_WORDS
         # kWays merge note 2 (review M1): a label the menu lists for this slot (``app.way``'s item: a way's control,
         # "New thread", whatever words the user used for it, "a fresh one"); only ``app.way``'s item slot is given
         # such names (:func:`_listed`), never a person or what to write
         listed = next((n for n in menu_names if _words(n).casefold() == text.casefold()), None)
         if listed is not None:
-            return True, listed
-        return False, None
+            return True, listed, FROM_MENU
+        return False, None, ""
     if t == "person":
         who = None
+        how = FROM_WORDS
         if not (_said(text, words) or text.casefold() in {_words(n).casefold() for n in menu_names}):
             who = heard_person(text, words) if heard_person is not None else None
             if not who:
-                return False, None
+                return False, None, ""
+            how = FROM_HEARD
         got = people(who or text) if people is not None else None
-        return (got is not None), got
+        return (got is not None), got, (how if got is not None else "")
     # entity: a span of the words, a name the menu listed, or the told value
     listed = next((n for n in menu_names if _words(n).casefold() == text.casefold()), None)
     if listed is not None:
-        return True, {"name": listed}
+        return True, {"name": listed}, (FROM_WORDS if _said(text, words) else FROM_MENU)
     if told is not None and _words(told if not isinstance(told, Mapping) else told.get("name")).casefold() == \
             text.casefold():
-        return True, told if isinstance(told, Mapping) else {"name": _words(told)}
+        return True, (told if isinstance(told, Mapping) else {"name": _words(told)}), FROM_WORDS
     if _said(text, words):
-        return True, {"name": text}
+        return True, {"name": text}, FROM_WORDS
     if menu_names:
         # lSkills: a value the words don't hold as written ("Lumin playlist") that sounds like exactly one listed name,
         # which the words do hold by sound ("Put on Lumin on Spotify"): that listed name
@@ -484,8 +493,8 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
 
         alike = heard_as(menu_names, text, loose=loose)
         if alike and any(heard_as([alike], str(w), loose=loose) for w in words if w):
-            return True, {"name": alike}
-    return False, None
+            return True, {"name": alike}, FROM_HEARD
+    return False, None, ""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -726,6 +735,19 @@ def _site_forms(value: Any) -> set[str]:
     return forms
 
 
+def _registrable(ident: str) -> str:
+    """A domain's registrable domain (``yuki.memory.moments.registrable_domain``: "app.excalidraw.com" ->
+    "excalidraw.com"), else the identity as it is. Never raises."""
+    if not ident:
+        return ""
+    try:
+        from yuki.memory.moments import registrable_domain
+
+        return str(registrable_domain(ident) or ident)
+    except Exception:  # noqa: BLE001
+        return ident
+
+
 def _known_site(store: Any, cap: str, slot_name: str, value: Any, *, now: float) -> str | None:
     """fBrain merge note (contract C5): the user's own known site (the learner's values for ``cap``'s ``slot_name``,
     best first, Not mine left out: :func:`yuki.skills.learn.values.known`) that the given ``value`` is by identity
@@ -734,14 +756,26 @@ def _known_site(store: Any, cap: str, slot_name: str, value: Any, *, now: float)
     if store is None or not _words(value.get("name") if isinstance(value, Mapping) else value):
         return None
     try:
+        from yuki.skills.connection import domain_like, scope_value
         from yuki.skills.learn.values import known
 
         want = _site_forms(value)
+        # Phase 2.1 (every reading of a site passes here now): a value that is itself an address matches only the same
+        # registrable domain ("github.com" is never their "x.github.io"); a name ("JustAnime") by its forms, as before
+        ident = scope_value(_words(value.get("name") if isinstance(value, Mapping) else value).casefold())
+        domain = _registrable(ident) if ident and domain_like(ident) else ""
         for v in known(store, cap, now=now).get(cap) or []:
             if v.get("slot") != slot_name or v.get("mark"):
                 continue
             own = _words(v.get("value") or v.get("label"))
-            if own and any(want & _site_forms(v.get(k)) for k in ("value", "label", "name") if _words(v.get(k))):
+            if not own:
+                continue
+            if domain:
+                theirs = {_registrable(scope_value(_words(v.get(k)).casefold())) for k in ("value", "label", "name")
+                          if _words(v.get(k))}
+                if domain in theirs:
+                    return own
+            elif any(want & _site_forms(v.get(k)) for k in ("value", "label", "name") if _words(v.get(k))):
                 return own
     except Exception:  # noqa: BLE001
         return None
@@ -1340,6 +1374,46 @@ def ladder(skill: Skill, values: Mapping[str, Any], *, store: Any = None, live: 
     return ok, skipped
 
 
+def _given_source(given_from: Mapping[str, str] | str | None, slot_name: str) -> str:
+    """The caller's own word for where the value it gave for ``slot_name`` came from (``resolve``'s ``given_from``: one
+    word for every slot, or a slot -> word map), when it is one of :data:`CALLER_SOURCES`; else ``""``."""
+    raw = given_from.get(slot_name) if isinstance(given_from, Mapping) else given_from
+    word = _words(raw).casefold()
+    return word if word in CALLER_SOURCES else ""
+
+
+def _known_app(slot: Slot, text: str, *, store: Any, until: float | None) -> str:
+    """The key of the app ``text`` names when the PC knows that app (one of the slot's options, a chat app's
+    connection data, or a program the user's timeline shows: :func:`app_identity`), else ``""`` ("music" names no app:
+    the slot's fills find it). Never raises."""
+    try:
+        opt = next((o for o in slot.options if o.casefold() == text.casefold()), None)
+        if opt is not None:
+            return opt
+        key = app_identity(text, store=store, until=until)[0]
+        apps = known_apps(store, until=until) if store is not None else {}
+        return key if key and (key in apps or key in _chat_titles()) else ""
+    except Exception:  # noqa: BLE001 - not known: the fills
+        return ""
+
+
+def _reading(slot: Slot, value: Any, *, store: Any, until: float | None) -> Any:
+    """Phase 2.1: a value the caller gave that the words don't hold, as the slot keeps it when it is taken as the
+    caller's reading: an app by its key (only an app the PC knows, :func:`_known_app`), a text as its words, an entity
+    as ``{"name"}`` (an entity's link is never taken from the caller: it only ever comes from the user's own things,
+    ``taste.find`` / ``find_offered``). ``None`` for a slot type code checks alone (an option, a number, a switch: a
+    wrong one is no mishearing), a told slot (a link they told Yuki is their data: only theirs or one in their words),
+    an app no program goes by, or an empty value. A person is never passed here."""
+    text = _words(value.get("name") if isinstance(value, Mapping) else value)
+    if not text or slot.told or slot.type not in ("app", "text", "entity"):
+        return None
+    if slot.type == "app":
+        return _known_app(slot, text, store=store, until=until) or None
+    if slot.type == "text":
+        return text
+    return {"name": text}
+
+
 def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str] | str, *, store: Any = None,
             live: Live | None = None, loaded: Loaded | None = None, now: float | None = None,
             until: float | None = None, again: bool = False, disable_after: int = 2,
@@ -1347,7 +1421,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             default_step: float = 10.0, earlier: Sequence[str] | None = None,
             heard_person: Callable[[str, Sequence[str]], str | None] | None = None,
             granted: Mapping[str, str] | None = None, chosen: Mapping[str, Any] | None = None,
-            chosen_from: str = FROM_CHOSEN, _strict: bool = False) -> Result:
+            chosen_from: str = FROM_CHOSEN, given_from: Mapping[str, str] | str | None = None,
+            own_pick: bool = False, _strict: bool = False) -> Result:
     """Fill ``skill_key``'s slots and pick its rungs (see the module docstring). ``words``: the user's own words, each
     turn exactly as heard or typed (the current exchange: their turns since the last finished job, newest last);
     ``earlier``: older turns of this conversation (their own words too), a source for validating a value the caller
@@ -1363,11 +1438,23 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     when the user named the channel) before any other source of that slot; a value the caller gave for it is not
     checked then (the engine took it out).
 
+    Phase 2.1 (the model's reading wins on undoable acts): on a run that neither sends nor commits (a page, a video, a
+    playlist, an app, a browser, a tab, a way's item, a volume), a value the caller gave that the words don't hold is
+    accepted as given, tagged where it came from (:attr:`Plan.sources`: ``given_from``, the caller's own word, else
+    :data:`FROM_CARD` for one of the user's own known sites or things, else :data:`FROM_READING`) and named in the done
+    line as a guess; an app only when the PC knows it. Data, not readings: a site's page kind, a told slot (their told
+    link) and, with a call live, the call's own app. A person, and every slot of a lasting run (a send, a call join:
+    rule 8), keep the strict checks exactly as before: the words, a confirmed heard form, a listed name, else dropped
+    (and asked or handed over). ``own_pick``: the caller says a listed name it gave that the words don't hold is its
+    own pick from the candidates (it passed their why): tagged :data:`FROM_MENU`, a guess; without it (or a
+    ``given_from`` word) such a name is the user's pointing at it ("the second one"): ``words``, as before.
+
     lResolve: on a draft or an open (a capability that may send, on a run that doesn't: :func:`_sends`, read before
     the slot loop and checked again on its values), the caller's own wording of what to write is kept as a draft
-    (:data:`FROM_WORDED`) and a person whose closest sound is a heard form the user confirmed runs unasked
-    (:func:`_heard_confirmed`). ``_strict`` (internal): neither of those, every run as a send (the loop's values sent
-    after all, so it resolves again)."""
+    (:data:`FROM_WORDED`), a person whose closest sound is a heard form the user confirmed runs unasked
+    (:func:`_heard_confirmed`), and the caller's reading of an undoable slot (the chat app, a way's item) is accepted.
+    ``_strict`` (internal): none of those, every run as a send (the loop's values sent after all, so it resolves
+    again)."""
     from yuki.skills import prefs, taste
 
     now = time.time() if now is None else float(now)
@@ -1406,6 +1493,11 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     # after it)
     sending = True if _strict else _sends(skill, given, told)
     drafting = bool(getattr(skill, "sends", False)) and not sending
+    # Phase 2.1: a lasting run (it sends, or reaches an end that commits otherwise: a call join, D24's commit table)
+    # keeps the strict checks on every slot; any other run takes the caller's reading of an undoable slot
+    from yuki.skills.engine import run_commit
+
+    lasting = sending or (run_commit(skill) != "none" and not drafting)
     relaxed = False
     worded: str | None = None
     # what Yuki just did (:func:`just_acted`), read once and only for an app slot: the windows its steps brought up,
@@ -1424,6 +1516,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
 
     values: dict[str, Any] = {}
     filled: dict[str, str] = {}
+    origin: dict[str, str] = {}       # Plan.sources: where each value the caller gave came from
     named: list[str] = []
     dropped: list[str] = []
     ask_keep: dict[str, Any] | None = None
@@ -1438,6 +1531,29 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 return {"slot": slot.name, "pref": slot.pref_key(skill.key, values), "option": option}
         return None
 
+    def own(slot: Slot, value: Any, menu_names: Sequence[str], offered: Sequence[str]) -> tuple[Any, str]:
+        """An entity value as one of the user's own things when it is one: a taste row by its name, or the one listed
+        name it sounds like (lSkills, live 17 Oct: "Lumin" heard for lumen, with [playlist: lumen | ネオン] on the
+        menu: contacts' sound key, onset and spelling distance, data, never a word list), else an upload just offered
+        aloud (tTaste merge note 2: ``{"name", "key", "ref"}``, rung A's ``when ref has`` passes). ``(value, how it is
+        theirs)``: :data:`FROM_WORDS` by its name, :data:`FROM_HEARD` by sound, ``""`` not one of theirs."""
+        if not isinstance(value, dict) or store is None:
+            return value, ""
+        if slot.taste:
+            how = FROM_WORDS
+            hit = taste.find(store, slot.taste, value.get("name", ""))
+            if hit is None and menu_names:
+                alike = taste.heard_as(menu_names, value.get("name", ""), loose=True)
+                if alike:
+                    hit, how = taste.find(store, slot.taste, alike), FROM_HEARD
+            if hit is not None:
+                return {"name": hit.name, "key": hit.entity_key, "ref": hit.ref}, how
+        elif offered:
+            pick = taste.find_offered(store, value.get("name", ""), now=now)
+            if pick is not None:
+                return pick, FROM_WORDS
+        return value, ""
+
     # The slot loop keeps FILL_ORDER: each step below ends in ``continue`` once it filled the slot, so a later source
     # (a learned skill's bound default, its fill policy's preference, a live guess) can never replace an earlier one,
     # and what the user said ("words") always comes first.
@@ -1445,9 +1561,11 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
         if chosen and slot.name in chosen and chosen[slot.name] not in (None, ""):
             # kTaste (C2): the engine's pick for this run (the user asked Yuki to choose, or named only the channel)
             values[slot.name], filled[slot.name] = chosen[slot.name], str(chosen_from or FROM_CHOSEN)
+            origin[slot.name] = filled[slot.name]
             continue
         if slot.name in derived:
             values[slot.name], filled[slot.name] = derived[slot.name], "words"
+            origin[slot.name] = FROM_WORDS
             continue
         way_slot = cap == WAY_CAPABILITY and slot.name == WAY_SLOT and slot.type == "entity" and store is not None
         if way_slot and slot.name in given:
@@ -1455,6 +1573,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             way = _way_given(store, given[slot.name])
             if way is not None:
                 values[slot.name], filled[slot.name] = way, "words"
+                origin[slot.name] = FROM_WORDS
                 continue
         menu_names = taste.candidates(store, slot.taste, now=now) if (slot.taste and store is not None) \
             else _listed(skill, slot, store, now=now)
@@ -1464,29 +1583,23 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
         # any entity slot; with no link, rung A's ``when`` skips it and the run hands off with the capability pinned
         offered = [t.name for t in taste.offered(store, now=now)] \
             if (store is not None and taste.takes_offers(skill, slot)) else []
-        # FILL_ORDER "words" (1): a value the caller gave that stands in the user's words
+        # FILL_ORDER "words" (1): a value the caller gave that stands in the user's words (or is heard there, or is a
+        # name listed for the slot)
         if slot.name in given:
-            ok, value = check_value(slot, given[slot.name], sources, menu_names=menu_names or offered,
+            ok, value, how = _check(slot, given[slot.name], sources, menu_names=menu_names or offered,
                                     told=told.get(slot.name), people=people,
                                     heard_person=heard_person if _person_bound(skill, slot) else None,
                                     app_names=app_names, site=skill.bind.get(slot.name) == SITE_BIND,
                                     loose=bool(slot.taste))
             if ok:
-                if slot.taste and isinstance(value, dict) and store is not None:
-                    hit = taste.find(store, slot.taste, value.get("name", ""))
-                    if hit is None and menu_names:
-                        # lSkills (live 17 Oct): "Lumin" heard for lumen, with [playlist: lumen | ネオン] on the menu:
-                        # a heard value no row is called that sounds like exactly one of the user's own listed names
-                        # is that one (contacts' sound key, onset and spelling distance: data, never a word list)
-                        alike = taste.heard_as(menu_names, value.get("name", ""), loose=True)
-                        if alike:
-                            hit = taste.find(store, slot.taste, alike)
-                    if hit is not None:
-                        value = {"name": hit.name, "key": hit.entity_key, "ref": hit.ref}
-                elif offered and isinstance(value, dict):
-                    pick = taste.find_offered(store, value.get("name", ""), now=now)
-                    if pick is not None:
-                        value = pick          # {"name", "key", "ref"}: rung A's ``when ref has`` passes
+                value, mine = own(slot, value, menu_names, offered)
+                if mine == FROM_HEARD and how == FROM_WORDS:
+                    how = FROM_HEARD      # their word, heard as one of their own things ("Lumin" -> lumen)
+                if how == FROM_MENU:
+                    # a listed name the words don't hold is Yuki's guess only when the caller says so (Phase 2.2: its
+                    # own pick from the candidates, passed with their why, or a ``given_from`` word); otherwise the
+                    # user pointed at it ("the second one", "my chill one"): their own ask, as before
+                    how = _given_source(given_from, slot.name) or (FROM_MENU if own_pick else FROM_WORDS)
                 literal = isinstance(value, str) and _words(value).casefold() == _words(given[slot.name]).casefold()
                 if literal and slot.type == "text" and _person_bound(skill, slot):
                     # a name said in another script than their people's names ("हेमंत") is the one person it reads as,
@@ -1512,26 +1625,23 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                             # hardish"). On a draft or an open: that person, unasked (the done line names them, so a
                             # wrong one shows); a send still asks (rule 8: never sent by sound), and once asked within
                             # CONFIRM_ONCE_S the same words again are a no (r1 L1)
-                            value, relaxed = alike[0], True
+                            value, relaxed, how = alike[0], True, FROM_HEARD
                         elif alike is not None and (until is not None or _first_confirm(confirm_key, now)):
                             return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=alike[0]), [alike[0]],
                                        dropped=list(dropped))
-                values[slot.name], filled[slot.name] = value, "words"
-                ask_keep = keep_check(slot, value) or ask_keep
+                # a value their words hold (as written or by sound) or a listed name they pointed at is "words" in the
+                # ledger, as before; the caller's own pick (above) keeps its tag (a guess, never their own word)
+                values[slot.name], origin[slot.name] = value, how
+                filled[slot.name] = "words" if how in (FROM_WORDS, FROM_HEARD) else how
+                if how in (FROM_WORDS, FROM_HEARD):
+                    ask_keep = keep_check(slot, value) or ask_keep
                 continue
-            if skill.bind.get(slot.name) == SITE_BIND and until is None:
-                # fBrain (contract C5): a site the caller gave from the user's own known sites ("my anime" ->
-                # JustAnime, from the card) that the words only hint at: accepted as known, never dropped and handed
-                # to the thinker (a 3.8 s round trip); a site none of theirs still needs its name said
-                site = _known_site(store, cap, slot.name, given[slot.name], now=now)
-                if site is not None:
-                    values[slot.name], filled[slot.name] = site, FROM_KNOWN
-                    continue
             if _granted(slot, given[slot.name], granted):
                 # Item 11's L2: the very text (or person) the brain's consent rule allowed this step and counted down,
                 # as given: Yuki's wording of what the user asked to say ("When will you come?" for "ask him when he
                 # will come"), never dropped to an Ask and handed back as a draft
                 values[slot.name], filled[slot.name] = _words(given[slot.name]), FROM_GRANT
+                origin[slot.name] = FROM_GRANT
                 continue
             if drafting and _worded_slot(skill, slot) and isinstance(given[slot.name], str) and \
                     _words(given[slot.name]):
@@ -1541,6 +1651,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 # types exactly it and nothing after it (uia_route.note_draft, below); a send stays the user's words
                 # or the brain's grant
                 values[slot.name], filled[slot.name] = _words(given[slot.name]), FROM_WORDED
+                origin[slot.name] = FROM_WORDED
                 worded, relaxed = slot.name, True
                 continue
             if _person_bound(skill, slot) and isinstance(given[slot.name], str):
@@ -1560,6 +1671,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                     # still asks below (rule 8: whom a message is sent to is never matched by sound); the loop's
                     # values are checked again after it (``relaxed``)
                     values[slot.name], filled[slot.name] = heard_as[0], "words"
+                    origin[slot.name] = FROM_HEARD
                     relaxed = True
                     continue
                 if heard_as is not None and (until is not None or _note_asked(store, heard_as[1], heard_as[2],
@@ -1573,7 +1685,39 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 text = (raw.get("key") or raw.get("name")) if isinstance(raw, Mapping) else raw
                 if _words(text):
                     values[slot.name], filled[slot.name] = {"name": _words(text)}, FROM_GIVEN
+                    origin[slot.name] = FROM_GIVEN
                     continue
+            # Phase 2.1: the caller's reading of an undoable slot, accepted as given (never "not in the words as
+            # heard"), even when the words name another app: the caller read the whole conversation, and the done line
+            # names its guess, so one word corrects it. A person, or any slot of a lasting run, is dropped below
+            # exactly as before. Data is no reading: a slot bound to a site's page kind (a page kind the site file
+            # lacks is dropped and the site's front page opens, as before; their own names for its pages were read
+            # above, ``derived``), a told slot (their told link fills it) and an app no program goes by (the fills)
+            reading = None if (lasting or _person_bound(skill, slot) or skill.bind.get(slot.name) == PAGE_BIND) \
+                else _reading(slot, given[slot.name], store=store, until=until)
+            if reading is not None and slot.type == "app" and slot.ask_in_call and live.in_call and \
+                    (_app_forms(reading, store=store, until=until) & call_apps(store, now=now, until=until)):
+                # with a call live, a slot that asks in a call never takes the call's own app unasked (audio.toml:
+                # "turn it down" on a call asks whose volume)
+                reading = None
+            if reading is not None:
+                src = _given_source(given_from, slot.name)
+                theirs = False
+                if skill.bind.get(slot.name) == SITE_BIND:
+                    # fBrain merge note (contract C5): one of the user's own known sites ("my anime" -> JustAnime,
+                    # from the card), kept as that known value (the form its runs used)
+                    site = _known_site(store, cap, slot.name, reading, now=now)
+                    if site is not None:
+                        reading, theirs = site, True
+                elif slot.type == "entity":
+                    reading, mine = own(slot, reading, menu_names, offered)
+                    theirs = bool(mine)
+                src = src or (FROM_CARD if theirs else FROM_READING)
+                values[slot.name], filled[slot.name] = reading, src
+                origin[slot.name] = src
+                # on a draft or an open, a run whose filled values send after all resolves again without it
+                relaxed = relaxed or drafting
+                continue
             dropped.append(slot.name)
         # FILL_ORDER "words" (2): an app their own words name, before any live guess, preference, fill policy or
         # bound default (the volume of "Spotify", not of the app playing). Never an app Yuki itself just acted in (a
@@ -1664,22 +1808,24 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
 
         if sends_with(skill, values):
             # lResolve: a draft's relaxations were taken for a run whose filled values send after all (a fill
-            # :func:`_sends` didn't foresee): resolved again with none of them, so Yuki's wording is dropped and a
-            # sound match asked, as before (rule 8)
+            # :func:`_sends` didn't foresee): resolved again with none of them, so Yuki's wording is dropped, a sound
+            # match asked and a reading checked against the words, as before (rule 8)
             return resolve(skill_key, slots, words, store=store, live=live, loaded=loaded, now=now, until=until,
                            again=again, disable_after=disable_after, people=people, default_step=default_step,
                            earlier=earlier, heard_person=heard_person, granted=granted, chosen=chosen,
-                           chosen_from=chosen_from, _strict=True)
+                           chosen_from=chosen_from, given_from=given_from, own_pick=own_pick, _strict=True)
     # What the user said wins over a learned skill's bound value too: its routes carry that value in their arguments,
-    # so a value they said for a bound slot that is another one runs its capability instead (a learned skill never
-    # hides its capability; the engine's request_key does the same for a given key slot before this)
+    # so a value given for a bound slot that is another one runs its capability instead (a learned skill never hides
+    # its capability; the engine's request_key does the same for a given key slot before this). Phase 2.1: any value
+    # the run was given counts (their words, a reading taken as given, a grant, Yuki's wording, the engine's pick: every
+    # entry of ``origin``), never one a fill chose (again, told, live, a preference, the taste guess, a bound default)
     if skill.learned and skill.capability and skill.capability != skill.key and \
-            any(filled.get(name) == "words" and _identity(skill.slot(name), values.get(name)) !=
+            any(name in origin and _identity(skill.slot(name), values.get(name)) !=
                 _identity(skill.slot(name), bound) for name, bound in (skill.bound or {}).items()):
         return resolve(skill.capability, slots, words, store=store, live=live, loaded=loaded, now=now, until=until,
                        again=again, disable_after=disable_after, people=people, default_step=default_step,
                        earlier=earlier, heard_person=heard_person, granted=granted, chosen=chosen,
-                       chosen_from=chosen_from, _strict=_strict)
+                       chosen_from=chosen_from, given_from=given_from, own_pick=own_pick, _strict=_strict)
     # a direction with no amount: the user's own step for it (a preference), else the default step
     for slot in skill.slots:
         v = values.get(slot.name)
@@ -1701,7 +1847,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
         # (uia_route.check_texts: a run that types it and does nothing else)
         _note_draft(cap, values.get(worded))
     return Plan(skill=skill, values=values, filled=filled, named=named, routes=routes, skipped=skipped,
-                dropped=dropped, game=live.game, ask_keep=ask_keep, handoff=skill.handoff and not live.game)
+                dropped=dropped, game=live.game, ask_keep=ask_keep, handoff=skill.handoff and not live.game,
+                sources=origin)
 
 
 def _title(app: str) -> str:
@@ -1713,11 +1860,38 @@ def _title(app: str) -> str:
         return str(app)
 
 
+#: Phase 2.1: how the done line names Yuki's guess at what they meant (:data:`GUESS_SOURCES`), so one word corrects it:
+#: the value when the line doesn't say it ("Opening excalidraw.com in Arc. I took that as Excalidraw."), else a short
+#: hedge ("Opening excalidraw.com in Arc, if that's what you meant."). Phase 2.2: a pick the caller made from the
+#: candidates with their code-made why says the why for that pick (the form of ``taste.choice_line``); any other guess
+#: is still named.
+GUESS_LINE = "{line} I took that as {what}."
+GUESS_SAID_LINE = "{line}, if that's what you meant."
+WHY_LINE = "{line} - {why}."
+#: A pick's why as said: at most this long, one line.
+WHY_CHARS = 90
+
+
+def shown_value(skill: Skill, name: str, value: Any) -> str:
+    """A slot value as the user hears it: an app by its title ("Arc", never "arc"), an entity or a person by its name,
+    anything else as its words."""
+    if isinstance(value, Mapping):
+        value = value.get("name")
+    text = _words(value)
+    if text and getattr(skill.slot(name), "type", None) == "app":
+        return _title(text)
+    return text
+
+
 def done_line(skill: Skill, values: Mapping[str, Any], named: Sequence[str] = (), *, route: Route | None = None,
-              say: str | None = None) -> str:
+              say: str | None = None, guessed: Sequence[str] = (), why: str = "", picked: Sequence[str] = ()) -> str:
     """The line said once the done-check saw it: the route's or the skill's template filled, plus each guessed slot's
     ``say`` (one word corrects it). ``say``: the route's own words (a driver's), used instead of the template. An app
-    slot's value is said as the app's title ("in Arc"), never its key ("in arc"; e2e simulation F12)."""
+    slot's value is said as the app's title ("in Arc"), never its key ("in arc"; e2e simulation F12). ``guessed``: the
+    slots whose given value is Yuki's guess (:attr:`Plan.guessed`), named by :data:`GUESS_LINE` /
+    :data:`GUESS_SAID_LINE`; ``why``: a pick's code-made why (the candidates' own, passed back by the caller), said as
+    :data:`WHY_LINE` for the picked slots (``picked``: those guesses need no other naming); every other guess the line
+    doesn't say is still named ("Opening excalidraw.com - you open it most mornings. I took that as Arc.")."""
     shown = {k: (_title(v) if isinstance(v, str) and v and getattr(skill.slot(k), "type", None) == "app" else v)
              for k, v in values.items()}
     base = say or fill(route.say if route is not None and route.say else skill.done_line, shown) or ""
@@ -1730,7 +1904,20 @@ def done_line(skill: Skill, values: Mapping[str, Any], named: Sequence[str] = ()
                 extra.append(words)
     if extra:
         base = base.rstrip(".") + " " + ", ".join(extra) + "."
-    return " ".join(base.split())
+    base = " ".join(base.split())
+    why = _words(why)[:WHY_CHARS].rstrip(" .")
+    if base and why:
+        base = WHY_LINE.format(line=base.rstrip("."), why=why)
+    covered = set(picked) if why else set()
+    whats = [w for w in dict.fromkeys(shown_value(skill, k, values.get(k)) for k in guessed if k not in covered) if w]
+    if base and whats:
+        unsaid = [w for w in whats if w.casefold() not in base.casefold()]
+        if unsaid:
+            return GUESS_LINE.format(line=base if base.endswith((".", "!", "?")) else base + ".",
+                                     what=" and ".join(unsaid[:2]))
+        if not why:          # a why already says it was a pick
+            return GUESS_SAID_LINE.format(line=base.rstrip("."))
+    return base
 
 
 def canonical(values: Mapping[str, Any]) -> dict[str, Any]:
@@ -1866,6 +2053,8 @@ def eval_resolver(db_path: Any, *, client: Any = None, model: str | None = None,
 
 
 __all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "FROM_GRANT", "FROM_WORDED", "FROM_GIVEN",
+           "FROM_CHOSEN", "FROM_WORDS", "FROM_HEARD", "FROM_MENU", "FROM_CARD", "FROM_SCREEN", "FROM_READING",
+           "GUESS_SOURCES", "CALLER_SOURCES", "GUESS_LINE", "GUESS_SAID_LINE", "WHY_LINE", "shown_value",
            "CODE_TYPES", "CONFIRM_PERSON", "JUST_ACTED_S",
            "CONFIRM_ONCE_S", "Live", "Plan", "Ask", "Held", "Handoff", "Refused", "app_name", "app_identity",
            "known_apps", "named_app", "just_acted", "call_apps", "check_value", "bool_option", "pref_option",
