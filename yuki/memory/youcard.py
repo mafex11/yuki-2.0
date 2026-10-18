@@ -27,9 +27,9 @@ reason from, not a catalog, in this order (the situation on the screens stays se
    ones last; their browsers when one means something; meeting tabs; YouTube channels (by display name, most watched
    first); Spotify playlists with what the user calls them; the voice channels and servers of the apps that join calls
    (``yuki.skills.discord_route.voice_channels``); the things inside their own ways' apps (their projects); usual means
-   (``prefs``); **Where they left off** (planner only) - on the :data:`LEFT_OFF_N` sites they come back to most, the
-   last page they had in front in a browser (an app's own embedded page is no page to open), with its title and
-   address (``Store.links``);
+   (``prefs``); **Where they left off** (planner only) - on the :data:`LEFT_OFF_N` sites they come back to most (never
+   a work site), the last page they had in front in one of their browsers (an app's own embedded page is no page to
+   open), with its title and address (``Store.links``);
 4. **People** (planner and judge; the talker's profile layer has the directory at 900) - the people block
    (``yuki.memory.contacts.directory`` without its header: the whole :data:`PEOPLE_CHARS` is the people's, closest
    first), then **Who** - the portrait's work and interests, first sentence each.
@@ -37,10 +37,12 @@ reason from, not a catalog, in this order (the situation on the screens stays se
 Every line says how sure it is ("often", "some days", "n of m", "you said", "dated"). Sizes: talker at most
 :data:`TALKER_CHARS`, planner and judge at most :data:`WIDE_CHARS`. When a card is over (:func:`_fit`), by priority from
 the least: the lists give their tails first (a weak item first, one with a meaning last, never below a few), then whole
-lines go; the live lines, Open, the habits and People go last. The slow part (everything but the live lines) is cached in
-RAM per database and purpose for :data:`CACHE_S` and rebuilt sooner when the learned rows, routines, tastes, prefs,
-contacts or portrait change (one stamp query); the live lines are read fresh on every call (the you-now record is in
-RAM). Never written to disk, never logged (logs carry sizes only), never in the MCP.
+lines go; a priority gives its tails only once the lines two or more priorities below it are gone (the first priority:
+Open, Lately, the desk, Usually now, Left off, People), and the live lines never go. The slow part (everything but the
+live lines) is cached in RAM per database and purpose for :data:`CACHE_S` and rebuilt sooner when the learned rows,
+routines, tastes, prefs, contacts, portrait, day digests, meanings or desk habits change (one stamp query, and the
+meanings' own); the live lines are read fresh on every call (the you-now record is in RAM). Never written to disk,
+never logged (logs carry sizes only), never in the MCP.
 
 Public::
 
@@ -94,19 +96,22 @@ DESK_CHARS = (300, 360)
 ROUTINES_N = (4, 6)
 #: "Lately": each day digest's first sentence at most.
 LATELY_CHARS = 130
-#: "Where they left off" (planner): the LEFT_OFF_N sites they come back to most (the most days), from pages seen within
-#: this many days; a site counts when its pages were seen on at least LEFT_OFF_MIN_DAYS days; only a page they had in a
-#: browser (a program that showed pages of at least LEFT_OFF_BROWSER_HOSTS hosts, as ``web_route.BROWSER_MIN_HOSTS``
-#: measures one) at an http(s) address: an app's own embedded page (its local bundle) is no page to open; a page whose
-#: address is longer than LEFT_OFF_URL_CHARS, or has a query longer than LEFT_OFF_QUERY_CHARS (a token, a tracking
-#: string, a search), is passed over for that site's last one that can be given whole: a cut address opens the wrong
-#: page, and a title alone is no way back.
+#: "Where they left off" (planner): the LEFT_OFF_N sites they come back to most (the most days; never fewer than
+#: LEFT_OFF_MIN_N when the card is over), from pages seen within LEFT_OFF_DAYS (read whole: at most LEFT_OFF_LINKS
+#: pages, measured 916 in 14 days); a site counts when its pages were seen on at least LEFT_OFF_MIN_DAYS days; only a
+#: page they had in one of their browsers (learned: the programs their own site visits used) at an http(s) address:
+#: an app's own embedded page (its local bundle) is no page to open; a page whose address is longer than
+#: LEFT_OFF_URL_CHARS, or has a query longer than LEFT_OFF_QUERY_CHARS (a token, a tracking string, a search), is
+#: passed over for that site's last one that can be given whole: a cut address opens the wrong page, and a title alone
+#: is no way back. Each page's title at most LEFT_OFF_TITLE_CHARS (its address names the site).
 LEFT_OFF_N = 3
-LEFT_OFF_BROWSER_HOSTS = 3
+LEFT_OFF_MIN_N = 2
 LEFT_OFF_DAYS = 14.0
+LEFT_OFF_LINKS = 2_000
 LEFT_OFF_MIN_DAYS = 2
 LEFT_OFF_URL_CHARS = 140
 LEFT_OFF_QUERY_CHARS = 40
+LEFT_OFF_TITLE_CHARS = 40
 #: The day and "in the middle of" lines at most, each (a thread, three due titles, two names).
 MIDDLE_CHARS = 420
 #: Phase 2.2, the picks for now on the "Usually around now" line (talker, wide): how many in all (fewer when the line
@@ -123,6 +128,9 @@ _lock = threading.Lock()
 #: ``yuki.memory.deskhabits.lines`` (contract D1) once imported, ``False`` when the module is absent (a failed import
 #: is not cached by Python and costs a path scan each time).
 _DESK_LINES: Any = None
+#: The learned stores of contracts M1 and D1 in the stamp, once their modules are looked up: ``(meanings.stamp or
+#: None, deskhabits.STATE_KEY or "")`` (none without them).
+_MORE: Any = None
 #: ``(db path, purpose) -> (built_at, stamp, entries as JSON)``
 _cache: dict[tuple[str, str], tuple[float, tuple[Any, ...], str]] = {}
 
@@ -158,16 +166,34 @@ def _hm(minute: float) -> str:
 
 
 def _stamp(store: Any) -> tuple[Any, ...]:
-    """What the slow part depends on (one query of maxima; content-free)."""
+    """What the slow part depends on (one query of maxima, and the meanings' own stamp: contract M1; content-free):
+    a nightly write of meanings or desk habits shows on the next card, not a minute later."""
+    global _MORE
+    if _MORE is None:
+        try:
+            from yuki.memory.meanings import stamp as more
+        except Exception:  # noqa: BLE001 - not merged yet
+            more = None
+        try:
+            from yuki.memory.deskhabits import STATE_KEY as desk_key
+        except Exception:  # noqa: BLE001
+            desk_key = ""
+        _MORE = (more, str(desk_key or ""))
+    more, desk_key = _MORE
     try:
         row = store._query(
             "SELECT (SELECT count(*) || ':' || coalesce(max(updated_at), 0) FROM skills WHERE origin != 'capability'),"
             " (SELECT coalesce(max(updated_at), 0) FROM routines), (SELECT coalesce(max(updated_at), 0) FROM tastes),"
             " (SELECT coalesce(max(updated_at), 0) FROM prefs), (SELECT coalesce(max(updated_at), 0) FROM contacts),"
-            " (SELECT coalesce(max(id), 0) FROM portraits), (SELECT coalesce(max(updated_at), 0) FROM day_digests)")
-        return tuple(row[0]) if row else ()
+            " (SELECT coalesce(max(id), 0) FROM portraits), (SELECT coalesce(max(updated_at), 0) FROM day_digests),"
+            " (SELECT coalesce(max(updated_at), 0) FROM nudge_state WHERE name = ?)", (desk_key,))
+        got = tuple(row[0]) if row else ()
     except Exception:  # noqa: BLE001 - an older database: the time bound alone
         return ()
+    try:
+        return got + tuple(more(store) or ()) if more is not None else got
+    except Exception:  # noqa: BLE001
+        return got
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -351,26 +377,42 @@ def _routines_week(store: Any, n: int) -> list[list[Any]]:
     return _list(2, "Weekly routines: ", ((line, PLAIN) for _at, line in out[:n]), sep="; ")
 
 
-def _left_off(store: Any, now: float, n: int) -> list[list[Any]]:
+def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: int,
+              names: dict[str, str]) -> list[list[Any]]:
     """fBrain (k_resume_anime: the planner clicked through "continue watching" instead of opening the episode): on the
     ``n`` sites the user comes back to most (their pages seen on the most days, at least :data:`LEFT_OFF_MIN_DAYS`),
-    the last page past the site's root they had in front there in a browser (never one only on screen beside it), with
-    its title and address. A page counts only from a program that showed pages of :data:`LEFT_OFF_BROWSER_HOSTS` hosts
-    or more in the window read (measured: a desktop app drawing its own embedded pages shows one or two, e.g. a music
-    app's local bundle), and only at an http(s) address. Planner only; RAM only."""
+    the last page past the site's root they had in front there in one of their browsers (never one only on screen
+    beside it), with its title and address. Their browsers are learned, not measured here: the programs their own
+    visits to their sites used (the ``browser`` means on their values, what the sites line names; an app drawing its
+    own embedded pages, e.g. a game store's local bundle, is none). Only an http(s) address; never a site of their work
+    (:meth:`contacts.WorkMarks.page`, their own verdicts: picking up where they left off is for their own time).
+    Planner only; RAM only. ``names``: the display names already read (:func:`_browser_name`)."""
     try:
-        links = store.links(how="viewed", since=now - LEFT_OFF_DAYS * 86400.0, limit=600)
+        from yuki.core.appnames import shown
+    except Exception:  # noqa: BLE001
+        def shown(app: Any, process: Any = None) -> str:
+            return str(app or "")
+    browsers: set[str] = set()
+    for items in vals.values():
+        for v in items:
+            for key in (v.get("means") or {}).get("browser") or {}:
+                if key:
+                    name = _browser_name(store, str(key), names)
+                    browsers |= {str(key).casefold(), name.casefold(), str(shown(name) or "").casefold()}
+    if not browsers:
+        return []
+    try:
+        links = store.links(how="viewed", since=now - LEFT_OFF_DAYS * 86400.0, limit=LEFT_OFF_LINKS)
     except Exception:  # noqa: BLE001
         return []
+    try:
+        from yuki.memory.contacts import work_marks
+
+        work = work_marks(store)
+    except Exception:  # noqa: BLE001
+        work = None
     from urllib.parse import urlsplit
 
-    hosts_of: dict[str, set[str]] = {}
-    for link in links:
-        app = str(getattr(link, "app", "") or "").casefold()
-        host = str(getattr(link, "host", "") or "").casefold()
-        if app and host:
-            hosts_of.setdefault(app, set()).add(host)
-    browsers = {app for app, hosts in hosts_of.items() if len(hosts) >= LEFT_OFF_BROWSER_HOSTS}
     days: dict[str, set[Any]] = {}
     last: dict[str, Any] = {}
     for link in links:   # most recently seen first
@@ -379,6 +421,8 @@ def _left_off(store: Any, now: float, n: int) -> list[list[Any]]:
             continue
         if str(getattr(link, "app", "") or "").casefold() not in browsers:
             continue   # an app's own page (its embedded UI), not one a browser can open
+        if work is not None and work.page(host):
+            continue   # their work: never offered to pick up
         seen = days.setdefault(host, set())
         for at in (getattr(link, "first_seen", None), getattr(link, "last_seen", None)):
             try:
@@ -402,13 +446,13 @@ def _left_off(store: Any, now: float, n: int) -> list[list[Any]]:
     picks.sort(key=lambda x: (-len(days.get(x[3]) or ()), -float(x[0].last_seen or 0.0)))
     today = datetime.fromtimestamp(now).date()
     bits = []
-    for link, parts, title, host in picks[:n]:
+    for link, _parts, title, _host in picks[:n]:
         day = datetime.fromtimestamp(float(link.last_seen)).date()
         gap = (today - day).days
         when = "today" if gap <= 0 else "yesterday" if gap == 1 else f"{day:%d %b}"
-        bits.append(f'"{_clip(title, 48)}" on {host} ({link.url}), {when}')
+        bits.append(f'"{_clip(title, LEFT_OFF_TITLE_CHARS)}" ({link.url}), {when}')
     return _list(1, "Where they left off (the last page on the sites they return to most; open its address to pick "
-                    "up): ", ((b, PLAIN) for b in bits), sep="; ")
+                    "up): ", ((b, PLAIN) for b in bits), sep="; ", min_n=min(len(bits), LEFT_OFF_MIN_N))
 
 
 def _skill_name(store: Any, key: str) -> str:
@@ -548,11 +592,10 @@ def _weak_last(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _things(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, wide: bool,
-            ways: Sequence[dict[str, Any]]) -> list[list[Any]]:
+            ways: Sequence[dict[str, Any]], names: dict[str, str]) -> list[list[Any]]:
     """Their things, each with what it means to them (contract M1) next to it."""
     i = 1 if wide else 0
     out: list[list[Any]] = []
-    names: dict[str, str] = {}
     sites = []
     for v in _weak_last(vals.get("web.open_page") or [])[:SITES_N[i]]:
         # the usual browser is the preference's own answer (``values.known``): what Yuki opens the site in
@@ -849,9 +892,10 @@ def _slow(store: Any, purpose: str, now: float) -> list[list[Any]]:
     if wide:
         out += _lately(store)
     out += _habits(store, vals, now, purpose, ways)
-    out += _things(store, vals, now, wide, ways)
+    names: dict[str, str] = {}   # app key -> display name, read once for the card
+    out += _things(store, vals, now, wide, ways, names)
     if purpose == "planner":
-        out += _left_off(store, now, LEFT_OFF_N)
+        out += _left_off(store, vals, now, LEFT_OFF_N, names)
     if wide:
         # the talker has the people directory in its profile layer (900 chars); "what did I do" stays a lookup
         out += _people(store)
@@ -861,13 +905,16 @@ def _slow(store: Any, purpose: str, now: float) -> list[list[Any]]:
 
 def _fit(entries: Sequence[Sequence[Any]], cap: int) -> str:
     """The card at most ``cap`` characters, its lines in the page's order. When it is over (never the live lines,
-    priority 0): by priority from the least, the lists give their tails (the longest list first and in it, past its
+    priority 0), by priority from the least: the lists give their tails (the longest list first and in it, past its
     first few - its minimum: those always stay - the last item of the lowest weight: a weak signal, then a plain one,
-    one with a meaning last), then that priority's plain lines go (never the first priority's here); only then whole
-    lists go, by priority from the least, a list holding a meaning after the others, the last on the page first, and
-    the first priority's plain lines (Usually now, People) last of all. Then the room a dropped line left is filled
-    back evenly (the list with the fewest items first) while items fit. Trimming before dropping: a list cut to its
-    best few says more than a line gone."""
+    one with a meaning last), then that priority's plain lines go (never the first priority's here). A priority gives
+    its tails only once every line two or more priorities below it is gone (by priority from the least, a list holding
+    a meaning after the others, the last on the page first): the first priority (Open, Lately, the desk, Usually now,
+    Left off) keeps its items while a third-priority list (meeting tabs, servers, their own ways) stands, while the
+    second's lists (their things) are only cut to their best few by then, never gone. Then whole lines go the same way,
+    by priority from the least, the first priority's plain lines (Usually now, People) last of all. Then the room a
+    dropped line left is filled back evenly (the list with the fewest items first) while items fit. Trimming before
+    dropping one priority down: a list cut to its best few says more than a line gone."""
     es = [[e[0], e[1], [list(x) for x in e[2]], *e[3:]] if len(e) > 2 else list(e) for e in entries]
     alive = [True] * len(es)
     taken: list[tuple[int, int, list[Any]]] = []
@@ -876,7 +923,7 @@ def _fit(entries: Sequence[Sequence[Any]], cap: int) -> str:
     def size() -> int:
         return len(HEAD) + sum(len(_text(e)) + 1 for e, a in zip(es, alive) if a)
 
-    for p in levels:
+    def trim(p: int) -> None:
         while size() > cap:
             lists = [i for i, e in enumerate(es) if alive[i] and int(e[0]) == p and len(e) > 2 and len(e[2]) > e[4]]
             if not lists:
@@ -891,7 +938,8 @@ def _fit(entries: Sequence[Sequence[Any]], cap: int) -> str:
                 break
             if alive[i] and int(es[i][0]) == p and len(es[i]) == 2:
                 alive[i] = False
-    for p in levels:
+
+    def drop(p: int) -> None:
         # the lists first (holding no meaning, then holding one), the plain lines of the first priority last
         order = sorted((i for i, e in enumerate(es) if int(e[0]) == p),
                        key=lambda i: (len(es[i]) == 2, len(es[i]) > 2 and any(w >= MEANT for _t, w in es[i][2]), -i))
@@ -899,6 +947,14 @@ def _fit(entries: Sequence[Sequence[Any]], cap: int) -> str:
             if size() <= cap:
                 break
             alive[i] = False
+
+    for p in levels:
+        for q in levels:
+            if q >= p + 2:
+                drop(q)   # the lines two or more priorities below go before this one gives a tail
+        trim(p)
+    for p in levels:
+        drop(p)
     # fill the room back, evenly: the item taken from the list that now has the fewest first
     left = [t for t in reversed(taken) if alive[t[0]]]
     while left:

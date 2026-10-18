@@ -88,6 +88,19 @@ def value_slots(cap: Any) -> tuple[Any | None, list[Any]]:
     return ent, []
 
 
+def _means_slots(cap: Any) -> list[Any]:
+    """The means slots a values record counts (``means``): the ones the capability binds from an occasion."""
+    bind = getattr(cap, "bind", None) or {}
+    return [s for s in getattr(cap, "slots", ()) or () if s.role == "means" and s.name in bind]
+
+
+def _pref_slots(cap: Any) -> list[Any]:
+    """Of :func:`_means_slots`, the ones that read a preference (a site's browser): their ``usual`` is the
+    preference's own answer. One predicate for :func:`build` (which leaves their usual out) and :func:`with_prefs`
+    (which fills exactly these), so no slot loses its usual between the two."""
+    return [s for s in _means_slots(cap) if getattr(s, "pref", "")]
+
+
 def _clean(v: Any) -> str:
     if isinstance(v, dict):
         v = v.get("name") or ""
@@ -128,14 +141,15 @@ def build(group: Any, cap: Any, store: Any, now: float, old: dict[str, dict[str,
     if ident is None:
         return []
     old = old or {}
-    means_slots = [s for s in cap.slots if s.role == "means" and s.name in (cap.bind or {})]
+    means = _means_slots(cap)
+    from_pref = {s.name for s in _pref_slots(cap)}
     lo = now - BAR_DAYS * DAY_S
     per: dict[str, list[Any]] = defaultdict(list)
     raw: dict[str, str] = {}
     every = [*group.occasions, *extra]
     # the means the user's own occasions of this capability used (their browsers): an asked run through another
     # program (a file path "opened" in an editor) gives no value
-    own_means = {_clean((o.attrs or {}).get(s.name)) for o in every if o.by == "user" for s in means_slots}
+    own_means = {_clean((o.attrs or {}).get(s.name)) for o in every if o.by == "user" for s in means}
     for o in every:
         v = _clean((o.attrs or {}).get(ident.name))
         if not v or not o.counts or o.at < lo or o.at > now + 1.0:
@@ -151,7 +165,7 @@ def build(group: Any, cap: Any, store: Any, now: float, old: dict[str, dict[str,
         prior = old.get(vid) or {}
         # asked once counts when that run was checked done and not corrected (a misheard value never becomes a thing)
         said_ok = [o for o in asked if (o.facts or {}).get("verified") and not (o.facts or {}).get("corrected")]
-        if not user and all(any(_clean((o.attrs or {}).get(s.name)) not in own_means | {""} for s in means_slots)
+        if not user and all(any(_clean((o.attrs or {}).get(s.name)) not in own_means | {""} for s in means)
                             for o in asked):
             continue        # only ever asked through a program the user never used for it: not a thing of theirs
         if len(days) < MIN_DAYS and len(said_ok) < MIN_ASKED and not prior.get("named_by"):
@@ -168,15 +182,15 @@ def build(group: Any, cap: Any, store: Any, now: float, old: dict[str, dict[str,
             c = Counter(_clean((o.attrs or {}).get(s.name)) or "" for o in its)
             if c:
                 parts[s.name] = dict(c.most_common(8))
-        means: dict[str, dict[str, int]] = {}
+        used: dict[str, dict[str, int]] = {}
         usual: dict[str, str] = {}
-        for s in means_slots:
+        for s in means:
             c = Counter(_clean((o.attrs or {}).get(s.name)) for o in user if _clean((o.attrs or {}).get(s.name)))
             if not c:
                 continue
-            means[s.name] = dict(c.most_common(5))
-            if getattr(s, "pref", ""):
-                continue    # a means slot with a preference: its usual is the preference's (read in :func:`known`)
+            used[s.name] = dict(c.most_common(5))
+            if s.name in from_pref:
+                continue    # its usual is the preference's (:func:`with_prefs`, read in :func:`known`)
             top, k = c.most_common(1)[0]
             if k >= 2 and k / sum(c.values()) >= USUAL_SHARE:
                 usual[s.name] = top
@@ -188,7 +202,7 @@ def build(group: Any, cap: Any, store: Any, now: float, old: dict[str, dict[str,
             "named_by": prior.get("named_by"),
             "n": len(user), "days": len(days), "said": len(asked),
             "first_at": round(min(o.at for o in its), 1), "last_at": round(last, 1),
-            "hours": hours, "weekdays": weekdays, "parts": parts, "means": means, "usual": usual,
+            "hours": hours, "weekdays": weekdays, "parts": parts, "means": used, "usual": usual,
             "everyday": prior.get("everyday"), "mark": prior.get("mark"),
             "score": round(recency(its, now), 3),
         })
@@ -266,8 +280,7 @@ def with_prefs(store: Any, table: dict[str, list[dict[str, Any]]]) -> dict[str, 
     out: dict[str, list[dict[str, Any]]] = {}
     for cap_key, vals in table.items():
         cap = caps.get(cap_key)
-        slots = [s for s in (getattr(cap, "slots", ()) or ()) if s.role == "means" and getattr(s, "pref", "")
-                 and s.name in (getattr(cap, "bind", None) or {})] if cap is not None else []
+        slots = _pref_slots(cap) if cap is not None else []
         if not slots:
             out[cap_key] = vals
             continue

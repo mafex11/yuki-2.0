@@ -2444,6 +2444,12 @@ class WorkMarks:
         """A call in a work app (the call digest's app is a thing marked work, e.g. a meeting service's tab)."""
         return bool(app) and " ".join(tokens(app)) in self.names
 
+    def page(self, host: str | None) -> bool:
+        """A page on a work site: its host, or a domain it sits under, is marked work (a value's site is its domain,
+        e.g. a work chat's ``slack.com`` holds its team's own host)."""
+        labels = str(host or "").strip().strip(".").casefold().split(".")
+        return any(".".join(labels[i:]) in self.hosts for i in range(len(labels) - 1))
+
 
 def work_marks(store: Store) -> WorkMarks:
     """The user's work marks from their learned values (``yuki.skills.learn.values.known``: RAM-cached), for
