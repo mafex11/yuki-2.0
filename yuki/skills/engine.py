@@ -68,8 +68,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 from yuki.skills.connection import (Check, Route, Skill, fill, fill_value, sends_with, strictest, template_names,
                                     window_state_reader)
-from yuki.skills.resolve import (FROM_CHOSEN, FROM_MENU, HELD_LINE, Ask, Handoff, Held, Live, Plan, Refused, canonical,
-                                 done_line, shown_value)
+from yuki.skills.resolve import (FROM_CARD, FROM_CHOSEN, FROM_MENU, HELD_LINE, Ask, Handoff, Held, Live, Plan, Refused,
+                                 canonical, done_line, shown_value)
 
 #: The time a request may take from the words to the done line (PLAN.md §5: p90 <= 5 s).
 BUDGET_S = 5.0
@@ -1557,7 +1557,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
         if waited.verdict is True:
             # Phase 2.1/2.2: a guessed value is named (one word corrects it); a pick the caller made from the
             # candidates says its why instead
-            line = done_line(skill, plan.values, plan.named, route=route, say=res.say, guessed=guessed, why=ctx.why)
+            line = done_line(skill, plan.values, plan.named, route=route, say=res.say, guessed=guessed, why=ctx.why,
+                             picked=[k for k in guessed if sources.get(k) in (FROM_MENU, FROM_CARD)])
             # kHands brief item 6: every rung tried is in skill_route_tries, the last one too (the counters leave a
             # run's last rung out of that table: registry.TRY_NOT_LAST)
             _ledger_try(ctx, run_key, route, True, "done", route_ms)
@@ -2181,11 +2182,13 @@ def note_args(skill_key: str, args: Mapping[str, Any], slots: Mapping[str, Any] 
     as a value. ``(why, from, slots)``: the why as one line (``""``: none), the from as given (one word or a slot ->
     word map; ``None``: none). Never raises."""
     rest = dict(slots or {})
+    own: set[str] = set()
     try:
-        from yuki.skills.catalog import load
+        if any(name in rest for name in NOTE_SLOTS):
+            from yuki.skills.catalog import load
 
-        skill = load().get(str(skill_key or ""))
-        own = {getattr(sl, "name", "") for sl in skill.slots} if skill is not None else set()
+            skill = load().get(str(skill_key or ""))
+            own = {getattr(sl, "name", "") for sl in skill.slots} if skill is not None else set()
     except Exception:  # noqa: BLE001 - unknown: the slots stay slots
         own = set(NOTE_SLOTS)
     got: dict[str, Any] = {name: args.get(name) if isinstance(args, Mapping) else None for name in NOTE_SLOTS}
@@ -2199,10 +2202,12 @@ def note_args(skill_key: str, args: Mapping[str, Any], slots: Mapping[str, Any] 
     return why, (src if isinstance(src, (str, Mapping)) and src else None), rest
 
 
-#: Phase 2.1: Yuki's guesses of the last :data:`GUESS_KEEP_S`, by (capability, slot) -> (monotonic time of the newest,
-#: the guessed values' identities, oldest first). RAM only, this process; never logged.
-_GUESSES: dict[tuple[str, str], tuple[float, list[str]]] = {}
+#: Phase 2.1: the runs of the last :data:`GUESS_KEEP_S` that held a guess of Yuki's, oldest first: (monotonic time, the
+#: capability, every slot's value identity in that run, the guessed slots). RAM only, this process; never logged.
+_GUESSES: list[tuple[float, str, dict[str, str], frozenset[str]]] = []
 _guess_lock = threading.Lock()
+#: At most this many such runs are kept.
+GUESS_RUNS = 8
 
 
 def _value_id(value: Any) -> str:
@@ -2215,44 +2220,57 @@ def _value_id(value: Any) -> str:
         return ""
 
 
-def _guessed_before(cap: str, slot: str) -> list[str]:
-    """The identities guessed for ``cap``'s ``slot`` within :data:`GUESS_KEEP_S` (oldest first)."""
+def _run_ids(plan: Plan) -> dict[str, str]:
+    """Every slot value of a resolved run as its identity (:func:`_value_id`), empty ones left out."""
+    ids = {str(k): _value_id(v) for k, v in plan.values.items()}
+    return {k: v for k, v in ids.items() if v}
+
+
+def _guess_runs(cap: str) -> list[tuple[dict[str, str], frozenset[str]]]:
+    """``cap``'s runs that held a guess within :data:`GUESS_KEEP_S` (oldest first): (their value identities, their
+    guessed slots)."""
     now = time.monotonic()
     with _guess_lock:
-        got = _GUESSES.get((cap, slot))
-    return list(got[1]) if got is not None and now - got[0] <= GUESS_KEEP_S else []
+        return [(ids, guessed) for t, c, ids, guessed in _GUESSES if c == cap and now - t <= GUESS_KEEP_S]
+
+
+def _guessed_before(cap: str, slot: str) -> list[str]:
+    """The identities guessed for ``cap``'s ``slot`` within :data:`GUESS_KEEP_S` (oldest first)."""
+    got = [ids.get(slot, "") for ids, guessed in _guess_runs(cap) if slot in guessed]
+    return [i for i in dict.fromkeys(got) if i]
 
 
 def _note_guesses(plan: Plan) -> None:
-    """Keep the run's guessed values (:attr:`Plan.guessed`) for "not that". Never raises."""
+    """Keep a run that held a guess (:attr:`Plan.guessed`), with every value it ran, for "not that". Never raises."""
     try:
         cap = plan.skill.capability or plan.skill.key
         now = time.monotonic()
+        entry = (now, cap, _run_ids(plan), frozenset(plan.guessed))
         with _guess_lock:
-            for k in [k for k, v in _GUESSES.items() if now - v[0] > GUESS_KEEP_S]:
-                _GUESSES.pop(k, None)
-            for slot in plan.guessed:
-                ident = _value_id(plan.values.get(slot))
-                if not ident:
-                    continue
-                old = _GUESSES.get((cap, slot))
-                seen = [i for i in (old[1] if old is not None else []) if i != ident][-7:]
-                _GUESSES[(cap, slot)] = (now, [*seen, ident])
+            _GUESSES[:] = [g for g in _GUESSES if now - g[0] <= GUESS_KEEP_S][-(GUESS_RUNS - 1):] + [entry]
     except Exception:  # noqa: BLE001 - nothing kept: "not that" then runs what the caller gives
         pass
 
 
 def _rejected_slot(resolved: Any) -> str | None:
-    """Phase 2.1: on a correction, the slot whose value is again a guess (its source one of
-    ``resolve.GUESS_SOURCES``) that Yuki already guessed moments ago: the caller re-sent the very value the user just
-    said "not that" to. ``None`` otherwise. A value now in their words ("no, I said Excalidraw") is theirs: never."""
+    """Phase 2.1: on a correction, the slot whose value is again Yuki's guess (``resolve.GUESS_SOURCES``) in a request
+    that is otherwise the very run of moments ago that guessed it (every other slot's value the same, review H1): the
+    caller re-sent the same request, so the only thing the user can have said "not that" to is that guess. ``None``
+    otherwise: a correction that changed any other value ("no, lower, like 10"; "no, in Chrome") runs as given, and a
+    value now in their words ("no, I said Excalidraw") is theirs."""
     if not isinstance(resolved, Plan):
         return None
     cap = resolved.skill.capability or resolved.skill.key
+    now_ids = _run_ids(resolved)
+    runs = _guess_runs(cap)
     for slot in resolved.guessed:
-        ident = _value_id(resolved.values.get(slot))
-        if ident and ident in _guessed_before(cap, slot):
-            return slot
+        ident = now_ids.get(slot)
+        if not ident:
+            continue
+        rest = {k: v for k, v in now_ids.items() if k != slot}
+        for ids, guessed in runs:
+            if slot in guessed and ids.get(slot) == ident and {k: v for k, v in ids.items() if k != slot} == rest:
+                return slot
     return None
 
 
@@ -2300,16 +2318,22 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     when the new run finds the PC already so (fSkills review M1: :func:`_note_false_done`).
     ``ctx.grant`` (the brain's validated consent grant, :func:`run_for_thinker`): the resolver keeps the granted text
     and person as given (``granted=``) instead of dropping them; with none, nothing changes.
-    Phase 2.1: ``ctx.given_from`` (the caller's word for where its values came from) goes to the resolver's
-    ``given_from``; a correction that gives again a value Yuki guessed moments ago (:func:`_rejected_slot`: the user
-    said "not that" to it) runs the user's next own candidate instead (:func:`_next_own`), else asks
-    (:data:`LINE_WHICH`), never the same guess twice; each run's guesses are kept for that (:func:`_note_guesses`)."""
+    Phase 2.1: the caller's notes (:data:`NOTE_SLOTS`) leave ``slots`` here for every origin (:func:`note_args`; the
+    context's own, read from a caller's arguments, first): ``ctx.given_from`` (the caller's word for where its values
+    came from) goes to the resolver's ``given_from``, and ``ctx.why`` (a pick's why) makes a listed name it gave its own
+    pick (``own_pick``) and is said in the done line. A correction that sends again the very request of moments ago
+    whose guess the user turned down (:func:`_rejected_slot`: every other value the same) runs the user's next own
+    candidate instead (:func:`_next_own`), else asks (:data:`LINE_WHICH`), never the same guess twice; each run that
+    held a guess is kept for that (:func:`_note_guesses`)."""
     from yuki.skills import enabled, setting
     from yuki.skills import resolve as res_mod
 
     if not enabled(settings):
         # the off switch (Settings.skills = false): the old paths run instead; nothing here acts
         return run(Refused(str(skill_key or ""), "skills_off"), ctx)
+    # Phase 2.1/2.2 (review M1): the caller's notes (``why``, ``from``) leave the slots on every path (the voice's
+    # hands, a card, the thinker), the context's own (a caller that read them from its arguments) first
+    ctx.why, ctx.given_from, slots = note_args(str(skill_key or ""), {"why": ctx.why, "from": ctx.given_from}, slots)
     if live is None:
         from yuki.skills.catalog import load
 
@@ -2353,6 +2377,8 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
             extra.update(chosen=dict(picked.chosen), chosen_from=picked.chosen_from)
         if ctx.given_from:
             extra["given_from"] = ctx.given_from
+        if ctx.why:
+            extra["own_pick"] = True        # a listed name it gave is its own pick from the candidates (a guess)
         return res_mod.resolve(key, slots, words, store=_store_of(client) if client is not None else None,
                                live=live, again=again, default_step=step, disable_after=disable_after, **extra)
 
@@ -2375,6 +2401,7 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
               guessed_slots=_slot_flags([rejected]), origin=ctx.origin)
         redo = None
         if nxt:
+            ctx.why = ""            # the caller's why was for the value the user just turned down
             again_slots = {**dict(slots or {}), rejected: nxt}
             src = {**(dict(ctx.given_from) if isinstance(ctx.given_from, Mapping) else {}), rejected: FROM_MENU}
             redo = _mem(ctx.memory, "skill_resolve", lambda c: res_mod.resolve(
@@ -2430,6 +2457,8 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         # with Yuki's own pick (``picked``: its done line and taste note name that pick)
         again_slots = {**dict(slots or {}), other[0]: other[1]}
         extra: dict[str, Any] = {"earlier": [str(w) for w in earlier if w]} if earlier else {}
+        extra["given_from"] = {**(dict(ctx.given_from) if isinstance(ctx.given_from, Mapping) else {}),
+                               other[0]: FROM_MENU}
         regranted = granted_values(ctx.grant, again_slots) if ctx.origin == "thinker" else None
         if regranted:
             extra["granted"] = dict(regranted)
@@ -2438,6 +2467,7 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
             again=again, default_step=step, disable_after=disable_after, **extra), timeout_s=1.0) \
             if ctx.memory is not None else None
         if isinstance(redo, Plan):
+            ctx.why = ""            # the caller's why was for the value the PC already showed
             result = run(redo, ctx)
     if picked is not None and result.done:
         # the pick played and its done-check saw it: the line names it and why (code-written), and the conversation
