@@ -1012,6 +1012,23 @@ class VoiceBridge(QObject):
 
     #: oVoice: the ONE driver's countdown ids start here, far above the runtime's own request ids (never the same id).
     ONE_SEND_ID_BASE = 1_900_000_000
+    #: oVoice (review fix L3): what a hand-off tool answers if it is ever called under ``brain = "one"``.
+    ONE_NO_HANDOFF = "Not done: there is no hand-over here, so nothing was handed on. Do it with your own tools."
+
+    async def _one_refuses(self, params: Any, tool: str) -> bool:
+        """oVoice (review fix L3, defence in depth): under ``brain = "one"`` the old hand-off handlers refuse (nothing is
+        submitted, no thinker job; they are not registered under one, so this is never reached on a live turn)."""
+        if not getattr(self, "one", False):
+            return False
+        self._log("bridge", op=tool, refused="one")
+        try:
+            from pipecat.frames.frames import FunctionCallResultProperties
+
+            await params.result_callback({"handed_over": False, "note": self.ONE_NO_HANDOFF},
+                                         properties=FunctionCallResultProperties(run_llm=False))
+        except Exception as exc:  # noqa: BLE001 - nothing was submitted either way
+            self._log("bridge_error", error=f"one_refuses: {type(exc).__name__}")
+        return True
 
     def one_send_pending(self, event: Any) -> int | None:
         """oVoice (phase 4 addendum, must-fix 5): the ONE countdown host's ``publish`` for voice: its ``SendPending``
@@ -1313,7 +1330,10 @@ class VoiceBridge(QObject):
 
     async def tell_yuki(self, params: Any) -> None:
         """Pipecat handler for ``tell_yuki`` (async: registered with ``cancel_on_interruption=False``), and for the lean
-        talker's ``hand_over``. bTalk: under ``brain = "all"`` it is :meth:`_hand_over` (the exact words, by code)."""
+        talker's ``hand_over``. bTalk: under ``brain = "all"`` it is :meth:`_hand_over` (the exact words, by code).
+        oVoice (review fix L3): never under ``brain = "one"`` (no hand-over: nothing is submitted)."""
+        if await self._one_refuses(params, "tell_yuki"):
+            return
         self._drop_step_line()   # sVoiceFix (F5): a hand-off answers a step check: no step line is owed any more
         if self.on_brain:
             await self._hand_over(params)
@@ -2085,7 +2105,10 @@ class VoiceBridge(QObject):
         return True
 
     async def check_progress(self, params: Any) -> None:
-        """Pipecat handler for ``check_progress``: an isolated one-shot answer over the task's real log."""
+        """Pipecat handler for ``check_progress``: an isolated one-shot answer over the task's real log. oVoice (review
+        fix L3): never under ``brain = "one"`` (no thinker's task to ask about)."""
+        if await self._one_refuses(params, "check_progress"):
+            return
         args = params.arguments if isinstance(params.arguments, dict) else {}
         question = str(args.get("question") or "").strip()
         if self.user_turn is not None and not self.user_turn():
@@ -3698,8 +3721,13 @@ class VoiceBridge(QObject):
         pinned dict (``yuki.skills.engine.pinned``) goes with the request (``runtime.submit(skill=)``, probed), so the
         thinker's frame shows it first and its done counts only on the skill's own check. The engine never hands over
         with a game in front (D17(2)).
+
+        oVoice (review fix L3): never under ``brain = "one"`` (``False``: nothing is handed to a thinker; the ONE agent
+        reads the hand's result itself).
         """
-        if self._loop is None:
+        if self._loop is None or getattr(self, "one", False):
+            if getattr(self, "one", False):
+                self._log("bridge", op="escalate", refused="one", hand=name)
             return False
         self._note_escalated_hand(name)   # Item 2(a): its record is no finished request; what it becomes decides
         heard = heard_words(params.context, skip=self.not_heard)
@@ -3748,7 +3776,11 @@ class VoiceBridge(QObject):
         return True
 
     async def _run_held(self, call: tuple[str, dict, Any]) -> bool:
-        """Do a held hand-off after all (the mouth stayed quiet twice on it): its words said by code, its job run."""
+        """Do a held hand-off after all (the mouth stayed quiet twice on it): its words said by code, its job run.
+        oVoice (review fix L3): never under ``brain = "one"`` (``False``: no hand-off to run)."""
+        if getattr(self, "one", False):
+            self._log("bridge", op="held_run", refused="one")
+            return False
         _name, args, context = call
         heard = heard_words(context, skip=self.not_heard)
         intent = str(args.get("intent") or "new_task")
