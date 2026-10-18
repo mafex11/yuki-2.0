@@ -12,8 +12,10 @@ they play) are data on that record, never skills of their own. Each value carrie
   they asked Yuki for it, when first and last;
 * ``hours`` (24 counts, local) and ``weekdays`` (7 counts, Monday first) - when;
 * ``parts`` - the other key slots' values with counts (a site's page kinds: ``{"page": {"watch": 645, ...}}``);
-* ``means`` / ``usual`` - the means slots' options with counts (the browser per site) and the one the user uses
-  (>= :data:`USUAL_SHARE` of its uses);
+* ``means`` / ``usual`` - the means slots' options with counts (the browser per site) and the one the user uses: for
+  a means slot that reads a preference (a site's browser), the preference's own answer (``yuki.skills.prefs.settled``,
+  read by :func:`known` and :func:`all_values`: one truth, phase 3.1), else the option with >= :data:`USUAL_SHARE` of
+  its uses;
 * ``everyday`` - ``True`` / ``False`` / ``None`` (unknown): ``False`` is work (never offered, still resolved on
   request); carried from a retired per-value row's naming verdict, and set by the user's "This is work";
 * ``mark`` - the user's say: ``"not_mine"`` (left off the menu, the card and the you-card) or ``None``.
@@ -33,7 +35,8 @@ Public::
 
     value_slots(cap) -> (identity slot, other key slots)
     build(group, cap, store, now, old) -> [value dicts]          # the learner's pass (write.plan)
-    known(store, capability=None, *, now=None) -> {cap: [value dicts]}   # RAM-cached by the learned version
+    known(store, capability=None, *, now=None) -> {cap: [value dicts]}   # RAM-cached by the learned + prefs version
+    with_prefs(store, {cap: [values]}) -> same, a preference slot's usual from the preference
     ranked(values, now) -> [value dicts]                          # recency-weighted, this hour first
     mark(store, capability, value_id, action, words="") -> dict   # the Playbook's Rename / Not mine / This is work
     routine_value(store, key) / routine_slots(store, key) / routine_offerable(value) / value_onsets(store, key, ...)
@@ -68,7 +71,7 @@ MAX_MARKS = 300
 DAY_S = 86400.0
 
 _lock = threading.Lock()
-#: ``(learned version, {capability: [values]})`` as last read.
+#: ``(learned version | preferences version, {capability: [values]})`` as last read.
 _cache: tuple[str, dict[str, list[dict[str, Any]]]] = ("", {})
 
 
@@ -172,6 +175,8 @@ def build(group: Any, cap: Any, store: Any, now: float, old: dict[str, dict[str,
             if not c:
                 continue
             means[s.name] = dict(c.most_common(5))
+            if getattr(s, "pref", ""):
+                continue    # a means slot with a preference: its usual is the preference's (read in :func:`known`)
             top, k = c.most_common(1)[0]
             if k >= 2 and k / sum(c.values()) >= USUAL_SHARE:
                 usual[s.name] = top
@@ -245,38 +250,82 @@ def _records(store: Any, rid: int | None = None) -> list[tuple[int, str, str, di
     return out
 
 
+def with_prefs(store: Any, table: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
+    """``table`` with each value's ``usual`` for a means slot that reads a preference (a site's browser) taken from
+    the preference itself (:func:`yuki.skills.prefs.settled`: the user's confirmed usual, else a clear observed
+    choice; none below that bar), so every place that shows "their usual" says what the engine will use (audit 18 Oct,
+    phase 3.1: the you-card said one browser for a site, the preference another). The record's own counts stay in
+    ``means``. New dicts; never raises (``table`` as it was)."""
+    try:
+        from yuki.skills import prefs
+        from yuki.skills.catalog import capabilities
+
+        caps = {c.key: c for c in capabilities().capabilities}
+    except Exception:  # noqa: BLE001
+        return table
+    out: dict[str, list[dict[str, Any]]] = {}
+    for cap_key, vals in table.items():
+        cap = caps.get(cap_key)
+        slots = [s for s in (getattr(cap, "slots", ()) or ()) if s.role == "means" and getattr(s, "pref", "")
+                 and s.name in (getattr(cap, "bind", None) or {})] if cap is not None else []
+        if not slots:
+            out[cap_key] = vals
+            continue
+        names = {s.name for s in slots}
+        fresh = []
+        for v in vals:
+            usual = {k: o for k, o in (v.get("usual") or {}).items() if k not in names}
+            for s in slots:
+                try:
+                    key = s.pref_key(cap_key, {str(v.get("slot") or ""): v.get("value")})
+                    got = prefs.settled(store, key) if "{" not in key else None
+                except Exception:  # noqa: BLE001
+                    got = None
+                if got is not None:
+                    usual[s.name] = got.option
+            fresh.append({**v, "usual": usual})
+        out[cap_key] = fresh
+    return out
+
+
 def known(store: Any, capability: str | None = None, *, now: float | None = None) -> dict[str, list[dict[str, Any]]]:
     """``{capability: [values]}`` from the values records (as the learner last wrote them), each list best first by
-    :func:`ranked` (marked not-mine left out). RAM-cached until the learned rows change (one count query). Never
+    :func:`ranked` (marked not-mine left out), a preference slot's ``usual`` read from the preference
+    (:func:`with_prefs`). RAM-cached until the learned rows or the preferences change (two count queries). Never
     raises (``{}``)."""
     global _cache
     try:
         from yuki.skills.catalog import learned_version
+        from yuki.skills.prefs import version as prefs_version
 
         version = learned_version(store)
+        stamp = f"{version}|{prefs_version(store)}" if version else ""
     except Exception:  # noqa: BLE001
         return {}
     with _lock:
         hit = _cache
-    if hit[0] != version or not version:
+    if hit[0] != stamp or not stamp:
         table: dict[str, list[dict[str, Any]]] = {}
         try:
             for _rid, _key, cap_key, spec, _prov in _records(store):
                 table[cap_key] = [v for v in spec.get("values") or [] if isinstance(v, dict) and v.get("id")]
         except Exception:  # noqa: BLE001
             table = {}
+        table = with_prefs(store, table)
         with _lock:
-            _cache = (version, table)
+            _cache = (stamp, table)
         hit = _cache
     out = {k: ranked(v, now) for k, v in hit[1].items() if capability is None or k == capability}
     return out
 
 
 def all_values(store: Any, capability: str | None = None) -> dict[str, list[dict[str, Any]]]:
-    """Every value as stored, the marked ones too (the Playbook shows and un-marks them). Never raises."""
+    """Every value as stored, the marked ones too (the Playbook shows and un-marks them), a preference slot's
+    ``usual`` read from the preference (:func:`with_prefs`). Never raises."""
     try:
-        return {cap_key: [v for v in spec.get("values") or [] if isinstance(v, dict) and v.get("id")]
-                for _rid, _key, cap_key, spec, _prov in _records(store) if capability is None or cap_key == capability}
+        return with_prefs(store, {
+            cap_key: [v for v in spec.get("values") or [] if isinstance(v, dict) and v.get("id")]
+            for _rid, _key, cap_key, spec, _prov in _records(store) if capability is None or cap_key == capability})
     except Exception:  # noqa: BLE001
         return {}
 
@@ -467,5 +516,5 @@ def value_onsets(store: Any, key: Any, since: float, until: float) -> list[float
 
 
 __all__ = ["MIN_DAYS", "MIN_ASKED", "USUAL_SHARE", "MAX_VALUES", "MARKS", "MARK_FIELDS", "value_slots", "value_id",
-           "build", "recency", "hour_weight", "ranked", "known", "all_values", "mark", "holds_mark", "marks_of",
-           "not_mine_ids", "routine_value", "routine_slots", "routine_offerable", "value_onsets"]
+           "build", "recency", "hour_weight", "ranked", "known", "with_prefs", "all_values", "mark", "holds_mark",
+           "marks_of", "not_mine_ids", "routine_value", "routine_slots", "routine_offerable", "value_onsets"]
