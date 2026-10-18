@@ -40,7 +40,7 @@ from __future__ import annotations
 import ctypes
 import time
 from dataclasses import dataclass, field, fields
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 #: Visible share at or above which a window counts as fully visible (the 16 px grid's rounding at the edges).
 FULLY_VISIBLE = 0.97
@@ -549,12 +549,12 @@ def _title(text: str, cap: int = TITLE_CHARS) -> str:
     return text if len(text) <= cap else text[: cap - 1].rstrip() + "…"
 
 
-def name_of(w: Window | None, *, title: bool = True) -> str:
-    """``[hwnd] App "title"`` (the hands' id kept), or ``[hwnd] App`` without the title."""
+def name_of(w: Window | None, *, title: bool = True, cap: int = TITLE_CHARS) -> str:
+    """``[hwnd] App "title"`` (the hands' id kept; the title cut to ``cap``), or ``[hwnd] App`` without the title."""
     if w is None:
         return "a window"
     head = f"[{w.hwnd}] {w.app or 'unknown app'}"
-    t = _title(w.title) if title else ""
+    t = _title(w.title, cap) if title and cap > 0 else ""
     return f'{head} "{t}"' if t and _squash(t) != _squash(w.app) else head
 
 
@@ -562,7 +562,7 @@ def _percent(share: float) -> int:
     return int(round(max(0.0, min(1.0, float(share))) * 100))
 
 
-def _window_words(state: DeskState, w: Window, *, planner: bool) -> str:
+def _window_words(state: DeskState, w: Window, *, planner: bool, cap: int = TITLE_CHARS) -> str:
     parts: list[str] = []
     if w.foreground:
         parts.append("in front")
@@ -589,7 +589,7 @@ def _window_words(state: DeskState, w: Window, *, planner: bool) -> str:
     if planner:
         left, top, right, bottom = w.rect
         parts.append(f"@{left},{top} {right - left}x{bottom - top}")
-    return f"{name_of(w)} " + ", ".join(parts)
+    return f"{name_of(w, cap=cap)} " + ", ".join(parts)
 
 
 def _priority(w: Window) -> int:
@@ -602,26 +602,49 @@ def _priority(w: Window) -> int:
     return 4
 
 
-def render(state: DeskState, *, purpose: str = "talker", max_chars: int = 900, just_asked: str = "",
-           just_did: str = "") -> str:
-    """The desk in plain words (content: RAM only, for a model, never a log line). Per monitor, top window first,
-    each ``[hwnd] App "title"`` with what holds of it; then the minimised windows, what plays, the volumes, the holds,
-    and ``just_asked`` / ``just_did``. ``purpose="planner"`` adds each window's frame rectangle and the monitors'
-    rectangles (the brain aims by them); the talker gets none. Lines give way by priority (hidden and minimised
-    windows first, then the volumes) to fit ``max_chars``; the monitors, the window in front and what plays stay."""
-    planner = purpose == "planner"
-    items: list[tuple[int, int, str, str]] = []   # (priority, order, group, text); group joins pieces on one line
-    order = 0
+#: Characters of the caller's "Just asked" / "Just did" words said in the render.
+SAID_CHARS = 120
+#: How the render says less when the desk does not fit, tried in turn: (title chars, asked/did chars, short header,
+#: lowest priority that may give way). Hidden and minimised windows and the volumes go first; titles get shorter
+#: before a window the user can see (25% or more) gives way.
+_LEVELS = ((TITLE_CHARS, SAID_CHARS, False, 3), (30, SAID_CHARS, False, 3), (30, SAID_CHARS, False, 2),
+           (12, 80, True, 2), (0, 60, True, 2))
+#: The last resort shortens the longest lines, never below this many characters each.
+_LINE_MIN = 24
+
+
+def _where(state: DeskState, m: Media) -> tuple[str, str]:
+    """A playing session's app as said, and where it plays: its window when tied to one; "no window open" only when
+    the app is known (a mixer entry of that app) and has no window; else "which window is not known". A session id
+    that names no window's app and no mixer app (a hashed id) is said as an id, not as an app's name."""
+    if m.hwnd:
+        return m.app, f" in [{m.hwnd}]"
+    key = _key(m.app)
+    if any(_key(w.app) == key for w in state.windows):
+        return m.app, " (which window is not known)"
+    if any(_key(a.app) == key for a in state.audio):
+        return m.app, " (no window open)"
+    if "audio" in state.errors or not m.app:
+        return m.app or "an app", " (which window is not known)"
+    return f"an app (id {m.app})", " (which window is not known)"
+
+
+def _items(state: DeskState, *, planner: bool, cap: int, said: int, short: bool, just_asked: str,
+           just_did: str) -> list[tuple[int, int, str, str]]:
+    """The render's pieces: ``(priority, order, group, text)``; a group joins its pieces on one line. Priority 0 and
+    1 never give way (the monitors, the front, the keyboard, what plays, the holds, the asked and done lines)."""
+    items: list[tuple[int, int, str, str]] = []
 
     def add(prio: int, group: str, text: str) -> None:
-        nonlocal order
         if text:
-            items.append((prio, order, group, text))
-            order += 1
+            items.append((prio, len(items), group, text))
 
     multi = len(state.monitors) > 1
-    add(0, "head", "Desk now (each monitor's windows top first; [n] is the window id for your hands):"
-        if state.windows else "Desk now: no windows open.")
+    if not state.windows:
+        add(0, "head", "Desk now: no windows open.")
+    else:
+        add(0, "head", "Desk now ([n] = window id):" if short else
+            "Desk now (each monitor's windows top first; [n] is the window id for your hands):")
     shown = [w for w in state.windows if not w.minimized]
     for m in state.monitors:
         width, height = m.rect[2] - m.rect[0], m.rect[3] - m.rect[1]
@@ -636,31 +659,31 @@ def render(state: DeskState, *, purpose: str = "talker", max_chars: int = 900, j
         if not mine:
             add(0, group, "nothing open")
         for w in mine:
-            add(_priority(w), group, _window_words(state, w, planner=planner) + ";")
+            add(_priority(w), group, _window_words(state, w, planner=planner, cap=cap) + ";")
     off = [w for w in shown if w.monitor is None or w.monitor not in {m.index for m in state.monitors}]
     for w in off:
-        add(4, "off", ("Off every monitor: " if w is off[0] else "") + name_of(w) + ";")
+        add(4, "off", ("Off every monitor: " if w is off[0] else "") + name_of(w, cap=cap) + ";")
     minimized = [w for w in state.windows if w.minimized]
     if minimized:
-        add(4, "min", "Minimised: " + ", ".join(name_of(w) + (" (playing)" if w.playing else "") for w in minimized)
-            + ".")
+        add(4, "min", "Minimised: " + ", ".join(name_of(w, cap=cap) + (" (playing)" if w.playing else "")
+                                                 for w in minimized) + ".")
     playing = [m for m in state.media if m.playing]
     if playing:
-        def where(m: Media) -> str:
-            if m.hwnd:
-                return f" in [{m.hwnd}]"
-            has_window = any(_key(w.app) == _key(m.app) for w in state.windows)
-            return " (which window is not known)" if has_window else " (no window open)"
-        add(1, "media", "Playing: " + "; ".join(
-            f'{m.app}{" " + chr(34) + _title(m.title, 50) + chr(34) if m.title else ""}{where(m)}' for m in playing)
-            + ".")
+        said_media = []
+        for m in playing:
+            app, where = _where(state, m)
+            title = f' "{_title(m.title, min(50, cap))}"' if m.title and cap > 0 else ""
+            said_media.append(f"{app}{title}{where}")
+        add(1, "media", "Playing: " + "; ".join(said_media) + ".")
     paused = [m for m in state.media if not m.playing and m.status in ("paused", "stopped") and not m.hwnd]
     if paused:
         add(3, "media", "Paused: " + "; ".join(
-            f'{m.app}{" " + chr(34) + _title(m.title, 40) + chr(34) if m.title else ""}' for m in paused) + ".")
+            f'{m.app}{" " + chr(34) + _title(m.title, min(40, cap)) + chr(34) if m.title and cap > 0 else ""}'
+            for m in paused) + ".")
     sound: list[str] = []
     if state.master:
-        sound.append(f"master {float(state.master.get('level') or 0):g}%{' muted' if state.master.get('muted') else ''}")
+        muted = " muted" if state.master.get("muted") else ""
+        sound.append(f"master {float(state.master.get('level') or 0):g}%{muted}")
     for a in state.audio:
         sound.append(f"{a.app} {a.level:g}%{' muted' if a.muted else ''}{' sounding' if a.playing else ''}")
     if sound:
@@ -668,37 +691,87 @@ def render(state: DeskState, *, purpose: str = "talker", max_chars: int = 900, j
     if state.holds:
         add(0, "holds", f"Holding them: {state.holds}.")
     if just_asked:
-        add(0, "asked", f"Just asked: {_title(just_asked, 200)}")
+        add(0, "asked", f"Just asked: {_title(just_asked, said)}")
     if just_did:
-        add(0, "did", f"Just did: {_title(just_did, 200)}")
+        add(0, "did", f"Just did: {_title(just_did, said)}")
+    return items
 
-    def assemble(kept: list[tuple[int, int, str, str]]) -> str:
-        lines: list[str] = []
-        groups: dict[str, int] = {}
-        for _prio, _order, group, text in sorted(kept, key=lambda t: t[1]):
-            if group in groups:
-                lines[groups[group]] += " " + text
-            else:
-                groups[group] = len(lines)
-                lines.append(text)
-        return "\n".join(line[:-1] + "." if line.endswith(";") else line for line in lines)
 
+def _assemble(kept: list[tuple[int, int, str, str]]) -> str:
+    lines: list[str] = []
+    groups: dict[str, int] = {}
+    for _prio, _order, group, text in sorted(kept, key=lambda t: t[1]):
+        if group in groups:
+            lines[groups[group]] += " " + text
+        else:
+            groups[group] = len(lines)
+            lines.append(text)
+    return "\n".join(line[:-1] + "." if line.endswith(";") else line for line in lines)
+
+
+def _fit(items: list[tuple[int, int, str, str]], max_chars: int, lowest: int = 2) -> tuple[str, bool]:
+    """Drop the least important pieces (priority ``lowest`` and up, never under 2; lowest and latest first) until the
+    text fits; a note says how many gave way. ``(text, fits)``."""
     kept = list(items)
-    text = assemble(kept)
+    text = _assemble(kept)
     dropped = 0
-    for victim in sorted(items, key=lambda t: (-t[0], -t[1])):
-        note = f"\n({dropped} less important fact(s) left out)" if dropped else ""
-        if len(text) + len(note) <= max_chars or victim[0] == 0:
+
+    def note(n: int) -> str:
+        return f"\n({n} less important fact(s) left out)" if n else ""
+
+    for victim in sorted((t for t in items if t[0] >= max(lowest, 2)), key=lambda t: (-t[0], -t[1])):
+        if len(text) + len(note(dropped)) <= max_chars:
             break
         kept.remove(victim)
         dropped += 1
-        text = assemble(kept)
-    if dropped:
-        text += f"\n({dropped} less important fact(s) left out)"
-    if len(text) > max_chars:
-        text = text[: max_chars - 1].rstrip() + "…"
-    return text
+        text = _assemble(kept)
+    text += note(dropped)
+    return text, len(text) <= max_chars
 
 
-__all__ = ["Audio", "DeskState", "Media", "Monitor", "Window", "coverer", "from_overview", "map_media", "monitor_of",
-           "name_of", "render", "snapshot", "warm"]
+def _squeeze(text: str, max_chars: int, soft: Sequence[str]) -> str:
+    """The last resort: cut lines to one width (the largest that fits, never under :data:`_LINE_MIN`) so each line
+    keeps its start and none is lost: first only the ``soft`` lines (the caller's words, the holds, the note), then
+    every line; a hard cut only if even that does not fit."""
+    lines = text.split("\n")
+
+    def cut(width: int, which: Callable[[str], bool]) -> list[str]:
+        return [line if len(line) <= width or not which(line) else line[: width - 1].rstrip() + "…" for line in lines]
+
+    for which in (lambda line: line.startswith(tuple(soft)), lambda line: True):
+        if len("\n".join(lines)) <= max_chars:
+            break
+        lo, hi, best = _LINE_MIN, max(len(line) for line in lines), _LINE_MIN
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if len("\n".join(cut(mid, which))) <= max_chars:
+                best, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        lines = cut(best, which)
+    text = "\n".join(lines)
+    return text if len(text) <= max_chars else text[: max_chars - 1].rstrip() + "…"
+
+
+def render(state: DeskState, *, purpose: str = "talker", max_chars: int = 900, just_asked: str = "",
+           just_did: str = "") -> str:
+    """The desk in plain words (content: RAM only, for a model, never a log line). Per monitor, top window first,
+    each ``[hwnd] App "title"`` with what holds of it; then the minimised windows, what plays, the volumes, the holds,
+    and ``just_asked`` / ``just_did`` (each said up to :data:`SAID_CHARS`). ``purpose="planner"`` adds each window's
+    frame rectangle and the monitors' rectangles (the brain aims by them); the talker gets none.
+
+    To fit ``max_chars``: hidden and minimised windows give way first, then partly seen ones and the volumes; then the
+    titles get shorter (:data:`_LEVELS`); last, the longest lines are cut. Never dropped: the monitors, the window in
+    front, the keyboard's and the playing ones, what plays, the holds, the asked and done lines."""
+    planner = purpose == "planner"
+    text = ""
+    for cap, said, short, lowest in _LEVELS:
+        text, fits = _fit(_items(state, planner=planner, cap=cap, said=said, short=short, just_asked=just_asked,
+                                 just_did=just_did), max_chars, lowest)
+        if fits:
+            return text
+    return _squeeze(text, max_chars, ("Just asked:", "Just did:", "Holding them:", "("))
+
+
+__all__ = ["SAID_CHARS", "Audio", "DeskState", "Media", "Monitor", "Window", "coverer", "from_overview", "map_media",
+           "monitor_of", "name_of", "render", "snapshot", "warm"]

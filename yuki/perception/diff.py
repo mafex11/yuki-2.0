@@ -6,25 +6,35 @@ picture-in-picture, an app that opened), windows gone, windows moved or resized 
 or uncovered (their visible share before and after, and what covers them now), where the focus went, media that
 started, stopped or changed track, and volume and mute changes (master and per app).
 
-Three flags say when the act touched what the user had, which is what earns the decider one look after acting (P1.3):
+Two sets say whose change is whose. ``acted``: what the request itself was about (a change to it is the ask, never
+flagged). ``touched``: the windows the act itself brought up or focused (the route's window, the launched app). The
+act's windows are the new ones, the touched ones and the asked ones; a change made by any other window (the user
+alt-tabbing during a countdown) is the user's own: it raises nothing, and :func:`render` marks it
+:data:`NOT_YOURS` so a look after acting never undoes it. Both take window ids (``int``) and/or app names
+(``"Discord"``, ``"Discord.exe"``). Each covered entry says ``by_act`` (the act's windows did it) and
+``side_effect`` (more than the ask itself).
 
-* ``covered_attention``: a window that had the user's attention before the act (it was in front, held the keyboard,
-  or a session played in it) lost most of its visible share: at least :data:`COVER_LOSS` (40 points), or it went from
-  mostly seen to mostly hidden (:data:`MOSTLY`) losing at least :data:`COVER_MIN_LOSS`; or the act minimised it.
-* ``focus_taken``: the window in front before is still there, but the front (or the keyboard) moved to another window
-  that the request was not about.
+Three flags say when the act took something the user had, which is what earns the decider one look after acting
+(P1.3). "Attention" windows are the ones that, before the act, were in front, held the keyboard, or had a session
+playing in them:
+
+* ``covered_attention``: an attention window the request was not about lost most of its visible share (under
+  :data:`COVER_KEEP` of what it had left, losing at least :data:`COVER_MIN_LOSS`), or got minimised, and the act did it:
+  the window over it (for a minimised one: the new front) is one of the act's windows, or the act touched that window
+  itself. When that window, or the new front, is the asked one, a merely-front window going under it is the ask
+  ("open Notepad" covers what was in front): it counts only when it was playing, or sits on another monitor than the
+  asked window.
+* ``focus_taken``: the window in front before is still there and was not the ask, but the front (or the keyboard)
+  moved to a new or touched window the request was not about.
 * ``new_popup``: a window that did not exist before and that the request was not about is now in front or holds the
   keyboard.
 
-``acted`` names what the request itself was about: window ids (``int``) and/or app names (``"Discord"``,
-``"Discord.exe"``): a change to them is the ask, never flagged. Pass nothing when the act's target is no window (a
-message sent, a media key, a volume): then a window coming forward is the act's side effect. The thresholds are
-measured shares (the 16 px occlusion grid), never a guess at meaning. Media and volume changes are only read when
-both snapshots read that part (``DeskState.errors``).
+The thresholds are measured shares (the 16 px occlusion grid), never a guess at meaning. Media and volume changes are
+only read when both snapshots read that part (``DeskState.errors``).
 
 Public API::
 
-    compare(before, after, *, acted=()) -> DeskDiff
+    compare(before, after, *, acted=(), touched=()) -> DeskDiff
     render(diff, max_chars=500) -> str      # plain words for the decider (no header: the caller titles it "After:")
     DeskDiff.facts() -> dict                # content-free, for log lines
 """
@@ -46,17 +56,20 @@ from yuki.perception.situation import (
     name_of,
 )
 
-#: Points of visible share an attention window must lose to be "covered" (the occlusion grid's share, 0..1).
-COVER_LOSS = 0.40
-#: "Mostly seen" / "mostly hidden" boundary, and the least loss that crossing it must be.
-MOSTLY = 0.50
+#: "Covered" = lost most of its view: under this share of what it had stays visible (a fully seen window under 50%)...
+COVER_KEEP = 0.50
+#: ...losing at least this many points of visible share (the occlusion grid's share, 0..1), so a sliver is no cover.
 COVER_MIN_LOSS = 0.20
+#: "Mostly seen": the windows of a playing app whose playing window is not known count as attention from this share.
+MOSTLY = 0.50
 #: A window that gained this much visible share is "uncovered".
 UNCOVER_GAIN = 0.40
 #: Pixels an edge must move for a window to count as moved or resized (DPI rounding and frame jitter stay below).
 MOVE_PX = 8
 #: A volume level change smaller than this (0-100 points) is rounding, not a change.
 LEVEL_EPS = 0.5
+#: How the render marks a change no window of the act made (the user's own, while the act ran): not to be undone.
+NOT_YOURS = "(not from your act)"
 
 
 @dataclass
@@ -70,6 +83,8 @@ class DeskDiff(_Rec):
     uncovered: list[dict[str, Any]] = field(default_factory=list)
     focus_from: int | None = None
     focus_to: int | None = None
+    #: Whether the window the focus went to is one of the act's (new, touched or asked); else the user moved it.
+    focus_by_act: bool = False
     media_changes: list[dict[str, Any]] = field(default_factory=list)
     volume_changes: list[dict[str, Any]] = field(default_factory=list)
     flags: dict[str, bool] = field(default_factory=lambda: {"covered_attention": False, "focus_taken": False,
@@ -129,14 +144,26 @@ def _moved(a: Window, b: Window) -> bool:
     return any(abs(int(x) - int(y)) >= MOVE_PX for x, y in zip(a.rect, b.rect))
 
 
-def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = ()) -> DeskDiff:
+def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
+            touched: Iterable[Any] = ()) -> DeskDiff:
     """What changed from ``before`` to ``after`` (two :func:`~yuki.perception.situation.snapshot` reads around one
-    act), with the three flags (module docstring). Pure: no OS call. Never raises on odd input."""
+    act), with the three flags (module docstring). ``acted``: what the request was about; ``touched``: the windows the
+    act itself brought up or focused (ids or app names). Pure: no OS call. Never raises on odd input."""
     diff = DeskDiff()
     acted_hwnds, acted_apps = _acted_sets(acted)
+    touched_hwnds, touched_apps = _acted_sets(touched)
+    old = {w.hwnd: w for w in before.windows}
+    new = {w.hwnd: w for w in after.windows}
 
     def asked(w: Window | None) -> bool:
         return w is not None and (w.hwnd in acted_hwnds or (bool(acted_apps) and _key(w.app) in acted_apps))
+
+    def touched_it(w: Window | None) -> bool:
+        return w is not None and (w.hwnd in touched_hwnds or (bool(touched_apps) and _key(w.app) in touched_apps))
+
+    def of_act(w: Window | None) -> bool:
+        """One of the act's windows: new, touched, or the ask. Any other window that changed, the user changed."""
+        return w is not None and (w.hwnd not in old or touched_it(w) or asked(w))
 
     def remember(*ws: Window | None) -> None:
         for w in ws:
@@ -144,20 +171,39 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = ()) -
                 diff.names[w.hwnd] = name_of(w)
 
     diff.monitors = {m.index: ("main" if m.primary else "") for m in after.monitors}
-    old = {w.hwnd: w for w in before.windows}
-    new = {w.hwnd: w for w in after.windows}
     windows_read = "windows" not in before.errors and "windows" not in after.errors
 
     # attention before the act: in front, the keyboard, a window a session played in
     attention: list[int] = []
+    playing: set[int] = set()
     for w in before.windows:
+        if w.playing:
+            playing.add(w.hwnd)
         if w.foreground or w.keyboard or w.playing:
             attention.append(w.hwnd)
     for m in before.media:   # a playing app whose window is not known: its windows that were mostly seen
         if m.playing and not m.hwnd:
-            attention.extend(w.hwnd for w in before.windows
-                             if w.kind == "window" and _key(w.app) == _key(m.app) and w.visible >= MOSTLY)
+            seen = [w.hwnd for w in before.windows
+                    if w.kind == "window" and _key(w.app) == _key(m.app) and w.visible >= MOSTLY]
+            attention.extend(seen)
+            playing.update(seen)
     diff.attention = list(dict.fromkeys(attention))
+    front_after = new.get(after.foreground or 0)
+
+    def act_took(a: Window, b: Window, by: Window | None) -> tuple[bool, bool]:
+        """``(the act did it, it is a side effect)``: whether the act (not the user) took this window's view, and
+        whether that is more than the ask itself. ``by``: the window over it now (for a minimised one: the new
+        front)."""
+        if touched_it(b):
+            return True, True
+        if not of_act(by):
+            return False, False
+        ask = by if asked(by) else (front_after if asked(front_after) else None)
+        if ask is None:
+            return True, True
+        # under the asked window: the ask itself, unless it was playing or sits on another monitor than the ask
+        return True, a.hwnd in playing or (a.monitor is not None and ask.monitor is not None
+                                           and a.monitor != ask.monitor)
 
     if windows_read:
         for hwnd, w in new.items():
@@ -181,36 +227,40 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = ()) -
                 diff.moved.append({"hwnd": hwnd, "app": b.app, "from_monitor": a.monitor, "to_monitor": b.monitor,
                                    "from_rect": tuple(a.rect), "to_rect": tuple(b.rect),
                                    "from_state": _state_word(a), "to_state": _state_word(b), "asked": asked(b)})
-            loss = float(a.visible) - float(b.visible)
-            if b.minimized and not a.minimized:
-                loss = float(a.visible)
-            if loss >= COVER_LOSS or (a.visible >= MOSTLY and b.visible < MOSTLY and loss >= COVER_MIN_LOSS) or (
-                    b.minimized and not a.minimized and a.visible >= HIDDEN):
-                by = None if b.minimized else coverer(after, b)
+            minimised = bool(b.minimized and not a.minimized)
+            was, now = float(a.visible), 0.0 if b.minimized else float(b.visible)
+            loss = was - now
+            if (minimised and was >= HIDDEN) or (loss >= COVER_MIN_LOSS and now < was * COVER_KEEP):
+                if minimised:
+                    by = front_after if front_after is not None and front_after.hwnd != hwnd else None
+                else:
+                    by = coverer(after, b)
                 remember(b, by)
-                diff.covered.append({"hwnd": hwnd, "app": b.app, "before": round(float(a.visible), 3),
-                                     "after": 0.0 if b.minimized else round(float(b.visible), 3),
+                did, side = act_took(a, b, by)
+                diff.covered.append({"hwnd": hwnd, "app": b.app, "before": round(was, 3), "after": round(now, 3),
                                      "by": by.hwnd if by is not None else None,
-                                     "by_app": by.app if by is not None else None,
-                                     "minimised": bool(b.minimized and not a.minimized),
-                                     "attention": hwnd in diff.attention, "playing": a.playing,
-                                     "was_front": a.foreground, "asked": asked(b)})
+                                     "by_app": by.app if by is not None else None, "minimised": minimised,
+                                     "attention": hwnd in diff.attention, "playing": hwnd in playing,
+                                     "was_front": a.foreground, "asked": asked(b), "by_act": did,
+                                     "side_effect": side})
             elif -loss >= UNCOVER_GAIN:
                 remember(b)
                 diff.uncovered.append({"hwnd": hwnd, "app": b.app, "before": round(float(a.visible), 3),
                                        "after": round(float(b.visible), 3), "asked": asked(b)})
 
         diff.focus_from, diff.focus_to = before.foreground, after.foreground
+        diff.focus_by_act = bool(diff.focus_from != diff.focus_to and of_act(front_after))
         remember(old.get(before.foreground or 0), new.get(after.foreground or 0))
 
-        # the flags
-        diff.flags["covered_attention"] = any(c["attention"] and not c["asked"] for c in diff.covered)
+        # the flags: only what the act's own windows did (a window the user brought forward raises nothing)
+        diff.flags["covered_attention"] = any(c["attention"] and not c["asked"] and c["side_effect"]
+                                              for c in diff.covered)
         front_before = old.get(before.foreground or 0)
         still = new.get(front_before.hwnd) if front_before is not None else None
-        moved_to = [new.get(after.foreground or 0), new.get(after.keyboard or 0)]
+        moved_to = [front_after, new.get(after.keyboard or 0)]
         diff.flags["focus_taken"] = bool(
             front_before is not None and still is not None and not asked(still)
-            and any(t is not None and t.hwnd != front_before.hwnd and not asked(t) for t in moved_to)
+            and any(t is not None and t.hwnd != front_before.hwnd and of_act(t) and not asked(t) for t in moved_to)
             and not (still.foreground or still.keyboard))
         diff.flags["new_popup"] = any((n["foreground"] or n["keyboard"]) and not n["asked"] for n in diff.new_windows)
 
@@ -282,13 +332,16 @@ def render(diff: DeskDiff, max_chars: int = 500) -> str:
         what = name(c["hwnd"]) or f"[{c['hwnd']}] {c['app']}"
         tags = [t for t in ("was in front" if c["was_front"] else "", "playing" if c["playing"] else "") if t]
         head = f"{what}{' (' + ', '.join(tags) + ')' if tags else ''}"
+        mine = "" if c.get("by_act", True) else f" {NOT_YOURS}"
         if c["minimised"]:
-            lines.append(f"{head} got minimised.")
+            lines.append(f"{head} got minimised{mine}.")
         else:
             by = f", under [{c['by']}] {c['by_app']}" if c.get("by") else ""
-            lines.append(f"{head}: visible {_percent(c['before'])}% -> {_percent(c['after'])}%{by}.")
+            lines.append(f"{head}: visible {_percent(c['before'])}% -> {_percent(c['after'])}%{by}{mine}.")
     if diff.focus_from != diff.focus_to:
-        lines.append(f"Focus: {name(diff.focus_from or 0) or 'nothing'} -> {name(diff.focus_to or 0) or 'nothing'}.")
+        mine = "" if diff.focus_by_act else f" {NOT_YOURS}"
+        lines.append(f"Focus: {name(diff.focus_from or 0) or 'nothing'} -> {name(diff.focus_to or 0) or 'nothing'}"
+                     f"{mine}.")
     for n in diff.new_windows:
         where = _mon(diff, n["monitor"])
         bits = [b for b in ("in front" if n["foreground"] else "", "has the keyboard" if n["keyboard"] else "",
@@ -330,4 +383,4 @@ def render(diff: DeskDiff, max_chars: int = 500) -> str:
     return text
 
 
-__all__ = ["COVER_LOSS", "DeskDiff", "MOSTLY", "compare", "render"]
+__all__ = ["COVER_KEEP", "COVER_MIN_LOSS", "DeskDiff", "MOSTLY", "NOT_YOURS", "compare", "render"]

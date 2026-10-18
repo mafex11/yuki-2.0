@@ -14,15 +14,22 @@ generic verbs for it, all undoable:
   rescales itself on ``WM_DPICHANGED``; a second ``SetWindowPos`` then sets the size asked for. ``activate``: bring it
   to the front afterwards; when not asked and maximising activated it, the window that was in front gets the front
   back. Verified from Windows: ``MonitorFromWindow`` and the rectangle read back (``ok`` only when it is on the target
-  monitor in the state asked).
+  monitor in the state asked). A monitor a game shows on (its top window, the game not in front) is never a target:
+  ``"other"`` skips it, a named one is refused.
 * :func:`focus_back` brings the window that was in front before Yuki's act forward again
   (:func:`yuki.actions.launch.focus_window`, which re-checks the game gate before every attempt).
-* :func:`undo_last` reverses the newest entry of the undo journal: a placement goes back to its rectangle, show state
-  and monitor (and the front goes back when the placement took it); a focus goes back to the window in front before
-  it. :func:`journal_add` lets other undoable acts put their own undo on the same journal.
+* :func:`undo_last` ("put it back") reverses the newest group of the undo journal, newest entry first: a placement
+  goes back to its rectangle, show state and monitor (and the front goes back when the placement took it); a focus
+  goes back to the window in front before it; another act runs its own undo (:func:`journal_add`). A group is one
+  act or one tidy-up: the entries given the same ``group`` (the caller's request id), and a focus given back within
+  :data:`GROUP_S` of a placement joins that placement's group, so "move it and give the video the front" is put back
+  whole. Refused (and kept for later: "after the round") with a game in front; refused (and kept: ``force=True`` puts
+  it back anyway) when a placed window has moved since.
 
-The game gate (D17, :mod:`yuki.actions.gate`): refused with a game in front, or when the target is a game's window.
-Nothing here types, clicks or closes; nothing reads a title for meaning. The journal is RAM only
+The game gate (D17, :mod:`yuki.actions.gate`): refused with a game in front, or when the target is a game's window,
+checked before every ``SetWindowPos`` pass and every maximise. Windows of other threads are moved and shown
+asynchronously (``SWP_ASYNCWINDOWPOS``, ``ShowWindowAsync``), so a hung app never blocks the hands; the read-back waits
+for the change. Nothing here types, clicks or closes; nothing reads a title for meaning. The journal is RAM only
 (:data:`JOURNAL_SIZE` entries, newest last); ``details`` and log facts are content-free (ids, app keys, monitors,
 rectangles, states, never a title).
 """
@@ -30,28 +37,39 @@ rectangles, states, never a title).
 from __future__ import annotations
 
 import ctypes
+import itertools
 import threading
 import time
 from collections import deque
+from ctypes import wintypes
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import win32api
 import win32con
 import win32gui
+import win32process
 
 from yuki.actions import ActionResult
 from yuki.actions import gate as _gate
 
 _user32 = ctypes.windll.user32
+#: A user32 of this module's own, so the argument types set here never change another module's calls.
+_show_async = ctypes.WinDLL("user32").ShowWindowAsync
+_show_async.argtypes = [wintypes.HWND, ctypes.c_int]
+_show_async.restype = wintypes.BOOL
 
 #: The ``how`` values :func:`place_window` takes.
 HOWS = ("keep", "maximize", "left", "right")
 #: Undo journal entries kept (RAM; newest last).
 JOURNAL_SIZE = 8
-#: How often a wait re-checks its condition, and the bound on a wait for a show state.
+#: A focus given back this soon after the newest placement (or focus) joins its group: one tidy-up, one "put it back".
+GROUP_S = 10.0
+#: How often a wait re-checks its condition, and the bound on a wait for a show state or a move to land.
 _POLL_S = 0.01
 _STATE_WAIT_S = 0.6
+#: After a move landed, how long the rectangle may keep changing (the app answering ``WM_DPICHANGED``).
+_SETTLE_S = 0.15
 #: An edge this many px off the asked rectangle counts as "not there" (DPI rounding stays below).
 _EDGE_PX = 8
 #: Share of the asked rectangle the window must cover for a left/right placement to count as exact.
@@ -87,6 +105,14 @@ class JournalEntry:
     at: float = 0.0
     undo: Callable[[], ActionResult] | None = None
     words: str = ""
+    #: The act or tidy-up it belongs to (:func:`undo_last` puts a whole group back).
+    group: Any = None
+    #: Where the placement left it (``GetWindowRect``, monitor, state): when it is no longer there, the user moved it.
+    after_rect: tuple[int, int, int, int] | None = None
+    after_monitor: int | None = None
+    after_state: str = ""
+    #: A custom undo that neither sends input nor takes the front (a volume): allowed with a game in front.
+    front_ok: bool = False
 
     def facts(self) -> dict[str, Any]:
         """Content-free: kind, ids, app key, monitor, state, age."""
@@ -96,25 +122,39 @@ class JournalEntry:
 
 _journal: deque[JournalEntry] = deque(maxlen=JOURNAL_SIZE)
 _journal_lock = threading.Lock()
+_auto_group = itertools.count(1)
 
 
-def journal_add(kind: str, *, hwnd: int, undo: Callable[[], ActionResult], words: str = "", app: str = "") -> None:
-    """Put another undoable act on the journal (a minimise, a volume, a tab shown): ``undo`` puts it back and returns
-    an :class:`ActionResult`. :func:`undo_last` calls it when it is the newest entry."""
+def _push(entry: JournalEntry, group: Any = None, *, join_recent: bool = False) -> None:
+    """Append ``entry`` in its group: the caller's ``group``; else, with ``join_recent``, the newest placement's or
+    focus's group when that is younger than :data:`GROUP_S`; else a group of its own."""
     with _journal_lock:
-        _journal.append(JournalEntry(kind=str(kind), hwnd=int(hwnd or 0), app=app, at=time.monotonic(), undo=undo,
-                                     words=words))
+        if group is not None:
+            entry.group = group
+        else:
+            last = _journal[-1] if _journal else None
+            if join_recent and last is not None and last.kind in ("place", "focus") and (
+                    time.monotonic() - last.at) < GROUP_S:
+                entry.group = last.group
+            else:
+                entry.group = ("auto", next(_auto_group))
+        _journal.append(entry)
+
+
+def journal_add(kind: str, *, hwnd: int, undo: Callable[[], ActionResult], words: str = "", app: str = "",
+                group: Any = None, front_ok: bool = False) -> None:
+    """Put another undoable act on the journal (a minimise, a volume, a tab shown): ``undo`` puts it back and returns
+    an :class:`ActionResult`. :func:`undo_last` calls it (newest first, with the rest of its ``group``) after the game
+    gate allowed it: with a game in front only when ``front_ok`` (the undo neither sends input nor takes the front);
+    never when ``hwnd`` is a game's window."""
+    _push(JournalEntry(kind=str(kind), hwnd=int(hwnd or 0), app=app, at=time.monotonic(), undo=undo, words=words,
+                       front_ok=bool(front_ok)), group)
 
 
 def journal() -> list[dict[str, Any]]:
     """The journal, newest last, content-free (:meth:`JournalEntry.facts`)."""
     with _journal_lock:
         return [e.facts() for e in _journal]
-
-
-def _push(entry: JournalEntry) -> None:
-    with _journal_lock:
-        _journal.append(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -131,32 +171,44 @@ def _as_mon(m: Any) -> _Mon:
                 primary=bool(get("primary", get("is_primary", False))), dpi_scale=float(get("dpi_scale", 1.0) or 1.0))
 
 
-def resolve_monitor(monitor: int | str, current: int | None, monitors: Sequence[Any]) -> tuple[int | None, str]:
+def resolve_monitor(monitor: int | str, current: int | None, monitors: Sequence[Any],
+                    avoid: Iterable[int] = ()) -> tuple[int | None, str]:
     """The target monitor's index for a ``monitor`` value, ``(index, "")``, or ``(None, why not)``. Pure.
 
     An index (or its digits); ``"other"``: the other one of two, with more the next one after ``current`` (wrapping);
-    ``"primary"`` / ``"main"``: the primary monitor. (``"with:<hwnd>"`` is resolved by the caller, who can read that
-    window's monitor.)"""
+    ``"primary"`` / ``"main"``: the primary monitor. ``avoid``: monitors a game shows on: ``"other"`` skips them, a
+    named one is refused. (``"with:<hwnd>"`` is resolved by the caller, who can read that window's monitor.)"""
     mons = sorted((_as_mon(m) for m in monitors), key=lambda m: m.index)
     if not mons:
         return None, "no monitor could be read"
     indexes = [m.index for m in mons]
+    avoid = set(avoid or ())
     value = monitor.strip().casefold() if isinstance(monitor, str) else monitor
     if isinstance(value, bool):
         return None, f"monitor must be an index, 'other' or 'primary', not {monitor!r}"
     if isinstance(value, str) and value.lstrip("-").isdigit():
         value = int(value)
-    if isinstance(value, int):
-        return (value, "") if value in indexes else (None, f"there is no monitor {value} (monitors: "
-                                                     f"{', '.join(str(i) for i in indexes)})")
     if value == "other":
         if len(mons) < 2:
             return None, "there is only one monitor"
         if current not in indexes:
-            return next((m.index for m in mons if not m.primary), mons[1].index), ""
-        return indexes[(indexes.index(current) + 1) % len(indexes)], ""
+            order = [m.index for m in mons if not m.primary] + [m.index for m in mons if m.primary]
+        else:
+            at = indexes.index(current)
+            order = [indexes[(at + k) % len(indexes)] for k in range(1, len(indexes))]
+        free = [i for i in order if i not in avoid]
+        if not free:
+            return None, (f"monitor {order[0]} shows a game: no window goes over it" if len(order) == 1 else
+                          "every other monitor shows a game: no window goes over one")
+        return free[0], ""
     if value in ("primary", "main"):
-        return next((m.index for m in mons if m.primary), mons[0].index), ""
+        value = next((m.index for m in mons if m.primary), mons[0].index)
+    if isinstance(value, int):
+        if value not in indexes:
+            return None, f"there is no monitor {value} (monitors: {', '.join(str(i) for i in indexes)})"
+        if value in avoid and value != current:
+            return None, f"monitor {value} shows a game: no window goes over it"
+        return value, ""
     return None, f"monitor must be an index, 'other', 'primary' or 'with:<hwnd>', not {monitor!r}"
 
 
@@ -229,6 +281,34 @@ def monitor_index(hwnd: int, monitors: Sequence[_Mon] | None = None) -> int | No
     return None
 
 
+def _game_monitors(monitors: Sequence[_Mon], skip: int) -> set[int]:
+    """The monitors a game shows on: a game's window among each monitor's windows from the top down to its first
+    maximised or full-screen one (that one hides the rest). Fails closed: a monitor that could not be checked counts."""
+    from yuki.memory.gamegate import window_game
+    from yuki.perception.windows import list_windows
+
+    out: set[int] = set()
+    done: set[int] = set()
+    try:
+        infos = list_windows()   # Z-order, top first
+    except Exception:  # noqa: BLE001
+        return {m.index for m in monitors}
+    for info in infos:
+        if info.hwnd == skip or info.is_minimized:
+            continue
+        index = monitor_index(info.hwnd, monitors)
+        if index is None or index in done:
+            continue
+        try:
+            if window_game(info.hwnd):
+                out.add(index)
+        except Exception:  # noqa: BLE001
+            out.add(index)
+        if info.is_maximized or info.is_fullscreen:
+            done.add(index)
+    return out
+
+
 def _frame(hwnd: int) -> tuple[int, int, int, int] | None:
     from yuki.perception.visibility import frame_bounds
 
@@ -268,22 +348,66 @@ def _zoomed(hwnd: int) -> bool:
         return False
 
 
+def _rect(hwnd: int) -> tuple[int, int, int, int]:
+    return tuple(int(v) for v in win32gui.GetWindowRect(hwnd))  # type: ignore[return-value]
+
+
+def _near(a: Sequence[int] | None, b: Sequence[int] | None) -> bool:
+    return a is not None and b is not None and all(abs(int(x) - int(y)) < _EDGE_PX for x, y in zip(a, b))
+
+
+def _other_thread(hwnd: int) -> bool:
+    """Whether another thread owns the window (then a move or show is posted to it, never waited on)."""
+    try:
+        return int(win32process.GetWindowThreadProcessId(hwnd)[0]) != int(win32api.GetCurrentThreadId())
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _show(hwnd: int, cmd: int) -> None:
+    if _other_thread(hwnd):
+        _show_async(hwnd, cmd)
+    else:
+        win32gui.ShowWindow(hwnd, cmd)
+
+
 def _set_rect(hwnd: int, rect: Sequence[int]) -> None:
+    """Move and size the window; for another thread's window the request is posted and its landing waited on (a hung
+    app times the wait out, it never blocks), then the rectangle let settle (the app's own ``WM_DPICHANGED`` resize)."""
     left, top, right, bottom = (int(v) for v in rect)
-    win32gui.SetWindowPos(hwnd, 0, left, top, max(right - left, 1), max(bottom - top, 1), _SWP_FLAGS)
+    if not _other_thread(hwnd):
+        win32gui.SetWindowPos(hwnd, 0, left, top, max(right - left, 1), max(bottom - top, 1), _SWP_FLAGS)
+        return
+    start = _rect(hwnd)
+    want = (left, top, right, bottom)
+    win32gui.SetWindowPos(hwnd, 0, left, top, max(right - left, 1), max(bottom - top, 1),
+                          _SWP_FLAGS | win32con.SWP_ASYNCWINDOWPOS)
+    if not _wait(lambda: _near(_rect(hwnd), want) or _rect(hwnd) != start):
+        return
+    last, deadline = _rect(hwnd), time.monotonic() + _SETTLE_S
+    while time.monotonic() < deadline:
+        time.sleep(_POLL_S)
+        now = _rect(hwnd)
+        if now == last:
+            return
+        last = now
 
 
-def _frame_to(hwnd: int, frame: Sequence[int], target: _Mon, monitors: Sequence[_Mon]) -> tuple[int, int, int, int]:
-    """Put the visible frame at ``frame``; a second pass when a DPI change made the app resize itself. Returns the
-    frame read back."""
+def _frame_to(hwnd: int, frame: Sequence[int], target: _Mon, monitors: Sequence[_Mon],
+              details: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    """Put the visible frame at ``frame``; a second pass when a DPI change made the app resize itself. The game gate
+    is asked before each pass. Returns the frame read back, or ``None`` when the gate refused a pass."""
     for _ in range(2):
-        rect, now = tuple(win32gui.GetWindowRect(hwnd)), _frame(hwnd)
+        refused = _gate.refuse("window_place", hwnd=hwnd)
+        if refused is not None:
+            details["refused"] = _gate.kind_of(refused)
+            return None
+        rect, now = _rect(hwnd), _frame(hwnd)
         _set_rect(hwnd, outer_rect(frame, rect, now or rect))
-        got = _frame(hwnd) or tuple(win32gui.GetWindowRect(hwnd))
-        if monitor_index(hwnd, monitors) == target.index and all(
-                abs(int(a) - int(b)) < _EDGE_PX for a, b in zip(got, frame)):
+        got = _frame(hwnd) or _rect(hwnd)
+        if monitor_index(hwnd, monitors) == target.index and _near(got, frame):
             break
-    return tuple(_frame(hwnd) or win32gui.GetWindowRect(hwnd))
+    return tuple(_frame(hwnd) or _rect(hwnd))  # type: ignore[return-value]
 
 
 def _give_front_back(front: int, hwnd: int, details: dict[str, Any]) -> None:
@@ -303,13 +427,13 @@ def _maximize(hwnd: int, details: dict[str, Any]) -> bool:
     if refused is not None:
         details["refused"] = _gate.kind_of(refused)
         return False
-    win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+    _show(hwnd, win32con.SW_MAXIMIZE)
     return _wait(lambda: _zoomed(hwnd))
 
 
 def _restore_quietly(hwnd: int) -> bool:
     """Un-maximise without activating (``SW_SHOWNOACTIVATE``), waited on."""
-    win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+    _show(hwnd, win32con.SW_SHOWNOACTIVATE)
     return _wait(lambda: not _zoomed(hwnd))
 
 
@@ -324,12 +448,27 @@ def _mon_words(index: int | None, monitors: Sequence[_Mon]) -> str:
     return f"monitor {index}" + (" (main)" if m is not None and m.primary and len(monitors) > 1 else "")
 
 
-def place_window(hwnd: int, *, monitor: int | str = "other", how: str = "keep", activate: bool = False) -> ActionResult:
-    """Move one window to a monitor (module docstring) and verify it there. Never raises."""
+def _note_after(entry: JournalEntry, hwnd: int, monitors: Sequence[_Mon]) -> None:
+    """Where the placement left the window: what :func:`undo_last` checks it is still at."""
+    try:
+        entry.after_rect, entry.after_monitor = _rect(hwnd), monitor_index(hwnd, monitors)
+        entry.after_state = _state(hwnd) or ""
+    except Exception:  # noqa: BLE001 - gone: nothing to put back later either
+        pass
+
+
+def place_window(hwnd: int, *, monitor: int | str = "other", how: str = "keep", activate: bool = False,
+                 group: Any = None) -> ActionResult:
+    """Move one window to a monitor (module docstring) and verify it there. ``group``: the act or tidy-up it belongs
+    to (the caller's request id), so one "put it back" undoes all of it. Never raises."""
     started = time.perf_counter()
     how = str(how or "keep").strip().casefold()
     how = {"maximise": "maximize", "maximized": "maximize", "maximised": "maximize"}.get(how, how)
     details: dict[str, Any] = {"hwnd": int(hwnd or 0), "how": how, "monitor_asked": str(monitor)}
+    entry: JournalEntry | None = None
+    state: str | None = None
+    front = 0
+    monitors: list[_Mon] = []
     try:
         hwnd = int(hwnd)
         if how not in HOWS:
@@ -362,7 +501,10 @@ def place_window(hwnd: int, *, monitor: int | str = "other", how: str = "keep", 
             asked = monitor_index(int(other), monitors)
             if asked is None:
                 return _result(started, False, f"{monitor!r}: that window's monitor could not be read", details)
-        index, why = resolve_monitor(asked, current, monitors)
+        games = _game_monitors(monitors, hwnd) if len(monitors) > 1 else set()
+        if games:
+            details["game_monitors"] = sorted(games)
+        index, why = resolve_monitor(asked, current, monitors, avoid=games)
         if index is None:
             return _result(started, False, f"{name}: {why}", details)
         details["to_monitor"] = index
@@ -377,20 +519,26 @@ def place_window(hwnd: int, *, monitor: int | str = "other", how: str = "keep", 
             return _result(started, True, f"{name} is already maximised on {_mon_words(index, monitors)}", details)
 
         front = int(_user32.GetForegroundWindow() or 0)
-        entry = JournalEntry(kind="place", hwnd=hwnd, app=app, rect=tuple(win32gui.GetWindowRect(hwnd)),
-                             state=state or "normal", monitor=current, foreground=front, at=time.monotonic())
+        entry = JournalEntry(kind="place", hwnd=hwnd, app=app, rect=_rect(hwnd), state=state or "normal",
+                             monitor=current, foreground=front, at=time.monotonic())
         if state == "maximized":
             if not _restore_quietly(hwnd):
                 return _result(started, False, f"{name}: could not un-maximise it to move it", details)
-            entry.rect = tuple(win32gui.GetWindowRect(hwnd))   # the restored rectangle: where "put it back" goes
-        _push(entry)
+            entry.rect = _rect(hwnd)   # the restored rectangle: where "put it back" goes
+        _push(entry, group)
         if state == "fullscreen":
-            got = _frame_to(hwnd, target.rect, target, monitors)
+            got = _frame_to(hwnd, target.rect, target, monitors, details)
         else:
-            frame = _frame(hwnd) or tuple(win32gui.GetWindowRect(hwnd))
-            got = _frame_to(hwnd, target_frame(frame, source, target, how), target, monitors)
+            frame = _frame(hwnd) or _rect(hwnd)
+            got = _frame_to(hwnd, target_frame(frame, source, target, how), target, monitors, details)
+        if got is None:   # a game came to the front between two passes: nothing more is done to the desk
+            _note_after(entry, hwnd, monitors)
+            return _result(started, False, f"{name}: stopped, a game came to the front (it is on "
+                                           f"{_mon_words(monitor_index(hwnd, monitors), monitors)}; \"put it back\" "
+                                           f"after the round)", details)
         if want_max and not _maximize(hwnd, details):
             if details.get("refused"):
+                _note_after(entry, hwnd, monitors)
                 return _result(started, False, f"{name}: moved to {_mon_words(index, monitors)}, but not maximised "
                                                 f"(a game came to the front)", details)
         if activate:
@@ -401,6 +549,7 @@ def place_window(hwnd: int, *, monitor: int | str = "other", how: str = "keep", 
         elif want_max:
             _give_front_back(front, hwnd, details)
         entry.took_front = bool(front and front != hwnd and int(_user32.GetForegroundWindow() or 0) == hwnd)
+        _note_after(entry, hwnd, monitors)
 
         # verified from Windows: the monitor it is on and the state it is in
         now_monitor = monitor_index(hwnd, monitors)
@@ -429,12 +578,20 @@ def place_window(hwnd: int, *, monitor: int | str = "other", how: str = "keep", 
                                        f"{', maximised' if want_max else ''}; it is on {where}{tail}", details)
     except Exception as exc:  # noqa: BLE001 - a window that closed mid-way, an access denied by the app
         details["error"] = type(exc).__name__
+        if entry is not None:   # the OS steps had begun: a window that was maximised is maximised again
+            try:
+                if state == "maximized" and win32gui.IsWindow(hwnd) and not _zoomed(hwnd) and _maximize(hwnd, details):
+                    _give_front_back(front, hwnd, details)
+                _note_after(entry, hwnd, monitors)
+            except Exception:  # noqa: BLE001
+                pass
         return _result(started, False, f"[{hwnd}]: could not place it ({type(exc).__name__})", details)
 
 
-def focus_back(hwnd: int) -> ActionResult:
+def focus_back(hwnd: int, *, group: Any = None) -> ActionResult:
     """Bring ``hwnd`` (the window in front before Yuki's act) to the front again: :func:`launch.focus_window` (gated:
-    never with a game in front, never into a game). Journaled, so :func:`undo_last` can hand the front back."""
+    never with a game in front, never into a game). Journaled in ``group``, else in the group of a placement made
+    within :data:`GROUP_S`, so :func:`undo_last` puts the front back with that placement."""
     started = time.perf_counter()
     details: dict[str, Any] = {"hwnd": int(hwnd or 0), "focus_back": True}
     try:
@@ -450,7 +607,7 @@ def focus_back(hwnd: int) -> ActionResult:
         details.update({k: v for k, v in (result.details or {}).items() if k in ("refused", "ready", "ready_ms")})
         if result.ok:
             _push(JournalEntry(kind="focus", hwnd=hwnd, app=_app(hwnd), foreground=front, took_front=True,
-                               at=time.monotonic()))
+                               at=time.monotonic()), group, join_recent=True)
             return _result(started, True, f"[{hwnd}] {_app(hwnd) or 'window'} is in front again", details)
         return _result(started, False, result.summary, details)
     except Exception as exc:  # noqa: BLE001
@@ -459,61 +616,135 @@ def focus_back(hwnd: int) -> ActionResult:
                        details)
 
 
-def undo_last() -> ActionResult:
-    """Put back the newest undoable act ("put it back"): a placement's rectangle, show state and monitor (and the front,
-    when the placement took it); a focus's front; another act's own undo. The entry leaves the journal either way."""
-    started = time.perf_counter()
-    with _journal_lock:
-        entry = _journal.pop() if _journal else None
-    if entry is None:
-        return _result(started, False, "nothing to put back: no placement or focus of mine is on record", {})
-    details: dict[str, Any] = {"undo": entry.kind, "hwnd": entry.hwnd}
-    try:
-        if entry.undo is not None:
-            result = entry.undo()
-            return _result(started, bool(result.ok), result.summary, {**details, **(result.details or {})})
-        if entry.kind == "focus":
-            if not entry.foreground or not win32gui.IsWindow(entry.foreground):
-                return _result(started, False, "the window that was in front before is gone", details)
-            from yuki.actions.launch import focus_window
+def _refusal(entry: JournalEntry) -> Any:
+    """The game gate's answer for putting ``entry`` back (``None`` = allowed)."""
+    if entry.undo is not None:
+        return _gate.refuse("journal_undo", hwnd=entry.hwnd or None, front_ok=entry.front_ok)
+    if entry.kind == "focus":
+        return _gate.refuse("window_focus", hwnd=entry.foreground or None)
+    return _gate.refuse("window_place", hwnd=entry.hwnd)
 
-            result = focus_window(entry.foreground)
-            details.update({k: v for k, v in (result.details or {}).items() if k == "refused"})
-            return _result(started, result.ok, f"[{entry.foreground}] {_app(entry.foreground) or 'window'} is in "
-                                               f"front again" if result.ok else result.summary, details)
-        hwnd = entry.hwnd
-        name = f"[{hwnd}] {entry.app or 'window'}"
-        if not win32gui.IsWindow(hwnd):
-            return _result(started, False, f"{name} is gone: nothing to put back", details)
+
+def _moved_since(entry: JournalEntry, monitors: Sequence[_Mon]) -> bool:
+    """Whether a placed window is no longer where the placement left it (the user moved it since)."""
+    if entry.kind != "place" or entry.undo is not None or entry.after_rect is None:
+        return False
+    if not win32gui.IsWindow(entry.hwnd):
+        return False
+    return (monitor_index(entry.hwnd, monitors) != entry.after_monitor
+            or (_state(entry.hwnd) or "") != entry.after_state or not _near(_rect(entry.hwnd), entry.after_rect))
+
+
+def _undo_one(entry: JournalEntry, details: dict[str, Any]) -> ActionResult:
+    started = time.perf_counter()
+    if entry.undo is not None:
+        result = entry.undo()
+        if not isinstance(result, ActionResult):
+            return _result(started, False, f"{entry.kind}: its undo gave no result", details)
+        details.update(result.details or {})
+        return result
+    if entry.kind == "focus":
+        if not entry.foreground or not win32gui.IsWindow(entry.foreground):
+            return _result(started, False, "the window that was in front before is gone", details)
+        from yuki.actions.launch import focus_window
+
+        result = focus_window(entry.foreground)
+        details.update({k: v for k, v in (result.details or {}).items() if k == "refused"})
+        return _result(started, result.ok, f"[{entry.foreground}] {_app(entry.foreground) or 'window'} is in "
+                                           f"front again" if result.ok else result.summary, details)
+    hwnd = entry.hwnd
+    name = f"[{hwnd}] {entry.app or 'window'}"
+    if not win32gui.IsWindow(hwnd):
+        return _result(started, False, f"{name} is gone: nothing to put back", details)
+    refused = _gate.refuse("window_place", hwnd=hwnd)
+    if refused is not None:
+        details["refused"] = _gate.kind_of(refused)
+        return _result(started, False, str(refused), details)
+    if _state(hwnd) == "maximized" and not _restore_quietly(hwnd):
+        return _result(started, False, f"{name}: could not un-maximise it to put it back", details)
+    if entry.rect is not None:
         refused = _gate.refuse("window_place", hwnd=hwnd)
         if refused is not None:
             details["refused"] = _gate.kind_of(refused)
             return _result(started, False, str(refused), details)
-        if _state(hwnd) == "maximized" and not _restore_quietly(hwnd):
-            return _result(started, False, f"{name}: could not un-maximise it to put it back", details)
-        if entry.rect is not None:
-            _set_rect(hwnd, entry.rect)
-        if entry.state == "maximized":
-            _maximize(hwnd, details)
-        if entry.took_front and entry.foreground and win32gui.IsWindow(entry.foreground):
-            from yuki.actions.launch import focus_window
+        _set_rect(hwnd, entry.rect)
+    if entry.state == "maximized":
+        _maximize(hwnd, details)
+    if entry.took_front and entry.foreground and win32gui.IsWindow(entry.foreground):
+        from yuki.actions.launch import focus_window
 
-            details["front_back"] = bool(focus_window(entry.foreground).ok)
-        elif entry.state == "maximized":
-            _give_front_back(entry.foreground, hwnd, details)
-        monitors = _monitors()
-        now_monitor = monitor_index(hwnd, monitors)
-        now_state = _state(hwnd) or "gone"
-        details.update(to_monitor_seen=now_monitor, state_after=now_state)
-        ok = now_monitor == entry.monitor and now_state == (entry.state or "normal")
-        shown = {"maximized": ", maximised", "fullscreen": ", full screen"}.get(now_state, "")
-        return _result(started, ok, (f"{name} is back on {_mon_words(now_monitor, monitors)}{shown}" if ok else
-                                     f"{name}: put back, but it is on {_mon_words(now_monitor, monitors)}{shown}"),
-                       details)
+        details["front_back"] = bool(focus_window(entry.foreground).ok)
+    elif entry.state == "maximized":
+        _give_front_back(entry.foreground, hwnd, details)
+    monitors = _monitors()
+    now_monitor = monitor_index(hwnd, monitors)
+    now_state = _state(hwnd) or "gone"
+    details.update(to_monitor_seen=now_monitor, state_after=now_state)
+    ok = now_monitor == entry.monitor and now_state == (entry.state or "normal")
+    shown = {"maximized": ", maximised", "fullscreen": ", full screen"}.get(now_state, "")
+    return _result(started, ok, (f"{name} is back on {_mon_words(now_monitor, monitors)}{shown}" if ok else
+                                 f"{name}: put back, but it is on {_mon_words(now_monitor, monitors)}{shown}"),
+                   details)
+
+
+def undo_last(*, force: bool = False) -> ActionResult:
+    """Put back the newest group of undoable acts ("put it back"), newest first: placements (rectangle, show state,
+    monitor, and the front when a placement took it), focuses (the front before), other acts' own undos.
+
+    Nothing is done, and the group stays on the journal, when the game gate refuses any of it (``details["refused"]``:
+    "after the round" works), or when a placed window has moved since (``details["stale"]``; ``force=True`` puts it
+    back anyway). Entries a refusal stops mid-way stay on the journal too."""
+    started = time.perf_counter()
+    with _journal_lock:
+        batch: list[JournalEntry] = []
+        if _journal:
+            group = _journal[-1].group
+            while _journal and _journal[-1].group == group:
+                batch.append(_journal.pop())   # newest first
+
+    def keep(rest: list[JournalEntry]) -> None:
+        with _journal_lock:
+            for e in reversed(rest):
+                _journal.append(e)
+
+    if not batch:
+        return _result(started, False, "nothing to put back: no placement or focus of mine is on record", {})
+    details: dict[str, Any] = {"undo": [e.kind for e in batch], "hwnd": batch[0].hwnd}
+    try:
+        for e in batch:
+            refused = _refusal(e)
+            if refused is not None:
+                keep(batch)
+                details["refused"] = _gate.kind_of(refused)
+                return _result(started, False, str(refused), details)
+        if not force:
+            monitors = _monitors()
+            seen: set[int] = set()
+            for e in batch:   # each window's newest placement is where the group left it
+                if e.kind != "place" or e.hwnd in seen:
+                    continue
+                seen.add(e.hwnd)
+                if _moved_since(e, monitors):
+                    keep(batch)
+                    details["stale"] = True
+                    return _result(started, False, f"[{e.hwnd}] {e.app or 'window'} has moved since I placed it: "
+                                                   f"not put back (say so and I put it back anyway)", details)
+        said: list[str] = []
+        ok = True
+        for i, e in enumerate(batch):
+            result = _undo_one(e, details)
+            said.append(result.summary)
+            ok = ok and bool(result.ok)
+            if not result.ok and details.get("refused"):
+                if e.kind == "place" and e.undo is None:   # part put back: "after the round" starts from here
+                    _note_after(e, e.hwnd, _monitors())
+                keep(batch[i:])
+                break
+        return _result(started, ok, "; ".join(s for s in said if s), details)
     except Exception as exc:  # noqa: BLE001
         details["error"] = type(exc).__name__
         return _result(started, False, f"could not put it back ({type(exc).__name__})", details)
 
 
-__all__ = ["HOWS", "JOURNAL_SIZE", "JournalEntry", "focus_back", "journal", "journal_add", "monitor_index",
-           "outer_rect", "place_window", "resolve_monitor", "target_frame", "undo_last"]
+__all__ = ["GROUP_S", "HOWS", "JOURNAL_SIZE", "JournalEntry", "focus_back", "journal", "journal_add",
+           "monitor_index", "outer_rect", "place_window", "resolve_monitor", "target_frame", "undo_last"]
