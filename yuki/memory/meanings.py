@@ -19,13 +19,15 @@ name (or a stored alias) stands in it as whole words, case aside (a name of at m
 with a one-letter word, only in its stored case). The items are the user's own words and the portrait, never anyone
 else's: the conversation facts drawn from the user's talks with Yuki (rules, preferences, resources, commitments; not
 the ones drawn from calls, which hold other people's lines), the user's own turns to Yuki (not those said to others,
-not the live test's), and the live portrait facts (corrections included). A name common enough to stand in more than
-:data:`FREQUENT` items (a group called "work") counts, for a thing that lives inside something (an app, a server),
-only in items that also name that container or a sibling; the user's turn (a short request: "since 12am") counts for
-such a thing only when it names the container, a sibling or the kind too. The kind's own word ("browser", "playlist") brings at most
-:data:`GENERAL_N` items about the kind in general that name none of its things (the portrait's line about a throwaway
-browser), and measured context goes with each thing (a browser's sites by time, a playlist's tracks heard, a site's
-browsers), so the model can tell which is which.
+not the live test's), and the live portrait facts (not the corrections: they quote what memory had, which the user
+may have called misheard, and the fold already carries what was right into the live facts). A name common enough to
+stand in more than :data:`FREQUENT` items (a group called "work") counts, for a thing that lives inside something (an
+app, a server), only in items that also name that container or a sibling; the user's turn (a short request: "since
+12am") counts for such a thing only when it names the container, a sibling or the kind too. The kind's own word
+("browser", "playlist") brings at most :data:`GENERAL_N` items about the kind in general: items that name none of its
+things but name something in their measured context (the portrait's line about a throwaway browser for YouTube, a site
+the browsers hold), most such names first. Measured context goes with each thing (a browser's sites by time, a
+playlist's tracks heard, a site's browsers), so the model can tell which is which.
 
 **The nightly call** (:func:`nightly`, from the portrait scheduler's night chain): one forced Haiku call through the
 portrait worker (logged, costed into ``portrait_runs`` kind ``meanings``) for the things whose evidence changed since
@@ -67,8 +69,8 @@ KIND_WORDS: dict[str, str] = {
     "site": "website", "playlist": "playlist", "channel": "YouTube channel", "way_group": "group they pick in an app",
     "server": "chat server", "voice_channel": "voice channel", "person": "person", "app": "app",
     "browser": "web browser"}
-#: The kind's own word: an item that names it (and the kind's container, when it has one) and none of the kind's
-#: things is about the kind in general.
+#: The kind's own word: an item that names it (and the kind's container, when it has one), none of the kind's things
+#: and something in their measured context (:attr:`Thing.marks`) is about the kind in general.
 KIND_NOUN: dict[str, str] = {"browser": "browser", "playlist": "playlist", "server": "server",
                              "voice_channel": "voice channel", "channel": "channel"}
 
@@ -182,7 +184,9 @@ class Thing:
     """One of the user's things. ``names``: the stored name first, then stored aliases. ``container``: what it lives
     in (an app, a server), as words people write. ``context``: measured lines sent with it; ``ident``: their stable
     part (names, never counts), signed. ``siblings``: the other things of its kind in the same container. ``said``:
-    the user's own words for it (taste pairings, a value they named)."""
+    the user's own words for it (taste pairings, a value they named). ``marks``: the names in its measured context (a
+    browser's top sites, a playlist's tracks and the user's names for it, a server's voice channels, a voice channel's
+    server): an item about its kind in general counts when it names one."""
 
     kind: str
     name: str
@@ -192,6 +196,7 @@ class Thing:
     ident: list[str] = field(default_factory=list)
     siblings: list[str] = field(default_factory=list)
     said: list[str] = field(default_factory=list)
+    marks: list[str] = field(default_factory=list)
 
     @property
     def key(self) -> str:
@@ -267,8 +272,9 @@ def _apps_and_browsers(store: Any, now: float, sites: Sequence[Mapping[str, Any]
         ctx = ["most time on: " + ", ".join(f"{_host(x)} ({h:.1f} h)" for x, h in top)]
         if others:
             ctx.append("their other browsers: " + ", ".join(others))
+        marks = [_site_alias(_host(x)) or _host(x) for x, _h in top]   # "youtube" also reads "youtube.com"
         _add(out, seen, Thing("browser", a, [a, _short_app(a), k], context=ctx,
-                              ident=sorted(_host(x) for x, _h in top[:3]), siblings=others))
+                              ident=sorted(_host(x) for x, _h in top[:3]), siblings=others, marks=marks))
     kept = 0
     for a, k, h in apps:
         if kept >= APPS_N:
@@ -344,7 +350,7 @@ def _taste(store: Any, now: float, out: list[Thing], seen: set[tuple[str, str]])
         if isinstance(plays, (int, float)) and plays >= 3:
             ctx.append("played often")
         _add(out, seen, Thing("playlist", name, [name], container="Spotify", context=ctx, ident=called,
-                              siblings=[n for n in names if n != name][:6], said=called))
+                              siblings=[n for n in names if n != name][:6], said=called, marks=[*called, *heard]))
     rows = [t for t in taste.top(store, "youtube_handle", now=now, n=10_000) if str(t.name or "").strip()]
     rows.sort(key=lambda t: (-t.n_obs, t.entity_key))
     rows = rows[:CHANNELS_N]
@@ -414,14 +420,14 @@ def _places(store: Any, out: list[Thing], seen: set[tuple[str, str]]) -> None:
             _add(out, seen, Thing("server", s, [s], container=title,
                                   context=[f"a {title} server" + (f"; voice channels: {', '.join(rooms)}" if rooms
                                                                   else "")],
-                                  ident=[title], siblings=[x for x in servers if x != s][:5]))
+                                  ident=[title], siblings=[x for x in servers if x != s][:5], marks=rooms))
         for vc in vcs:
             if not vc.name:
                 continue
             where = str(vc.place or "")
             _add(out, seen, Thing("voice_channel", str(vc.name), [str(vc.name)], container=where or title,
                                   context=[f"a {title} voice channel" + (f" in {where}" if where else "")],
-                                  ident=[where]))
+                                  ident=[where], marks=[where] if where else []))
 
 
 def _people(store: Any, out: list[Thing], seen: set[tuple[str, str]]) -> None:
@@ -492,9 +498,9 @@ class Item:
         return Item(self.ref, self.source + ":general", self.text, self.at, self.weight)
 
 
-#: Where evidence comes from, and its base weight: the user's words to Yuki (conversation facts), the portrait, a
-#: correction they made to the portrait (it quotes what memory had), their own turns.
-SOURCES: dict[str, float] = {"said": 3.0, "portrait": 2.0, "correction": 1.5, "turn": 1.0}
+#: Where evidence comes from, and its base weight: the user's words to Yuki (conversation facts), the portrait, their
+#: own turns.
+SOURCES: dict[str, float] = {"said": 3.0, "portrait": 2.0, "turn": 1.0}
 
 
 def _joined(words: Sequence[str]) -> list[str]:
@@ -546,16 +552,18 @@ def corpus(store: Any) -> list[Item]:
     except Exception:  # noqa: BLE001
         pass
     try:
-        for f in store.portrait_facts():
+        # not the corrections: they quote what memory had (maybe what the user called misheard and said to forget);
+        # the fold carries what was right into the live facts
+        for f in store.portrait_facts(include_corrections=False):
             head = f"{f.subject}: " if f.subject else ""
-            src = "correction" if f.kind == "correction" else "portrait"
-            weight = SOURCES[src] + (float(f.importance) / 10.0 if f.importance else 0.5)
-            items.append(Item(f"p:{f.id}", src, f"{head}{f.text}", float(f.valid_from or 0.0), weight))
+            weight = SOURCES["portrait"] + (float(f.importance) / 10.0 if f.importance else 0.5)
+            items.append(Item(f"p:{f.id}", "portrait", f"{head}{f.text}", float(f.valid_from or 0.0), weight))
     except Exception:  # noqa: BLE001
         pass
     try:
         rows = store._query("SELECT * FROM conversation_turns WHERE (addressed IS NULL OR addressed = 'yuki') AND "
-                            + testtag.sql_real_session("session_id") + " ORDER BY at")
+                            + testtag.sql_real_session("session_id") + " AND "
+                            + testtag.sql_real_request("request_id") + " ORDER BY at")
         for r in rows:
             try:
                 t = store._turn(r)
@@ -615,7 +623,8 @@ def evidence(things_: Sequence[Thing], items: Sequence[Item], *, now: float | No
     kind's word or a sibling is named too. Ranked by source (:data:`SOURCES`; the portrait by importance), the
     container or a sibling named too, and recency; copies dropped; at most :data:`EVIDENCE_N` (:data:`TURNS_N` turns).
     Then each kind's general items (:data:`KIND_NOUN`): at most :data:`GENERAL_N` that name the kind (and its
-    container) and none of its things, the portrait's first."""
+    container), none of its things, and at least one of their marks (:attr:`Thing.marks`), the most marks first, then
+    the portrait's, by weight."""
     now = time.time() if now is None else float(now)
     index = _Index(items)
     by_kind: dict[str, list[int]] = {}
@@ -668,9 +677,14 @@ def evidence(things_: Sequence[Thing], items: Sequence[Item], *, now: float | No
         mine = {i for n in members for i in named[n]}
         names = [name for n in members for name in things_[n].names]
         containers = {things_[n].container for n in members if things_[n].container and kind != "voice_channel"}
+        marks = {_key(m): m for n in members for m in things_[n].marks if _key(m)}
+        hits_of = [set(index.naming(m)) for m in marks.values()]
         general = [i for i in index.naming(noun) if i not in mine and not index.names_any(i, names)
                    and (not containers or index.names_any(i, containers))]
-        general.sort(key=lambda i: (index.items[i].source != "portrait", -index.items[i].weight, -index.items[i].at))
+        overlap = {i: sum(1 for h in hits_of if i in h) for i in general}
+        general = [i for i in general if overlap[i]]
+        general.sort(key=lambda i: (-overlap[i], index.items[i].source != "portrait", -index.items[i].weight,
+                                    -index.items[i].at))
         extra: list[Item] = []
         heads = set()
         for i in general:
@@ -704,8 +718,8 @@ Each THING has a kind, its name, what it lives in, a few measured lines, and EVI
 words to Yuki and from Yuki's portrait of the user that name the thing, or that are about its kind in general \
 (marked "about {{kind}}s in general"). Answer every thing with one entry:
 - meaning: what the thing is to them, at most {MEANING_WORDS} plain words, without its own name: the role it plays, \
-the device or place it stands for, what they use it for, its mood, who it is with (like "the office desktop's \
-projects", "browser kept for work accounts", "songs for focus", "old school friends' server"). Empty when the \
+the device or place it stands for, what they use it for, its mood, who it is with (like "the kitchen \
+tablet's recipes", "where the rent gets paid", "rainy-day songs", "her cycling club's chat"). Empty when the \
 evidence says no more than its kind and name, or when the evidence is about something else that shares the name.
 - sure: "said" when the user said it outright; "clear" when an evidence line states it; "inferred" when you \
 join lines or measured context to reach it (which of two browsers is the casual one, from the sites each holds; \
@@ -753,6 +767,9 @@ class Asked:
     refs: dict[str, Item] = field(default_factory=dict)
     #: The stored row's signature ("" for a new thing).
     prev: str = ""
+    #: Whether the stored meaning may stay over a rejected answer: it has one, and every evidence line it rests on is
+    #: still sent.
+    keepable: bool = False
 
 
 def message(batch: Sequence[Asked]) -> str:
@@ -776,7 +793,7 @@ def message(batch: Sequence[Asked]) -> str:
             lines.append(f"  measured: {safe(c, 220)}")
         for ref, it in a.refs.items():
             general = it.source.endswith(":general")
-            src = {"said": "their words to Yuki", "portrait": "portrait", "correction": "their correction of memory",
+            src = {"said": "their words to Yuki", "portrait": "portrait",
                    "turn": "said to Yuki"}.get(it.source.split(":")[0], "portrait")
             when = _day(it.at)
             lines.append(f"  {ref} ({src}{', ' + when if when else ''}"
@@ -822,20 +839,27 @@ def _name_key(store: Any, kind: str, key: str) -> str:
 
 
 def _rows(store: Any) -> dict[tuple[str, str], dict[str, Any]]:
-    """``{(kind, name_key): {"id", "signature", "state", "meaning"}}`` of every stored row."""
+    """``{(kind, name_key): {"id", "signature", "state", "has", "sources"}}`` of every stored row (``has``: a meaning
+    is stored; ``sources``: the evidence refs it rests on)."""
     out: dict[tuple[str, str], dict[str, Any]] = {}
-    for r in store._query("SELECT id, kind, name_key, signature, state, meaning_ciphertext FROM meanings"):
-        out[(str(r[1]), str(r[2]))] = {"id": int(r[0]), "signature": r[3], "state": r[4], "has": r[5] is not None}
+    for r in store._query("SELECT id, kind, name_key, signature, state, meaning_ciphertext IS NOT NULL, sources"
+                          " FROM meanings"):
+        try:
+            sources = [str(s) for s in json.loads(r[6] or "[]")]
+        except (TypeError, ValueError):
+            sources = None   # unreadable: the meaning is not kept over a rejected answer
+        out[(str(r[1]), str(r[2]))] = {"id": int(r[0]), "signature": r[3], "state": r[4], "has": bool(r[5]),
+                                       "sources": sources}
     return out
 
 
 def _upsert(store: Any, *, kind: str, name_key: str, thing: Thing, meaning: str, confidence: float,
             sources: Sequence[str], sig: str, model: str | None, run_id: int | None, now: float,
             keep: bool = False) -> None:
-    """Write a thing's answer. ``keep``: a rejected answer; a stored row keeps its meaning, only its signature moves
-    (a new thing gets a row with none)."""
+    """Write a thing's answer. ``keep``: a rejected answer over a meaning that may stay (:attr:`Asked.keepable`); the
+    stored row keeps its meaning and is live again, only its signature moves (a new thing gets a row with none)."""
     aliases = json.dumps(thing.names[1:], ensure_ascii=False)
-    update = ("signature = excluded.signature, updated_at = excluded.updated_at" if keep else
+    update = ("signature = excluded.signature, state = 'live', updated_at = excluded.updated_at" if keep else
               "name_ciphertext = excluded.name_ciphertext, aliases_ciphertext = excluded.aliases_ciphertext,"
               " meaning_ciphertext = excluded.meaning_ciphertext, confidence = excluded.confidence,"
               " sources = excluded.sources, signature = excluded.signature, model = excluded.model,"
@@ -897,7 +921,9 @@ def plan(store: Any, *, now: float | None = None) -> dict[str, Any]:
         if row is not None and row["signature"] == sig and row["state"] == "live":
             same += 1
             continue
-        todo.append(Asked(n, t, list(items), sig, prev=str(row["signature"] or "") if row else ""))
+        keepable = bool(row and row["has"] and row["sources"] is not None
+                        and set(row["sources"]) <= {it.ref for it in items})
+        todo.append(Asked(n, t, list(items), sig, prev=str(row["signature"] or "") if row else "", keepable=keepable))
     todo.sort(key=lambda a: (-sum(1 for it in a.items if it.source == "said") - len(a.thing.said), -len(a.items)))
     gone = [r["id"] for k, r in rows.items() if r["state"] == "live" and k not in live_keys]
     return {"things": len(all_things), "with_evidence": len(ev), "todo": todo, "same": same, "gone": gone}
@@ -986,12 +1012,13 @@ def _ask(store: Any, batch: list[Asked], *, worker: Any, now: float) -> dict[str
             sig, bad = a.sig, bool(why) and why != "none"
             if bad:
                 # a rejected answer is asked once more (the next night), then rests until its evidence changes; a
-                # meaning the thing already had stays
+                # meaning the thing already had stays while every line it rests on is still sent, else it goes (as
+                # an empty answer would)
                 out["rejected"] += 1
                 sig = a.sig if a.prev == RETRY + a.sig else RETRY + a.sig
             _upsert(store, kind=a.thing.kind, name_key=_name_key(store, a.thing.kind, a.thing.key), thing=a.thing,
                     meaning=meaning, confidence=conf, sources=sources, sig=sig, model=HAIKU_MODEL, run_id=run_id,
-                    now=now, keep=bad)
+                    now=now, keep=bad and a.keepable)
             out["written"] += 1
             out["meanings"] += int(bool(meaning))
         stats.outcome = "ok"
