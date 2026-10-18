@@ -74,14 +74,14 @@ new-one item for a new one, or that thread's own words as item.
 control's name and role as a read shows it, or [id] from a look. Never coordinates. Give expect when a step's result \
 can be read.
 - say (voice): only on a slow step.
-- Keep their screen theirs. When they watch or work on one screen, a window you bring forward goes on another \
-(window_action place). Undo your own side effects (place it back, focus_back).
+- Keep their screen theirs. When they watch or work on one screen, what you bring forward goes on another \
+(place, in a window_action or a run_skill). Undo your own side effects (place, focus_back, undo).
 - done is the probe that reads what their words were for, not only the literal ask, to its last part; steps \
 doing a part end with a look. \
 Code says the result line from what the checks saw; never write a done sentence. done none only when no probe \
 reads it: a closed tab or control reads gone by its name, a pause or play media_session, a page page_at.
 - A step that doesn't match: revise from what showed, never repeat it unchanged; if you can't get there, say \
-what stopped you.
+why.
 - kind answer: read in steps (memory, look, fetch), then answer in plain text. kind ask: one short question, no \
 list, only when the card and the screen can't settle a real choice.
 
