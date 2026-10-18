@@ -153,6 +153,24 @@ LINE_HELD_CALL = "You're on a call, so I held off."
 #: this one says only that the step was stopped (``{what}``: the step in words), and the run ends there (a replan would
 #: meet the same gate). ``{what}``: :data:`STOPPED_WHAT`.
 LINE_INPUT_STOPPED = "Something on the PC stopped me {what}, so I left it there."
+#: fHands note 2: a ``run_skill`` step the gate stopped for anything but a game (``refused: blocked``) that gave no line
+#: of its own: plain, never the game line.
+LINE_BLOCKED = "Something on the PC stopped me there, so nothing was done."
+#: The skill engine's code words for a run the gate stopped for anything but a game (the skills side's ``blocked``
+#: outcome, whichever word it lands as): settled like a held run, said with :data:`LINE_BLOCKED`.
+BLOCKED_OUTCOMES = frozenset({"blocked", "held_blocked"})
+#: jBrain (fMsg B1; 18 Oct live A, k_clarify_who_draft and msg_quix_beat_draft: the message capability asked "Who to?"
+#: or couldn't place the person, and the planner typed the text into whichever DM happened to be open): said when a
+#: request ends with whom a message goes to still open.
+LINE_WHO = "Who's it for?"
+#: The planner's hint after a capability with a person slot dropped it as unheard or found no one by it (code's words).
+HINT_WHO_UNHEARD = ("It didn't run: whom it goes to isn't in their words as heard, or no one of theirs goes by it. Ask "
+                    "them whom: a plan kind ask with one short question (name the one person of theirs it sounds "
+                    "like, if one does). Never type it into whichever chat is open.")
+#: The refusal of a typing step into a chat while whom the message goes to is open (:meth:`Executor._who_guard`).
+HINT_WHO_FIRST = ("not typed: whom this message goes to isn't settled (its capability asked or couldn't place the "
+                  "person), so nothing is typed into whichever chat is open. Ask them whom (a plan kind ask), then run "
+                  "the message capability with that person.")
 #: The step a gate stopped, in words (the closed act verbs; anything else: "there").
 STOPPED_WHAT: dict[str, str] = {
     "launch_app": "opening the app", "focus_window": "bringing that window forward", "open_url": "opening the page",
@@ -418,6 +436,15 @@ class Executor:
         self._batch_words = -1   # how many of the user's words the batch was checked on (they only grow)
         #: x9: each open_url step's browser image as its resolution found it (step index -> image)
         self._open_images: dict[int, str] = {}
+        #: jBrain (fSkills merge note 2): each open_url step's page its own report confirmed (step index -> the page's
+        #: title, as launch.open_url read it), for a done that saw only the app (:meth:`_pages_cover`)
+        self._open_pages: dict[int, str] = {}
+        #: jBrain (fMsg B1): a capability with a person slot asked about it, or dropped it as unheard, in this request,
+        #: and no later run of it confirmed a chat: whom the message goes to is not settled, so nothing is typed into
+        #: whichever chat is open (:meth:`_who_guard`)
+        from yuki.brain.plan import person_open
+
+        self._who_unsettled = person_open(self.seed)   # a hand-off that left the person open (the talker's run)
         self.stopped: RunResult | None = None
         self.plan_since = time.time()
 
@@ -840,6 +867,9 @@ class Executor:
             status.state, status.why = "skipped", "wrong thread"
             return RunResult("refused", line=LINE_BUSY, final=True)
         live = self._live(call)
+        refused = self._who_guard(index, call, live)
+        if refused is not None:
+            return refused
         cv = self._verdict_for(call, live)
         effect = str(getattr(cv, "effect", "") or "") if cv is not None and not getattr(cv, "failed", False) else ""
         verdict = consent.check(call, self.head, self._all_words(), live, cv)
@@ -1126,17 +1156,23 @@ class Executor:
         self._trace_step(call, outcome, ok=bool(outcome.ok), verdict=verdict, why=why, ms=ms, started=started_at,
                          send=send_state, send_sig=send_sig)
         self._after_act(call, outcome, effect=effect, verdict=verdict)
+        if call.tool == "open_url":
+            self._note_page(index, outcome, verdict)
         self.last_act = {"hwnd": call.hwnd, "app": call.app, "title": call.title, "verdict": verdict}
         if call.tool == "run_skill":
             return self._skill_result(index, step, call, outcome)
         if not outcome.ok or verdict is False:
             status.state, status.why = "failed", why
             payload = outcome.payload if isinstance(outcome.payload, dict) else {}
-            if payload.get("refused") == "game" or (payload.get("details") or {}).get("refused") == "game":
-                if self._game_seen(call):
-                    return RunResult("refused", line=consent.LINE_GAME, final=True)
+            kind = _refused_kind(payload)
+            if kind == "game" and self._game_seen(call):
+                return RunResult("refused", line=consent.LINE_GAME, final=True)
+            if kind in ("game", "blocked"):
+                # fHands note 2: the gate stopped the step for anything but a game (it failed closed, another guard:
+                # "blocked"), or said game with none in front: a settled stop with a plain line, never the game line,
+                # never a replan (it would meet the same gate)
                 status.state, status.why = "refused", "input_gate"
-                self._emit_log("brain_gate_no_game", verb=call.tool)
+                self._emit_log("brain_gate_no_game", verb=call.tool, kind=kind)
                 return RunResult("refused", line=LINE_INPUT_STOPPED.format(
                     what=STOPPED_WHAT.get(call.tool, "there")), final=True)
             return self._mismatch_result(index, why, seen=shown, call=call, seen_fenced=external and bool(body))
@@ -1150,8 +1186,14 @@ class Executor:
         payload = outcome.payload if isinstance(outcome.payload, dict) else {}
         state = str(payload.get("outcome") or "")
         details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
-        held = HELD_OUTCOMES.get(state) or (
-            "game" if payload.get("refused") == "game" or details.get("refused") == "game" else "")
+        kind = _refused_kind(payload)
+        held = HELD_OUTCOMES.get(state) or ("game" if kind == "game" else "")
+        if kind == "blocked" or state in BLOCKED_OUTCOMES:
+            # fHands note 2: a skill step the gate stopped for anything but a game: the same settled stop with the
+            # plain line (the engine's own when it gave one), never the game line, never a replan or the next rung
+            status.state, status.why = "refused", "blocked"
+            self._emit_log("brain_gate_no_game", verb=call.tool, kind="blocked")
+            return RunResult("refused", line=done.engine_line(outcome) or LINE_BLOCKED, final=True)
         if held:
             # kBrain review M1: held before it acted (a game in front, a call live): settled, never a replan; the
             # engine's own line says so and names the pick it kept for later
@@ -1161,6 +1203,9 @@ class Executor:
         if details.get("refused") == "act_off" or payload.get("refused") == "act_off":
             status.state, status.why = "refused", "act_off"
             return RunResult("refused", line=done.engine_line(outcome) or str(outcome.summary or ""), final=True)
+        who = self._who_result(index, call, outcome, state, details)
+        if who is not None:
+            return who
         # ``why`` stays the outcome's code word (the planner's report, the logs); ``line`` is what is said if the
         # request ends on this step: plain words only, never the code word
         if state == "handed_over" and isinstance(payload.get("handoff"), dict):
@@ -1179,6 +1224,59 @@ class Executor:
                                          line=_engine_said(outcome) or LINE_SKILL_FAILED)
         status.state, status.why = "ok", state
         return None
+
+    def _who_result(self, index: int, call: Call, outcome: Any, state: str,
+                    details: Mapping[str, Any]) -> RunResult | None:
+        """jBrain (fMsg B1): a ``run_skill`` of a capability with a person slot (a message) that asked its own question
+        or couldn't place the person (its hand-off dropped that slot as unheard, or its routes found no one by it):
+        whom it goes to is open, so the user is asked, never a fallback by steps into whichever chat is open. The
+        capability's own question is asked at once (the Brain asks it and the answer goes back to the planner, so the
+        next plan runs the capability with that person); a person it couldn't place goes back to the planner, with no
+        hand-off seed (the capability stays open for the answer), to ask whom in one short question. A run that
+        confirmed its chat settles it. Code facts only (the capability's slots, the engine's outcome words)."""
+        key, _slots = consent.skill_input(call, self.head)
+        slot = consent.person_slot(util.skill(key))
+        if not slot:
+            return None
+        if state in ("done", "already") or details.get("verified") is True:
+            self._who_unsettled = False
+            return None
+        status = self.statuses[index]
+        if state == "asked":
+            self._who_unsettled = True
+            ask = _engine_ask(outcome)
+            status.state, status.why = "failed", "asked"
+            self._emit_log("brain_who", how="ask", own=bool(ask))
+            return RunResult("ask", line=ask or LINE_WHO)
+        payload = outcome.payload if isinstance(outcome.payload, dict) else {}
+        handoff = payload.get("handoff") if isinstance(payload.get("handoff"), dict) else {}
+        from yuki.brain.plan import handoff_person_open
+
+        if state == "handed_over" and handoff_person_open(handoff, slot):
+            self._who_unsettled = True
+            status.state, status.why = "failed", "who_open"
+            self._emit_log("brain_who", how="replan", own=False)
+            return self._mismatch_result(index, "who_open", seen=HINT_WHO_UNHEARD, call=call, line=LINE_WHO)
+        return None
+
+    def _who_guard(self, index: int, call: Call, live: consent.Live) -> RunResult | None:
+        """jBrain (fMsg B1): while whom a message goes to is open in this request (:meth:`_who_result`), a typing step
+        into a chat's window (``consent.chat_window``; unknown counts as a chat) is refused back to the planner: ask
+        whom, then run the capability with that person (its draft types only into the chat it confirmed open).
+        ``None``: the step goes on."""
+        if not self._who_unsettled or call.tool != "type_text":
+            return None
+        try:
+            chat = consent.chat_window(call, live)
+        except Exception:  # noqa: BLE001 - can't tell: as a chat (fail closed)
+            chat = None
+        if chat is False:
+            return None
+        status = self.statuses[index]
+        status.state, status.why = "refused", "who_open"
+        self._trace_step(call, None, ok=False, verdict=False, why="refused: who_open", kind="control", refused=True)
+        self._emit_log("consent", verb=call.tool, row=4, result="refuse", why="who_open")
+        return self._mismatch_result(index, "who_open", refused=True, seen=HINT_WHO_FIRST, line=LINE_WHO)
 
     def _run_draft(self, index: int, step: Any, call: Call, verdict: consent.Verdict) -> RunResult | None:
         """Row 4's draft: the capability runs with its send slot on a non-sending option; Yuki's own wording is typed
@@ -2235,6 +2333,8 @@ class Executor:
                                 args=self._probe_args(probe, args) if args is not None else None)
         if probe == done.NONE and result.verdict is None and not runs:
             result = self._steps_seen() or result
+        elif result.verdict is True and result.uncovered:
+            result = self._pages_cover(result) or result
         if not runs and not before:
             return result
         if result.verdict is False:
@@ -2250,29 +2350,17 @@ class Executor:
         is open in Chrome"). Level ``likely``, never ``verified``: the steps were seen, what they asked for was not
         read. ``None`` when any act step wasn't seen (a key, a click with nothing watched) or no step's verb has such
         words: the plan's "couldn't confirm" line stands. Code facts only."""
+        pages = self._seen_pages()
+        if not pages:
+            return None
         lines: list[str] = []
-        for index, step in enumerate(self.steps):
-            verb = self._verb(step)
-            if verb not in ACT_VERBS:
+        for _index, args, _title in pages:
+            try:
+                line = done.line_for("page_at", args, {})
+            except (KeyError, IndexError, ValueError):
                 continue
-            status = self.statuses[index] if index < len(self.statuses) else None
-            if status is None or status.state != "ok" or status.verdict is not True:
-                return None
-            probe = STEP_LINE_PROBES.get(verb)
-            if probe == "page_at":
-                address = words(field_of(step, "value", ""))
-                if not _web_host(address):
-                    continue
-                args = {"site": address}
-                image = self._open_images.get(index, "")
-                if image:
-                    args["process"] = image
-                try:
-                    line = done.line_for(probe, args, {})
-                except (KeyError, IndexError, ValueError):
-                    continue
-                if line and line not in lines:
-                    lines.append(line)
+            if line and line not in lines:
+                lines.append(line)
         if not lines:
             return None
         parts = [done.DoneResult(True, util.LIKELY, line, probe="steps", seen="each step's own report saw it")
@@ -2280,6 +2368,75 @@ class Executor:
         result = done.parts_done(parts)
         result.level = util.LIKELY
         return result
+
+    def _seen_pages(self) -> list[tuple[int, dict[str, str], str]] | None:
+        """The pages this plan's open_url steps opened, each ``(index, page_at args, the page's title)`` (``args``: the
+        step's own address as ``site``, its browser image as ``process`` when its resolution found one; the title as
+        the step's own report confirmed it, ``""`` when it gave none), when every act step ran and was seen to take by
+        its own report (``status.verdict`` True); ``None`` when any act step wasn't (a key, a click with nothing
+        watched). Code facts only (:data:`STEP_LINE_PROBES`)."""
+        out: list[tuple[int, dict[str, str], str]] = []
+        for index, step in enumerate(self.steps):
+            verb = self._verb(step)
+            if verb not in ACT_VERBS:
+                continue
+            status = self.statuses[index] if index < len(self.statuses) else None
+            if status is None or status.state != "ok" or status.verdict is not True:
+                return None
+            if STEP_LINE_PROBES.get(verb) != "page_at":
+                continue
+            address = words(field_of(step, "value", ""))
+            if not _web_host(address):
+                continue
+            args = {"site": address}
+            image = self._open_images.get(index, "")
+            if image:
+                args["process"] = image
+            out.append((index, args, self._open_pages.get(index, "")))
+        return out
+
+    def _note_page(self, index: int, outcome: Any, verdict: bool | None) -> None:
+        """An open_url step's page as its own report confirmed it (``details.page_verified`` and the page's title,
+        ``launch.open_url``), kept by step index; anything else forgets it. Bookkeeping only; never raises."""
+        try:
+            payload = outcome.payload if isinstance(outcome.payload, dict) else {}
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            page = details.get("page") if isinstance(details.get("page"), dict) else {}
+            if verdict is True and outcome.ok and details.get("page_verified") is True:
+                self._open_pages[index] = words(page.get("title"))
+            else:
+                self._open_pages.pop(index, None)
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            self._open_pages.pop(index, None)
+
+    def _pages_cover(self, result: done.DoneResult) -> done.DoneResult | None:
+        """jBrain (fSkills merge note 2; 18 Oct live A, open_excalidraw: open_url reported "navigation confirmed ...
+        page 'Excalidraw Whiteboard'" and the plan's done, reading only the app in front, said "Arc is in front; I
+        couldn't check the rest."): a done that read true but left target fields uncovered, in a plan whose every act
+        step was seen to take, and whose open_url steps' own reports confirmed pages that cover those fields (the page
+        as the target's window by its address or title, the browser as its app: :func:`done.coverage` of ``page_at``
+        on the step's own facts). The line then says those pages ("Excalidraw is open in Arc."), level ``likely``
+        (the steps saw them; the done read the app). ``None`` when a field stays uncovered (the honest "couldn't check
+        the rest" stands). Code facts only."""
+        pages = self._seen_pages()
+        if not pages:
+            return None
+        covered = set(result.covered)
+        for _index, args, title in pages:
+            entry = {"title": title, "process_name": args.get("process", "")} if title else None
+            try:
+                got, _left = done.coverage("page_at", args, self.head, window_entry=entry)
+            except Exception:  # noqa: BLE001 - a page not read covers nothing
+                continue
+            covered.update(got)
+        if any(field not in covered for field in result.uncovered):
+            return None
+        seen = self._steps_seen()
+        if seen is None:
+            return None
+        seen.covered, seen.uncovered = sorted(covered), []
+        self._emit_log("done_pages_cover", pages=len(pages), fields=len(result.uncovered))
+        return seen
 
     def _game_seen(self, call: Call) -> bool:
         """fBrain: whether a game is in front, or is the window this step aimed at, read now through the game gate's
@@ -2939,6 +3096,16 @@ def _handed_line(seed: Mapping[str, Any]) -> str:
     if why in _ACTED_WHYS:
         return LINE_SKILL_UNSURE
     return LINE_SKILL_HANDED
+
+
+def _refused_kind(payload: Mapping[str, Any]) -> str | None:
+    """fHands: the refusal kind an act's payload carries (``"game"`` / ``"blocked"``: ``yuki.actions.gate.carried``),
+    its own or its details', ``"game"`` first; ``None`` for any other refusal (a ToolError's ``True``, ``act_off``)."""
+    from yuki.actions.gate import carried
+
+    details = payload.get("details") if isinstance(payload.get("details"), Mapping) else {}
+    kinds = {carried(payload), carried(details)}
+    return "game" if "game" in kinds else ("blocked" if "blocked" in kinds else None)
 
 
 def _engine_ask(outcome: Any) -> str:

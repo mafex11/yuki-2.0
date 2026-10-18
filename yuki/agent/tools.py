@@ -2258,8 +2258,15 @@ class Dispatcher:
                                elapsed_ms=(time.perf_counter() - started) * 1000)
         refused = self._game_refusal(name, tool_input)
         if refused is not None:
-            return ToolOutcome(name=name, ok=False, summary=refused, content=[{"type": "text", "text": refused}],
-                               payload={"error": refused, "refused": "game", "details": {"refused": "game"}},
+            # fHands note 1: tagged with the refusal's own kind (yuki.actions.gate.kind_of): "game" only when the
+            # gate's game check refused it, else "blocked" (the gate failed closed, or a wrapper refused): only a
+            # "game" is ever said as a game
+            from yuki.actions.gate import kind_of
+
+            kind = kind_of(refused)
+            return ToolOutcome(name=name, ok=False, summary=str(refused),
+                               content=[{"type": "text", "text": str(refused)}],
+                               payload={"error": str(refused), "refused": kind, "details": {"refused": kind}},
                                elapsed_ms=(time.perf_counter() - started) * 1000)
         try:
             outcome = handler(tool_input)
@@ -4595,19 +4602,21 @@ class Dispatcher:
 
     def _game_refusal(self, name: str, tool_input: dict[str, Any]) -> str | None:
         """D17(1) on the thinker's side: why this action may not run now (a game is in front, or it is aimed at a
-        game's window), else ``None``. ``run_skill`` gates its own rungs (its no-focus ones may run mid-game)."""
+        game's window; or the gate could not check and failed closed), else ``None``. ``run_skill`` gates its own rungs
+        (its no-focus ones may run mid-game). fHands note 1: asked through :func:`yuki.actions.gate.refuse`, so the
+        refusal (a :class:`yuki.actions.gate.Refusal`) carries its kind for the caller's tag."""
         guard = self.game_guard if self.game_guard is not None else isinstance(self.backend, _LazyRealBackend)
         if not guard or name not in ACTION_TOOL_NAMES or name == "run_skill":
             return None
-        from yuki.memory import gamegate
+        from yuki.actions import gate
 
         traits = tool_traits(name, tool_input)
         if traits.needs in ("input", "focus") or name == "run_powershell":
-            return gamegate.refuse_input(f"tool_{name}")
+            return gate.refuse(f"tool_{name}")
         hwnd = tool_input.get("hwnd") or tool_input.get("expect_hwnd")
         if traits.needs == "window" and hwnd:
             try:
-                return gamegate.refuse_input(f"tool_{name}", hwnd=int(hwnd), front_ok=True)
+                return gate.refuse(f"tool_{name}", hwnd=int(hwnd), front_ok=True)
             except (TypeError, ValueError):
                 return None
         return None
@@ -4641,7 +4650,13 @@ class Dispatcher:
             return self._skill_act_off(result, off, ctx.get("memory"), acted)
         verified = True if result.done else (False if result.outcome == "failed" else None)
         details: dict[str, Any] = {"verified": verified}
-        if result.held:
+        # fHands: a run the gate stopped for anything but a game (it failed closed, another guard) is "blocked", never
+        # said as a game; only a game hold is "game" (an engine giving held "blocked" or a "blocked" outcome is read
+        # as that, so the tag stays right whichever way the skills side names it)
+        blocked = result.held == "blocked" or result.outcome in ("blocked", "held_blocked")
+        if blocked:
+            details["refused"] = "blocked"
+        elif result.held:
             details["refused"] = "game"
         elif result.outcome == "held_call":
             # kTaste (C2, decision 2): a call is live, so Yuki's own pick was kept for after it: settled, never redone
@@ -4658,8 +4673,8 @@ class Dispatcher:
             # bExec merge note 7: the engine's own done line whole (the summary is cut at 200 characters; a done line
             # with the fresh uploads named can be longer), read by ``brain.done.engine_line``
             payload["done_line"] = result.done_line or result.say
-        if result.held:
-            payload["refused"] = "game"
+        if blocked or result.held:
+            payload["refused"] = details["refused"]
         return ToolOutcome(name="run_skill", ok=ok, summary=text.split("\n", 1)[0][:200],
                            content=[{"type": "text", "text": text}], payload=payload)
 
