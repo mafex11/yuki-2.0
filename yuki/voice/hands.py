@@ -2812,8 +2812,9 @@ class Hands:
             try:
                 self.actions.add("your hand", f"watched {app_name} start", summary[:400], ok=verdict is not False,
                                  verified=verdict)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001 - a record never breaks a hand (content-free log)
+                if self.log is not None:
+                    self.log.event("hands", op="open_watch", ledger_error=type(exc).__name__)
             if self.on_step is not None:
                 try:
                     self.on_step("open_app", hand_words(name, args, result.get("process_name") or facts.get("app")),
@@ -3742,9 +3743,14 @@ class Hands:
                 facts = facts or {}
                 outcome = str(facts.get("outcome") or "") or "none"
                 if facts.get("verified") is True or facts.get("sent_at") is not None or facts.get("acted"):
-                    self.actions.add("your hand", _what(SKILL_HAND, dict(args or {})),
-                                     f"finished late, after the {self.SKILL_HAND_MAX_S:g} s wait: {str(report)[:300]}",
-                                     ok=bool(ok), verified=facts.get("verified"))
+                    try:
+                        self.actions.add("your hand", _what(SKILL_HAND, dict(args or {})),
+                                         f"finished late, after the {self.SKILL_HAND_MAX_S:g} s wait: "
+                                         f"{str(report)[:300]}", ok=bool(ok), verified=facts.get("verified"))
+                    except Exception as exc:  # noqa: BLE001 - a record never breaks a hand (content-free log)
+                        if self.log is not None:
+                            self.log.event("hands", op=SKILL_HAND, late=True, ledger_error=type(exc).__name__,
+                                           request_id=hand_id)
         except Exception:  # noqa: BLE001
             pass
         if self.log is not None:
@@ -5354,6 +5360,15 @@ class Hands:
         outcome = self._dispatcher.dispatch("type_text", {"text": text, "expect_hwnd": hwnd})
         if self._on_brain() and str(hwnd).lstrip("-").isdigit():
             self._typed_waiting[int(hwnd)] = time.monotonic()   # bTalk: Yuki's words wait there, unsent
+        if outcome.ok and str(hwnd).lstrip("-").isdigit():
+            # fMsg M1: a draft this hand typed is Yuki's own, so the message skill may replace it (hinglish); the window
+            # alone (this hand can't say which chat), kept as a keyed digest in RAM only
+            try:
+                from yuki.skills.chat import note_typed
+
+                note_typed(int(hwnd), text)
+            except Exception:  # noqa: BLE001 - bookkeeping only
+                pass
         from yuki.agent.loop import action_verdict
 
         verified, why = action_verdict("type_text", outcome)
@@ -6223,8 +6238,12 @@ class Hands:
         from yuki.actions.scrolling import stopped_words
 
         why = str(report.get("why") or "")
-        self.actions.add("your hand", "scroll keep (stopped by itself)", stopped_words(report)[:400],
-                         ok=why not in ("failed", "error"), verified=None)
+        try:
+            self.actions.add("your hand", "scroll keep (stopped by itself)", stopped_words(report)[:400],
+                             ok=why not in ("failed", "error"), verified=None)
+        except Exception as exc:  # noqa: BLE001 - a record never breaks a hand (content-free log)
+            if self.log is not None:
+                self.log.event("hands", op="scroll_keep", ledger_error=type(exc).__name__)
         if self.log is not None:
             self.log.event("hands", op="scroll_keep", stopped=why, steps=report.get("steps"),
                            seconds=report.get("seconds"))

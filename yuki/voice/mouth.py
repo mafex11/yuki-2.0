@@ -631,8 +631,9 @@ The Skills list below is what Yuki can do, each checked by the PC. When their wo
 run_skill alone, its key, slots only from their words as said or a name its line lists, the rest left out (code fills \
 them and names a guess), say_first "" or "On it.". When code says its line or passes it on, say nothing after it. \
 "Again" or "a bit more": again true. They name another value for its last run ("no, the slider inside Spotify"): \
-run_skill again with it, corrects true. Their answer to "Keep this as your usual?" is keep_usual, alone. Two things \
-to do at once ("play my Japanese playlist and turn it down"), each one skill or hand step: one call per part, all in \
+run_skill again with it, corrects true, a value other than the one it just ran, say_first neutral ("Switching."), \
+never naming a value (code's done line names it). Their answer to "Keep this as your usual?" is keep_usual, alone. \
+Two things to do at once ("play my Japanese playlist and turn it down"), each one skill or hand step: one call per part, all in \
 this same reply, in their order. One thing with its app or place ("YouTube and Arc") is one ask, one call. When any \
 part needs the thinker (no line fits), all of it goes to the thinker in one call.
 
@@ -999,7 +1000,7 @@ pick). When no habit plainly fits, reply, and offer one thing in one short quest
 - "Yeah", "do it" or a name right after a question answers it: act on it (a question from running work: hand_over \
 follow_up).
 - Not done, done wrong, "try another way", "just do it": hand_over now (say_first "My bad, on it."), unless it is \
-another value for a skill's last run (that skill again, corrects true).
+another value for a skill's last run (that skill again, corrects true, a different value, say_first neutral).
 - Something to keep (a lasting rule for you, a correction about them, a fact about their life): react like a friend \
 and hand_over intent remember in the same reply; this moment only (stop, be quiet) is not kept.
 
@@ -1074,7 +1075,10 @@ done; an item in it only when you took the item from their words or the You bloc
 and names it: "Finding you something."). say_first "" when the change lands in front of them at once (a pause, a \
 volume step), when code will hold it (a game in front, a call) or when the skill must ask first (a message to nobody \
 named). Code says the done line: say nothing after it. "Again" or "a bit more": again true. Another value for its \
-last run: the same skill, corrects true. Their answer to "Keep this as your usual?" is keep_usual, alone."""
+last run ("the other one", "not that one"): the same skill, corrects true, with a value other than the one it just \
+ran (never that same value again), and say_first neutral ("Switching."), never naming a value: code's done line names \
+what played. A correction about something else ("from the start") is no corrects. Their answer to "Keep this as your \
+usual?" is keep_usual, alone."""
 
 LEAN_MESSAGE_SENTENCE = (
     " Every message is run_skill message: person as heard (never a guess by spelling; it resolves and asks), app only "

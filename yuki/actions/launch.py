@@ -1637,6 +1637,10 @@ def _page_key(url: str):
 _PAGE_BEFORE_WINDOWS = 4
 _PAGE_BEFORE_WINDOW_S = 0.35
 _PAGE_BEFORE_S = 1.0
+#: fSkills (live 18 Oct, youtube_channel_ndl: 5 s for nothing): when a window already showed the very page asked for
+#: right before the hand-off, no change can come to wait for; the page is read once or twice in this short look (a
+#: new window at the address still counts as opened) and then said as already up (:func:`_already_page`).
+_ALREADY_PAGE_S = 0.8
 #: With a deadline (``deadline=``), the address is handed a second time (percFix, a cold start that dropped it) only
 #: when at least this much of it is left.
 _AGAIN_MIN_S = 1.5
@@ -3129,6 +3133,13 @@ def launch_app(
                 content_deadline = min(content_deadline, up_at + _REFUSED_PAGE_S)
         if deadline is not None:
             content_deadline = min(content_deadline, float(deadline))
+        if unchanged and any(_same_page(target, url) and not _past_root(target, url)
+                             for url in unchanged.values() for target in page_targets):
+            # fSkills: a window already showed the very page asked for before the hand-off: what it shows can't change
+            # to it, so the wait is a short look (_ALREADY_PAGE_S), not the whole content wait, and the page is
+            # reported at once (as "already", below, unless another window newly shows it)
+            content_deadline = min(content_deadline, handed_off + _ALREADY_PAGE_S)
+            details["page_already_before"] = True
         page_wait = _await_page(identity, page_targets, before, content_deadline - time.monotonic(),
                                 unchanged=unchanged)
         mark("page")

@@ -4169,8 +4169,12 @@ class Conversation:
             try:
                 hands.actions.add("your reflex", rec["what"], str(report or "")[:400], ok=bool(ok),
                                   verified=facts.get("verified"))
-            except Exception:  # noqa: BLE001 - a record only
-                pass
+            except Exception as exc:  # noqa: BLE001 - a record only, never the reflex's result (content-free log)
+                try:
+                    self.log.event("reflex", op="record_error", session=self.session, tool=tool,
+                                   ledger_error=type(exc).__name__)
+                except Exception:  # noqa: BLE001 - logging never breaks a reflex
+                    pass
             on_step = getattr(hands, "on_step", None)
             if callable(on_step):
                 try:
