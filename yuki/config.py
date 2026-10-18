@@ -218,7 +218,7 @@ for _family, _rates in (("sonnet-5-5", {"input": 2.00, "output": 10.00, "cache_w
 #: (checked 2026-09-25), so this is a setting, not a constant in code.
 DEFAULT_VOICE_MOUTH_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 #: kMind (audit 17 Oct): the lean talker's model (``brain = "all"``, the voice that reads the user and decides). The
-#: full talker (the ``loop`` rollback) and the voice's side calls (speech guard, rest check, router) keep
+#: full talker (the ``loop`` rollback) and the voice's side calls (speech guard's claim check, router) keep
 #: :data:`DEFAULT_VOICE_MOUTH_MODEL`.
 DEFAULT_VOICE_LEAN_MODEL = "global.anthropic.claude-sonnet-5-5"
 
@@ -382,7 +382,7 @@ class Settings:
         voice_eot_threshold / voice_eager_eot_threshold / voice_eot_timeout_ms:
             Flux's end-of-turn settings (eager off: ``None``).
         voice_mouth_model: Bedrock model id of the fast mouth: the full talker (the ``loop`` rollback) and the voice's
-            side calls (speech guard, rest check, router, progress).
+            side calls (speech guard's claim check, router, progress).
         voice_lean_model: kMind (audit 17 Oct): the lean talker's model (``brain = "all"``): the voice that reads the
             user (the you-card) and decides. Thinking off as the model takes it (:func:`thinking_off`).
         voice_mouth_max_tokens: Output ceiling for one spoken reply.
@@ -483,8 +483,9 @@ class Settings:
             (their stable layers are kept an hour) are read again this often.
         voice_screen_terms: At most this many names on the screen in front (its list items, chats, tabs,
             links, buttons) are added to them, refreshed as the screen changes (v3.10); 0 = off.
-        voice_speech_guard: Check every line with the fast model before the voice says it: never its
-            reasoning, talk about the user, its inner workings or a repeat (yuki.voice.speechguard, v3.10).
+        voice_speech_guard: Check every line before the voice says it: never its reasoning, talk about the user,
+            its inner workings or a repeat (yuki.voice.speechguard, v3.10). Under ``brain = "all"`` (phase 2) only
+            code rules, plus one fast-model claim check on a talker line after a non-success act of the turn.
         voice_speech_guard_timeout_s: The check's verdict is waited for at most this long (fails open).
         voice_speech_channel: What decides which of the talker's words are spoken (v3.16). ``"guard"``: the
             spoken-line check above blocks lines (as since v3.10). ``"marker"``: every reply starts with a fixed
@@ -737,7 +738,7 @@ class Settings:
     skills: bool = field(default_factory=lambda: skills_mode() != "off")
     skills_learned: bool = field(default_factory=lambda: skills_mode() == "on")
     skills_max: int = 20
-    skills_menu_chars: int = 2400
+    skills_menu_chars: int = 2322
     skills_disable_after: int = 2
     skills_volume_step: int = 10
     youtube_feed_budget_s: float = 1.5
@@ -845,6 +846,9 @@ class Settings:
     #: request logs).
     brain_effort_voice: str = "low"
     brain_effort_typed: str = "low"
+    #: aBrain (phase 2.5): how the planner's effort is chosen (``yuki.brain.settings``): ``auto`` (from the request's
+    #: structure), ``fixed`` (the two settings above) or a level for both; ``""``: ``YUKI_BRAIN_EFFORT``, else ``auto``.
+    brain_effort_rule: str = ""
     #: Act plans: replans after a step did not match (the call budget bounds the rest).
     brain_max_replans: int = 3
     #: The commit check's model (one small yes/no call per plan, only on steps that could send, delete, buy, close or
@@ -868,6 +872,7 @@ class Settings:
         self.skills_learned = bool(self.skills and self.skills_learned)
         self.brain_effort_voice = _soft_effort(self.brain_effort_voice)
         self.brain_effort_typed = _soft_effort(self.brain_effort_typed)
+        self.brain_effort_rule = str(self.brain_effort_rule or "").strip().lower()
         self.brain_max_replans = max(0, int(self.brain_max_replans or 0))
         self.model = resolve_model(self.model)
         self.effort = resolve_effort(self.effort)

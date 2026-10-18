@@ -156,11 +156,10 @@ VERB_FIELDS: dict[str, str] = {
     "wait": "value: seconds (max 10)",
 }
 
-#: String caps, enforced in code (strict mode has no ``maxLength``). Goal, question and say are cut to fit (display
-#: text); a value over its cap is rejected (a cut value could act on the wrong thing).
+#: String caps, enforced in code (strict mode has no ``maxLength``). Goal and question are cut to fit (display text);
+#: a value over its cap is rejected (a cut value could act on the wrong thing).
 GOAL_CHARS = 200
 QUESTION_CHARS = 200
-SAY_CHARS = 120
 VALUE_CHARS = 1500
 TARGET_CHARS = 200
 QUOTE_CHARS = 600
@@ -245,7 +244,9 @@ def plan_schema() -> dict[str, Any]:
     step = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["verb", "window", "element", "value", "submit", "expect", "say"],
+        # aBrain (phase 2.3): no "say" field: the executor measures a slow step and says the plan's goal then
+        # (executor.SLOW_STEP_S); the model no longer guesses which steps are slow, nor writes a line per step
+        "required": ["verb", "window", "element", "value", "submit", "expect"],
         "properties": {
             "verb": {"type": "string", "enum": list(VERBS)},
             "window": _nullable("string", "An hwnd or a title."),
@@ -253,10 +254,6 @@ def plan_schema() -> dict[str, Any]:
             "value": _nullable("string"),
             "submit": {"type": "boolean"},
             "expect": {"anyOf": [_probe_schema(), {"type": "null"}]},
-            # sBrainFix (F7): spoken the moment the step is dispatched, so before its result (a tidy-up's after the
-            # request's line: P1.3); the core prompt says when to set it (qBrain: its description gave the room to
-            # the window verbs)
-            "say": _nullable("string"),
         },
     }
     # goal, route and question carry no description here: the core prompt says each (one line in their terms; steps
@@ -1051,59 +1048,17 @@ def parse_step(raw: Mapping[str, Any], index: int, header: Plan, checks: Checks,
         expect = _probe(raw.get("expect"), errors, f"{where}expect")
         if expect is not None and expect.name in ENGINE_ONLY_PROBES:
             errors.append(f"{where}expect.probe {expect.name} is only for skills")
-    say = _opt_str(raw, "say", errors, where, SAY_CHARS)
-    if checks.channel != "voice":
-        say = None
     if errors:
         raise PlanError(errors)
+    # aBrain (phase 2.3): a step carries no line of its own (the schema has no "say"): a step still running after
+    # executor.SLOW_STEP_S is said once in the plan's goal's words; quick steps are silent
     step = Step(index=index, verb=str(verb), window=window, element=element, value=value, submit=submit,
-                expect=expect, say=say)
-    if step.say:
-        # sBrainFix (F7): the line is heard before the step runs (the voice's step line as the step closes in the
-        # stream, the executor's as it starts), so its words are code's for that step, never the model's: on 10 and
-        # 16 Oct the model wrote "Playing your Japanese playlist now." and "Sent it to Hemanth." there, whatever the
-        # prompt said. The model still decides which steps are narrated (it wrote a say).
-        step = replace(step, say=step_line(step, header))
+                expect=expect)
     _check_verb(step, header, checks, prior, where)
     if checks.failed_step is not None and not checks.repeat_rejected and step.same_as(checks.failed_step):
         checks.repeat_rejected = True
         raise PlanError([f"{where}that step just failed: change it"])
     return step
-
-
-#: sBrainFix (review r1 M2): the window and tab actions whose step is said by no line: a close may still be asked
-#: about first (consent's lasting row), so "Closing Arc." before that question would claim what may not happen.
-UNSAID_ACTIONS: frozenset[str] = frozenset({"close"})
-#: sBrainFix (review r1 L5): a run_skill step's line when its skill is a capability (shipped, never learned: a key
-#: without the learned ``#`` part, :func:`skill_family`); a learned skill's is the island's "Doing it the way I
-#: learned".
-LINE_CAPABILITY_STEP = "Working on it."
-
-
-def step_line(step: Step, header: Plan) -> str | None:
-    """What Yuki says as a step starts (sBrainFix, F7): the step in the island's words (``yuki.ui.step_words``:
-    built from the verb, the control's role and name, the plan's target app and the verb's closed values only, never
-    the step's free text), as a sentence ("Clicking Play ネオン."): what starts, never that it is done or happening
-    to work. ``None`` (nothing said) when no words come.
-
-    The line is heard before the step runs and before its consent check (review r1 M2), so it never says more than
-    what starts: typing is said without its Enter ("Typing in the Message box.", never "Typing and sending a
-    message.": Enter in an address bar sends nothing, and a send the check refuses never went); a close
-    (:data:`UNSAID_ACTIONS`) is said by no line; a capability's run_skill step is :data:`LINE_CAPABILITY_STEP`."""
-    if step.verb in ("window_action", "tab") and " ".join(str(step.value or "").split()).casefold() in UNSAID_ACTIONS:
-        return None
-    if step.verb == "run_skill":
-        call = step.skill_call(header.skill)
-        if call is None or skill_family(call[0]) == call[0]:
-            return LINE_CAPABILITY_STEP
-    try:
-        from yuki.ui.step_words import describe_plan_step
-
-        said = replace(step, submit=False) if step.submit else step
-        words = " ".join(str(describe_plan_step(said, app=header.target.app) or "").split()).rstrip(". ")
-    except Exception:  # noqa: BLE001 - presentation only: say nothing rather than the model's words
-        return None
-    return f"{words}."[:SAY_CHARS] if words else None
 
 
 def _check_verb(step: Step, header: Plan, checks: Checks, prior: Sequence[Step], where: str) -> None:
@@ -1444,6 +1399,6 @@ __all__ = [
     "Plan", "PlanError", "Checks", "required_probe", "parse_header", "parse_step", "validate_plan", "finish_plan",
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",
     "probe_args_text", "probe_errors", "error_code", "error_codes", "SEED_RERUN_OK", "skill_family", "seed_skill",
-    "spent_skills", "unescape", "seed_sends", "step_line", "UNSAID_ACTIONS", "LINE_CAPABILITY_STEP",
+    "spent_skills", "unescape", "seed_sends",
     "person_open", "handoff_person_open",
 ]

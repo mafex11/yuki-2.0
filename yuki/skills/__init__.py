@@ -45,7 +45,7 @@ DEFAULTS: dict[str, Any] = {
     "skills": True,
     "skills_learned": True,
     "skills_max": 20,
-    "skills_menu_chars": 2400,
+    "skills_menu_chars": 2322,
     "skills_disable_after": 2,
     "skills_volume_step": 10,
 }

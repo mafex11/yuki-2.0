@@ -339,7 +339,7 @@ def window_of(dispatcher: Any, ref: Any, *, payload: Mapping[str, Any] | None = 
     hwnd = as_hwnd(ref)
     if hwnd is not None:
         entry = next((w for w in windows if int(w.get("hwnd") or 0) == hwnd), None)
-        return (hwnd, dict(entry)) if entry is not None or not windows else (None, {})
+        return (hwnd, dict(entry or {})) if entry is not None or not windows else (None, {})   # aBrain: no list
     hits = fitting(windows, ref)
     if len(hits) > 1:
         front = int((payload or {}).get("foreground_hwnd") or 0)
@@ -1157,16 +1157,21 @@ def unread_line(env: ProbeEnv) -> str:
 
 
 def pick_done(plan: Any, env: ProbeEnv, *, hwnd: int | None = None, last_window: Mapping[str, Any] | None = None,
-              cancelled: Callable[[], bool] | None = None, args: Mapping[str, Any] | None = None) -> DoneResult:
+              cancelled: Callable[[], bool] | None = None, args: Mapping[str, Any] | None = None,
+              probe: str | None = None) -> DoneResult:
     """An act plan's own pick from the closed list: read (bounded), covered, lined. ``hwnd`` / ``last_window``: the
     window the last act step acted on (its events pace the re-reads; ``read_back`` names its app). ``args``: the
     done's arguments as the executor resolved them (x9: page_at's ``process`` the browser the request named,
-    :func:`with_browser`); ``None``: as the plan wrote them. A check that couldn't read says "I did it, but I couldn't
-    confirm it worked" only when an act step of this request ran; else "I tried, ..." (:func:`unread_line`)."""
+    :func:`with_browser`); ``None``: as the plan wrote them. ``probe``: aBrain (phase 2.5), the probe code derived for
+    a plan that wrote none (with ``args``); ``None``: the plan's own. A check that couldn't read says "I did it, but I
+    couldn't confirm it worked" only when an act step of this request ran; else "I tried, ..." (:func:`unread_line`)."""
     from yuki.brain.consent import plan_consent
 
     unread = unread_line(env)
-    probe, written, why = plan_done(plan)
+    if probe is not None and probe in PROBES and isinstance(args, Mapping):
+        written, why = dict(args), ""
+    else:
+        probe, written, why = plan_done(plan)
     if probe == NONE or written is None or probe not in PROBES:
         # the validator lets no act plan through without a probe; a broken one is never "done"
         return DoneResult(None, util.UNVERIFIED, unread, seen="nothing was set to check it", probe=probe)

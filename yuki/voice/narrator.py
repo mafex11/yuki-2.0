@@ -548,6 +548,14 @@ class OwedLedger:
                 item.state = "dropped"
                 self.stats["dropped"] += 1
 
+    def hold(self, token: int, held: bool, now: float | None = None) -> None:
+        """Phase 2 review r1 M4: a hand's own fallback line is held (never due, still heard by the talker's words) while
+        the talker's next call for that outcome runs; let go of again (due as before) when that call was not tried."""
+        now = time.monotonic() if now is None else now
+        for item in self.pending:
+            if item.token == token:
+                item.next_at = float("inf") if held else now
+
     def quiet_run(self) -> bool:
         """The talker's run for what is owed chose silence: it is said by code at the next quiet moment."""
         marked = False

@@ -1894,16 +1894,6 @@ class TurnObserver:
         self.owes_reply_since = None
         self._activity()
 
-    def _prejudge(self, words: str | None = None) -> None:
-        """fTalk: the claim gate's ask check starts on their words now, alongside the talker (speechguard.prejudge);
-        ``None``: they began a new utterance, so the last verdict is dropped (speechguard.new_utterance)."""
-        fn = getattr(self.guard, "new_utterance" if words is None else "prejudge", None)
-        if callable(fn) and (words is None or str(words).strip()):
-            try:
-                fn() if words is None else fn(words)
-            except Exception:  # noqa: BLE001 - only a head start: the line check stays
-                pass
-
     def as_observer(self) -> Any:
         outer = self
 
@@ -2285,13 +2275,11 @@ class TurnObserver:
             note, low, near = heard_note(result.get("words") if isinstance(result, dict) else None, self.keyterms,
                                          cut_before=self.cut_before(), screen=self.screen_terms)
             self.heard, self.heard_plain = note, bool(note and not (low or near))
-            self._prejudge(getattr(frame, "text", "") or "")
             return
         if isinstance(frame, UserStartedSpeakingFrame):
             self.user_speaking = True
             self._user_started_at = now
             self.heard, self.heard_plain = None, False  # a new turn: the last one's doubts are not about these
-            self._prejudge(None)   # fTalk (review H1): the last ask verdict was about other words, maybe another line
             if self.bot_speaking and self.turn is not None:
                 self.turn.interrupted = True
             if (self.turn is not None and self.turn.trigger == "user" and not self.turn.heard
@@ -2327,7 +2315,6 @@ class TurnObserver:
                 self.recent_words.append(turn.user_text.strip())
             if self.guard is not None:
                 self.guard.new_turn()
-            self._prejudge(turn.user_text)   # fTalk: the same words as the eager ones keep that check
             self._last_words, self._words_at = "", None
             turn.eot_at = now  # Flux pushes the final transcript at its end of turn
             turn.eager_at, self._eager_at = self._eager_at, None
@@ -4165,9 +4152,12 @@ class Conversation:
         state = act_state(tool, ok, facts)
         rec.update(state=state, verified=verified, report=str(report or "")[:400], facts=facts,
                    done_at=time.monotonic(), ms=ms, sent_at=facts.get("sent_at"))
+        # phase 2.3 (aResolve merge note): a skill's non-success report ends with its Evidence line; the action log and
+        # the step strip keep only the first line (``rec["report"]``, the talker's, keeps it whole)
+        first_line = str(report or "").split("\n", 1)[0] if tool == "run_skill" else str(report or "")
         if not skipped:
             try:
-                hands.actions.add("your reflex", rec["what"], str(report or "")[:400], ok=bool(ok),
+                hands.actions.add("your reflex", rec["what"], first_line[:400], ok=bool(ok),
                                   verified=facts.get("verified"))
             except Exception as exc:  # noqa: BLE001 - a record only, never the reflex's result (content-free log)
                 try:
@@ -4178,7 +4168,7 @@ class Conversation:
             on_step = getattr(hands, "on_step", None)
             if callable(on_step):
                 try:
-                    on_step(tool, rec["what"], verified, str(report or "")[:400], ms)
+                    on_step(tool, rec["what"], verified, first_line[:400], ms)
                 except Exception:  # noqa: BLE001 - the screen never breaks a hand
                     pass
             if tool != "run_skill" and callable(getattr(hands, "_trace", None)):
@@ -4254,9 +4244,9 @@ class Conversation:
                        state=rec.get("state"))
 
     def _reflex_note(self, rec: dict[str, Any]) -> None:
-        """Review r1 M3: the reflex's act goes into the hands' list of this user turn's steps (``Hands._note_call``),
-        which their end check reads ("pause the music and open Insta": the opening's check sees the pause done, so it
-        is never handed to the thinker again). Only once the observer counted the turn of its words (``reached``),
+        """Review r1 M3: the reflex's act goes into the hands' list of this user turn's steps (``Hands._note_call``:
+        the thinker's list of steps, and the claim gate's "something was asked").
+        Only once the observer counted the turn of its words (``reached``),
         never at the eager end of turn (the hands' turn is still the one before), and only for an act that went out.
         Once per reflex."""
         if rec.get("noted") or not rec.get("reached") or rec.get("state") not in self.REFLEX_WENT:
@@ -4905,7 +4895,7 @@ class Conversation:
             hands.prefetch_desk()   # the first reply's desktop block, read while they talk
         self._reflex_load()   # lSpeed: the learned reflexes, read once per process off the loop
         if s.voice_hands and hands is not None and callable(getattr(hands, "warm_check", None)):
-            hands.warm_check()   # vRound2 review r1 M1: the step check's own model client, made off the loop (no call)
+            hands.warm_check()   # vRound2 review r1 M1: the commit check's model client, made off the loop (no call)
         tts = getattr(self, "_tts", None)
         for service in (getattr(self, "_stt", None), tts):
             load = getattr(service, "load_now", None)   # vLocal: the models on this PC load now (their own thread)
@@ -5200,7 +5190,7 @@ class Conversation:
                                 shadow=self.channel == "marker", **code_only)   # v3.16: marker: it only measures
             guard.on_drop = self.observer.guarded
             if self.talker == "lean":
-                # kMind (the claim gate, Hands.acted_this_turn): no "done" without an act in this turn
+                # kMind (the claim gate), phase 2: no "done" after a non-success act of this turn
                 guard.claim_open = self._claim_open
                 guard.on_claim = self._claim_dropped
             self.guard = guard
@@ -6568,17 +6558,23 @@ class Conversation:
         return int(obs.user_turns) + (1 if begun else 0)
 
     def _claim_open(self) -> bool:
-        """kMind (the claim gate): the talker's words now are a reply to the user's own turn in which nothing was done
-        yet: no call in this turn or this reply, no hand or skill verified anything (``Hands.acted_this_turn``), no
-        reflex did it. A stream and state fact, never the words. Never raises."""
+        """kMind (the claim gate), phase 2 (2.4): the talker's words now can claim something done that is not: this
+        reply makes no call (its own result speaks for a call), the talker called something in this user turn
+        (something was asked: its own tool use says so, :meth:`Hands.called_this_turn`) and nothing it or a reflex
+        did verified (``Hands.acted_this_turn``). A plain reply (no call in the turn) and a turn with a verified act
+        get no model call. A stream and state fact, never the words. Never raises."""
         try:
-            turn = self.observer.turn
-            if turn is None or turn.trigger != "user" or turn.tools:
-                return False
             call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
-            if call is None or not call.user_turn or call.tool:
+            if call is None or call.tool:
                 return False
-            return self._acted_this_turn() is False
+            hands = getattr(self.bridge, "hands", None)
+            called = getattr(hands, "called_this_turn", None)
+            if not callable(called) or not called():
+                return False
+            if hands.acted_this_turn():
+                return False
+            rec = self._reflex_state()
+            return not (rec and rec.get("state") == "done")
         except Exception:  # noqa: BLE001
             return False
 

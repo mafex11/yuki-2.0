@@ -136,6 +136,19 @@ REASON_WORDS: dict[str, str] = {
     "asked": "it needed a detail I didn't have",
     "chat_not_confirmed": "the chat didn't open",
 }
+#: aBrain (phase 2.3; 18 Oct live A: "I did it, but I couldn't confirm it worked." x5, every time the evidence said
+#: more): a request that didn't end done says what the evidence holds (:func:`ending_line`, from the executor's
+#: ``ending_facts``): what ran, what the check looked for and what it saw. ``{did}``: the last act step that ran, as
+#: done; ``{claim}``: what the check looked for; ``{seen}``: what it saw; ``{stuck}``: the step that stopped it.
+LINE_DID_UNCHECKED = "{did}, but I couldn't check it worked."
+LINE_DID_UNREAD = "{did}, but I couldn't check that {claim}."
+LINE_UNREAD = "I couldn't check that {claim}."
+LINE_DID_NOT_SO = "{did}, but I couldn't confirm {claim}: {seen}."
+LINE_STUCK_AFTER = "{did}, then got stuck {stuck}{why}. Try another way?"
+#: The evidence the voice's talker words a non-success ending from (``outcome["evidence"]``), at most this long.
+EVIDENCE_CHARS = 420
+#: The outcome levels whose ending carries the evidence (with any ``partial`` one).
+EVIDENCE_LEVELS = frozenset({"unverified", "failed"})
 LINE_DECLINED = "Okay, I didn't do that."
 LINE_DRAFTED = "It's typed in; send it when you're ready."
 LINE_ANSWER_BUDGET = "I couldn't finish looking that up."
@@ -876,7 +889,7 @@ class Brain:
         menu, _lines, _keys = read_menu(self.memory, self.settings, limit=bs.menu_chars)
         params = build_params(model=bs.model, max_tokens=1, system=system_blocks(profile, menu),
                               messages=[{"role": "user", "content": [{"type": "text", "text": WARM_TEXT}]}],
-                              effort=bs.effort_typed, thinking_display=bs.thinking_display, stream=bs.stream,
+                              effort=bs.effort_of("typed")[0], thinking_display=bs.thinking_display, stream=bs.stream,
                               eager=bs.eager)
         if bs.stream:
             with self.client.messages.stream(**params) as stream:
@@ -1661,9 +1674,13 @@ class Brain:
                                          nonce=nonce, seed_hint=hint_box[0] if hint_box else None,
                                          understanding=req.understanding))
         system = system_blocks(gathered.profile, gathered.menu)
-        effort = bs.effort_for(req.channel)
+        # aBrain (phase 2.5): pinned for the whole request, from its structure (the talker's understanding: its parts
+        # and the skills they name; a hand-off), never its words; the rule is a setting so a test can compare
+        effort, effort_why = bs.effort_of(req.channel, req.understanding, seeded=req.seed is not None,
+                                          skills=gathered.skill_keys)
         self._effort = effort
-        self.logger.log("brain_request", channel=req.channel, effort=effort, model=bs.model, seeded=req.seed is not None,
+        self.logger.log("brain_request", channel=req.channel, effort=effort, effort_why=effort_why,
+                        effort_rule=bs.effort_rule, model=bs.model, seeded=req.seed is not None,
                         early=early is not None, words=len(req.words), context_chars=len(req.context),
                         overview_chars=len(gathered.overview), you_chars=len(gathered.you),
                         people_chars=len(gathered.people), profile_chars=len(gathered.profile),
@@ -1729,10 +1746,9 @@ class Brain:
             params = build_params(model=bs.model, max_tokens=state.max_tokens or bs.max_tokens, system=system,
                                   messages=conv.messages(), effort=effort, thinking_display=bs.thinking_display,
                                   stream=bs.stream, eager=bs.eager)
-            # a tidy-up turn's steps are said after the request's line, never as they stream (P1.3)
+            # no step is said as it streams (aBrain, phase 2.3: the executor says a slow one in the goal's words)
             call = ModelCall(self.client, params, checks=checks, emit=self._push, cancelled=self._cancelled.is_set,
-                             log=self.logger.log, voice=req.channel == "voice" and not self._tidying(state),
-                             stream=bs.stream)
+                             log=self.logger.log, stream=bs.stream)
             state.calls += 1
             result: ExecResult | None = None
             try:
@@ -2181,7 +2197,18 @@ class Brain:
                 # review r2 L3: a message skill's hand-off finished by steps is a draft its own probe saw typed in:
                 # said as one ("send it when you're ready"), never a generic "the box holds it"
                 line = LINE_DRAFTED
-            outcome = self._result_outcome(result, state, plan, line)
+            # a send's or a join's line is consent's own, word for word (the send rule is unchanged)
+            sent = isinstance(result.outcome, Mapping) and bool(result.outcome.get("send"))
+            said = ending_line(line, self._ending_facts()) if (status == "unconfirmed" and not sent
+                                                               and not self._consent_lined(plan)) else line
+            outcome = self._result_outcome(result, state, plan, said)
+            if said != line:
+                # aBrain (phase 2.3): the generic line gave way to the evidence's; the outcome's code line is the same
+                line = said
+                if outcome.get("line"):
+                    outcome["line"] = line
+            # review M2: its evidence from this plan, now, before any held turn or tidy-up plan resets the executor
+            outcome = self._with_evidence(line, outcome)
             if (status == "unconfirmed" and look_only(plan, result) and state.look_backs < LOOK_BACKS_MAX
                     and self._budget_left(state, bs, self._req)):
                 # sBrainFix (F9): an act plan that only looked did nothing, so its check reading nothing is no ending
@@ -2256,7 +2283,7 @@ class Brain:
             # the executor ends the run here with its own line (a game in front: "after the round?"; the desk busy):
             # no replan routes around it; the parts already done are said first (review M2)
             line = with_parts(result.parts, result.line)
-            self._final(line, self._result_outcome(result, state, plan, line))
+            self._final(line, self._with_evidence(line, self._result_outcome(result, state, plan, line)))
             return True
         if status == "stopped":
             self._push(self._cancel_event())
@@ -2372,7 +2399,9 @@ class Brain:
         held_line, held_outcome = state.tidy_held or ("", {})
         said = " ".join(" ".join(str(w).split()) for w in state.tidy_words if str(w).strip())
         text = f"{held_line.rstrip()} {said}".strip() if said else held_line
-        outcome = {**dict(held_outcome or {}), "said_first": held_line, **({"line": text} if said else {})}
+        # review M2: the line went out as code said it (a Say), so no talker re-words it ("" weighed: nothing to add)
+        outcome = {**dict(held_outcome or {}), "said_first": held_line, "evidence": "",
+                   **({"line": text} if said else {})}
         self.logger.log("brain_tidy", ended=True, acts=len(state.tidy_words),
                         status=result.status if result is not None else None)
         state.tidy_held = None
@@ -2448,11 +2477,64 @@ class Brain:
 
     # -- endings ------------------------------------------------------------------------------------------------------
 
+    def _with_evidence(self, text: str, outcome: dict[str, Any]) -> dict[str, Any]:
+        """aBrain (phase 2.3): ``outcome`` with what a non-success ending's line stands on (or a done that read only
+        part of what they asked), ``outcome["evidence"]``, for the voice's talker to say in its own words (typed shows
+        the line); content: never logged. Built where the ending's line is made, from the plan that made it (review M2:
+        a later tidy-up or read plan resets the executor), so a held ending keeps its own; ``""`` marks one already
+        weighed with nothing to add, and a send's or a join's (consent's own words, said word for word). Never
+        raises."""
+        if not isinstance(outcome, dict) or "evidence" in outcome:
+            return outcome
+        level = str(outcome.get("level") or "")
+        if level not in EVIDENCE_LEVELS | {"likely"} and not outcome.get("partial"):
+            return outcome
+        state = self._state
+        plan = state.current if state is not None else None
+        if outcome.get("send") or self._consent_lined(plan):
+            return {**outcome, "evidence": ""}
+        facts = self._ending_facts()
+        evidence = ""
+        if level in EVIDENCE_LEVELS or outcome.get("partial") or facts.get("unchecked"):
+            last = state.last if state is not None else None
+            evidence = evidence_text(facts, goal=plan.goal if plan is not None else "",
+                                     parts=last.parts if last is not None else (), line=text)
+        return {**outcome, "evidence": evidence}
+
+    def _consent_lined(self, plan: Plan | None) -> bool:
+        """The ending is a send's or a join's: the plan declared one, or a capability it ran joins (consent's lines
+        stand word for word; the send rule is unchanged). Code facts only; ``True`` when it can't tell."""
+        try:
+            if plan is not None and plan.consent.commit in ("send", "join"):
+                return True
+            from yuki.brain import util as _util
+            from yuki.brain.consent import skill_joins
+
+            runs = getattr(getattr(self, "_executor", None), "skill_outcomes", None) or ()
+            return any(skill_joins(_util.skill(getattr(run, "key", ""))) for run in runs)
+        except Exception:  # noqa: BLE001 - can't tell: as consent's
+            return True
+
     def _final(self, text: str, outcome: dict[str, Any]) -> None:
+        # an ending made before this (held, a tidy-up's) carries its own evidence; one made now is weighed now
+        outcome = self._with_evidence(text, outcome)
+        if isinstance(outcome, dict) and "evidence" in outcome and not outcome["evidence"]:
+            outcome = {k: v for k, v in outcome.items() if k != "evidence"}
         self._last_outcome = outcome
         self._final_text = str(text or "")
         self._push(Final(text, outcome=outcome))
         self._observe_seed(outcome)
+
+    def _ending_facts(self) -> dict[str, str]:
+        """The executor's evidence for an ending (:meth:`yuki.brain.executor.Executor.ending_facts`), ``{}`` when there
+        is no executor or it can't say. Never raises."""
+        executor = getattr(self, "_executor", None)
+        reader = getattr(executor, "ending_facts", None)
+        try:
+            got = reader() if callable(reader) else {}
+        except Exception:  # noqa: BLE001 - no facts: the line stands
+            got = {}
+        return dict(got) if isinstance(got, Mapping) else {}
 
     def _observe_seed(self, outcome: Mapping[str, Any] | None) -> None:
         """sBrainFix (F8): a request a skill handed over that ends "verified" or "likely" by a plan's own check, or
@@ -2576,20 +2658,26 @@ class Brain:
             return
         last, plan = state.last, state.current
         where, why = "", ""
+        facts = self._ending_facts()
         if last is not None and isinstance(last.step, int) and plan is not None and 0 <= last.step < len(plan.steps):
-            where = STEP_WORDS.get(plan.steps[last.step].verb, "")
+            # aBrain (phase 2.3): the step in the island's words ("clicking Continue"), else its verb's
+            where = facts.get("stuck") or STEP_WORDS.get(plan.steps[last.step].verb, "")
         if not where and state.acted:
             where = "partway"   # something ran, the step that stopped it is not known
         if last is not None and last.reason:
             # x10: a reason is a code word (or an executor's note) for the planner and the log: only the few with
             # plain words of their own are said; any other is left out
             why = plain_reason(last.reason, refused=last.status == "refused")
-        line = (last.line if last is not None and last.line and last.status in ("mismatch", "refused") else
-                LINE_STUCK.format(where=f" {where}" if where else "", why=f": {why}" if why else ""))
+        if last is not None and last.line and last.status in ("mismatch", "refused"):
+            line = last.line
+        elif facts.get("did") and where and where != "partway":
+            line = LINE_STUCK_AFTER.format(did=facts["did"], stuck=where, why=f": {why}" if why else "")
+        else:
+            line = LINE_STUCK.format(where=f" {where}" if where else "", why=f": {why}" if why else "")
         # review M2: the parts already done (their own skill's check saw them) are said before where it stopped
         line = with_parts(last.parts if last is not None else (), line)
-        self._final(line, self._outcome(state, level="failed" if state.acted else "answer", line=line,
-                                        partial=state.acted))
+        self._final(line, self._with_evidence(line, self._outcome(state, level="failed" if state.acted else "answer",
+                                                                  line=line, partial=state.acted)))
 
     def _outcome(self, state: _State, *, level: str, line: str = "", partial: bool = False,
                  seen: str = "", send: str | None = None) -> dict[str, Any]:
@@ -2805,6 +2893,84 @@ class Brain:
             self.logger.log("memory_turn_queued", queued=bool(queued), outcome=outcome, reply_chars=len(reply))
         except Exception as exc:  # noqa: BLE001
             self.logger.log("error", where="memory_turn", error=type(exc).__name__)
+
+
+_GENERIC: frozenset[str] | None = None
+
+
+def generic_lines() -> frozenset[str]:
+    """The code lines that say nothing of what happened (the brain's, the done-check's and the skill engine's "couldn't
+    confirm it worked", "That didn't work."), whitespace-normalised: :func:`ending_line` replaces them when the evidence
+    says more. Code's own constants; never a reading of words."""
+    global _GENERIC
+    if _GENERIC is None:
+        from yuki.brain import util as _util
+
+        lines = {LINE_UNCONFIRMED, _util.LINE_UNVERIFIED, _util.LINE_FAILED, _util.LINE_PARTIAL}
+        try:
+            from yuki.brain.executor import LINE_SKILL_UNSURE
+            from yuki.skills.engine import LINE_UNVERIFIED as ENGINE_UNVERIFIED
+
+            lines |= {LINE_SKILL_UNSURE, ENGINE_UNVERIFIED}
+        except Exception:  # noqa: BLE001 - those modules not importable: the brain's own lines only
+            pass
+        _GENERIC = frozenset(" ".join(line.split()) for line in lines)
+    return _GENERIC
+
+
+def ending_line(line: str, facts: Mapping[str, str] | None) -> str:
+    """aBrain (phase 2.3): a non-success ending's line from the evidence when ``line`` is one of the generic ones
+    (:func:`generic_lines`) and ``facts`` (the executor's ``ending_facts``) say more; else ``line`` as it is.
+
+    What the check looked for and saw: "Opened a page in Arc, but I couldn't confirm Excalidraw is open in Arc: another
+    page is showing."; what it couldn't read: "..., but I couldn't check that Excalidraw is open in Arc."; only what
+    ran: "Opened a page in Arc, but I couldn't check it worked." Facts are code's words, never the planner's."""
+    text = " ".join(str(line or "").split())
+    if not facts or text not in generic_lines():
+        return line
+    did, claim, seen = (" ".join(str(facts.get(k) or "").split()) for k in ("did", "claim", "seen"))
+    if claim and seen and not facts.get("unread"):
+        if did:
+            return LINE_DID_NOT_SO.format(did=did, claim=claim, seen=seen.rstrip(". "))
+        from yuki.brain.done import LINE_NOT_CONFIRMED
+
+        return LINE_NOT_CONFIRMED.format(what=claim, seen=seen.rstrip(". "))
+    if claim:
+        return LINE_DID_UNREAD.format(did=did, claim=claim) if did else LINE_UNREAD.format(claim=claim)
+    if did:
+        return LINE_DID_UNCHECKED.format(did=did)
+    return line
+
+
+def evidence_text(facts: Mapping[str, str] | None, *, goal: str = "", parts: Sequence[str] = (),
+                  line: str = "") -> str:
+    """aBrain (phase 2.3): what a non-success ending stands on, in a few labelled plain facts for the voice's talker
+    to word in one short line (``outcome["evidence"]``): the plan's goal, the parts done, the last step that ran, the
+    step that stopped it and why, what the check looked for and what it saw. Content (titles, names): never logged.
+    ``""`` when there is nothing beyond ``line``. At most :data:`EVIDENCE_CHARS`."""
+    facts = dict(facts or {})
+    bits: list[str] = []
+    goal = " ".join(str(goal or "").split())
+    if goal:
+        bits.append(f"Goal: {goal.rstrip('. ')}")
+    done_parts = [" ".join(str(p).split()).rstrip(". ") for p in parts or () if str(p or "").strip()]
+    if done_parts:
+        bits.append("Done: " + "; ".join(done_parts))
+    if facts.get("did"):
+        bits.append(f"Last step that ran: {facts['did']}")
+    if facts.get("stuck"):
+        bits.append(f"Stopped at: {facts['stuck']}" + (f" ({facts['why']})" if facts.get("why") else ""))
+    if facts.get("claim"):
+        bits.append(f"Checked for: {facts['claim']}; " + ("couldn't read it" if facts.get("unread") or not
+                                                          facts.get("seen") else f"saw: {facts['seen']}"))
+    elif facts.get("seen") and not facts.get("unread"):
+        bits.append(f"The check saw: {facts['seen']}")
+    if facts.get("unchecked"):
+        bits.append(f"The check read only part of it; not read: {facts['unchecked']}")
+    if not bits or (len(bits) == 1 and goal):
+        return ""
+    text = ". ".join(bits) + "."
+    return text if len(text) <= EVIDENCE_CHARS else text[:EVIDENCE_CHARS - 1].rstrip() + "…"
 
 
 def plain_reason(reason: Any, *, refused: bool = False) -> str:

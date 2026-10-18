@@ -16,8 +16,8 @@ One :class:`ModelCall` per model round trip:
 * ``stop_reason`` ``max_tokens`` or ``refusal`` stops every further step (the steps already run committed nothing:
   only non-committing steps run before the plan is complete, the executor's rule);
 * events: :class:`Thinking` per thinking block, ``Partial`` for the thinking and a plain-text reply as they stream,
-  ``Partial("now", goal)`` once the header is valid (the island's line), ``Partial("step", say)`` for a voice step's
-  words as it is handed on.
+  ``Partial("now", goal)`` once the header is valid (the island's line). No line per step (aBrain, phase 2.3): the
+  executor says a step only when it runs slow, in the goal's words.
 
 Logs are content-free (counts, ms, tokens, stop reasons, code words).
 """
@@ -414,19 +414,16 @@ class ModelCall:
         emit: Pushes events to the caller (thread-safe).
         cancelled: Whether the request was cancelled.
         log: ``log(type, **fields)`` (content-free fields only).
-        voice: Hand a voice step's words on as ``Partial("step", ...)``.
     """
 
     def __init__(self, client: Any, params: dict[str, Any], *, checks: Checks, emit: Callable[[AgentEvent], None],
-                 cancelled: Callable[[], bool], log: Callable[..., Any], voice: bool = False,
-                 stream: bool = True) -> None:
+                 cancelled: Callable[[], bool], log: Callable[..., Any], stream: bool = True) -> None:
         self._client = client
         self.params = params
         self.checks = checks
         self._emit = emit
         self.cancelled = cancelled
         self._log = log
-        self._voice = voice
         self._stream_mode = stream
         self._mgr: Any = None
         self._stream: Any = None
@@ -584,14 +581,10 @@ class ModelCall:
 
     def _start_plan(self) -> None:
         self._scanner = PlanScanner()
-        self.plan = PlanStream(self, self.checks, on_header=self._header_ready, on_step=self._step_out)
+        self.plan = PlanStream(self, self.checks, on_header=self._header_ready)
 
     def _header_ready(self, plan: Plan) -> None:
         self._partial("now", plan.goal, force=True)
-
-    def _step_out(self, step: Step) -> None:
-        if self._voice and step.say:
-            self._partial("step", step.say, force=True)
 
     def _strict_tool_input(self) -> None:
         """A non-plan tool's streamed input, parsed strictly (the plan's own blocks are, by :class:`PlanStream`): what
