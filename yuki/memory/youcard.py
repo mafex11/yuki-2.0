@@ -97,9 +97,10 @@ LATELY_CHARS = 130
 #: "Where they left off" (planner): the LEFT_OFF_N sites they come back to most (the most days), from pages seen within
 #: this many days; a site counts when its pages were seen on at least LEFT_OFF_MIN_DAYS days; only a page they had in a
 #: browser (a program that showed pages of at least LEFT_OFF_BROWSER_HOSTS hosts, as ``web_route.BROWSER_MIN_HOSTS``
-#: measures one) at an http(s) address: an app's own embedded page (its local bundle) is no page to open; an address
-#: longer than LEFT_OFF_URL_CHARS, or with a query longer than LEFT_OFF_QUERY_CHARS (a token, a tracking string), is
-#: left out (the title and site stay): a cut address would open the wrong page.
+#: measures one) at an http(s) address: an app's own embedded page (its local bundle) is no page to open; a page whose
+#: address is longer than LEFT_OFF_URL_CHARS, or has a query longer than LEFT_OFF_QUERY_CHARS (a token, a tracking
+#: string, a search), is passed over for that site's last one that can be given whole: a cut address opens the wrong
+#: page, and a title alone is no way back.
 LEFT_OFF_N = 3
 LEFT_OFF_BROWSER_HOSTS = 3
 LEFT_OFF_DAYS = 14.0
@@ -393,6 +394,8 @@ def _left_off(store: Any, now: float, n: int) -> list[list[Any]]:
             continue
         if parts.scheme.casefold() not in ("http", "https") or not parts.path.strip("/"):
             continue   # not a web address, or a site's root: no place to pick up from
+        if len(str(link.url or "")) > LEFT_OFF_URL_CHARS or len(parts.query) > LEFT_OFF_QUERY_CHARS:
+            continue   # an address that can't be given whole (a cut one opens the wrong page): no way back to it
         last[host] = (link, parts, title)
     picks = [(link, parts, title, host) for host, (link, parts, title) in last.items()
              if len(days.get(host) or ()) >= LEFT_OFF_MIN_DAYS]
@@ -400,12 +403,10 @@ def _left_off(store: Any, now: float, n: int) -> list[list[Any]]:
     today = datetime.fromtimestamp(now).date()
     bits = []
     for link, parts, title, host in picks[:n]:
-        url = str(link.url or "")
-        address = url if len(url) <= LEFT_OFF_URL_CHARS and len(parts.query) <= LEFT_OFF_QUERY_CHARS else ""
         day = datetime.fromtimestamp(float(link.last_seen)).date()
         gap = (today - day).days
         when = "today" if gap <= 0 else "yesterday" if gap == 1 else f"{day:%d %b}"
-        bits.append(f'"{_clip(title, 48)}" on {host}' + (f" ({address})" if address else "") + f", {when}")
+        bits.append(f'"{_clip(title, 48)}" on {host} ({link.url}), {when}')
     return _list(1, "Where they left off (the last page on the sites they return to most; open its address to pick "
                     "up): ", ((b, PLAIN) for b in bits), sep="; ")
 
