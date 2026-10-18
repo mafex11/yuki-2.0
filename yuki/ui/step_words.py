@@ -417,11 +417,15 @@ def _volume(args: dict[str, Any], about: dict[str, Any], done: bool) -> str:
     return _two(done, "Checking which apps play sound", "Checked which apps play sound")
 
 
-#: ``window_action``'s fixed ``action`` enum, as (running, done) verbs; ``{}`` is the window's app.
+#: ``window_action``'s fixed ``action`` enum, as (running, done) verbs; ``{}`` is the window's app. ``place``,
+#: ``focus_back`` and ``undo``: P1.4 (``yuki.brain.plan.PLACE_ACTIONS``); undo is the user's "put it back", never a
+#: tidy-up.
 WINDOW_ACTIONS: dict[str, tuple[str, str]] = {
     "minimize": ("Minimizing {}", "Minimized {}"), "maximize": ("Maximizing {}", "Maximized {}"),
     "fullscreen": ("Making {} full screen", "Made {} full screen"), "restore": ("Restoring {}", "Restored {}"),
     "focus": ("Switching to {}", "Switched to {}"), "close": ("Closing {}", "Closed {}"),
+    "place": ("Moving {}", "Moved {}"), "focus_back": ("Switching back to {}", "Switched back to {}"),
+    "undo": ("Putting it back", "Put it back"),
 }
 
 
@@ -538,7 +542,8 @@ def describe_step(name: str, tool_input: dict[str, Any] | None = None, *, done: 
 #: A plan step's fixed values the words may use (closed enums of the verbs, never the step's free text).
 PLAN_CLICKS: dict[str, dict[str, Any]] = {"right": {"button": "right"}, "middle": {"button": "middle"},
                                           "double": {"clicks": 2}}
-PLAN_ACTIONS = frozenset({"minimize", "maximize", "fullscreen", "restore", "focus", "close", "select"})
+PLAN_ACTIONS = frozenset({"minimize", "maximize", "fullscreen", "restore", "focus", "close", "select",
+                          "place", "focus_back", "undo"})
 
 
 def describe_plan_step(step: Any, *, app: Any = None, done: bool = False, limit: int = 60) -> str:
@@ -559,6 +564,10 @@ def describe_plan_step(step: Any, *, app: Any = None, done: bool = False, limit:
     about = {k: v for k, v in (("role", _squash(role)), ("element", _squash(name)), ("app", _squash(app))) if v}
     args: dict[str, Any] = {ABOUT: about} if about else {}
     value = _squash(get("value")).casefold()
+    if verb == "window_action":
+        from yuki.brain.plan import window_op   # the place form (``place:other:maximize``) is the action ``place``
+
+        value = window_op(value)
     if verb == "click" and value in PLAN_CLICKS:
         args.update(PLAN_CLICKS[value])
     elif verb in ("window_action", "tab") and value in PLAN_ACTIONS:

@@ -53,14 +53,15 @@ from yuki.agent.tools import COMMITTING_CLICK_TRAITS, TOOL_TRAITS, Traits, call_
 LEVELS: tuple[str, ...] = ("suggest", "show_plan", "ask", "do_and_tell")
 #: Each kind's default and ceiling (``yuki.ui.policy.KINDS``; a test keeps the two in step).
 POLICY_DEFAULTS: dict[str, str] = {"read_screen": "do_and_tell", "open_apps": "do_and_tell", "click_type": "do_and_tell",
-                                   "send_messages": "ask", "files": "show_plan", "money": "suggest"}
+                                   "send_messages": "ask", "files": "show_plan", "money": "suggest",
+                                   "tidy": "do_and_tell"}
 POLICY_CEILINGS: dict[str, str] = {"read_screen": "do_and_tell", "open_apps": "do_and_tell",
                                    "click_type": "do_and_tell", "send_messages": "ask", "files": "do_and_tell",
-                                   "money": "ask"}
+                                   "money": "ask", "tidy": "do_and_tell"}
 #: How each kind and level reads in the judge's request.
 KIND_WORDS: dict[str, str] = {"read_screen": "Read the screen", "open_apps": "Open apps and windows",
                               "click_type": "Click and type", "send_messages": "Send messages", "files": "Files",
-                              "money": "Money"}
+                              "money": "Money", "tidy": "Tidy-ups inside my requests"}
 LEVEL_WORDS: dict[str, str] = {"suggest": "Just suggest", "show_plan": "Show me the plan",
                                "ask": "Ask before doing", "do_and_tell": "Do it and tell me"}
 

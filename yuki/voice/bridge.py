@@ -1582,6 +1582,14 @@ class VoiceBridge(QObject):
                 # alone is ~1.6 s), no rewording. Longer results, questions, failures, late outcomes and "nothing was
                 # done" still go to the talker, which says them once, merged with whatever it is saying. The narrator
                 # releases a final with only a short gap, the moment the user may be spoken to.
+                if kind == "done":
+                    # P1.3: the brain's tidy-up said the request's line first; only what is new is said now
+                    payload, first = self._said_first(job, payload)
+                    if first and not payload:   # all of it was heard already: settled as said, no talker run
+                        self._outcome_said(job)
+                        await params.result_callback({"done": first, "how_to_handle_it": RESULT_SAID_NOTE},
+                                                     properties=FunctionCallResultProperties(run_llm=False))
+                        return
                 held = self._held_verdict(job, kind, payload)   # honest (87): below likely, never said as written
                 verified = bool(kind == "done" and job.finished_by_action
                                 and payload.strip() == job.finished_by_action) and held is None
@@ -1756,6 +1764,25 @@ class VoiceBridge(QObject):
         if job is not None and job.log is not None:
             job.log.add("said to the user", text)
             job.last_say = text
+
+    def _said_first(self, job: Job, text: str) -> tuple[str, str]:
+        """P1.3 (qBrain merge note 6): a done whose start the brain already put out as a say line says only what is
+        new. The brain's tidy-up turn says the request's line at once (a :class:`Say`, ``outcome["said_first"]``), and
+        its Final is that line then the tidy words. ``(text, first)``: when that line went to the voice as this job's
+        last say line and the done starts with it, ``first`` is the line and ``text`` the rest (``""``: all of it was
+        heard); otherwise ``first`` is ``""`` and ``text`` is as given, so a say line that was dropped (talked over, a
+        repeat, a question first) is never lost. String identity of code's own lines only, never their meaning."""
+        verdict = job.verdict if isinstance(job.verdict, dict) else {}
+        first = " ".join(str(verdict.get("said_first") or "").split())
+        heard = " ".join(str(job.last_say or "").split())   # step_said sets it once the say line went to the voice
+        body = " ".join(str(text or "").split())
+        if not first or heard.casefold() != first.casefold() or not body.casefold().startswith(first.casefold()):
+            if first:
+                self._log("bridge", op="said_first", job_id=job.job_id, heard=False, chars=len(body))
+            return text, ""
+        rest = body[len(first):].strip()
+        self._log("bridge", op="said_first", job_id=job.job_id, heard=True, chars=len(first), rest_chars=len(rest))
+        return rest, first
 
     async def _offer(self, job: Job, kind: str, deliver: Callable[[bool, bool], Awaitable[None]],
                      drop: Callable[[], None] | None = None, *, self_spoken: bool = False) -> None:
@@ -3688,6 +3715,13 @@ class VoiceBridge(QObject):
                 # Like a tell_yuki call's own result: a short or verified one said by code (C1, v3.17), anything else
                 # by the talker, once.
                 late = self._moved_on(job)
+                if kind == "done":
+                    # P1.3: the brain's tidy-up said the request's line first; only what is new is said now
+                    payload, first = self._said_first(job, payload)
+                    if first and not payload:   # all of it was heard already: settled as said, no talker run
+                        self._outcome_said(job)
+                        await announce({"done": first, "how_to_handle_it": RESULT_SAID_NOTE}, False)
+                        return
                 held = self._held_verdict(job, kind, payload)   # honest (87): below likely, never said as written
                 verified = bool(kind == "done" and job.finished_by_action
                                 and payload.strip() == job.finished_by_action) and held is None
