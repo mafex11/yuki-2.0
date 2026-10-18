@@ -681,8 +681,13 @@ def place_for(ctx: RunContext | None, hwnd: int, *, activate: bool) -> bool:
     verified by its monitor, journaled in the request's group so "put it back" undoes it). Called as soon as the
     window is known: before it is brought forward when it already exists (it comes forward there), right after it
     opens otherwise (``activate``: it keeps the front, for the typing after). ``True`` when placed; a refusal or a miss
-    leaves the window where it is and the run goes on. Logged content-free."""
+    leaves the window where it is and the run goes on. Logged content-free.
+
+    With no hint from the caller, the user's own desk habit for the app may give one (phase 3.3,
+    :func:`habit_place`)."""
     hint = getattr(ctx, "place", None) if ctx is not None else None
+    if not hint and ctx is not None and hwnd:
+        hint = habit_place(ctx, int(hwnd))
     if not hint or not hwnd:
         return False
     try:
@@ -695,6 +700,51 @@ def place_for(ctx: RunContext | None, hwnd: int, *, activate: bool) -> bool:
         ok = False
     _emit(ctx, "skill_place", ok=ok, how=hint[1], activate=activate)
     return ok
+
+
+#: How long the place default waits for memory's answer (s; it reads the desk only when the app has a habit).
+HABIT_PLACE_S = 0.6
+
+
+def _desk_situation() -> Any:
+    """The desk now for the habit lookup: windows, monitors and what plays (no sound, no master, no holds)."""
+    from yuki.perception.situation import snapshot
+
+    return snapshot(audio=[], master=False, holds="")
+
+
+def habit_place(ctx: RunContext, hwnd: int) -> tuple[str, str] | None:
+    """Phase 3.3: the place hint the user's own desk habit gives a run whose caller gave none
+    (:func:`yuki.memory.deskhabits.place_for`, learned nightly from where they keep the app), or ``None``.
+
+    Only to keep their screen theirs: a hint comes only when the window shows on a monitor where another app plays or
+    shows full screen now, and their habit for this app, on this desk, is another monitor (e.g. while a video plays on
+    monitor 0 they keep Discord on monitor 1). A window they placed elsewhere stays where it is; a minimised one gets
+    no hint (the place verb refuses it: "restore it first"); an app they keep full screen (a game) has no habit; the
+    place gate still refuses with a game in front. Content-free log line ``skill_place_habit``."""
+    if getattr(ctx, "memory", None) is None or not hwnd:
+        return None
+    try:
+        from yuki.actions import place as _place
+        from yuki.memory import deskhabits
+
+        app = _place._app(hwnd)
+        if not app or _place._state(hwnd) == "minimized":
+            return None   # place_window refuses a minimised window: no hint, no refused move logged
+        got = _mem(ctx.memory, "desk_place",
+                   lambda c: deskhabits.place_for(_store_of(c), app, situation=_desk_situation),
+                   timeout_s=HABIT_PLACE_S)
+        if not isinstance(got, Mapping) or got.get("monitor") is None:
+            return None
+        where = _place.monitor_index(hwnd)
+    except Exception:  # noqa: BLE001 - no habit: the window goes where its app puts it
+        return None
+    target = int(got["monitor"])
+    if where is None or target == where or where not in set(got.get("busy") or ()):
+        return None
+    _emit(ctx, "skill_place_habit", situational=got.get("when") == "while", n=got.get("n"), m=got.get("m"),
+          monitor=target, was=where)
+    return str(target), str(got.get("how") or "keep")
 
 
 def v_open_uri(call: RouteCall) -> RouteResult:
@@ -2584,6 +2634,7 @@ __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_O
            "HANDOFF_ORIGINS", "FROM_UNHEARD", "FROM_GIVEN", "SEEN_MAX", "COMMIT_BY_END", "COMMIT_BY_NEED", "commit_for",
            "run_commit", "served_commit", "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult",
            "VERB_FUNCS", "open_uri", "pinned", "SEED_KEYS", "plan_seed", "run", "resolve_and_run", "run_for_voice",
-           "run_for_thinker", "granted_values", "place_arg", "place_hint", "place_for",
+           "run_for_thinker", "granted_values", "place_arg", "place_hint", "place_for", "habit_place",
+           "HABIT_PLACE_S",
            "CHOICE_SLOTS", "CHOOSE_TIMEOUT_S", "HELD_CALL", "asks_choice", "NOTE_SLOTS", "LINE_WHICH",
            "GUESS_KEEP_S", "note_args", "evidence_words"]

@@ -3639,6 +3639,26 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX IF NOT EXISTS meanings_state ON meanings(state, updated_at);
     """,
+    # 48 (2026-10-18, bDesk; phase 3.3, docs/research/audit-2026-10-18/builds/bDesk.md): the desk record. One row per
+    # stretch of the desk staying the same (yuki.memory.timeline.DeskRecord): the monitor setup (``screens``, e.g.
+    # "1920x1080@0,0;2560x1440@1920,0"), and per window on a monitor (JSON ``windows``: ``[[app key, monitor index,
+    # how (max | full | win), plays (0/1), seconds in front, seconds mostly visible], ...]``), whether the user was
+    # away, and whether Yuki was acting. Content-free (app keys, numbers, code words; never a title), like the
+    # timeline's ``process`` column. Mined nightly into desk habits (yuki.memory.deskhabits); rows older than 60 days
+    # are deleted there. Additive only; idempotent.
+    """
+    CREATE TABLE IF NOT EXISTS desk_stretches (
+        id          INTEGER PRIMARY KEY,
+        started_at  REAL NOT NULL,
+        ended_at    REAL NOT NULL,
+        screens     TEXT NOT NULL,
+        windows     TEXT NOT NULL,
+        away        INTEGER NOT NULL DEFAULT 0,
+        by_yuki     INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS desk_stretches_at ON desk_stretches(started_at);
+    CREATE INDEX IF NOT EXISTS desk_stretches_end ON desk_stretches(ended_at);
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
