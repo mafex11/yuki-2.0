@@ -13,7 +13,8 @@ reason from, not a catalog, in this order (the situation on the screens stays se
    (``younow.middle_words``, labelled ``younow.MIDDLE_LABEL``: to choose well, never recited unasked). The focus and
    what just changed are not here: the talker's own per-turn line carries them, and the planner's and the judge's
    you-now renders (``render(you, "thinker" | "cards")``) sit beside the card; **Open** - the brief's live items
-   (dated goals, loops, plans), top 3 (the talker's top 2); **Lately** (planner and judge) - the last two day digests;
+   (dated goals, loops, plans; a call promise only once known what it is about: ``cardjudge.about_known_items``),
+   top 3 (the talker's top 2); **Lately** (planner and judge) - the last two day digests;
 2. **Their habits, each with how often** - how they keep their desk (``yuki.memory.deskhabits.lines``, contract D1:
    "when ..., he keeps X on screen 2 (9 of 11)"); **Usually now** - the routines due around this hour, the picks for
    now (phase 2.2: ``yuki.skills.taste.now_picks``, each with a code-made why; the talker and the planner may choose
@@ -57,6 +58,7 @@ import threading
 import time
 from collections.abc import Iterable, Sequence
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 
 PURPOSES: tuple[str, ...] = ("talker", "planner", "judge")
@@ -853,13 +855,48 @@ def _people(store: Any) -> list[list[Any]]:
     return [_line(1, f"People (closest first; how speech hears their name; where they talk):\n{text}")] if text else []
 
 
+def _about_known(store: Any, items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The brief's live items without a call promise not known to be about something (phase 3, 3.4: an unclear "we'll
+    play that" never reaches a card; ``cardjudge.about_known_items``). The brief keeps an item's id only, so a
+    promise's origin is read here (one content-free query); one whose origin is unread counts as a call promise
+    (fails closed, as ``about_known_items`` does)."""
+    ids = set()
+    for x in items:
+        prefix, _sep, number = str(x.get("ref") or "").partition(":")
+        if prefix == "commit" and number.strip().isdigit():
+            ids.add(int(number))
+    if not ids:
+        return list(items)
+    try:
+        rows = store._query("SELECT id, origin FROM conversation_facts WHERE id IN (%s)" % ",".join("?" * len(ids)),
+                            tuple(ids))
+        origin = {int(r[0]): str(r[1] or "") for r in rows}
+    except Exception:  # noqa: BLE001 - unread: every promise counts as a call's
+        origin = {}
+
+    def source(ref: Any) -> str:
+        prefix, _sep, number = str(ref or "").partition(":")
+        if prefix != "commit" or not number.strip().isdigit():
+            return ""
+        return "call" if origin.get(int(number), "call") == "call" else "chat"
+
+    tagged = [SimpleNamespace(ref=x.get("ref"), source=source(x.get("ref")), item=x) for x in items]
+    try:
+        from yuki.memory.cardjudge import about_known_items
+
+        kept = about_known_items(store, tagged)
+    except Exception:  # noqa: BLE001
+        kept = [t for t in tagged if t.source != "call"]
+    return [t.item for t in kept]
+
+
 def _open(store: Any, n: int) -> list[list[Any]]:
     try:
         portrait = store.latest_portrait()
         brief = dict(portrait.brief) if portrait and portrait.brief else {}
     except Exception:  # noqa: BLE001
         return []
-    items = [x for x in brief.get("now") or [] if isinstance(x, dict) and x.get("text")][:n]
+    items = _about_known(store, [x for x in brief.get("now") or [] if isinstance(x, dict) and x.get("text")])[:n]
     return _list(1, "Open for them (dated): ", (
         (f"{x.get('date') or ''}: {_clip(x['text'], OPEN_ITEM_CHARS)}".strip(": "), PLAIN) for x in items), sep="; ",
         min_n=len(items))

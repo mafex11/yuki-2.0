@@ -3922,10 +3922,12 @@ class PortraitScheduler:
             return
         started = time.monotonic()
         got = deskhabits.mine(self.store, now=self.clock())
-        counts = {k: v for k, v in (got or {}).items() if isinstance(v, (int, float, bool))
-                  and k not in ("kind", "ok", "ms")}
-        self._log("portrait_run", kind="deskhabits", ok=True, ms=round((time.monotonic() - started) * 1000, 1),
-                  **counts)
+        got = got or {}
+        # numeric counts only; a failed pass (a missing table) logs ok=False with its exception type name (no content)
+        counts = {k: v for k, v in got.items() if isinstance(v, (int, float, bool))
+                  and k not in ("kind", "ok", "ms", "error")}
+        self._log("portrait_run", kind="deskhabits", ok="error" not in got, error=got.get("error"),
+                  ms=round((time.monotonic() - started) * 1000, 1), **counts)
 
     def _meanings(self, kind: str) -> None:
         """Phase 3.2 (contract M1): what the user's things mean to them (``yuki.memory.meanings.nightly``: evidence

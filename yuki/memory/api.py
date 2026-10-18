@@ -4383,10 +4383,10 @@ class MemoryClient:
 
     def people_directory(self) -> str:
         """The compact people block (<= ~900 characters, ``yuki.memory.contacts.directory``): each person the user
-        talks to with their relation, aliases (names speech recognition misheard too), where the user talks with them
-        most used lately first, and how the user writes to them; then the group chats the user writes in most. For
-        the cached profile layer of the typed agent, the voice thinker and the voice talker. A plain string, ``""``
-        when memory has no people index yet. Never raises."""
+        talks to with their relation, aliases (names speech recognition misheard too), where the user talks with them,
+        and how the user writes to them, closest first: chats and calls outside work count most, work a quarter; then
+        the group chats the user writes in most. For the cached profile layer of the typed agent, the voice thinker
+        and the voice talker. A plain string, ``""`` when memory has no people index yet. Never raises."""
         from yuki.memory import contacts as _c
 
         try:

@@ -182,7 +182,7 @@ class Gathered:
         overview: The window list and the Now picture (``Dispatcher.overview_text``), and when it was read.
         payload: The overview as data (the executor's window facts).
         you: The "you right now" text (``render(you, "thinker")``, or the Now board as a stand-in; with the you-card,
-            less the lines the card holds whole).
+            less the lines the card holds whole: its live lines are "Day" and "In the middle of", so the Day line).
         card: The you-card (C1, :func:`read_card`), ``""`` when it could not be read.
         people: People named and their last messages.
         places: The user's places from memory (:func:`read_places`: the pages they watch, the voice channels they
@@ -605,7 +605,7 @@ def channel_known(name: Any, app: str | None = None, *, now: float | None = None
 
 def beside_card(you: str, card: str) -> str:
     """The "you right now" text without the lines the you-card already holds whole (kYou merge note 4: the planner's
-    card carries the same record's focus, day, just-changed and thread-now lines as its "right now"). String identity
+    card carries the same record's "Day" line, and its "In the middle of" line in its own words). String identity
     only (spaces folded), never a reading: a line the card words otherwise, or that changed between the two reads,
     stays; ``""`` when the card holds every line."""
     held = " ".join(str(card or "").split())
@@ -776,8 +776,9 @@ def gather(*, dispatcher: Any, memory: Any, settings: Any, words: str, names: Se
             # same again (the places stay read for the join check)
             out.profile = profile_text(names=names, brief=None, rules=rules, limit=limits.profile_chars)
             if out.you and out.you != YOU_UNKNOWN:
-                # kYou merge note 4: the card's "right now" is this record's top lines; the ones it holds whole are
-                # not said twice (the due items, the usual now and the other threads stay)
+                # kYou merge note 4: the card's live lines ("Day", "In the middle of") come from this record; a line
+                # it holds whole (the Day line) is not said twice (the focus, the due items, the usual now and the
+                # other threads stay)
                 out.you = beside_card(out.you, out.card)
         else:
             places = results.get("places")

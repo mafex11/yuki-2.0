@@ -287,6 +287,7 @@ _PROBE_SQL = (
     "   FROM conversation_facts WHERE kind = 'commitment'),"
     " (SELECT max(updated_at) FROM work_items),"
     " (SELECT updated_at FROM nudge_state WHERE name = 'presence_events'),"
+    " (SELECT updated_at FROM nudge_state WHERE name = 'commitment_referents'),"
     " (SELECT ifnull(max(id), 0) || ':' || ifnull(max(shown_at), 0) || ':' || ifnull(max(outcome_at), 0) FROM nudges),"
     " (SELECT max(reacted_at) FROM nudges),"
     " (SELECT ifnull(max(id), 0) || ':' || ifnull(max(at), 0) FROM portraits),"
@@ -1091,15 +1092,16 @@ class YouBuilder:
                 self._round.update(DB_SECTIONS)
             self._db_sig = None   # asked again at the next check
             return
-        probes = {"focus": p[0], "work": p[1:8], "cards": p[8:10], "about": p[10], "usual": p[11:14], "prefs": p[14]}
+        # work: goals .. presence_events, commitment_referents (a call promise found "named" re-reads the Due lines)
+        probes = {"focus": p[0], "work": p[1:9], "cards": p[9:11], "about": p[11], "usual": p[12:15], "prefs": p[15]}
         for section, value in probes.items():
             if self._probe_seen.get(section, ...) != value:
                 self._probe_seen[section] = value
                 self._round.add(section)
-        if p[9] != self._reacted_seen:
+        if p[10] != self._reacted_seen:
             if self._reacted_seen is not ...:
                 self._breaks.append("reaction")
-            self._reacted_seen = p[9]
+            self._reacted_seen = p[10]
 
     def _add_synth(self, kind: str, at: float, *, app: str | None = None) -> None:
         """A transition this module saw itself: kept for ``changed`` and a breakpoint for the judge."""
@@ -1521,6 +1523,16 @@ class YouBuilder:
         try:
             items = [i for i in todo_items(self.store, now=now) if i.status == "open"]
             list_n = len(items)
+            # a call promise not known to be about something ("we'll play that" with nothing naming "that") never
+            # reaches the Due lines the judge, the card writer and the talker's "In the middle of" read (phase 3, 3.4);
+            # fails closed on call promises, as cardjudge.about_known_items does
+            try:
+                from yuki.memory.commitments import about_known, referent_states
+
+                ref_states = referent_states(self.store)
+                items = [i for i in items if about_known(ref_states, i.ref, i.source)]
+            except Exception:  # noqa: BLE001
+                items = [i for i in items if i.source != "call"]
             for i in items:
                 if i.due_at is not None:   # enters the 24 h window, turns overdue, leaves the overdue window
                     turns += [t for t in (i.due_at - DUE_AHEAD_S, i.due_at, i.due_at + OVERDUE_BACK_S) if t > now]
