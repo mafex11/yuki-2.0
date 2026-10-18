@@ -4241,9 +4241,9 @@ class Conversation:
                        state=rec.get("state"))
 
     def _reflex_note(self, rec: dict[str, Any]) -> None:
-        """Review r1 M3: the reflex's act goes into the hands' list of this user turn's steps (``Hands._note_call``),
-        which their end check reads ("pause the music and open Insta": the opening's check sees the pause done, so it
-        is never handed to the thinker again). Only once the observer counted the turn of its words (``reached``),
+        """Review r1 M3: the reflex's act goes into the hands' list of this user turn's steps (``Hands._note_call``:
+        the thinker's list of steps, and the claim gate's "something was asked").
+        Only once the observer counted the turn of its words (``reached``),
         never at the eager end of turn (the hands' turn is still the one before), and only for an act that went out.
         Once per reflex."""
         if rec.get("noted") or not rec.get("reached") or rec.get("state") not in self.REFLEX_WENT:
@@ -4892,7 +4892,7 @@ class Conversation:
             hands.prefetch_desk()   # the first reply's desktop block, read while they talk
         self._reflex_load()   # lSpeed: the learned reflexes, read once per process off the loop
         if s.voice_hands and hands is not None and callable(getattr(hands, "warm_check", None)):
-            hands.warm_check()   # vRound2 review r1 M1: the step check's own model client, made off the loop (no call)
+            hands.warm_check()   # vRound2 review r1 M1: the commit check's model client, made off the loop (no call)
         tts = getattr(self, "_tts", None)
         for service in (getattr(self, "_stt", None), tts):
             load = getattr(service, "load_now", None)   # vLocal: the models on this PC load now (their own thread)

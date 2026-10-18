@@ -1179,10 +1179,10 @@ class Hands:
         #: stop until the user speaks again (re-read, tell them, or hand it over; never repeat blindly).
         self.halted: str | None = None
         #: lVoice (live 17 Oct, problem 7), phase 2 (2.4): that halt in detail (RAM only): ``{"turn", "name",
-        #: "target", "passed", "first", "tried"}``. Other undoable tries (a step not tried yet in this turn: Chrome after
-        #: Arc) are let through for :data:`RETRY_BUDGET_S` after the first miss, when the failed one was not passed to the
-        #: thinker; after that, or once the thinker has it, a refused one is "not tried", never a new failure
-        #: (:data:`_HALTED_NOTE`: rule #149's one line).
+        #: "target", "passed", "first", "tried"}``. Other undoable tries (a step not tried yet in this turn: Chrome
+        #: after Arc) are let through for :data:`RETRY_BUDGET_S` after the first miss, when the failed one was not
+        #: passed to the thinker; after that, or once the thinker has it, a refused one is "not tried", never a new
+        #: failure (:data:`_HALTED_NOTE`: rule #149's one line).
         self._halt: dict[str, Any] | None = None
         #: lVoice (problem 3): the order gate of the user turn's calls: a reply's hands and skills run one after
         #: another, in the order they came (``{"loop", "key", "lock", "waiting", "passed"}``; :meth:`_enter_order`).
@@ -1190,7 +1190,7 @@ class Hands:
         #: Background tasks still running (kept so none is collected before it ends).
         self._background: set[Any] = set()
         #: Phase 2 (2.3): ``(token, turn, at)`` of a hand's non-success outcome whose code line waits in the owed
-        #: ledger while the talker words it (:meth:`_owe_fallback`); dropped when the talker's next call of the turn acts.
+        #: ledger while the talker words it (:meth:`_owe_fallback`); dropped when the talker's next call acts.
         self._owed_line: tuple[int, Any, float] | None = None
         #: lVoice (a hook for lSpeed's reflex path, :meth:`reflex_done`): ``{step key: when}`` of steps the reflex ran
         #: for the words being heard, so the talker's own call for the same step is that step, never a second act.
@@ -1341,6 +1341,7 @@ class Hands:
         self._other_complete = {}
         self._then_open = None
         self._step_owed = None
+        self._owed_line = None
         self._halt = None
         self.halted = None
         self._order = None
@@ -4708,8 +4709,9 @@ class Hands:
             pass
 
     def _retry_words(self, facts: dict[str, Any]) -> str:
-        """lVoice review r1 L7, phase 2: :data:`_RETRY_OPEN` when the hand whose failed note this is did not take effect,
-        was not passed on, and this turn's retry time is still open; else ``""`` (the plain note). State only."""
+        """lVoice review r1 L7, phase 2: :data:`_RETRY_OPEN` when the hand whose failed note this is did not take
+        effect, was not passed on, and this turn's retry time is still open; else ``""`` (the plain note). State
+        only."""
         try:
             if facts.get("refused") or not self.halted or not self._retry_open():
                 return ""
