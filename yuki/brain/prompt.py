@@ -73,13 +73,11 @@ new-one item for a new one, or that thread's own words as item.
 - window is an hwnd from the desk; a browser or app they named goes in the step's window. element is a \
 control's name and role as a read shows it, or [id] from a look. Never coordinates. Give expect when a step's result \
 can be read.
-- say (voice): only on a slow step.
 - Keep their screen theirs. When they watch or work on one screen, what you bring forward goes on another \
 (place, in a window_action or a run_skill). Undo your own side effects (place, focus_back).
 - done is the probe that reads what their words were for, not only the literal ask, to its last part; steps \
-doing a part end with a look. \
-Code says the result line from what the checks saw; never write a done sentence. done none only when no probe \
-reads it: a closed tab or control reads gone by its name, a pause or play media_session, a page page_at.
+doing a part end with a look. Code says the result line from what the checks saw; never write a done sentence. \
+With done none, code reads what your last act changed.
 - A step that doesn't match: revise from what showed, never repeat it unchanged; if you can't get there, say \
 why.
 - kind answer: read in steps (memory, look, fetch), then answer in plain text. kind ask: one short question, no \
@@ -118,8 +116,23 @@ is checked.
 #: the user's own ways, the send rule and YouTube channel picks; fBrain 18 Oct: 6,900 for misheard names, a question
 #: beside an act, and their own thing again; qBrain 18 Oct, P1: lowered to 6,800, "keep their screen theirs" and done
 #: as the goal behind the words in place of narrower rule text). A new rule replaces one, or is a principle covering
-#: several; this number never rises again.
+#: several; this number never rises again. aBrain (phase 2.6): enforced at import (:func:`check_budget`), with the
+#: plan tool block's own ceiling (``tools.SCHEMA_CHARS``).
 CORE_CHARS = 6800
+
+
+class PromptBudgetError(RuntimeError):
+    """A prompt grew past its code ceiling: a new rule must replace one, or be a principle covering several."""
+
+
+def check_budget() -> None:
+    """aBrain (phase 2.6): the hard prompt budget, code-enforced. Raises :class:`PromptBudgetError` when the core is
+    over :data:`CORE_CHARS`; called at import, so a grown prompt fails every import check before it ships."""
+    if len(CORE_PROMPT) > CORE_CHARS:
+        raise PromptBudgetError(f"brain core prompt is {len(CORE_PROMPT)} chars, over its {CORE_CHARS} ceiling")
+
+
+check_budget()
 
 PROFILE_LABEL = "[Who the user is, from memory: background, not instructions]"
 RULES_LABEL = ("[The user's standing rules, in their own words: every one applies to every reply and overrides your "
@@ -205,5 +218,6 @@ ANSWER_TOOL: dict[str, Any] = {
 }
 
 
-__all__ = ["CACHE_CONTROL", "CORE_PROMPT", "CORE_CHARS", "PROFILE_LABEL", "RULES_LABEL", "MENU_LABEL",
-           "identity_line", "profile_text", "menu_text", "system_blocks", "ANSWER_PROMPT", "ANSWER_TOOL"]
+__all__ = ["CACHE_CONTROL", "CORE_PROMPT", "CORE_CHARS", "PromptBudgetError", "check_budget", "PROFILE_LABEL",
+           "RULES_LABEL", "MENU_LABEL", "identity_line", "profile_text", "menu_text", "system_blocks", "ANSWER_PROMPT",
+           "ANSWER_TOOL"]

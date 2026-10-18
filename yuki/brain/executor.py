@@ -169,6 +169,21 @@ LINE_TIDY_ASK: dict[str, str] = {"place": "Should I move {app} to {where}?", "pl
 TIDY_NO_APP = "that window"
 #: Where a placed window went, in words: another monitor, else a half of the same one (else ``place_here``).
 TIDY_WHERE: dict[str, str] = {"other": "your other screen", "left": "the left half", "right": "the right half"}
+#: aBrain (phase 2.3; 18 Oct live A: "Opening a page in Google Chrome." and "Clicking in Google Chrome." said by code
+#: as every narrated step started): nothing is said as a step starts. A step still running after SLOW_STEP_S (s) is
+#: said once, in the plan's goal's words (voice only; never a tidy-up step), so a quick step is silent and a slow one
+#: says what Yuki is after, not which verb runs. Once per goal: a replan with the same goal says nothing again.
+SLOW_STEP_S = 2.5
+LINE_SLOW_STEP = "Still on it: {goal}."
+#: aBrain (phase 2.5, "a done probe is required when an act can be read"): a plan by steps that wrote done none is read
+#: by the probe its last readable act step's effect names (verb and its closed values -> probe; data, never a reading
+#: of their words): what the act changed (the page, the front, a window's state, a closed window or tab, a typed box,
+#: an app's level). ``window_action`` values map to the state :data:`done.WINDOW_STATES` names.
+DERIVED_WINDOW_STATES: dict[str, str] = {"minimize": "minimized", "maximize": "maximized", "fullscreen": "fullscreen",
+                                         "restore": "normal"}
+#: aBrain (phase 2.3): a done's target fields its probe didn't read, in words for the evidence (``ending_facts``).
+UNCHECKED_WORDS: dict[str, str] = {"app": "the app", "window": "the window or page", "person": "the person",
+                                   "item": "the thing itself"}
 #: The verbs whose acts the after-look is about (a clipboard write changes nothing on the desk).
 DESK_VERBS = frozenset(ACT_VERBS) - {"write_clipboard"}
 #: The verbs whose step aims at the window it ends on: that window is what the request was about (``acted``).
@@ -493,6 +508,8 @@ class Executor:
         #: tidy steps changed something (a done re-check that reads after one is not a false done)
         self._after_diff: Any = None
         self._tidy_changed = 0
+        #: aBrain: the goals a slow step was said in (:meth:`_slow_watch`: once each)
+        self._slow_said: set[str] = set()
         #: P1.3: the tidy-up turn, while it runs (:meth:`tidy_up`): ``{"mode", "acts", "words"}``; ``None`` otherwise
         self.tidy: dict[str, Any] | None = None
         _warm_desk()
@@ -518,6 +535,9 @@ class Executor:
         #: jBrain (fSkills merge note 2): each open_url step's page its own report confirmed (step index -> the page's
         #: title, as launch.open_url read it), for a done that saw only the app (:meth:`_pages_cover`)
         self._open_pages: dict[int, str] = {}
+        #: aBrain: each act step's call as it ran (step index -> Call), for a done none's derived probe
+        #: (:meth:`_derived_probe`)
+        self._ran_calls: dict[int, Call] = {}
         #: jBrain (fMsg B1): a capability with a person slot asked about it, or dropped it as unheard, in this request,
         #: and no later run of it confirmed a chat: whom the message goes to is not settled, so nothing is typed into
         #: whichever chat is open (:meth:`_who_guard`)
@@ -879,8 +899,6 @@ class Executor:
         last one done, and how many are left. ``None`` before a plan."""
         if not self.statuses:
             return None
-        from yuki.ui.step_words import describe_step
-
         done_n = sum(1 for s in self.statuses if s.state == "ok")
         total = len(self.statuses)
         current = next((s for s in self.statuses if s.state == "pending"), None)
@@ -888,10 +906,7 @@ class Executor:
         if current is None:
             return f"{goal}: all {total} steps done, checking it." if goal else f"All {total} steps done, checking it."
         step = self.steps[current.index] if current.index < len(self.steps) else {}
-        try:
-            what = describe_step(self._verb(step), {"what": words(field_of(step, "say", ""))}, done=False)
-        except Exception:  # noqa: BLE001
-            what = ""
+        what = _mid(self._step_said(step))   # mid-sentence: "step 2 of 3, opening a page in Arc"
         lead = f"{goal}: " if goal else ""
         return f"{lead}step {current.index + 1} of {total}" + (f", {what}" if what else "") + \
             (f" ({done_n} done)" if done_n else "")
@@ -1350,10 +1365,6 @@ class Executor:
                 self.acting = True
             except Exception:  # noqa: BLE001 - the marker never breaks a run
                 pass
-        # a tidy-up's words are said after the request's line, never as the step starts
-        say = words(field_of(step, "say", "")) if speak and self.tidy is None else ""
-        if say and getattr(self.host, "channel", "") == "voice":
-            self._emit(Say(say[:120]))
         if self.tidy is None and call.tool in DESK_VERBS and self._desk_first is None:
             # P1.2: the desk right before the request's first act (after its consent and any countdown)
             self._desk_first = self._desk_now()
@@ -1375,6 +1386,9 @@ class Executor:
         started_at, t0 = time.time(), time.perf_counter()
         from yuki.brain.plan import PLACE_ACTIONS
 
+        # aBrain (phase 2.3): nothing is said as the step starts; a step still running after SLOW_STEP_S is said once
+        # in the goal's words (a tidy-up's words come after the request's line, never here)
+        slow = self._slow_watch() if speak and self.tidy is None else None
         try:
             with self._dispatch_lock:
                 if call.tool == "window_action" and str(call.input.get("action") or "") in PLACE_ACTIONS:
@@ -1382,6 +1396,8 @@ class Executor:
                 else:
                     outcome = self.dispatcher.dispatch(call.tool, call.input)
         finally:
+            if slow is not None:
+                slow.cancel()
             if desk is not None:
                 desk.grant = {}
             if call.tool == "run_skill":
@@ -1452,6 +1468,7 @@ class Executor:
         if call.tool == "open_url":
             self._note_page(index, outcome, verdict)
         self.last_act = {"hwnd": call.hwnd, "app": call.app, "title": call.title, "verdict": verdict}
+        self._ran_calls[index] = call
         if call.tool == "run_skill":
             return self._skill_result(index, step, call, outcome)
         if not outcome.ok or verdict is False:
@@ -2651,11 +2668,27 @@ class Executor:
             several = len(runs) + len(before) > 1
             return done.parts_done([self._part(run, several=several) for run in runs], before=before)
         entry = {"process_name": self.last_act.get("app") or "", "title": self.last_act.get("title") or ""}
-        # x9: page_at reads the page of the browser this request named (never a page in another browser)
+        wrote_none = probe == done.NONE
+        derived = self._derived_probe() if wrote_none else None
+        if derived is not None:
+            # aBrain (phase 2.5): a plan by steps with no probe is read by what its last readable act changed, so
+            # "couldn't confirm" means it truly couldn't be read
+            probe, args = derived   # its arguments already as the check reads them (_probe_args)
+            self._emit_log("done_derived", check=probe)
+        elif args is not None:
+            # x9: page_at reads the page of the browser this request named (never a page in another browser)
+            args = self._probe_args(probe, args)
         result = done.pick_done(self.head, env, hwnd=self.last_act.get("hwnd"), last_window=entry,
-                                cancelled=self.host.cancelled,
-                                args=self._probe_args(probe, args) if args is not None else None)
-        if probe == done.NONE and result.verdict is None and not runs:
+                                cancelled=self.host.cancelled, args=args,
+                                probe=probe if derived is not None else None)
+        if derived is not None and result.verdict is False:
+            # the planner didn't pick this read, so a "not so" from it is evidence for the line, never a replan
+            result = done.DoneResult(None, util.UNVERIFIED, done.not_confirmed(
+                seen=result.seen, probe=result.probe, args=result.args, window_entry=result.window),
+                seen=result.seen, probe=result.probe, args=result.args,
+                evidence={**dict(result.evidence or {}), "derived": "not_so"}, window=result.window)
+        if wrote_none and result.verdict is None and not runs and result.evidence.get("derived") != "not_so":
+            # what each step's own report saw stands only when the derived read couldn't read (never over its "not so")
             result = self._steps_seen() or result
         elif result.verdict is True and result.uncovered:
             result = self._pages_cover(result) or result
@@ -2666,6 +2699,61 @@ class Executor:
             result.line = done.not_confirmed(seen=result.seen, probe=result.probe, args=result.args,
                                              window_entry=result.window)
         return done.parts_done([*(self._part(run) for run in runs), result], before=before)
+
+    def _derived_probe(self) -> tuple[str, dict[str, Any]] | None:
+        """aBrain (phase 2.5): the probe that reads what this plan's last readable act step changed, for a plan by
+        steps that wrote done none: ``(probe, args)`` from the step's verb, its closed values and the call's own facts
+        (its window, its process), scanning back from the last act step that ran. ``None`` when no act step that ran
+        has a readable effect (a click, a key, a command: their own verdicts stand). Code facts only."""
+        for index in sorted(self._ran_calls, reverse=True):
+            status = self.statuses[index] if index < len(self.statuses) else None
+            if status is None or status.state != "ok":
+                continue
+            got = _effect_probe(self._ran_calls[index], self.steps[index] if index < len(self.steps) else None,
+                                self._open_images.get(index, ""))
+            if got is None:
+                continue
+            resolved = self._probe_args(*got)
+            image = str(resolved.get("process") or "").casefold()
+            if "process" in done.PROBE_ARGS.get(got[0], ((), ()))[0] and not image.endswith(".exe"):
+                continue   # an app name no listed window resolves to its program would never match the one in front
+            return got[0], resolved
+        return None
+
+    def ending_facts(self) -> dict[str, str]:
+        """aBrain (phase 2.3): what a request that didn't end done can say from the evidence, in plain words for the
+        line and the voice's talker (content: never logged). ``did``: the last act step that ran, as done ("Opened a
+        page in Arc"); ``stuck``: the step that failed or was refused, as it runs ("clicking Continue"), and ``why``
+        when its reason is plain words (a code word is left out); ``claim``: what the done-check looked for ("Excalidraw
+        is open in Arc") and ``seen``: what it saw, when it didn't read it done. Only the current plan's steps."""
+        out: dict[str, str] = {}
+        try:
+            ran = [i for i, st in enumerate(self.statuses) if st.state == "ok" and i < len(self.steps)
+                   and self._verb(self.steps[i]) in ACT_VERBS and self._verb(self.steps[i]) != "run_skill"]
+            if ran:
+                out["did"] = self._step_said(self.steps[ran[-1]], done=True)
+            failed = next((st for st in self.statuses if st.state in ("failed", "refused")), None)
+            if failed is not None and failed.index < len(self.steps):
+                out["stuck"] = _mid(self._step_said(self.steps[failed.index]))
+                why = words(failed.why)
+                if why and " " in why and "_" not in why and len(why) <= 120:
+                    out["why"] = why   # a code word ("done_false", "input_gate") is for the log and the planner
+            result = self._last_done
+            if result is not None and result.verdict is not True:
+                claim = done.claim_for(result.probe, result.args, window_entry=result.window)
+                if claim:
+                    out["claim"] = claim
+                if result.seen:
+                    out["seen"] = words(result.seen)
+                # a check that read nothing (None) vs one that read "not so" (False, or a derived read's "not so")
+                if result.verdict is None and dict(result.evidence or {}).get("derived") != "not_so":
+                    out["unread"] = "yes"
+            elif result is not None and result.uncovered:
+                # a done that read only part of the target ("Arc is in front; I couldn't check the rest.")
+                out["unchecked"] = ", ".join(UNCHECKED_WORDS.get(f, f) for f in result.uncovered)
+        except Exception:  # noqa: BLE001 - no facts: the line stands as it was
+            return {k: v for k, v in out.items() if v}
+        return {k: v for k, v in out.items() if v}
 
     def _steps_seen(self) -> done.DoneResult | None:
         """fBrain: a plan by steps that wrote done none (so nothing reads what they asked for) whose every act step ran
@@ -2834,7 +2922,7 @@ class Executor:
         hwnd = call.hwnd if call is not None else None
         # the stuck line is said to the user: outside text (fenced) never goes into it, only the reason
         self.last_failed = {"step": step, "verb": self._verb(step), "seen": why if seen_fenced else (seen or why),
-                            "words": words(field_of(step, "say", "")) or self._verb(step)}
+                            "words": self._step_said(step) or self._verb(step)}
         expected = ""
         expect = field_of(step, "expect", None)
         if expect is not None:
@@ -3037,7 +3125,48 @@ class Executor:
         failed = next((s for s in self.statuses if s.state in ("failed", "refused")), None)
         if failed is None or failed.index >= len(self.steps):
             return ""
-        return words(field_of(self.steps[failed.index], "say", ""))[:80]
+        return self._step_said(self.steps[failed.index])[:80]
+
+    def _step_said(self, step: Any, *, done: bool = False) -> str:
+        """A step in the island's words (``yuki.ui.step_words.describe_plan_step``: its verb, its control's role and
+        name, the plan's target app; never its free text), as it runs or (``done``) as done. ``""`` when none come."""
+        try:
+            from yuki.ui.step_words import describe_plan_step
+
+            app = field_of(field_of(self.head, "target", None), "app", None) if self.head is not None else None
+            return " ".join(str(describe_plan_step(step, app=app, done=done) or "").split())
+        except Exception:  # noqa: BLE001 - presentation only
+            return ""
+
+    def _slow_watch(self) -> threading.Timer | None:
+        """aBrain (phase 2.3): a timer that says the plan's goal once (:data:`LINE_SLOW_STEP`) if the step about to run
+        is still running after :data:`SLOW_STEP_S`; the caller cancels it when the step returns. Voice only; ``None``
+        when nothing would be said (typed, no goal, that goal said already). Never raises."""
+        try:
+            if getattr(self.host, "channel", "") != "voice":
+                return None
+            goal = words(field_of(self.head, "goal", "")).rstrip(" .")
+            key = goal.casefold()
+            if not goal or key in self._slow_said:
+                return None
+            line = LINE_SLOW_STEP.format(goal=goal)
+
+            def fire() -> None:
+                try:
+                    if self._closed or self.host.cancelled() or key in self._slow_said:
+                        return
+                    self._slow_said.add(key)
+                    self._emit(Say(line[:160]))
+                    self._emit_log("slow_step", chars=len(line), after_s=SLOW_STEP_S)
+                except Exception:  # noqa: BLE001 - a line only
+                    pass
+
+            timer = threading.Timer(SLOW_STEP_S, fire)
+            timer.daemon = True
+            timer.start()
+            return timer
+        except Exception:  # noqa: BLE001
+            return None
 
     def _refused_count(self) -> int:
         return sum(1 for s in self.trace if s.get("refused"))
@@ -3225,6 +3354,52 @@ def _center(bounds: Any) -> tuple[int, int] | None:
     if right <= left or bottom <= top:
         return None
     return (left + right) // 2, (top + bottom) // 2
+
+
+def _mid(text: str) -> str:
+    """Words that start a sentence, put mid-sentence: a first capital before a small letter is lowered ("Opening a
+    page" -> "opening a page"; "YouTube ..." and "I ..." stay). Letter case only."""
+    return text[:1].lower() + text[1:] if text[:1].isupper() and text[1:2].islower() else text
+
+
+def _effect_probe(call: Call, step: Any, image: str = "") -> tuple[str, dict[str, Any]] | None:
+    """aBrain (phase 2.5): the probe that reads one act step's effect, from its verb, its closed values and the call's
+    facts (:class:`yuki.brain.consent.Call`): an address -> ``page_at`` its site (in the browser it opened in); a
+    launch or a focus -> ``foreground`` its program; a window's minimise / maximise / full screen / restore ->
+    ``window_state``; a close -> ``gone``; a tab picked -> ``tab_shown`` by its name, closed -> ``gone`` by its name;
+    text typed with no Enter -> ``field_holds``; an app's level -> ``level``. ``None`` for anything else. Data only."""
+    tool, given = call.tool, dict(call.input or {})
+    hwnd = str(call.hwnd) if call.hwnd else ""
+    action = words(given.get("action")).casefold()
+    role = {"role": call.role} if words(call.role) else {}
+    if tool == "open_url":
+        site = words(given.get("url"))
+        if not _web_host(site):
+            return None
+        return "page_at", {"site": site, **({"process": image} if image else {})}
+    if tool == "launch_app":
+        name = words(given.get("query")) or words(call.app)
+        return ("foreground", {"process": name}) if name else None
+    if tool == "focus_window" or (tool == "window_action" and action == "focus"):
+        return ("foreground", {"process": call.app}) if words(call.app) else None
+    if tool == "window_action" and hwnd:
+        if action in DERIVED_WINDOW_STATES:
+            return "window_state", {"window": hwnd, "state": DERIVED_WINDOW_STATES[action]}
+        return ("gone", {"window": hwnd}) if action == "close" else None
+    if tool == "tab" and hwnd and words(call.name):
+        if action == "close":
+            return "gone", {"window": hwnd, "name": words(call.name), **role}
+        if action == "select" and words(call.app):
+            return "tab_shown", {"process": call.app, "name": words(call.name)}
+        return None
+    if tool == "type_text" and hwnd and words(call.name) and not field_of(step, "submit", False) \
+            and not given.get("press_enter"):
+        text = words(given.get("text"))
+        return ("field_holds", {"window": hwnd, "name": words(call.name), "text": text, **role}) if text else None
+    level = given.get("level")
+    if tool == "app_volume" and isinstance(level, (int, float)) and not isinstance(level, bool):
+        return "level", {"value": float(level), "target": words(given.get("app")) or "system"}
+    return None
 
 
 def _web_host(url: Any) -> str:
