@@ -23,11 +23,11 @@
 # the sent message. Never offered (offer_class = "never"). Never with a game in front ("after the round?"). The code
 # is yuki/skills/chat.py and yuki/skills/web_route.py.
 #
-# Where the chat app's window goes (P1.4, 18 Oct): a run may carry a place hint beside its slots (run_skill's
-# "place": "other", a monitor index or "with:<hwnd>", each with an optional ":keep|maximize|left|right";
-# yuki/skills/engine.py place_hint). The routes put the app's window there as soon as it is known, before anything is
-# typed (an open window before its link or switcher brings it forward), so it never covers what the user watches.
-# It is not a slot: it changes no value, no check and no send rule.
+# Where the chat app's window goes (P1.4, 18 Oct): a run may carry a place hint (run_skill's "place", beside its slots
+# or, from the talker, among them: "other", a monitor index or "with:<hwnd>", each with an optional
+# ":keep|maximize|left|right"; yuki/skills/engine.py place_arg). The routes put the app's window there as soon as it
+# is known, before anything is typed (an open window before its link or switcher brings it forward), so it never
+# covers what the user watches. It is not a slot: it changes no value, no check and no send rule.
 
 [connection]
 app = "chat"

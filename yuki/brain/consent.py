@@ -1,9 +1,18 @@
 """The one consent rule (brain-design.md §2.5): one table, in code, applied to every act step before it runs.
 
-**Permission by undoability** (P1.5, 18 Oct): every act step is in one class of :data:`CLASSES` (:func:`act_class`,
-code facts only): **never** (rows 1-2: refused, said plainly), **lasting** (rows 3-5: their plain words or one
-question; a send keeps its countdown) or **undoable** (row 6: allowed, then said; place and focus back are journaled
-for "put it back"). A tidy-up inside a request (the executor's after-look) may take only undoable window steps.
+**Permission by undoability** (P1.5, 18 Oct): the rows below are three classes, decided by code facts in
+:func:`check`'s order:
+
+* **never** (rows 1-2, refused and said plainly): input, focus, a launch or a link with a game in front; an app whose
+  Act switch is off; a kind on "just suggest"; and by row 4's own rules, typing over their draft and a send in Yuki's
+  own wording without their yes;
+* **undoable** (row 6, allowed, then said): a step that cannot commit (:func:`may_commit` false): place, focus, focus
+  back, put it back, open, switch, tab show, minimise / maximise / restore, volume, media, scroll, typing without
+  Enter, reads; place and focus back are journaled for "put it back";
+* **lasting** (rows 3-5, their plain words or one question; a send keeps its countdown): a send, a join, anything that
+  destroys or reaches (delete, close, buy, a setting, a shell, a committing click).
+
+A tidy-up inside a request (the executor's after-look) may take only undoable window steps.
 
 ``check(step, plan, user_words, live, check_verdict) -> allow | ask | refuse | draft``, row by row, the first row that
 applies decides:
@@ -177,18 +186,8 @@ SAID_SPAN = 2
 #: chat: Enter there sends a message, whatever app it is (the generic chat detector's too).
 CHAT_KIND = "conversation"
 
-#: P1.5: the act classes, one table (module docstring). Which class a step is in is :func:`act_class`'s code facts;
-#: what each class gets is :func:`check`'s rows. Phrased for the reader; never shown to a model.
-NEVER, LASTING, UNDOABLE = "never", "lasting", "undoable"
-CLASSES: dict[str, str] = {
-    NEVER: "refused: input, focus, a launch or a link with a game in front (row 1); an app whose Act switch is off, a "
-           "kind on just suggest (row 2); and by row 4's own rules: typing over their draft, a send in Yuki's own "
-           "wording without their yes",
-    LASTING: "their plain words or one question: a send (row 4, then the countdown), a join (row 3, their click), "
-             "anything that destroys or reaches (delete, close, buy, a setting, a shell, a committing click: row 5)",
-    UNDOABLE: "allowed, then said (row 6): place, focus, focus back, put it back, open, switch, tab show, minimise / "
-              "maximise / restore, volume, media, scroll, typing without Enter, reads",
-}
+#: P1.5: row 6's code word: the undoable class (module docstring).
+UNDOABLE = "undoable"
 
 #: The plain words said for a refusal's code word (``Verdict.why``), for a line the user hears; a code word itself is
 #: never said. Missing or empty: nothing worth saying (the planner's own fixes).
@@ -1202,18 +1201,6 @@ def may_commit(call: Call, live: Live, plan: Any = None) -> bool:
     return t.destroys or t.reaches or is_join_control(call, live) or policy_holds(call, live)
 
 
-def act_class(call: Call, live: Live, plan: Any = None) -> str:
-    """P1.5: the step's class in :data:`CLASSES`: :data:`NEVER` when rows 1-2 refuse it, :data:`LASTING` when it may
-    commit (:func:`may_commit`: it destroys or reaches, sends, joins, or a kind the user's policy holds), else
-    :data:`UNDOABLE`. Code facts only. Never raises (an error: lasting, so it is checked)."""
-    try:
-        if _rows_1_2(call, live, step_traits(call, live)) is not None:
-            return NEVER
-        return LASTING if may_commit(call, live, plan) else UNDOABLE
-    except Exception:  # noqa: BLE001 - fail closed
-        return LASTING
-
-
 def takes_screen(call: Call) -> bool:
     """Row 1: the step takes focus, sends input, restores a window, launches an app or opens a link (tool metadata and
     fixed operations). ``run_skill`` is gated rung by rung inside the engine instead."""
@@ -1585,7 +1572,7 @@ def after_ask(verdict: Verdict) -> Verdict:
     return replace(verdict, result=ALLOW, countdown=verdict.row == 4)
 
 
-__all__ = ["CLASSES", "LASTING", "NEVER", "UNDOABLE", "act_class",
+__all__ = ["UNDOABLE",
            "ALLOW", "ASK", "CHAT_KIND", "COMMITS", "DRAFT", "EFFECTS", "LINE_ASK_SEND", "LINE_DRAFTED", "LINE_GAME",
            "NAME_GAP", "PLAIN_WHY", "REFUSE", "RESULTS", "SAID_SHARE", "SAID_SPAN", "Call", "Live", "Verdict",
            "after_ask", "ask_send_question", "spoken_name", "calling_windows", "chat_window", "check", "draft_slots",

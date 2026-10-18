@@ -86,10 +86,13 @@ WINDOW_ACTIONS: tuple[str, ...] = ("minimize", "maximize", "fullscreen", "restor
 #: ``place[:<monitor>[:<how>]]`` puts the step's window on a monitor (an index as the desk view says it, ``other``,
 #: ``primary``, or ``with:<hwnd>``: that window's monitor; default ``other``) in a way (:data:`PLACE_HOWS`; default
 #: ``keep``); ``focus_back`` gives the front back to the step's window; ``undo`` puts the last placement (and the front
-#: it took) back, no window. These are the only acts a tidy-up turn may take (:data:`TIDY_ACTIONS`).
+#: it took) back, no window (:data:`PLACE_ACTIONS`). A tidy-up turn may take only place and focus back
+#: (:data:`TIDY_ACTIONS`), on what the request's own acts changed (the executor's tidy gate); never undo, which puts
+#: back whatever group is newest on the journal.
 PLACE_ACTION = "place"
 PLACE_HOWS: tuple[str, ...] = ("keep", "maximize", "left", "right")
-TIDY_ACTIONS: tuple[str, ...] = (PLACE_ACTION, "focus_back", "undo")
+PLACE_ACTIONS: tuple[str, ...] = (PLACE_ACTION, "focus_back", "undo")
+TIDY_ACTIONS: tuple[str, ...] = (PLACE_ACTION, "focus_back")
 #: The window actions that need no window of their own (``undo`` puts back whatever the journal holds).
 WINDOWLESS_ACTIONS: frozenset[str] = frozenset({"undo"})
 
@@ -1435,7 +1438,7 @@ class ExecResult:
 __all__ = [
     "send_text_error", "LINE_SEND_TEXT", "join_target_error", "join_slot_error", "LINE_JOIN_UNKNOWN",
     "ACT_VERBS", "READ_VERBS", "VERBS", "KINDS", "COMMITS", "SKILL_PROBES", "GENERIC_PROBES", "PROBES", "PROBE_ARGS",
-    "ENGINE_ONLY_PROBES", "LOOK_WHATS", "WINDOW_ACTIONS", "PLACE_ACTION", "PLACE_HOWS", "TIDY_ACTIONS",
+    "ENGINE_ONLY_PROBES", "LOOK_WHATS", "WINDOW_ACTIONS", "PLACE_ACTION", "PLACE_ACTIONS", "PLACE_HOWS", "TIDY_ACTIONS",
     "WINDOWLESS_ACTIONS", "place_spec", "window_op", "TAB_ACTIONS", "MEMORY_KINDS", "VERB_FIELDS", "PLAN_TOOL",
     "STEPS_ROUTE", "SKILL_ROUTE_PREFIX", "MAX_STEPS", "plan_schema", "Target", "Consent", "Probe", "Element", "Step",
     "Plan", "PlanError", "Checks", "required_probe", "parse_header", "parse_step", "validate_plan", "finish_plan",

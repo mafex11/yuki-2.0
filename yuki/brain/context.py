@@ -225,6 +225,29 @@ SITUATION_LOOK_CHARS = 3000
 #: disabled (and the dialog), and the apps running with no window (``windows.format_overview``'s fixed markers).
 _LIST_FLAGS = (" BLOCKED by [", " DISABLED", " DIALOG for [")
 _LIST_BACKGROUND = "running with no open window:"
+#: Review L4: the windows a busy desk's plain words left out keep their ids, in one line of at most this many
+#: characters ("Also open: [id] App, [id] App (minimised), ... and N more").
+ALSO_OPEN_CHARS = 400
+
+
+def also_open(windows: Sequence[Any], limit: int = ALSO_OPEN_CHARS) -> str:
+    """One line naming ``windows`` (the desk's windows its plain words left out) by id and app, so the hands can still
+    aim at them; ``""`` when there are none. Never raises."""
+    try:
+        from yuki.perception.situation import name_of
+
+        names = [name_of(w, title=False) + (" (minimised)" if getattr(w, "minimized", False) else "")
+                 for w in windows]
+    except Exception:  # noqa: BLE001
+        return ""
+    head, out = "Also open: ", []
+    for i, name in enumerate(names):
+        more = len(names) - i - 1
+        tail = f" and {more} more" if more else ""
+        if len(head) + len(", ".join([*out, name])) + len(tail) > limit:
+            return f"{head}{', '.join(out)} and {len(names) - i} more" if out else ""
+        out.append(name)
+    return f"{head}{', '.join(out)}" if out else ""
 
 
 def desk_text(text: str, payload: Any, *, limit: int, situation_chars: int = SITUATION_CHARS) -> str:
@@ -252,7 +275,8 @@ def desk_text(text: str, payload: Any, *, limit: int, situation_chars: int = SIT
         lines = head.splitlines()
         keep = [ln for ln in lines[1:] if ln.startswith("[") and any(f in ln for f in _LIST_FLAGS)]
         keep += [ln for ln in lines[1:] if ln.startswith(_LIST_BACKGROUND)]
-        body = "\n".join([*lines[:1], desk, *keep])
+        also = also_open([w for w in state.windows if f"[{w.hwnd}]" not in desk], ALSO_OPEN_CHARS)
+        body = "\n".join([*lines[:1], desk, *([also] if also else []), *keep])
         room = limit - len(body) - 2
         if now.strip() and room > 200:
             body = f"{body}\n\n{clip(now, room)}"
@@ -1329,17 +1353,18 @@ KEEP_THEIRS = ("Keep their screen theirs: undo your own side effects with one un
 
 def tidy_report(plan: Plan | None, line: str, after: str, *, nonce: str, ask: bool = False, steps: int = 2) -> str:
     """P1.3: a done plan's acts took something the user had (the executor's after-look: a window in front, playing or
-    with the keyboard covered, the front taken, a pop-up left). Code's line is held; the planner gets the "After:"
-    block (fenced: it holds window titles) and the principle, for at most ``steps`` undoable window steps or the one
-    word that nothing needs undoing. ``ask``: the user's tidy dial asks first. Code-written."""
+    with the keyboard covered, the front taken, a pop-up left). Code's line was just said; the planner gets the
+    "After:" block (fenced: it holds window titles) and the principle, for one reply: at most ``steps`` undoable window
+    steps on its own windows, or the one word that nothing needs undoing. ``ask``: the user's tidy dial asks first.
+    Code-written."""
     pid = plan.id if plan else "null"
     told = "they are asked first, " if ask else ""
     return "\n".join([
-        f"{CHECK_LABEL} Plan {pid} is done; Yuki's line, not said yet: {one_line(line, 200)}",
+        f"{CHECK_LABEL} Plan {pid} is done; Yuki said: {one_line(line, 200)}",
         fence(after, source="the desk before and after your acts", nonce=nonce),
-        f"{KEEP_THEIRS} A change marked (not from your act) is theirs. To undo one of yours: plan kind act, at most "
-        f"{steps} window_action steps (place your window, focus_back the one that was in front, or undo), done none; "
-        f"{told}code says each in a few words after Yuki's line. Else reply with the one word {REST_DONE_WORD}."])
+        f"{KEEP_THEIRS} A change marked (not from your act) is theirs. One reply: to undo one of yours, plan kind act, "
+        f"at most {steps} window_action steps (place a window your acts brought up, focus_back the one that was in "
+        f"front), done none; {told}code says each in a few words. Else the one word {REST_DONE_WORD}."])
 
 
 def text_back_report(plan: Plan | None, line: str) -> str:
@@ -1387,7 +1412,7 @@ def answer_report(question: str, answer: str | None) -> str:
     return f"{CHECK_LABEL} You asked: {question}\n{ANSWER_LABEL}: {answer}"
 
 
-__all__ = ["KEEP_THEIRS", "SITUATION_CHARS", "desk_text", "tidy_report",
+__all__ = ["ALSO_OPEN_CHARS", "KEEP_THEIRS", "SITUATION_CHARS", "also_open", "desk_text", "tidy_report",
            "Gathered", "gather", "read_overview", "read_you", "read_people", "read_places", "Places", "channel_known",
            "PLACES_LABEL", "read_profile_parts", "read_card", "beside_card", "CARD_LABEL", "understanding_block",
            "UNDERSTANDING_LABEL", "read_menu",

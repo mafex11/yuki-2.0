@@ -75,7 +75,7 @@ control's name and role as a read shows it, or [id] from a look. Never coordinat
 can be read.
 - say (voice): only on a slow step.
 - Keep their screen theirs. When they watch or work on one screen, what you bring forward goes on another \
-(place, in a window_action or a run_skill). Undo your own side effects (place, focus_back, undo).
+(place, in a window_action or a run_skill). Undo your own side effects (place, focus_back).
 - done is the probe that reads what their words were for, not only the literal ask, to its last part; steps \
 doing a part end with a look. \
 Code says the result line from what the checks saw; never write a done sentence. done none only when no probe \

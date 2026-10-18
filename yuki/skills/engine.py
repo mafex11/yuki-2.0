@@ -610,6 +610,26 @@ def place_hint(value: Any) -> tuple[str, str] | None:
         return None
 
 
+def place_arg(skill_key: str, args: Mapping[str, Any], slots: Mapping[str, Any]
+              ) -> tuple[tuple[str, str] | None, Mapping[str, Any]]:
+    """A run's place hint and its slots without it: ``args["place"]`` (the planner's run_skill), else ``slots["place"]``
+    (the talker's run_skill has free-form slots and no place field) when the skill has no slot of that name; that
+    entry then leaves the slots, so the resolver never reads it as a value. ``(None, slots)`` when there is none."""
+    value = args.get("place")
+    if value in (None, "") and "place" in slots:
+        try:
+            from yuki.skills.catalog import load
+
+            skill = load().get(str(skill_key or ""))
+            own = bool(skill and any(getattr(sl, "name", "") == "place" for sl in skill.slots))
+        except Exception:  # noqa: BLE001 - unknown: the slot stays a slot
+            own = True
+        if not own:
+            value = slots.get("place")
+            slots = {k: v for k, v in slots.items() if k != "place"}
+    return place_hint(value), slots
+
+
 def place_for(ctx: RunContext | None, hwnd: int, *, activate: bool) -> bool:
     """Put the run's app window where its place hint says (:attr:`RunContext.place`; ``yuki.actions.place``: gated,
     verified by its monitor, journaled in the request's group so "put it back" undoes it). Called as soon as the
@@ -2159,12 +2179,12 @@ def run_for_voice(hands: Any, args: Mapping[str, Any], words: list[str], *, game
     the live facts at resolve time (review r2 L5: every rung's D17 re-check reads the game itself, fresh). The
     talker's ``corrects`` flag, with the same values, marks the skill's last "done" false (D19). ``on_focus``: the
     acting marker, published only right before a rung that takes focus (sound-only rungs publish none, D18)."""
+    key = str(args.get("skill") or "")
+    hint, slots = place_arg(key, args, args.get("slots") if isinstance(args.get("slots"), Mapping) else {})
     ctx = RunContext(origin="voice", words=[str(w) for w in words or []], memory=getattr(hands, "memory", None),
                      hands=hands, log=log, request_id=request_id, on_focus=on_focus,
-                     session_id=getattr(getattr(hands, "memory", None), "session_id", None),
-                     place=place_hint(args.get("place")))
-    result = resolve_and_run(str(args.get("skill") or ""), args.get("slots") if isinstance(args.get("slots"), Mapping)
-                             else {}, ctx.words, ctx, again=bool(args.get("again")), settings=settings, live=live,
+                     session_id=getattr(getattr(hands, "memory", None), "session_id", None), place=hint)
+    result = resolve_and_run(key, slots, ctx.words, ctx, again=bool(args.get("again")), settings=settings, live=live,
                              corrects=bool(args.get("corrects")), game_answer=game)
     ok, report, facts = result.as_voice()
     facts["corrects"] = bool(args.get("corrects"))
@@ -2187,10 +2207,10 @@ def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = 
     used only when :func:`yuki.skills.uia_route.send_grant` finds it is the one these desk hands hold now, for this
     request and skill, a send with its text and person id, and these slots give exactly its text and person
     (:attr:`RunContext.grant`, failure fix-plan Item 11's L2)."""
-    slots = args.get("slots") if isinstance(args.get("slots"), Mapping) else {}
+    hint, slots = place_arg(str(args.get("skill") or ""), args,
+                            args.get("slots") if isinstance(args.get("slots"), Mapping) else {})
     ctx = RunContext(origin="thinker", words=[str(w) for w in words or []], memory=memory, log=log,
-                     request_id=request_id, game=game, verbs=dict(verbs or {}), hands=hands,
-                     place=place_hint(args.get("place")))
+                     request_id=request_id, game=game, verbs=dict(verbs or {}), hands=hands, place=hint)
     ctx.grant = _thinker_grant(grant, ctx, str(args.get("skill") or ""), slots)
     return resolve_and_run(str(args.get("skill") or ""), slots, ctx.words, ctx, again=bool(args.get("again")),
                            settings=settings, corrects=bool(args.get("corrects")), earlier=earlier)
@@ -2202,5 +2222,5 @@ __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_O
            "HANDOFF_ORIGINS", "FROM_UNHEARD", "FROM_GIVEN", "SEEN_MAX", "COMMIT_BY_END", "COMMIT_BY_NEED", "commit_for",
            "run_commit", "served_commit", "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult",
            "VERB_FUNCS", "open_uri", "pinned", "SEED_KEYS", "plan_seed", "run", "resolve_and_run", "run_for_voice",
-           "run_for_thinker", "granted_values", "place_hint", "place_for",
+           "run_for_thinker", "granted_values", "place_arg", "place_hint", "place_for",
            "CHOICE_SLOTS", "CHOOSE_TIMEOUT_S", "HELD_CALL", "asks_choice"]
