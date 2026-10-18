@@ -19,11 +19,17 @@ does not need to decide.
 **Types** (:data:`TYPES`; the ledger key is ``type``): ``reminder``, ``confirm``, ``asked`` (deadline and user-asked);
 ``checkin:day_start`` (the Today card's head), ``checkin:followup``, ``checkin:evening``, ``checkin:care``,
 ``checkin:new_thread``; ``session:break``, ``session:callback``; ``stuck``, ``recap``, ``followup``, ``plans``;
-``thread``, ``question``, ``work``, ``review`` (lasting: the Today card's lines); the judge's own ``today`` and
+``thread``, ``question``, ``work``, ``review`` (lasting: the Today card's lines; phase 3, 3.4: today's dated items
+lead it, :func:`dated_today`, as ``plans`` lines); the judge's own ``today`` and
 ``away``; ``routine`` (jSwitch: the "Your usual" card, :meth:`yuki.memory.routine_offers.RoutineLane.candidates`,
 live only); and ``usual`` (18 Oct: media the user measurably puts on around this time of day, :func:`gen_usual`, with a
 button that runs the skill). Not ported (question 2): ``notice`` (milestone:
 "you just finished X") and ``recall`` (the screen meets something memory holds: screen trivia).
+
+**What a call promise is about** (phase 3, 3.4): a plan the user said on a call is a card question (a confirm, a
+plans card, a follow-up, a Today line) only once the commitments check found what it is about
+(:func:`yuki.memory.commitments.about_known`): "You said you'd play tomorrow, still on?" with no idea what is never
+shown.
 
 **The check-in guard** (:func:`guard_ok`): a check-in rests on a goal or thread id, or a measured day anchor (``DAY`` /
 ``HOURS``) - never on screen content. ``checkin:followup``'s "a day they named passed" rule rests on the user's own
@@ -107,6 +113,8 @@ SEEN_STATE = "judge_seen"
 SEEN_KEEP_S = 30 * 86400.0
 #: A Today line is code text of at most this many characters.
 DIGEST_LINE_CHARS = 120
+#: Today's dated items (phase 3, 3.4): at most this many lead the Today card.
+DATED_MAX = 3
 #: A card's code text is clipped to this.
 TEXT_CHARS = 300
 #: Timing classes a type in mode ``best`` may show at.
@@ -195,6 +203,7 @@ class Candidate:
     seen_within: float = SEEN_KEEP_S
     seen_keys: tuple[str, ...] = ()   # more marks to set once it is shown or queued (content-free ids)
     seen_n: int = 0                   # the number kept with the mark (stuck: the newest fact id)
+    lead: bool = False                # phase 3 (3.4): a Today line that leads the card (today's dated item)
 
     @property
     def info(self) -> TypeInfo:
@@ -321,6 +330,7 @@ class Context:
         self._items: list[Any] | None = None
         self._goals: list[Any] | None = None
         self._events: list[dict[str, Any]] | None = None
+        self._referents: dict[int, dict[str, Any]] | None = None
 
     def deadline(self, at: float | None) -> None:
         if at is not None and float(at) > self.now:
@@ -346,6 +356,27 @@ class Context:
             except Exception:  # noqa: BLE001
                 self._goals = []
         return self._goals
+
+    @property
+    def referents(self) -> dict[int, dict[str, Any]]:
+        """What each call promise is about, as the commitments check judged it (read once; content-free)."""
+        if self._referents is None:
+            try:
+                from yuki.memory.commitments import referent_states
+
+                self._referents = referent_states(self.store)
+            except Exception:  # noqa: BLE001 - an older build without it: nothing judged, no call promise asked
+                self._referents = {}
+        return self._referents
+
+    def asks_ok(self, item: Any) -> bool:
+        """Whether a list item may be a card question: anything but a call promise not known to be about something
+        (:func:`yuki.memory.commitments.about_known`)."""
+        try:
+            from yuki.memory.commitments import about_known
+        except Exception:  # noqa: BLE001
+            return getattr(item, "source", None) != "call"
+        return about_known(self.referents, getattr(item, "ref", None), getattr(item, "source", None))
 
     @property
     def events(self) -> list[dict[str, Any]]:
@@ -430,6 +461,7 @@ def gen_reminders(ctx: Context) -> list[Candidate]:
     now = ctx.now
     late = float(cfg.reminder_late_max_h) * 3600.0
     lead = float(cfg.confirm_lead_min) * 60.0
+    today = user_day(now, cfg.resume_day_start)   # 3.4: a card about an item shown today is its Today line's mention
     for item in ctx.items:
         if item.due_at is None or item.source == "loop":
             continue
@@ -439,7 +471,7 @@ def gen_reminders(ctx: Context) -> list[Candidate]:
         title = _clip(item.title, TEXT_CHARS)
         when = _when(at, now, bool(item.all_day))
         if item.source in ("call", "chat"):   # the user's own plan: Yuki asks before it reminds
-            if at - now < lead:
+            if at - now < lead or not ctx.asks_ok(item):   # 3.4: a call promise once known what it is about
                 continue
             key = f"confirm:{item.ref}:{int(item.due_at)}"
             if ctx.seen.looked(key, now) or (ctx.live and ctx.store.reminded(item.ref, item.due_at)):
@@ -450,7 +482,8 @@ def gen_reminders(ctx: Context) -> list[Candidate]:
                 confidence=0.8, refs={"item": item.ref, "due_at": float(item.due_at), "source": item.source},
                 evidence={item.ref: float(item.since or now)},
                 text=(f"{said}: {title} ({when}). Want a reminder?" if title else None), needs_writer=not title,
-                offer_channel="reminder", why=f"confirm lead_h={(at - now) / 3600.0:.1f} titled={int(bool(title))}"))
+                offer_channel="reminder", seen_keys=(f"dated:{item.ref}:{today}",),
+                why=f"confirm lead_h={(at - now) / 3600.0:.1f} titled={int(bool(title))}"))
         elif at <= now:
             key = f"reminder:{item.ref}:{int(item.due_at)}"
             if ctx.seen.looked(key, now) or (ctx.live and ctx.store.reminded(item.ref, item.due_at)):
@@ -463,7 +496,8 @@ def gen_reminders(ctx: Context) -> list[Candidate]:
                       "all_day": bool(item.all_day)},
                 evidence={item.ref: float(item.since or at)},
                 text=(f"Reminder ({hm}): {title}" if title else None), needs_writer=not title,
-                offer_channel="reminder", why=f"reminder late_min={(now - at) / 60.0:.0f} titled={int(bool(title))}"))
+                offer_channel="reminder", seen_keys=(f"dated:{item.ref}:{today}",),
+                why=f"reminder late_min={(now - at) / 60.0:.0f} titled={int(bool(title))}"))
         else:
             ctx.deadline(at)
     return out
@@ -651,7 +685,7 @@ def gen_followup_checkin(ctx: Context) -> list[Candidate]:
         elif g.due_at and now - g.due_at < DEADLINE_AFTER_S:
             ctx.deadline(g.due_at + DEADLINE_AFTER_S)
     for i in ctx.items:
-        if i.owner != "user" or i.due_at is None:
+        if i.owner != "user" or i.due_at is None or not ctx.asks_ok(i):
             continue
         if DEADLINE_AFTER_S <= now - i.due_at <= DEADLINE_WITHIN_S:
             key = f"checkin:followup:{i.ref}:due"
@@ -1009,11 +1043,16 @@ def gen_plans(ctx: Context) -> list[Candidate]:
     code ("Coming up: ...").
 
     Differences: an event's ``asked`` flag is read only live; a plan that also has a ``confirm`` candidate is left to
-    the confirm (one card about one plan, :func:`generate`)."""
+    the confirm (one card about one plan, :func:`generate`). Phase 3 (3.4): today's dated items (:func:`dated_today`)
+    come with it; a plan with a dated line this pass gets no plans card, and a plans card shown marks today's dated
+    line for it seen (one mention per plan a day)."""
     now = ctx.now
+    dated = dated_today(ctx)
+    dated_refs = {c.refs.get("item") or c.refs.get("plan") for c in dated}
+    today = user_day(now, ctx.config.resume_day_start)
     cands: list[dict[str, Any]] = []
     for item in ctx.items:
-        if item.due_at is None or item.source not in ("call", "chat"):
+        if item.due_at is None or item.source not in ("call", "chat") or not ctx.asks_ok(item):
             continue
         day0 = datetime.fromtimestamp(item.due_at).replace(hour=0, minute=0, second=0).timestamp()
         cands.append({"ref": item.ref, "at": day0 if item.all_day else float(item.due_at), "all_day": bool(item.all_day),
@@ -1049,7 +1088,7 @@ def gen_plans(ctx: Context) -> list[Candidate]:
         if any(abs(t - c["due"]) <= PLANS_TODO_NEAR_S for t in todos):
             continue   # a timed to-do of theirs already sits by it
         key = f"plans:{c['ref']}"
-        if ctx.seen.looked(key, now, PLANS_AGAIN_S) or c["ref"] in answered:
+        if ctx.seen.looked(key, now, PLANS_AGAIN_S) or c["ref"] in answered or c["ref"] in dated_refs:
             continue
         when = _when(c["due"], now, c["all_day"])
         return [Candidate("plans", key, created_at=now, expires_at=c["at"] - PLANS_MIN_LEAD_S, home="card",
@@ -1057,8 +1096,71 @@ def gen_plans(ctx: Context) -> list[Candidate]:
                           digest_line=(lambda w=c["words"], d=when: _clip(f"Coming up: {_clip(resolve(w), 80)} ({d})",
                                                                          DIGEST_LINE_CHARS)),
                           needs_writer=True, offer_channel="plans", seen_within=PLANS_AGAIN_S,
-                          why=f"plans lead_h={lead / 3600.0:.1f} all_day={int(c['all_day'])}")]
-    return []
+                          seen_keys=(f"dated:{c['ref']}:{today}",),
+                          why=f"plans lead_h={lead / 3600.0:.1f} all_day={int(c['all_day'])}"), *dated]
+    return dated
+
+
+def dated_today(ctx: Context) -> list[Candidate]:
+    """Today's dated items, the Today card's leading lines (phase 3, 3.4; 18 Oct: the card spent a line on reply counts
+    while a plan for that day waited): the user's own open list items (a plan said on a call or told Yuki, a to-do of
+    theirs) due today, a goal for today, a personal event today. "Today" is the user's day (``resume_day_start``); an
+    all-day item by its date, a timed one only while still ahead. A call promise only once known what it is about
+    (:meth:`Context.asks_ok`). The same words twice (an event and the promise it came from) are one line (identity,
+    case folded). Code text "Today: <title>[ at HH:MM]", type ``plans`` (its ledger and toggle), home ``digest``,
+    ``lead`` (first on the card), timed ones first; at most :data:`DATED_MAX`. Each once a day; shown, it marks its
+    plans card seen (one mention per plan). Content-free ``why``."""
+    now = ctx.now
+    day = user_day(now, ctx.config.resume_day_start)
+    start = day_boundary(day, ctx.config.resume_day_start)
+    end = start + 86400.0
+    found: list[tuple[int, float, str, dict[str, Any], Any]] = []   # (all day, when, ref, refs, words)
+
+    def add(ref: str, refs: dict[str, Any], at: float | None, all_day: bool, words: Any) -> None:
+        if at is None:
+            return
+        if all_day:
+            if datetime.fromtimestamp(float(at)).strftime("%Y-%m-%d") != day:
+                return
+        elif not (start <= float(at) < end) or float(at) < now:
+            return
+        found.append((int(bool(all_day)), float(at), ref, refs, words))
+
+    for item in ctx.items:
+        if item.due_at is None or item.source not in ("call", "chat", "user") or not ctx.asks_ok(item):
+            continue
+        add(item.ref, {"item": item.ref}, item.due_at, bool(item.all_day), lambda i=item: i.title or i.text)
+    for g in ctx.goals:
+        if g.due_at is not None:
+            add(g.ref, {"plan": g.ref}, float(g.due_at), False, lambda g=g: g.text)
+        elif g.day:
+            try:
+                at = datetime.strptime(g.day, "%Y-%m-%d").timestamp()
+            except ValueError:
+                continue
+            add(g.ref, {"plan": g.ref}, at, True, lambda g=g: g.text)
+    for ev in ctx.events:
+        if ev.get("at"):
+            ref = f"event:{ev.get('id')}"
+            add(ref, {"plan": ref}, float(ev["at"]), bool(ev.get("all_day")), lambda e=ev: e.get("what"))
+    out: list[Candidate] = []
+    said: set[str] = set()
+    for all_day, at, ref, refs, words in sorted(found, key=lambda f: (f[0], f[1])):
+        key = f"dated:{ref}:{day}"
+        if ctx.seen.looked(key, now, 86400.0):
+            continue
+        text = _clip(resolve(words), 80)
+        if not text or text.casefold() in said:
+            continue
+        said.add(text.casefold())
+        line = f"Today: {text}" + ("" if all_day else f" at {datetime.fromtimestamp(at):%H:%M}")
+        out.append(Candidate("plans", key, created_at=now, expires_at=end, home="digest", confidence=0.9, refs=refs,
+                             evidence={"PLAN": at}, digest_line=_clip(line, DIGEST_LINE_CHARS), lead=True,
+                             seen_within=86400.0, seen_keys=(f"plans:{ref}",),
+                             why=f"dated all_day={all_day}"))
+        if len(out) >= DATED_MAX:
+            break
+    return out
 
 
 def _confirm_answered(store: Any, now: float) -> set[str]:
@@ -1484,8 +1586,9 @@ CALL_UNKNOWN_GENERATORS: tuple[str, ...] = ("reminder", "asked")
 
 
 def generate(ctx: Context, *, only: Iterable[str] | None = None) -> list[Candidate]:
-    """Every candidate open now, deduped by key (one card about one plan: a ``plans`` candidate yields to a ``confirm``
-    on the same item). Each generator is wrapped: an error is counted in ``ctx.errors`` (content-free), never raised."""
+    """Every candidate open now, deduped by key (one card about one plan: a ``plans`` candidate - its card, or today's
+    dated line for an item - yields to a ``confirm`` or a ``reminder`` on the same item). Each generator is wrapped: an
+    error is counted in ``ctx.errors`` (content-free), never raised."""
     wanted = set(only) if only is not None else None
     out: list[Candidate] = []
     for name, fn, every in GENERATORS:
@@ -1505,10 +1608,12 @@ def generate(ctx: Context, *, only: Iterable[str] | None = None) -> list[Candida
             continue
         out += got
     confirmed = {c.refs.get("item") for c in out if c.type == "confirm"}
+    carded = confirmed | {c.refs.get("item") for c in out if c.type == "reminder"}
     seen: set[str] = set()
     pile: list[Candidate] = []
     for c in out:
-        if c.key in seen or (c.type == "plans" and c.refs.get("plan") in confirmed):
+        if c.key in seen or (c.type == "plans" and (c.refs.get("plan") in confirmed
+                                                     or (c.lead and c.refs.get("item") in carded))):
             continue
         seen.add(c.key)
         pile.append(c)
