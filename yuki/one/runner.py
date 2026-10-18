@@ -274,6 +274,8 @@ class RunState:
     lines: set[str] = field(default_factory=set)
     nonce: str = field(default_factory=lambda: secrets.token_hex(4))
     acted: bool = False
+    #: The turn's call order on the driver's event loop (:meth:`Runner.arun`): ``(loop, asyncio.Lock)``.
+    order: tuple[Any, Any] | None = None
 
 
 def state_of(turn: Any) -> RunState:
@@ -583,15 +585,25 @@ class Runner:
                                evidence={"why": "Yuki's runner broke on this call"}, owed=OWED_LINES[FAILED])
             self._emit("one_run_error", tool=name, error=type(exc).__name__)
         result.ms = (time.perf_counter() - started) * 1000.0
-        state.results.append(result)
         budget = getattr(turn, "budget", None)
+        if budget is not None and budget.late() and not result.settle:
+            # the turn was closed while this ran (the hard stop): its result settles silently (code said the owed line)
+            result.settle, result.silent = True, True
+        state.results.append(result)
         self._emit("one_run", **result.facts(), **(budget.facts() if budget is not None else {}))
         return result
 
     async def arun(self, name: str, args: Mapping[str, Any] | None, turn: policy.Turn,
                    speak: Callable[[str], Any] | None = None) -> OneResult:
-        """:meth:`run` on a worker thread (never on the event loop)."""
-        return await asyncio.to_thread(self.run, name, args, turn, speak)
+        """:meth:`run` on a worker thread (never on the event loop), the turn's calls one after another in the order
+        they arrived (Pipecat starts a reply's calls side by side, in the order written; ``asyncio.Lock`` wakes its
+        waiters first come, first served: the hands' order gate, ``Hands._enter_order``)."""
+        state = state_of(turn)
+        loop = asyncio.get_running_loop()
+        if state.order is None or state.order[0] is not loop:
+            state.order = (loop, asyncio.Lock())
+        async with state.order[1]:
+            return await asyncio.to_thread(self.run, name, args, turn, speak)
 
     @staticmethod
     def answer(turn: policy.Turn, yes: bool) -> None:
@@ -605,7 +617,7 @@ class Runner:
         spec = T.spec_of(name)
         budget = getattr(turn, "budget", None)
         if spec is None or turn.channel not in spec.channels or (budget is not None and budget.closed):
-            return self._refused(name, policy.gate(name, args, {}, turn), say, state)
+            return self._refused(name, policy.gate(name, args, {}, turn), say, state, turn)
         if name == "scroll" and args.get("keep") == "stop":
             # stopping Yuki's own scrolling always works (``hands._stop_scrolling``): a stop, not an act
             ok, report, facts = self.verbs.run(name, args)
@@ -614,7 +626,7 @@ class Runner:
         if spec.kind == T.CONTROL or name in DRIVER_TOOLS:
             decision = policy.gate(name, args, {}, turn)
             if not decision.allowed:
-                return self._refused(name, decision, say, state)
+                return self._refused(name, decision, say, state, turn)
             return OneResult(name, DRIVER, decision=decision, payload=dict(args), verb=decision.verb)
         if spec.kind == T.READ:
             return self._read(name, args, turn, state, say)
@@ -624,7 +636,8 @@ class Runner:
             return self._skill(args, turn, say, state)
         return self._act(name, args, turn, spec, say, state)
 
-    def _refused(self, name: str, decision: Any, say: Any, state: RunState) -> OneResult:
+    def _refused(self, name: str, decision: Any, say: Any, state: RunState,
+                 turn: policy.Turn | None = None) -> OneResult:
         """A call the gate did not allow: refused (its line; said by code when final or when it settles the turn) or
         asked (its question, for the agent to ask)."""
         kind = getattr(decision, "kind", policy.REFUSE)
@@ -636,10 +649,29 @@ class Runner:
         said = ""
         if line and not silent and (final or settle):
             said = self._say(line, say, state)
+        focus = getattr(decision, "focus", None)
+        if focus and getattr(decision, "kind", "") == policy.REFUSE and turn is not None:
+            self._bring_forward(int(focus), turn)
         return OneResult(name, status, verified=None, result=line if not final else "",
                          question=str(getattr(decision, "question", "") or ""), line=line, final=final,
                          settle=settle, silent=silent, said=said, decision=decision,
                          verb=str(getattr(decision, "verb", "") or ""), tidy=bool(getattr(decision, "tidy", False)))
+
+    def _bring_forward(self, hwnd: int, turn: policy.Turn) -> None:
+        """A refused join's window brought forward for the user's own click (``Executor._bring_forward``): never with a
+        game in front (read again), inside the desk lease and the acting marker. Never raises."""
+        try:
+            if rule.game_holds(rule.Live(game=rule.game_now(turn.board_now()))):
+                return
+            hands = getattr(self.verbs, "hands", None)
+            acting = hands._acting("window") if hands is not None and hasattr(hands, "_acting") else nullcontext()
+            with _Lease(turn, wanted=self.lease, wait_s=self.lease_wait_s) as lease:
+                if lease.got:
+                    with acting:
+                        self.dispatcher.dispatch("focus_window", {"hwnd": int(hwnd)})
+                    self._emit("one_forward", ok=True)
+        except Exception as exc:  # noqa: BLE001 - the refusal's line still says it
+            self._emit("one_forward", ok=False, error=type(exc).__name__)
 
     def _say(self, line: str, say: Any, state: RunState) -> str:
         """Code's line, said once a turn (``""``: nothing said)."""
@@ -662,7 +694,7 @@ class Runner:
         facts = self._facts_of(args.get("window"))
         decision = policy.gate(name, args, facts, turn)
         if not decision.allowed:
-            return self._refused(name, decision, say, state)
+            return self._refused(name, decision, say, state, turn)
         got = reads.read(name, args, dispatcher=self.dispatcher, memory=self.memory, words=" / ".join(turn.words),
                          nonce=state.nonce, channel=turn.channel, menu=self.menu)
         if got.ok and got.tool == "look_at_desktop" and isinstance(got.payload, Mapping):
@@ -673,7 +705,7 @@ class Runner:
     def _write(self, name: str, args: dict[str, Any], turn: policy.Turn, state: RunState, say: Any) -> OneResult:
         decision = policy.gate(name, args, {}, turn)
         if not decision.allowed:
-            return self._refused(name, decision, say, state)
+            return self._refused(name, decision, say, state, turn)
         if name == "keep_usual":
             ok, line, facts = self.verbs.run("keep_usual", args)
             said = self._say(line, say, state) if ok and line else ""
@@ -724,7 +756,7 @@ class Runner:
                 spend = budget.refused(decision.line if decision.final else "")
                 if spend.settle:
                     decision = replace(decision, settle=True, line=spend.line)
-            return self._refused(name, decision, say, state)
+            return self._refused(name, decision, say, state, turn)
         resolved = dict(ctx.resolved or args)
         then = T.then_of(args)
         verified = facts.get("verified")
@@ -737,7 +769,8 @@ class Runner:
             status = REFUSED if facts.get("refused") or not facts.get("sent_at") else status
         said = ""
         line = ""
-        if status == DONE and not then:
+        late = budget is not None and budget.late()   # closed by the hard stop while it ran: nothing more is said
+        if status == DONE and not then and not late:
             given = args.get("say_when_done") if name != "run_skill" else None
             line = (done_line if done_line is not None else
                     (_words(given) if given is not None else self.verbs.code_line(name, resolved, facts)))
@@ -903,7 +936,7 @@ class Runner:
         ctx.skill_app = app
         decision = ctx.check("run_skill", args, {"app": app})
         if not decision.allowed:
-            return self._refused("run_skill", decision, say, state)
+            return self._refused("run_skill", decision, say, state, turn)
         run_args = {k: v for k, v in dict(decision.rewrite or args).items() if k != "consent"}
         drafted = decision.rewrite is not None
         counted = False
