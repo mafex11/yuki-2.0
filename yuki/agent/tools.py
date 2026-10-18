@@ -4678,6 +4678,13 @@ class Dispatcher:
             # bExec merge note 7: the engine's own done line whole (the summary is cut at 200 characters; a done line
             # with the fresh uploads named can be longer), read by ``brain.done.engine_line``
             payload["done_line"] = result.done_line or result.say
+        elif result.evidence:
+            # Phase 2.3 (aResolve merge note): what a run that didn't end in a checked done tried, saw and is missing,
+            # for structured reading (the text's last line says the same); content: RAM only, never logged
+            payload["evidence"] = dict(result.evidence)
+        if result.guessed:
+            # Phase 2.1: the values Yuki guessed (slot, value, from); the done line already names them
+            payload["guessed"] = [dict(g) for g in result.guessed if isinstance(g, dict)]
         if blocked or result.held:
             payload["refused"] = details["refused"]
         return ToolOutcome(name="run_skill", ok=ok, summary=text.split("\n", 1)[0][:200],

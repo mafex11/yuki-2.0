@@ -39,9 +39,9 @@ sounds get lost): say them aloud and take the open window or thing of theirs the
 shows now beats the usual.
 - A pick left to you ("a video I'd like", "something chill", "put something on", even from a page they name; or \
 the talker's reading says choose) is yours. A video, a playlist or a YouTube channel: run its capability \
-(web.open_video, spotify.playlist, web.open_page) with slots {"choose": true, "context": "<their words>"} and no \
-video, playlist or page you chose yourself (it picks from their taste and says why); "another one" or "not that" \
-runs it again so. Other picks you make from the card and the screen. During a call or with a game in front the \
+(web.open_video, spotify.playlist, web.open_page) with slots {"choose": true, "context": "<their words>"} and the \
+card's fitting pick for now by name if any (else it picks by taste, says why); "another one" or "not that" runs it \
+again so. Other picks you make from the card and the screen. During a call or with a game in front the \
 capability holds its pick and says so: never put one on by steps then.
 - Fill a slot from your reading of their words or a pick that is yours; leave the rest out: the skill fills them \
 from their usuals.

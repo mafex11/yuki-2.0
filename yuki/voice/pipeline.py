@@ -4152,9 +4152,12 @@ class Conversation:
         state = act_state(tool, ok, facts)
         rec.update(state=state, verified=verified, report=str(report or "")[:400], facts=facts,
                    done_at=time.monotonic(), ms=ms, sent_at=facts.get("sent_at"))
+        # phase 2.3 (aResolve merge note): a skill's non-success report ends with its Evidence line; the action log and
+        # the step strip keep only the first line (``rec["report"]``, the talker's, keeps it whole)
+        first_line = str(report or "").split("\n", 1)[0] if tool == "run_skill" else str(report or "")
         if not skipped:
             try:
-                hands.actions.add("your reflex", rec["what"], str(report or "")[:400], ok=bool(ok),
+                hands.actions.add("your reflex", rec["what"], first_line[:400], ok=bool(ok),
                                   verified=facts.get("verified"))
             except Exception as exc:  # noqa: BLE001 - a record only, never the reflex's result (content-free log)
                 try:
@@ -4165,7 +4168,7 @@ class Conversation:
             on_step = getattr(hands, "on_step", None)
             if callable(on_step):
                 try:
-                    on_step(tool, rec["what"], verified, str(report or "")[:400], ms)
+                    on_step(tool, rec["what"], verified, first_line[:400], ms)
                 except Exception:  # noqa: BLE001 - the screen never breaks a hand
                     pass
             if tool != "run_skill" and callable(getattr(hands, "_trace", None)):

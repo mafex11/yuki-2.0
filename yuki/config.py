@@ -738,7 +738,7 @@ class Settings:
     skills: bool = field(default_factory=lambda: skills_mode() != "off")
     skills_learned: bool = field(default_factory=lambda: skills_mode() == "on")
     skills_max: int = 20
-    skills_menu_chars: int = 2400
+    skills_menu_chars: int = 2322
     skills_disable_after: int = 2
     skills_volume_step: int = 10
     youtube_feed_budget_s: float = 1.5
@@ -846,6 +846,9 @@ class Settings:
     #: request logs).
     brain_effort_voice: str = "low"
     brain_effort_typed: str = "low"
+    #: aBrain (phase 2.5): how the planner's effort is chosen (``yuki.brain.settings``): ``auto`` (from the request's
+    #: structure), ``fixed`` (the two settings above) or a level for both; ``""``: ``YUKI_BRAIN_EFFORT``, else ``auto``.
+    brain_effort_rule: str = ""
     #: Act plans: replans after a step did not match (the call budget bounds the rest).
     brain_max_replans: int = 3
     #: The commit check's model (one small yes/no call per plan, only on steps that could send, delete, buy, close or
@@ -869,6 +872,7 @@ class Settings:
         self.skills_learned = bool(self.skills and self.skills_learned)
         self.brain_effort_voice = _soft_effort(self.brain_effort_voice)
         self.brain_effort_typed = _soft_effort(self.brain_effort_typed)
+        self.brain_effort_rule = str(self.brain_effort_rule or "").strip().lower()
         self.brain_max_replans = max(0, int(self.brain_max_replans or 0))
         self.model = resolve_model(self.model)
         self.effort = resolve_effort(self.effort)

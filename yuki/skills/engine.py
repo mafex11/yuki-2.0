@@ -2081,8 +2081,9 @@ def _choice_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunCon
     (:func:`yuki.skills.taste.choose`) and the run plays its pick: a video (``web.open_video``; ``web.open_page`` on
     YouTube's front page asked to choose becomes it: "put something on YouTube" plays), a channel's page
     (``web.open_page`` on a channel page kind), a playlist of the user's own (``spotify.playlist``). A video or playlist
-    text given with it counts only when it stands in their words and IS one of their channels or playlists
-    (``taste._same_name``); asked to choose, any other text given is their words for the judgement and the pick is free
+    text given with it counts when it IS one of their channels or playlists (``taste._same_name``) and stands in their
+    words, or, asked to choose, when they never said it (the card's pick for now: Yuki's own, ``taste.FROM_CARD``, a
+    guess; phase 2.2); asked to choose, any other text given is their words for the judgement and the pick is free
     (review M1); not asked, it goes the normal way (review H2: "the Sidemen video about the island" is a search, never
     Sidemen's newest). With a game in front nothing is put on; with a call live nothing Yuki chose is put on (a channel
     they named plays, review L4): the result says so and keeps the pick for later (:func:`taste.held_line`,
@@ -2106,6 +2107,7 @@ def _choice_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunCon
         return None
     bound = dict(getattr(skill, "bound", None) or {})
     only = ""
+    source = ""                    # phase 2.2: taste.FROM_CARD for a name under choose they never said (Yuki's pick)
     key = skill.key
     if cap == "web.open_page":
         from yuki.skills.youtube_feed import CHANNEL_PAGE, HANDLE_PAGE, HOME_PAGE, SITE
@@ -2131,7 +2133,10 @@ def _choice_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunCon
             from yuki.skills.uia_route import said
 
             if not said(name, ctx.words):
-                name = ""          # not their words: no constraint (asked), else the normal way as given
+                if asked:
+                    source = taste.FROM_CARD   # choose + a name they never said: the card's pick for now, Yuki's own
+                else:
+                    name = ""      # not asked: the normal way as given (2.1's reading path, e.g. "soccer" -> lumen)
             elif cap == "web.open_video" and _offered_pick(ctx, name):
                 return None        # an offered upload they picked ("the Deji one"): the offer's own path
         if name and (asked or cap == "web.open_video"):
@@ -2145,7 +2150,8 @@ def _choice_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunCon
     def pick(client: Any) -> Any:
         return taste.choose(_store_of(client), kind, words=list(ctx.words), context=context,
                             session=ctx.session_id, only=only, asked=asked, taste_kind=taste_kind, settings=settings,
-                            log=ctx.log, network=not hold, judge_wait_s=0.0 if hold else taste.CHOOSE_WAIT_S)
+                            log=ctx.log, network=not hold, judge_wait_s=0.0 if hold else taste.CHOOSE_WAIT_S,
+                            source=source)
 
     choice = _mem(ctx.memory, "taste_choose", pick, timeout_s=CHOOSE_TIMEOUT_S)
     if not asked and choice is None:

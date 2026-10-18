@@ -3046,16 +3046,26 @@ class VoiceBridge(QObject):
         request's), and one for a request that asked for something to be done when nothing was (v3.14b). Facts of the
         job's record and the text's own punctuation and machine formats, never what the words mean.
         """
+        v = job.verdict if isinstance(job.verdict, dict) else {}
+        if kind == "done" and job.brain_run and v.get("evidence") and not v.get("send") and not v.get("said_first"):
+            # Phase 2 (2.3, aBrain merge note 1): a brain ending that carries its evidence (not confirmed, failed,
+            # partial, stuck, refused, or likely with part of it unread) is the talker's to word from that evidence
+            # (:func:`result_payload` passes it as data); this line waits in the owed ledger as its fallback
+            # (``_owed_words``). The gate is the evidence, never the level: the brain attaches none to a send's or a
+            # join's ending (consent's words) or a tidy-up's (``said_first``), so those stay code's, word for word.
+            self._log("bridge", op="outcome_worded", job_id=job.job_id, said_by="talker", evidence=True,
+                      level=str(v.get("level") or "") or None)
+            return None
         if self.on_brain and self._results_by_code and kind == "done" and not job.remember and not job.superseded \
                 and ((job.brain_run and code_line(job.verdict)) or verdict_line(job.verdict, f"{head} {rest}")):
             # bTalk (design 3, "narrator re-voice off for code lines"): the brain's line after an act, or its own code
             # line, is voice-shaped and says no more than the check saw: said by code word for word, late or not.
-            # Phase 2 (2.3): only a success (checked or likely, whole): any other outcome (not confirmed, failed,
-            # partial, stuck, held, a refusal) is the talker's to word from the outcome's evidence, and this line
-            # waits in the owed ledger as its fallback (``_owed_words``). Review r1 M3: an outcome of a send (a lasting
-            # act: ``send`` set) keeps code's own line word for word, so no talker run can make it a "Sent."
-            lasting = isinstance(job.verdict, dict) and bool(job.verdict.get("send"))
-            if not success_line(job.verdict) and not lasting:
+            # Phase 2 (2.3): a brain run's line with no evidence (a success, a send or join, a tidy-up) stays here. The
+            # old loop's line: only a success (checked or likely, whole); any other outcome is the talker's, and this
+            # line waits in the owed ledger as its fallback (``_owed_words``). Review r1 M3: an outcome of a send (a
+            # lasting act: ``send`` set) keeps code's own line word for word, so no talker run can make it a "Sent."
+            lasting = bool(v.get("send"))
+            if not job.brain_run and not success_line(job.verdict) and not lasting:
                 self._log("bridge", op="outcome_worded", job_id=job.job_id, said_by="talker",
                           level=str((job.verdict or {}).get("level") or "") or None)
                 return None

@@ -3788,10 +3788,11 @@ class Hands:
                 facts = facts or {}
                 outcome = str(facts.get("outcome") or "") or "none"
                 if facts.get("verified") is True or facts.get("sent_at") is not None or facts.get("acted"):
+                    first_line = str(report).split("\n", 1)[0]   # phase 2.3: never the Evidence line
                     try:
                         self.actions.add("your hand", _what(SKILL_HAND, dict(args or {})),
                                          f"finished late, after the {self.SKILL_HAND_MAX_S:g} s wait: "
-                                         f"{str(report)[:300]}", ok=bool(ok), verified=facts.get("verified"))
+                                         f"{first_line[:300]}", ok=bool(ok), verified=facts.get("verified"))
                     except Exception as exc:  # noqa: BLE001 - a record never breaks a hand (content-free log)
                         if self.log is not None:
                             self.log.event("hands", op=SKILL_HAND, late=True, ledger_error=type(exc).__name__,
@@ -4013,7 +4014,10 @@ class Hands:
             self._skill_reply_log(params, name, ok, report, facts, ms, hand_id, line=False, fallback=None)
             await self._halted_result(params, report)
             return
-        record = self._keep_record(params, name, args, report, ok=ok, verified=facts.get("verified"),
+        # phase 2.3 (aResolve merge note): a non-success report ends with its Evidence line; the action log and the step
+        # strip keep only the first line (the talker's tool result keeps the whole report)
+        first_line = report.split("\n", 1)[0]
+        record = self._keep_record(params, name, args, first_line, ok=ok, verified=facts.get("verified"),
                                    turn=self._call_safely(self.user_turn, None))
         if record is not None and verified and facts.get("focus_taken"):
             # fHands (k_tab_close_it): a skill that opened a page leaves no tab identity of its own, so "close it" had
@@ -4022,7 +4026,8 @@ class Hands:
             self._place_record(record)
         if self.on_step is not None:
             try:
-                self.on_step(name, hand_words(name, args, facts.get("app")), bool(ok and verified), report[:400], ms)
+                self.on_step(name, hand_words(name, args, facts.get("app")), bool(ok and verified), first_line[:400],
+                             ms)
             except Exception:  # noqa: BLE001 - the screen never breaks a hand
                 pass
         can_pass = self.bridge is not None and callable(getattr(self.bridge, "escalate", None))

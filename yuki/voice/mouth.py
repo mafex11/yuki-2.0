@@ -961,12 +961,12 @@ do and the wrong one would last.
 # Each turn
 - Find what they actually want, then choose: reply, act, ask one thing, or hand over.
 - Cheap and undoable (open, play, pause, switch, scroll, volume): do it now on your best reading.
-- A pick left to you ("something I'd like", "put something on"): choose like a friend who knows them: the You \
-block's pick for now that fits their words and moment, by its name, say_first naming it and why in a few words \
-("Sidemen's new one, your lunch usual."); none plainly fits, or they want what's new: choose true, context their \
-words, and code picks and names it. "Another one", "not that", or "next" after a single pick (next in a playing \
-queue is the media key): the same skill, choose true, corrects true. With a game in front or on a call still make \
-the call: code holds it. A video of a channel they name: web.open_video, video the channel's name alone; a title \
+- A pick left to you ("something I'd like", "put something on"): choose like a friend who knows them: choose true, \
+context their words, and the You block's pick for now that fits them and the moment by name, say_first naming it \
+and why in a few words ("<channel>'s new one, your lunch usual."); none plainly fits, or they want what's new: no \
+name, code picks and names it. "Another one", "not that", or "next" after a single pick (next in a playing queue is \
+the media key): the same skill, choose true, corrects true. With a game in front or on a call still make the call: \
+code holds it and says why. A video of a channel they name: web.open_video, video the channel's name alone; a title \
 or what it is about: video their words.
 - Lasting (send, post, join, delete, buy) needs their plain words, never your guess: a message goes out only when \
 they ask for it to go and give its text ("message Y X", "tell Y X", "ask Y if X"); else, or asked for a draft or \
@@ -1054,10 +1054,10 @@ _LEAN_INSTANT_VOLUME = "Instant hands (media_key, scroll, window, tab)"
 
 LEAN_SKILLS_PARAGRAPH = """\
 The Skills list below is what Yuki can do, each checked by the PC; a line shows their usual values. An ask a skill \
-covers: run_skill, slots from their words (your reading of a misheard name), a value its line lists or a You block \
-pick, the rest left out (code fills them from their usuals and names its guess). say_first: a few words heard at \
-once while it runs, naming the act and what you chose ("Opening <site>.", "Getting <channel>'s new one."), never \
-that it is done; under choose, no item ("Finding you something."); "" when the change lands in front of them at once \
+covers: run_skill, slots from their words (your reading of a misheard name) or a value its line lists, the rest left \
+out (code fills them from their usuals and names its guess). say_first: a few words heard at once while it runs, \
+naming the act and what you chose ("Opening <site>.", "Getting <channel>'s new one."), never that it is done; \
+choose with no name: no item ("Finding you something."); "" when the change lands in front of them at once \
 (a pause, a volume step), when code will hold it (a game, a call) or must ask first. "Again" or "a bit more": again \
 true. Another value for its last run ("the other one", "not that one"): the same skill, corrects true, never the \
 value it just ran, say_first neutral ("Switching."): code's done line names what played. Their answer to "Keep this \
@@ -1901,21 +1901,33 @@ OUTCOME_NOTES = {
 }
 #: What the result's ``outcome`` field says per level (plain words, the same everywhere).
 OUTCOME_WORDS = {"unverified": "not confirmed", "failed": "did not work", "unread": "not checked"}
+#: Phase 2 (2.3, aBrain merge note 2): the one principle an ending with the brain's evidence goes with (it replaces the
+#: level's note); the evidence itself is a data field of the result, never part of this note.
+EVIDENCE_NOTE = "Say what happened in one short line from this evidence; when it failed, offer one other way."
 
 
 def outcome_fields(verdict: dict[str, Any] | None) -> tuple[dict[str, Any], str]:
     """``(fields, note)`` a spoken result carries for its request's outcome verdict: ``{"outcome", "checked"}`` and the
-    level's note (:data:`OUTCOME_NOTES`) when the verdict is below likely, else ``({}, "")``."""
+    level's note (:data:`OUTCOME_NOTES`) when the verdict is below likely, else ``({}, "")``. A brain ending with its
+    evidence (``verdict["evidence"]``: labelled plain facts, at most 420 chars; content, so never logged) carries it as
+    ``evidence`` with :data:`EVIDENCE_NOTE` instead, whatever its level."""
     level = verdict.get("level") if isinstance(verdict, dict) else None
-    if level not in ("unverified", "failed"):
+    evidence = " ".join(str(verdict.get("evidence") or "").split()) if isinstance(verdict, dict) else ""
+    if level not in ("unverified", "failed") and not evidence:
         return {}, ""
     if level == "unverified" and not verdict.get("acted"):
         level = "unread"
     checked = " ".join(str(verdict.get("seen") or "").split()) or "nothing showed it"
-    step = " ".join(str(verdict.get("step") or "").split()) or "not named"
-    fields: dict[str, Any] = {"outcome": OUTCOME_WORDS[level], "checked": checked}
+    fields: dict[str, Any] = {"outcome": OUTCOME_WORDS[level]} if level in OUTCOME_WORDS else {}
+    if evidence:
+        fields["evidence"] = evidence
+    else:
+        fields["checked"] = checked
     if verdict.get("partial"):
         fields["partly"] = "another part of it did work"
+    if evidence:
+        return fields, EVIDENCE_NOTE
+    step = " ".join(str(verdict.get("step") or "").split()) or "not named"
     return fields, OUTCOME_NOTES[level].format(checked=checked, step=step)
 
 
@@ -2300,7 +2312,7 @@ def fetch_skills(memory: Any, *, timeout_s: float = 1.5, chars: int | None = Non
 
 
 #: The talker's Skills menu is cut to this (``Settings.skills_menu_chars``' default; whole lines).
-SKILLS_CHARS = 2400
+SKILLS_CHARS = 2322
 
 
 def menu_keys(menu: str | None) -> list[str]:
