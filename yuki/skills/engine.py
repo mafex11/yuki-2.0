@@ -285,6 +285,10 @@ class RunContext:
     window_state: Callable[[str], str | None] | None = None
     hand_id: str | None = None
     grant: Mapping[str, Any] | None = None
+    #: P1.4 (18 Oct free-thinker plan): where the run's app window goes as soon as it is up, before anything is typed
+    #: (``(monitor, how)``: :func:`place_hint`), so an app opens on the screen the user isn't watching; ``None``: where
+    #: the app puts itself.
+    place: tuple[str, str] | None = None
 
     def game_now(self) -> str:
         """D9, read now (fails closed: a check that raised counts as a game)."""
@@ -586,8 +590,54 @@ def open_uri(uri: str) -> Any:
     return launch.open_url(str(uri or ""))
 
 
+def place_hint(value: Any) -> tuple[str, str] | None:
+    """A run's place hint as ``(monitor, how)``: ``"other"``, a monitor index, ``"primary"`` or ``"with:<hwnd>"``,
+    each with an optional ``:<how>`` (keep | maximize | left | right), with or without the ``place:`` the plan's
+    window verb writes, or ``{"monitor", "how"}``. ``None`` for anything else (the run goes as before). The plan's own
+    parser (``yuki.brain.plan.place_spec``): one machine format."""
+    if isinstance(value, Mapping):
+        value = f"place:{value.get('monitor') or 'other'}:{value.get('how') or 'keep'}"
+    text = " ".join(str(value or "").split())
+    if not text:
+        return None
+    if not text.casefold().startswith("place"):
+        text = f"place:{text}"
+    try:
+        from yuki.brain.plan import place_spec
+
+        return place_spec(text)
+    except Exception:  # noqa: BLE001 - no hint
+        return None
+
+
+def place_for(ctx: RunContext | None, hwnd: int, *, activate: bool) -> bool:
+    """Put the run's app window where its place hint says (:attr:`RunContext.place`; ``yuki.actions.place``: gated,
+    verified by its monitor, journaled in the request's group so "put it back" undoes it). Called as soon as the
+    window is known: before it is brought forward when it already exists (it comes forward there), right after it
+    opens otherwise (``activate``: it keeps the front, for the typing after). ``True`` when placed; a refusal or a miss
+    leaves the window where it is and the run goes on. Logged content-free."""
+    hint = getattr(ctx, "place", None) if ctx is not None else None
+    if not hint or not hwnd:
+        return False
+    try:
+        from yuki.actions import place
+
+        result = place.place_window(int(hwnd), monitor=hint[0], how=hint[1], activate=activate,
+                                    group=getattr(ctx, "request_id", None))
+        ok = bool(getattr(result, "ok", False))
+    except Exception:  # noqa: BLE001 - not placed: the run goes on
+        ok = False
+    _emit(ctx, "skill_place", ok=ok, how=hint[1], activate=activate)
+    return ok
+
+
 def v_open_uri(call: RouteCall) -> RouteResult:
-    return _opened(open_uri(str(call.args.get("uri") or "")))
+    result = open_uri(str(call.args.get("uri") or ""))
+    details = getattr(result, "details", None) or {}
+    hwnd = details.get("hwnd") if isinstance(details, Mapping) else None
+    if getattr(result, "ok", False) and isinstance(hwnd, int) and not isinstance(hwnd, bool):
+        place_for(call.ctx, hwnd, activate=True)
+    return _opened(result)
 
 
 def v_focus(call: RouteCall) -> RouteResult:
@@ -596,6 +646,7 @@ def v_focus(call: RouteCall) -> RouteResult:
     hwnd = _window(call.args)
     if not hwnd:
         return RouteResult(ran=False, outcome="no_window")
+    place_for(call.ctx, hwnd, activate=False)   # P1.4: it comes forward on the screen the hint names
     result = launch.focus_window(hwnd)
     held = _held_if_refused(getattr(result, "details", None))
     if held:
@@ -2110,7 +2161,8 @@ def run_for_voice(hands: Any, args: Mapping[str, Any], words: list[str], *, game
     acting marker, published only right before a rung that takes focus (sound-only rungs publish none, D18)."""
     ctx = RunContext(origin="voice", words=[str(w) for w in words or []], memory=getattr(hands, "memory", None),
                      hands=hands, log=log, request_id=request_id, on_focus=on_focus,
-                     session_id=getattr(getattr(hands, "memory", None), "session_id", None))
+                     session_id=getattr(getattr(hands, "memory", None), "session_id", None),
+                     place=place_hint(args.get("place")))
     result = resolve_and_run(str(args.get("skill") or ""), args.get("slots") if isinstance(args.get("slots"), Mapping)
                              else {}, ctx.words, ctx, again=bool(args.get("again")), settings=settings, live=live,
                              corrects=bool(args.get("corrects")), game_answer=game)
@@ -2137,7 +2189,8 @@ def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = 
     (:attr:`RunContext.grant`, failure fix-plan Item 11's L2)."""
     slots = args.get("slots") if isinstance(args.get("slots"), Mapping) else {}
     ctx = RunContext(origin="thinker", words=[str(w) for w in words or []], memory=memory, log=log,
-                     request_id=request_id, game=game, verbs=dict(verbs or {}), hands=hands)
+                     request_id=request_id, game=game, verbs=dict(verbs or {}), hands=hands,
+                     place=place_hint(args.get("place")))
     ctx.grant = _thinker_grant(grant, ctx, str(args.get("skill") or ""), slots)
     return resolve_and_run(str(args.get("skill") or ""), slots, ctx.words, ctx, again=bool(args.get("again")),
                            settings=settings, corrects=bool(args.get("corrects")), earlier=earlier)
@@ -2149,4 +2202,5 @@ __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_O
            "HANDOFF_ORIGINS", "FROM_UNHEARD", "FROM_GIVEN", "SEEN_MAX", "COMMIT_BY_END", "COMMIT_BY_NEED", "commit_for",
            "run_commit", "served_commit", "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult",
            "VERB_FUNCS", "open_uri", "pinned", "SEED_KEYS", "plan_seed", "run", "resolve_and_run", "run_for_voice",
-           "run_for_thinker", "granted_values", "CHOICE_SLOTS", "CHOOSE_TIMEOUT_S", "HELD_CALL", "asks_choice"]
+           "run_for_thinker", "granted_values", "place_hint", "place_for",
+           "CHOICE_SLOTS", "CHOOSE_TIMEOUT_S", "HELD_CALL", "asks_choice"]

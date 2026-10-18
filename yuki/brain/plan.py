@@ -75,12 +75,51 @@ def probe_args_text() -> str:
         if name == "window_state":
             names = [n if n != "state" else "state=" + "|".join(_done.WINDOW_STATES) for n in names]
         parts.append(f"{name} {','.join(names)}")
-    return "done/expect args, JSON object as string (? optional): " + "; ".join(parts)
+    return "done/expect args as a JSON string (? optional): " + "; ".join(parts)
 
 #: What ``look`` reads (a step's value, the ``look`` tool's ``what``) and the windows it needs.
 LOOK_WHATS: tuple[str, ...] = ("desktop", "window", "page", "tabs", "focus", "clipboard", "system")
 LOOK_NEEDS_WINDOW: frozenset[str] = frozenset({"window", "page", "tabs"})
-WINDOW_ACTIONS: tuple[str, ...] = ("minimize", "maximize", "fullscreen", "restore", "focus", "close")
+WINDOW_ACTIONS: tuple[str, ...] = ("minimize", "maximize", "fullscreen", "restore", "focus", "close", "focus_back",
+                                   "undo")
+#: P1.4 (18 Oct free-thinker plan): the undoable window verbs of ``yuki.actions.place``, as ``window_action`` values.
+#: ``place[:<monitor>[:<how>]]`` puts the step's window on a monitor (an index as the desk view says it, ``other``,
+#: ``primary``, or ``with:<hwnd>``: that window's monitor; default ``other``) in a way (:data:`PLACE_HOWS`; default
+#: ``keep``); ``focus_back`` gives the front back to the step's window; ``undo`` puts the last placement (and the front
+#: it took) back, no window. These are the only acts a tidy-up turn may take (:data:`TIDY_ACTIONS`).
+PLACE_ACTION = "place"
+PLACE_HOWS: tuple[str, ...] = ("keep", "maximize", "left", "right")
+TIDY_ACTIONS: tuple[str, ...] = (PLACE_ACTION, "focus_back", "undo")
+#: The window actions that need no window of their own (``undo`` puts back whatever the journal holds).
+WINDOWLESS_ACTIONS: frozenset[str] = frozenset({"undo"})
+
+
+def place_spec(value: Any) -> tuple[str, str] | None:
+    """A ``window_action`` value of the place form as ``(monitor, how)``, else ``None``. A machine format split on its
+    ``:`` separators (``with:<hwnd>`` keeps its own): ``place`` -> ``("other", "keep")``; ``place:1:left`` ->
+    ``("1", "left")``; ``place:with:4197272`` -> ``("with:4197272", "keep")``. The monitor is checked against the
+    monitors when the step runs (``place.resolve_monitor``)."""
+    parts = [p.strip().casefold() for p in " ".join(str(value or "").split()).split(":")]
+    if not parts or parts[0] != PLACE_ACTION or len(parts) > 4 or any(not p for p in parts[1:]):
+        return None
+    rest = parts[1:]
+    if rest and rest[0] == "with":
+        if len(rest) < 2 or not rest[1].isdigit():
+            return None
+        rest = [f"with:{rest[1]}", *rest[2:]]
+    monitor = rest[0] if rest else "other"
+    how = rest[1] if len(rest) > 1 else "keep"
+    if len(rest) > 2 or how not in PLACE_HOWS:
+        return None
+    if not (monitor.isdigit() or monitor in ("other", "primary", "main") or monitor.startswith("with:")):
+        return None
+    return monitor, how
+
+
+def window_op(value: Any) -> str:
+    """The action word of a ``window_action`` value (``place`` for the place form), casefolded."""
+    text = " ".join(str(value or "").split()).casefold()
+    return PLACE_ACTION if place_spec(text) is not None else text
 TAB_ACTIONS: tuple[str, ...] = ("select", "close")
 CLICK_BUTTONS: tuple[str, ...] = ("left", "right", "middle", "double")
 MEMORY_KINDS: tuple[str, ...] = (
@@ -93,8 +132,9 @@ MEMORY_KINDS: tuple[str, ...] = (
 VERB_FIELDS: dict[str, str] = {
     "launch_app": "value: app name",
     "focus_window": "window",
-    "open_url": "window: the browser it opens in; value: address, file or folder",
-    "window_action": "window; value: minimize|maximize|fullscreen|restore|focus|close",
+    "open_url": "window: its browser; value: address, file or folder",
+    "window_action": "window; value: minimize|maximize|fullscreen|restore|focus|close|focus_back|undo|"
+                     "place[:index|other|with:hwnd[:keep|maximize|left|right]]",
     "tab": "window; element: the tab; value: select|close",
     "click": "element; value: null|right|middle|double",
     "type_text": "element or focus; value: text; submit: Enter after",
@@ -105,11 +145,11 @@ VERB_FIELDS: dict[str, str] = {
     "app_volume": "target.app; value: 0-100, +N, -N, mute|unmute",
     "run_powershell": "value: command",
     "write_clipboard": "value: text",
-    "run_skill": "value: JSON {\"skill\": id, \"slots\": {}}",
+    "run_skill": "value: JSON {\"skill\": id, \"slots\": {}, \"place\"?: monitor[:how]}",
     "open_yuki": "value: page",
-    "look": "value: desktop|window|page|tabs|focus|clipboard|system; window",
-    "memory": "value: JSON memory-tool args with kind",
-    "fetch": "value: http(s) address or file path",
+    "look": "value: what, as the look tool; window",
+    "memory": "value: JSON memory args",
+    "fetch": "value: address or file path",
     "wait": "value: seconds (max 10)",
 }
 
@@ -210,9 +250,10 @@ def plan_schema() -> dict[str, Any]:
             "value": _nullable("string"),
             "submit": {"type": "boolean"},
             "expect": {"anyOf": [_probe_schema(), {"type": "null"}]},
-            # sBrainFix (F7): spoken the moment the step is dispatched, so before its result (the room: revises's
-            # description, which said nothing code uses: a replan's revises is code's own, parse_header)
-            "say": _nullable("string", "Spoken before any result."),
+            # sBrainFix (F7): spoken the moment the step is dispatched, so before its result (a tidy-up's after the
+            # request's line: P1.3); the core prompt says when to set it (qBrain: its description gave the room to
+            # the window verbs)
+            "say": _nullable("string"),
         },
     }
     # goal, route and question carry no description here: the core prompt says each (one line in their terms; steps
@@ -1075,12 +1116,14 @@ def _check_verb(step: Step, header: Plan, checks: Checks, prior: Sequence[Step],
         errors.append(f"{where}{verb} needs value ({VERB_FIELDS[verb]})")
     if verb in ("type_text", "write_clipboard") and value is None:
         errors.append(f"{where}{verb} needs value ({VERB_FIELDS[verb]})")
-    if verb in ("focus_window", "window_action", "tab") and not step.window:
+    if verb in ("focus_window", "window_action", "tab") and not step.window and not (
+            verb == "window_action" and text.casefold() in WINDOWLESS_ACTIONS):
         errors.append(f"{where}{verb} needs window ({VERB_FIELDS[verb]})")
     if verb in ("click", "set_slider", "tab") and step.element is None:
         errors.append(f"{where}{verb} needs element ({VERB_FIELDS[verb]})")
-    if verb == "window_action" and text not in WINDOW_ACTIONS:
-        errors.append(f"{where}window_action value must be one of: {', '.join(WINDOW_ACTIONS)}")
+    if verb == "window_action" and text not in WINDOW_ACTIONS and place_spec(text) is None:
+        errors.append(f"{where}window_action value must be one of: {', '.join(WINDOW_ACTIONS)}, or "
+                      f"place[:<monitor>[:<how>]] (how: {'|'.join(PLACE_HOWS)})")
     if verb == "tab" and text not in TAB_ACTIONS:
         errors.append(f"{where}tab value must be select or close")
     if verb == "click" and value is not None and text not in CLICK_BUTTONS:
@@ -1384,12 +1427,16 @@ class ExecResult:
     #: kBrain review M2: on a plan that didn't end done, the lines of the request's ``run_skill`` parts their own check
     #: saw done, said before the line the request ends on (``done.with_parts``).
     parts: list[str] = field(default_factory=list)
+    #: P1.3: a done plan whose acts took something the user had (the executor's after-look flagged it): the "After:"
+    #: block for one tidy-up turn; ``""``: nothing flagged (no turn).
+    after: str = ""
 
 
 __all__ = [
     "send_text_error", "LINE_SEND_TEXT", "join_target_error", "join_slot_error", "LINE_JOIN_UNKNOWN",
     "ACT_VERBS", "READ_VERBS", "VERBS", "KINDS", "COMMITS", "SKILL_PROBES", "GENERIC_PROBES", "PROBES", "PROBE_ARGS",
-    "ENGINE_ONLY_PROBES", "LOOK_WHATS", "WINDOW_ACTIONS", "TAB_ACTIONS", "MEMORY_KINDS", "VERB_FIELDS", "PLAN_TOOL",
+    "ENGINE_ONLY_PROBES", "LOOK_WHATS", "WINDOW_ACTIONS", "PLACE_ACTION", "PLACE_HOWS", "TIDY_ACTIONS",
+    "WINDOWLESS_ACTIONS", "place_spec", "window_op", "TAB_ACTIONS", "MEMORY_KINDS", "VERB_FIELDS", "PLAN_TOOL",
     "STEPS_ROUTE", "SKILL_ROUTE_PREFIX", "MAX_STEPS", "plan_schema", "Target", "Consent", "Probe", "Element", "Step",
     "Plan", "PlanError", "Checks", "required_probe", "parse_header", "parse_step", "validate_plan", "finish_plan",
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",

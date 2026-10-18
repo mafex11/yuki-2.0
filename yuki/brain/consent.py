@@ -1,5 +1,10 @@
 """The one consent rule (brain-design.md §2.5): one table, in code, applied to every act step before it runs.
 
+**Permission by undoability** (P1.5, 18 Oct): every act step is in one class of :data:`CLASSES` (:func:`act_class`,
+code facts only): **never** (rows 1-2: refused, said plainly), **lasting** (rows 3-5: their plain words or one
+question; a send keeps its countdown) or **undoable** (row 6: allowed, then said; place and focus back are journaled
+for "put it back"). A tidy-up inside a request (the executor's after-look) may take only undoable window steps.
+
 ``check(step, plan, user_words, live, check_verdict) -> allow | ask | refuse | draft``, row by row, the first row that
 applies decides:
 
@@ -71,8 +76,9 @@ applies decides:
    close, a non-web open, a fetch after a file, clipboard or memory read, M9), and a step of a kind the user's policy
    holds below "do it and tell me": the commit check decides (``effect = none`` allow; lasting and asked allow; lasting
    and not asked **ask** its question; the check failed or timed out **ask**, fail closed).
-6. Anything else (focus, a web page, an address typed into a browser with Enter, scroll, typing without Enter, a list
-   item, tab or link click, reads): **allow**.
+6. Anything else, the undoable class (focus, place, focus back, put it back, a web page, an address typed into a
+   browser with Enter, scroll, typing without Enter, a list item, tab or link click, minimise / maximise / restore,
+   volume, media, reads): **allow**.
 
 Rows 1-4's facts are code facts: tool metadata (``yuki.agent.tools.call_traits``), the Now board, capability data,
 memory's people index, string spans and counted shares of words. Whether the words *ask* for the effect is the commit
@@ -171,6 +177,19 @@ SAID_SPAN = 2
 #: chat: Enter there sends a message, whatever app it is (the generic chat detector's too).
 CHAT_KIND = "conversation"
 
+#: P1.5: the act classes, one table (module docstring). Which class a step is in is :func:`act_class`'s code facts;
+#: what each class gets is :func:`check`'s rows. Phrased for the reader; never shown to a model.
+NEVER, LASTING, UNDOABLE = "never", "lasting", "undoable"
+CLASSES: dict[str, str] = {
+    NEVER: "refused: input, focus, a launch or a link with a game in front (row 1); an app whose Act switch is off, a "
+           "kind on just suggest (row 2); and by row 4's own rules: typing over their draft, a send in Yuki's own "
+           "wording without their yes",
+    LASTING: "their plain words or one question: a send (row 4, then the countdown), a join (row 3, their click), "
+             "anything that destroys or reaches (delete, close, buy, a setting, a shell, a committing click: row 5)",
+    UNDOABLE: "allowed, then said (row 6): place, focus, focus back, put it back, open, switch, tab show, minimise / "
+              "maximise / restore, volume, media, scroll, typing without Enter, reads",
+}
+
 #: The plain words said for a refusal's code word (``Verdict.why``), for a line the user hears; a code word itself is
 #: never said. Missing or empty: nothing worth saying (the planner's own fixes).
 PLAIN_WHY: dict[str, str] = {
@@ -194,7 +213,7 @@ PLAIN_WHY: dict[str, str] = {
 #: The steps whose input takes the screen even with no focus trait of their own (row 1): an app opened, a link
 #: opened, a shell (it may start a window), a window shown or restored. Fixed tool names and operations.
 _TAKES_SCREEN_TOOLS = frozenset({"launch_app", "open_url", "run_powershell", "open_yuki"})
-_TAKES_SCREEN_WINDOW_OPS = frozenset({"restore", "focus", "maximize", "fullscreen"})
+_TAKES_SCREEN_WINDOW_OPS = frozenset({"restore", "focus", "maximize", "fullscreen", "place", "focus_back", "undo"})
 #: The steps that submit with Enter (typed with it, or pressed as its own step: the way :data:`LINE_TYPED_ENTER`
 #: offers). Outside a chat app's window the check's ``send`` their words didn't ask for is a question, never a refusal.
 _ENTER_TOOLS = frozenset({"type_text", "press"})
@@ -1183,6 +1202,18 @@ def may_commit(call: Call, live: Live, plan: Any = None) -> bool:
     return t.destroys or t.reaches or is_join_control(call, live) or policy_holds(call, live)
 
 
+def act_class(call: Call, live: Live, plan: Any = None) -> str:
+    """P1.5: the step's class in :data:`CLASSES`: :data:`NEVER` when rows 1-2 refuse it, :data:`LASTING` when it may
+    commit (:func:`may_commit`: it destroys or reaches, sends, joins, or a kind the user's policy holds), else
+    :data:`UNDOABLE`. Code facts only. Never raises (an error: lasting, so it is checked)."""
+    try:
+        if _rows_1_2(call, live, step_traits(call, live)) is not None:
+            return NEVER
+        return LASTING if may_commit(call, live, plan) else UNDOABLE
+    except Exception:  # noqa: BLE001 - fail closed
+        return LASTING
+
+
 def takes_screen(call: Call) -> bool:
     """Row 1: the step takes focus, sends input, restores a window, launches an app or opens a link (tool metadata and
     fixed operations). ``run_skill`` is gated rung by rung inside the engine instead."""
@@ -1358,17 +1389,29 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
     failed = cv is None or bool(getattr(cv, "failed", False))
     asked = bool(getattr(cv, "asked", False)) and not failed
 
-    # rows 1-2: a game in front; the app's Act switch off or a kind on "just suggest"
+    # never (rows 1-2): a game in front; the app's Act switch off or a kind on "just suggest"
     gate = _rows_1_2(step, live, traits)
     if gate is not None:
         return gate
 
-    # row 3: joins are the user's click
     sk = None
     if step.tool == "run_skill":
         key, slots = skill_input(step, plan)
         sk = util.skill(key)
-    joining = (committing and bool(step.hwnd) and int(step.hwnd) in live.calling) or is_join_control(step, live) \
+    slots = skill_input(step, plan)[1] if sk is not None else {}
+    if sk is not None and consent["commit"] == "send" and getattr(sk, "sends", False) \
+            and not skill_sends(sk, slots):
+        # a declared send whose capability step leaves a draft (its send slot on a non-sending option, 10 Oct job 7):
+        # it could only open the chat and end unconfirmed; the planner makes the plan and the step agree
+        return Verdict(REFUSE, 4, "declared_draft",
+                       line=LINE_DECLARED_DRAFT.format(slots=", ".join(send_slots(sk)) or "send"))
+
+    # undoable (row 6): nothing it does lasts, so it is allowed and said after (P1.5)
+    if not committing:
+        return Verdict(ALLOW, 6, UNDOABLE)
+
+    # lasting (rows 3-5). Row 3: joins are the user's click
+    joining = (bool(step.hwnd) and int(step.hwnd) in live.calling) or is_join_control(step, live) \
         or effect == "join" or (sk is not None and skill_joins(sk))
     if joining:
         if sk is not None and skill_commit(sk) == "words" and asked and effect in ("join", "none", ""):
@@ -1380,13 +1423,6 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
                        focus=int(step.hwnd) if step.hwnd else None)
 
     # row 4: sends (typing with Enter outside a chat goes to the commit check: row 5, or back here on its "send")
-    slots = skill_input(step, plan)[1] if sk is not None else {}
-    if sk is not None and consent["commit"] == "send" and getattr(sk, "sends", False) \
-            and not skill_sends(sk, slots):
-        # a declared send whose capability step leaves a draft (its send slot on a non-sending option, 10 Oct job 7):
-        # it could only open the chat and end unconfirmed; the planner makes the plan and the step agree
-        return Verdict(REFUSE, 4, "declared_draft",
-                       line=LINE_DECLARED_DRAFT.format(slots=", ".join(send_slots(sk)) or "send"))
     by_code = sends_now(step, live, traits) or (sk is not None and skill_sends(sk, slots))
     if not by_code and effect == "send" and step.tool in _ENTER_TOOLS and chat_window(step, live) is False:
         # Enter typed or pressed where no data says Enter sends (a search box, a command field; the check called
@@ -1401,18 +1437,14 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
         return _send(step, plan, consent, user_words, live, sk, asked, failed, effect)
 
     # row 5: anything else that could last
-    if committing:
-        if failed:
-            return Verdict(ASK, 5, "check_failed", question=failed_question(step))
-        if effect in ("none", "") and cv is not None:
-            return Verdict(ALLOW, 5, "none")
-        if asked:
-            return Verdict(ALLOW, 5, "asked")
-        question = words(getattr(cv, "question", "")) or failed_question(step)
-        return Verdict(ASK, 5, "lasting", question=question)
-
-    # row 6
-    return Verdict(ALLOW, 6, "none")
+    if failed:
+        return Verdict(ASK, 5, "check_failed", question=failed_question(step))
+    if effect in ("none", "") and cv is not None:
+        return Verdict(ALLOW, 5, "none")
+    if asked:
+        return Verdict(ALLOW, 5, "asked")
+    question = words(getattr(cv, "question", "")) or failed_question(step)
+    return Verdict(ASK, 5, "lasting", question=question)
 
 
 def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str], live: Live, sk: Any, asked: bool,
@@ -1553,7 +1585,8 @@ def after_ask(verdict: Verdict) -> Verdict:
     return replace(verdict, result=ALLOW, countdown=verdict.row == 4)
 
 
-__all__ = ["ALLOW", "ASK", "CHAT_KIND", "COMMITS", "DRAFT", "EFFECTS", "LINE_ASK_SEND", "LINE_DRAFTED", "LINE_GAME",
+__all__ = ["CLASSES", "LASTING", "NEVER", "UNDOABLE", "act_class",
+           "ALLOW", "ASK", "CHAT_KIND", "COMMITS", "DRAFT", "EFFECTS", "LINE_ASK_SEND", "LINE_DRAFTED", "LINE_GAME",
            "NAME_GAP", "PLAIN_WHY", "REFUSE", "RESULTS", "SAID_SHARE", "SAID_SPAN", "Call", "Live", "Verdict",
            "after_ask", "ask_send_question", "spoken_name", "calling_windows", "chat_window", "check", "draft_slots",
            "failed_question", "field_of", "game_holds", "game_now", "in_words", "is_join_control", "join_controls",
