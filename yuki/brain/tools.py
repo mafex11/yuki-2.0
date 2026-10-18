@@ -241,9 +241,9 @@ def run_look(dispatcher: Any, tool_input: Mapping[str, Any], *, nonce: str) -> T
     text = outcome_text(outcome)
     payload = getattr(outcome, "payload", None)
     if what == "desktop" and getattr(outcome, "ok", False) and isinstance(payload, Mapping) and payload.get("windows"):
-        from yuki.brain.context import desk_text
+        from yuki.brain.context import SITUATION_LOOK_CHARS, desk_text
 
-        text = desk_text(text, payload, limit=DESK_LOOK_CHARS)   # P1.1: the desk in plain words, then the Now block
+        text = desk_text(text, payload, limit=DESK_LOOK_CHARS, situation_chars=SITUATION_LOOK_CHARS)   # P1.1: the desk in plain words, then the Now block
     source = {"window": f"the window {call.get('hwnd')}", "page": f"the page in window {call.get('hwnd')}",
               "tabs": f"the tabs of window {call.get('hwnd')}", "clipboard": "the clipboard",
               "focus": "what has focus"}.get(what, "the desktop")

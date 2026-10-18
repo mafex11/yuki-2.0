@@ -2473,9 +2473,9 @@ class Executor:
         payload = getattr(outcome, "payload", None)
         if tool == "look_at_desktop" and getattr(outcome, "ok", False) and isinstance(payload, Mapping) \
                 and payload.get("windows"):
-            from yuki.brain.context import desk_text
+            from yuki.brain.context import SITUATION_LOOK_CHARS, desk_text
 
-            text = desk_text(text, payload, limit=READ_CHARS)   # P1.1: the desk in plain words, then the Now block
+            text = desk_text(text, payload, limit=READ_CHARS, situation_chars=SITUATION_LOOK_CHARS)   # P1.1: the desk in plain words, then the Now block
         text = (text or str(getattr(outcome, "summary", "") or ""))[:READ_CHARS]
         if tool in EXTERNAL_TEXT_TOOLS:   # capped first, so the fence stays whole
             text = wrap(text, source=source_for(tool, tool_input), nonce=self.nonce)

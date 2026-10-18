@@ -219,15 +219,17 @@ class Gathered:
 #: keyboard is, each window's [hwnd] and rectangle, the monitors' work areas), in place of the raw window list; at most
 #: this many characters, the Now block (what the windows show) after it in the rest of the overview's room.
 SITUATION_CHARS = 1400
+#: The same for a ``look desktop`` (the planner asked for the whole desk).
+SITUATION_LOOK_CHARS = 3000
 #: The window list's own lines the plain-words desk does not say, kept beside it: a window a dialog blocks or that is
 #: disabled (and the dialog), and the apps running with no window (``windows.format_overview``'s fixed markers).
 _LIST_FLAGS = (" BLOCKED by [", " DISABLED", " DIALOG for [")
 _LIST_BACKGROUND = "running with no open window:"
 
 
-def desk_text(text: str, payload: Any, *, limit: int) -> str:
+def desk_text(text: str, payload: Any, *, limit: int, situation_chars: int = SITUATION_CHARS) -> str:
     """The overview for the planner (P1.1): the window list's header line (screen, cursor, locale), the desk in plain
-    words (:data:`SITUATION_CHARS`), the list's lines that say more (:data:`_LIST_FLAGS`, the background apps), then
+    words (``situation_chars``), the list's lines that say more (:data:`_LIST_FLAGS`, the background apps), then
     the Now block in the room left of ``limit``. The window list and the Now block are split where the Dispatcher
     joins them (one blank line: the list has none). The old list as it was when the desk can't be said. Never
     raises."""
@@ -244,7 +246,7 @@ def desk_text(text: str, payload: Any, *, limit: int) -> str:
         except Exception:  # noqa: BLE001 - said without what plays
             media = None
         state = situation.from_overview(dict(payload), media=media, audio=None, holds="")
-        desk = situation.render(state, purpose="planner", max_chars=SITUATION_CHARS)
+        desk = situation.render(state, purpose="planner", max_chars=situation_chars)
         if not desk.strip():
             return clip(text, limit)
         lines = head.splitlines()
