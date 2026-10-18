@@ -45,7 +45,9 @@ role = "means"
 scope = "service"
 
 # Which of two equal tabs, counted along the strip (1 = the first). Asked only when the census finds two that match
-# equally (D8: two equal -> ask).
+# equally and differ in title (D8: two equal -> ask). A weaker identity that also agrees breaks the tie (the name in
+# the place the site's tab is kept), and two with the very same title are one page twice: the one showing is brought
+# up, else the first along the strip, never a question no answer could tell apart (fHands, live 18 Oct meet_tab_zen).
 [[capability."browser.site_tab".slot]]
 name = "pick"
 type = "number"

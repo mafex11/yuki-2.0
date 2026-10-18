@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Mapping, Sequence
 
-from yuki.brain.plan import SEED_RERUN_OK, ExecResult, Plan, StepStatus, seed_sends, skill_family
+from yuki.brain.plan import SEED_RERUN_OK, ExecResult, Plan, StepStatus, person_open, seed_sends, skill_family
 from yuki.brain.prompt import menu_text, profile_text
 
 #: How the request turn labels each part (Yuki's own words about the parts, never the user's).
@@ -83,6 +83,13 @@ SEED_UNSURE_LABEL = ("[A skill's hand-off: it acted but couldn't confirm the res
 SEED_DROPPED_LABEL = ("[A skill's hand-off: a value it was given isn't in their words as heard (misheard, or reworded), "
                       "so it didn't run. Check the values against their words, the people named and memory, then do it "
                       f"by steps (look, then click or type in the app); never run that skill again. {SEED_DONE}]")
+#: jBrain (fMsg B1): a hand-off of a capability with a person slot (a message) that left whom it goes to open (the
+#: slot dropped as unheard, or no one of theirs found by it: ``yuki.brain.plan.person_open``). Never done by steps into
+#: whichever chat is open: the planner asks whom, then runs the capability with that person (it is not spent).
+SEED_WHO_LABEL = ("[A skill's hand-off: whom it goes to isn't in their words as heard, or no one of theirs goes by it, "
+                  "so it didn't run. Ask them whom: a plan kind ask with one short question (name the one person of "
+                  "theirs it sounds like, if one does). Never type it into whichever chat is open. Once they say "
+                  "whom, run that skill with that person.]")
 SEED_LABELS: dict[str, str] = {"unverified": SEED_UNSURE_LABEL, "error": SEED_UNSURE_LABEL,
                                "dropped": SEED_DROPPED_LABEL}
 #: A hand-off whose step would send or join with no plan behind it (``yuki.skills.engine.TO_PLANNER``): that step did
@@ -880,8 +887,9 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "",
     except (TypeError, ValueError):
         body = str(keep)
     why = str(seed.get("why") or "").strip()
-    rerun = why in SEED_RERUN_OK
-    label = SEED_COMMIT_LABEL if rerun else SEED_LABELS.get(why, SEED_LABEL)
+    who = person_open(seed)
+    rerun = why in SEED_RERUN_OK or who
+    label = SEED_WHO_LABEL if who else SEED_COMMIT_LABEL if rerun else SEED_LABELS.get(why, SEED_LABEL)
     draft = not rerun and seed_sends(seed)
     if draft:
         # the skill's check reads a send, never a draft's (the validator gives a plan by steps none for it): the
@@ -895,7 +903,7 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "",
                  f"skill:{family} route, no run_skill of it).")
     if draft:
         text += "\n" + SEED_DRAFT_LINE
-    missing = one_line(seed.get("missing"), 40) if isinstance(seed.get("missing"), str) else ""
+    missing = one_line(seed.get("missing"), 40) if isinstance(seed.get("missing"), str) and not who else ""
     if missing:
         # sBrainFix (review r1 L2): the pick is made, not asked (16 Oct B08: "Which one's your Japanese playlist?"
         # with every name read out, in 3 of 5 runs)
@@ -1247,6 +1255,23 @@ def part_rest_report(result: ExecResult | Mapping[str, Any], plan: Plan | None, 
     return "\n".join(lines)
 
 
+def answer_part_report(result: ExecResult | Mapping[str, Any], plan: Plan | None, line: str) -> str:
+    """fBrain (18 Oct live A, "Pause the song bro, also what time's my meeting tomorrow": the act plan read memory for
+    the meeting, then ended on the pause's line alone and the question was never answered): an act plan that ended and
+    read memory or fetched something in its steps. Code's line for the act is held; what the reads returned (each
+    fenced by whoever read it) goes back so the planner answers what their words asked from it, in plain text. Code
+    then says its line and the answer after it. Code-written."""
+    pid = plan.id if plan else ""
+    reads = [str(r) for r in _field(result, "reads", None) or [] if str(r).strip()]
+    lines = [f"{CHECK_LABEL} Plan {pid} ended. Yuki's line for what it did, not said yet: {one_line(line, 200)}",
+             "What its reads returned:\n\n" + ("\n\n".join(reads) if reads else "(Nothing came back.)"),
+             f"If their words above also asked something, reply now in plain text with only the answer, from what "
+             f"came back (one or two short sentences, in their terms; if it holds nothing, say so): code says its own "
+             f"line first, so never repeat or claim what was done. If they asked nothing more, reply with the one word "
+             f"{REST_DONE_WORD}."]
+    return "\n".join(lines)
+
+
 def text_back_report(plan: Plan | None, line: str) -> str:
     """pBrain: an act request not confirmed done got a plain reply from the planner: it was not said, and the planner
     gets one more turn with where it stands (code's own line) to finish by steps or ask as a plan. Code-written."""
@@ -1299,6 +1324,6 @@ __all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "re
            "request_turn", "Conversation",
            "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report",
            "look_report", "REST_DONE_WORD", "invalid_report", "unconfirmed_report",
-           "part_rest_report", "text_back_report", "REST_LAST_PART",
+           "part_rest_report", "text_back_report", "answer_part_report", "REST_LAST_PART",
            "answer_report", "clip",
            "one_line", "fence", "CHECK_LABEL", "STEER_LABEL"]

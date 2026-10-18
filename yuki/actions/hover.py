@@ -108,7 +108,9 @@ def hover(x: int, y: int, *, expect_hwnd: int | None = None, label: str = "") ->
     pending = _Pending(job, "yuki-hover", 0.6 + WATCH_S + 0.8)
     shared = pending.wait()
     if shared.get("refused"):
-        details["refused"] = "game"
+        from yuki.actions.gate import kind_of
+
+        details["refused"] = kind_of(shared["refused"])   # "game" only when a game refused it
         return done(False, f"{shared['refused']}; the pointer was not moved")
     if not shared.get("moved"):
         return done(False, f"could not move the pointer ({shared.get('error') or 'timed out'})")

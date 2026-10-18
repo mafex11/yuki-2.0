@@ -124,6 +124,14 @@ CHOICE_SLOTS: tuple[str, ...] = ("choose", "context")
 CHOOSE_TIMEOUT_S = 4.5
 #: The outcome of a pick held because a call is live (decision 2: never during a call, said so instead).
 HELD_CALL = "held_call"
+#: fHands (live 18 Oct, k_t3_draft): a rung's step stopped by something other than a game (the gate could not check
+#: and failed closed, or another guard refused it: ``yuki.actions.gate.BLOCKED``). A ``RouteResult.held`` of this word
+#: and the run's outcome of the same name: a settled stop said with :data:`LINE_BLOCKED` (or
+#: :data:`LINE_BLOCKED_PARTWAY` once a rung acted), never the game line, never the next rung, never handed over (the
+#: thinker would be stopped the same way).
+HELD_BLOCKED = "blocked"
+LINE_BLOCKED = "Something on the PC stopped me there, so nothing was done."
+LINE_BLOCKED_PARTWAY = "Something on the PC stopped me partway, so I left it there."
 #: At most this many names a route read on screen ride on a seed (``seen``, RAM only), each at most this long.
 SEEN_MAX = 40
 SEEN_NAME_CHARS = 80
@@ -345,6 +353,9 @@ class SkillResult:
             return f"Held: a game is in front, nothing was sent. Say: {self.say}"
         if self.outcome == HELD_CALL:
             return f"Held: a call is live, so nothing was put on. Say: {self.say}"
+        if self.outcome == HELD_BLOCKED:
+            return (f"Stopped: something on the PC (not a game) stopped a step, so nothing more was tried; don't do it "
+                    f"by steps (the same stop applies). Say: {self.say}")
         if self.outcome == "handed_over":
             why = (self.handoff or {}).get("why")
             if why == TO_PLANNER:
@@ -397,9 +408,11 @@ class SkillResult:
                  "ask": self.ask, "options": list(self.options), "held": self.held, "ask_keep": self.ask_keep,
                  "handoff_skill": self.handoff, "skill": self.skill, "outcome": self.outcome, "route": self.route,
                  "run_key": self.run_key,
-                 "settled": self.outcome in ("held_game", HELD_CALL, "other_device", "unverified", "asked",
-                                             "already")}
-        if self.held:
+                 "settled": self.outcome in ("held_game", HELD_CALL, HELD_BLOCKED, "other_device", "unverified",
+                                             "asked", "already")}
+        if self.outcome == HELD_BLOCKED:
+            facts["refused"] = HELD_BLOCKED      # fHands: never said as a game (``held`` stays empty)
+        elif self.held:
             facts["refused"] = "game"
         return self.done, self.report(), facts
 
@@ -498,7 +511,10 @@ def _window(args: Mapping[str, Any]) -> int:
 
 
 def _held_if_refused(details: Mapping[str, Any] | None) -> str | None:
-    return "game" if isinstance(details, Mapping) and details.get("refused") == "game" else None
+    """The refusal kind an action's ``details`` carry (``yuki.actions.gate.carried``): ``"game"`` (held for a game) or
+    :data:`HELD_BLOCKED` (a settled stop, fHands), else ``None``."""
+    value = details.get("refused") if isinstance(details, Mapping) else None
+    return value if value in ("game", HELD_BLOCKED) else None
 
 
 def v_uia_invoke(call: RouteCall) -> RouteResult:
@@ -512,6 +528,9 @@ def v_uia_invoke(call: RouteCall) -> RouteResult:
                 pattern=str(a.get("pattern") or "invoke"), value=a.get("value"), container=a.get("container") or (),
                 budget_s=max(0.2, min(float(a.get("budget_s") or 0.6), call.deadline - call.ctx.clock())))
     facts = {"status": got.outcome, "n": got.n, "ms": got.ms}
+    if got.outcome == "refused" and getattr(got, "kind", "") in ("game", HELD_BLOCKED):
+        # fHands: the gate refused the pattern call (a game's own window, or it failed closed): by its kind
+        return RouteResult(ran=False, held=got.kind, outcome="refused", facts=facts)
     if got.outcome == "pressed":
         return RouteResult(ran=True, outcome="pressed", facts=facts)
     if got.outcome == "ambiguous":
@@ -621,8 +640,9 @@ def v_uia_steps(call: RouteCall) -> RouteResult:
     except SkillRefused:
         return RouteResult(ran=False, outcome="refused_steps")
     done = int(facts.get("steps_done") or 0)
-    if facts.get("refused") == "game" or facts.get("act_off"):
-        return RouteResult(ran=done > 0, held="game" if facts.get("refused") == "game" else None, outcome="refused")
+    kind = _held_if_refused(facts)
+    if kind or facts.get("act_off"):
+        return RouteResult(ran=done > 0, held=kind, outcome="refused")
     if facts.get("to_planner"):
         # bSkill (bTalk merge note 4): the consent rule (brain = "all": hands.authorize -> brain.check.one) handed a
         # step over that would send or join; it did not run. Rung C, never the talker's "exactly this?"
@@ -980,28 +1000,35 @@ def _ledger_start(ctx: RunContext, skill: Skill, values: Mapping[str, Any], fill
     return got or (key if ctx.memory is not None else None)
 
 
-def _note_false_done(resolved: Any, ctx: RunContext, *, corrects: bool, again: bool) -> str | None:
-    """D19's other false-done source (review r2 M2), before the new run starts: the user corrected the skill's last
-    run (``corrects``), or asked the same skill again with the same absolute values (not ``again``, in another
-    request) within :data:`yuki.skills.registry.FALSE_DONE_S` of a run that ended "done": that run is marked a false
-    done in the ledger (``recheck = 0``: the scorecard's false-done count and the rung's trust see it) and logged.
-    Returns the run key marked."""
-    if ctx.memory is None or ctx.origin == "eval" or isinstance(resolved, Refused):
+def _note_false_done(resolved: Any, ctx: RunContext, *, corrects: bool,
+                     again: bool) -> tuple[str, int | None] | None:
+    """D19's other false-done source (review r2 M2), before the new run starts: the user asked the same skill again
+    with the same absolute values, as a correction of its last run (``corrects``) or a repeat (not ``again``, in
+    another request), within :data:`yuki.skills.registry.FALSE_DONE_S` of a run that ended "done": that run is marked
+    a false done in the ledger (``recheck = 0``: the scorecard's false-done count and the rung's trust see it) and
+    logged.
+
+    fSkills review M1 (live 18 Oct: web.open_page's protocol rung disabled for 24 h by two marks on runs that had done
+    what they were asked): only the same ask redone charges the run it follows, a correction too. A correction with
+    other values ("the other playlist") says the value was wrong, never the rung that put it on (when the value was
+    Yuki's own pick, :mod:`yuki.skills.taste` counts the quick change as a skip of that pick, its own feedback); and a
+    resolve that dropped a value it was given (``dropped``: "open MKBHD's channel" with its page dropped reads as the
+    "open YouTube" before it) can't tell a repeat from another ask, so neither marks anything. A question or a hold
+    (no values) marks nothing either.
+    Returns ``(the run key marked, its recheck before)`` (:func:`_withdraw_false_done`), else ``None``."""
+    if ctx.memory is None or ctx.origin == "eval" or not isinstance(resolved, (Plan, Handoff)) or resolved.dropped:
         return None
-    skill = getattr(resolved, "skill", None)
-    key = skill.key if isinstance(skill, Skill) else str(skill or "")
-    if not key:
+    if again and not corrects:
         return None
-    absolute = None
-    if not corrects:
-        if again or not isinstance(skill, Skill):
-            return None
-        absolute = _absolute_values(skill, getattr(resolved, "values", None))
-        if absolute is None:
-            return None
-        # a repeat is ledgered where its run would be (lCore review r2 L9): a learned skill asked with another key
-        # value counts on its capability (:func:`ledger_skill`)
-        key = ledger_skill(skill, absolute).key
+    skill = resolved.skill
+    if not isinstance(skill, Skill):
+        return None
+    absolute = _absolute_values(skill, resolved.values)
+    if absolute is None:
+        return None
+    # the same ask is ledgered where its run would be (lCore review r2 L9): a learned skill asked with another key
+    # value counts on its capability (:func:`ledger_skill`)
+    key = ledger_skill(skill, absolute).key
     from yuki.skills import registry
 
     # a correction may follow a run of the learned skill or one its capability took (another key value): the newest
@@ -1013,23 +1040,43 @@ def _note_false_done(resolved: Any, ctx: RunContext, *, corrects: bool, again: b
 
     def go(client: Any) -> Any:
         store = _store_of(client)
-        target = key
-        if len(keys) > 1:
-            newest = -1.0
-            for k in keys:
-                rows = registry.last_runs(store, k, since=time.time() - registry.FALSE_DONE_S - 30.0, limit=1)
-                at = float(rows[0].get("t0") or 0.0) if rows else -1.0
-                if at > newest:
-                    target, newest = k, at
-        digest = None if corrects else registry.values_digest(store, target, absolute)
-        return registry.false_done_after(store, target, digest=digest, corrects=corrects, request_id=ctx.request_id)
+        target, before = key, None
+        newest = -1.0
+        for k in keys:
+            rows = registry.last_runs(store, k, since=time.time() - registry.FALSE_DONE_S - 30.0, limit=1)
+            at = float(rows[0].get("t0") or 0.0) if rows else -1.0
+            if at > newest:
+                target, newest, before = k, at, rows[0].get("recheck")
+        digest = registry.values_digest(store, target, absolute)
+        if not digest:
+            return None
+        # the same values as the run it follows, a correction or a repeat alike (the digest's own rule)
+        marked = registry.false_done_after(store, target, digest=digest, request_id=ctx.request_id)
+        return (str(marked), None if before is None else int(before)) if marked else None
 
     marked = _mem(ctx.memory, "skill_false_done", go, timeout_s=0.5)
     if not marked:
         return None
     _emit(ctx, "done_recheck", skill=key, result="false_done", recheck="user",
           reason="correction" if corrects else "repeat", origin=ctx.origin)
-    return str(marked)
+    return marked
+
+
+def _withdraw_false_done(ctx: RunContext, noted: tuple[str, int | None] | None, result: SkillResult,
+                         skill_key: str) -> None:
+    """fSkills review M1: the run that followed a false-done mark (:func:`_note_false_done`) found the PC already
+    showing what was asked (``already``, checked): the run marked had done it after all (the user asked again for
+    another reason: "the other one", "from the start"), so its mark is taken back (its recheck as it was) and logged."""
+    if not noted or result.outcome != "already" or result.verified is not True:
+        return
+    from yuki.skills import registry
+
+    run_key, before = noted
+    took = _mem(ctx.memory, "skill_false_done", lambda c: registry.set_recheck(
+        _store_of(c), run_key, None if before is None else bool(before)), timeout_s=0.5)
+    if took:
+        _emit(ctx, "done_recheck", skill=skill_key, result="withdrawn", recheck="user", reason="already",
+              origin=ctx.origin)
 
 
 def _ledger_app(ctx: RunContext, run_key: str | None, app: str) -> None:
@@ -1195,6 +1242,17 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                                            if isinstance(res.facts, Mapping) else None)
         if isinstance(res.facts_ram, Mapping) and res.facts_ram.get("seen"):
             seen = _seen_names([*seen, *(res.facts_ram.get("seen") or [])])
+        if res.held == HELD_BLOCKED:
+            # fHands: something other than a game stopped this rung's step (the gate failed closed, another guard):
+            # a settled stop said plainly, never the game line, never the next rung (it would meet the same stop),
+            # never handed over (the thinker too). The ledger keeps it as a refusal (never counted against the rung)
+            acted = state["acted"] = acted or bool(res.ran)
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": HELD_BLOCKED})
+            _emit(ctx, "route_try", skill=skill.key, route=route.key, result=HELD_BLOCKED, ms=route_ms)
+            _ledger_finish(ctx, run_key, outcome="refused", checked=None, route=route, ms=route_ms, app=app_done,
+                           acted=acted)
+            return _simple(skill.key, HELD_BLOCKED, ctx, started, say=LINE_BLOCKED_PARTWAY if acted else LINE_BLOCKED,
+                           tried=tried, run_key=run_key, route=route.key, focus_taken=focus_taken, sends=sends)
         if res.held:
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "held_game"})
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result="held_game", ms=route_ms)
@@ -1601,6 +1659,29 @@ def _dropped_handoff(resolved: Any, slots: Mapping[str, Any] | None, words: list
         return None
 
 
+def _asks_whom(resolved: Ask, slots: Mapping[str, Any] | None, loaded: Any) -> bool:
+    """Whether the resolver's question is for a person slot nobody gave (fMsg merge note E1): the asked slot is
+    person-bound by the capability's own data (``resolve._person_bound``: a ``person`` slot, or a text slot bound to a
+    contact, ``message.person``), the caller gave no value for it, and the resolver dropped none there. Data only;
+    never raises (``False``)."""
+    try:
+        from yuki.skills.resolve import _person_bound
+
+        if resolved.slot in set(getattr(resolved, "dropped", None) or ()):
+            return False
+        if _given_text((slots or {}).get(resolved.slot)):
+            return False
+        if loaded is None or not hasattr(loaded, "get"):
+            from yuki.skills.catalog import load
+
+            loaded = load()
+        skill = loaded.get(str(resolved.skill or ""))
+        slot = skill.slot(resolved.slot) if isinstance(skill, Skill) else None
+        return slot is not None and bool(_person_bound(skill, slot))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _dropped(resolved: Ask, slots: Mapping[str, Any] | None, words: list[str], loaded: Any) -> Handoff | None:
     """:func:`_dropped_handoff`'s work (it may raise; the caller keeps the question then)."""
     from yuki.skills.resolve import app_name, check_value
@@ -1849,8 +1930,9 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     ``earlier``: the conversation's older turns, oldest first (x6Resolver merge note M1): only ever passed to the
     resolver as ``earlier=``, which validates a given value against them and never fills from them; never appended to
     ``words``, whose newest turn decides a named app.
-    ``corrects``: the user corrected the skill's last run; with it, or the same skill and absolute values asked again
-    within 60 s of a "done" (not ``again``), that run is marked a false done first (D19, review r2 M2).
+    ``corrects``: the user corrected the skill's last run; the same skill and absolute values asked again within 60 s
+    of a "done" (as a correction, or not ``again``) mark that run a false done first (D19, review r2 M2), taken back
+    when the new run finds the PC already so (fSkills review M1: :func:`_note_false_done`).
     ``ctx.grant`` (the brain's validated consent grant, :func:`run_for_thinker`): the resolver keeps the granted text
     and person as given (``granted=``) instead of dropping them; with none, nothing changes."""
     from yuki.skills import enabled, setting
@@ -1911,7 +1993,7 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         return run(Refused(str(skill_key or ""), "memory_slow"), ctx)
     if resolved is None:
         resolved = go(None)
-    _note_false_done(resolved, ctx, corrects=bool(corrects), again=bool(again))
+    noted = _note_false_done(resolved, ctx, corrects=bool(corrects), again=bool(again))
     handed = _dropped_handoff(resolved, slots, words, catalog.get("loaded"), ctx)
     if handed is not None:
         # x5Fallback (IF-handoff): a value the caller gave that the words as heard don't hold is never asked back
@@ -1920,6 +2002,16 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
               dropped_slots=_slot_flags([k for k, v in handed.filled.items() if v == FROM_UNHEARD]),
               origin=ctx.origin)
         resolved = handed
+    elif isinstance(resolved, Ask) and _asks_whom(resolved, slots, catalog.get("loaded")):
+        # fMsg merge note E1 (live 18 Oct, k_clarify_who_draft): the resolver asks whom a message is for ("Who to?") and
+        # nobody gave the person: noted with the user's turns as they stand, so their very next turn ("to hardish")
+        # answers it and a draft or an open runs as the one person that answer sounds like, never asked twice
+        try:
+            from yuki.skills.chat import note_who_asked
+
+            note_who_asked(list(ctx.words))
+        except Exception:  # noqa: BLE001 - the question stands either way
+            pass
     # tTaste merge note 1 (phase T): a run that opens YouTube's home with no game in front ranks the fresh uploads on a
     # short thread of their own while the page opens; they are named (and noted, so "the B one" can pick one) only
     # after the run's checked done and a non-empty wait; a run that fails, asks or times out names nothing. A card's
@@ -1935,6 +2027,25 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         except Exception:  # noqa: BLE001 - the offer is extra; the run goes on without it
             pending = None
     result = run(resolved, ctx)
+    _withdraw_false_done(ctx, noted, result, getattr(getattr(resolved, "skill", None), "key", str(skill_key or "")))
+    other = None if picked is not None else _other_than_corrected(resolved, result, ctx, corrects=bool(corrects))
+    if other is not None:
+        # fSkills (live 18 Oct: "No, not this one. The other playlist" ran ネオン again, the very one just put on):
+        # a backstop for a talker that re-sends the value the user just rejected. A correction whose run found the PC
+        # already so changed nothing, so the slot's next own candidate of theirs runs instead (their taste order, the
+        # corrected value left out), resolved with the same extras as the first (the grant, the older turns). Never
+        # with Yuki's own pick (``picked``: its done line and taste note name that pick)
+        again_slots = {**dict(slots or {}), other[0]: other[1]}
+        extra: dict[str, Any] = {"earlier": [str(w) for w in earlier if w]} if earlier else {}
+        regranted = granted_values(ctx.grant, again_slots) if ctx.origin == "thinker" else None
+        if regranted:
+            extra["granted"] = dict(regranted)
+        redo = _mem(ctx.memory, "skill_resolve", lambda c: res_mod.resolve(
+            resolved.skill.key, again_slots, words, store=_store_of(c) if c is not None else None, live=live,
+            again=again, default_step=step, disable_after=disable_after, **extra), timeout_s=1.0) \
+            if ctx.memory is not None else None
+        if isinstance(redo, Plan):
+            result = run(redo, ctx)
     if picked is not None and result.done:
         # the pick played and its done-check saw it: the line names it and why (code-written), and the conversation
         # keeps it ("another one" takes the next; a quick change counts as a skip)
@@ -1956,6 +2067,38 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     return result
 
 
+def _other_than_corrected(resolved: Any, result: SkillResult, ctx: RunContext, *,
+                          corrects: bool) -> tuple[str, str] | None:
+    """fSkills: ``(slot, the next own candidate's name)`` when a correction (``corrects``) resolved to the very state
+    the PC already shows (its run ``already``): the user said "not this one", so the taste slot that named it takes
+    the user's next own candidate of that kind (:func:`yuki.skills.taste.top` at this hour, the current one left out;
+    else the next name :func:`yuki.skills.taste.candidates` lists). ``None`` otherwise, or with no other candidate."""
+    if not corrects or result.outcome != "already" or not isinstance(resolved, Plan) or ctx.memory is None:
+        return None
+    from yuki.skills import taste
+
+    for slot in resolved.skill.slots:
+        value = resolved.values.get(slot.name)
+        if not slot.taste or not isinstance(value, Mapping):
+            continue
+        now_key, now_name = str(value.get("key") or ""), " ".join(str(value.get("name") or "").split()).casefold()
+
+        def pick(c: Any, kind: str = slot.taste) -> str | None:
+            store = _store_of(c)
+            for t in taste.top(store, kind, n=6):
+                if t.name and t.entity_key != now_key and " ".join(t.name.split()).casefold() != now_name:
+                    return t.name
+            for n in taste.candidates(store, kind):
+                if n and " ".join(str(n).split()).casefold() != now_name:
+                    return str(n)
+            return None
+
+        name = _mem(ctx.memory, "taste_other", pick, timeout_s=0.5)
+        if name:
+            return slot.name, str(name)
+    return None
+
+
 def run_for_voice(hands: Any, args: Mapping[str, Any], words: list[str], *, game: str | None = None,
                   log: Callable[..., Any] | None = None, request_id: str | None = None,
                   settings: Any = None, live: Live | None = None,
@@ -1963,8 +2106,8 @@ def run_for_voice(hands: Any, args: Mapping[str, Any], words: list[str], *, game
     """The talker's ``run_skill`` (sVoice wires it into ``Hands._skill`` inside ``_acting_run``): ``(ok, report,
     facts)`` (see :meth:`SkillResult.as_voice`). ``game``: the voice's own D9 answer when it has one, used only for
     the live facts at resolve time (review r2 L5: every rung's D17 re-check reads the game itself, fresh). The
-    talker's ``corrects`` flag marks the skill's last "done" false (D19). ``on_focus``: the acting marker, published
-    only right before a rung that takes focus (sound-only rungs publish none, D18)."""
+    talker's ``corrects`` flag, with the same values, marks the skill's last "done" false (D19). ``on_focus``: the
+    acting marker, published only right before a rung that takes focus (sound-only rungs publish none, D18)."""
     ctx = RunContext(origin="voice", words=[str(w) for w in words or []], memory=getattr(hands, "memory", None),
                      hands=hands, log=log, request_id=request_id, on_focus=on_focus,
                      session_id=getattr(getattr(hands, "memory", None), "session_id", None))

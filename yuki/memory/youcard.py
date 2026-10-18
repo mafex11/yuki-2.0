@@ -13,7 +13,10 @@ This module builds ONE card from the stores that already hold the answer, by cod
   first), Spotify playlists with what the user calls them, meeting tabs, the voice channels and servers of the apps
   that join calls (``yuki.skills.discord_route.voice_channels``), the things inside their own ways' apps (their
   projects) and the ways themselves (contract C4 rows: run only when asked, never offered), usual means (``prefs``),
-  and the people block (``yuki.memory.contacts.directory``: names, how each is heard, their app);
+  and the people block (``yuki.memory.contacts.directory``: names, how each is heard, their app); their weekly
+  routines with days and times (every active one, whatever the day: "what time's my meeting tomorrow");
+* **Where they left off** (planner only) - per site they come back to, the last page they had in front there, with its
+  title and address (``Store.links``), so "put my anime back on" is one open;
 * **Open** - the brief's live items (dated goals, loops, plans), top 3;
 * **Lately** - the last two day digests, one short line each.
 
@@ -55,6 +58,17 @@ PEOPLE_CHARS = (480, 700)
 ROUTINE_NEAR_MIN = 90.0
 #: A value counts as "usual at this hour" when this share of its use falls within an hour of now.
 HOUR_SHARE = 0.12
+#: The weekly routines line names at most this many (talker, wide).
+ROUTINES_N = (4, 6)
+#: "Where they left off" (planner): this many sites, from pages seen within this many days; a site counts when its
+#: pages were seen on at least LEFT_OFF_MIN_DAYS days (one they come back to); an address longer than
+#: LEFT_OFF_URL_CHARS, or with a query longer than LEFT_OFF_QUERY_CHARS (a token, a tracking string), is left out
+#: (the title and site stay): a cut address would open the wrong page.
+LEFT_OFF_N = 4
+LEFT_OFF_DAYS = 14.0
+LEFT_OFF_MIN_DAYS = 2
+LEFT_OFF_URL_CHARS = 140
+LEFT_OFF_QUERY_CHARS = 40
 
 _lock = threading.Lock()
 #: ``(db path, purpose) -> (built_at, stamp, text)``
@@ -186,6 +200,83 @@ def _routines_near(store: Any, now: float) -> list[str]:
     return [line for _gap, line in out[:3]]
 
 
+def _routines_week(store: Any, n: int) -> list[str]:
+    """fTalk (k_two_asks: "what time's my meeting tomorrow" on a Sunday): every active routine with its days and time,
+    whatever today is ("Usually around now" names only those due today, within :data:`ROUTINE_NEAR_MIN`), earliest in
+    the day first. One short line; RAM only."""
+    try:
+        rows = store.routines(states=["active"])
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for r in rows:
+        at = r.get("at_min")
+        if at is None:
+            continue
+        try:
+            label = store.routine_label(r) or ""
+        except Exception:  # noqa: BLE001
+            label = ""
+        label = label or _skill_name(store, str(r.get("skill_id") or "")) or "their usual"
+        dayset = str(r.get("dayset") or "")
+        days = "every day" if dayset in ("", "all") else dayset
+        hits, eligible = int(r.get("hits") or 0), int(r.get("eligible") or 0)
+        sure = f" ({hits} of {eligible} {'days' if days == 'every day' else days})" if eligible else ""
+        out.append((float(at) % 1440.0, f"{_clip(label, 40)} {days} around {_hm(float(at))}{sure}"))
+    out.sort(key=lambda x: x[0])
+    lines = [line for _at, line in out[:n]]
+    return ["Weekly routines: " + "; ".join(lines)] if lines else []
+
+
+def _left_off(store: Any, now: float, n: int) -> list[str]:
+    """fBrain (k_resume_anime: the planner clicked through "continue watching" instead of opening the episode): per
+    site the user comes back to (its pages seen on :data:`LEFT_OFF_MIN_DAYS` days or more), the last page past the
+    site's root they had in front there (never one only on screen beside it), with its title and address, newest
+    first. Planner only; RAM only."""
+    try:
+        links = store.links(how="viewed", since=now - LEFT_OFF_DAYS * 86400.0, limit=600)
+    except Exception:  # noqa: BLE001
+        return []
+    from urllib.parse import urlsplit
+
+    days: dict[str, set[Any]] = {}
+    last: dict[str, Any] = {}
+    for link in links:   # most recently seen first
+        host = str(getattr(link, "host", "") or "").casefold()
+        if not host or getattr(link, "attention", None) == "visible":
+            continue
+        seen = days.setdefault(host, set())
+        for at in (getattr(link, "first_seen", None), getattr(link, "last_seen", None)):
+            try:
+                seen.add(datetime.fromtimestamp(float(at)).date())
+            except Exception:  # noqa: BLE001
+                pass
+        title = " ".join(str(getattr(link, "title", "") or "").split())
+        if host in last or not title:
+            continue
+        try:
+            parts = urlsplit(str(link.url or ""))
+        except Exception:  # noqa: BLE001
+            continue
+        if not parts.path.strip("/"):
+            continue   # a site's root is no place to pick up from
+        last[host] = (link, parts, title)
+    picks = [(link, parts, title, host) for host, (link, parts, title) in last.items()
+             if len(days.get(host) or ()) >= LEFT_OFF_MIN_DAYS]
+    picks.sort(key=lambda x: -float(x[0].last_seen or 0.0))
+    today = datetime.fromtimestamp(now).date()
+    bits = []
+    for link, parts, title, host in picks[:n]:
+        url = str(link.url or "")
+        address = url if len(url) <= LEFT_OFF_URL_CHARS and len(parts.query) <= LEFT_OFF_QUERY_CHARS else ""
+        day = datetime.fromtimestamp(float(link.last_seen)).date()
+        gap = (today - day).days
+        when = "today" if gap <= 0 else "yesterday" if gap == 1 else f"{day:%d %b}"
+        bits.append(f'"{_clip(title, 60)}" on {host}' + (f" ({address})" if address else "") + f", {when}")
+    return ["Where they left off (the last page on each site they come back to, newest first; to pick one up, open "
+            "its address): " + "; ".join(bits)] if bits else []
+
+
 def _skill_name(store: Any, key: str) -> str:
     if not key:
         return ""
@@ -254,7 +345,7 @@ def _browser_name(store: Any, key: str, names: dict[str, str]) -> str:
 
 def _things(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, wide: bool) -> list[str]:
     i = 1 if wide else 0
-    out: list[str] = []
+    out: list[str] = _routines_week(store, ROUTINES_N[i])
     names: dict[str, str] = {}
     sites = vals.get("web.open_page") or []
     if sites:
@@ -520,6 +611,8 @@ def _slow(store: Any, purpose: str, now: float) -> list[tuple[int, str]]:
         lines += [(3, x) for x in _who(store)]
     lines += [(1, x) for x in _usually_now(store, vals, now, wide)]
     lines += [(2, x) for x in _things(store, vals, now, wide)]
+    if purpose == "planner":
+        lines += [(2, x) for x in _left_off(store, now, LEFT_OFF_N)]
     lines += [(3, x) for x in _people(store, wide)]
     if wide:
         # the planner and the judge only: the talker answers "what's due / what did I do" by a lookup (25 Sept), so a

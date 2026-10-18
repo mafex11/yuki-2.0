@@ -614,9 +614,12 @@ def sounds_alike(store: Store, name: str | None) -> Alike | None:
     """The one person ``name`` sounds like when none of the user's people goes by it as written (:func:`resolve` finds
     nobody) and no group chat or channel is called exactly that: one of their names or aliases matched by the strict
     rule (:func:`_sound_ok`), the looser one (:func:`_alike`) or the tight one (:func:`_alike_tight`, a confirmed
-    heard form), and nobody else's. ``None`` when anyone fits as written, none or two people sound alike, or memory
-    can't say. For the chat driver's question ("Did you mean bobsled?") and, only when ``tight``, a draft or an open
-    without one; never whom a send goes to. Never raises."""
+    heard form), and nobody else's. When two people sound alike, only the hits whose sound key is the very key of a
+    heard form the user confirmed count (fMsg merge note C1, live 18 Oct: "Kwix" sounded like bobsled, whose confirmed
+    heard form "quix" has the same key, and loosely like someone else): one person there is that person, ``tight`` (a
+    correction of theirs said again). ``None`` when anyone fits as written, none or two people sound alike (and no
+    such confirmed key settles it), or memory can't say. For the chat driver's question ("Did you mean bobsled?") and,
+    only when ``tight``, a draft or an open without one; never whom a send goes to. Never raises."""
     try:
         text = " ".join(str(name or "").split())
         form = heard_form(text)
@@ -626,7 +629,7 @@ def sounds_alike(store: Store, name: str | None) -> Alike | None:
         if any(tokens(r.chat) == want for r in places(store)):
             return None
         word = _one_word(text)
-        hits: list[tuple[bool, float, Contact, str, bool, bool]] = []
+        hits: list[tuple[bool, float, Contact, str, bool, bool, bool]] = []
         for c in people(store):
             heard = {" ".join(tokens(h)) for h in c.heard()}
             for n in c.names:
@@ -637,13 +640,22 @@ def sounds_alike(store: Store, name: str | None) -> Alike | None:
                 strict = _sound_ok(form, f)
                 tight = confirmed and word is not None and _alike_tight(word, f)
                 if strict or tight or _alike(form, f):
-                    hits.append((tight, _distance(form.letters, f.letters), c, n, confirmed, strict))
-        if not hits or len({h[2].id for h in hits}) != 1:
+                    hits.append((tight, _distance(form.letters, f.letters), c, n, confirmed, strict,
+                                 f.key == form.key))
+        settled = False
+        if hits and len({h[2].id for h in hits}) != 1:
+            # C1: two people sound alike; an exact sound-key hit on a heard form the user confirmed settles it when
+            # those hits are one person's (their own correction, said again), else nobody
+            same = [h for h in hits if h[6] and h[4]]
+            if not same or len({h[2].id for h in same}) != 1:
+                return None
+            hits, settled = same, True
+        if not hits:
             return None
         hits.sort(key=lambda h: (not h[0], h[1], not h[4]))
-        tight, _d, c, n, confirmed, _s = hits[0]
+        tight, _d, c, n, confirmed, _s, _k = hits[0]
         return Alike(contact=c, form=" ".join(str(n).split()), confirmed=confirmed,
-                     strict=any(h[5] for h in hits), tight=tight)
+                     strict=any(h[5] for h in hits), tight=bool(tight or settled))
     except Exception:
         return None
 

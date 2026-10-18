@@ -90,6 +90,7 @@ import win32process
 
 from yuki.actions import ActionResult
 from yuki.core.inputtag import YUKI_INPUT_TAG
+from yuki.actions import gate as _gate
 from yuki.memory import gamegate as _gamegate
 from yuki.perception.windows import (
     accepts_input,
@@ -249,8 +250,8 @@ def _send_each(records: list[_Input], *, why: list[str] | None = None) -> int:
     """
     mouse = any(int(record.type) == _INPUT_MOUSE for record in records)
     # D17: nothing reaches a game in front, nor the game window under the pointer (a click or wheel goes there)
-    if (refused := _gamegate.refuse_input("mouse" if mouse else "keys",
-                                          point=cursor_position() if mouse else None)) is not None:
+    if (refused := _gate.refuse("mouse" if mouse else "keys",
+                                point=cursor_position() if mouse else None)) is not None:
         if why is not None:
             why.append(refused)
         return 0
@@ -302,7 +303,7 @@ def _send_presses(key: str, times: int = 1, *, why: list[str] | None = None) -> 
 def _game_stopped(why: list[str], details: dict, started: float, summary: str) -> ActionResult:
     """D17 (review r2 L2): the backstop refused mid-action (a game came to the front): a failed result that says so,
     never "done"."""
-    details["refused"] = "game"
+    details["refused"] = _gate.kind_of(why[0])   # "game" only when a game refused it (k-live-A k_t3_draft)
     return _result(False, f"{summary}: {why[0]}", details, started)
 
 
@@ -386,7 +387,7 @@ def _send_text(text: str, expect_hwnd: int | None = None) -> tuple[int, int, str
         if refusal:
             return sent, expected, f"{refusal} after {index} of {len(body)} characters"
         # D17: re-checked before every character, like the foreground (a game can come to the front mid-string)
-        if (refusal := _gamegate.refuse_input("type_text")) is not None:
+        if (refusal := _gate.refuse("type_text")) is not None:
             return sent, expected, f"{refusal} (after {index} of {len(body)} characters)"
         events = _char_events(char)
         array = (_Input * len(events))(*events)
@@ -538,7 +539,7 @@ def _in_screen_bounds(x: int, y: int) -> bool:
 def _move(x: int, y: int, *, why: list[str] | None = None) -> bool:
     """Put the cursor exactly on (x, y) - instantly, on any monitor. False (not moved) with a game in front or a game's
     window at the point (D17); ``why`` (a caller's list) then gets the refusal."""
-    if (refused := _gamegate.refuse_input("pointer", point=(int(x), int(y)))) is not None:
+    if (refused := _gate.refuse("pointer", point=(int(x), int(y)))) is not None:
         if why is not None:
             why.append(refused)
         return False
@@ -549,8 +550,8 @@ def _move(x: int, y: int, *, why: list[str] | None = None) -> bool:
 def _refused_for_game(action: str, details: dict, started: float, **target: object) -> ActionResult | None:
     """D17, said up front: a public action refused because a game is in front or is its target (``hwnd``, ``point``,
     ``front_ok``), as a failed result whose summary says why; ``None`` = go ahead (the primitives check again)."""
-    if (refused := _gamegate.refuse_input(action, **target)) is not None:   # type: ignore[arg-type]
-        details["refused"] = "game"
+    if (refused := _gate.refuse(action, **target)) is not None:   # type: ignore[arg-type]
+        details["refused"] = _gate.kind_of(refused)   # "game" only when a game refused it (k_t3_draft)
         return _result(False, refused, details, started)
     return None
 
@@ -1692,7 +1693,7 @@ def _clear_focused(expect_hwnd: int | None, details: dict) -> tuple[str | None, 
         _send_presses("delete", why=why)
     if why:   # D17: a game came to the front: not "sent" (review r2 L2)
         details["cleared"] = False
-        details["refused"] = "game"
+        details["refused"] = _gate.kind_of(why[0])
         return f"did not clear: {why[0]}", ""
     if not known or not getattr(focus, "has_value", False):
         details["cleared"] = None

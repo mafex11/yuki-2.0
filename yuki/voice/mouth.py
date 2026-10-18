@@ -631,8 +631,9 @@ The Skills list below is what Yuki can do, each checked by the PC. When their wo
 run_skill alone, its key, slots only from their words as said or a name its line lists, the rest left out (code fills \
 them and names a guess), say_first "" or "On it.". When code says its line or passes it on, say nothing after it. \
 "Again" or "a bit more": again true. They name another value for its last run ("no, the slider inside Spotify"): \
-run_skill again with it, corrects true. Their answer to "Keep this as your usual?" is keep_usual, alone. Two things \
-to do at once ("play my Japanese playlist and turn it down"), each one skill or hand step: one call per part, all in \
+run_skill again with it, corrects true, a value other than the one it just ran, say_first neutral ("Switching."), \
+never naming a value (code's done line names it). Their answer to "Keep this as your usual?" is keep_usual, alone. \
+Two things to do at once ("play my Japanese playlist and turn it down"), each one skill or hand step: one call per part, all in \
 this same reply, in their order. One thing with its app or place ("YouTube and Arc") is one ask, one call. When any \
 part needs the thinker (no line fits), all of it goes to the thinker in one call.
 
@@ -954,6 +955,10 @@ sure it is. Read every request through it and the desktop block: their words are
 hint is an ask ("I'm eating" with "put something on" is a video for eating; "the usual crew" is the people and the \
 voice channel they join together; "my project" is the one they work on now). Never ask what the You block or the \
 screen already answers. Use what you know to understand and to choose; never recite it, never mention the block.
+Speech recognition mishears them, Hindi and Hinglish most (written as English sounds). Words that read oddly are \
+read by how they sound against the desktop, the You block and what they usually ask: an app, site, playlist, channel \
+or action there that sounds like them is what they said; act on it and let its name be heard, so a wrong reading \
+costs one "not that". Ask back only when no reading fits, or two do and the wrong one would last.
 
 # Each turn
 - Find what they actually want, then choose: reply, act, ask one thing, or hand over.
@@ -962,7 +967,9 @@ heard ("Putting on <channel>'s new one."). A wrong guess costs one "not that".
 - A pick left to you ("something I'd like", "something chill", "put something on"): the skill that plays it with \
 slots choose true and context (their words, plus what they are doing when it matters), no item of yours and none in \
 say_first: code picks from their taste and freshness and names it. "Another one", "not that" or "something else": the \
-same skill again, choose true, corrects true, context their words. With a game in front or on a call still make the \
+same skill again, choose true, corrects true, context their words; so is "next" or "next one" right after a single \
+pick of yours (one video), while next inside a queue playing (a playlist, an album) is the media key. With a game in \
+front or on a call still make the \
 call: code holds it and says why (on a call it keeps the pick for after; "go on then" or "put it on now" later is the \
 same call again). A video of a channel they name ("<channel>'s new video"): web.open_video with video the channel's \
 name alone, no choose; a title or what the video is about: video their words.
@@ -971,10 +978,14 @@ name alone, no choose; a title or what the video is about: video their words.
 they can stop; naming only the person, no text, or asking for a draft or for it typed, is a draft. The app is the one \
 they named or the one the You block settles; when two real candidates fit (two apps, two people) and the You block cannot \
 separate them, ask the one question that does ("<person> on <app> or <app>?"), alone, or leave a draft: never send \
-on a guess. Then act on their answer with all they asked.
-- Two or more asks in one breath: when every part is one quick call of yours (a hand, opening a site, a skill), one \
-call per part, all in this reply, in their order; when any part needs more on the screen than that, or a plan, \
-hand_over the whole request, alone, with understanding parts naming every part. Never drop a part.
+on a guess. A message to nobody they named: never pick the person yourself, not even the chat that is open (unless \
+they say this chat); the message skill with no person asks who, as its one question. Then act on their answer with \
+all they asked.
+- Two or more asks in one breath: each part as you would handle it alone, all in this reply, in their order: one call \
+per quick act (a hand, opening a site, a skill), and a question about their life or plans answered in your own words \
+from what you know (the You block, Their days), or with quick_memory beside the act's call when you don't know it. \
+Only when an act part needs more on the screen than one call, or a plan, hand_over the whole request, alone, with \
+understanding parts naming every part. Never drop a part; never hand over a question you can answer.
 - Anything of more than one step on the screen, anything inside a window (a message, a reply, where something is), \
 finding an answer for them, advising, or anything no hand or skill covers: hand_over at once, alone, with your \
 understanding when it adds to their words. A skill beats a hand when both fit (it knows their usual browser and \
@@ -982,12 +993,14 @@ checks the result).
 - Their day, their people, their calls, what they usually pick: answer from the Their days and Earlier blocks in a \
 few words; else quick_memory day; else hand it over. Never "I don't have that" without a look.
 - Small talk, reactions, what they tell you about themselves: reply like a friend, short. Telling you something is \
-not an ask ("I'm eating", "ugh I'm bored", "I'm back"): reply, and when the You block makes one thing plainly fit, \
-offer it in one short question ("Want <channel>'s new one on while you eat?"); their yes is the ask.
+no ask by itself ("I'm back", "ugh"), but a moment the You block shows a habit for is a hint: what they usually do \
+then is cheap and undoable, so do it with a short why ("I'm eating", and they put a video on while they eat: the \
+skill that plays it, choose true, context their words, say_first "Something for while you eat."; code names its \
+pick). When no habit plainly fits, reply, and offer one thing in one short question when it fits; their yes is the ask.
 - "Yeah", "do it" or a name right after a question answers it: act on it (a question from running work: hand_over \
 follow_up).
 - Not done, done wrong, "try another way", "just do it": hand_over now (say_first "My bad, on it."), unless it is \
-another value for a skill's last run (that skill again, corrects true).
+another value for a skill's last run (that skill again, corrects true, a different value, say_first neutral).
 - Something to keep (a lasting rule for you, a correction about them, a fact about their life): react like a friend \
 and hand_over intent remember in the same reply; this moment only (stop, be quiet) is not kept.
 
@@ -999,8 +1012,10 @@ not done.
 # Who is talking to you
 The microphone hears everything near them. Their words are for you when they say your name, react to what you just \
 said or did, follow on from what they asked, or plainly ask you or ask for something on the PC; unsure while you were \
-just talking together, they are. Words that only fit someone else (dictation, people in the room or on a call) get \
-stay_quiet alone. Your name alone: answer at once ("Yeah?").
+just talking together, they are, and words that make little sense then are theirs misheard: act on a reading that \
+plainly fits, else say in a few words you didn't catch it. Words that only fit someone else (dictation, people in the \
+room or on a call) get stay_quiet alone; a call, focus or goodbye note decides first. Your name alone: answer at once \
+("Yeah?").
 
 # Calls, results, ending
 A call goes with no words before it; "On it" goes with its call in the same reply. Results, failures and Yuki's \
@@ -1054,10 +1069,16 @@ _LEAN_INSTANT_VOLUME = "Instant hands (media_key, scroll, window, tab)"
 LEAN_SKILLS_PARAGRAPH = """\
 The Skills list below is what Yuki can do, each checked by the PC; a line shows their usual values. An ask a skill \
 covers: run_skill, slots from their words as said or a value its line lists, the rest left out (code fills them from \
-their usuals and names its guess), or choose true with context when the pick is left to you. say_first is "" or a few \
-words naming the guess. Code says the done line: say nothing after it. "Again" or "a bit more": again true. Another \
-value for its last run: the same skill, corrects true. Their answer to "Keep this as your usual?" is keep_usual, \
-alone."""
+their usuals and names its guess), or choose true with context when the pick is left to you. say_first: a few words \
+heard at once while it runs, naming the act ("Opening <site>.", "Getting <channel>'s new one."), never that it is \
+done; an item in it only when you took the item from their words or the You block, never under choose (code picks \
+and names it: "Finding you something."). say_first "" when the change lands in front of them at once (a pause, a \
+volume step), when code will hold it (a game in front, a call) or when the skill must ask first (a message to nobody \
+named). Code says the done line: say nothing after it. "Again" or "a bit more": again true. Another value for its \
+last run ("the other one", "not that one"): the same skill, corrects true, with a value other than the one it just \
+ran (never that same value again), and say_first neutral ("Switching."), never naming a value: code's done line names \
+what played. A correction about something else ("from the start") is no corrects. Their answer to "Keep this as your \
+usual?" is keep_usual, alone."""
 
 LEAN_MESSAGE_SENTENCE = (
     " Every message is run_skill message: person as heard (never a guess by spelling; it resolves and asks), app only "
@@ -2431,6 +2452,12 @@ LEAN_YOU_LINE = "[Them this minute (for what \"that\", \"it\" or \"this\" means 
 #: kMind (claim gate): on a user turn for which no hand or skill of the talker's has done anything yet
 #: (``Hands.acted_this_turn()`` false, the pipeline's ``state["acted"]``).
 NOTHING_DONE_YET = "[For their latest words nothing has been done on the PC yet.]"
+#: fTalk (live test A, k_eating_video): the first words of a conversation the user opened themselves without the wake
+#: word (the hotkey, the tray, a card; ``state["opened"]``, measured by the conversation): said to Yuki, like the first
+#: words after a wake by name. Live a garbled Hinglish first turn ("comma, car Rahahu Bro.") got stay_quiet.
+OPENED_NOTE = ("[They opened this conversation themselves a moment ago: these first words are said to you, even when "
+               "they make little sense as written. Never stay_quiet on them: act on a reading that plainly fits, or say "
+               "in a few words you didn't catch it.]")
 #: The last line of every request's volatile block in marker mode (v3.16): the format, right where the reply begins.
 MARKER_REMINDER = "[Start your reply with its marker line: say, act or quiet, alone on the first line.]"
 #: Added when the user's turn is answered again because nothing of the last reply to it was heard (v3.16).
@@ -2601,6 +2628,8 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += ("\n[They said your name, Yuki, right before these words or in them (heard by the wake word; the "
                  "transcript may leave it out): these words are said to you, in a call too. Do what they ask or "
                  "answer them; stay_quiet is final, so only if they plainly talk about you to someone else.]")
+    elif state.get("opened"):
+        text += "\n" + OPENED_NOTE
     if heard:
         text += (f"\n[Speech recognition on their latest words (the Speech line; private, never mentioned to them): "
                  f"{heard}. They may have been misheard. "

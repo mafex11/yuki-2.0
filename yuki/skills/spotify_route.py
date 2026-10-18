@@ -405,9 +405,13 @@ class Desk:
 DESK: Any = Desk()
 
 
-def _refused(result: Any) -> bool:
+def _refused(result: Any) -> str | None:
+    """The refusal kind an action's result carries (fHands, ``yuki.actions.gate.carried``): ``"game"`` (held for a
+    game) or ``"blocked"`` (the gate failed closed, or another guard refused it: the engine's settled stop, never said
+    as a game), else ``None``."""
     details = getattr(result, "details", None)
-    return isinstance(details, Mapping) and details.get("refused") == "game"
+    value = details.get("refused") if isinstance(details, Mapping) else None
+    return value if value in ("game", "blocked") else None
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -751,15 +755,28 @@ def _learned_wording(memory: Any) -> dict[str, str] | None:
     return got if isinstance(got, dict) else None
 
 
-def _pattern_refused(hwnd: int) -> bool:
+def _pattern_refused(hwnd: int) -> str | None:
     """D17's backstop for a pattern call: refused only on a game's own window (``front_ok``: a pattern call on any
-    other window is neither input nor focus, so it may run with a game in front); the check fails closed."""
+    other window is neither input nor focus, so it may run with a game in front); the check fails closed. ``None``
+    (go ahead), else the refusal's kind (fHands): ``"game"``, or ``"blocked"`` (the gate failed closed)."""
     try:
-        from yuki.memory import gamegate
+        from yuki.actions import gate
 
-        return gamegate.refuse_input("uia_pattern", hwnd=int(hwnd), front_ok=True) is not None
+        why = gate.refuse("uia_pattern", hwnd=int(hwnd), front_ok=True)
+        return None if why is None else gate.kind_of(why)
     except Exception:  # noqa: BLE001
-        return True
+        return "blocked"
+
+
+def _refused_look(kind: str) -> "Look":
+    """A pattern call the gate refused, as a read's status: ``refused`` (a game's own window: the rung did not run, as
+    before) or ``blocked`` (fHands: the engine's settled stop, :func:`_blocked_rr`)."""
+    return Look("blocked" if kind == "blocked" else "refused")
+
+
+def _blocked_rr(facts: dict[str, Any]) -> Any:
+    """fHands: a step stopped by something other than a game (``Look("blocked")``): the engine's settled stop."""
+    return _rr(ran=False, held="blocked", outcome="refused", facts=facts)
 
 
 def _look(desk: Any, hwnd: int, want: str, *, learned: Mapping[str, str] | None, press: bool = False,
@@ -767,8 +784,8 @@ def _look(desk: Any, hwnd: int, want: str, *, learned: Mapping[str, str] | None,
     """One read of the row (and, with ``page``, the page's button when the row isn't in view; with ``link``, only a
     page button whose own container shows that link); with ``press``, the "Play {name}" button found is invoked in
     the same job (decide and press on one read)."""
-    if press and _pattern_refused(hwnd):
-        return Look("refused")
+    if press and (kind := _pattern_refused(hwnd)):
+        return _refused_look(kind)
     gone = threading.Event()
     gate = threading.Lock()       # "the caller stopped waiting" and "the press starts" are decided one at a time
     langs = _langs()
@@ -849,8 +866,8 @@ def _set_slider(desk: Any, hwnd: int, *, to: float | None, by: float | None, bud
     caller stopped waiting."""
     from yuki.actions import slider as slider_mod
 
-    if _pattern_refused(hwnd):
-        return Look("refused")
+    if kind := _pattern_refused(hwnd):
+        return _refused_look(kind)
     langs = _langs()
     gone = threading.Event()
     gate = threading.Lock()
@@ -1525,6 +1542,8 @@ def _after_row(call: Any, look: Look, status: str, app_id: str, facts: dict[str,
     with the session paused or stopped -> a stale label: the session's own ``play`` (M1a: never Invoke, never a
     toggle)."""
     facts.update({k: v for k, v in look.counts().items() if k in ("rows", "row", "where", "label_source")})
+    if look.status == "blocked":
+        return _blocked_rr(facts)
     if look.status == "ambiguous":
         return _ask_two(look)
     if look.status == "not_in_view":
@@ -1620,7 +1639,14 @@ def _confirm_flip(call: Any, hwnd: int, want: str, learned: Mapping[str, str] | 
     facts["flip"] = seen or "unread"
     facts["flip_reads"] = reads
     if seen == "play":
-        look.details["not_taken"] = True
+        # fSkills (live 18 Oct: "not_taken" 0.2 s before the playlist audibly started, then the link rung and the
+        # thinker, 18 s): the row's own label lags the press, so Spotify's media session is read too; a session that
+        # plays now and didn't before the press is the press taken (the done-check still checks which playlist)
+        status, _app_id = DESK.spotify_status(None)
+        if status == "playing" and facts.get("session") != "playing":
+            facts["flip"] = "session"
+        else:
+            look.details["not_taken"] = True
     return look
 
 
@@ -1792,8 +1818,8 @@ def play_restored(call: Any) -> Any:
     name = _check_name(first, want) if first.status == "ok" else want
     prev = DESK.foreground()
     got = DESK.focus(win.hwnd)
-    if _refused(got):
-        return _rr(ran=False, held="game", outcome="refused", facts=facts)
+    if kind := _refused(got):
+        return _rr(ran=False, held=kind, outcome="refused", facts=facts)
     if not getattr(got, "ok", False):
         return _rr(ran=False, outcome="focus_failed", facts=facts)
     facts["restored"] = True
@@ -1860,8 +1886,8 @@ def play_link(call: Any) -> Any:
     if where == "other":
         return _other_device(facts)
     opened = DESK.open_uri(uri)
-    if _refused(opened):
-        return _rr(ran=False, held="game", outcome="refused", facts=facts)
+    if kind := _refused(opened):
+        return _rr(ran=False, held=kind, outcome="refused", facts=facts)
     if not getattr(opened, "ok", False):
         return _rr(ran=False, outcome="open_failed", facts=facts)
     clock, sleep = _clock(call), _sleeper(call)
@@ -1905,8 +1931,8 @@ def _search_job(desk: Any, hwnd: int, *, step: str, text: str = "") -> dict[str,
     (review r2 L3: a fill landing after the clear would leave Your Library filtered; ``late`` says one may still be
     going)."""
     sd = _sd()
-    if _pattern_refused(hwnd):
-        return {"refused": True}
+    if kind := _pattern_refused(hwnd):
+        return {"refused": kind}
     buttons = extra_control("library_search")
     boxes = extra_control("library_filter")
     gone = threading.Event()
@@ -1983,6 +2009,8 @@ def play_search(call: Any) -> Any:
     clock, sleep = _clock(call), _sleeper(call)
     learned = _learned_wording(call.ctx.memory)
     opened = _search_job(DESK, win.hwnd, step="open")
+    if opened.get("refused") == "blocked":
+        return _blocked_rr(facts)
     if not (opened.get("box") or opened.get("pressed")):
         return _rr(ran=False, outcome="no_search", facts=facts)
     look = Look("missing")
@@ -2057,8 +2085,8 @@ def play_launch(call: Any) -> Any:
     args = [str(a) for a in raw] if isinstance(raw, list) else []
     facts["launched"] = True
     got = DESK.launch(args, timeout_s=left)
-    if _refused(got):
-        return _rr(ran=False, held="game", outcome="refused", facts=facts)
+    if kind := _refused(got):
+        return _rr(ran=False, held=kind, outcome="refused", facts=facts)
     if not getattr(got, "ok", False):
         return _rr(ran=False, outcome="launch_failed", facts=facts)
     clock, sleep = _clock(call), _sleeper(call)
@@ -2074,8 +2102,8 @@ def play_launch(call: Any) -> Any:
     if state == "minimised":
         # started minimised anyway (Spotify's own setting): restored so Chromium builds its tree (guarded focus)
         back = DESK.focus(win.hwnd)
-        if _refused(back):
-            return _rr(ran=False, held="game", outcome="refused", facts=facts)
+        if kind := _refused(back):
+            return _rr(ran=False, held=kind, outcome="refused", facts=facts)
         facts["restored"] = bool(getattr(back, "ok", False))
         state = DESK.state(win.hwnd)
     if not _ensure_warm(DESK, win, call, facts, force=True, floor_s=LAUNCH_WARM_S):
@@ -2293,6 +2321,8 @@ def _slider_result(look: Look, facts: dict[str, Any], *, how: str = "") -> Any:
     -> acted, contradicted; didn't move at all (a backgrounded window ignored it) -> couldn't run (the next rung may
     try); not found -> couldn't."""
     facts.update(label_source=look.source, slider=look.status)
+    if look.status == "blocked":
+        return _blocked_rr(facts)
     if look.status == "acting_late":
         return _rr(ran=None, outcome="set_late", facts=facts, unverified_line=LINE_VOLUME_UNCONFIRMED)
     if look.status != "ok":
@@ -2370,9 +2400,9 @@ def volume_keys(call: Any) -> Any:
             out_of_time = True             # no press whose read-back can't be waited for within the request
             break
         got = DESK.hotkey(["ctrl", "up" if toward > 0 else "down"], win.hwnd)
-        if _refused(got):
+        if kind := _refused(got):
             facts["presses"] = presses
-            return _rr(ran=presses > 0, held="game", outcome="refused", facts=facts)
+            return _rr(ran=presses > 0, held=kind, outcome="refused", facts=facts)
         if not getattr(got, "ok", False):
             break
         presses += 1
@@ -2422,8 +2452,8 @@ def volume_restored(call: Any) -> Any:
         return _rr(ran=False, outcome="slider_" + first.status, facts=facts)
     prev = DESK.foreground()
     got = DESK.focus(win.hwnd)
-    if _refused(got):
-        return _rr(ran=False, held="game", outcome="refused", facts=facts)
+    if kind := _refused(got):
+        return _rr(ran=False, held=kind, outcome="refused", facts=facts)
     if not getattr(got, "ok", False):
         return _rr(ran=False, outcome="focus_failed", facts=facts)
     facts["restored"] = True

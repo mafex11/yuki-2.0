@@ -144,6 +144,7 @@ import win32process
 from yuki.actions import ActionResult
 from yuki.actions.input import wait_for_input_ready
 from yuki.actions.shell import run_powershell
+from yuki.actions import gate as _gate
 from yuki.memory import gamegate as _gamegate
 from yuki.perception.windows import (
     cloak_state,
@@ -537,7 +538,7 @@ def _find_app_window(identity: _AppIdentity, pids: set[int]) -> tuple[int | None
 def _show_window(hwnd: int, timeout_s: float = _SHOW_S) -> bool:
     """Show a hidden window and wait (bounded) until it is on screen. Never with a game in front, never a game's own
     window (D17: showing or restoring a window can put it over the game)."""
-    if _gamegate.refuse_input("window_show", hwnd=hwnd) is not None:
+    if _gate.refuse("window_show", hwnd=hwnd) is not None:
         return False
     try:
         win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
@@ -1443,7 +1444,7 @@ def _activate_packaged(
         ``(pid, error)``: the activated process id (the first, with several
         URIs), or ``None`` and why not.
     """
-    if (refused := _gamegate.refuse_input("launch")) is not None:   # D17: no app launch with a game in front
+    if (refused := _gate.refuse("launch")) is not None:   # D17: no app launch with a game in front
         return None, refused
     result: dict = {}
 
@@ -1636,6 +1637,10 @@ def _page_key(url: str):
 _PAGE_BEFORE_WINDOWS = 4
 _PAGE_BEFORE_WINDOW_S = 0.35
 _PAGE_BEFORE_S = 1.0
+#: fSkills (live 18 Oct, youtube_channel_ndl: 5 s for nothing): when a window already showed the very page asked for
+#: right before the hand-off, no change can come to wait for; the page is read once or twice in this short look (a
+#: new window at the address still counts as opened) and then said as already up (:func:`_already_page`).
+_ALREADY_PAGE_S = 0.8
 #: With a deadline (``deadline=``), the address is handed a second time (percFix, a cold start that dropped it) only
 #: when at least this much of it is left.
 _AGAIN_MIN_S = 1.5
@@ -1882,7 +1887,7 @@ def _open_new_window(chosen: dict[str, str], identity: _AppIdentity, budget_s: f
     Returns:
         ``(pid or None, via, error)``.
     """
-    if (refused := _gamegate.refuse_input("launch")) is not None:   # D17: no app launch with a game in front
+    if (refused := _gate.refuse("launch")) is not None:   # D17: no app launch with a game in front
         return None, "refused", refused
     appid = chosen["appid"]
     if _is_packaged(appid):
@@ -1964,6 +1969,8 @@ def _restore_background_app(
     details.update(via=via, pid=pid, launched=not error or pid is not None)
     if error:
         details["launch_error"] = error
+    if via == "refused":
+        details["refused"] = _gate.kind_of(error)   # fHands: the gate's refusal, by kind (a game or something else)
     if error and pid is None:
         return False, f"{lead}, and asking it for a new window ({via}) failed: {error}"
     if pid and pid not in running:
@@ -2352,7 +2359,7 @@ def _foreground() -> int:
 def _start_entry(appid: str, timeout_s: float) -> tuple[bool, str]:
     """Start a Start entry the way the Start menu does (``shell:AppsFolder\\<AppID>``: a shortcut's own arguments, a
     link's scheme handler). ``(ok, error)``."""
-    if (refused := _gamegate.refuse_input("launch")) is not None:   # D17: no app launch with a game in front
+    if (refused := _gate.refuse("launch")) is not None:   # D17: no app launch with a game in front
         return False, refused
     result = run_powershell(f"Start-Process -FilePath {_quote('shell:AppsFolder' + chr(92) + appid)}",
                             timeout_s=timeout_s)
@@ -2880,8 +2887,9 @@ def launch_app(
         )
     arg_list = [a for a in (args or []) if a != ""]
     # D17: no app is launched, shown or brought forward while a game is in front (re-checked before each step below)
-    if (refused := _gamegate.refuse_input("launch")) is not None:
-        return finish(False, refused, {"launched": False, "hwnd": None, "candidates": [], "refused": "game"})
+    if (refused := _gate.refuse("launch")) is not None:
+        return finish(False, refused, {"launched": False, "hwnd": None, "candidates": [],
+                                       "refused": _gate.kind_of(refused)})
     focus_floor = _FOCUS_FLOOR_S
     if deadline is not None:
         # x8WebArc: the caller's deadline bounds every wait of the call (a skill rung answers within its request)
@@ -3006,9 +3014,9 @@ def launch_app(
         """Start the app with its arguments (writes ``launched`` and the start's facts into ``into``): ``(pid,
         failure)``. percFix: also used once more to hand the address again (see below)."""
         launched_pid: int | None = None
-        if (refused := _gamegate.refuse_input("launch")) is not None:   # D17: re-checked before every hand-over
+        if (refused := _gate.refuse("launch")) is not None:   # D17: re-checked before every hand-over
             into["launched"] = False
-            into["refused"] = "game"
+            into["refused"] = _gate.kind_of(refused)
             return None, refused
         if plan is None:
             # shell:AppsFolder\<AppID> is the Start menu's own launch path and works
@@ -3047,7 +3055,7 @@ def launch_app(
     launched_pid, failure = hand_over(details)
     mark("start")
     if (not details["launched"] and plan is not None and plan.get("via") == "ActivateForProtocol"
-            and details.get("refused") != "game" and _hresult_of(str(details.get("launch_error") or "")) is not None):
+            and not _gate.carried(details) and _hresult_of(str(details.get("launch_error") or "")) is not None):
         # only a refusal Windows answered with an HRESULT: an activation that merely didn't return in time may still
         # deliver the address, and a second hand-off would open it twice
         # lSkills (live 17 Oct): Windows refused protocol activation (Arc: 0x80270254 on every open; the model then
@@ -3125,6 +3133,13 @@ def launch_app(
                 content_deadline = min(content_deadline, up_at + _REFUSED_PAGE_S)
         if deadline is not None:
             content_deadline = min(content_deadline, float(deadline))
+        if unchanged and any(_same_page(target, url) and not _past_root(target, url)
+                             for url in unchanged.values() for target in page_targets):
+            # fSkills: a window already showed the very page asked for before the hand-off: what it shows can't change
+            # to it, so the wait is a short look (_ALREADY_PAGE_S), not the whole content wait, and the page is
+            # reported at once (as "already", below, unless another window newly shows it)
+            content_deadline = min(content_deadline, handed_off + _ALREADY_PAGE_S)
+            details["page_already_before"] = True
         page_wait = _await_page(identity, page_targets, before, content_deadline - time.monotonic(),
                                 unchanged=unchanged)
         mark("page")
@@ -3472,7 +3487,7 @@ def _try_activate(hwnd: int) -> bool:
         What ``SetForegroundWindow`` reported: False means Windows refused the
         call outright, so there is nothing to wait for.
     """
-    if _gamegate.refuse_input("focus", hwnd=hwnd) is not None:   # D17: never over a game, never into one
+    if _gate.refuse("focus", hwnd=hwnd) is not None:   # D17: never over a game, never into one
         return False
     foreground = _user32.GetForegroundWindow()
     our_thread = _kernel32.GetCurrentThreadId()
@@ -3514,8 +3529,8 @@ def focus_window(hwnd: int, *, timeout_s: float = 2.0) -> ActionResult:
     if not win32gui.IsWindow(hwnd):
         return finish(False, f"hwnd {hwnd} is not a window (it may have closed)", {"hwnd": hwnd})
     # D17: no focus, restore or activation with a game in front or into a game (re-checked before every attempt)
-    if (refused := _gamegate.refuse_input("focus", hwnd=hwnd)) is not None:
-        return finish(False, refused, {"hwnd": hwnd, "refused": "game"})
+    if (refused := _gate.refuse("focus", hwnd=hwnd)) is not None:
+        return finish(False, refused, {"hwnd": hwnd, "refused": _gate.kind_of(refused)})
 
     info = window_info(hwnd)
     details: dict = {
@@ -3552,8 +3567,8 @@ def focus_window(hwnd: int, *, timeout_s: float = 2.0) -> ActionResult:
     for name, action in attempts:
         if focused():
             break
-        if (refused := _gamegate.refuse_input("focus", hwnd=hwnd)) is not None:
-            details["refused"] = "game"     # a game came to the front meanwhile: no further try
+        if (refused := _gate.refuse("focus", hwnd=hwnd)) is not None:
+            details["refused"] = _gate.kind_of(refused)   # a game came to the front meanwhile: no further try
             return finish(False, refused, details)
         details["attempts"].append(name)
         try:
@@ -3735,8 +3750,8 @@ def window_action(hwnd: int, action: str) -> ActionResult:
     # D17: no window action ever on a game's own window; with a game in front only minimising another window (shown
     # without activating anything) is allowed, never maximise, restore, full screen or close (a save prompt would
     # come up over the game)
-    if (refused := _gamegate.refuse_input(f"window_{action}", hwnd=hwnd, front_ok=action == "minimize")) is not None:
-        details["refused"] = "game"
+    if (refused := _gate.refuse(f"window_{action}", hwnd=hwnd, front_ok=action == "minimize")) is not None:
+        details["refused"] = _gate.kind_of(refused)
         return finish(False, refused, details)
     info = window_info(hwnd)
     name = f"{info.process_name} \"{info.title}\"" if info else f"hwnd {hwnd}"
@@ -4007,7 +4022,9 @@ def app_window(app: str, *, deadline: float | None = None) -> tuple[int | None, 
     address-bar rung): found by the app's identity (:func:`_own_window`: ``open``, ``minimized``, ``hidden``); with
     the app not running or showing no window, ``launch_app(app)`` brings one up (``launched``); ``(None, why)``
     otherwise (``no_app``: no such Start menu app; ``none``: no window came). Never raises; never with a game in front
-    (``launch_app`` refuses it: ``(None, "refused")``)."""
+    (``launch_app`` refuses it: ``(None, "refused")``, the word a caller holds as a game). fHands (review): a launch
+    stopped by anything else (the gate failed closed, another guard) is ``(None, "blocked")``, never "refused": it
+    is not said as a game."""
     try:
         chosen, _candidates = _match_apps(app, get_start_apps())
     except Exception:  # noqa: BLE001
@@ -4022,8 +4039,8 @@ def app_window(app: str, *, deadline: float | None = None) -> tuple[int | None, 
         started = launch_app(app, deadline=deadline)
     except Exception:  # noqa: BLE001
         return None, "none"
-    if (started.details or {}).get("refused") == "game":
-        return None, "refused"
+    if (kind := _gate.carried(started.details)) is not None:
+        return None, "refused" if kind == _gate.GAME else _gate.BLOCKED
     got = (started.details or {}).get("hwnd")
     return (int(got), "launched") if started.ok and got else (None, "none")
 
@@ -4079,19 +4096,19 @@ def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: 
         except Exception:  # noqa: BLE001
             up = None
         got = (up.details or {}).get("hwnd") if up is not None and up.ok else None
-        if not got or (up.details or {}).get("refused") == "game":
+        if not got or _gate.carried(up.details):
             return None
         hwnd, how = int(got), "launched"
     details["bar_window"] = how
-    if _gamegate.refuse_input("focus", hwnd=hwnd) is not None:
+    if _gate.refuse("focus", hwnd=hwnd) is not None:
         return None
     pid = _window_pid(hwnd)
     befores = _pages_before(identity, min(_PAGE_BEFORE_S, max(0.2, 0.25 * (end - time.monotonic()))))
     details["before_pages"] = [{"hwnd": h, "url": u} for h, u in befores.items()]
     before, _before_pids, _titles = _window_snapshot()
     focused = focus_window(hwnd, timeout_s=min(2.0, max(0.5, end - time.monotonic())))
-    if (focused.details or {}).get("refused") == "game":
-        details["refused"] = "game"
+    if _gate.carried(focused.details):
+        details["refused"] = _gate.carried(focused.details)
         return finish(False, str(focused.summary), "refused")
     if not focused.ok:
         return finish(False, f"could not bring {chosen['name']} forward to type the address ({focused.summary})",
@@ -4105,8 +4122,8 @@ def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: 
     from yuki.actions import input as keys
 
     opened = keys.hotkey(*_NEW_TAB_KEYS, expect_hwnd=hwnd)
-    if (opened.details or {}).get("refused") == "game":
-        details["refused"] = "game"
+    if _gate.carried(opened.details):
+        details["refused"] = _gate.carried(opened.details)
         return finish(False, str(opened.summary), "refused")
     if not opened.ok:
         return finish(False, f"{chosen['name']} didn't take the new-tab keys ({opened.summary})", "keys_refused")
@@ -4128,8 +4145,8 @@ def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: 
         return finish(False, f"focus in {chosen['name']} is not on its own address field ({why}): nothing was typed",
                       "no_field")
     typed = keys.type_text(target, expect_hwnd=field_hwnd)
-    if (typed.details or {}).get("refused") == "game":
-        details["refused"] = "game"
+    if _gate.carried(typed.details):
+        details["refused"] = _gate.carried(typed.details)
         return finish(False, str(typed.summary), "refused")
     facts = typed.details or {}
     if not typed.ok or facts.get("readback") != "arrived":
@@ -4219,8 +4236,8 @@ def open_url(
         return finish(False, "no url given", {"url": url})
     target = url.strip()
     # D17: an opened link brings its handler forward (a browser, Spotify, Discord): never with a game in front
-    if (refused := _gamegate.refuse_input("open_url")) is not None:
-        return finish(False, refused, {"url": target, "refused": "game"})
+    if (refused := _gate.refuse("open_url")) is not None:
+        return finish(False, refused, {"url": target, "refused": _gate.kind_of(refused)})
     if app is not None and app.strip():
         address = _page_address(target)
         typed_first = None
@@ -4247,7 +4264,7 @@ def open_url(
         if launched.ok and ld.get("page_verified") is True:
             _note_ignored(appid, False)
             return launched
-        if ld.get("refused") == "game" or typed_first is not None:
+        if _gate.carried(ld) or typed_first is not None:
             return launched
         same = ld.get("reason") == "page_unchanged" and ld.get("page_state") == "same"
         # review r1 L1: another page showing ("other") is an ignored hand-off only in a packaged browser or one whose
