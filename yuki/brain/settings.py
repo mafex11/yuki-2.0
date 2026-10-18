@@ -9,8 +9,9 @@ the tray's model switch (``Settings.model``) belongs to the old loop and no long
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Collection, Mapping
 
 from yuki.config import EFFORT_LEVELS
 
@@ -24,6 +25,18 @@ DEFAULT_MODE = "all"
 PLANNER_MODEL = "global.anthropic.claude-sonnet-5-5"
 
 
+#: aBrain (phase 2.5, 18 Oct): how the planner's effort is chosen per request. ``auto``: from the request's structure
+#: (:func:`effort_for_request`): typed requests medium; a spoken hand-over medium when the talker's understanding (C3)
+#: has two or more parts or no part names a skill of the live catalog (or no understanding came, or a skill handed the
+#: request over), else low. A level (``low`` | ``medium`` | ``high`` ...) pins both channels to it, and ``fixed`` uses
+#: ``brain_effort_voice`` / ``brain_effort_typed`` as before, so the final test can compare. Read from
+#: ``brain_effort_rule`` on the settings, else the ``YUKI_BRAIN_EFFORT`` environment variable, else ``auto``.
+EFFORT_RULES: tuple[str, ...] = ("auto", "fixed")
+DEFAULT_EFFORT_RULE = "auto"
+#: The effort a request gets under ``auto`` when its structure asks for thinking, and when it doesn't.
+EFFORT_THINK, EFFORT_QUICK = "medium", "low"
+
+
 def _get(settings: Any, name: str, default: Any) -> Any:
     value = getattr(settings, name, None)
     return default if value is None or value == "" else value
@@ -34,6 +47,42 @@ def _effort(value: Any, default: str) -> str:
     return text if text in EFFORT_LEVELS else default
 
 
+def _effort_rule(settings: Any) -> str:
+    """``auto``, ``fixed`` or an effort level (:data:`EFFORT_RULES`); anything else is ``auto``."""
+    raw = getattr(settings, "brain_effort_rule", None) or os.environ.get("YUKI_BRAIN_EFFORT") or DEFAULT_EFFORT_RULE
+    text = str(raw).strip().lower()
+    return text if text in EFFORT_RULES or text in EFFORT_LEVELS else DEFAULT_EFFORT_RULE
+
+
+def effort_for_request(channel: str, understanding: Mapping[str, Any] | None, *, seeded: bool = False,
+                       skills: Collection[str] | None = None) -> tuple[str, str]:
+    """``(effort, why)`` under the ``auto`` rule, from the request's structure only (never its words).
+
+    Typed: :data:`EFFORT_THINK` (``typed``). Spoken: :data:`EFFORT_THINK` when a skill handed the request over
+    (``seeded``: its usual way didn't get there), when no understanding came (``no_reading``), when the talker's
+    understanding (contract C3) holds two or more parts (``parts``), or when no part names a skill (``no_skill``: a part
+    whose ``skill`` is empty, or not one of the live catalog's ``skills`` ids when those are known); else
+    :data:`EFFORT_QUICK` (``one_skill``). ``why`` is a code word for the log."""
+    if channel != "voice":
+        return EFFORT_THINK, "typed"
+    if seeded:
+        return EFFORT_THINK, "seeded"
+    if not isinstance(understanding, Mapping):
+        return EFFORT_THINK, "no_reading"
+    parts = [p for p in (understanding.get("parts") or []) if isinstance(p, Mapping)]
+    if len(parts) >= 2:
+        return EFFORT_THINK, "parts"
+    known = frozenset(str(k) for k in skills) if skills is not None else None
+
+    def fits(part: Mapping[str, Any]) -> bool:
+        skill = " ".join(str(part.get("skill") or "").split())
+        return bool(skill) and (known is None or skill in known or skill.split("#", 1)[0] in known)
+
+    if not parts or not any(fits(p) for p in parts):
+        return EFFORT_THINK, "no_skill"
+    return EFFORT_QUICK, "one_skill"
+
+
 @dataclass(frozen=True)
 class BrainSettings:
     """One request's view of the settings (the design's numbers as defaults).
@@ -41,7 +90,9 @@ class BrainSettings:
     Attributes:
         mode: ``Settings.brain`` (``loop`` | ``typed`` | ``all``; anything else reads as ``all``).
         model: The planner's model (``brain_model``, else :data:`PLANNER_MODEL`).
-        effort_voice / effort_typed: The planner's effort per channel (adaptive thinking on both; design L9).
+        effort_rule: How the effort is chosen (:data:`DEFAULT_EFFORT_RULE`, aBrain phase 2.5): ``auto`` (from the
+            request's structure: :meth:`effort_of`), ``fixed`` (the two values below), or a level pinned for both.
+        effort_voice / effort_typed: The planner's effort per channel under ``fixed`` (adaptive thinking on both).
         max_tokens: The planner's output ceiling (a plan is ~100-600 tokens plus thinking; streamed).
         thinking_display: ``summarized`` (the island's thinking line) or ``omitted``.
         stream: Stream the planner (the default; steps then run as they close).
@@ -68,6 +119,7 @@ class BrainSettings:
 
     mode: str = DEFAULT_MODE
     model: str = PLANNER_MODEL
+    effort_rule: str = DEFAULT_EFFORT_RULE
     effort_voice: str = "low"
     effort_typed: str = "low"
     max_tokens: int = 16000
@@ -100,6 +152,7 @@ class BrainSettings:
         return cls(
             mode=mode if mode in BRAIN_MODES else DEFAULT_MODE,
             model=str(_get(settings, "brain_model", "") or PLANNER_MODEL),
+            effort_rule=_effort_rule(settings),
             effort_voice=_effort(_get(settings, "brain_effort_voice", "low"), "low"),
             effort_typed=_effort(_get(settings, "brain_effort_typed", "low"), "low"),
             max_tokens=int(_get(settings, "brain_max_tokens", 16000)),
@@ -128,14 +181,26 @@ class BrainSettings:
         )
 
     def effort_for(self, channel: str) -> str:
-        """The effort pinned for ``channel`` (``voice`` | ``typed``) for a whole request."""
+        """The ``fixed`` rule's effort for ``channel`` (``voice`` | ``typed``)."""
         return self.effort_voice if channel == "voice" else self.effort_typed
+
+    def effort_of(self, channel: str, understanding: Mapping[str, Any] | None = None, *, seeded: bool = False,
+                  skills: Collection[str] | None = None) -> tuple[str, str]:
+        """The effort pinned for a whole request, and why (a code word for the log): the rule's level when it names
+        one (``pinned``), the channel's setting under ``fixed``, else :func:`effort_for_request`."""
+        if self.effort_rule in EFFORT_LEVELS:
+            return self.effort_rule, "pinned"
+        if self.effort_rule == "fixed":
+            return self.effort_for(channel), "fixed"
+        return effort_for_request(channel, understanding, seeded=seeded, skills=skills)
 
     def facts(self) -> dict[str, Any]:
         """Content-free facts for the log."""
-        return {"mode": self.mode, "model": self.model, "effort_voice": self.effort_voice,
-                "effort_typed": self.effort_typed, "stream": self.stream, "eager": self.eager,
-                "max_replans": self.max_replans, "act_calls": self.act_calls, "answer_calls": self.answer_calls}
+        return {"mode": self.mode, "model": self.model, "effort_rule": self.effort_rule,
+                "effort_voice": self.effort_voice, "effort_typed": self.effort_typed, "stream": self.stream,
+                "eager": self.eager, "max_replans": self.max_replans, "act_calls": self.act_calls,
+                "answer_calls": self.answer_calls}
 
 
-__all__ = ["BRAIN_MODES", "DEFAULT_MODE", "PLANNER_MODEL", "BrainSettings"]
+__all__ = ["BRAIN_MODES", "DEFAULT_MODE", "PLANNER_MODEL", "BrainSettings", "EFFORT_RULES", "DEFAULT_EFFORT_RULE",
+           "EFFORT_THINK", "EFFORT_QUICK", "effort_for_request"]

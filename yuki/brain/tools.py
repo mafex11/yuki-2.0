@@ -155,8 +155,21 @@ def tool_params(*, streamed: bool, eager: bool = True) -> list[dict[str, Any]]:
 
 
 def schema_chars() -> int:
-    """The block's size as sent (without the per-call streaming flag): a reviewer's check against 8,000."""
+    """The block's size as sent (without the per-call streaming flag), checked against :data:`SCHEMA_CHARS`."""
     return len(json.dumps(tool_params(streamed=False), ensure_ascii=False))
+
+
+def check_budget() -> None:
+    """aBrain (phase 2.6): the tool block's ceiling, code-enforced at import like the core's
+    (``prompt.check_budget``): a verb or a description that grows past it must replace text, never add beside it."""
+    from yuki.brain.prompt import PromptBudgetError
+
+    size = schema_chars()
+    if size > SCHEMA_CHARS:
+        raise PromptBudgetError(f"brain tool block is {size} chars, over its {SCHEMA_CHARS} ceiling")
+
+
+check_budget()
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -357,5 +370,6 @@ def _keep_usual(memory: Any, args: Mapping[str, Any], *, words: str, started: fl
 
 __all__ = ["PLAN_DESCRIPTION", "LOOK_TOOL", "MEMORY_TOOL", "FETCH_TOOL", "ASK_USER_TOOL", "REMEMBER_TOOL",
            "REMEMBER_KINDS", "TOOL_NAMES", "READ_TOOLS", "SCHEMA_CHARS", "plan_tool", "tool_params", "schema_chars",
+           "check_budget",
            "LOOK_DISPATCH", "PRIVATE_READS", "ToolRun", "outcome_text", "run_look", "run_memory", "run_fetch",
            "run_remember"]
