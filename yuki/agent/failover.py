@@ -104,8 +104,14 @@ def adapt_params(params: dict[str, Any], model: str) -> dict[str, Any]:
     A fixed-budget thinking config (``{"type": "enabled", "budget_tokens": N}``, what a Haiku 4.5
     call carries) is refused by Sonnet 5 / Opus 5, which take adaptive thinking: it becomes
     adaptive on another model. Thinking turned off (``disabled``, or Sonnet 5.5's ``between_tools``) stays off in
-    ``model``'s own form (:func:`yuki.config.thinking_off`): one model refuses the other's value (HTTP 400). Everything
-    else is sent as it was.
+    ``model``'s own form (:func:`yuki.config.thinking_off`): one model refuses the other's value (HTTP 400).
+
+    hotTools: a call that sends no ``thinking``, built for a model that then does not think (Haiku 4.5: the commit
+    check's forced tool call), moved to one that thinks unasked (:data:`yuki.config.THINKS_UNASKED`: Haiku 5.5, Sonnet
+    5 / 5.5) sends that model's "thinking off" explicitly, so it answers as the call was built to (Sonnet 5 takes no
+    forced tool call with thinking on). Not on a model that cannot turn it off (Opus 5.5), nor with an effort above
+    ``high`` (off is refused there). A call built for a model that thinks unasked keeps thinking. Everything else is
+    sent as it was.
     """
     out = {**params, "model": model}
     thinking = params.get("thinking")
@@ -115,6 +121,14 @@ def adapt_params(params: dict[str, Any], model: str) -> dict[str, Any]:
         from yuki.config import thinking_off
 
         out["thinking"] = thinking_off(model)
+    elif thinking is None and model != params.get("model"):
+        from yuki.config import THINKING_ALWAYS_ON, THINKS_UNASKED, thinking_off
+
+        config = params.get("output_config")
+        effort = config.get("effort") if isinstance(config, dict) else None
+        if (model in THINKS_UNASKED and model not in THINKING_ALWAYS_ON
+                and str(params.get("model") or "") not in THINKS_UNASKED and effort not in ("xhigh", "max")):
+            out["thinking"] = thinking_off(model)
     return out
 
 

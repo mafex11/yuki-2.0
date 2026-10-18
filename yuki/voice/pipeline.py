@@ -515,6 +515,66 @@ def early_flag(partial_json: str, name: str) -> bool | None:
     return None
 
 
+class ReplyToolCalls:
+    """Every ``tool_use`` block of one streamed talker reply, in the order written (hotTools, 18 Oct).
+
+    Pipecat 1.11's Anthropic service (``pipecat/services/anthropic/llm.py``, ``_process_context``) keeps one
+    ``tool_use_block`` and one JSON accumulator, overwritten at each new tool_use block, and queues a single call when
+    the reply stops for tools: a reply of two calls ("pause the music and mute the PC") ran only its last, and the first
+    was lost without a trace. The talker's stream passes through :meth:`feed` (its events unchanged), which keeps each
+    block's id, name and streamed arguments by the block's index; :meth:`complete` then puts the calls Pipecat dropped
+    back in front of the one it queued, so the runner gets the reply's every call in order. Plumbing; never the words.
+    """
+
+    def __init__(self) -> None:
+        #: ``{"id", "name", "json"}`` per tool_use block, in the order the reply wrote them.
+        self.blocks: list[dict[str, Any]] = []
+        self._at: dict[Any, dict[str, Any]] = {}
+
+    def feed(self, event: Any) -> None:
+        kind = getattr(event, "type", "")
+        if kind == "content_block_start":
+            block = getattr(event, "content_block", None)
+            if getattr(block, "type", "") == "tool_use":
+                entry = {"id": str(getattr(block, "id", "") or ""), "name": str(getattr(block, "name", "") or ""),
+                         "json": ""}
+                self.blocks.append(entry)
+                self._at[getattr(event, "index", None)] = entry
+        elif kind == "content_block_delta" and self.blocks:
+            part = getattr(getattr(event, "delta", None), "partial_json", None)
+            if isinstance(part, str):
+                # by the block's index (a stream without one: the latest tool_use block, as Pipecat does)
+                self._at.get(getattr(event, "index", None), self.blocks[-1])["json"] += part
+
+    def last_id(self) -> str | None:
+        return self.blocks[-1]["id"] if self.blocks else None
+
+    def complete(self, calls: list[Any], make: Callable[..., Any]) -> tuple[list[Any], int, int]:
+        """``calls`` (what Pipecat queued for this reply) with the reply's earlier tool_use blocks it dropped put back
+        in front, in the order written, each made by ``make`` (Pipecat's ``FunctionCallFromLLM``) on the same context:
+        ``(calls, put back, left out)``; a block whose arguments do not parse is left out (as Pipecat's own parse of
+        the last one would fail the reply), counted. ``calls`` unchanged when it is not the tail of this reply's blocks
+        (Pipecat already gave every call, or the list is another reply's)."""
+        import json
+
+        ids = [str(getattr(fc, "tool_call_id", "")) for fc in calls]
+        known = [b["id"] for b in self.blocks]
+        if not ids or len(ids) >= len(known) or known[-len(ids):] != ids:
+            return list(calls), 0, 0
+        context = getattr(calls[-1], "context", None)
+        front: list[Any] = []
+        bad = 0
+        for block in self.blocks[:len(known) - len(ids)]:
+            try:
+                args = json.loads(block["json"]) if block["json"] else {}
+            except ValueError:
+                bad += 1
+                continue
+            front.append(make(context=context, tool_call_id=block["id"], function_name=block["name"],
+                              arguments=args))
+        return front + list(calls), len(front), bad
+
+
 def one_stop_per_turn(base: type) -> type:
     """``base`` (Pipecat's ``EagerUserTurnStopStrategy``) resolving each user turn's end once.
 
@@ -991,6 +1051,27 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             #: live 09:10:01 the words were dropped as "held", then the same call ran a moment later, because the
             #: turn's doubt had moved on in between; the user heard a question and the outcome).
             self._yuki_hold: dict[str, bool] = {}
+            #: hotTools: every tool_use block of the reply being streamed (Pipecat queues only the last; see
+            #: :class:`ReplyToolCalls`), taken by :meth:`run_function_calls` when that reply's calls come in.
+            self._yuki_reply_tools: ReplyToolCalls | None = None
+
+        def _yuki_every_call(self, function_calls: Any) -> Any:
+            """hotTools: the reply's every call, in the order written, where Pipecat queued only its last (its stream
+            loop keeps one tool_use block). Only for the reply just streamed (its last block is Pipecat's last call);
+            a list from elsewhere (an eager reply's held calls, already whole) is left as it is."""
+            tools = self._yuki_reply_tools
+            if tools is None or not function_calls:
+                return function_calls
+            last = str(getattr(function_calls[-1], "tool_call_id", ""))
+            if last != tools.last_id():
+                return function_calls
+            self._yuki_reply_tools = None
+            from pipecat.services.llm_service import FunctionCallFromLLM
+
+            calls, back, bad = tools.complete(list(function_calls), FunctionCallFromLLM)
+            if back or bad:
+                hook("calls_restored", len(calls), back, bad)
+            return calls
 
         async def _yuki_release_words(self, *, drop: bool = False) -> None:
             """Say the reply's held words now, or drop them unsaid (``drop``: a call of the reply is held)."""
@@ -1006,6 +1087,9 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 await super().push_frame(frame, FrameDirection.DOWNSTREAM)
 
         async def run_function_calls(self, function_calls: Any) -> None:
+            # hotTools: Pipecat hands over only the reply's last call; the ones it dropped go back in front, so
+            # everything below (holds, words, the reply rule, the order gate) sees the whole reply as written
+            function_calls = self._yuki_every_call(function_calls)
             for fc in function_calls or []:
                 # review r1 L3: the call's arguments decide too (a sound-only skill runs like the sound hands); a
                 # stand-in without would_hold_call answers by the name alone
@@ -1110,6 +1194,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
         async def _process_context(self, context: Any) -> None:
             self._yuki_held_calls = None  # a new inference: whatever an older speculation held is void
             self._yuki_early_pending = None
+            self._yuki_reply_tools = None   # hotTools: set again when this reply's stream opens
             self._yuki_context = context
             call = LlmCall(entered=time.monotonic())
             self._yuki_call = call
@@ -1273,11 +1358,16 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             if call is not None:
                 call.sent = time.monotonic()
             stream, head = await self._yuki_open(api_call, params)
+            # hotTools: every tool_use block of this reply, seen before anything below drops or edits an event
+            tools = ReplyToolCalls()
+            self._yuki_reply_tools = tools
 
             async def events() -> Any:
                 for event in head:
+                    tools.feed(event)
                     yield event
                 async for event in stream:
+                    tools.feed(event)
                     yield event
 
             response = events()
@@ -2582,6 +2672,10 @@ class _Hooks:
     def speculation(self, op: str, calls: int) -> None:
         """An eager reply's tool calls were held, released on the confirmed turn, or dropped."""
         self.c.log.event("speculation", op=op, calls=calls)
+
+    def calls_restored(self, calls: int, restored: int, bad: int) -> None:
+        """hotTools: a reply of several calls, whose earlier calls Pipecat dropped, runs whole (content-free log)."""
+        self.c.log.event("talker_calls", op="restored", calls=calls, restored=restored, bad_args=bad)
 
     def would_hold(self, name: str) -> bool:
         """Whether a call of the reply now ending will be held until the user answers (see ``Conversation._held``)."""

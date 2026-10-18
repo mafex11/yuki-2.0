@@ -237,6 +237,22 @@ def thinking_off(model: str) -> dict[str, str]:
     """The ``thinking`` value that turns thinking off on ``model`` (:data:`THINKING_OFF`, else ``disabled``)."""
     return dict(THINKING_OFF.get(str(model or ""), {"type": "disabled"}))
 
+
+#: hotTools (18 Oct): models that think (adaptive) when a request sends no ``thinking`` at all, by id. Haiku 4.5 is not
+#: one: a call built for it that sends none means none (the commit check, the claim checks, the journal's forced tool
+#: calls). Moved by a failover chain to one of these, such a call is sent that model's "thinking off" explicitly
+#: (:func:`yuki.agent.failover.adapt_params`): unasked, Haiku 5.5 thinks at its default effort before every answer, and
+#: Sonnet 5 takes no forced tool call with thinking on.
+THINKS_UNASKED: frozenset[str] = frozenset(
+    f"{profile}.anthropic.claude-{family}" for profile in ("global", "us")
+    for family in ("sonnet-5", "opus-5", "sonnet-5-5", "opus-5-5", "haiku-5-5"))
+#: Of those, the models whose thinking cannot be turned off (``disabled`` is HTTP 400 at every effort): Opus 5.5.
+THINKING_ALWAYS_ON: frozenset[str] = frozenset(f"{profile}.anthropic.claude-opus-5-5" for profile in ("global", "us"))
+#: hotTools: Claude Haiku 5.5, the successor of Haiku 4.5 (whose Bedrock end of life was "no sooner than 2026-10-16"):
+#: the first backup of every Haiku 4.5 id (:data:`DEFAULT_FALLBACKS`). It takes adaptive thinking and an effort, and
+#: ``disabled`` up to effort ``high``; never ``budget_tokens``, sampling values or a prefill (HTTP 400).
+HAIKU_5_5 = "global.anthropic.claude-haiku-5-5"
+
 #: The same models through the US inference profiles (a failover target, yuki.agent.failover).
 for _alias, _rates in (("sonnet", DEFAULT_PRICING[MODEL_ALIASES["sonnet"]]),
                        ("opus", DEFAULT_PRICING[MODEL_ALIASES["opus"]])):
@@ -245,7 +261,9 @@ for _alias, _rates in (("sonnet", DEFAULT_PRICING[MODEL_ALIASES["sonnet"]]),
 #: Failover chains (``Settings.model_fallbacks``): the same model in another region first (the
 #: global profile from us-east-1, then the US profile), then a sibling model. Thinking blocks of
 #: the primary are ignored by a sibling (the API drops another model's blocks), so a switch
-#: mid-task is safe; Haiku takes no effort or adaptive thinking, so no chain switches *to* Haiku.
+#: mid-task is safe. Haiku 4.5 takes no effort or adaptive thinking, so no chain switches *to* it; Haiku 5.5 takes both
+#: (hotTools): it is the first backup of the Haiku 4.5 ids (past that model's end of life, before any Sonnet 5 step) and
+#: the fast last step of the Sonnet 5.5 chain.
 DEFAULT_FALLBACKS: dict[str, list[dict[str, str | None]]] = {
     MODEL_ALIASES["sonnet"]: [
         {"model": MODEL_ALIASES["sonnet"], "region": "us-east-1"},
@@ -256,19 +274,29 @@ DEFAULT_FALLBACKS: dict[str, list[dict[str, str | None]]] = {
         {"model": MODEL_ALIASES["opus"], "region": "us-east-1"},
         {"model": MODEL_ALIASES["sonnet"], "region": None},
     ],
+    # Haiku 4.5 (the full talker, the voice's side calls, the commit check, the claim checks, the taste judge, the
+    # journal): Haiku 5.5 first (hotTools: past Haiku 4.5's end of life every call of it fails, and its retries from
+    # us-east-1 would only add the wait), then Haiku 4.5 from us-east-1 and the US profile, then Sonnet 5. A call with
+    # no ``thinking`` gets each model's "thinking off" there (:data:`THINKS_UNASKED`).
     DEFAULT_VOICE_MOUTH_MODEL: [
+        {"model": HAIKU_5_5, "region": None},
         {"model": DEFAULT_VOICE_MOUTH_MODEL, "region": "us-east-1"},
         {"model": "us.anthropic.claude-haiku-4-5-20251001-v1:0", "region": "us-east-1"},
         {"model": MODEL_ALIASES["sonnet"], "region": None},
     ],
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0": [
+        {"model": HAIKU_5_5, "region": None},
+        {"model": DEFAULT_VOICE_MOUTH_MODEL, "region": None},
+        {"model": MODEL_ALIASES["sonnet"], "region": None},
+    ],
     # Sonnet 5.5: the lean talker (kMind) and the brain's planner (kBrain, ``brain_model``) share this chain (it is
-    # keyed by model id): the same model from us-east-1, then Sonnet 5, then the fast Haiku. Sonnet 5 comes before
-    # Haiku because the planner sends adaptive thinking and an effort, which Haiku refuses (HTTP 400, no further
-    # failover); the talker sets thinking off as each model takes it, so it works on either.
+    # keyed by model id): the same model from us-east-1, then Sonnet 5, then the fast Haiku. hotTools: Haiku 5.5, not
+    # Haiku 4.5: the planner sends adaptive thinking and an effort, which Haiku 4.5 refuses (HTTP 400, no further
+    # failover) and Haiku 5.5 takes; the talker's thinking off goes as each model takes it (``disabled`` there).
     DEFAULT_VOICE_LEAN_MODEL: [
         {"model": DEFAULT_VOICE_LEAN_MODEL, "region": "us-east-1"},
         {"model": MODEL_ALIASES["sonnet"], "region": None},
-        {"model": DEFAULT_VOICE_MOUTH_MODEL, "region": None},
+        {"model": HAIKU_5_5, "region": None},
     ],
 }
 
