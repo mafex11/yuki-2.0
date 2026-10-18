@@ -24,7 +24,7 @@ never tested against the bar. The things that are not time-bound wait for **the 
 sit-down after the user's night (a break of 5 h or more, whatever the clock says; §4.7): a check-in head line (the
 writer's) and up to 3 code lines, at most 2 of them asking, each line carrying its id; today's dated items lead
 (phase 3, 3.4: ``Candidate.lead``, :func:`yuki.memory.candidates.dated_today`), the rest by rank. After 3 h away in
-the day, a "While you were away" list shows when at least 2 things wait.
+the day, a "While you were away" list (up to 5 lines, the same order) shows when at least 2 things wait.
 
 **Live** (``[judge] mode = "on"``, the shipped default since 18 Oct; the old first-writer chain is gone): the judge
 alone writes the cards. **Shadow** (a setting): none of Yuki's own cards; the judge decides what it *would* have shown
@@ -154,9 +154,11 @@ BURST_SAME_S = 2 * 60.0
 #: of them asking.
 TODAY_LINES = 3
 TODAY_ASKING = 2
-#: "While you were away": after this long away in the day, with at least this many lines waiting.
+#: "While you were away": after this long away in the day, with at least this many lines waiting, at most this many
+#: lines (its own cap: the Today card's went to 3, this list kept its 5).
 AWAY_MIN_S = 3 * 3600.0
 AWAY_MIN_LINES = 2
+AWAY_LINES = 5
 #: The ledger: its window, how often it is read again, and the mode-step rules (§4.8).
 LEDGER_WINDOW_S = 28 * 86400.0
 LEDGER_EVERY_S = 300.0
@@ -860,6 +862,17 @@ def _you_card(store: Any, now: float) -> str:
         return ""
 
 
+def about_known_items(store: Any, items: Sequence[Any]) -> list[Any]:
+    """``items`` without a call promise not known to be about something (phase 3, 3.4:
+    :func:`yuki.memory.commitments.about_known`, the state read once). Fails closed on a call promise."""
+    try:
+        from yuki.memory.commitments import about_known, referent_states
+    except Exception:  # noqa: BLE001 - an older build: no call promise is known to be about anything
+        return [i for i in items if getattr(i, "source", None) != "call"]
+    states = referent_states(store)
+    return [i for i in items if about_known(states, getattr(i, "ref", None), getattr(i, "source", None))]
+
+
 class CardWriter:
     """The one writer call for the one chosen candidate (§4.6): one prompt for every card, ``write_card`` (never
     ``run_skill``; ``draft`` absent from the offers and refused by ``validate_offer``), checked in code. Built here and
@@ -894,7 +907,9 @@ class CardWriter:
             return sanitize_untrusted(" ".join(str(value or "").split()), nonce, cap)
 
         lines, ids = evidence_lines(self.store, c, now, safe)
-        items = [i for i in todo_items(self.store, now=now) if i.status == "open"]
+        # phase 3, 3.4: a call promise not known to be about something is neither shown to the writer (DEADLINES) nor
+        # citable - a day-start head or an evening check-in can't ask "still on for playing?" about it either
+        items = about_known_items(self.store, [i for i in todo_items(self.store, now=now) if i.status == "open"])
         mentions = {i.ref for i in items} | {k for k in ids if k[:1] == "G" and k[1:].isdigit()}
         allowed = self.allowed(c, config, now)
         head = c.text if isinstance(c.text, str) else None
@@ -1614,10 +1629,11 @@ class CardJudge:
         self._log("judge_decision", **out)
         return out
 
-    def _lines(self, now: float, cfg: Any) -> list[Candidate]:
-        """The Today card's lines: up to :data:`TODAY_LINES` from the queue, today's dated items first (``lead``, by
-        their time: phase 3, 3.4), then by rank (prior x confidence), at most :data:`TODAY_ASKING` of them asking,
-        plus one weekly probe line of a type the ledger turned off when there is room."""
+    def _lines(self, now: float, cfg: Any, cap: int = TODAY_LINES) -> list[Candidate]:
+        """The Today card's lines: up to ``cap`` (:data:`TODAY_LINES`; the away list :data:`AWAY_LINES`) from the
+        queue, today's dated items first (``lead``, by their time: phase 3, 3.4), then by rank (prior x confidence), at
+        most :data:`TODAY_ASKING` of them asking, plus one weekly probe line of a type the ledger turned off when there
+        is room."""
         ranked = sorted((c for c, _first in self.queue.values()
                          if (c.expires_at is None or c.expires_at > now) and c.digest_line is not None
                          and type_on(c.type, cfg) and self.ledger.mode(c.type) != "off"),   # B3, §4.8: the switch now
@@ -1628,7 +1644,7 @@ class CardJudge:
         asking = 0
         types: set[str] = set()
         for c in ranked:
-            if len(out) >= TODAY_LINES:
+            if len(out) >= cap:
                 break
             if c.asks and asking >= TODAY_ASKING:
                 continue
@@ -1637,7 +1653,7 @@ class CardJudge:
             out.append(c)
             types.add(c.type)
             asking += 1 if c.asks else 0
-        if len(out) < TODAY_LINES:
+        if len(out) < cap:
             for t, c in self.probes.items():
                 if self.ledger.probe_due(t, now) and not (c.asks and asking >= TODAY_ASKING):
                     out.append(c)
@@ -1756,7 +1772,7 @@ class CardJudge:
         key = f"away:{int(float(at))}"
         if self.seen.looked(key, now) or not type_on("away", cfg) or self.ledger.mode("away") == "off":
             return None
-        lines = self._lines(now, cfg)
+        lines = self._lines(now, cfg, AWAY_LINES)
         if len(lines) < AWAY_MIN_LINES:
             return None
         for d in (holds(you, now, sw, cfg, type="away"), budget(self._hist(live), now, cfg, type="away")):

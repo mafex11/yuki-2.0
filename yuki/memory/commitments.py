@@ -26,8 +26,10 @@ written, and the screen entries of those minutes): ``named`` (its words say what
 it names the thing, which must appear in what was shown: grounding by equality, never a word list), or ``unresolved``.
 Kept in ``nudge_state['commitment_referents']`` (ids and states only). A call commitment is a card question (a
 confirm, a plan, a follow-up, a Today line) only once it is ``named`` or ``resolved``
-(:func:`about_known`); an unresolved one stays on the list, never asked about. A new call commitment is looked at
-within :data:`REFERENT_GAP_S` of :data:`REFERENT_SETTLE_S` after it was written (bypassing the 30-minute pace).
+(:func:`about_known`); an unresolved one stays on the list, never asked about - nor shown to the card writer
+(:func:`yuki.memory.cardjudge.about_known_items`). A new call commitment is looked at within :data:`REFERENT_GAP_S`
+of :data:`REFERENT_SETTLE_S` after it was written (bypassing the 30-minute pace); one the check can't list counts a
+try each time, and a failed model call puts that fast look back on the ordinary pace.
 
 **Put back by the user** (migration 37, leftMem): on the Work page the user can press Not done yet on a promise memory
 saw kept (or Put it back, or Undo); ``reopened_at`` records the moment. From then on only evidence dated after it can
@@ -39,6 +41,7 @@ from __future__ import annotations
 
 import json
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -233,8 +236,11 @@ def about_known(states: dict[int, dict[str, Any]] | None, ref: Any, source: Any)
 
 
 def _fold(value: Any) -> str:
-    """Case, spacing and punctuation folded (identity of a name inside shown text, never meaning)."""
-    text = "".join(ch if ch.isalnum() else " " for ch in str(value or "").casefold())
+    """Case, spacing and punctuation folded (identity of a name inside shown text, never meaning). A combining mark (a
+    Devanagari vowel sign, category M*) stays inside its word: one Hindi word stays one word, never split at its
+    vowel signs into letters that match other words."""
+    text = "".join(ch if ch.isalnum() or unicodedata.category(ch)[:1] == "M" else " "
+                   for ch in str(value or "").casefold())
     return " ".join(text.split())
 
 
@@ -333,6 +339,8 @@ class CommitmentChecker:
         self.model = model
         self._last_at = 0.0
         self._jokes_at = 0.0
+        #: after a failed model call the fast look for fresh call promises waits this long (RAM; back to every_s)
+        self._about_quiet_until = 0.0
         #: what the last message showed per call promise under WHAT THESE ARE ABOUT: ``{fact id: (folded text shown,
         #: whether the call digest was in it)}`` (RAM only, for :meth:`validate_about`'s grounding)
         self._about_shown: dict[int, tuple[str, bool]] = {}
@@ -357,7 +365,7 @@ class CommitmentChecker:
         :data:`REFERENT_SETTLE_S` ago has not been looked at yet (what it is about: phase 3, 3.4)."""
         cp = self._checkpoint()
         last = max(self._last_at, float(cp.get("at") or 0.0))
-        if now - last >= REFERENT_GAP_S and self._about_waiting(now):
+        if now - last >= REFERENT_GAP_S and now >= self._about_quiet_until and self._about_waiting(now):
             return True
         if now - last < self.every_s:
             return False
@@ -370,31 +378,60 @@ class CommitmentChecker:
             return False
 
     def _about_waiting(self, now: float) -> bool:
-        """An open call commitment written between :data:`REFERENT_SETTLE_S` and :data:`REFERENT_FRESH_S` ago that the
+        """Whether a fresh call promise waits for its first look (:meth:`_waiting_ids`)."""
+        return bool(self._waiting_ids(now))
+
+    def _waiting_ids(self, now: float) -> set[int]:
+        """The open call commitments written between :data:`REFERENT_SETTLE_S` and :data:`REFERENT_FRESH_S` ago that the
         check has not answered for yet (content-free columns and the state only: this runs on every worker wake). An
-        older one waits for the ordinary check's pace (:meth:`about_pending` looks at it then), so a promise the check
-        can't list never makes it run every few minutes."""
+        older one waits for the ordinary check's pace (:meth:`about_pending` looks at it then). One the check can't
+        list (a test's, or past its :data:`MAX_COMMITMENTS` cut) counts a try each time it made the check run
+        (:meth:`_count_unlisted`), so it is unresolved after :data:`REFERENT_TRIES` and stops the fast pace."""
         try:
             rows = self.store._query("SELECT id, created_at FROM conversation_facts WHERE kind = 'commitment' AND"
                                      " status = 'active' AND origin = 'call' AND created_at >= ?",
                                      (now - REFERENT_FRESH_S,))
         except Exception:  # noqa: BLE001
-            return False
+            return set()
         if not rows:
-            return False
+            return set()
         states = referent_states(self.store)
+        out: set[int] = set()
         for r in rows:
             st = states.get(int(r[0])) or {}
             if str(st.get("s") or "") in (*ABOUT_KNOWN, ABOUT_UNRESOLVED):
                 continue
             if now - float(r[1] or 0.0) >= REFERENT_SETTLE_S:
-                return True
-        return False
+                out.add(int(r[0]))
+        return out
+
+    def _count_unlisted(self, now: float, listable: set[int]) -> list[int]:
+        """The waiting call promises (:meth:`_waiting_ids`) this check can't list: each counts a try (as one the model
+        left out does), so after :data:`REFERENT_TRIES` it is unresolved - never asked about, and no longer a reason
+        for the fast pace. Returns their ids (content-free); never raises."""
+        left = sorted(self._waiting_ids(now) - set(listable))
+        if not left:
+            return []
+        states = referent_states(self.store)
+        for cid in left:
+            st = dict(states.get(cid) or {})
+            st["n"] = int(st.get("n") or 0) + 1
+            if st["n"] >= REFERENT_TRIES:
+                st["s"] = ABOUT_UNRESOLVED
+            st.setdefault("s", "")
+            st["g"] = int(bool(st.get("g")))
+            states[cid] = st
+        self._save_states(states)
+        return left
 
     def about_pending(self, items: Sequence[ConversationFact], now: float) -> list[ConversationFact]:
         """The open call commitments the check looks at for what they are about (at most :data:`REFERENT_MAX`,
         newest first): never answered yet, written at least :data:`REFERENT_SETTLE_S` ago; or unresolved without the
         call's digest while the digest is now written (one more look, with it)."""
+        return self.about_eligible(items, now)[:REFERENT_MAX]
+
+    def about_eligible(self, items: Sequence[ConversationFact], now: float) -> list[ConversationFact]:
+        """Every promise :meth:`about_pending` may look at, newest first (no cap)."""
         states = referent_states(self.store)
         out: list[ConversationFact] = []
         for f in sorted((f for f in items if f.origin == "call" and f.status == "active"),
@@ -409,8 +446,6 @@ class CommitmentChecker:
             elif now - float(f.created_at or f.valid_from) < REFERENT_SETTLE_S:
                 continue
             out.append(f)
-            if len(out) >= REFERENT_MAX:
-                break
         return out
 
     def _calls_at(self, at: float) -> list[Any]:
@@ -454,10 +489,15 @@ class CommitmentChecker:
         except Exception as exc:
             result.error = f"{type(exc).__name__}: {exc}"
             return result
+        eligible = self.about_eligible(open_items, now)
+        if not dry_run:
+            # a waiting promise this check can't list (a test's, past the cut) counts a try: no fast loop on it
+            result.about += [{"item": cid, "about": "unlisted"}
+                             for cid in self._count_unlisted(now, {f.id for f in eligible})]
         if not open_items:
             return result
         oldest = min(open_since(f) for f in open_items)   # a put-back one's earlier evidence can't close it
-        about = self.about_pending(open_items, now)
+        about = eligible[:REFERENT_MAX]
         user, shown_j, shown_t, shown_d = self.message(open_items, oldest, now, about=about)
         if not shown_j and not shown_t and not shown_d and not about:
             if not dry_run:
@@ -471,9 +511,12 @@ class CommitmentChecker:
         except Exception as exc:
             call.outcome, call.error = "error", f"{type(exc).__name__}: {exc}"
             result.error = call.error
+            # a failing model call: the fast look at fresh call promises falls back to the ordinary pace
+            self._about_quiet_until = now + self.every_s
             self.worker._log("conversation_error", purpose="commitments", error=call.error, cost_usd=call.cost_usd)
             self._account(call, dry_run)
             return result
+        self._about_quiet_until = 0.0
         result.ran = True
         result.cost_usd = call.cost_usd
         decisions = tool_input.get("decisions") if isinstance(tool_input, dict) else None
@@ -488,7 +531,7 @@ class CommitmentChecker:
                     result.closed.append({"item": item, "status": status})
             result.mirrors += close_mirrors(self.store, now=now)
             closed = {c["item"] for c in result.closed} | {m.get("item") for m in result.mirrors}
-            result.about = self.apply_about(answers, [f for f in about if f.id not in closed])
+            result.about += self.apply_about(answers, [f for f in about if f.id not in closed])
             self._save(now, newest_j, newest_t)
         else:
             result.closed = [{"item": item, "status": status, "note": note} for item, status, _a, note in closes]
@@ -697,8 +740,9 @@ class CommitmentChecker:
                        ) -> tuple[dict[int, dict[str, Any]], list[str]]:
         """``({fact id: {"about", "thing", "text", "title"}}, [why rejected])`` for the promises listed: a
         ``resolved`` one needs a thing of at most :data:`REFERENT_WORDS` words that appears in what was shown for it
-        (case, spacing and punctuation folded: grounding by equality, never a word list) and a text; one that fails is
-        ``unresolved`` (nothing shown names it, as far as code can tell). Content-free reasons."""
+        (case, spacing and punctuation folded: grounding by equality, never a word list) and a text that names it (the
+        same identity); one that fails is ``unresolved`` (nothing shown names it, as far as code can tell).
+        Content-free reasons."""
         ids = {f.id for f in about}
         out: dict[int, dict[str, Any]] = {}
         rejected: list[str] = []
@@ -724,6 +768,9 @@ class CommitmentChecker:
                     what = ABOUT_UNRESOLVED
                 elif f" {folded} " not in f" {where} ":
                     rejected.append(f"C{cid}: about resolved to a thing not in what was shown")
+                    what = ABOUT_UNRESOLVED
+                elif f" {folded} " not in f" {_fold(text)} ":
+                    rejected.append(f"C{cid}: about resolved with a text not naming the thing")
                     what = ABOUT_UNRESOLVED
                 else:
                     out[cid] = {"about": what, "thing": thing, "text": text,
@@ -774,12 +821,15 @@ class CommitmentChecker:
         return done
 
     def _save_states(self, states: dict[int, dict[str, Any]]) -> None:
-        """The states of the commitments still open (content-free); never raises."""
+        """The states of the commitments still open (content-free), written only when they changed (a reader may watch
+        the row's ``updated_at``); never raises."""
         try:
             live = {int(r[0]) for r in self.store._query(
                 "SELECT id FROM conversation_facts WHERE kind = 'commitment' AND status = 'active'")}
             keep = {str(k): v for k, v in states.items() if k in live}
-            self.store.set_nudge_state(REFERENT_STATE, json.dumps(keep, sort_keys=True))
+            value = json.dumps(keep, sort_keys=True)
+            if value != (self.store.nudge_state(REFERENT_STATE) or json.dumps({})):
+                self.store.set_nudge_state(REFERENT_STATE, value)
         except Exception:  # noqa: BLE001
             pass
 

@@ -28,12 +28,13 @@ and occasions (with the preference observations fed from them) learned inside it
 (ended, with the journal and portrait changes their pass made undone). **Except what real use confirmed** (phase 3,
 3.4; dots audit 18 Oct: the purge took "lumen = chill" and the Japanese playlist's meaning, learned in test sessions):
 a "said" taste row (a pairing of the user's words with a playlist, or a pick they named) or a name alias still in
-force is kept when a real exchange (no test session) holds its words - the alias's heard form said after it was
-learned - and a real skill run finished done or already within :data:`CONFIRM_RUN_S` after it (:func:`real_uses`).
+force is kept when a real exchange (no test session) holds its words - a pairing's words or an alias's heard form said
+after it was learned - and that exchange's own skill run finished done or already (:func:`real_uses`: joined by the
+request id, else a run within :data:`CONFIRM_RUN_S` after it that no other exchange claims).
 Still in force is the "no correction afterwards": a correction drops a pairing (``taste.unsay``) or ends an alias.
-A pick row that a kept pairing (or a pairing outside the span) points at is kept too. Only test-only rows go. The standing rules a test session made are
-conversation facts resting on its exchanges only, so they go with them. Kept: what the screen showed in the
-span (screen journal facts, links seen, the hour counts of "observed" tastes), which may be real incoming content.
+A pick row that a kept pairing (or a pairing outside the span) points at is kept too. Only test-only rows go.
+The standing rules a test session made are conversation facts resting on its exchanges only, so they go with them.
+Kept: what the screen showed in the span (screen journal facts, links seen, the hour counts of "observed" tastes), which may be real incoming content.
 
 **Live lookups still see test runs** (review r1 M2): they say how a route or a control behaves on this PC, whoever
 asked, so a test measures the same Yuki the user runs and real evidence (a verified rung B, a false done) is never
@@ -77,6 +78,7 @@ import json
 import sqlite3
 import sys
 import time
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -207,8 +209,9 @@ def is_test_fact(fact: Any, turn_ids: frozenset[int] | set[int]) -> bool:
 #: Test sessions closer than this (s) are one span; a span is padded by :data:`SPAN_PAD_S` on each side.
 SPAN_JOIN_S = 300.0
 SPAN_PAD_S = 120.0
-#: Real use that confirms a "said" pairing or a name alias (phase 3, 3.4): a real exchange holding its words, then a
-#: real skill run done or already within this long (s; the exchange's own request), read back this many days.
+#: Real use that confirms a "said" pairing or a name alias (phase 3, 3.4): a real exchange holding its words whose own
+#: skill run (joined by request id; else one within this long after it, s) finished done or already, read back this
+#: many days.
 CONFIRM_RUN_S = 180.0
 CONFIRM_DAYS = 60
 #: The kind suffix of the taste rows that keep what the user called an entity (``yuki.skills.taste.SAID_SUFFIX``).
@@ -216,34 +219,64 @@ SAID_SUFFIX = "@said"
 
 
 def _fold(value: Any) -> str:
-    """Case, spacing and punctuation folded, padded: identity of the user's own words, never meaning."""
-    text = "".join(ch if ch.isalnum() else " " for ch in str(value or "").casefold())
+    """Case, spacing and punctuation folded, padded: identity of the user's own words, never meaning. A combining mark
+    (a Devanagari vowel sign, category M*) stays inside its word: one Hindi word stays one word."""
+    text = "".join(ch if ch.isalnum() or unicodedata.category(ch)[:1] == "M" else " "
+                   for ch in str(value or "").casefold())
     return " " + " ".join(text.split()) + " "
+
+
+def _request_base(request_id: Any) -> str:
+    """A request id as its exchange and its runs share it: a turn's ``voice-`` prefix and a run's ``-t<n>`` step
+    suffix off (``voice-20261017-122119-c060-2`` and ``20261017-122119-c060-2``; the id's own format, no words)."""
+    rid = str(request_id or "")
+    if rid.startswith("voice-"):
+        rid = rid[len("voice-"):]
+    head, sep, tail = rid.rpartition("-t")
+    return head if sep and tail.isdigit() else rid
 
 
 def real_uses(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: float
               ) -> list[tuple[float, str]]:
-    """``(at, folded words)`` of the user's real exchanges of the last :data:`CONFIRM_DAYS` (no test session) that a
-    real skill run finishing done or already followed within :data:`CONFIRM_RUN_S`: the uses that confirm a pairing
-    or an alias whose words they hold. Decrypted in RAM only; ``[]`` when the tables or the key are missing."""
+    """``(at, folded words)`` of the user's real exchanges of the last :data:`CONFIRM_DAYS` (no test session) whose
+    own skill run finished done or already: the uses that confirm a pairing or an alias whose words they hold. The run
+    is the exchange's by its request id (``conversation_turns.request_id`` = ``voice-`` + ``skill_runs.request_id``);
+    an exchange with no run of its own id falls back to a real run within :data:`CONFIRM_RUN_S` after it that no other
+    exchange's id claims. Decrypted in RAM only; ``[]`` when the tables or the key are missing."""
     if not (_has(conn, "conversation_turns", "user_ciphertext") and _has(conn, "skill_runs", "outcome")):
         return []
     since = now - CONFIRM_DAYS * 86400.0
-    runs = sorted(float(r[0]) for r in conn.execute(
-        f"SELECT coalesce(t0, at) FROM skill_runs WHERE outcome IN ('done', 'already') AND coalesce(t0, at) >= ? AND"
-        f" {sql_real_skill_run()}", (since,)).fetchall() if r[0] is not None)
-    if not runs:
-        return []
     lo, hi = _session_range()
-    out: list[tuple[float, str]] = []
+    turns = conn.execute("SELECT at, user_ciphertext, request_id FROM conversation_turns WHERE at >= ? AND NOT"
+                         " (session_id >= ? AND session_id < ?) AND user_ciphertext IS NOT NULL",
+                         (since, lo, hi)).fetchall()
+    if not turns:
+        return []
+    claimed = {_request_base(r[2]) for r in turns if r[2]}
+    by_request: dict[str, bool] = {}   # an exchange's own runs: whether any finished done or already
+    loose: list[float] = []            # done runs no exchange's id claims (older rows), for the time window
+    for r in conn.execute(f"SELECT request_id, coalesce(t0, at), outcome FROM skill_runs WHERE coalesce(t0, at) >= ?"
+                          f" AND {sql_real_skill_run()}", (since,)).fetchall():
+        ok = str(r[2] or "") in ("done", "already")
+        base = _request_base(r[0])
+        if r[0] and base in claimed:
+            by_request[base] = by_request.get(base, False) or ok
+        elif ok and r[1] is not None:
+            loose.append(float(r[1]))
+    loose.sort()
     import bisect
 
-    for r in conn.execute("SELECT at, user_ciphertext FROM conversation_turns WHERE at >= ? AND NOT (session_id >= ?"
-                          " AND session_id < ?) AND user_ciphertext IS NOT NULL", (since, lo, hi)).fetchall():
+    out: list[tuple[float, str]] = []
+    for r in turns:
         at = float(r[0])
-        i = bisect.bisect_left(runs, at - 5.0)
-        if i >= len(runs) or runs[i] > at + CONFIRM_RUN_S:
-            continue
+        base = _request_base(r[2]) if r[2] else ""
+        if base and base in by_request:
+            if not by_request[base]:
+                continue   # its own run did not get there: no confirmation
+        else:
+            i = bisect.bisect_left(loose, at - 5.0)
+            if i >= len(loose) or loose[i] > at + CONFIRM_RUN_S:
+                continue
         try:
             words = dec(r[1])
         except Exception:  # noqa: BLE001 - unreadable: no evidence
@@ -389,8 +422,9 @@ def _purge_corrections(conn: sqlite3.Connection, dec: Callable[[Any], str | None
 def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: float) -> dict[str, int]:
     """Delete what the live test left and what was learned from it (module docstring), inside the caller's write
     transaction (``conn``; ``dec`` decrypts a stored field). Idempotent: a second run finds nothing. Counts per kind,
-    only the kinds where something went; content-free. Never reads words to decide: the tag, or the test sessions'
-    own span for rows that carry none."""
+    only the kinds where something went; content-free. What goes is found by the tag, or the test sessions' own span
+    for rows that carry none; the one place words are read (in RAM, by identity) is what keeps a "said" pairing or a
+    name alias of that span: a real exchange holding its words, confirmed by its own run (:func:`real_uses`)."""
     out: dict[str, int] = {}
 
     def count(kind: str, n: int) -> None:
@@ -543,8 +577,8 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
         if _has(conn, "tastes", "source"):
             # phase 3 (3.4): a pairing or a named pick the user's real use confirmed is kept; only test-only rows go
             cond, params = _in_spans("last_at", spans)
-            rows = conn.execute(f"SELECT id, kind, name_ciphertext, ref_ciphertext FROM tastes WHERE source = 'said'"
-                                f" AND {cond}", params).fetchall()
+            rows = conn.execute(f"SELECT id, kind, name_ciphertext, ref_ciphertext, last_at FROM tastes WHERE"
+                                f" source = 'said' AND {cond}", params).fetchall()
             if rows:
                 uses = real_uses(conn, dec, now=now)
             gone_rows: list[int] = []
@@ -559,7 +593,9 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
                     name = target = None
                 if not kind.endswith(SAID_SUFFIX):
                     picks.append((int(r[0]), kind, name))
-                elif _confirmed(name, uses or []):
+                # a later use: one through the pairing (taste.said_target) leaves its row alone, so last_at is when
+                # it was learned
+                elif _confirmed(name, uses or [], after=float(r[4] or 0.0)):
                     kept_targets.add((kind[: -len(SAID_SUFFIX)], _fold(target)))
                     count("taste_said_kept", 1)
                 else:

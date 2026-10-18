@@ -461,6 +461,7 @@ def gen_reminders(ctx: Context) -> list[Candidate]:
     now = ctx.now
     late = float(cfg.reminder_late_max_h) * 3600.0
     lead = float(cfg.confirm_lead_min) * 60.0
+    today = user_day(now, cfg.resume_day_start)   # 3.4: a card about an item shown today is its Today line's mention
     for item in ctx.items:
         if item.due_at is None or item.source == "loop":
             continue
@@ -481,7 +482,8 @@ def gen_reminders(ctx: Context) -> list[Candidate]:
                 confidence=0.8, refs={"item": item.ref, "due_at": float(item.due_at), "source": item.source},
                 evidence={item.ref: float(item.since or now)},
                 text=(f"{said}: {title} ({when}). Want a reminder?" if title else None), needs_writer=not title,
-                offer_channel="reminder", why=f"confirm lead_h={(at - now) / 3600.0:.1f} titled={int(bool(title))}"))
+                offer_channel="reminder", seen_keys=(f"dated:{item.ref}:{today}",),
+                why=f"confirm lead_h={(at - now) / 3600.0:.1f} titled={int(bool(title))}"))
         elif at <= now:
             key = f"reminder:{item.ref}:{int(item.due_at)}"
             if ctx.seen.looked(key, now) or (ctx.live and ctx.store.reminded(item.ref, item.due_at)):
@@ -494,7 +496,8 @@ def gen_reminders(ctx: Context) -> list[Candidate]:
                       "all_day": bool(item.all_day)},
                 evidence={item.ref: float(item.since or at)},
                 text=(f"Reminder ({hm}): {title}" if title else None), needs_writer=not title,
-                offer_channel="reminder", why=f"reminder late_min={(now - at) / 60.0:.0f} titled={int(bool(title))}"))
+                offer_channel="reminder", seen_keys=(f"dated:{item.ref}:{today}",),
+                why=f"reminder late_min={(now - at) / 60.0:.0f} titled={int(bool(title))}"))
         else:
             ctx.deadline(at)
     return out
@@ -1040,9 +1043,13 @@ def gen_plans(ctx: Context) -> list[Candidate]:
     code ("Coming up: ...").
 
     Differences: an event's ``asked`` flag is read only live; a plan that also has a ``confirm`` candidate is left to
-    the confirm (one card about one plan, :func:`generate`)."""
+    the confirm (one card about one plan, :func:`generate`). Phase 3 (3.4): today's dated items (:func:`dated_today`)
+    come with it; a plan with a dated line this pass gets no plans card, and a plans card shown marks today's dated
+    line for it seen (one mention per plan a day)."""
     now = ctx.now
     dated = dated_today(ctx)
+    dated_refs = {c.refs.get("item") or c.refs.get("plan") for c in dated}
+    today = user_day(now, ctx.config.resume_day_start)
     cands: list[dict[str, Any]] = []
     for item in ctx.items:
         if item.due_at is None or item.source not in ("call", "chat") or not ctx.asks_ok(item):
@@ -1081,7 +1088,7 @@ def gen_plans(ctx: Context) -> list[Candidate]:
         if any(abs(t - c["due"]) <= PLANS_TODO_NEAR_S for t in todos):
             continue   # a timed to-do of theirs already sits by it
         key = f"plans:{c['ref']}"
-        if ctx.seen.looked(key, now, PLANS_AGAIN_S) or c["ref"] in answered:
+        if ctx.seen.looked(key, now, PLANS_AGAIN_S) or c["ref"] in answered or c["ref"] in dated_refs:
             continue
         when = _when(c["due"], now, c["all_day"])
         return [Candidate("plans", key, created_at=now, expires_at=c["at"] - PLANS_MIN_LEAD_S, home="card",
@@ -1089,6 +1096,7 @@ def gen_plans(ctx: Context) -> list[Candidate]:
                           digest_line=(lambda w=c["words"], d=when: _clip(f"Coming up: {_clip(resolve(w), 80)} ({d})",
                                                                          DIGEST_LINE_CHARS)),
                           needs_writer=True, offer_channel="plans", seen_within=PLANS_AGAIN_S,
+                          seen_keys=(f"dated:{c['ref']}:{today}",),
                           why=f"plans lead_h={lead / 3600.0:.1f} all_day={int(c['all_day'])}"), *dated]
     return dated
 
@@ -1578,8 +1586,9 @@ CALL_UNKNOWN_GENERATORS: tuple[str, ...] = ("reminder", "asked")
 
 
 def generate(ctx: Context, *, only: Iterable[str] | None = None) -> list[Candidate]:
-    """Every candidate open now, deduped by key (one card about one plan: a ``plans`` candidate yields to a ``confirm``
-    on the same item). Each generator is wrapped: an error is counted in ``ctx.errors`` (content-free), never raised."""
+    """Every candidate open now, deduped by key (one card about one plan: a ``plans`` candidate - its card, or today's
+    dated line for an item - yields to a ``confirm`` or a ``reminder`` on the same item). Each generator is wrapped: an
+    error is counted in ``ctx.errors`` (content-free), never raised."""
     wanted = set(only) if only is not None else None
     out: list[Candidate] = []
     for name, fn, every in GENERATORS:
@@ -1599,10 +1608,12 @@ def generate(ctx: Context, *, only: Iterable[str] | None = None) -> list[Candida
             continue
         out += got
     confirmed = {c.refs.get("item") for c in out if c.type == "confirm"}
+    carded = confirmed | {c.refs.get("item") for c in out if c.type == "reminder"}
     seen: set[str] = set()
     pile: list[Candidate] = []
     for c in out:
-        if c.key in seen or (c.type == "plans" and c.refs.get("plan") in confirmed):
+        if c.key in seen or (c.type == "plans" and (c.refs.get("plan") in confirmed
+                                                     or (c.lead and c.refs.get("item") in carded))):
             continue
         seen.add(c.key)
         pile.append(c)
