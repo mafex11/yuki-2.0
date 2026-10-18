@@ -3,18 +3,24 @@
 One :class:`TurnBudget` per user turn (voice) or request (typed). Every number is a code fact, never a reading of words:
 
 * **Rounds**: model calls for the turn (voice 8, typed 12).
-* **Wall time** from round 1, waits excluded (a send's countdown; on typed also asks, pauses and desk-lease waits:
+* **Wall time** from round 1 (or the turn's first tool call, whichever comes first), waits excluded (a send's countdown; on typed also asks, pauses and desk-lease waits:
   :meth:`TurnBudget.excluded`). Past the soft limit (voice 45 s, typed 120 s) an acting call is refused with
   :data:`LINE_SPENT` ("say what's left in one line and one other way"). At the hard stop (voice 60 s, the same as
   ``voice.hands.Hands.SKILL_HAND_MAX_S``, so a skill run started at round 1 is never cut before its own backstop; typed
   300 s of work) the driver interrupts the generation, says the owed line (:data:`LINE_REST_LEFT`, rule #149) and
-  :meth:`TurnBudget.close` s the turn: every later result settles silently (:attr:`TurnBudget.closed`).
+  :meth:`TurnBudget.close` s the turn: every later result settles silently (:attr:`TurnBudget.closed`). A hard stop
+  :meth:`TurnBudget.round` or :meth:`TurnBudget.before_call` finds first closes the turn itself.
 * **Answers**: a turn with no act yet gets at most ``reads`` read calls (voice 8, typed 12) or ``answer_s`` of work.
 * **Retry window**: after the first act that did not take effect, other undoable tries go for 8 s
   (``voice.hands.RETRY_BUDGET_S``), never after; a lasting act (a send, a join) that missed is never tried again in the
   turn.
 * **Same failing step**: refused at once, keyed by :func:`step_key` (``voice.hands._step_key``'s identity).
 * **Refusals**: the second refusal in a turn settles it: no model run (``run_llm=False``), code's rule-#149 line.
+
+Every settle (the hard stop, the rounds, the second refusal) closes the turn: a later call in the same reply, or a
+late result, settles silently, so code's line is said once. The driver calls :meth:`TurnBudget.round` before **every**
+model call of the turn; the gate calls :meth:`TurnBudget.before_call` before every agent call (which starts the clock
+too, so a driver that forgot :meth:`TurnBudget.round` still has its time limits).
 
 Thread-safe; ``clock`` is injectable for checks. Logs nothing (the runner logs the content-free counts it reads here:
 :meth:`TurnBudget.facts`).
@@ -204,42 +210,51 @@ class TurnBudget:
     def close(self, why: str = "closed") -> None:
         """The turn is over by code: every later call and result settles silently."""
         with self._lock:
-            if not self.closed:
-                self.closed, self.closed_why = True, str(why or "closed")
+            self._close(why)
+
+    def _close(self, why: str) -> None:
+        """:meth:`close` with the lock held."""
+        if not self.closed:
+            self.closed, self.closed_why = True, str(why or "closed")
 
     # -- rounds and calls ---------------------------------------------------------------------------------------------
 
     def round(self) -> Spend:
-        """Before each model call of the turn. Over the rounds or past the hard stop: the turn settles by code with
-        rule #149's line (no model call is made)."""
+        """Before each model call of the turn (the driver's, every one). Over the rounds or past the hard stop: the
+        turn settles by code with rule #149's line (no model call is made) and is closed."""
         self.start()
         with self._lock:
             if self.closed:
                 return Spend(False, "closed", LINE_CLOSED, settle=True, silent=True)
             if self._elapsed() >= self.limits.hard_s:
+                self._close("hard")
                 return Spend(False, "hard", LINE_REST_LEFT, settle=True)
             if self.rounds >= self.limits.rounds:
+                self._close("rounds")
                 return Spend(False, "rounds", LINE_REST_LEFT, settle=True)
             self.rounds += 1
             return OK
 
     def before_call(self, name: str, args: Mapping[str, Any] | None = None, *, acts: bool = True,
                     lasting: bool = False) -> Spend:
-        """Before one tool call (``acts``: it acts on the desktop; ``lasting``: a send or a join). Never raises."""
+        """Before one tool call (``acts``: it acts on the desktop; ``lasting``: a send or a join). The first call starts
+        the clock when no :meth:`round` did; the hard stop closes the turn. Never raises."""
+        self.start()
         with self._lock:
             if self.closed:
                 return Spend(False, "closed", LINE_CLOSED, settle=True, silent=True)
             now_s = self._elapsed()
-            if self.started is not None and now_s >= self.limits.hard_s:
+            if now_s >= self.limits.hard_s:
+                self._close("hard")
                 return Spend(False, "hard", LINE_REST_LEFT, settle=True)
             if not acts:
                 if self.reads >= self.limits.reads:
                     return Spend(False, "reads", LINE_READS_SPENT)
-                if self.acts == 0 and self.started is not None and now_s >= self.limits.answer_s:
+                if self.acts == 0 and now_s >= self.limits.answer_s:
                     return Spend(False, "answer_s", LINE_READS_SPENT)
                 self.reads += 1
                 return OK
-            if self.started is not None and now_s >= self.limits.soft_s:
+            if now_s >= self.limits.soft_s:
                 return Spend(False, "soft", LINE_SPENT)
             key = step_key(name, args)
             if key in self.failed:
@@ -249,6 +264,16 @@ class TurnBudget:
             if self.first_miss is not None and self._clock() - self.first_miss > self.limits.retry_s:
                 return Spend(False, "retry", LINE_RETRY_SPENT)
             self.acts += 1
+            return OK
+
+    def lasting(self) -> Spend:
+        """After the gate found a call lasting (a send with its countdown, a join): refused when one already missed
+        this turn (it may have gone partly; never tried again)."""
+        with self._lock:
+            if self.closed:
+                return Spend(False, "closed", LINE_CLOSED, settle=True, silent=True)
+            if self.lasting_missed:
+                return Spend(False, "lasting_retry", LINE_LASTING_RETRY)
             return OK
 
     def after_call(self, name: str, args: Mapping[str, Any] | None = None, *, acts: bool = True, ok: bool = True,
@@ -266,10 +291,12 @@ class TurnBudget:
 
     def refused(self, final_line: str = "") -> Spend:
         """A call was refused (by the gate or this budget). The second refusal of the turn settles it by code: no model
-        run, ``final_line`` when the refusal is one said as it is (a game, Act off), else rule #149's line."""
+        run, ``final_line`` when the refusal is one said as it is (a game, Act off), else rule #149's line; the turn is
+        closed (a later call of the same reply settles silently)."""
         with self._lock:
             self.refusals += 1
             if self.refusals >= self.limits.refusals:
+                self._close("refusals")
                 return Spend(False, "refusals", str(final_line or "") or LINE_REST_LEFT, settle=True)
             return OK
 

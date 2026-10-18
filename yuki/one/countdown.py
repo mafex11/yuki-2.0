@@ -195,11 +195,17 @@ class Countdown:
         elif state == CANCELLED:
             self._emit("stopped", seconds, info)
         elif why == "swap" and cur.swap is not None:
+            # the chosen alternative leaves the chips and the name it replaced takes its place (at most two), as
+            # ``brain.agent.Brain._send_countdown`` does
             event = dict(info)
+            value = cur.swap["value"]
             if cur.swap["kind"] == "who":
-                event["who"] = cur.swap["value"]
+                event["who"] = value
+                event["who_alts"] = tuple(x for x in (info["who"], *info["who_alts"]) if x and x != value)[:2]
             else:
-                event["where"] = cur.swap["value"]
+                event["where"] = value
+                event["where_alts"] = tuple(x for x in (info["where"], *info["where_alts"])
+                                            if x and x != value)[:2]
             event["window"] = ""
             self._emit("swapped", seconds, event)
         else:

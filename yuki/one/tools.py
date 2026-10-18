@@ -344,9 +344,14 @@ ACTING: frozenset[str] = frozenset(n for n, s in SPECS.items() if s.acts)
 PLACE_VERB_ACTIONS: dict[str, str] = {"move": "place", "focus_back": "focus_back", "undo": "undo"}
 
 
-def spec_of(name: str) -> Spec | None:
-    """The tool's :class:`Spec` (a ONE tool, else a Dispatcher verb the skill engine passes); ``None``: unknown."""
-    return SPECS.get(str(name or "")) or DISPATCHER_SPECS.get(str(name or ""))
+def spec_of(name: str, *, inner: bool = False) -> Spec | None:
+    """The tool's :class:`Spec`; ``None``: unknown. The agent's own call (``inner`` false) is one of its ONE tools and
+    nothing else: a Dispatcher verb's name, or any other, from the model is unknown (fail closed). The skill engine's
+    steps (``inner``) are Dispatcher verbs by their own names (:data:`DISPATCHER_SPECS`), a ONE name after that."""
+    key = str(name or "")
+    if not inner:
+        return SPECS.get(key)
+    return DISPATCHER_SPECS.get(key) or SPECS.get(key)
 
 
 def then_of(args: Mapping[str, Any] | None) -> str:
@@ -363,14 +368,16 @@ def _hwnd(value: Any) -> int | None:
         return None
 
 
-def as_verb(name: str, args: Mapping[str, Any] | None, *, tab_names: Sequence[str] | None = None
-            ) -> tuple[str, dict[str, Any]] | None:
+def as_verb(name: str, args: Mapping[str, Any] | None, *, tab_names: Sequence[str] | None = None,
+            inner: bool = False) -> tuple[str, dict[str, Any]] | None:
     """The Dispatcher call the consent table judges for one ONE call: ``(verb, input)``, the words for the user
     (``say_*``, ``named``, ``then``, ``consent``) left out (``voice.hands.judged_call``'s mapping, plus the new verbs).
-    A Dispatcher verb passes as it is. ``None``: an unknown tool."""
+    A Dispatcher verb passes as it is: the skill engine's step (``inner``) by its Dispatcher name with its Dispatcher
+    input (``click``'s ``hwnd`` and ``element`` kept), never read as the ONE tool of the same name. ``None``: an
+    unknown tool."""
     args = dict(args or {})
     w = _hwnd(args.get("window"))
-    if name in DISPATCHER_SPECS and name not in SPECS:
+    if name in DISPATCHER_SPECS and (inner or name not in SPECS):
         return name, {k: v for k, v in args.items() if k not in ("say_first", "say_when_done", "then")}
     if name == "window":
         action = str(args.get("action") or "")

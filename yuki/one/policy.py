@@ -5,8 +5,12 @@
 It is a thin wrapper on the table that already exists: ``brain.consent`` (rows 1-6) with the one-step commit check
 (``brain.check.one``), plus the ONE agent's own facts. Rows, in order:
 
-0. **Closed turn** (the budget's hard stop): refused silently. **Unknown tool: refused** (fail closed); a typed-only
-   tool (``keys``, ``shell``, ``fetch``, ``ask_user``) on voice: refused.
+0. **Closed turn** (the budget's hard stop): refused silently. **Unknown tool: refused** (fail closed: the agent's own
+   call is one of its ONE tools, never a Dispatcher verb's name; the skill engine's steps, ``inner``, are Dispatcher
+   verbs); a typed-only tool (``keys``, ``shell``, ``fetch``, ``ask_user``) on voice: refused. **The budget**
+   (:mod:`yuki.one.budget`: hard stop, soft time, reads, the same failing step, the retry window) is read here, before
+   any row below, so a call it refuses leaves nothing behind (no question recorded, no text marked, no tidy step used,
+   no commit check spent); a lasting act after one missed is refused once the decision shows it lasting.
 1. **Controls, reads, memory writes**: allowed. ``quick_memory``/``memory`` reads, a file or the clipboard set the
    turn's ``private_read``; after it a ``fetch`` of an address and an ``open_url`` whose address carries a query go to
    the commit check as an outbound fetch (the old M9 rule).
@@ -17,7 +21,10 @@ It is a thin wrapper on the table that already exists: ``brain.consent`` (rows 1
 4. **Sends by code**: Enter (typed or pressed), a committing key or any click in a window holding text Yuki typed and
    has not sent is a send (``sends_for_certain`` widened to every click and key, addendum must-fix 4): refused, since
    raw verbs never send; a message goes through ``run_skill`` with a declaration. The skill run the gate itself granted
-   (a counted send, :meth:`Turn.begin_skill`) may press its own send once, for that very text.
+   (a counted send, :meth:`Turn.begin_skill`) may press its own send once, for that very text. The agent's own Enter
+   (a key, a combination holding it, typing with Enter or a line break) in a chat's window (``consent.chat_window``;
+   a program it can't tell counts as a chat) is a send by code too, whoever's text waits there (addendum: zero
+   tolerance); the skill engine's own steps keep using Enter (a quick switcher), judged as before.
 5. **Skill sends**: no declaration (``consent`` on ``run_skill``): the gate **rewrites the send slot to a draft**
    (``Decision.rewrite``; Yuki's own wording typed after, ``type_after``), never a hand-over. With one: ``check.one``
    with ``consent=``: the send rule unchanged (countdown, the quote in their words, the recipient named, their text,
@@ -30,8 +37,11 @@ It is a thin wrapper on the table that already exists: ``brain.consent`` (rows 1
    brought up or took the front from): the tidy dial (``util.tidy_mode``): do it / ask once / off; at most two tidy
    steps per flagged diff.
 
-A yes to a question the gate asked is recorded as a code fact (:meth:`Turn.answer`): the same step is not asked again
-(rows 1-2 read again first; a send keeps its countdown). The second refusal of a turn settles it by code
+A yes to a question the gate asked is recorded as a code fact (:meth:`Turn.answer`): that very step is allowed once,
+not asked again (rows 1-2 read first; a send keeps its countdown), and the yes is used up (``consent.after_ask``:
+"allowed this once"). A question nobody answered lasts one more turn (:meth:`Turn.carry`), a yes never carries, and a
+send of the previous turn is asked before it goes again. A click whose target has neither role nor name is judged as a
+committing click (the hands' rule for an unknown role). The second refusal of a turn settles it by code
 (``Decision.settle``; :mod:`yuki.one.budget`). Content-free log, one line per decision.
 
 The hands' consent state lives here now, as turn state: the newest-words close rule, the windows holding Yuki's unsent
@@ -68,6 +78,11 @@ LINE_SEND_BY_CODE = ("Not done: that would send the text Yuki typed there and ha
 LINE_SHELL_LONG = ("Not run: the command is longer than Yuki's check reads ({n} characters at most); split it into "
                    "shorter commands (the session keeps variables).")
 LINE_ALREADY_SENT = "Not sent again: that same message already went to them in this request."
+#: The same message went to them in the turn before: asked before it goes again (a yes: once, with the countdown).
+LINE_SENT_AGAIN = "You just sent that to {who}. Send it again?"
+#: Enter in a chat, or a step the check read as sending with nothing declared: a message goes only through a skill.
+LINE_CHAT_SEND = ("Not done: that would send a message (Enter or a send button in a chat); a message goes out only "
+                  "through run_skill message with consent. Nothing was sent.")
 #: M9: an address carrying a query, after this request read their private things, that the check did not find asked.
 LINE_M9_ASK = "Should I open that address? It may carry what I read of yours."
 LINE_TIDY_OFF = ("Not done: their settings say no tidy-ups; leave the windows as they are and say in a few words what "
@@ -78,7 +93,7 @@ LINE_TIDY_ASK: dict[str, str] = {"place": "Should I move {app} to your other scr
                                  "focus_back": "Should I put {app} back in front?"}
 #: Row 4's refusals in the words the ONE agent writes (``run_skill``'s ``consent``), by consent's code word.
 ONE_LINES: dict[str, str] = {
-    "undeclared_send": LINE_SEND_BY_CODE,
+    "undeclared_send": LINE_CHAT_SEND,
     "not_capability": "Not done: messages go only through run_skill message with consent; nothing was sent.",
     "recipient": "Not sent: consent.to must name whom it goes to.",
     "recipient_slot": "Not sent: the skill's person and consent.to name different people; make them the same person.",
@@ -128,6 +143,32 @@ def mark_typed(hwnd: Any, text: str = "", *, clock: Callable[[], float] = time.m
             _typed[key] = (clock(), " ".join(str(text or "").split()))
 
 
+def adopt_typed(waiting: Any, *, clock: Callable[[], float] = time.monotonic) -> int:
+    """A skill run's own record of the windows it typed Yuki's text into and did not send (``uia_route.DeskHands``'s
+    ``_typed``: hwnd -> monotonic time typed) joins the desk's registry, the text not known (``""``): a later click,
+    Enter or key there is a send by code. The runner calls it after every ``run_skill`` (a draft waits in the chat).
+    Windows already registered keep their text. Returns how many it added. Never raises."""
+    added = 0
+    try:
+        items = list(dict(waiting or {}).items())
+    except Exception:  # noqa: BLE001 - nothing readable: nothing added
+        return 0
+    now = clock()
+    with _typed_lock:
+        for raw, at in items:
+            key = _hwnd(raw)
+            if key is None or key in _typed:
+                continue
+            try:
+                when = float(at)
+            except (TypeError, ValueError):
+                when = now
+            if now - when < TYPED_WAIT_S:
+                _typed[key] = (when, "")
+                added += 1
+    return added
+
+
 def clear_typed(hwnd: Any) -> None:
     """The window's waiting text went (submitted, or the user cleared it)."""
     key = _hwnd(hwnd)
@@ -167,7 +208,7 @@ class Decision:
     plain words allowed (the run's own steps pass row 3). ``game``: a game is in front (a skill runs in its game mode).
     ``tidy``: a tidy-up step. ``key``: the step's identity (a yes is recorded by it). ``settle``: the turn ends by
     code, ``line`` said (rule #149), no model run; ``silent``: it ends with nothing said (a closed turn). ``act_off``:
-    the app whose Act switch is off."""
+    the app whose Act switch is off. ``yes``: allowed on the user's recorded yes (used up by this decision)."""
 
     kind: str
     reason: str
@@ -187,6 +228,7 @@ class Decision:
     settle: bool = False
     silent: bool = False
     act_off: str = ""
+    yes: bool = False
 
     @property
     def allowed(self) -> bool:
@@ -196,7 +238,7 @@ class Decision:
         """Content-free fields for a log line."""
         return {"kind": self.kind, "reason": self.reason, "row": self.row, "verb": self.verb,
                 "countdown": self.countdown, "rewrite": self.rewrite is not None, "final": self.final,
-                "join": self.join, "game": self.game, "tidy": self.tidy, "settle": self.settle}
+                "join": self.join, "game": self.game, "tidy": self.tidy, "settle": self.settle, "yes": self.yes}
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -260,12 +302,17 @@ class Turn:
         self.log = log
         self.tidy = Tidy()
         self.refusals = 0
-        #: Step identities the user said yes to (a code fact, never asked again), with the row that asked.
+        #: Step identities the user said yes to, with the row that asked: that step is allowed once, then the yes is
+        #: used up (:meth:`use_yes`). Never carried to a later turn.
         self.yes: dict[str, int] = {}
         #: Questions the gate asked and nobody answered yet: identity -> (question, row), newest last.
         self.asks: dict[str, tuple[str, int]] = {}
+        #: The questions in :attr:`asks` that came from the turn before (they last one turn: not carried again).
+        self._carried_asks: set[str] = set()
         #: Sends that went this turn (once per request): (person folded, text folded).
         self.sent: set[tuple[str, str]] = set()
+        #: Sends that went in the turn before (voice, :meth:`carry`): the same message again is asked first.
+        self.sent_before: set[tuple[str, str]] = set()
         self._lock = threading.Lock()
         self._join: tuple[int, str, str] | None = None
         self._send: dict[str, Any] | None = None
@@ -317,16 +364,39 @@ class Turn:
                 return
             key = key if key in self.asks else next(reversed(self.asks))
             _question, row = self.asks.pop(key)
+            self._carried_asks.discard(key)
             if yes:
                 self.yes[key] = row
 
+    def ask(self, key: str, question: str, row: int) -> None:
+        """The gate asked the user about this step (newest last); asked again here, it is this turn's question."""
+        if not key:
+            return
+        with self._lock:
+            self.asks.pop(key, None)
+            self.asks[key] = (question, row)
+            self._carried_asks.discard(key)
+
+    def use_yes(self, key: str) -> None:
+        """A recorded yes authorised its step: used up (``consent.after_ask``: allowed this once)."""
+        with self._lock:
+            self.yes.pop(key, None)
+
     def carry(self, previous: "Turn | None") -> "Turn":
-        """A new user turn that follows ``previous`` (voice): its open questions and recorded yeses carry over (the
-        user answers in their next turn), and its tidy and budget state do not. Returns self."""
+        """A new user turn that follows ``previous`` (voice): the questions ``previous`` itself asked and nobody answered
+        (the user answers in their next turn; one carried in already expires), and the sends that went in it (the same
+        message again is asked first). A yes never carries (it is recorded on the turn that reads the answer and used
+        once); tidy and budget state do not carry. Returns self."""
         if previous is not None:
             with previous._lock:
-                self.asks.update(previous.asks)
-                self.yes.update(previous.yes)
+                fresh = {k: v for k, v in previous.asks.items() if k not in previous._carried_asks}
+                sent = set(previous.sent)
+            with self._lock:
+                for k, v in fresh.items():
+                    if k not in self.asks:
+                        self.asks[k] = v
+                        self._carried_asks.add(k)
+                self.sent_before |= sent
         return self
 
     # -- the runner's facts -------------------------------------------------------------------------------------------
@@ -358,8 +428,11 @@ class Turn:
             self._send = None
 
     def mark_sent(self, tool_input: Mapping[str, Any]) -> None:
-        """A send may have gone (its run's own result says so): the same message never goes twice this request."""
-        self.sent.add(send_key(tool_input))
+        """A send may have gone (its run's own result says so): the same message never goes twice this request (and is
+        asked first in the next turn, :meth:`carry`)."""
+        key = send_key(tool_input)
+        with self._lock:
+            self.sent.add(key)
 
     def _join_granted(self, verb: str, vinput: Mapping[str, Any], facts: Mapping[str, Any]) -> bool:
         grant = self._join
@@ -416,10 +489,12 @@ def step_identity(verb: str, vinput: Mapping[str, Any], facts: Mapping[str, Any]
 
 def gate(tool: str, tool_input: Mapping[str, Any] | None = None, target: Mapping[str, Any] | None = None,
          turn: Turn | None = None, *, inner: bool = False) -> Decision:
-    """The decision for one call (module docstring). ``tool``: a ONE tool or a Dispatcher verb (the skill engine's
-    steps, ``inner``: not the agent's own call, so not counted on the budget's calls or refusals). ``target``: the
-    code facts the verb read (``hwnd``, ``app``: the window's process, ``title``, ``role``, ``name``). Never raises:
-    an error is a refusal (nothing done)."""
+    """The decision for one call (module docstring). ``tool``: the agent's own call, one of its ONE tools (any other
+    name is unknown, refused); with ``inner``, a skill engine step by its Dispatcher verb name and input (or a code
+    step of the runner's, e.g. typing a draft's ``type_after``): not the agent's own call, so not counted on the
+    budget's calls or refusals. ``target``: the code facts the verb read (``hwnd``, ``app``: the window's process,
+    ``title``, ``role``, ``name`` of the item from the fresh read). Never raises: an error is a refusal (nothing
+    done)."""
     turn = turn if turn is not None else Turn()
     started = time.perf_counter()
     name = str(tool or "")
@@ -455,26 +530,42 @@ def _gate(name: str, args: dict[str, Any], facts: dict[str, Any], turn: Turn, in
     budget = turn.budget
     if budget is not None and budget.closed:
         return Decision(REFUSE, "closed", settle=True, silent=True)
-    spec = T.spec_of(name)
+    spec = T.spec_of(name, inner=inner)
     if spec is None:
         return Decision(REFUSE, "unknown_tool", line=LINE_UNKNOWN)
-    if name in T.SPECS and turn.channel not in spec.channels:
+    if turn.channel not in spec.channels:
         return Decision(REFUSE, "channel", line=LINE_CHANNEL.format(tool=name))
-    mapped = T.as_verb(name, args, tab_names=facts.get("tabs") if isinstance(facts.get("tabs"), list) else None)
+    mapped = T.as_verb(name, args, tab_names=facts.get("tabs") if isinstance(facts.get("tabs"), list) else None,
+                       inner=inner)
     if mapped is None:
         return Decision(REFUSE, "unknown_tool", line=LINE_UNKNOWN)
     verb, vinput = mapped
     if facts.get("hwnd") is None and vinput.get("hwnd") is not None:
         facts["hwnd"] = vinput.get("hwnd")
+    if not inner and verb == "click" and not facts.get("role") and not facts.get("name"):
+        # a target with no role and no name may be anything: judged as a committing click (``authorize``'s rule for a
+        # forced click whose role is unknown; the runner passes the item's role and name from the fresh read)
+        facts["role"] = "Button"
+    # row 0: the budget first, so a call it refuses leaves nothing behind (no ask, no typed mark, no tidy step, no check)
+    counted = not inner and budget is not None and spec.kind not in (T.CONTROL, T.WRITE)
+    if counted:
+        spend = budget.before_call(name, args, acts=spec.acts)
+        if not spend.ok:
+            return _spent(spend, verb)
     decision = _decide(name, spec, verb, vinput, args, facts, turn, inner)
-    if decision.kind == REFUSE or inner or budget is None or name not in T.SPECS or spec.kind in (T.CONTROL, T.WRITE):
-        return decision
-    lasting = decision.countdown or decision.join
-    spend = budget.before_call(name, args, acts=spec.acts, lasting=lasting)
-    if not spend.ok:
-        return Decision(REFUSE, f"budget_{spend.why}", line=spend.line, verb=verb, settle=spend.settle,
-                        silent=spend.silent)
+    if counted and decision.allowed and (decision.countdown or decision.join):
+        spend = budget.lasting()
+        if not spend.ok:
+            return _spent(spend, verb)
+    if decision.allowed and decision.yes and decision.key:
+        turn.use_yes(decision.key)
     return decision
+
+
+def _spent(spend: Any, verb: str) -> Decision:
+    """The budget's refusal as a decision."""
+    return Decision(REFUSE, f"budget_{spend.why}", line=spend.line, verb=verb, settle=spend.settle,
+                    silent=spend.silent)
 
 
 def _decide(name: str, spec: T.Spec, verb: str, vinput: dict[str, Any], args: dict[str, Any],
@@ -517,6 +608,11 @@ def _decide(name: str, spec: T.Spec, verb: str, vinput: dict[str, Any], args: di
                 clear_typed(hwnd)
                 return Decision(ALLOW, "granted_send", row=4, verb=verb)
             return Decision(REFUSE, "send_by_code", line=LINE_SEND_BY_CODE, row=4, verb=verb)
+    # row 4 by code: the agent's own Enter in a chat sends whatever its box holds (addendum zero tolerance), never
+    # left to the commit check's reading; the skill engine's own steps (a quick switcher's Enter) are judged as before
+    if not inner and verb != "click" and _submits(verb, vinput) \
+            and rule.chat_window(_call(verb, vinput, facts), _board_live(board)) is not False:
+        return Decision(REFUSE, "send_by_code", line=LINE_CHAT_SEND, row=4, verb=verb)
 
     # row 6 (shell): shown whole to the commit check, or refused plainly
     if verb == "run_powershell":
@@ -535,20 +631,19 @@ def _decide(name: str, spec: T.Spec, verb: str, vinput: dict[str, Any], args: di
         return tidy
 
     key = step_identity(verb, vinput, facts)
-    if key in turn.yes:
-        gate_again = rule.screen_gate(_call(verb, vinput, facts), rule.Live(game=game, policy=turn.policy))
-        if gate_again is not None:
-            return _refusal(gate_again.why, gate_again.line, gate_again.row, verb, final=gate_again.final)
-        return Decision(ALLOW, "said_yes", row=turn.yes[key], verb=verb, key=key)
-
-    words, earlier = turn.words_for(verb, vinput)
-    verdict = _check.one(verb, vinput, facts, words=words, checker=turn.checker(), earlier=earlier, board=board,
-                         policy=turn.policy, log=turn.log)
-    decision = _from_verdict(verdict, verb, key, turn)
-    if not decision.allowed and decision.row == 3 and inner and turn._join_granted(verb, vinput, facts):
-        decision = Decision(ALLOW, "join_words", row=3, verb=verb, join=True)
+    said = turn.yes.get(key)
+    if said is not None:
+        # their yes to this very step (rows 1-2 were read again just above): allowed once, used up by the gate
+        decision = Decision(ALLOW, "said_yes", row=said, verb=verb, key=key, yes=True)
+    else:
+        words, earlier = turn.words_for(verb, vinput)
+        verdict = _check.one(verb, vinput, facts, words=words, checker=turn.checker(), earlier=earlier, board=board,
+                             policy=turn.policy, log=turn.log)
+        decision = _from_verdict(verdict, verb, key, turn)
+        if not decision.allowed and decision.row == 3 and inner and turn._join_granted(verb, vinput, facts):
+            decision = Decision(ALLOW, "join_words", row=3, verb=verb, join=True)
     if decision.allowed:
-        if tidy is not None:
+        if tidy is not None:   # a tidy-up step counts toward the flagged diff's steps, a yes'd one too
             decision = replace(decision, tidy=True)
             turn.tidy.acts += 1
         if verb == "type_text" and hwnd:
@@ -578,15 +673,13 @@ def _outbound(verb: str, vinput: dict[str, Any], facts: dict[str, Any], turn: Tu
     judged = {"url": str(vinput.get("url") or "")}
     key = step_identity("fetch_url", judged, {})
     if key in turn.yes:
-        return Decision(ALLOW, "said_yes", row=5, verb=verb, key=key)
+        return Decision(ALLOW, "said_yes", row=5, verb=verb, key=key, yes=True)
     verdict = _check.one("fetch_url", judged, {**facts, "files_read": True}, words=turn.words,
                          checker=turn.checker(), earlier=turn.earlier, board=board, policy=turn.policy, log=turn.log)
     decision = _from_verdict(verdict, verb, key, turn)
     if decision.kind == REFUSE and not decision.final and decision.reason != "error":
         # the check read it as reaching someone (a send) their words didn't ask for: theirs to say, asked plainly
-        with turn._lock:
-            turn.asks.pop(key, None)
-            turn.asks[key] = (LINE_M9_ASK, 5)
+        turn.ask(key, LINE_M9_ASK, 5)
         decision = Decision(ASK, "m9", question=LINE_M9_ASK, row=5, verb=verb, key=key)
     return replace(decision, reason=f"m9_{decision.reason}") if not decision.reason.startswith("m9") else decision
 
@@ -625,17 +718,24 @@ def _skill(verb: str, vinput: dict[str, Any], args: Mapping[str, Any], facts: di
     if sends and declared is not None and send_key(vinput) in turn.sent:
         return Decision(REFUSE, "already_sent", line=LINE_ALREADY_SENT, row=4, verb=verb, game=in_game)
     step = step_identity(verb, vinput, facts)
-    if step in turn.yes:
+    said = turn.yes.get(step)
+    if said is not None:
         recheck = recheck_send(turn, vinput)
         if recheck is not None:
             return _refusal(recheck[0], recheck[1], 1 if recheck[0] == "game" else 2, verb, final=True)
-        row = turn.yes[step]
-        return Decision(ALLOW, "said_yes", row=row, countdown=row == 4 and sends, verb=verb, key=step, game=in_game)
+        return Decision(ALLOW, "said_yes", row=said, countdown=said == 4 and sends, verb=verb, key=step,
+                        game=in_game, yes=True)
     verdict = _check.one(verb, vinput, facts, words=turn.words, checker=turn.checker(), earlier=turn.earlier,
                          board=board, policy=turn.policy, log=turn.log, consent=declared if sends else None,
                          recent=turn.recent_for(declared["to"]) if sends and declared else None,
                          people_in=turn.people_in)
     decision = replace(_from_verdict(verdict, verb, step, turn), game=in_game)
+    if decision.allowed and decision.countdown and sends and send_key(vinput) in turn.sent_before:
+        # the same message went to them in the turn before (memory may not have it yet): asked before it goes again
+        who = (declared or {}).get("to") or rule.words(slots.get(rule.person_slot(sk))) or "them"
+        question = LINE_SENT_AGAIN.format(who=who)
+        turn.ask(step, question, 4)
+        return Decision(ASK, "sent_again", question=question, row=4, verb=verb, key=step, game=in_game)
     if decision.allowed and decision.row == 3 and verdict.code == "join_words":
         decision = replace(decision, join=True)
     if decision.allowed and decision.rewrite is not None:
@@ -653,10 +753,7 @@ def _from_verdict(v: OneVerdict, verb: str, key: str, turn: Turn) -> Decision:
         return Decision(ALLOW, "draft", rewrite=dict(v.draft_input or {}) or None, type_after=v.type_after,
                         line=v.line or rule.LINE_DRAFTED, row=v.row, verb=verb, key=key)
     if v.question:
-        if key:
-            with turn._lock:
-                turn.asks.pop(key, None)
-                turn.asks[key] = (v.question, v.row)
+        turn.ask(key, v.question, v.row)
         return Decision(ASK, v.code or v.why or "ask", question=v.question, row=v.row, verb=verb, key=key)
     if v.act_off:
         return Decision(REFUSE, "act_off", line=util.app_off_line(v.act_off), row=2, verb=verb, final=True,
@@ -677,6 +774,21 @@ def _call(verb: str, vinput: Mapping[str, Any], facts: Mapping[str, Any]) -> rul
     return rule.Call(verb, dict(vinput or {}), index=0, hwnd=_hwnd(facts.get("hwnd")), app=str(facts.get("app") or ""),
                      title=str(facts.get("title") or ""), role=str(facts.get("role") or ""),
                      name=str(facts.get("name") or ""))
+
+
+def _board_live(board: Mapping[str, Any] | None) -> rule.Live:
+    """Consent's code facts for a chat-window read, from the board this decision already holds (each window's page and
+    the extraction's kind); no board: ``consent`` reads its own (50 ms at most)."""
+    if not isinstance(board, Mapping) or not isinstance(board.get("windows"), list):
+        return rule.Live()
+    pages: dict[int, str] = {}
+    kinds: dict[int, str] = {}
+    for w in board["windows"]:
+        key = _hwnd(w.get("hwnd")) if isinstance(w, Mapping) else None
+        if key is not None:
+            pages[key] = str(w.get("url") or "")
+            kinds[key] = str(w.get("kind") or "")
+    return rule.Live(pages=pages, kinds=kinds)
 
 
 def _act_off_name(facts: Mapping[str, Any], turn: Turn) -> str:
@@ -764,8 +876,7 @@ def _tidy(verb: str, vinput: Mapping[str, Any], facts: Mapping[str, Any], turn: 
             raw = str(facts.get("app") or "").strip()
             app = util.app_name(raw) if raw else "that window"
             question = LINE_TIDY_ASK["place" if action == "place" else "focus_back"].format(app=app)
-            with turn._lock:
-                turn.asks[key] = (question, 8)
+            turn.ask(key, question, 8)
             return Decision(ASK, "tidy_ask", question=question, row=8, verb=verb, tidy=True, key=key)
     return Decision(ALLOW, "tidy", row=8, verb=verb, tidy=True)
 
@@ -886,9 +997,9 @@ def _emit(turn: Turn, event: str, **fields: Any) -> None:
         pass
 
 
-__all__ = ["ALLOW", "ASK", "Decision", "ENTER_KEYS", "KINDS", "LINE_ALREADY_SENT", "LINE_CHANNEL", "LINE_ERROR",
-           "LINE_GAME", "LINE_M9_ASK", "LINE_SEND_BY_CODE", "LINE_SHELL_LONG", "LINE_TIDY_ASK", "LINE_TIDY_OFF",
-           "LINE_TIDY_STEPS", "LINE_UNKNOWN", "ONE_LINES", "PRIVATE_VERBS", "REFUSE", "TIDY_STEPS",
-           "TYPED_WAIT_S", "Tidy", "Turn",
-           "authorize", "clear_typed", "gate", "mark_typed", "read_answer", "recheck_send", "send_key",
+__all__ = ["ALLOW", "ASK", "Decision", "ENTER_KEYS", "KINDS", "LINE_ALREADY_SENT", "LINE_CHANNEL", "LINE_CHAT_SEND",
+           "LINE_ERROR", "LINE_GAME", "LINE_M9_ASK", "LINE_SEND_BY_CODE", "LINE_SENT_AGAIN", "LINE_SHELL_LONG",
+           "LINE_TIDY_ASK", "LINE_TIDY_OFF", "LINE_TIDY_STEPS", "LINE_UNKNOWN", "ONE_LINES", "PRIVATE_VERBS", "REFUSE",
+           "TIDY_STEPS", "TYPED_WAIT_S", "Tidy", "Turn",
+           "adopt_typed", "authorize", "clear_typed", "gate", "mark_typed", "read_answer", "recheck_send", "send_key",
            "skill_grant", "step_identity", "typed_text"]

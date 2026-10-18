@@ -179,7 +179,20 @@ code picks their usual control. Fine with a game in front."""
 #: The skills the paragraphs name (``voice.hands.VOLUME_SKILL``, ``voice.mouth.MESSAGE_SKILL``).
 VOLUME_SKILL, MESSAGE_SKILL = "volume", "message"
 
-#: The always-on ceiling (design §3.1 ``ONE_CORE_CHARS``): the larger channel's core, tail and full tools paragraph.
+#: Pipecat's standing async-tool paragraph for the ONE voice agent (the driver sets ``ASYNC_TOOL_INSTRUCTIONS`` to it,
+#: as ``voice.pipeline.async_tool_instructions`` does for the talkers; the lean one's names hand_over, gone here). It
+#: reaches block 0 as the voice ``tail``.
+ONE_ASYNC_TOOL_INSTRUCTIONS = (
+    "ASYNC TOOLS:\n"
+    "Your acts and slow reads keep running after you reply: each result arrives later as a message, at a good "
+    "moment. Say what it needs once and never again in a later reply (a later \"okay\" or \"thanks\" is no cue)."
+)
+#: The room the voice ``tail`` (Pipecat's async paragraphs) has in block 0, counted in the ceiling; a longer tail is
+#: replaced by :data:`ONE_ASYNC_TOOL_INSTRUCTIONS` (:func:`voice_tail`).
+VOICE_TAIL_CHARS = 400
+
+#: The always-on ceiling (design §3.1 ``ONE_CORE_CHARS``): the larger channel's core, tail and full tools paragraph
+#: (voice: with the room for Pipecat's async tail, :data:`VOICE_TAIL_CHARS`).
 ONE_CORE_CHARS = 12_000
 
 
@@ -215,12 +228,26 @@ def core_text(channel: str, *, marker: bool = True, marks: bool = True) -> str:
 
 def always_on_chars(channel: str, *, skill_keys: Sequence[str] = (VOLUME_SKILL, MESSAGE_SKILL), marker: bool = True,
                     marks: bool = True) -> int:
-    """The channel's always-on prompt text in characters: :func:`core_text` and :func:`tools_paragraph`."""
-    return len(core_text(channel, marker=marker, marks=marks)) + len(tools_paragraph(skill_keys))
+    """The channel's always-on prompt text in characters: :func:`core_text` and :func:`tools_paragraph`, and on voice
+    the room for Pipecat's async tail (:data:`VOICE_TAIL_CHARS` and its separator), whatever the driver passes."""
+    size = len(core_text(channel, marker=marker, marks=marks)) + len(tools_paragraph(skill_keys))
+    return size + (2 + VOICE_TAIL_CHARS if channel == VOICE else 0)
+
+
+def voice_tail(tail: Sequence[str] | None) -> list[str]:
+    """The voice ``tail`` block 0 carries: the driver's parts as given while they fit :data:`VOICE_TAIL_CHARS`, else
+    :data:`ONE_ASYNC_TOOL_INSTRUCTIONS` alone (the ceiling counts that room, never more)."""
+    parts = [str(t) for t in (tail or []) if t and str(t).strip()]
+    if len("\n\n".join(parts)) <= VOICE_TAIL_CHARS:
+        return parts
+    return [ONE_ASYNC_TOOL_INSTRUCTIONS]
 
 
 def check_budget() -> int:
     """The ceiling, enforced at import: the larger channel's always-on text, every optional part in. Returns it."""
+    if len(ONE_ASYNC_TOOL_INSTRUCTIONS) > VOICE_TAIL_CHARS:
+        raise PromptBudgetError(f"the ONE async paragraph is {len(ONE_ASYNC_TOOL_INSTRUCTIONS)} chars, over its room "
+                                f"VOICE_TAIL_CHARS={VOICE_TAIL_CHARS}")
     size = max(always_on_chars(VOICE), always_on_chars(TYPED))
     if size > ONE_CORE_CHARS:
         raise PromptBudgetError(f"the ONE agent's always-on prompt is {size} chars, over its ceiling ONE_CORE_CHARS="
@@ -246,8 +273,7 @@ def voice_blocks(memory: Any, *, tail: list[str] | None = None, call: str | None
 
     blocks = mouth_system_blocks(memory, tail=tail, call=call, call_evidence=call_evidence,
                                  channel="marker" if marker else None, hands=True, marks=marks, talker="lean")
-    blocks[0] = {**blocks[0], "text": "\n\n".join([core_text(VOICE, marker=marker, marks=marks),
-                                                   *[t for t in (tail or []) if t and t.strip()]])}
+    blocks[0] = {**blocks[0], "text": "\n\n".join([core_text(VOICE, marker=marker, marks=marks), *voice_tail(tail)])}
     menu = str(getattr(memory, "skills", "") or "").strip()
     keys = menu_keys(menu)
     blocks[1] = {**blocks[1], "text": tools_paragraph(keys) + (f"\n\n{menu}" if keys else "")}
@@ -285,7 +311,7 @@ def system_blocks(memory: Any, channel: str, **kw: Any) -> list[dict[str, Any]]:
                         skill_keys=tuple(get("skill_keys", ()) or ()), **kw)
 
 
-__all__ = ["CORE_CHARS_NOW", "MESSAGE_SENTENCE", "ONE_CORE", "ONE_CORE_CHARS", "PromptBudgetError", "SKILLS_PARAGRAPH",
-           "TOOLS_PARAGRAPH", "TYPED", "TYPED_TAIL", "VOICE", "VOICE_MARKER", "VOICE_TAIL", "VOLUME_PARAGRAPH",
-           "always_on_chars", "check_budget", "core_text", "system_blocks", "tools_paragraph", "typed_blocks",
-           "voice_blocks"]
+__all__ = ["CORE_CHARS_NOW", "MESSAGE_SENTENCE", "ONE_ASYNC_TOOL_INSTRUCTIONS", "ONE_CORE", "ONE_CORE_CHARS",
+           "PromptBudgetError", "SKILLS_PARAGRAPH", "TOOLS_PARAGRAPH", "TYPED", "TYPED_TAIL", "VOICE", "VOICE_MARKER",
+           "VOICE_TAIL", "VOICE_TAIL_CHARS", "VOLUME_PARAGRAPH", "always_on_chars", "check_budget", "core_text",
+           "system_blocks", "tools_paragraph", "typed_blocks", "voice_blocks", "voice_tail"]
