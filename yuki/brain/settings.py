@@ -5,6 +5,10 @@ Read once per request (:meth:`BrainSettings.read`): effort is pinned per channel
 kBrain (18 Oct): the plan-first brain is THE brain. Its shipped mode is ``all`` (typed and spoken); ``loop`` stays only
 as the rollback value. The planner runs on :data:`PLANNER_MODEL` (Sonnet 5.5) unless ``brain_model`` names another;
 the tray's model switch (``Settings.model``) belongs to the old loop and no longer reaches the planner.
+
+Phase 4 (oTyped): the switch's values come from :mod:`yuki.one.modes` (``one`` beside ``all``); :class:`OneSettings`
+is the ONE agent's typed view (its model, typed thinking, who settles a clean act); its effort is this module's rule
+(:meth:`BrainSettings.effort_of`), and its budgets are :mod:`yuki.one.budget`'s (``one_typed_*`` overrides).
 """
 
 from __future__ import annotations
@@ -14,11 +18,10 @@ from dataclasses import dataclass
 from typing import Any, Collection, Mapping
 
 from yuki.config import EFFORT_LEVELS
-
-#: ``Settings.brain``: which requests the new brain takes (``loop`` is the rollback value only).
-BRAIN_MODES: tuple[str, ...] = ("loop", "typed", "all")
-#: The shipped mode: the brain takes typed requests and the voice's hand-overs.
-DEFAULT_MODE = "all"
+# phase 4: the one brain-mode helper is the only copy of the switch's values (``one`` among them; an unknown value
+# reads as ``all``, never the old thinker)
+from yuki.one.modes import BRAIN_MODES, DEFAULT_MODE
+from yuki.one.modes import normalize as _brain_mode
 #: The planner's model when ``brain_model`` is unset: Sonnet 5.5 (measured 18 Oct on this PC's Bedrock, ap-south-1:
 #: first token 0.77-0.92 s on an 8k-character system prompt, warm). Adaptive thinking at ``low`` effort skips thinking
 #: on simple asks and thinks on harder ones by itself.
@@ -88,7 +91,7 @@ class BrainSettings:
     """One request's view of the settings (the design's numbers as defaults).
 
     Attributes:
-        mode: ``Settings.brain`` (``loop`` | ``typed`` | ``all``; anything else reads as ``all``).
+        mode: ``Settings.brain`` (``all`` | ``one`` | ``loop`` | ``typed``; anything else reads as ``all``).
         model: The planner's model (``brain_model``, else :data:`PLANNER_MODEL`).
         effort_rule: How the effort is chosen (:data:`DEFAULT_EFFORT_RULE`, aBrain phase 2.5): ``auto`` (from the
             request's structure: :meth:`effort_of`), ``fixed`` (the two values below), or a level pinned for both.
@@ -148,9 +151,8 @@ class BrainSettings:
     @classmethod
     def read(cls, settings: Any) -> "BrainSettings":
         """The values in force now (``settings``: a :class:`yuki.config.Settings`, or anything with its fields)."""
-        mode = str(_get(settings, "brain", DEFAULT_MODE)).strip().lower()
         return cls(
-            mode=mode if mode in BRAIN_MODES else DEFAULT_MODE,
+            mode=_brain_mode(_get(settings, "brain", DEFAULT_MODE)),
             model=str(_get(settings, "brain_model", "") or PLANNER_MODEL),
             effort_rule=_effort_rule(settings),
             effort_voice=_effort(_get(settings, "brain_effort_voice", "low"), "low"),
@@ -202,5 +204,80 @@ class BrainSettings:
                 "answer_calls": self.answer_calls}
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase 4: the ONE agent (``brain = "one"``)
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: The ONE agent's model when ``one_model`` is unset: Sonnet 5.5 (the lean talker's and the planner's model today).
+ONE_MODEL = "global.anthropic.claude-sonnet-5-5"
+#: The models a ONE agent's failover chain ends with (Sonnet 5, either profile): the chain stops after the first of
+#: them, and no Haiku is ever in it (addendum must-fix 9: no Haiku driving acts). Model ids: data, not words.
+ONE_CHAIN_LAST: frozenset[str] = frozenset({"global.anthropic.claude-sonnet-5", "us.anthropic.claude-sonnet-5"})
+#: Typed thinking (``one_typed_thinking``): ``adaptive`` on every round at the typed effort (design 2.5 and 2.6:
+#: typed is adaptive medium on every round, today's typed effort under the ``auto`` rule), or ``fast`` (off).
+ONE_TYPED_THINKING: tuple[str, ...] = ("adaptive", "fast")
+#: Who ends a clean simple act (``one_settle``, addendum decision 2): ``code`` (shipped) or ``model``.
+ONE_SETTLE: tuple[str, ...] = ("code", "model")
+#: What one tool result may carry back to the typed agent (characters; design 3.1: memory and fetch reads up to 12,000
+#: typed). The runner caps its own results; the driver cuts anything longer at this.
+ONE_RESULT_CHARS = 12000
+
+
+def _choice(value: Any, choices: tuple[str, ...]) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in choices else choices[0]
+
+
+def one_chain(chain: Any, *, last: frozenset[str] = ONE_CHAIN_LAST) -> list[dict[str, Any]]:
+    """The ONE agent's failover chain from a model's configured one (``Settings.model_fallbacks[model]``): its
+    entries in order up to and including the first Sonnet 5 (:data:`ONE_CHAIN_LAST`), with any Haiku entry left out
+    (model ids only: data). Never raises; a chain it can't read is ``[]`` (the primary alone)."""
+    out: list[dict[str, Any]] = []
+    for entry in chain if isinstance(chain, (list, tuple)) else ():
+        model = str(entry.get("model") or "") if isinstance(entry, Mapping) else ""
+        if not model or "haiku" in model.casefold():
+            continue
+        out.append(dict(entry))
+        if model in last:
+            break
+    return out
+
+
+@dataclass(frozen=True)
+class OneSettings:
+    """One typed request's view of the ONE agent's settings (read once per request).
+
+    Attributes:
+        model: ``one_model`` (else :data:`ONE_MODEL`).
+        typed_thinking: :data:`ONE_TYPED_THINKING` (``one_typed_thinking``).
+        settle: :data:`ONE_SETTLE` (``one_settle``).
+        max_tokens: The output ceiling of one round (``one_max_tokens``, else the planner's ``brain_max_tokens``,
+            16,000: thinking included; streamed).
+        result_chars: :data:`ONE_RESULT_CHARS` (``one_result_chars``).
+    """
+
+    model: str = ONE_MODEL
+    typed_thinking: str = "adaptive"
+    settle: str = "code"
+    max_tokens: int = 16000
+    result_chars: int = ONE_RESULT_CHARS
+
+    @classmethod
+    def read(cls, settings: Any) -> "OneSettings":
+        return cls(
+            model=str(_get(settings, "one_model", "") or ONE_MODEL),
+            typed_thinking=_choice(_get(settings, "one_typed_thinking", ""), ONE_TYPED_THINKING),
+            settle=_choice(_get(settings, "one_settle", ""), ONE_SETTLE),
+            max_tokens=max(1024, int(_get(settings, "one_max_tokens", _get(settings, "brain_max_tokens", 16000)))),
+            result_chars=max(1000, int(_get(settings, "one_result_chars", ONE_RESULT_CHARS))),
+        )
+
+    def facts(self) -> dict[str, Any]:
+        """Content-free facts for the log."""
+        return {"model": self.model, "typed_thinking": self.typed_thinking, "settle": self.settle,
+                "max_tokens": self.max_tokens}
+
+
 __all__ = ["BRAIN_MODES", "DEFAULT_MODE", "PLANNER_MODEL", "BrainSettings", "EFFORT_RULES", "DEFAULT_EFFORT_RULE",
-           "EFFORT_THINK", "EFFORT_QUICK", "effort_for_request"]
+           "EFFORT_THINK", "EFFORT_QUICK", "effort_for_request", "ONE_CHAIN_LAST", "ONE_MODEL", "ONE_RESULT_CHARS",
+           "ONE_SETTLE", "ONE_TYPED_THINKING", "OneSettings", "one_chain"]
