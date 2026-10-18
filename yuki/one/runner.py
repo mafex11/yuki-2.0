@@ -158,6 +158,8 @@ class OneResult:
     def for_model(self) -> dict[str, Any]:
         """The tool result the agent reads (plain fields; ``said`` is already heard, never to be repeated)."""
         out: dict[str, Any] = {"status": STATUS_WORDS.get(self.status, self.status)}
+        if self.verified is not None:
+            out["verified"] = self.verified   # a read showed the effect (True) or showed it didn't take (False)
         if self.result:
             out["result"] = self.result
         if self.said:
@@ -775,9 +777,11 @@ class Runner:
             line = (done_line if done_line is not None else
                     (_words(given) if given is not None else self.verbs.code_line(name, resolved, facts)))
             said = self._say(line, say, state) if line else ""
-        result = OneResult(name, status, verified=verified, result=str(report or "")[:RESULT_CHARS], said=said,
-                           then=then, decision=decision, verb=verb, tidy=bool(getattr(decision, "tidy", False)))
-        if status not in CLEAN and status not in (NO_CHANGE, STARTING):
+        # a read's text was capped before its fence (a shell's output): never cut again, so the fence stays whole
+        text = str(report or "") if facts.get("read") else str(report or "")[:RESULT_CHARS]
+        result = OneResult(name, status, verified=verified, result=text, said=said, then=then, decision=decision,
+                           verb=verb, tidy=bool(getattr(decision, "tidy", False)))
+        if status not in CLEAN and status not in (NO_CHANGE, STARTING, READ):
             result.evidence = self._evidence(name, resolved, ok, status, report, facts, probe_note)
             result.owed = str(facts.get("say") or "") or OWED_LINES.get(
                 "blocked" if facts.get("refused") == "blocked" else status, "")
@@ -807,6 +811,8 @@ class Runner:
             return ASKED if facts.get("question") else REFUSED
         if facts.get("act_off"):
             return REFUSED
+        if ok and facts.get("read"):
+            return READ   # a command's effect is what it printed: the agent reads it
         if verified is True and ok:
             return DONE
         if ok and facts.get("expected"):
