@@ -1238,10 +1238,16 @@ class YukiUi(QObject):
         self.ui_log.event("send_stop", id=rid, how=how)
 
     def _on_send_swap(self, request_id: int, kind: str, value: str) -> None:
-        """A chip tapped on the send countdown: the running request sends to the new person or place instead."""
+        """A chip tapped on the send countdown: the running request sends to the new person or place instead. Phase 4
+        (oVoice review L4): a countdown no running request holds but the voice showed (a ONE voice send) takes the
+        chip there; under every other brain the voice has no such countdown and answers ``False``."""
+        rid = int(request_id)
         send = getattr(self.runtime, "send_choice", None)
-        ok = bool(send(int(request_id), str(kind), str(value))) if callable(send) else False
-        self.ui_log.event("send_swap", id=int(request_id), kind=kind, delivered=ok)
+        ok = bool(send(rid, str(kind), str(value))) if callable(send) else False
+        if not ok and self.voice.owns(rid):
+            choose = getattr(self.voice, "send_choice", None)
+            ok = bool(choose(rid, str(kind), str(value))) if callable(choose) else False
+        self.ui_log.event("send_swap", id=rid, kind=kind, delivered=ok)
 
     def _on_esc(self, _action: str) -> None:
         s = self.island.inputs.send

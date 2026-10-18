@@ -900,7 +900,8 @@ class Runner:
             if facts.get("refused") == "game" and status == REFUSED:
                 # a game in front held it (the verb's backstop, or the skill's own hold): said as it is, by code
                 result.final, result.line = True, _words(facts.get("say")) or policy.LINE_GAME
-                result.said, result.heard = self._speak(result.line, say, state)
+                if not late:   # oVoice review L6: nothing said after the hard stop's line (the result settles silent)
+                    result.said, result.heard = self._speak(result.line, say, state)
             if facts.get("held") and facts.get("question"):
                 result.status, result.question = ASKED, str(facts.get("question") or "")
         acted = facts.get("sent_at") is not None or status in (DONE, NOT_CONFIRMED, FAILED)

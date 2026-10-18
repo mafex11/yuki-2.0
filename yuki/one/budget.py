@@ -143,6 +143,7 @@ class TurnBudget:
         self.acts = 0
         self.reads = 0
         self.refusals = 0
+        #: Counted seconds (:meth:`elapsed`) at the turn's first act that did not take effect; the retry window's start.
         self.first_miss: float | None = None
         self.failed: set[str] = set()
         self.lasting_missed = False
@@ -261,7 +262,9 @@ class TurnBudget:
                 return Spend(False, "same_step", LINE_SAME_STEP)
             if lasting and self.lasting_missed:
                 return Spend(False, "lasting_retry", LINE_LASTING_RETRY)
-            if self.first_miss is not None and self._clock() - self.first_miss > self.limits.retry_s:
+            # oRun's note to oCore (phase 4 integration): the retry window runs on the counted clock, so a wait the
+            # budget excludes (an ask, the send countdown, a typed lease wait) does not run it down
+            if self.first_miss is not None and now_s - self.first_miss > self.limits.retry_s:
                 return Spend(False, "retry", LINE_RETRY_SPENT)
             self.acts += 1
             return OK
@@ -284,7 +287,7 @@ class TurnBudget:
             return
         with self._lock:
             if self.first_miss is None:
-                self.first_miss = self._clock()
+                self.first_miss = self._elapsed()   # counted seconds since round 1, as before_call reads it
             self.failed.add(step_key(name, args))
             if lasting:
                 self.lasting_missed = True

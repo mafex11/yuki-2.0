@@ -2725,8 +2725,15 @@ class _Hooks:
             return []   # Settings → AI moved the talker: its client retries there and uses only the user's backup
         s = self.c.settings
         model = getattr(self.c, "talker_model", None) or s.voice_mouth_model
-        return [dict(t) for t in (getattr(s, "model_fallbacks", None) or {}).get(model, [])
-                if isinstance(t, dict) and t.get("model")]
+        chain = [dict(t) for t in (getattr(s, "model_fallbacks", None) or {}).get(model, [])
+                 if isinstance(t, dict) and t.get("model")]
+        if getattr(self.c, "one", False):
+            # phase 4 (addendum must-fix 9, oTyped's note): the ONE agent acts, so its chain stops after Sonnet 5 and
+            # holds no Haiku (``brain.settings.one_chain``, as typed's ``one.host.one_client``)
+            from yuki.brain.settings import one_chain
+
+            return one_chain(chain)
+        return chain
 
     def sticky_index(self, size: int) -> int:
         index, until = getattr(self.c, "_failover_sticky", (0, 0.0))
