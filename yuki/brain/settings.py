@@ -218,14 +218,24 @@ ONE_CHAIN_LAST: frozenset[str] = frozenset({"global.anthropic.claude-sonnet-5", 
 ONE_TYPED_THINKING: tuple[str, ...] = ("adaptive", "fast")
 #: Who ends a clean simple act (``one_settle``, addendum decision 2): ``code`` (shipped) or ``model``.
 ONE_SETTLE: tuple[str, ...] = ("code", "model")
-#: What one tool result may carry back to the typed agent (characters; design 3.1: memory and fetch reads up to 12,000
-#: typed). The runner caps its own results; the driver cuts anything longer at this.
-ONE_RESULT_CHARS = 12000
+#: What one tool result may carry back to the typed agent (characters). The runner caps its own reads (design 3.1:
+#: memory, fetch and a shell's output up to 12,000 typed) before their fence; this leaves room for the fence and the
+#: result's other fields around a capped read, so a fence is never cut. The driver cuts anything longer at this.
+ONE_RESULT_CHARS = 14000
 
 
 def _choice(value: Any, choices: tuple[str, ...]) -> str:
     text = str(value or "").strip().lower()
     return text if text in choices else choices[0]
+
+
+def _whole(value: Any, default: int, least: int) -> int:
+    """A whole number setting: ``value`` when it reads as one (at least ``least``), else ``default`` (a bad value never
+    fails a request; ``one.budget.limits_for``'s rule)."""
+    try:
+        return max(least, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return max(least, int(default))
 
 
 def one_chain(chain: Any, *, last: frozenset[str] = ONE_CHAIN_LAST) -> list[dict[str, Any]]:
@@ -264,12 +274,14 @@ class OneSettings:
 
     @classmethod
     def read(cls, settings: Any) -> "OneSettings":
+        """The values in force now; a bad number reads as its default (never a failed request)."""
+        planner = _whole(_get(settings, "brain_max_tokens", 16000), 16000, 1024)
         return cls(
             model=str(_get(settings, "one_model", "") or ONE_MODEL),
             typed_thinking=_choice(_get(settings, "one_typed_thinking", ""), ONE_TYPED_THINKING),
             settle=_choice(_get(settings, "one_settle", ""), ONE_SETTLE),
-            max_tokens=max(1024, int(_get(settings, "one_max_tokens", _get(settings, "brain_max_tokens", 16000)))),
-            result_chars=max(1000, int(_get(settings, "one_result_chars", ONE_RESULT_CHARS))),
+            max_tokens=_whole(_get(settings, "one_max_tokens", planner), planner, 1024),
+            result_chars=_whole(_get(settings, "one_result_chars", ONE_RESULT_CHARS), ONE_RESULT_CHARS, 1000),
         )
 
     def facts(self) -> dict[str, Any]:

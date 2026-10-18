@@ -705,6 +705,11 @@ class Lane(QThread):
                                channel="voice" if voice else "typed", request_id=job.log_request_id or "",
                                origin_hwnd=job.origin_hwnd, plan_seed=seed, understanding=job.understanding,
                                late_understanding=lambda job_id=job.id: self._late_seed(job_id))
+            if getattr(agent, "one_agent", False):
+                # phase 4: a ONE agent hands a request over itself (``needed_hands`` at its first call that needs the
+                # worker); the front desk's tool list is the old loop's and names none of its tools, so it is not read
+                # here (else an answered request would run again on the worker); the blocked backend still is
+                allowed = None
             return self._relay(job, agent, events, allowed, refused)
         events = self.agent.run(
             job.request, origin_hwnd=job.origin_hwnd, effort=effort if voice else None,

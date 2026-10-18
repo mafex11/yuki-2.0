@@ -17,21 +17,18 @@ thinker:
 * **The model chain**: Sonnet 5.5 with its failover chain cut after Sonnet 5 (:func:`one_client`; addendum must-fix 9:
   no Haiku drives an act). The commit check and the answer read keep their own Haiku chains (the same client: only the
   ONE model's chain is replaced, on this client alone).
-* **The runner** (:func:`make_runner`): ``yuki.one.runner`` (lane oRun), imported guardedly. Until it is merged (or if
-  it can't be made) a reads-only stand-in (:class:`ReadsRunner`) runs ``look`` / ``memory`` / ``fetch`` /
-  ``remember`` through ``yuki.brain.tools`` behind the same gate, and refuses every act plainly.
-* **A job that can't be built fails with a plain line** (:class:`Unbuilt`): never a fallback to another brain, and
-  never a host without ``run()``.
+* **The runner** (:func:`make_runner`): ``yuki.one.runner.Runner`` (lane oRun) over the lane's own
+  ``voice.hands.Hands`` (``Verbs``), made with the agent (:func:`build_agent`): every call of the agent goes through
+  it, so through the one gate at the verbs' authorizer points.
+* **A job that can't be built fails with a plain line** (:class:`Unbuilt`): a runner that can't be made included;
+  never a fallback to reads only or to another brain, and never a host without ``run()``.
 
 Nothing here imports Qt or the runtime (the runtime passes its blocked backend in), and nothing runs at import.
 """
 
 from __future__ import annotations
 
-import inspect
 import threading
-import time
-from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from yuki.one import tools as T
@@ -42,13 +39,9 @@ WORKER_ONLY: frozenset[str] = frozenset({"remember", "ask_user"})
 #: Typed-only tools that a spoken request on a lane is never offered (addendum decision 5: shell, fetch and keys stay
 #: off voice; the gate refuses them on the voice channel too).
 TYPED_ONLY_ACTS: frozenset[str] = frozenset({"keys", "shell", "fetch"})
-#: The line a job ends with when the ONE agent could not be made for its lane (a plain line, no fallback brain).
+#: The line a job ends with when the ONE agent (or its runner) could not be made for its lane (a plain line, no
+#: fallback brain).
 LINE_UNBUILT = "I couldn't start on that just now, so nothing was done. Please try again in a minute."
-#: The runner stand-in's refusal of an act (until ``yuki.one.runner`` is merged).
-LINE_NO_RUNNER = ("Not done: this build of Yuki can't act on the screen yet (its runner is missing), so nothing was "
-                  "done. Say so in one line.")
-#: The stand-in's answer to a read it does not run (``quick_memory``: the memory tool reads the same).
-LINE_NOT_IN_BUILD = "Not run: {tool} is not in this build; use memory instead."
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -105,125 +98,47 @@ def one_client(settings: Any, *, log: Callable[..., Any] | None = None, factory:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The runner (lane oRun), guarded
+# The runner (lane oRun)
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-@dataclass
-class Result:
-    """A runner result in the shape the typed driver reads (``yuki.one.runner.OneResult``'s fields, design 6: status,
-    said, evidence, after, flags, verified; plus ``text``, the result for the model, ``ok``, ``question`` for a gate's
-    ask, ``settle`` / ``silent`` / ``line`` for a code settle, ``payload`` for the UI's step words)."""
+class _HandsLog:
+    """The hands' log (``Hands.log.event(...)``, the voice log's shape) onto the lane's session log (content-free, as
+    the hands' own events are)."""
 
-    status: str
-    said: str = ""
-    evidence: str = ""
-    after: str = ""
-    flags: tuple[str, ...] = ()
-    verified: bool = False
-    text: str = ""
-    ok: bool = True
-    question: str = ""
-    settle: bool = False
-    silent: bool = False
-    line: str = ""
-    acted: bool = False
-    payload: Any = None
-
-
-class ReadsRunner:
-    """The runner stand-in until ``yuki.one.runner`` is merged (or when it can't be made): an act is refused at once
-    with :data:`LINE_NO_RUNNER` (nothing done, no commit check spent); every other call passes the gate
-    (``policy.gate``: the budget, unknown tools, the channel, M9), then ``look``, ``memory``, ``fetch`` and
-    ``remember`` run through ``yuki.brain.tools`` (fenced reads, the user's own words for memory's quote checks).
-    Content-free log line per call."""
-
-    kind = "reads_only"
-
-    def __init__(self, *, dispatcher: Any, memory: Any, log: Callable[..., Any] | None = None,
-                 menu: Callable[[], str] | None = None) -> None:
-        self.dispatcher = dispatcher
-        self.memory = memory
+    def __init__(self, log: Callable[..., Any] | None) -> None:
         self._log = log
-        self._menu = menu
 
-    def run(self, name: str, args: Mapping[str, Any], turn: Any, speak: Callable[[str], None] | None = None
-            ) -> Result:
-        from yuki.one import policy
-
-        started = time.perf_counter()
-        spec = T.spec_of(name)
-        if spec is not None and spec.acts:
-            # nothing can act without the runner: refused before the gate, so no commit check is spent on it
-            return self._done(Result("refused", ok=False, text=LINE_NO_RUNNER), name, started)
-        decision = policy.gate(name, args, {}, turn)
-        if decision.kind == policy.ASK:
-            return self._done(Result("ask", question=decision.question, ok=False, text=decision.question), name,
-                              started)
-        if not decision.allowed:
-            if decision.final and decision.line and speak is not None:
-                speak(decision.line)
-            return self._done(Result("refused", ok=False, text=decision.line or "Not done.", settle=decision.settle,
-                                     silent=decision.silent, line=decision.line), name, started)
-        run = self._read(name, dict(args or {}), turn)
-        if run is None:
-            return self._done(Result("refused", ok=False, text=LINE_NOT_IN_BUILD.format(tool=name)), name, started)
-        if getattr(run, "private", False):
-            turn.note_read("memory" if name == "memory" else "file")
-        return self._done(Result("ok" if run.ok else "failed", ok=bool(run.ok), text=str(run.text or ""),
-                                 payload=getattr(run, "payload", None)), name, started)
-
-    def _read(self, name: str, args: dict[str, Any], turn: Any) -> Any:
-        from yuki.agent.untrusted import new_nonce
-        from yuki.brain import tools as BT
-
-        words = "\n".join(getattr(turn, "words", []) or [])
-        nonce = new_nonce()
-        if name == "look":
-            return BT.run_look(self.dispatcher, args, nonce=nonce)
-        if name == "memory":
-            menu = self._menu() if callable(self._menu) else ""
-            return BT.run_memory(self.memory, args, words=words, nonce=nonce, menu=menu)
-        if name == "fetch":
-            return BT.run_fetch(self.dispatcher, args, nonce=nonce)
-        if name == "remember":
-            return BT.run_remember(self.memory, args, words=words)
-        return None
-
-    def _done(self, result: Result, name: str, started: float) -> Result:
-        if self._log is not None:
+    def event(self, event: str, **fields: Any) -> None:
+        if callable(self._log):
             try:
-                self._log("one_run", tool=name, status=result.status, runner=self.kind,
-                          ms=round((time.perf_counter() - started) * 1000, 1), chars=len(result.text))
-            except Exception:  # noqa: BLE001 - a log never breaks a call
+                self._log(event, **fields)
+            except Exception:  # noqa: BLE001 - a log never breaks a hand
                 pass
-        return result
 
 
-def _accepted(fn: Callable[..., Any], offer: Mapping[str, Any]) -> dict[str, Any]:
-    """The part of ``offer`` that ``fn`` (a function or a class) takes by keyword: everything when it takes
-    ``**kwargs``. Raises ``TypeError`` when a required parameter is not offered."""
-    sig = inspect.signature(fn)
-    params = sig.parameters
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return dict(offer)
-    out = {k: v for k, v in offer.items() if k in params}
-    for p in params.values():
-        if p.name in ("self", "cls") or p.kind in (inspect.Parameter.VAR_POSITIONAL,):
-            continue
-        if p.default is inspect.Parameter.empty and p.name not in out:
-            raise TypeError(f"the runner needs {p.name!r}, which the typed lane does not offer")
-    return out
+#: The hooks the lane's agent set on its own Dispatcher (``Brain._setup_input_gate``) that the lane's hands share on
+#: theirs: the wait for the user to stop typing before global input (typed requests have it under ``all``), the lines
+#: it wants said, and the cancel check it polls (Stop reaches an act still waiting).
+SHARED_HOOKS: tuple[str, ...] = ("input_gate", "notices", "cancel_check")
 
 
 def make_runner(agent: Any) -> Any:
-    """The runner for one ONE agent (one per lane, long-lived; the turn and ``speak`` come with each call). Built from
-    ``yuki.one.runner`` (lane oRun) when it is importable: its ``make_runner``, else its ``Runner``, given by keyword
-    what it takes of the lane's offer (``dispatcher``, ``settings``, ``memory``, ``log``, ``logger``, ``lane``,
-    ``channel`` = ``typed``, ``countdown``: the lane's one countdown host, ``client``: the agent's failover client
-    (the ONE chain; the commit check runs on its default Claude path), ``hands``: whether the lane acts, ``agent``: the
-    :class:`yuki.one.loop.OneAgent` itself). Otherwise, or when it can't be made, :class:`ReadsRunner`. Logged once
-    (content-free)."""
+    """The runner of one ONE agent (one per lane, long-lived; the turn and ``speak`` come with each call):
+    ``yuki.one.runner.Runner`` (lane oRun) over the lane's own hands, as its contract gives a typed driver:
+
+    * ``Hands(with_app_volume(backend))`` over the lane's backend (the worker's real desktop; the front desk's
+      hands-blocked one: it only looks, and hands the request over before any act), their log the lane's session log,
+      their memory and the skill engine's the agent's, the skill settings the agent's, their words the request's
+      (``hands.words`` / ``exchange``: the gate's ``Turn.words`` as they are now), their user turn the request's
+      number;
+    * the agent's Dispatcher hooks (:data:`SHARED_HOOKS`) shared with the hands' own Dispatcher;
+    * ``Runner(Verbs(hands), channel="typed", settings, countdown = the lane's one countdown host, memory, log)``. Its
+      reads go through the hands' own Dispatcher (no ``dispatcher=``), so a control's ``[id]`` from ``look window`` is
+      the one ``click`` / ``type`` find (``Verbs.element_facts`` reads that same Dispatcher's latest read).
+
+    Raises when it can't be made (``yuki.one.runner`` missing, a contract that changed): the lane then fails its jobs
+    with a plain line (:class:`Unbuilt`), never on reads only or on another brain. Logged once (content-free)."""
     log = getattr(getattr(agent, "logger", None), "log", None)
 
     def note(**fields: Any) -> None:
@@ -233,29 +148,62 @@ def make_runner(agent: Any) -> Any:
             except Exception:  # noqa: BLE001
                 pass
 
-    offer = {"dispatcher": agent.dispatcher, "settings": agent.settings, "memory": agent.memory, "log": log,
-             "logger": getattr(agent, "logger", None), "lane": getattr(agent, "lane", ""), "channel": T.TYPED,
-             "countdown": getattr(agent, "one_countdown", None), "client": agent.client,
-             "hands": bool(getattr(agent, "hands", True)), "agent": agent}
     try:
-        from yuki.one import runner as mod   # lane oRun; guarded until it is merged
-    except Exception as exc:  # noqa: BLE001 - not merged yet, or broken: reads only
-        note(state="reads_only", why=type(exc).__name__)
-        return ReadsRunner(dispatcher=agent.dispatcher, memory=agent.memory, log=log,
-                           menu=lambda: getattr(agent, "_menu_lines", ""))
-    for factory_name in ("make_runner", "Runner"):
-        factory = getattr(mod, factory_name, None)
-        if not callable(factory):
-            continue
+        from yuki.one.runner import Runner   # lane oRun
+        from yuki.voice.hands import Hands, Verbs, with_app_volume
+
+        dispatcher = agent.dispatcher
+        backend = getattr(dispatcher, "backend", None)
+        if backend is None:
+            raise RuntimeError("the lane's dispatcher has no backend")
+        hands = Hands(with_app_volume(backend), log=_HandsLog(log))
+        hands.memory = hands.skill_memory = agent.memory
+        hands.skill_settings = agent.settings
+        hands.words = lambda: list(getattr(getattr(agent, "_turn", None), "words", None) or [])
+        hands.exchange = hands.words
+        hands.user_turn = lambda: getattr(agent, "_requests", 0)
+        own = getattr(hands, "_dispatcher", None)
+        for hook in SHARED_HOOKS:
+            value = getattr(dispatcher, hook, None)
+            if own is not None and value is not None and getattr(own, hook, None) is None:
+                setattr(own, hook, value)
+        runner = Runner(Verbs(hands), channel=T.TYPED, settings=agent.settings,
+                        countdown=getattr(agent, "one_countdown", None), memory=agent.memory, log=log)
+    except Exception as exc:
+        note(state="unbuilt", why=type(exc).__name__)
+        raise
+    note(state="ready", kind=type(runner).__name__, hands=bool(getattr(agent, "hands", True)))
+    return runner
+
+
+def hands_of(runner: Any) -> Any:
+    """The lane's hands behind ``runner`` (``runner.verbs.hands``), else ``None`` (a fake in checks)."""
+    return getattr(getattr(runner, "verbs", None), "hands", None)
+
+
+def ready_for_request(runner: Any, *, skill_keys: Sequence[str] = (), menu: str = "") -> None:
+    """At a request's start: the runner's Skills menu text (``memory`` kind ``skills``) and the hands' Skills keys
+    (``run_skill``'s skill path is on with a menu, as on the voice) are this request's. Never raises."""
+    try:
+        if hasattr(runner, "menu"):
+            runner.menu = str(menu or "")
+        hands = hands_of(runner)
+        if hands is not None:
+            hands.skill_keys = tuple(str(k) for k in skill_keys or () if str(k or "").strip())
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def fresh_desk(runner: Any) -> None:
+    """Right before an act: the hands' summary of the desk (``Verbs.desk``: the last one while it is fresh and nothing
+    was done since, else read now, a few ms), so the verbs act on the windows the agent was shown (they refuse a window
+    they were never shown). Never raises."""
+    desk = getattr(getattr(runner, "verbs", None), "desk", None)
+    if callable(desk):
         try:
-            runner = factory(**_accepted(factory, offer))
-        except Exception as exc:  # noqa: BLE001 - can't be made: reads only, said in the log
-            note(state="reads_only", why=type(exc).__name__, via=factory_name)
-            break
-        note(state="ready", via=factory_name, kind=type(runner).__name__)
-        return runner
-    return ReadsRunner(dispatcher=agent.dispatcher, memory=agent.memory, log=log,
-                       menu=lambda: getattr(agent, "_menu_lines", ""))
+            desk()
+        except Exception:  # noqa: BLE001 - the verbs say plainly what they can't find
+            pass
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -269,8 +217,9 @@ def build_agent(*, lane: str, settings: Any, logger: Any = None, memory: Any = N
     """The ONE agent of one lane (:class:`yuki.one.loop.OneAgent`). ``dispatcher``: the front desk's Dispatcher on the
     hands-blocked backend (``None`` on the worker: the agent makes its own on the real desktop, as the plan brain
     does). ``loop_agent``: the lane's ``loop.Agent`` (``all``'s host, untouched): its session log is the lane's, and
-    the worker takes its send countdown, takeover watch and ``takeover_ok`` (as ``Lane._make_brain`` does). Raises on
-    a build failure: the runtime then fails the job with :data:`LINE_UNBUILT` (:class:`Unbuilt`)."""
+    the worker takes its send countdown, takeover watch and ``takeover_ok`` (as ``Lane._make_brain`` does). Its runner
+    is made here (:func:`make_runner`), so a runner that can't be made is a build failure. Raises on a build failure:
+    the runtime then fails the job with :data:`LINE_UNBUILT` (:class:`Unbuilt`)."""
     from yuki.one.loop import OneAgent
 
     agent = OneAgent(settings, logger if logger is not None else getattr(loop_agent, "logger", None), client=client,
@@ -279,6 +228,7 @@ def build_agent(*, lane: str, settings: Any, logger: Any = None, memory: Any = N
         agent.send_countdown_s = float(getattr(loop_agent, "send_countdown_s", 0.0) or 0.0)
         agent.takeover = getattr(loop_agent, "takeover", None)
         agent.takeover_ok = getattr(loop_agent, "takeover_ok", None)
+    agent.runner()   # raises when it can't be made: the job fails plainly, never on reads only
     return agent
 
 
@@ -290,6 +240,8 @@ class Unbuilt:
 
     hands = False
     needed_hands = False
+    #: A ONE lane's agent (the runtime reads it: no front-desk tool list applies, the agent hands over itself).
+    one_agent = True
     paused = False
     awaiting_answer = False
     last_summary: dict[str, Any] | None = None
@@ -355,5 +307,5 @@ class Unbuilt:
         return None
 
 
-__all__ = ["LINE_NOT_IN_BUILD", "LINE_NO_RUNNER", "LINE_UNBUILT", "ReadsRunner", "Result", "TYPED_ONLY_ACTS", "Unbuilt", "WORKER_ONLY",
-           "build_agent", "lane_tools", "make_runner", "needs_worker", "one_client"]
+__all__ = ["LINE_UNBUILT", "SHARED_HOOKS", "TYPED_ONLY_ACTS", "Unbuilt", "WORKER_ONLY", "build_agent", "fresh_desk",
+           "hands_of", "lane_tools", "make_runner", "needs_worker", "one_client", "ready_for_request"]

@@ -21,13 +21,17 @@ One request:
    and lease waits not counted); spent: code ends the request with its line and no model call. One streamed call
    (adaptive thinking at the typed effort, ``one_typed_thinking``; the failover chain stops after Sonnet 5): a reply
    with no call ends the request with the model's words; a reply's calls run **in order**, each through the runner
-   (``one.runner``, lane oRun: budget -> gate -> desk -> act -> desk -> diff -> result), so every act passes the one
-   policy gate. A gate's question is asked here (``AskUser``), the yes read by the check model and recorded as a code
-   fact (``Turn.answer``), and the same call goes to the gate again (a yes allows it once).
-4. **Who ends it.** The model, by replying with no call. Code ends a clean simple act as today (addendum decision 2,
-   must-fix 2; ``one_settle = "code"``): every call of the reply acted and verified, nothing flagged, every ``then``
-   empty: code's verified line is the reply, no closing call. A settle by the gate or the budget (the second refusal,
-   the hard stop, the rounds) ends it with code's line (rule #149).
+   (``yuki.one.runner.Runner``, lane oRun: budget -> gate -> desk -> act -> desk -> diff -> result), so every call
+   passes the one policy gate (fail closed on an unknown tool). The model reads each call's ``OneResult.for_model()``
+   as plain lines (:func:`model_text`). A gate's question (status ``asked``) is asked here (``AskUser``), the yes read
+   by the check model and recorded as a code fact (``Runner.answer``), and the same call goes to the gate again (a yes
+   allows it once); a skill's own question goes to the model with their answer. The tools the drivers run themselves
+   (status ``driver``: ``ask_user``, ``quick_memory``) run here once the gate allowed them. A reply cut at its output
+   ceiling is never kept: it is asked again once with more room (``Brain._after_cutoff``'s rule).
+4. **Who ends it.** The model, by replying with no call. Code ends a clean reply as today (addendum decision 2,
+   must-fix 2; ``one_settle = "code"``) by the runner's one settle rule (``yuki.one.runner.settles``: every call took,
+   nothing flagged, every ``then`` empty): code's verified line is the reply, no closing call. A settle by the gate or
+   the budget (the second refusal, the hard stop, the rounds) ends it with code's line (rule #149).
 5. **The front desk** (``hands`` false) only looks: the first call that needs the worker (an act, ``remember``,
    ``ask_user``) ends its run with ``LINE_NEEDS_HANDS`` and ``needed_hands`` (the runtime hands the request to the
    worker, as before).
@@ -39,8 +43,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, replace
-from types import SimpleNamespace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Sequence
 
 from yuki.brain.agent import (
@@ -52,6 +55,7 @@ from yuki.brain.agent import (
     LINE_NEEDS_HANDS,
     LINE_NO_REPLY,
     LINE_REFUSAL,
+    LINE_STUCK,
     STEP_WORDS,
     WARM_AFTER_S,
     WARM_TEXT,
@@ -74,14 +78,14 @@ from yuki.brain.context import (
 )
 from yuki.brain.planner import CallCancelled
 from yuki.brain.settings import BrainSettings, OneSettings
-from yuki.log.events import Final, Partial, Say, Thinking, ToolCall, ToolResult
+from yuki.log.events import ErrorEvent, Final, Partial, Say, Thinking, ToolCall, ToolResult
 from yuki.log.requests import usage_tokens
 from yuki.one import budget as B
 from yuki.one import policy as P
 from yuki.one import prompt as PR
 from yuki.one import tools as T
 from yuki.one.countdown import Countdown
-from yuki.one.host import lane_tools, needs_worker
+from yuki.one.host import LINE_UNBUILT, fresh_desk, lane_tools, needs_worker, ready_for_request
 
 #: Code's line for a verified act that said nothing of its own (the runner's ``said`` was empty).
 LINE_DONE = "Done."
@@ -94,19 +98,27 @@ BAD_INPUT_TEXT = "Not run: its input was cut off. Send the call again, shorter."
 LINE_NOT_RUN = "Not run: the request is over; nothing was done."
 #: Their reply to a gate's question was not a yes: that step is not done (the model decides what is left).
 LINE_NOT_YES = "Their reply was not a yes, so it was not done. Leave it, unless their words ask for something else."
-#: The status words of a result that did not act (the runner's or the stand-in's), for the outcome's facts.
-NOT_ACTED: frozenset[str] = frozenset({"refused", "ask", "closed", "not_run", "cancelled", "changed", "declined"})
-#: Result statuses sent back as errors (``is_error``): nothing was done, or it failed.
-FAILED: frozenset[str] = frozenset({"refused", "failed", "error", "closed", "not_run", "cancelled"})
+#: A tool the runner gave back for its driver to run that this driver does not run (another channel's control).
+LINE_NOT_DRIVEN = "Not run: {tool} is not a tool here; nothing was done."
+#: A runner that broke on a call (it never should: it fails closed itself).
+LINE_RUNNER_BROKE = "Not done: Yuki's runner failed on that call; nothing more is known."
+# The runner's status words (``yuki.one.runner``, lane oRun: code words; the agent reads them in plain words).
+ASKED, DRIVER = "asked", "driver"
+#: Statuses after which something was done on the PC for the call, or it was found already so: the request's acts.
+RAN: frozenset[str] = frozenset({"done", "already", "no_change", "not_confirmed", "failed", "starting"})
+#: Statuses of an act that took (the request's level), unless a read showed it didn't (``verified`` False).
+TOOK: frozenset[str] = frozenset({"done", "already"})
+#: Statuses sent back as errors (``is_error``): nothing was done for it, or it failed.
+NOT_OK: frozenset[str] = frozenset({"refused", "asked", "failed", "busy", "not_done", "declined", "error"})
+#: The labels of a result's fields the model reads (``OneResult.for_model``; the prompt calls the act's diff "After").
+FIELD_LABELS: dict[str, str] = {"after": "After", "said": "said by code (already shown to them)"}
 #: The fewest seconds between two ``Partial`` updates of the same kind (``planner.PARTIAL_GAP_S``).
 PARTIAL_GAP_S = 0.12
 #: The no-menu line of the ONE agent (``brain.prompt.NO_MENU`` speaks of the planner's routes).
 NO_SKILLS = "Skills: none are loaded just now."
-#: A round cut at its output ceiling is asked again once, with more room (``brain.agent.MAX_CUTOFFS``).
+#: A round cut at its output ceiling is asked again once, with more room (``brain.agent.MAX_CUTOFFS``); the cut reply
+#: is never kept (a thinking block cut short has no signature, a call cut short no whole input).
 MAX_CUTOFFS = 1
-CUTOFF_TEXT = f"{CHECK_LABEL} Your reply was cut off at its length limit; nothing of it was sent. Go on, more briefly."
-#: A complete call in a reply that was cut off: not run either (the reply as a whole is asked again).
-CUT_CALL_TEXT = "Not run: the reply was cut off before it ended. Send the call again."
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -161,77 +173,95 @@ def reply_uses(content: Sequence[Any], stop_reason: str | None) -> list[Use]:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _as_result(r: Any) -> Any:
-    return SimpleNamespace(**r) if isinstance(r, Mapping) else r
+def model_text(fields: Mapping[str, Any]) -> str:
+    """A result's fields as plain lines for the model (``OneResult.for_model()``, a driver's report): ``label: value``
+    in their order, a value of several lines under its label (a fenced read stays whole), a flag as yes / no, a list
+    joined, a mapping (a chip they tapped) as ``key: value`` pairs; an empty field, or one that repeats an earlier one
+    word for word (a refusal's line is its result too), left out."""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for key, value in dict(fields or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            value = "yes" if value else "no"
+        elif isinstance(value, Mapping):
+            value = "; ".join(f"{k}: {v}" for k, v in value.items())
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            value = ", ".join(str(v) for v in value)
+        text = str(value).strip()
+        if not text or (len(text) > 3 and text in seen):
+            continue
+        seen.add(text)
+        label = FIELD_LABELS.get(str(key), str(key).replace("_", " "))
+        lines.append(f"{label}:\n{text}" if "\n" in text else f"{label}: {text}")
+    return "\n".join(lines) or "ok"
 
 
-def _field(r: Any, name: str, default: Any = None) -> Any:
+@dataclass
+class Got:
+    """One call's result as the driver reads it: the tool result's text for the model, whether it goes back as an error
+    (``ok`` false), and the request's facts from code: ``ran`` (something was done on the PC for it, or it was found
+    already so), ``took`` (done or already so, not read back as failed), ``failed``, a settle (``settle``, ``silent``,
+    ``line``), the evidence of a non-success (plain text), a send's state for the outcome (``send``: ``confirmed`` /
+    ``unconfirmed``), the UI's payload of a read. ``one``: the runner's own result (``OneResult``; the settle rule
+    reads it), ``None`` for a result the driver made itself."""
+
+    status: str
+    text: str
+    ok: bool
+    ran: bool = False
+    took: bool = False
+    failed: bool = False
+    settle: bool = False
+    silent: bool = False
+    line: str = ""
+    evidence: str = ""
+    send: str | None = None
+    payload: Any = None
+    one: Any = None
+
+
+def read_result(r: Any, limit: int) -> Got:
+    """The runner's ``OneResult`` (lane oRun) as the driver reads it: the model's text is its ``for_model()`` in plain
+    lines (:func:`model_text`), cut at ``limit``; ``ok`` / ``ran`` / ``took`` from its status, ``refused`` and
+    ``verified`` (never from a field it lacks: a result that says nothing ran nothing). A :class:`Got` is returned as
+    it is."""
+    if isinstance(r, Got):
+        return r
+    status = str(getattr(r, "status", "") or "").strip().lower() or "error"
+    for_model = getattr(r, "for_model", None)
     try:
-        value = getattr(r, name, default)
+        fields = for_model() if callable(for_model) else {"status": status}
+    except Exception:  # noqa: BLE001 - its fields can't be read: its status alone
+        fields = {"status": status}
+    verified = getattr(r, "verified", None)
+    refused = bool(getattr(r, "refused", False)) or status in ("refused", ASKED)
+    ran = status in RAN
+    took = ran and status in TOOK and verified is not False
+    send = None
+    if str(getattr(r, "countdown", "") or "") == "sent":
+        send = "confirmed" if status == "done" and verified is True else "unconfirmed"
+    return Got(status, clip(model_text(fields), limit), ok=not refused and status not in NOT_OK and verified is not False,
+               ran=ran, took=took, failed=ran and (status == "failed" or verified is False),
+               settle=bool(getattr(r, "settle", False)), silent=bool(getattr(r, "silent", False)),
+               line=" ".join(str(getattr(r, "line", "") or "").split()),
+               evidence="" if took else str(fields.get("evidence") or "") if isinstance(fields, Mapping) else "",
+               send=send, payload=getattr(r, "payload", None) if status == "read" else None, one=r)
+
+
+def runner_settles(results: Sequence[Any]) -> bool:
+    """The runner's one settle rule over one reply's results (``yuki.one.runner.settles``, addendum must-fix 2: every
+    call took, nothing flagged, every ``then`` empty; a forced settle is the driver's own path). ``False`` when it
+    can't be read: the model then has its round (never a settle on a guess)."""
+    if not results:
+        return False
+    try:
+        from yuki.one.runner import settles   # lane oRun
+
+        return bool(settles(list(results)))
     except Exception:  # noqa: BLE001
-        return default
-    return default if value is None else value
-
-
-def result_status(r: Any) -> str:
-    return str(_field(r, "status", "") or "").strip().lower()
-
-
-def result_ok(r: Any) -> bool:
-    """Whether a runner result goes back as a success (``ok`` when it says, else by its status)."""
-    ok = _field(r, "ok", None)
-    if isinstance(ok, bool):
-        return ok
-    return result_status(r) not in FAILED
-
-
-def result_acted(r: Any) -> bool:
-    """Whether the call did something on the PC (``acted`` when the result says, else its status is not one of
-    :data:`NOT_ACTED`)."""
-    acted = _field(r, "acted", None)
-    if isinstance(acted, bool):
-        return acted
-    return result_status(r) not in NOT_ACTED and bool(_field(r, "verified", False) or result_ok(r))
-
-
-def result_flagged(r: Any) -> bool:
-    """Whether the act's diff came back flagged (``flags``: the names of the flags set, or a mapping of them)."""
-    flags = _field(r, "flags", ())
-    if isinstance(flags, Mapping):
-        return any(bool(v) for v in flags.values())
-    if isinstance(flags, (list, tuple, set, frozenset)):
-        return any(bool(f) for f in flags)
-    return bool(flags)
-
-
-def result_text(r: Any, limit: int) -> str:
-    """The tool result the model reads: the runner's own ``text`` when it gives one (a method or a string), else its
-    fields in order (status, what code said, the evidence, the After diff, the flags, a line), cut at ``limit``."""
-    text = _field(r, "text", "")
-    if callable(text):
-        try:
-            text = text()
-        except Exception:  # noqa: BLE001
-            text = ""
-    if isinstance(text, str) and text.strip():
-        return clip(text, limit)
-    parts: list[str] = []
-    status = result_status(r)
-    if status:
-        parts.append(f"status: {status}")
-    said = str(_field(r, "said", "") or "").strip()
-    if said:
-        parts.append(f"code already told them: {said}")
-    for name, label in (("evidence", ""), ("after", "After: "), ("line", "")):
-        value = str(_field(r, name, "") or "").strip()
-        if value and value != said:
-            parts.append(f"{label}{value}")
-    flags = _field(r, "flags", ()) or ()
-    if isinstance(flags, Mapping):
-        flags = [k for k, v in flags.items() if v]
-    if isinstance(flags, (list, tuple, set, frozenset)) and flags:
-        parts.append("flags: " + ", ".join(str(f) for f in flags))
-    return clip("\n".join(parts) or "ok", limit)
+        return False
 
 
 def typed_menu(menu_lines: str) -> tuple[str, list[str]]:
@@ -252,20 +282,15 @@ def typed_menu(menu_lines: str) -> tuple[str, list[str]]:
 
 @dataclass
 class _ReplyFacts:
-    """What one reply's calls came to (the settle rule's facts, addendum must-fix 2)."""
+    """What one reply's calls came to. ``results``: the runner's own results (the settle rule reads them:
+    ``yuki.one.runner.settles``); ``own``: calls the driver answered itself (a cut input, an ask, ``ask_user``,
+    ``quick_memory``, a call not run): a reply with one never ends in code. ``settle``: code's line when the gate or
+    the budget ended the request (``""``: silent)."""
 
-    acts: int = 0
-    other: int = 0
-    unverified: int = 0
-    flagged: bool = False
-    then_left: bool = False
+    results: list[Any] = field(default_factory=list)
+    own: int = 0
     settle: str | None = None
     handoff: bool = False
-
-    @property
-    def clean(self) -> bool:
-        """Every call of the reply acted and verified, nothing flagged, every ``then`` empty."""
-        return self.acts > 0 and not self.other and not self.unverified and not self.flagged and not self.then_left
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -282,6 +307,9 @@ class OneAgent(Brain):
         runner: The runner (a fake in checks); ``None``: ``runner_factory(self)`` on first use.
         runner_factory: Builds the runner for this agent (``yuki.one.host.make_runner`` by default).
     """
+
+    #: A ONE lane's agent (the runtime reads it: no front-desk tool list applies; the agent hands over itself).
+    one_agent = True
 
     def __init__(self, settings: Any = None, logger: Any = None, *, client: Any = None, backend: Any = None,
                  dispatcher: Any = None, memory: Any = None, lane: str = "worker", record_requests: bool = True,
@@ -306,9 +334,13 @@ class OneAgent(Brain):
         self._lines_lock = threading.Lock()
         self._lines: list[str] = []
         self._ended_by = ""
-        #: This request's acts that did not verify, and the last one's evidence (the outcome's, for a non-success).
-        self._unverified = 0
+        #: This request's acts (:class:`Got`: ran, took, failed), the last non-success's evidence and the last send's
+        #: state (the outcome's facts, from code).
+        self._ran = 0
+        self._took = 0
+        self._failed = 0
         self._evidence = ""
+        self._send: str | None = None
 
     # -- the client: the ONE chain ------------------------------------------------------------------------------------
 
@@ -416,7 +448,8 @@ class OneAgent(Brain):
     # -- the runner ---------------------------------------------------------------------------------------------------
 
     def runner(self) -> Any:
-        """This lane's runner, made once (``host.make_runner``: ``yuki.one.runner`` when merged, else reads only)."""
+        """This lane's runner, made once (``host.make_runner``: ``yuki.one.runner.Runner`` over the lane's hands;
+        raises when it can't be made)."""
         with self._runner_lock:
             if self._runner is None:
                 factory = self._runner_factory
@@ -472,6 +505,13 @@ class OneAgent(Brain):
     # -- the request --------------------------------------------------------------------------------------------------
 
     def _drive(self, req: _Request) -> None:
+        try:
+            runner = self.runner()
+        except Exception as exc:  # noqa: BLE001 - no runner: the job fails plainly, nothing runs, no other brain
+            self._ended_by = "unbuilt"
+            self.logger.log("one_unbuilt", why=type(exc).__name__, lane=self.lane)
+            self._push(ErrorEvent(LINE_UNBUILT))
+            return
         os_ = self._os = OneSettings.read(self.settings)
         bs = self._bs = BrainSettings.read(self.settings)
         host = self._host_ref = Host(self, req)
@@ -497,6 +537,7 @@ class OneAgent(Brain):
         self._gather_ms = (time.perf_counter() - started) * 1000
         self._menu_lines = gathered.menu_lines
         menu, keys = typed_menu(gathered.menu_lines)
+        ready_for_request(runner, skill_keys=keys, menu=menu)
         spoken = req.channel == "voice"
         tools = lane_tools(keys, worker=self.hands, spoken=spoken)
         system = PR.typed_blocks(gathered.profile, menu, skill_keys=keys)
@@ -517,7 +558,6 @@ class OneAgent(Brain):
         #: request), a code fact (an hwnd), ``None`` when unknown.
         turn.origin_hwnd = req.origin_hwnd
         state.private_read = turn.private_read
-        runner = self.runner()
         self.logger.log("one_request", channel=req.channel, lane=self.lane, hands=self.hands, model=os_.model,
                         effort=self._effort, effort_why=effort_why, thinking=os_.typed_thinking, settle=os_.settle,
                         words=len(req.words), context_chars=len(req.context), tools=len(tools), skills=len(keys),
@@ -558,16 +598,20 @@ class OneAgent(Brain):
                 self._settle(state, B.LINE_REST_LEFT, shown, why="budget_hard")
                 return
             self._record(reply, os_)
-            conv.add_assistant(reply.content)   # as it came: thinking blocks and their signatures kept in-request
-            if reply.stop_reason == "max_tokens" and cutoffs < MAX_CUTOFFS:
-                # cut off (thinking included): once more with more room; a cut call's input is never run
+            if reply.stop_reason == "max_tokens":
+                # cut off at its output ceiling (thinking included): never kept (a thinking block cut short has no
+                # signature, a call cut short no whole input) and nothing of it runs; asked again once with more room,
+                # the conversation as it was (Brain._after_cutoff's rule); a second cut ends it with code's line
                 cutoffs += 1
-                os_ = replace(os_, max_tokens=max(os_.max_tokens,
-                                                  CUTOFF_TOKENS_STREAMED if bs.stream else CUTOFF_TOKENS_PLAIN))
                 self.logger.log("one_cutoff", n=cutoffs, tools=len(reply.uses))
-                conv.add_user([*(tool_result(u.id, BAD_INPUT_TEXT if u.bad else CUT_CALL_TEXT, error=True)
-                                 for u in reply.uses), {"type": "text", "text": CUTOFF_TEXT}])
+                if cutoffs > MAX_CUTOFFS:
+                    self._settle(state, LINE_STUCK.format(where=" partway" if state.acted else "", why=""), shown,
+                                 why="cutoff")
+                    return
+                ceiling = CUTOFF_TOKENS_STREAMED if bs.stream else CUTOFF_TOKENS_PLAIN
+                os_ = replace(os_, max_tokens=max(os_.max_tokens, min(ceiling, os_.max_tokens * 2)))
                 continue
+            conv.add_assistant(reply.content)   # as it came: thinking blocks and their signatures kept in-request
             if not reply.uses:
                 if reply.stop_reason == "refusal":
                     self._ended_by = "refusal"
@@ -586,17 +630,23 @@ class OneAgent(Brain):
                 return
             lines = self._take_lines()
             if facts.settle is not None:
-                self._settle(state, facts.settle, shown + lines, why="gate")
+                ending = " ".join(facts.settle.split())
+                for line in lines:   # an earlier call's line of this reply (its done line) is shown before the end
+                    if line != ending:
+                        self._push(Say(line))
+                        shown.append(line)
+                self._settle(state, ending, shown, why="gate")
                 return
             if self._cancelled.is_set():
                 self._ended_by = "cancelled"
                 self._push(self._cancel_event())
                 return
-            if os_.settle == "code" and facts.clean:
-                # addendum decision 2 / must-fix 2: a clean simple act ends in code, as today: code's verified line
+            if os_.settle == "code" and not facts.own and runner_settles(facts.results):
+                # addendum decision 2 / must-fix 2: a clean reply ends in code, as today, by the runner's one settle
+                # rule: code's verified line (said at verification) is the reply, no closing model call
                 self._ended_by = "code"
                 text = " ".join(lines) or LINE_DONE
-                self._final(text, self._outcome_one(state, level="verified"))
+                self._final(text, self._outcome_one(state, level=self._level()))
                 return
             for line in lines:   # said at verification: shown now as progress; the model reads them in its results
                 self._push(Say(line))
@@ -607,96 +657,150 @@ class OneAgent(Brain):
 
     def _run_calls(self, uses: list[Use], host: Host, state: _State, os_: OneSettings, turn: P.Turn,
                    runner: Any) -> tuple[list[dict[str, Any]], _ReplyFacts]:
-        """Every call of one reply, in written order (a later one waits for the one before). Each has a result (the
-        API's rule: every tool_use answered), the ones after a settle or a cancel "not run"."""
+        """Every call of one reply, in written order (a later one waits for the one before), each through the runner
+        (the one gate decides it, fail closed). Each has a result (the API's rule: every tool_use answered), the ones
+        after a settle or a cancel "not run"."""
         results: list[dict[str, Any]] = []
         facts = _ReplyFacts()
+        if not self.hands:
+            needs = next((u for u in uses if not u.bad and needs_worker(u.name, u.input)), None)
+            if needs is not None:
+                # the front desk only looks: a reply with a call that needs the worker goes there as it came, before
+                # any of its calls runs here (the worker reads again what it needs)
+                self.needed_hands = True
+                facts.handoff = True
+                self.logger.log("one_handoff", tool=needs.name, lane=self.lane)
+                return results, facts
         for use in uses:
             if facts.settle is not None or self._cancelled.is_set():
+                facts.own += 1
                 results.append(tool_result(use.id, LINE_NOT_RUN, error=True))
                 continue
             if use.bad:
-                facts.other += 1
+                facts.own += 1
                 results.append(tool_result(use.id, BAD_INPUT_TEXT, error=True))
                 continue
-            if not self.hands and needs_worker(use.name, use.input):
-                # the front desk only looks: the request goes to the worker as it came (its reads are read again there)
-                self.needed_hands = True
-                facts.handoff = True
-                self.logger.log("one_handoff", tool=use.name, lane=self.lane)
-                return results, facts
-            if use.name == "ask_user":
-                facts.other += 1
-                results.append(tool_result(use.id, self._ask_user(use.input, host, turn)))
-                continue
             if not self._hold_if_paused(turn):
+                facts.own += 1
                 results.append(tool_result(use.id, LINE_NOT_RUN, error=True))
                 continue
             spec = T.spec_of(use.name)
             acts = spec is not None and spec.acts
             if acts and self.hands:
                 host.acting_begin()   # "Yuki is acting" for memory, and the takeover watch
+                fresh_desk(runner)    # the verbs act only on windows they were shown
             verb = self._emit_call(use.name, use.input)
-            r = self._run_one(runner, use.name, use.input, turn, host)
-            text = result_text(r, os_.result_chars)
-            ok = result_ok(r)
-            self._emit_result(verb, r, ok, text)
-            results.append(tool_result(use.id, text, error=not ok))
+            got = self._run_one(runner, use.name, use.input, turn, host, os_.result_chars)
+            self._emit_result(verb, got)
+            results.append(tool_result(use.id, got.text, error=not got.ok))
+            if got.one is not None:
+                facts.results.append(got.one)
+            else:
+                facts.own += 1
             if acts:
-                facts.acts += 1
                 state.kind = "act"
                 state.steps += 1
-                ran = result_acted(r)
-                if ran:
-                    state.acted = True
-                if not bool(_field(r, "verified", False)):
-                    facts.unverified += 1   # the reply is not clean: the model gets its next round
-                    if ran:   # it ran and was not seen to work (a refused act did nothing: not counted here)
-                        self._unverified += 1
-                        evidence = str(_field(r, "evidence", "") or "").strip()
-                        if evidence:
-                            self._evidence = evidence
-                if result_flagged(r):
-                    facts.flagged = True
-                if T.then_of(use.input):
-                    facts.then_left = True
-            else:
-                facts.other += 1
-            if bool(_field(r, "settle", False)):
-                facts.settle = "" if bool(_field(r, "silent", False)) else str(_field(r, "line", "") or "")
+            self._tally(state, got)
+            if got.settle:
+                facts.settle = "" if got.silent else got.line
         return results, facts
 
-    def _run_one(self, runner: Any, name: str, args: Mapping[str, Any], turn: P.Turn, host: Host) -> Any:
-        """One call through the runner; a gate's question is asked here (budget not counting the wait), the reply read
-        by the check model (fail closed), recorded as a code fact (``Turn.answer``), and on a yes the same call goes to
-        the gate again (allowed that once)."""
+    def _tally(self, state: _State, got: Got) -> None:
+        """One call's facts into the request's (its level, the evidence of the last non-success, a send's state)."""
+        if got.ran:
+            state.acted = True
+            self._ran += 1
+            self._took += 1 if got.took else 0
+            self._failed += 1 if got.failed else 0
+            if not got.took and got.evidence:
+                self._evidence = got.evidence
+        if got.send:
+            self._send = got.send
+
+    def _run_one(self, runner: Any, name: str, args: Mapping[str, Any], turn: P.Turn, host: Host,
+                 limit: int) -> Got:
+        """One call through the runner. A question (status ``asked``) is asked here, the wait not counted
+        (:meth:`_asked`); a tool the runner gives back to its driver (status ``driver``) runs here
+        (:meth:`_driver`)."""
         started = time.perf_counter()
-        r = self._through(runner, name, args, turn)
-        if result_status(r) == "ask" and str(_field(r, "question", "") or "").strip():
-            question = " ".join(str(_field(r, "question", "")).split())
-            with turn.budget.excluded():
-                answer = host.ask_text(question)
-                yes = bool(answer and answer.strip()) and not self._cancelled.is_set() \
-                    and self._judge_answer(question, answer)
-            turn.answer(yes)
-            self._sync_words(turn, host)
-            self.logger.log("one_ask", tool=name, answered=answer is not None, yes=yes)
-            if yes and not self._cancelled.is_set():
-                r = self._through(runner, name, args, turn)
-            else:
-                r = SimpleNamespace(status="declined", ok=False, acted=False, verified=False,
-                                    text=f"{answer_report(question, answer)}\n{LINE_NOT_YES}")
+        got = read_result(self._through(runner, name, args, turn), limit)
+        if got.status == ASKED:
+            got = self._asked(runner, name, args, turn, host, got, limit)
+        elif got.status == DRIVER:
+            got = self._driver(name, args, turn, host, limit)
         self._tool_s += time.perf_counter() - started
-        return r
+        return got
+
+    def _asked(self, runner: Any, name: str, args: Mapping[str, Any], turn: P.Turn, host: Host, got: Got,
+               limit: int) -> Got:
+        """A call that came back asked. The gate's question (its decision asked, or the turn holds that question open):
+        asked here, the reply read by the check model (fail closed), recorded as a code fact (``Runner.answer``), and on
+        a yes the same call goes to the gate again (allowed that once). A skill's own question (which one, who to):
+        asked here, their answer goes to the model with the result (it runs the skill again with it). No question, or
+        the request was stopped: the model reads the result as it is."""
+        question = " ".join(str(getattr(got.one, "question", "") or "").split())
+        if not question or self._cancelled.is_set():
+            return got
+        decision = getattr(got.one, "decision", None)
+        gate = getattr(decision, "kind", None) == P.ASK or any(
+            " ".join(str(q).split()) == question for q, _row in list(getattr(turn, "asks", {}).values()))
+        with turn.budget.excluded():
+            answer = host.ask_text(question)
+            yes = gate and bool(answer and answer.strip()) and not self._cancelled.is_set() \
+                and self._judge_answer(question, answer)
+        if gate:
+            answered = getattr(runner, "answer", None)
+            if callable(answered):
+                answered(turn, yes)
+            else:
+                turn.answer(yes)
+        self._sync_words(turn, host)
+        self.logger.log("one_ask", tool=name, gate=gate, answered=answer is not None, yes=yes)
+        if not gate:
+            return Got("answered", clip(f"{got.text}\n{answer_report(question, answer)}", limit), True)
+        if yes and not self._cancelled.is_set():
+            return read_result(self._through(runner, name, args, turn), limit)
+        return Got("declined", f"{answer_report(question, answer)}\n{LINE_NOT_YES}", False)
+
+    def _driver(self, name: str, args: Mapping[str, Any], turn: P.Turn, host: Host, limit: int) -> Got:
+        """A tool the gate allowed that the driver runs itself (``yuki.one.runner.DRIVER_TOOLS``): ``ask_user`` (the
+        worker's: one question, their reply as their own words) and ``quick_memory`` (the voice's quick memory read or
+        to-do add, :meth:`_quick_memory`). Any other is not a typed tool: not run."""
+        if name == "ask_user":
+            return Got("answered", self._ask_user(args, host, turn), True)
+        if name == "quick_memory":
+            return self._quick_memory(args, limit)
+        return Got("not_run", LINE_NOT_DRIVEN.format(tool=name), False)
+
+    def _quick_memory(self, args: Mapping[str, Any], limit: int) -> Got:
+        """``quick_memory`` (``voice.recall.QuickMemory.run``, blocking on this worker thread): its report as plain
+        lines, what memory holds fenced as data (its handling note, Yuki's own words, after the fence). Content-free
+        log line."""
+        started = time.perf_counter()
+        action = str(dict(args or {}).get("action") or "")
+        try:
+            from yuki.voice.recall import QuickMemory
+
+            payload, facts = QuickMemory(self.memory).run(dict(args or {}))
+        except Exception as exc:  # noqa: BLE001 - a failed read is said as one
+            payload, facts = {"failed": f"memory could not be read ({type(exc).__name__})"}, {"ok": False}
+        report = dict(payload) if isinstance(payload, Mapping) else {"found": str(payload or "")}
+        note = str(report.pop("how_to_handle_it", "") or "").strip()
+        ok = bool(dict(facts or {}).get("ok"))
+        from yuki.agent.untrusted import new_nonce, wrap
+
+        nonce = str(getattr(self._host_ref, "nonce", "") or "") or new_nonce()
+        text = wrap(model_text(report), source="their memory", nonce=nonce)
+        self.logger.log("one_quick", action=action, ok=ok, items=dict(facts or {}).get("items"),
+                        ms=round((time.perf_counter() - started) * 1000, 1))
+        return Got("read" if ok else "failed", clip(f"{text}\n{note}" if note else text, limit), ok)
 
     def _through(self, runner: Any, name: str, args: Mapping[str, Any], turn: P.Turn) -> Any:
         try:
-            got = runner.run(name, dict(args or {}), turn, self._speak)
+            return runner.run(name, dict(args or {}), turn, self._speak)
         except Exception as exc:  # noqa: BLE001 - a runner error is a failed call, never a crash
             self.logger.log("error", where="one_runner", tool=name, error=type(exc).__name__)
-            return SimpleNamespace(status="error", ok=False, verified=False,
-                                   text="Not done: Yuki's runner failed on that call; nothing more is known.")
-        return _as_result(got)
+            return Got("error", LINE_RUNNER_BROKE, False)
 
     def _speak(self, text: str) -> None:
         """The runner's ``speak``: code's line at verification (typed: kept, then shown as progress or as the reply)."""
@@ -752,10 +856,10 @@ class OneAgent(Brain):
         self._push(ToolCall(verb, {**dict(vinput or {}), "_about": {"what": STEP_WORDS.get(verb, verb)}}))
         return verb
 
-    def _emit_result(self, verb: str, r: Any, ok: bool, text: str) -> None:
-        summary = "ok" if ok else (clip(" ".join(text.split()), 120) or result_status(r) or "not done")
-        self._push(ToolResult(verb, ok, summary, payload=_field(r, "payload", None),
-                              about={"what": STEP_WORDS.get(verb, verb)}))
+    def _emit_result(self, verb: str, got: Got) -> None:
+        """The step's result on the island and the window: ``ok``, or its own line (else its status) in a few words."""
+        summary = "ok" if got.ok else (clip(" ".join((got.line or got.text).split()), 120) or got.status or "not done")
+        self._push(ToolResult(verb, got.ok, summary, payload=got.payload, about={"what": STEP_WORDS.get(verb, verb)}))
 
     # -- the model call -----------------------------------------------------------------------------------------------
 
@@ -884,11 +988,16 @@ class OneAgent(Brain):
         (every act verified, some not, or no act)."""
         self._ended_by = "model"
         line = str(text or "").strip() or " ".join(shown) or LINE_NO_REPLY
-        if state.kind == "act":
-            level = "verified" if not self._unverified and state.acted else ("unverified" if state.acted else "failed")
-        else:
-            level = "answer"
-        self._final(line, self._outcome_one(state, level=level, line=line))
+        self._final(line, self._outcome_one(state, level=self._level() if state.kind == "act" else "answer", line=line))
+
+    def _level(self) -> str:
+        """The request's level from code's facts of its acts: none ran (refused, asked, stopped): ``answer``; every one
+        took: ``verified``; every one failed: ``failed``; else ``unverified``."""
+        if not self._ran:
+            return "answer"
+        if self._took >= self._ran:
+            return "verified"
+        return "failed" if self._failed >= self._ran else "unverified"
 
     def _settle(self, state: _State, line: str, shown: list[str], *, why: str) -> None:
         """Code ends the request (a budget limit, the gate's second refusal, the hard stop): its line, no model call.
@@ -904,9 +1013,10 @@ class OneAgent(Brain):
         carries its evidence (the last unverified act's, at most :data:`EVIDENCE_CHARS`) for the voice's own words."""
         out: dict[str, Any] = {
             "level": level, "label": LEVEL_LABELS.get(level, ""), "acted": bool(state.acted), "seen": "",
-            "send": None, "partial": bool(partial), "line": "" if level == "verified" else line,
+            "send": self._send, "partial": bool(partial), "line": "" if level == "verified" else line,
             "step": STEP_WORDS.get(self._verbs_run[-1], "") if self._verbs_run and state.kind == "act" else "",
-            "steps": int(state.steps), "open": 0 if level in ("verified", "answer") else int(self._unverified)}
+            "steps": int(state.steps),
+            "open": 0 if level in ("verified", "answer") else max(0, self._ran - self._took)}
         if level in ("unverified", "failed") and self._evidence:
             out["evidence"] = clip(self._evidence, EVIDENCE_CHARS)
         else:
@@ -915,8 +1025,9 @@ class OneAgent(Brain):
 
     def _begin(self, request: str, user_words: Any, channel: str) -> None:
         super()._begin(request, user_words, channel)
-        self._unverified = 0
+        self._ran = self._took = self._failed = 0
         self._evidence = ""
+        self._send = None
 
     def _observe_seed(self, outcome: Mapping[str, Any] | None) -> None:
         """No hand-off check is read as an observer here: the ONE agent takes no skill hand-off (a job's
@@ -941,5 +1052,6 @@ class OneAgent(Brain):
             self.logger.log("error", where="memory_turn", error=type(exc).__name__)
 
 
-__all__ = ["BAD_INPUT_TEXT", "LINE_DONE", "LINE_NOT_RUN", "LINE_NOT_YES", "NO_SKILLS", "OneAgent", "REPLY_HELD",
-           "Reply", "Use", "reply_uses", "result_acted", "result_ok", "result_status", "result_text", "typed_menu"]
+__all__ = ["BAD_INPUT_TEXT", "FIELD_LABELS", "Got", "LINE_DONE", "LINE_NOT_RUN", "LINE_NOT_YES", "NO_SKILLS", "NOT_OK",
+           "OneAgent", "RAN", "REPLY_HELD", "Reply", "TOOK", "Use", "model_text", "read_result", "reply_uses",
+           "runner_settles", "typed_menu"]
