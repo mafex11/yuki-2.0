@@ -32,15 +32,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from yuki.one import modes as _modes
 from yuki.voice.recall import RECENT_TIMEOUT_S, fetch_recent
 
 # ---------------------------------------------------------------------------
 # bTalk (brain rebuild rev 2, design 3 and 10.1 row bTalk): which brain a spoken request runs on, which talker
 # ---------------------------------------------------------------------------
 
-#: ``Settings.brain`` (bWire): ``loop`` (the old thinker for everything), ``typed`` (typed requests on the new brain,
-#: voice exactly as before), ``all`` (voice on the new brain too: the lean talker, ``hand_over``, no router).
-BRAIN_MODES: tuple[str, ...] = ("loop", "typed", "all")
+#: ``Settings.brain`` (bWire; oVoice: the one helper's list, ``yuki.one.modes``): ``loop`` (the old thinker for
+#: everything), ``typed`` (typed requests on the new brain, voice exactly as before), ``all`` (voice on the new brain
+#: too: the lean talker, ``hand_over``, no router), ``one`` (phase 4: the ONE agent owns the whole voice turn).
+BRAIN_MODES: tuple[str, ...] = _modes.BRAIN_MODES
 #: The talker's prompt and hand-off tool (``Settings.voice_talker``): ``full`` (as before) or ``lean`` (design 3).
 TALKER_KINDS: tuple[str, ...] = ("full", "lean")
 #: The talker's hand-off tools: the full talker's ``tell_yuki`` and the lean talker's ``hand_over``.
@@ -48,19 +50,28 @@ HANDOFF_TOOLS: tuple[str, ...] = ("tell_yuki", "hand_over")
 
 
 def brain_mode(settings: Any) -> str:
-    """``Settings.brain`` (``loop`` | ``typed`` | ``all``; anything else, or no such setting yet, is ``loop``)."""
-    value = str(getattr(settings, "brain", "loop") or "loop").strip().lower()
-    return value if value in BRAIN_MODES else "loop"
+    """``Settings.brain`` through the one mode helper (``yuki.one.modes.brain_mode``): ``all`` | ``one`` | ``loop`` |
+    ``typed``. oVoice (phase 4 addendum, must-fix 7): anything unknown or empty reads as ``all``, never as ``loop``."""
+    return _modes.brain_mode(settings)
 
 
 def voice_on_brain(settings: Any) -> bool:
-    """Whether spoken requests run on the new brain (``brain = "all"``): only then does anything of bTalk run."""
-    return brain_mode(settings) == "all"
+    """Whether spoken requests run on the new brain through the lean talker's hand-over (``brain = "all"``): only then
+    does anything of bTalk run. ``False`` under ``one`` (the ONE agent drives the turn itself: :func:`voice_one`)."""
+    return _modes.voice_brain(settings) == "all"
+
+
+def voice_one(settings: Any) -> bool:
+    """oVoice (phase 4): whether the ONE agent owns the spoken turn (``brain = "one"``)."""
+    return _modes.is_one(settings)
 
 
 def talker_kind(settings: Any) -> str:
     """The talker in force: ``Settings.voice_talker`` when set (``full`` / ``lean``, for debugging), else derived from
-    ``brain`` (design 10.1: ``loop`` / ``typed`` -> ``full``, ``all`` -> ``lean``)."""
+    ``brain`` (design 10.1: ``loop`` / ``typed`` -> ``full``, ``all`` -> ``lean``). Under ``one`` always ``lean``
+    (memory's lean card with the you-card; the ONE driver uses its own prompt and tools whatever this says)."""
+    if voice_one(settings):
+        return "lean"
     explicit = str(getattr(settings, "voice_talker", "") or "").strip().lower()
     if explicit in TALKER_KINDS:
         return explicit
@@ -69,8 +80,8 @@ def talker_kind(settings: Any) -> str:
 
 def router_on(settings: Any) -> bool:
     """Whether the hand-off router runs: never under ``brain = "all"`` (design 3: it decided 10 times in 26 days, all
-    "talker", 0 starts); otherwise ``Settings.voice_router`` exactly as before."""
-    if voice_on_brain(settings):
+    "talker", 0 starts) nor ``one`` (no hand-off at all); otherwise ``Settings.voice_router`` exactly as before."""
+    if voice_on_brain(settings) or voice_one(settings):
         return False
     return bool(getattr(settings, "voice_router", False))
 
