@@ -14,10 +14,10 @@ already hold the answer, by code, with no model call:
   items due soon, who they wait on (``younow.middle_words``, labelled ``younow.MIDDLE_LABEL``: to choose well, never
   recited unasked). The talker's own per-turn line carries the focus and what just changed, and its profile layer the
   people directory, so its card repeats neither;
-* **Usually now** - the active routines due around this hour; the picks for now (phase 2.2: code's best candidates
-  per kind, a channel's unwatched upload, a playlist, a channel, each with a short code-made why, scored like the
-  recommender: ``yuki.skills.taste.now_picks``), which the talker and the planner may choose from themselves; their
-  other things at this hour (``yuki.skills.learn.values`` hour histograms);
+* **Usually now** - the active routines due around this hour; the picks for now (phase 2.2: code's best few
+  candidates across the kinds, a channel's unwatched upload, a playlist, a channel, each with a short code-made why,
+  scored like the recommender: ``yuki.skills.taste.now_picks``), which the talker and the planner may choose from
+  themselves (by name, under choose); their other things at this hour (``yuki.skills.learn.values`` hour histograms);
 * **Your things** - sites with their usual browser and a work mark, YouTube channels (by display name, most watched
   first), Spotify playlists with what the user calls them, meeting tabs, the voice channels and servers of the apps
   that join calls (``yuki.skills.discord_route.voice_channels``), the things inside their own ways' apps (their
@@ -85,11 +85,12 @@ LEFT_OFF_URL_CHARS = 140
 LEFT_OFF_QUERY_CHARS = 40
 #: The talker's day and "in the middle of" lines at most, each (a thread, three due titles, two names).
 MIDDLE_CHARS = 420
-#: Phase 2.2, the picks for now on the "Usually around now" line (talker, wide): per kind at most (fewer when the line
-#: is long), a video's title cut to, and the whole line at most.
-PICKS_N = (3, 5)
+#: Phase 2.2, the picks for now on the "Usually around now" line (talker, wide): how many in all (fewer when the line
+#: is long, down to :data:`PICKS_MIN`), a video's title cut to, and the whole line at most.
+PICKS_N = (4, 9)
+PICKS_MIN = 3
 TITLE_CHARS = (32, 48)
-USUAL_CHARS = (620, 900)
+USUAL_CHARS = (360, 440)
 
 _lock = threading.Lock()
 #: ``(db path, purpose) -> (built_at, stamp, text)``
@@ -321,64 +322,83 @@ def _values(store: Any) -> dict[str, list[dict[str, Any]]]:
         return {}
 
 
-def _picks_part(store: Any, now: float, wide: bool, n: tuple[int, int, int]) -> str:
+def _pick_text(p: Any, title_n: int) -> str:
+    """One pick as the card names it: ``name (why)``; a video ``channel (its habit): "title" (how new)``, so the
+    channel's habit never reads as the upload's."""
+    name = _clip(p.name, 30)
+    if p.kind == "video" and p.title and title_n:
+        return (f"{name} ({p.why})" if p.why else name) + f': "{_clip(p.title, title_n)}"' + (
+            f" ({p.age})" if p.age else "")
+    why = ", ".join(b for b in (p.age, p.why) if b)
+    return f"{name} ({why})" if why else name
+
+
+def _picks_part(store: Any, now: float, wide: bool, n: int) -> tuple[str, list[str]]:
     """Phase 2.2: the picks for now (``yuki.skills.taste.now_picks``: code's candidates, scored like the recommender,
-    each with its code-made why), for the deciders to choose from: per kind (a channel's fresh unwatched upload, a
-    playlist, a channel) at most ``n`` (video, playlist, channel), best first, the kind whose best one fits this hour
-    most (time at this hour, comparable across kinds) first; a channel already named for its upload is not named again.
-    ``""`` with none."""
+    each with its code-made why), for the deciders to choose from, and the names it shows: ``n`` in all, taken a
+    rank at a time across the kinds (a channel's fresh unwatched upload, a playlist, a channel), the kind whose best
+    one fits this hour most (time at this hour, comparable across kinds) first, so each kind's best comes before any
+    kind's second; a channel with an upload among them goes by its upload. ``("", [])`` with none."""
     try:
         from yuki.skills import taste
 
         got = taste.now_picks(store, now=now)
     except Exception:  # noqa: BLE001
-        return ""
+        return "", []
     title_n = TITLE_CHARS[1 if wide else 0]
-    shown = {"".join(p.name.casefold().split()) for p in (got.get("video") or [])[:n[0]]}
+    vids = (got.get("video") or [])[:n]
     kinds = []
-    for i, (kind, label) in enumerate((("video", "new uploads, unwatched"), ("playlist", "playlists"),
+    for i, (kind, label) in enumerate((("video", "unwatched uploads"), ("playlist", "playlists"),
                                        ("channel", "channels"))):
-        items = [p for p in got.get(kind) or [] if kind != "channel" or "".join(p.name.casefold().split()) not in shown]
-        items = items[:n[i]]
-        if not items:
-            continue
-        bits = [_clip(p.name, 30) + (f' "{_clip(p.title, title_n)}"' if p.title and title_n else "") + f" ({p.why})"
-                for p in items]
-        kinds.append((-max(p.fit for p in items), i, f"{label}: " + "; ".join(bits)))
+        items = [p for p in got.get(kind) or []
+                 if kind != "channel" or not any(taste._same_name(p.name, v.name) for v in vids)][:n]
+        if items:
+            kinds.append((-max(p.fit for p in items), i, label, items))
     kinds.sort(key=lambda k: (k[0], k[1]))
-    return ("Picks for now, best first: " + " | ".join(text for _f, _i, text in kinds)) if kinds else ""
+    shown: list[list[Any]] = [[] for _ in kinds]
+    left, rank = max(0, int(n)), 0
+    while left > 0 and any(rank < len(k[3]) for k in kinds):
+        for j, k in enumerate(kinds):
+            if left > 0 and rank < len(k[3]):
+                shown[j].append(k[3][rank])
+                left -= 1
+        rank += 1
+    text = " | ".join(f"{k[2]}: " + "; ".join(_pick_text(p, title_n) for p in got_) for k, got_ in zip(kinds, shown)
+                      if got_)
+    return ("Picks for now, best first: " + text) if text else "", [p.name for got_ in shown for p in got_]
 
 
 def _usually_now(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, wide: bool) -> list[str]:
     """The "Usually around now" line, most decisive first: the routines due now, the picks for now
-    (:func:`_picks_part`), their other things at this hour (a value the picks cover, a playlist, is not named twice).
-    At most :data:`USUAL_CHARS`: the picks give way first (fewer per kind), then their things at this hour."""
+    (:func:`_picks_part`), their other things at this hour (a value the picks name is not named twice). At most
+    :data:`USUAL_CHARS`: the picks give way first (fewer, down to :data:`PICKS_MIN`), then their things at this hour."""
     from yuki.skills.learn import values as V
 
+    try:
+        from yuki.skills.taste import _same_name
+    except Exception:  # noqa: BLE001
+        def _same_name(a: Any, b: Any) -> bool:
+            return False
     i = 1 if wide else 0
     routines = _routines_near(store, now)
     head = ["Routines: " + "; ".join(routines)] if routines else []
-    try:
-        from yuki.skills import taste
-
-        covered = {(cap, taste.CHOOSE_SLOTS[k]) for cap, k in taste.CHOOSE_KINDS.items()}
-    except Exception:  # noqa: BLE001
-        covered = set()
     hour_vals = []
-    for cap_key, items in vals.items():
+    for items in vals.values():
         for v in items:
-            if v.get("everyday") is False or (cap_key, v.get("slot")) in covered:
+            if v.get("everyday") is False:
                 continue
             w = V.hour_weight(v, now)
             if w >= HOUR_SHARE and int(v.get("days") or 0) >= 2:
                 hour_vals.append((w * float(v.get("score") or 0.0), v))
     hour_vals.sort(key=lambda x: -x[0])
-    things = ["Their things at this hour: " + ", ".join(
-        f"{_clip(v.get('name'), 30)} ({v.get('slot')}, {_sure_days(int(v.get('days') or 0))})"
-        for _s, v in hour_vals[:4])] if hour_vals else []
-    line = ""
-    for n in range(PICKS_N[i], 0, -1):
-        picks = _picks_part(store, now, wide, (n, n, n))
+    line = picks = ""
+    things: list[str] = []
+    for n in range(PICKS_N[i], min(PICKS_N[i], PICKS_MIN) - 1, -1):
+        picks, names = _picks_part(store, now, wide, n)
+        kept = [v for _s, v in hour_vals if not any(_same_name(v.get("name"), x) for x in names)][:4]
+        things = ["Their things at this hour: " + ", ".join(
+            f"{_clip(v.get('name'), 30)} ({v.get('slot')}, {_sure_days(int(v.get('days') or 0))})"
+            for v in kept)] if kept else []
         parts = [*head, *([picks] if picks else []), *things]
         line = "Usually around now: " + " | ".join(parts) if parts else ""
         if len(line) <= USUAL_CHARS[i] or not picks:

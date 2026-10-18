@@ -866,8 +866,10 @@ RETIRED_KINDS: tuple[str, ...] = ("yt_channel",)
 #: (``skill_runs.filled``), and never when any came from :data:`GUESS_FILLS` (a guess must not feed itself). Only the
 #: taste guess and Yuki's own pick for "something I'd like" (``chosen``, kTaste): ``pref`` fills means slots only
 #: (``connection.py`` derives ``Slot.pref`` for ``role = "means"``: which browser, never which entity), so "open Deji's channel" in the usual browser is still the user's pick (tTaste r1 M1).
+#: Phase 2.1's own guesses too (aResolve's note): ``menu``, a listed name the words don't hold (a pick from the
+#: candidates), and ``reading``, the model's reading that nothing holds.
 ASKED_FILLS: frozenset[str] = frozenset({"words", "again", "told"})
-GUESS_FILLS: frozenset[str] = frozenset({"taste", "chosen"})
+GUESS_FILLS: frozenset[str] = frozenset({"taste", "chosen", "menu", "reading"})
 #: The fields an offered option's value carries beyond its name (``youtube_feed.Offer.value``): a slot every route of
 #: which needs one of them is filled from the offers (:func:`takes_offers`).
 OFFER_FIELDS: frozenset[str] = frozenset({"key", "ref"})
@@ -1466,8 +1468,9 @@ CHOOSE_DEADLINE_S = 4.0
 JUDGE_MIN_S = 0.6
 #: A candidate's hour fit at least this share of its own best hour today: "you usually ... around now".
 HABIT_SHARE = 0.5
-#: Phase 2.2: where a given channel or playlist came from when the talker took it from the card's picks for now
-#: (:func:`now_picks`) rather than their words (the resolver's source tag of the same name, phase 2.1).
+#: Phase 2.2: where a given channel or playlist came from when it is Yuki's own pick, not their words: asked to choose
+#: (``choose`` true), the talker or the planner gave the card's fitting pick for now (:func:`now_picks`) by name (the
+#: engine's tag for a name under choose that they never said; the resolver's source tag of the same name, phase 2.1).
 FROM_CARD = "card"
 
 CHOOSE_SYSTEM = """You help a voice assistant pick what to put on for a person who asked it to choose for them. Their
@@ -1878,8 +1881,9 @@ def choose(store: Any, kind: str, *, words: Any = (), context: str = "", session
     is late). ``only``: the channel or playlist the user named, exactly (:func:`_same_name`: "Deji's new video" ->
     "Deji"): that channel's newest unwatched upload, no judgement; ``asked`` (they asked Yuki to choose): an ``only``
     that is none of theirs ("something chill" given as the video) is their words for the judgement and the pick is free
-    (review M1), else None. ``source`` :data:`FROM_CARD`: ``only`` is the talker's own pick from the card's picks for
-    now (:func:`now_picks`), not their words: the same upload or playlist, a guess (never ``named``). A pick kept from
+    (review M1), else None. ``source`` :data:`FROM_CARD` (asked, a name they never said): ``only`` is the talker's or
+    the planner's own pick, the card's pick for now (:func:`now_picks`): the same upload or playlist, a guess (never
+    ``named``); one that is none of theirs is their words for the judgement, as above. A pick kept from
     a held request (:func:`keep_for_later`) comes first. None when there is nothing to pick. Nothing plays here; the
     only thing noted is a ``skipped`` event (once per pick) when this asks again within :data:`SKIP_S` of the last pick
     (:func:`chosen` notes the pick, once it played). Content-free logs; never raises."""
@@ -2025,9 +2029,10 @@ SKIPPED_W = 0.5
 class NowPick:
     """One candidate for now (:func:`now_picks`): its ``kind`` (:data:`CHOOSE_KINDS`' values), the ``name`` a run
     takes (a channel's name: its newest unwatched upload for ``video``, its page for ``channel``; a playlist's name),
-    the short code-made ``why`` (2 to 5 words, from the scorer's own numbers), the recommender's ``score``, its hour
-    ``fit`` (time units at this hour: comparable across kinds), and for a video its ``title`` and age in days (RAM
-    only, never logged)."""
+    the short code-made why in two parts (:func:`why_parts`, from the scorer's own numbers): ``why``, the habit of
+    the channel or playlist ("lunch usual", "watched yesterday"; ``""`` for a video with none), and for a video
+    ``age``, how new the upload is ("new today"); the recommender's ``score``, its hour ``fit`` (time units at this
+    hour: comparable across kinds), and for a video its ``title`` and age in days (RAM only, never logged)."""
 
     kind: str
     name: str
@@ -2036,6 +2041,7 @@ class NowPick:
     fit: float
     title: str = ""
     fresh_d: float | None = None
+    age: str = ""
 
 
 _now_lock = threading.Lock()
@@ -2048,31 +2054,38 @@ def _forget_now(store: Any) -> None:
         _now_cache.pop(str(getattr(store, "path", "") or ""), None)
 
 
-def short_why(c: _Cand, kind: str, *, top_total: float, now: float, skipped: float = 0.0) -> str:
-    """A candidate's why in 2 to 5 words, from the scorer's own numbers, its strongest factor first: how new a video
-    is ("new today", "a week old": every video candidate is unwatched), then its habit: this part of the day ("lunch
-    usual": its fit at this hour at least :data:`HABIT_SHARE` of its best hour and :data:`USUAL_MIN`), the most time
-    overall ("most watched"), or a recent pick by its day ("played yesterday", "watched Tuesday"); a recent skip says
-    so ("skipped lately"). A format of numbers, never a judgement of what it holds."""
-    bits: list[str] = []
+def why_parts(c: _Cand, kind: str, *, top_total: float, now: float, skipped: float = 0.0) -> tuple[str, str]:
+    """A candidate's why from the scorer's own numbers, ``(age, habit)``: how new a video's upload is ("new today",
+    "a week old": every video candidate is unwatched; ``""`` for other kinds), and the habit of its channel or
+    playlist: this part of the day ("lunch usual": its fit at this hour at least :data:`HABIT_SHARE` of its best hour
+    and :data:`USUAL_MIN`), the most time overall ("most watched"), or a recent pick by its day ("played yesterday",
+    "watched Tuesday"); a recent skip says so ("skipped lately"); ``""`` for a video with none. A format of numbers,
+    never a judgement of what it holds."""
+    age = ""
     if kind == "video" and c.fresh_d is not None:
         d, weeks = float(c.fresh_d), int(float(c.fresh_d) // 7)
-        bits.append("new today" if d < 1 else "new yesterday" if d < 2 else "new this week" if d < 7
-                    else "a week old" if weeks == 1 else f"{weeks} weeks old")
+        age = ("new today" if d < 1 else "new yesterday" if d < 2 else "new this week" if d < 7
+               else "a week old" if weeks == 1 else f"{weeks} weeks old")
     past = "played" if kind == "playlist" else "watched"
+    habit = ""
     if skipped >= SKIPPED_W:
-        bits.append("skipped lately")
+        habit = "skipped lately"
     elif c.fit >= USUAL_MIN and c.fit >= HABIT_SHARE * c.peak:
-        bits.append(f"{_day_part(now)[0]} usual")
+        habit = f"{_day_part(now)[0]} usual"
     elif top_total > 0 and c.total >= top_total:
-        bits.append(f"most {past}")
+        habit = f"most {past}"
     elif 0 <= now - c.last_at < RECENT_S:
         last = datetime.fromtimestamp(c.last_at)
         days = (datetime.fromtimestamp(now).date() - last.date()).days
-        bits.append(f"{past} " + ("today" if days <= 0 else "yesterday" if days == 1 else f"{last:%A}"))
-    elif not bits:
-        bits.append(f"{past} now and then")
-    return ", ".join(bits)
+        habit = f"{past} " + ("today" if days <= 0 else "yesterday" if days == 1 else f"{last:%A}")
+    elif not age:
+        habit = f"{past} now and then"
+    return age, habit
+
+
+def short_why(c: _Cand, kind: str, *, top_total: float, now: float, skipped: float = 0.0) -> str:
+    """A candidate's why in 2 to 5 words (:func:`why_parts`, its strongest factor first): "new today, lunch usual"."""
+    return ", ".join(b for b in why_parts(c, kind, top_total=top_total, now=now, skipped=skipped) if b)
 
 
 def _taste_kind_of(kind: str) -> str:
@@ -2099,9 +2112,12 @@ def _now_picks(store: Any, now: float) -> dict[str, list[NowPick]]:
 
     def picks(kind: str, cands: list[_Cand], every: list[_Cand]) -> None:
         top_total = max((c.total for c in every), default=0.0)
-        got = [NowPick(kind, c.name, short_why(c, kind, top_total=top_total, now=now, skipped=skips.get(c.group, 0.0)),
-                       round(c.score, 4), round(c.fit, 3), c.title if kind == "video" else "",
-                       c.fresh_d if kind == "video" else None) for c in cands[:NOW_N] if c.name]
+        got = []
+        for c in cands[:NOW_N]:
+            if c.name:
+                age, habit = why_parts(c, kind, top_total=top_total, now=now, skipped=skips.get(c.group, 0.0))
+                got.append(NowPick(kind, c.name, habit, round(c.score, 4), round(c.fit, 3),
+                                   c.title if kind == "video" else "", c.fresh_d if kind == "video" else None, age))
         if got:
             out[kind] = got
 
@@ -2130,7 +2146,7 @@ def now_picks(store: Any, *, now: float | None = None, n: int = NOW_N) -> dict[s
     """Phase 2.2: the user's best candidates for right now per pick kind (``{"video" | "channel" | "playlist":
     [NowPick]}``, best first, at most ``n`` each; a kind with none left out), scored exactly as :func:`choose` scores
     them before any judgement (their time at this hour and kind of day, a share of their all-time time, halved per
-    recent skip; a video by how new it is), each with a short code-made why (:func:`short_why`). Videos come from the
+    recent skip; a video by how new it is), each with a short code-made why (:func:`why_parts`). Videos come from the
     feeds already read (no network here; :func:`choose` reads fresh ones for "pick for me"), one per channel: running
     ``web.open_video`` with ``video`` the channel's name plays that same upload. What the cards show for the talker
     and the planner to choose from. No model call; cached in RAM per database for :data:`NOW_TTL_S`; names and titles
@@ -2166,4 +2182,5 @@ __all__ = ["SIGMA_MIN", "FALLBACK_MASS", "MENU_CANDIDATES", "OPTIONS_N", "SEEN_S
            "capability_kinds", "slot_kind", "recompute", "seed_sites", "note", "saw", "unsay", "busy", "seed",
            "VISIT_UNITS", "SESSION_UNITS", "LISTEN_SPAN_S", "CHOOSE_KINDS", "CHOOSE_SLOTS", "CONVO_S", "SKIP_S",
            "CHOOSE_N", "CHOOSE_WAIT_S", "CHOSE_LEAD_S", "Choice", "choose", "chosen", "keep_for_later", "choice_line",
-           "held_line", "FROM_CARD", "NOW_N", "NOW_TTL_S", "USUAL_MIN", "NowPick", "short_why", "now_picks"]
+           "held_line", "FROM_CARD", "NOW_N", "NOW_TTL_S", "USUAL_MIN", "NowPick", "why_parts", "short_why",
+           "now_picks"]

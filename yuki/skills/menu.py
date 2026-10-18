@@ -245,13 +245,14 @@ def menu_lines(loaded: Loaded, *, store: Any = None, now: float | None = None, c
     return out
 
 
-#: The talker's heading (its menu follows). Phase 2.2: a pick left to Yuki is the talker's own when one of the You
-#: block's picks for now (:func:`yuki.skills.taste.now_picks`, on the card) fits; else the recommender's (choose).
-TALKER_HEAD = ("Skills (run_skill with the key; slots from their words, a value listed or the You block). \"theirs\" "
-               "after a line: the user's own values for it, best first, to match their words. A pick for now goes by "
-               "its name (a channel's name as video plays its newest unwatched upload); choose: true, context: their "
-               "words lets Yuki pick by taste and fresh uploads (again with corrects: true: the next). An app.way line "
-               "is a way of theirs: run app.way with its way value:")
+#: The talker's heading (its menu follows). Phase 2.2: a pick left to Yuki is always choose: true; the talker's own
+#: pick, one of the You block's picks for now (:func:`yuki.skills.taste.now_picks`, on the card) that fits, goes by
+#: name in its slot (the engine tags a name under choose they never said ``card``); with none, the recommender picks.
+TALKER_HEAD = ("Skills (run_skill with the key; slots from their words or a value listed). \"theirs\" after a line: "
+               "the user's own values for it, best first, to match their words. A pick left to Yuki: choose: true, "
+               "context: their words, and the You block's fitting pick for now by name if any (a channel's name as "
+               "video: its newest unwatched upload); \"another one\": corrects: true too. An app.way line is a way of "
+               "theirs: run app.way with its way value:")
 
 
 #: The planner's heading (bSkill): what a line is and how its slots are filled. Generic: no app, no skill, no case.
@@ -259,10 +260,10 @@ TALKER_HEAD = ("Skills (run_skill with the key; slots from their words, a value 
 #: out is refused by the consent rule (bExec merge note 3), so the heading says to fill it.
 PLANNER_HEAD = ("Each line: - <id>: what it does [slot] or [slot: option | option], then \"theirs\": the user's own "
                 "values for it, best first, to match their words (an app.way line is a way of theirs: route app.way "
-                "with its way value). A pick left to Yuki: a pick for now on the card that fits, by name, or choose: "
-                "true, context: their words. Slots only from their words, a listed name or option, or the card; leave "
-                "the rest out (Yuki fills them). A skill that sends: its send slot takes the sending option only with "
-                "consent.commit send, else the other.")
+                "with its way value). A pick left to Yuki: choose: true, context: their words, and the card's fitting "
+                "pick for now by name if any. Slots only from their words, a listed name or option, or that pick; "
+                "leave the rest out (Yuki fills them). A skill that sends: its send slot takes the sending option only "
+                "with consent.commit send, else the other.")
 
 
 def menu_text(store: Any = None, *, audience: str = TALKER, loaded: Loaded | None = None, now: float | None = None,
@@ -348,9 +349,9 @@ def talker_tool(keys: list[str] | tuple[str, ...]) -> dict[str, Any]:
         "properties": {
             "say_first": {"type": "string", "description": "Written first: words said as it starts, or \"\"."},
             "skill": {"type": "string", "enum": list(keys)},
-            "slots": {"type": "object", "description": "From their words, a value the Skills line lists or a You "
-                                                       "block pick; or choose true and context (their words, what "
-                                                       "they are doing) to let Yuki pick; leave the rest out (Yuki "
+            "slots": {"type": "object", "description": "From their words or a listed value; a pick left to Yuki: "
+                                                       "choose true, context (their words, what they are doing), a "
+                                                       "fitting You block pick by name; leave the rest out (Yuki "
                                                        "fills them)."},
             "again": {"type": "boolean", "description": "They asked for the same again (\"a bit more\")."},
             "corrects": {"type": "boolean", "description": "They corrected the last run of this skill."},
