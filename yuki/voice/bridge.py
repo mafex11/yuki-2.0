@@ -2695,10 +2695,13 @@ class VoiceBridge(QObject):
             what = (job.acting if job is not None and job.acting else name)
             hwnd, tab = (getattr(job, "acting_on", None) or (None, "")) if job is not None else (None, "")
             try:
-                self.actions.add("the thinker", what, summary[:400], ok=bool(ok), verified=None if ok else False,
-                                 turn=job.user_turn if job is not None else None, hwnd=hwnd, tab_id=tab)
-            except TypeError:   # an older log without the identities
-                self.actions.add("the thinker", what, summary[:400], ok=bool(ok), verified=None if ok else False)
+                try:
+                    self.actions.add("the thinker", what, summary[:400], ok=bool(ok), verified=None if ok else False,
+                                     turn=job.user_turn if job is not None else None, hwnd=hwnd, tab_id=tab)
+                except TypeError:   # an older log without the identities
+                    self.actions.add("the thinker", what, summary[:400], ok=bool(ok), verified=None if ok else False)
+            except Exception as exc:  # noqa: BLE001 - a record never breaks the thinker's step (content-free log)
+                self._log("bridge", op="action_record", job_id=job_id, ledger_error=type(exc).__name__)
             if job is not None:
                 job.finished_by_action = job.finishing if ok else None
                 job.finishing = None
@@ -2748,10 +2751,13 @@ class VoiceBridge(QObject):
             # (a step's level is not on its event); the request's one verdict closes them, so the talker's desktop
             # block and the next hand-off read the checked level, never only the step marks
             level = str(verdict.get("level") or "")
-            self.actions.add("the thinker", f'the request "{job.brief()}", as a whole',
-                             f"{verdict.get('label')}: {verdict.get('seen') or ''}".rstrip(": "),
-                             ok=level != "failed", verified=True if level == "verified" else False if level == "failed"
-                             else None)
+            try:
+                self.actions.add("the thinker", f'the request "{job.brief()}", as a whole',
+                                 f"{verdict.get('label')}: {verdict.get('seen') or ''}".rstrip(": "),
+                                 ok=level != "failed",
+                                 verified=True if level == "verified" else False if level == "failed" else None)
+            except Exception as exc:  # noqa: BLE001 - a record never breaks the verdict (content-free log)
+                self._log("bridge", op="action_record", job_id=job_id, ledger_error=type(exc).__name__)
         self._log("bridge", op="outcome", job_id=job_id, level=verdict.get("level"), acted=verdict.get("acted"),
                   send=verdict.get("send"))
 

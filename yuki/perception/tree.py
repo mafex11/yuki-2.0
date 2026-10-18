@@ -4943,6 +4943,7 @@ def _read_focused_text(automation: object, caret_chars: int, max_chars: int) -> 
             window.MoveEndpointByUnit(
                 _TEXT_ENDPOINT_START, _TEXT_UNIT_CHARACTER, -max(int(caret_chars), 1)
             )
+            _clamp_range(window, _document_range(pattern))   # fMsg P1: never past the field's own text
             text = window.GetText(max(int(caret_chars), 1) + 1)
             return FocusText(
                 ok=True, readable=True, source="caret", text=str(text or ""), **who
@@ -5003,6 +5004,95 @@ def focused_text(
     return FocusText(
         reason=str(result.get("error") or f"UIA did not answer within {timeout_s:g} s")
     )
+
+
+@dataclass
+class FieldText:
+    """fMsg P1 (review L1): the whole text of the field with the keyboard, scoped to that field.
+
+    Attributes:
+        value: its Value pattern's value (``None``: no Value pattern).
+        document: its Text pattern's own ``DocumentRange`` text (``None``: no Text pattern, or unreadable).
+        window: the top-level window the field sits in.
+    """
+
+    value: str | None = None
+    document: str | None = None
+    window: int = 0
+
+    def reads(self) -> list[str]:
+        """Every read that answered (the Value first), in RAM only."""
+        return [r for r in (self.value, self.document) if r is not None]
+
+
+def _read_field_text(automation: object, window: int, max_chars: int) -> FieldText | None:
+    """The focused field's own text when it sits in ``window``.  Runs on the worker thread."""
+    element = automation.GetFocusedElement()  # type: ignore[attr-defined]
+    if not element:
+        return None
+    request = _build_cache_request(automation, _TREE_SCOPE_ELEMENT)
+    request.AddProperty(_P_IS_TEXT_AVAILABLE)
+    request.AddProperty(_P_IS_PASSWORD)
+    get = element.BuildUpdatedCache(request).GetCachedPropertyValue
+    if _as_bool(get(_P_IS_PASSWORD)):
+        return None   # a password field is named, never read
+    try:
+        native = int(get(_P_NATIVE_WINDOW_HANDLE) or 0)
+    except Exception:
+        native = 0
+    top = _top_window_of(native)[0]
+    if not top or (window and top != int(window)):
+        return None
+    out = FieldText(window=top)
+    if _as_bool(get(_P_IS_VALUE_AVAILABLE)):
+        raw = get(_P_VALUE_VALUE)
+        out.value = str(raw if isinstance(raw, str) else "")[:max_chars + 1]
+    if _as_bool(get(_P_IS_TEXT_AVAILABLE)):
+        try:
+            module = _uia_core()
+            pattern = element.GetCurrentPattern(_PATTERN_TEXT).QueryInterface(
+                module.IUIAutomationTextPattern  # type: ignore[attr-defined]
+            )
+            out.document = str(pattern.DocumentRange.GetText(max_chars + 1) or "")
+        except Exception:
+            out.document = None   # the Value read (if any) stands alone
+    if out.value is None and out.document is None:
+        return None
+    return out
+
+
+def field_text(window: int, *, max_chars: int = 4000, timeout_s: float = _FOCUS_TIMEOUT_S) -> FieldText | None:
+    """fMsg P1 (review L1): the whole text of the field with the keyboard, read only from the field itself (its Value
+    and its Text pattern's ``DocumentRange``, never the characters around the caret, which in a Chromium app walk out
+    into the page) and only when it sits in the top-level window ``window`` (``0``: any window). ``None`` when no field
+    has the keyboard, it is in another window or a password field, it exposes neither pattern, or UIA doesn't answer
+    within ``timeout_s``. RAM only; never raises."""
+    result: dict[str, object] = {}
+
+    def _worker() -> None:
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception:
+            pass
+        try:
+            module = _uia_core()
+            automation = comtypes.client.CreateObject(
+                _CUIAUTOMATION_CLSID, interface=module.IUIAutomation
+            )
+            result["field"] = _read_field_text(automation, int(window or 0), max(int(max_chars), 1))
+        except BaseException:  # noqa: BLE001 - unread
+            result.pop("field", None)
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_worker, name="yuki-uia-field", daemon=True)
+    thread.start()
+    thread.join(max(0.05, float(timeout_s)))
+    read = result.get("field")
+    return read if isinstance(read, FieldText) else None
 
 
 # ---------------------------------------------------------------------------
@@ -5246,6 +5336,33 @@ def _range_text(text_range: object, limit: int) -> str:
         return ""
 
 
+def _clamp_range(text_range: object, doc: object) -> None:
+    """fMsg P1: keep a range moved by characters inside the element's own ``DocumentRange``: in a Chromium app
+    (Discord, Slack, WhatsApp's web view) a caret range moved back or on walks out of the field into the page around
+    it, so an empty composer read as holding the chat's messages. Never raises (an unclamped range stays as it was)."""
+    if doc is None:
+        return
+    try:
+        if text_range.CompareEndpoints(_TEXT_ENDPOINT_START, doc, _TEXT_ENDPOINT_START) < 0:  # type: ignore[attr-defined]
+            text_range.MoveEndpointByRange(_TEXT_ENDPOINT_START, doc, _TEXT_ENDPOINT_START)  # type: ignore[attr-defined]
+        if text_range.CompareEndpoints(_TEXT_ENDPOINT_END, doc, _TEXT_ENDPOINT_END) > 0:  # type: ignore[attr-defined]
+            text_range.MoveEndpointByRange(_TEXT_ENDPOINT_END, doc, _TEXT_ENDPOINT_END)  # type: ignore[attr-defined]
+        if text_range.CompareEndpoints(_TEXT_ENDPOINT_START, doc, _TEXT_ENDPOINT_END) > 0:  # type: ignore[attr-defined]
+            text_range.MoveEndpointByRange(_TEXT_ENDPOINT_START, doc, _TEXT_ENDPOINT_END)  # type: ignore[attr-defined]
+        if text_range.CompareEndpoints(_TEXT_ENDPOINT_END, doc, _TEXT_ENDPOINT_START) < 0:  # type: ignore[attr-defined]
+            text_range.MoveEndpointByRange(_TEXT_ENDPOINT_END, doc, _TEXT_ENDPOINT_START)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _document_range(pattern: object) -> object:
+    """The Text pattern's own ``DocumentRange``, or ``None`` when it can't be read."""
+    try:
+        return pattern.DocumentRange  # type: ignore[attr-defined]
+    except Exception:
+        return None
+
+
 def _read_focus_snapshot(automation: object, context_chars: int) -> FocusSnapshot:
     """The focused element and its text around the caret.  Runs on the reader thread."""
     element = automation.GetFocusedElement()  # type: ignore[attr-defined]
@@ -5293,10 +5410,12 @@ def _read_focus_snapshot(automation: object, context_chars: int) -> FocusSnapsho
     snap.selection = _range_text(current, FOCUS_SELECTION_CHARS)
     around = max(int(context_chars), 0)
     if around:
+        doc = _document_range(pattern)   # fMsg P1: the text around the caret is the field's own, never the page's
         try:
             before = current.Clone()
             before.MoveEndpointByRange(_TEXT_ENDPOINT_END, current, _TEXT_ENDPOINT_START)
             before.MoveEndpointByUnit(_TEXT_ENDPOINT_START, _TEXT_UNIT_CHARACTER, -around)
+            _clamp_range(before, doc)
             snap.before = _range_text(before, around + 1)[-around:]
         except Exception:
             pass
@@ -5304,6 +5423,7 @@ def _read_focus_snapshot(automation: object, context_chars: int) -> FocusSnapsho
             after = current.Clone()
             after.MoveEndpointByRange(_TEXT_ENDPOINT_START, current, _TEXT_ENDPOINT_END)
             after.MoveEndpointByUnit(_TEXT_ENDPOINT_END, _TEXT_UNIT_CHARACTER, around)
+            _clamp_range(after, doc)
             snap.after = _range_text(after, around + 1)[:around]
         except Exception:
             pass
