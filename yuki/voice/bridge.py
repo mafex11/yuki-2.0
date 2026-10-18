@@ -941,6 +941,46 @@ class VoiceBridge(QObject):
         except Exception as exc:  # noqa: BLE001 - the ledger never breaks the bridge
             self._log("bridge_error", error=f"owe: {type(exc).__name__}: {exc}")
 
+    #: Phase 2 (2.3): the owed ledger's tokens for a hand's or skill's own outcome (negative: never a job's token).
+    _line_tokens = itertools.count(-1, -1)
+
+    def owe_line(self, text: str, kind: str = "failed") -> int | None:
+        """Phase 2 (2.3): code's own line for a hand's or skill run's non-success outcome, kept owed while the talker
+        says the outcome in its own words: the ledger says it by code only when no talker words are heard for it (its
+        run chose silence, wrote only calls, or never came in time). Returns its token (``drop_owed_line``), or
+        ``None`` with no ledger. Never raises."""
+        ledger = self.ledger
+        if ledger is None or not " ".join(str(text or "").split()):
+            return None
+        token = next(self._line_tokens)
+        try:
+            turns = int(self.user_turns()) if self.user_turns is not None else 0
+        except Exception:  # noqa: BLE001
+            turns = 0
+        try:
+            return token if ledger.owe(token, kind, text, turns) is not None else None
+        except Exception as exc:  # noqa: BLE001 - the ledger never breaks a hand
+            self._log("bridge_error", error=f"owe_line: {type(exc).__name__}")
+            return None
+
+    def drop_owed_line(self, token: int) -> None:
+        """Phase 2 (2.3): the talker acted on that outcome (its next call): code's fallback line is let go."""
+        if self.ledger is not None:
+            try:
+                self.ledger.drop(token)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def hold_owed_line(self, token: int, held: bool) -> None:
+        """Review r1 M4: code's fallback line held while the talker's next call for that outcome runs (``True``), or
+        due again because that call was not tried (``False``). Never raises."""
+        hold = getattr(self.ledger, "hold", None) if self.ledger is not None else None
+        if callable(hold):
+            try:
+                hold(token, held)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _unowe(self, job: Job) -> None:
         if self.ledger is not None:
             try:
@@ -1409,8 +1449,8 @@ class VoiceBridge(QObject):
     def last_not_done(self) -> str | None:
         """pVoice: the outcome of this conversation's newest finished spoken request when it really failed (its state
         ``FAILED`` or its verdict ``failed``, or ``unverified`` when it was asked to act and nothing acted), within
-        :attr:`LAST_NOT_DONE_S`, else ``None``: the hands' end check hands the rest of a request on with it ("try
-        another way" after the playlist run that did not get there), so the thinker never redoes that way. Review r1
+        :attr:`LAST_NOT_DONE_S`, else ``None``: the hands hand an open rest of a request on with it ("try another
+        way" after the playlist run that did not get there), so the thinker never redoes that way. Review r1
         M2: an answered question (``answer``), a request with no verdict and any other ending are no failure (the
         thinker is never told a false "ended not done"). Its own words (content: RAM only, never logged). Not one the
         user stopped or a newer request replaced. The job table's states and verdicts only."""
@@ -1449,19 +1489,6 @@ class VoiceBridge(QObject):
         with self._lock:
             jobs = list(self._jobs.values()) + list(self._unsubmitted.values()) + list(self._finished)
         return any(j.source == "voice" and not j.remember and not j.unadopted and j.user_turn == turn for j in jobs)
-
-    def answer_pending(self) -> bool:
-        """lVoice review r1 L8: whether a voice job waits on a question the user heard (:meth:`_answerable`) or a turn
-        of theirs is held as such an answer (a claim not settled yet). The hands' end check then hands no rest on:
-        :meth:`escalate` would route their words as that job's answer, though a hand already acted on them. State
-        only; ``True`` when it cannot be told (nothing is handed on then). Never raises."""
-        try:
-            claim = self._claim
-            if claim is not None and not claim.done and not claim.dropped:
-                return True
-            return self._answerable() is not None
-        except Exception:  # noqa: BLE001
-            return True
 
     async def note_planned(self, text: str) -> bool:
         """lVoice review r1 L2: a labelled note (code's words: a part of the reply the voice planned and did not run,
@@ -3022,7 +3049,16 @@ class VoiceBridge(QObject):
         if self.on_brain and self._results_by_code and kind == "done" and not job.remember and not job.superseded \
                 and ((job.brain_run and code_line(job.verdict)) or verdict_line(job.verdict, f"{head} {rest}")):
             # bTalk (design 3, "narrator re-voice off for code lines"): the brain's line after an act, or its own code
-            # line, is voice-shaped and says no more than the check saw: said by code word for word, late or not
+            # line, is voice-shaped and says no more than the check saw: said by code word for word, late or not.
+            # Phase 2 (2.3): only a success (checked or likely, whole): any other outcome (not confirmed, failed,
+            # partial, stuck, held, a refusal) is the talker's to word from the outcome's evidence, and this line
+            # waits in the owed ledger as its fallback (``_owed_words``). Review r1 M3: an outcome of a send (a lasting
+            # act: ``send`` set) keeps code's own line word for word, so no talker run can make it a "Sent."
+            lasting = isinstance(job.verdict, dict) and bool(job.verdict.get("send"))
+            if not success_line(job.verdict) and not lasting:
+                self._log("bridge", op="outcome_worded", job_id=job.job_id, said_by="talker",
+                          level=str((job.verdict or {}).get("level") or "") or None)
+                return None
             text = " ".join((head or "").split())
             if strip_tags(text).strip():
                 return sentences(text) or None
@@ -4175,6 +4211,16 @@ def code_line(verdict: dict[str, Any] | None) -> bool:
         return False
     level = str(verdict.get("level") or "")
     return level not in ("", "answer") or bool(str(verdict.get("line") or "").strip())
+
+
+def success_line(verdict: dict[str, Any] | None) -> bool:
+    """Phase 2 (2.3): whether a new-brain outcome's code line is a success said fast by code: level ``verified`` or
+    ``likely``, nothing of it partial or left open. Every other outcome (not confirmed, failed, partial, a stuck line, a
+    refusal or decline) is worded by the talker from its evidence. The outcome dict's own fields, never the words."""
+    if not isinstance(verdict, dict):
+        return False
+    level = str(verdict.get("level") or "")
+    return level in ("verified", "likely") and not verdict.get("partial") and not int(verdict.get("open") or 0)
 
 
 def verdict_line(verdict: dict[str, Any] | None, text: str | None) -> bool:
