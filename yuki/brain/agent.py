@@ -11,7 +11,13 @@ the done card, the island and the ledger read) or :class:`ErrorEvent`:
    the one done-check, and reports back (:class:`yuki.brain.plan.ExecResult`);
 3. done or unconfirmed -> the code line from the probe's evidence; a mismatch, a refusal or the user's correction ->
    a replan (at most 3 for an act plan, 5 model calls in all; an answer plan: 8 calls or 30 s); otherwise the code line
-   "I got stuck at ...".
+   "I got stuck at ...";
+4. P1.3 (18 Oct free-thinker plan): a done whose acts took something the user had (the executor's after-look: a
+   window that was in front, playing or holding the keyboard covered, the front taken, a pop-up left) gets one
+   tidy-up turn AFTER its line: the line goes out at once (a :class:`Say`), then one planner call with the "After:"
+   block and one principle, for at most two undoable window steps on what the request's own acts changed (place it,
+   give the front back); the :class:`Final` is the line and what the tidy-up did (``outcome["said_first"]``: the part
+   already said). Nothing flagged, or the user's tidy dial off: no turn, no cost.
 
 The executor runs push-style against :class:`yuki.brain.plan.ExecHost` (``emit``, a blocking ``ask``), so the request
 runs on its own worker thread and this generator only relays: events come through one queue (no polling), and an
@@ -66,6 +72,7 @@ from yuki.brain.context import (
     steer_blocks,
     swap_blocks,
     text_back_report,
+    tidy_report,
     tool_result,
     unconfirmed_report,
 )
@@ -149,7 +156,8 @@ STEP_WORDS: dict[str, str] = {
     "write_clipboard": "copying", "run_skill": "running your usual way", "open_yuki": "opening my window",
     "look": "looking", "memory": "checking memory", "fetch": "reading", "wait": "waiting",
 }
-#: The ``outcome`` dict's keys (``finish.outcome_verdict``'s, design M7).
+#: The ``outcome`` dict's keys (``finish.outcome_verdict``'s, design M7). A request that had a tidy-up turn adds
+#: ``said_first``: the start of its Final already put out as a :class:`Say` (P1.3, :meth:`Brain._tidy_ending`).
 OUTCOME_KEYS: tuple[str, ...] = ("level", "label", "acted", "seen", "send", "partial", "line", "step", "steps", "open")
 #: How long the generator waits for the worker after the caller dropped it (s).
 WORKER_JOIN_S = 5.0
@@ -194,6 +202,11 @@ TEXT_BACK_CALLS = 2
 #: ANSWER_PART_CALLS to the act budget (code's question).
 ANSWER_PARTS_MAX = 1
 ANSWER_PART_CALLS = 1
+#: P1.3 (18 Oct free-thinker plan): a done act request whose acts took something the user had (the executor's
+#: after-look) gets one tidy-up turn after its line is said (one per request: the turn's own acts are never looked at
+#: again). The turn is exactly one model call (whatever comes back ends it); it adds TIDY_CALLS to the act budget
+#: (code's question). No flag: no turn, no cost.
+TIDY_CALLS = 1
 #: The read verbs whose results are content for the user (a look reads the screen to check or to find a control).
 ANSWER_READ_VERBS: frozenset[str] = frozenset({"memory", "fetch"})
 #: pBrain (B35, bRound2 "Sending to हेमंत"): the bound on the people-index read that gives a spoken line memory's own
@@ -305,6 +318,11 @@ class _State:
     #: (:func:`answer_due`), and the held ending that turn put up (:attr:`held` while no other ending replaced it).
     answer_parts: int = 0
     answer_held: tuple[str, dict[str, Any]] | None = None
+    #: P1.3: the tidy-up turn was given (once per request), the ending it holds (its line, already said), and the
+    #: executor's list of what its steps did (their words, said after that line).
+    tidied: bool = False
+    tidy_held: tuple[str, dict[str, Any]] | None = None
+    tidy_words: list[str] = field(default_factory=list)
     #: pBrain review r1 (L1): how many of the user's words (``Host.user_words``: their turns, steers, answers to a
     #: question) there were when the last plan began; words added since mean the user spoke after it (a steer folded
     #: into its report, an answer), and :func:`text_back` then leaves their reply to the planner's reading of them.
@@ -1655,6 +1673,7 @@ class Brain:
                         parts_ms=gathered.parts_ms)
         host.nonce = nonce
         executor = self._executor_for(host, req)
+        self._executor = executor
         host.desk = getattr(executor, "lease", None)
         try:
             self._loop(req, host, state, bs, conv, system, effort, gathered, sends, executor, nonce)
@@ -1686,7 +1705,8 @@ class Brain:
         ``answer_calls`` or ``answer_s`` of work."""
         if state.kind == "act":
             return state.calls < (bs.act_calls + state.part_rests * PART_REST_CALLS
-                                  + state.text_backs * TEXT_BACK_CALLS + state.answer_parts * ANSWER_PART_CALLS)
+                                  + state.text_backs * TEXT_BACK_CALLS + state.answer_parts * ANSWER_PART_CALLS
+                                  + int(state.tidied) * TIDY_CALLS)
         work_s = time.monotonic() - req.started - self._waited_s
         return state.calls < bs.answer_calls and work_s < bs.answer_s
 
@@ -1709,8 +1729,10 @@ class Brain:
             params = build_params(model=bs.model, max_tokens=state.max_tokens or bs.max_tokens, system=system,
                                   messages=conv.messages(), effort=effort, thinking_display=bs.thinking_display,
                                   stream=bs.stream, eager=bs.eager)
+            # a tidy-up turn's steps are said after the request's line, never as they stream (P1.3)
             call = ModelCall(self.client, params, checks=checks, emit=self._push, cancelled=self._cancelled.is_set,
-                             log=self.logger.log, voice=req.channel == "voice", stream=bs.stream)
+                             log=self.logger.log, voice=req.channel == "voice" and not self._tidying(state),
+                             stream=bs.stream)
             state.calls += 1
             result: ExecResult | None = None
             try:
@@ -1733,6 +1755,12 @@ class Brain:
             self._record_call(resp, call, exec_s=self._last_exec_s if result is not None else 0.0)
             if result is not None and _acted(result):
                 state.acted = True
+            if self._tidying(state):
+                # P1.3 (review M2): the tidy-up turn is one model call, plan-only: whatever came back ends it here (a
+                # plan's steps already ran under the executor's tidy gate; any other tool is never run)
+                if self._after_tidy(call, resp, result, state, bs, conv, host):
+                    return
+                continue
             if resp.broken or resp.stop_reason == "max_tokens":
                 if self._after_cutoff(call, result, resp, state, bs, conv, host):
                     return
@@ -1812,6 +1840,10 @@ class Brain:
             return ExecResult(status="refused", reason="needs_hands", line=LINE_NEEDS_HANDS, final=True)
         if header.kind == "act":
             state.kind = "act"
+        elif self._tidying(state):
+            # the tidy-up turn only acts (undoable window steps) or says nothing: never a question or a read plan
+            source.complete()
+            return ExecResult(status="refused", reason="tidy_only")
         if header.kind == "ask":
             plan = source.complete()
             if plan is None:
@@ -2007,7 +2039,8 @@ class Brain:
             "probe": str(getattr(found, "probe", "") or "") if found is not None else "",
             "line": str(getattr(got, "line", "") or ""), "check_calls": checks,
             "outcome": getattr(got, "outcome", None), "final": bool(getattr(got, "final", False)),
-            "parts": [str(p) for p in getattr(got, "parts", None) or [] if str(p or "").strip()]}
+            "parts": [str(p) for p in getattr(got, "parts", None) or [] if str(p or "").strip()],
+            "after": str(getattr(got, "after", "") or "")}
         status = str(getattr(got, "status", "") or "error")
         if status == "done":
             # "done" only when the check saw it; any other reading is said as not confirmed, with the executor's line
@@ -2214,6 +2247,9 @@ class Brain:
                 conv.add_user([tool_result(tool_id, answer_part_report(result, plan, line)), *extra,
                                *self._steer_turn(host)])
                 return False
+            if status != "declined" and self._tidy_turn(result, plan, line, outcome, state, bs, conv, extra, host,
+                                                        tool_id):
+                return False
             self._final(line, outcome)
             return True
         if result.final and result.line and status in ("refused", "stopped") and not self._cancelled.is_set():
@@ -2263,6 +2299,87 @@ class Brain:
         conv.add_user([tool_result(tool_id, step_report(result, plan, limit=bs.result_chars, replans_left=left)),
                        *extra, *blocks, *self._steer_turn(host)])
         return False
+
+    # -- the look after acting (P1.3) ---------------------------------------------------------------------------------
+
+    @staticmethod
+    def _tidying(state: _State) -> bool:
+        """The tidy-up turn is running: its held ending is the one up."""
+        return state.tidy_held is not None and state.held is state.tidy_held
+
+    def _tidy_turn(self, result: ExecResult, plan: Plan | None, line: str, outcome: dict[str, Any], state: _State,
+                   bs: BrainSettings, conv: Conversation, extra: list[dict[str, Any]], host: Host,
+                   tool_id: str) -> bool:
+        """One tidy-up turn when the executor's after-look flagged what the request's acts did (``result.after``) and
+        the user's tidy dial is not off. The request's line goes out first (review H1: a :class:`Say`, at once: the
+        voice says it, the strip shows it; nothing waits on the turn), then the planner gets the "After:" block and
+        the principle (:func:`tidy_report`) for exactly one call, and the executor takes only undoable window steps on
+        what the request's own acts changed. ``True`` when the turn was given."""
+        executor = getattr(self, "_executor", None)
+        if (not result.after or state.tidied or executor is None or not hasattr(executor, "tidy_up")
+                or self._cancelled.is_set()):
+            return False
+        from yuki.brain.util import TIDY_ASK, TIDY_OFF, tidy_mode
+
+        mode = tidy_mode()
+        if mode == TIDY_OFF:
+            self.logger.log("brain_tidy", given=False, why="off")
+            return False
+        state.tidied = True   # counted before the budget is read: the turn's own call is in it
+        if not self._budget_left(state, bs, self._req):
+            self.logger.log("brain_tidy", given=False, why="budget")
+            return False
+        from yuki.brain.executor import TIDY_STEPS
+
+        executor.tidy_up(mode)
+        state.tidy_words = executor.tidy["words"]
+        state.held = state.tidy_held = (line, outcome)
+        self._push(Say(line))
+        self.logger.log("brain_tidy", given=True, mode=mode, status=result.status, said_first=True)
+        report = tidy_report(plan, line, result.after, nonce=str(getattr(host, "nonce", "") or ""),
+                             ask=mode == TIDY_ASK, steps=TIDY_STEPS)
+        conv.add_user([tool_result(tool_id, report), *extra, *self._steer_turn(host)])
+        return True
+
+    def _after_tidy(self, call: ModelCall, resp: CallResult, result: ExecResult | None, state: _State,
+                    bs: BrainSettings, conv: Conversation, host: Host) -> bool:
+        """The tidy-up turn's one call came back (a plan that ran, a plain reply, any other tool, a cut-off, a
+        refusal): the turn ends (review M2: nothing else runs in it). Its ending (:meth:`_tidy_ending`) is the
+        request's Final; when the user added words meanwhile (review L5), that ending is held instead and their words
+        are a normal turn (the ending stands if nothing more needs doing). ``True`` when the request ended."""
+        text, outcome = self._tidy_ending(state, result)
+        whole = not resp.broken and resp.stop_reason not in ("max_tokens", "refusal")
+        if (whole and self._steer_waiting() and not self._cancelled.is_set()
+                and self._budget_left(state, bs, self._req)):
+            state.held = (text, outcome)
+            self.logger.log("steer", held_final="tidy")
+            conv.add_assistant(resp.content)
+            source = call.plan
+            report = held_report(result if result is not None else {"status": "done"},
+                                 source.plan if source is not None else None, text)
+            blocks = ([tool_result(resp.tool.id, report), *self._extra_tools(resp)] if resp.tool is not None
+                      else [{"type": "text", "text": report}])
+            conv.add_user([*blocks, *self._steer_turn(host)])
+            return False
+        self._final(text, outcome)
+        return True
+
+    def _tidy_ending(self, state: _State, result: ExecResult | None) -> tuple[str, dict[str, Any]]:
+        """The tidy-up turn is over: ``(text, outcome)``, the request's line (said already) then the words of each tidy
+        step whose own read-back saw it change something (the executor's list; none: the line alone, "otherwise stay
+        quiet"). The text is the whole record (the chat, memory); ``outcome["said_first"]`` is the part the
+        :class:`Say` already put out, so the voice need not say it again. Ends the turn's state."""
+        held_line, held_outcome = state.tidy_held or ("", {})
+        said = " ".join(" ".join(str(w).split()) for w in state.tidy_words if str(w).strip())
+        text = f"{held_line.rstrip()} {said}".strip() if said else held_line
+        outcome = {**dict(held_outcome or {}), "said_first": held_line, **({"line": text} if said else {})}
+        self.logger.log("brain_tidy", ended=True, acts=len(state.tidy_words),
+                        status=result.status if result is not None else None)
+        state.tidy_held = None
+        executor = getattr(self, "_executor", None)
+        if executor is not None and hasattr(executor, "tidy"):
+            executor.tidy = None
+        return text, outcome
 
     def _steer_turn(self, host: Host) -> list[dict[str, Any]]:
         """What the user added mid-task, taken now: their own words for the next call (and for the consent rule), and

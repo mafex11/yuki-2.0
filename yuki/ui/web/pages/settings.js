@@ -52,9 +52,10 @@
     return [h('div', { class: 'dial-h' }, h('span'), rungs.map((r) => h('span', { text: r.words }))),
       A.kinds.map((k) => h('div', { class: 'dial-r' }, h('div', { class: 'k' }, k.words, k.note ? h('small', { text: k.note }) : null),
         h('div', { class: 'dial', attrs: { role: 'radiogroup', 'aria-label': k.words } }, rungs.map((r, j) => {
-          const cur = rank(k.level), over = j > rank(k.max);
+          // a kind whose rungs read differently (tidy: Off / Ask first / Do it and tell me) labels them its way
+          const cur = rank(k.level), over = j > rank(k.max), words = (k.level_words && k.level_words[r.key]) || r.words;
           return h('button', { class: j === cur ? 'on' : j < cur ? 'fill' : '', data: { do: 'dial', kind: k.key, level: r.key },
-            attrs: { type: 'button', role: 'radio', 'aria-checked': String(j === cur), 'aria-label': r.words, disabled: over, title: over ? (k.note || 'Not allowed for this kind') : r.words } }, h('i'));
+            attrs: { type: 'button', role: 'radio', 'aria-checked': String(j === cur), 'aria-label': words, disabled: over, title: over ? (k.note || 'Not allowed for this kind') : words } }, h('i'));
         })))),
       dialSentence(A),
       (A.fixed_rules || []).length ? h('ul', { class: 'fixed-rules' }, A.fixed_rules.map((t) => h('li', { text: '· ' + t }))) : null];

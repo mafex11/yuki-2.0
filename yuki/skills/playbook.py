@@ -279,7 +279,7 @@ def ways(store: Any, now: float) -> list[dict[str, Any]]:
     name, app, how it was learned (its provenance: demonstrations, days, first and last; or the user told it), how
     often Yuki ran it, and the user's things in it (``spec["item"]["things"]``: their projects); never offered."""
     try:
-        from yuki.skills.learn.ways import app_title, live_ways
+        from yuki.skills.learn.ways import app_title, group_words, live_ways
 
         rows = live_ways(store)
     except Exception:  # noqa: BLE001
@@ -299,11 +299,13 @@ def ways(store: Any, now: float) -> list[dict[str, Any]]:
         used = (f"Yuki ran it {_plural(uses, 'time')}" + (f", last {_day_words(last, now)}" if last else "")
                 if uses else "Runs when you ask; never offered")
         spec = w.get("spec") or {}
-        noun = str(spec.get("item_noun") or p.get("item_noun") or "thing")
+        # the things are the groups the rows sit under, by the naming call's group noun ("projects"), not the rows'
+        # item noun ("threads"); the provenance's copy when the spec has none
+        noun = group_words({k: spec.get(k) or p.get(k) for k in ("group_noun", "item_noun")})
         things = [t for t in ((spec.get("item") or {}).get("things") or []) if isinstance(t, dict) and t.get("name")]
         out.append({"ref": f"{REF_PREFIX}{int(w['id'])}", "name": _clip(name or "Your way", 60),
                     "app": app_title(str(w.get("app") or "")), "seen": seen, "used": used,
-                    "things_title": f"Your {noun} groups" if things else "",
+                    "things_title": f"Your {noun}" if things else "",
                     "things": [_clip(t["name"], 40) + (f" · {_plural(int(t['days']), 'day')}" if t.get("days") else "")
                                for t in things[:12]],
                     "your_name": p.get(NAMED_BY) == NAMED_BY_USER})

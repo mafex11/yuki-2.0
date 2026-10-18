@@ -32,9 +32,18 @@ clicked at run time only when the user's words name them (their own visible name
 
 **Privacy.** Never typed text, never an item's name (a thread title). The user's things in the item slot are kept only
 as **group labels**: a part of the items' composite names (UI Automation joins a row's texts with ", ") that stays put
-on each item and is shared by at least :data:`THING_MIN_ITEMS` items (T3 Code's project names), with counts and days.
-A way is everyday only when the naming judgment says so; a work app's way is never offered and never a routine: it
-runs only when asked (``everyday = false``).
+on each item, is never an item's own text (its first part) and is carried by items with at least
+:data:`THING_MIN_ITEMS` different own texts, with counts and days. In T3 Code these are the projects the user picks
+threads under: each sidebar row reads "<thread title>[, <status>], <project>" (checked 18 Oct against T3's own project
+list: every row whose thread is on this PC carried its own project's title; the trace keeps no parent identity for a
+row, only its index and its parent's role, so the row's own label is the structure there is).
+
+**Naming.** One small model call names a new way from its structure only (:func:`_describe`: the steps with how many
+demonstrations took each, the rows' group labels, the app's command labels, never a row's own text) and gives the
+nouns of its rows and of their groups ("thread", "project"). A model name from older inputs (:data:`NAMING_V`) is
+asked again once at the next pass (kept when that call fails); the user's own name is never replaced. A way is
+everyday only when the naming judgment says so; a work app's way is never offered and never a routine: it runs only
+when asked (``everyday = false``).
 
 **Rows.** ``skills`` with ``origin = 'learned_way'`` and ``capability_id`` the ``app.way`` capability's row (contract
 C4); name and spec encrypted; provenance content-free. The nightly learner calls :func:`learn` (guarded);
@@ -93,6 +102,9 @@ TEXT_KINDS = frozenset({"type", "paste", "keys"})
 #: Model calls one pass makes at most (naming new ways, borderline merges).
 MAX_MODEL_CALLS = 6
 NAME_CHARS = 60
+#: The naming inputs' version: a model name given from older inputs is asked again (2: the steps' counts, the groups'
+#: noun, no row texts among the controls; pMem 18 Oct, after "type and submit code message in T3 Code").
+NAMING_V = 2
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -154,6 +166,7 @@ class Way:
     name: str = ""
     everyday: bool = False
     named_by: str = ""
+    naming_v: int = 0
 
     @property
     def days(self) -> int:
@@ -411,22 +424,26 @@ def things(store: Any, app: str, role: str, parent: str, *, since: float, until:
     # an item's own text comes first in its composite name (a thread's title); a group label never does
     own: set[str] = {p[0] for names in variants.values() for p in names if p}
     stable_by_item: dict[str, set[str]] = {}
+    own_of: dict[str, str] = {}
     for ident, names in variants.items():
         alls = [set(p) for p in names]
         common = set.intersection(*alls) if alls else set()
         unstable |= set.union(*alls) - common if alls else set()
         stable_by_item[ident] = common - own
-    carriers: Counter[str] = Counter()
+        own_of[ident] = next((p[0] for p in names if p), "")
+    # a label is carried by items with different own texts: a title's own later parts ("Fix login, add tests"), seen on
+    # one row drawn twice with no AutomationId, are never a group
+    carriers: dict[str, set[str]] = defaultdict(set)
     for ident, parts in stable_by_item.items():
         for p in parts:
-            carriers[p] += 1
-    labels = {p for p, n in carriers.items() if n >= THING_MIN_ITEMS and p not in unstable}
+            carriers[p].add(own_of[ident])
+    labels = {p for p, owners in carriers.items() if len(owners) >= THING_MIN_ITEMS and p not in unstable}
     picks: dict[str, list[float]] = defaultdict(list)
     for ek, ats in clicks.items():
         ident = item_of.get(ek)
         for p in stable_by_item.get(ident or "", set()) & labels:
             picks[p].extend(ats)
-    out = [{"name": p, "items": carriers[p], "picks": len(picks.get(p, [])),
+    out = [{"name": p, "items": len(carriers[p]), "picks": len(picks.get(p, [])),
             "days": len({_day(a) for a in picks.get(p, [])}), "last": max(picks.get(p, [0.0]))} for p in labels]
     out.sort(key=lambda t: (-t["days"], -t["picks"], t["name"].casefold()))
     return out[:MAX_THINGS]
@@ -482,18 +499,18 @@ def template(store: Any, demos: Sequence[Demo], *, now: float) -> dict[str, Any]
 
 NAME_TOOL = {
     "name": "name_way",
-    "description": "Name one way the user does something in one app, and say whether it is their work.",
+    "description": "Name one way the user does something in one app; say whether it is their work.",
     "input_schema": {"type": "object", "properties": {
-        "name": {"type": "string", "description": "3-8 plain words, a verb first: what the whole way achieves, "
-                                                  "judged by its END (what submitting the typed text does in this "
-                                                  "app, read from the app's title and controls: who or what receives "
-                                                  "it, when the controls show that), with the app's name; never its "
-                                                  "first click. No people's names, no content."},
-        "everyday": {"type": "boolean", "description": "true only when this is clearly part of everyday life; false "
-                                                       "when it is, or may be, the user's work."},
-        "item_noun": {"type": "string", "description": "One word for what the list items are in this app (e.g. "
-                                                       "'project', 'chat', 'board'), or ''."}},
-        "required": ["name", "everyday", "item_noun"]},
+        "name": {"type": "string", "description": "3-8 plain words, a verb first, with the app's name: the goal "
+                                                  "reached at the END (what submitting the text does, as the app's "
+                                                  "controls show: who or what receives it), never the steps. No "
+                                                  "people's names, no content."},
+        "everyday": {"type": "boolean", "description": "true only when clearly part of everyday life; false when it "
+                                                       "is, or may be, their work."},
+        "item_noun": {"type": "string", "description": "One word for the list's rows ('chat', 'thread'), or ''."},
+        "group_noun": {"type": "string", "description": "One word for the groups the rows sit in ('project'), "
+                                                        "or ''."}},
+        "required": ["name", "everyday", "item_noun", "group_noun"]},
 }
 SAME_TOOL = {
     "name": "same_goal",
@@ -506,19 +523,32 @@ SYSTEM = ("You name ways a person does things on their PC, from the structure of
 
 
 def _describe(spec: Mapping[str, Any], app_title: str) -> list[str]:
+    """A way's structure for the model (never a row's own text, never typed text): the steps with how many of the
+    demonstrations took each, the rows' group labels and the nouns an earlier pass gave."""
+    ev = spec.get("evidence") or {}
+    n = int(ev.get("demos") or 0)
     lines = [f"app: {app_title}"]
+    if n:
+        lines.append(f"done {n} times on {int(ev.get('days') or 0)} days, each ending the same way; each step with how "
+                     f"many of the {n} took it:")
+
+    def share(k: Any) -> str:
+        return f" ({int(k)} of {n})" if n and k else ""
+
     for s in spec.get("steps") or []:
         if s.get("do") == "item":
             item = spec.get("item") or {}
             labels = [t["name"] for t in item.get("things") or []][:8]
-            lines.append(f"- pick one item of a list ({item.get('role')} rows)"
-                         + (f"; the rows are grouped under: {', '.join(labels)}" if labels else ""))
+            rows = f"{item.get('role')} rows" + (f": {spec['item_noun']}s" if spec.get("item_noun") else "")
+            lines.append(f"- pick one row of a list ({rows}){share(item.get('demos'))}"
+                         + (f"; each row carries the {spec.get('group_noun') or 'group'} it sits under, one of: "
+                            f"{', '.join(labels)}" if labels else ""))
         elif s.get("do") == "control":
-            lines.append(f"- sometimes: click {s.get('role')} \"{s.get('name')}\"")
+            lines.append(f"- click {s.get('role')} \"{s.get('name')}\"{share(s.get('demos'))}")
         elif s.get("do") == "field":
             lines.append("- click the app's text field")
         elif s.get("do") == "text":
-            lines.append("- type text there")
+            lines.append(f"- type text there{share(ev.get('typed'))}")
     keys = "+".join((spec.get("end") or {}).get("keys") or [])
     lines.append(f"- press {keys or 'the end key'}: the text is submitted")
     return lines
@@ -561,7 +591,8 @@ class Judge:
             return None
         self.calls += 1
         text = "\n".join(_describe(spec, app_title)
-                         + (["other controls of this app: " + "; ".join(labels[:15])] if labels else []))
+                         + (["the app's controls (their own labels, most used first): " + "; ".join(labels[:15])]
+                            if labels else []))
         try:
             return _ask(self.client, NAME_TOOL, text, model=self.model)
         except Exception as exc:  # noqa: BLE001
@@ -602,18 +633,23 @@ def _app_title(app: str) -> str:
 
 
 def _labels(store: Any, app: str) -> list[str]:
-    """The app's command controls' own labels, most used first (context for naming; never content)."""
+    """The app's command controls' own labels, most used first (context for naming; never content): never a row of a
+    set (an element the trace saw clicked at an index: a sidebar's thread drawn as a Button) and never a composite
+    name (a row's texts joined with ", "), so no thread title reaches the call."""
     from yuki.memory.store import app_key
 
     out: list[str] = []
     try:
-        for r in store._query("SELECT process, name_ciphertext FROM ui_elements WHERE name_class = 'command' AND "
-                              "name_ciphertext IS NOT NULL AND role IN ('Button', 'MenuItem', 'ComboBox', 'Tab', "
-                              "'TabItem') ORDER BY n DESC LIMIT 300"):
-            if (app_key(str(r["process"] or "")) or "") == app:
-                name = " ".join(str(store._dec(r["name_ciphertext"]) or "").split())
-                if name and len(name) <= 30 and name not in out:
-                    out.append(name)
+        rows = {str(r[0]) for r in store._query("SELECT DISTINCT element_key FROM ui_actions WHERE element_key IS NOT "
+                                                "NULL AND position GLOB '[0-9]*/*'")}
+        for r in store._query("SELECT process, element_key, name_ciphertext FROM ui_elements WHERE name_class = "
+                              "'command' AND name_ciphertext IS NOT NULL AND role IN ('Button', 'MenuItem', "
+                              "'ComboBox', 'Tab', 'TabItem') ORDER BY n DESC LIMIT 300"):
+            if (app_key(str(r["process"] or "")) or "") != app or str(r["element_key"]) in rows:
+                continue
+            name = " ".join(str(store._dec(r["name_ciphertext"]) or "").split())
+            if name and len(name) <= 30 and len(_parts(name)) == 1 and name not in out:
+                out.append(name)
     except Exception:  # noqa: BLE001
         pass
     return out[:15]
@@ -702,20 +738,26 @@ def learn(store: Any, *, now: float | None = None, client: Any = None, settings:
             prev = old.get(way.key)
             prev_name = (prev or {}).get("name") or ""
             prov = (prev or {}).get("prov") or {}
-            if prev_name and prov.get("named_by") in ("model", "user"):
+            named = bool(prev_name) and prov.get("named_by") in ("model", "user")
+            if named:
                 way.name, way.everyday, way.named_by = prev_name, bool(prov.get("everyday")), str(prov["named_by"])
-                if prov.get("item_noun"):
-                    way.spec["item_noun"] = prov["item_noun"]
-            else:
-                got = judge.name(way.spec, _app_title(way.app), _labels(store, way.app))
-                name = " ".join(str((got or {}).get("name") or "").split())[:NAME_CHARS]
-                if name:
-                    way.name, way.everyday, way.named_by = name, bool((got or {}).get("everyday")), "model"
-                    noun = " ".join(str((got or {}).get("item_noun") or "").split())[:20]
+                way.naming_v = int(prov.get("naming_v") or 1)
+                for k in ("item_noun", "group_noun"):
+                    if prov.get(k):
+                        way.spec[k] = prov[k]
+            if named and (way.named_by == "user" or way.naming_v >= NAMING_V):
+                continue
+            got = judge.name(way.spec, _app_title(way.app), _labels(store, way.app))
+            name = " ".join(str((got or {}).get("name") or "").split())[:NAME_CHARS]
+            if name:
+                way.name, way.everyday, way.named_by = name, bool((got or {}).get("everyday")), "model"
+                way.naming_v = NAMING_V
+                for k in ("item_noun", "group_noun"):
+                    noun = " ".join(str((got or {}).get(k) or "").split())[:20]
                     if noun:
-                        way.spec["item_noun"] = noun
-                else:
-                    way.name, way.everyday, way.named_by = f"your way in {_app_title(way.app)}", False, ""
+                        way.spec[k] = noun
+            elif not named:   # a named way keeps its name until a call answers
+                way.name, way.everyday, way.named_by = f"your way in {_app_title(way.app)}", False, ""
         counts["model_calls"] = judge.calls
         counts["ways"] = len(live)
         if write:
@@ -735,7 +777,8 @@ def _provenance(way: Way) -> dict[str, Any]:
     ev = way.spec.get("evidence") or {}
     return {"v": SPEC_VERSION, "learned_by": "ways", "demos": int(ev.get("demos") or 0),
             "days": int(ev.get("days") or 0), "first": ev.get("first"), "last": ev.get("last"),
-            "everyday": bool(way.everyday), "named_by": way.named_by, "item_noun": way.spec.get("item_noun", ""),
+            "everyday": bool(way.everyday), "named_by": way.named_by, "naming_v": int(way.naming_v),
+            "item_noun": way.spec.get("item_noun", ""), "group_noun": way.spec.get("group_noun", ""),
             "offer": "never" if not way.everyday else "asked_only"}
 
 
@@ -863,6 +906,16 @@ def app_title(app: str) -> str:
     return _app_title(app)
 
 
+def group_words(spec: Mapping[str, Any]) -> str:
+    """What a way's things are, in words: the naming call's noun for the groups ("projects"), else "<row noun>
+    groups" ("thread groups"), else "groups"."""
+    group = " ".join(str(spec.get("group_noun") or "").split())
+    if group:
+        return group if group.endswith("s") else group + "s"
+    item = " ".join(str(spec.get("item_noun") or "").split())
+    return f"{item} groups" if item else "groups"
+
+
 def menu_lines(store: Any, ways: Sequence[Mapping[str, Any]] | None = None) -> list[str]:
     """One line per live way for a menu or the you-card: its name, its key as the ``way`` slot's value (``[way =
     app.way#...]``), app, item noun and top things, and the item values its controls take (their own labels, exactly
@@ -872,7 +925,7 @@ def menu_lines(store: Any, ways: Sequence[Mapping[str, Any]] | None = None) -> l
     for w in (live_ways(store) if ways is None else ways):
         item = (w["spec"].get("item") or {})
         things_ = [t["name"] for t in item.get("things") or []][:5]
-        noun = str(w["spec"].get("item_noun") or "item")
+        noun = group_words(w["spec"])
         controls = [(" ".join(str(s.get("name") or "").split()), str(s.get("role") or "control"))
                     for s in w["spec"].get("steps") or []
                     if isinstance(s, dict) and s.get("do") == "control" and str(s.get("name") or "").strip()]
@@ -949,4 +1002,4 @@ if __name__ == "__main__":
 __all__ = ["CAPABILITY", "ORIGIN", "END_FACTS", "MAX_WAYS", "Step", "Demo", "Way", "demonstrations", "group_key",
            "passes", "kept_places", "merge_groups", "things", "template", "way_key", "find", "learn", "keep_told",
            "live_ways", "menu_lines", "control_labels", "note_use", "name_digest", "container_digest", "covered_apps",
-           "capability_id", "app_title"]
+           "capability_id", "app_title", "group_words", "NAMING_V"]

@@ -237,14 +237,15 @@ STABLE_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral", "ttl": "1h"}
 LEVELS: tuple[str, ...] = ("suggest", "show_plan", "ask", "do_and_tell")
 #: Each kind's default and ceiling (``yuki.ui.policy.KINDS``; a test keeps the two in step).
 POLICY_DEFAULTS: dict[str, str] = {"read_screen": "do_and_tell", "open_apps": "do_and_tell", "click_type": "do_and_tell",
-                                   "send_messages": "ask", "files": "show_plan", "money": "suggest"}
+                                   "send_messages": "ask", "files": "show_plan", "money": "suggest",
+                                   "tidy": "do_and_tell"}
 POLICY_CEILINGS: dict[str, str] = {"read_screen": "do_and_tell", "open_apps": "do_and_tell",
                                    "click_type": "do_and_tell", "send_messages": "ask", "files": "do_and_tell",
-                                   "money": "ask"}
+                                   "money": "ask", "tidy": "do_and_tell"}
 #: How each kind and level reads in the judge's request.
 KIND_WORDS: dict[str, str] = {"read_screen": "Read the screen", "open_apps": "Open apps and windows",
                               "click_type": "Click and type", "send_messages": "Send messages", "files": "Files",
-                              "money": "Money"}
+                              "money": "Money", "tidy": "Tidy-ups inside my requests"}
 LEVEL_WORDS: dict[str, str] = {"suggest": "Just suggest", "show_plan": "Show me the plan",
                                "ask": "Ask before doing", "do_and_tell": "Do it and tell me"}
 
@@ -420,6 +421,22 @@ def _shared_reader() -> PolicyReader:
 
 
 # -- yuki/agent/judge.py lines 266-271
+#: P1.5: the tidy dial's modes (``yuki.ui.policy`` kind ``tidy``): do it and tell me, ask first, off.
+TIDY_DO, TIDY_ASK, TIDY_OFF = "do", "ask", "off"
+
+
+def tidy_mode(reader: "PolicyReader | None" = None) -> str:
+    """The user's tidy dial ("Tidy-ups inside my requests"): :data:`TIDY_DO` (``do_and_tell``), :data:`TIDY_ASK`
+    (``ask`` / ``show_plan``) or :data:`TIDY_OFF` (``suggest``). An unreadable policy reads as its default (do it and
+    tell me: tidy-ups only undo Yuki's own undoable side effects). The talker and the brain read the same dial. Never
+    raises."""
+    try:
+        level = (reader or _shared_reader()).levels().get("tidy", POLICY_DEFAULTS["tidy"])
+    except Exception:  # noqa: BLE001 - the default
+        level = POLICY_DEFAULTS["tidy"]
+    return TIDY_DO if level == "do_and_tell" else TIDY_OFF if level == "suggest" else TIDY_ASK
+
+
 def suggest_only(traits: Traits, levels: dict[str, str]) -> str | None:
     """The kind of this call the user set to "just suggest" (never act on it), or ``None``."""
     for kind in traits.kinds:
@@ -489,7 +506,8 @@ def skill(key: Any) -> Any:
         return None
 
 
-__all__ = ["ANSWER", "CONTAINER_SHARE", "EXPECTED_UNVERIFIABLE", "KIND_WORDS", "LEVELS", "LEVEL_LABELS", "LEVEL_WORDS",
+__all__ = ["TIDY_ASK", "TIDY_DO", "TIDY_OFF", "tidy_mode",
+           "ANSWER", "CONTAINER_SHARE", "EXPECTED_UNVERIFIABLE", "KIND_WORDS", "LEVELS", "LEVEL_LABELS", "LEVEL_WORDS",
            "LIKELY", "LINE_FAILED", "LINE_NOTHING_DONE", "LINE_NOT_CHECKED", "LINE_PARTIAL", "LINE_SEND_UNCONFIRMED",
            "LINE_UNREAD", "LINE_UNVERIFIED", "PAGE_SCROLL_UNVERIFIABLE", "POLICY_CEILINGS", "POLICY_DEFAULTS",
            "PolicyReader", "SAYABLE", "SIMILAR", "STABLE_CACHE_CONTROL", "CONTRADICTED", "EXPECTED", "FAILED",
