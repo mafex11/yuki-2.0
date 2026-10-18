@@ -4122,11 +4122,11 @@ class Conversation:
         ok, report, facts = False, "", {}
         try:
             if tool == "run_skill":
-                ok, report, facts = hands._skill_hand(args, hand_id, rec["turn_key"])
+                ok, report, facts = hands._skill_hand(args, hand_id, rec["turn_key"], bracket=False)
                 for name in ("_prefs", "_values", "_tried", "_words"):
                     facts.pop(name, None)
             else:
-                ok, report, facts = hands._acting_run(tool, args, hand_id)
+                ok, report, facts = hands._acting_run(tool, args, hand_id, bracket=False)
             if refused_first(facts):
                 # review r2 M2: refused before anything went out (a halt set meanwhile, a game, the thinker on the
                 # desktop, a check): nothing was tried, so it is a skip (no action-log line, no step, no trace, no

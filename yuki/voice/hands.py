@@ -57,16 +57,27 @@ call did goes to the thinker by code (problem 3, multi 0 of 6). After a failed h
 let through in the same turn; a hand refused after that is "not tried", never a failure (problem 7).
 ``say_when_done`` and ``then`` are optional; left out, code says its own line where it has one (fix d).
 
-The desktop summary (:meth:`Hands.snapshot`) is the brain's own overview
-(``format_overview``) plus the media sessions, the foreground window's tabs and
-the action log, captured off the event loop for every mouth call and put in the
-volatile block after every cache breakpoint. Sizes and times go to the voice log
-(content-free).
+The desktop summary (:meth:`Hands.snapshot`) is the Situation (P1.1, 18 Oct free-thinker plan:
+:func:`yuki.perception.situation.render` of the overview the hands read, per monitor, top window first, what is in
+front, covered, playing, with the ``[hwnd]`` ids the hands use, and the sound) plus the foreground window's tabs, its
+items and the action log, captured off the event loop for every mouth call and put in the volatile block after every
+cache breakpoint. Sizes and times go to the voice log (content-free).
+
+**Look after acting (P1.2-P1.4).** Each window-touching hand and each skill run that takes focus is bracketed by two
+desk reads (:meth:`Hands._desk_read`, right before the act and once its done line is queued) and compared
+(:func:`yuki.perception.diff.compare`). Only when the act took something the user had (it covered the window in
+front, playing or holding the keyboard; took the focus; left a pop-up) does the talker get one more run after the done
+line, with the "After:" lines and one principle: keep their screen theirs (:data:`_AFTER_NOTE`; the Settings tidy
+dial, ``ui.policy`` kind ``tidy``, can make it ask first or turn it off). Nothing flagged: the done line ends the call
+as before (``run_llm=False``), no model call. At most one look per user turn; its tidy-ups (the window hand's
+``move``, ``focus_back``, ``undo``: :mod:`yuki.actions.place`, all undoable, never judged, gated for games) are never
+looked after again.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 from collections import deque
@@ -134,6 +145,50 @@ _ACT_OFF_NOTE = (
 
 _WINDOW = {"type": "integer", "description": "The window's [hwnd] from the desktop block."}
 _SAID_NOTE = "It worked, verified, and your done line was said. Do not say it again."
+#: P1.1: the talker's desk picture (``situation.render``, purpose talker) is cut to this many characters (about eight
+#: windows with long titles); every window's id and the Sound line ride outside it (:meth:`Hands._situation_text`).
+DESK_CHARS = 1200
+#: P1.4: the window hand's placement verbs (:mod:`yuki.actions.place`): undoable, so never judged; refused with a game
+#: in front by place itself; never bracketed or looked after (a tidy-up is never tidied again).
+PLACE_OPS = ("move", "focus_back", "undo")
+#: P1.4: the voice's run_skill field for where the run's app window goes (``yuki.skills.engine.place_hint``).
+SKILL_PLACE = {"type": "string", "description": "Optional: \"other\" or a monitor's number, for its app's window."}
+#: P1.3: a call in a look's own run other than its one tidy step (code holds a look to that, never the prompt alone).
+_LOOK_ONLY_NOTE = (
+    "Not done: after a done line your hands only undo your own side effect, one move or focus_back as After allows. "
+    "Say nothing now."
+)
+#: Code's own done line for a placement verb whose call left say_when_done out.
+_CODE_LINE_PLACE = {"move": "Moved it.", "undo": "Put it back."}
+#: P1.3: the After lines (``diff.render``) the talker reads after a flagged act are cut to this many characters.
+AFTER_CHARS = 500
+#: P1.3: the one principle with the After lines (the tidy dial at "do it and tell me", its default) ...
+_AFTER_NOTE = (
+    "Done and verified; said is what was heard already. After is what your act did to their screen. Keep their screen "
+    "theirs: what they asked for stays; undo only your own side effects, with one undoable step (window move, "
+    "focus_back), and say it in a few words; otherwise stay quiet."
+)
+#: ... and with the dial at "ask": the same look, a question instead of the step.
+_AFTER_ASK_NOTE = (
+    "Done and verified; said is what was heard already. After is what your act did to their screen. Keep their screen "
+    "theirs: what they asked for stays; when your own act left a side effect worth undoing, ask in a few words whether "
+    "to (the question alone, no call; their yes is the ask); otherwise stay quiet."
+)
+#: A placement verb that did not take effect: said plainly, no other hand (never a loop of tidy-ups).
+_PLACE_FAILED_NOTE = (
+    "It did not take effect, as the report says. Say so in a few words if they asked for it; if it was your own "
+    "tidy-up, stay quiet. No other hand."
+)
+#: undo refused because the window moved since it was placed: asked once; their yes within this many seconds (a later
+#: user turn) puts it back anyway (``place.undo_last(force=True)``).
+_UNDO_CONFIRM_S = 60.0
+#: focus_back with no window named gives the front back to the window in front before Yuki's last act that moved the
+#: focus, kept this long (s).
+_FRONT_KEEP_S = 600.0
+_UNDO_STALE_NOTE = (
+    "Not put back: it has moved since, as the report says. Ask in a few words whether to put it back anyway, the "
+    "question alone; on their yes call undo again."
+)
 #: A verified hand whose done line was left empty (v3.12: "on every scroll it says done, it's very repetitive").
 _SILENT_NOTE = "It worked, verified, and, as you chose, nothing was said: they can see it. Say nothing now."
 _UNCONFIRMED_NOTE = (
@@ -231,10 +286,10 @@ _DONE_LINE = {
     "type": "string",
     "description": "Optional: said once verified (\"Done, it's minimized.\"); \"\": nothing; left out: code's own.",
 }
-#: kHands (two asks in one breath): no words before it; a request of several parts is one call per part in the same
-#: reply, in their order (the hands run them in that order, each with its own result, and the last call's end check
-#: reads every call of the turn: :meth:`Hands._parts_start`).
-_NOW = " Instant: no words before it; one call per part they asked for, in their order."
+#: kHands (two asks in one breath): no words before it. qVoice (18 Oct prompt budget): "one call per part they asked
+#: for, in their order" is said once, in both talkers' prompts (the lean "Two or more asks in one breath", the full
+#: Skills paragraph), not in ten schemas; the hands still run a reply's calls in order (:meth:`Hands._parts_start`).
+_NOW = " Instant: no words before it."
 #: The spoken acknowledgement of a slow hand (open_url, open_app), said the moment it is written (v3.5).
 _SAY_FIRST = {
     "type": "string",
@@ -653,12 +708,12 @@ HAND_TOOLS: list[dict[str, Any]] = [
         "name": "app_volume",
         "description": (
             "Your hand: ONE APP's own mixer volume (that app only: Chrome's video, Spotify, your own voice), the app "
-            "as the app volumes line names it; nothing on the screen is touched. Verified by reading its level back. "
+            "as the Sound line names it; nothing on the screen is touched. Verified by reading its level back. "
             "Never for a player's in-app volume (its slider in the window): that is the thinker's, and this is no "
             "stand-in for it." + _NOW
         ),
         "properties": {
-            "app": {"type": "string", "description": "As the app volumes line names it, e.g. chrome.exe."},
+            "app": {"type": "string", "description": "As the Sound line names it, e.g. chrome."},
             "change": {"type": "integer", "description": "Points to move it by, e.g. -20."},
             "level": {"type": "integer", "description": "Or the level, 0-100."},
             "mute": {"type": "boolean", "description": (
@@ -687,16 +742,19 @@ HAND_TOOLS: list[dict[str, Any]] = [
     {
         "name": "window",
         "description": (
-            "Your hand: focus, minimize, maximize, fullscreen, restore or close an app's window, its state read back "
-            "from Windows. Name it by window ([hwnd]) or by app (the app as they said it: \"WhatsApp\", \"Arc\"; "
-            "minimize and close then act on every window of it). \"Force quit\" is close. Maximized keeps the title bar "
-            "and taskbar; full screen is fullscreen (F11), never maximize. A window is not a tab. close only when they "
-            "asked to close that window or app, with their words asking for it in named." + _NOW
+            "Your hand on an app's window, read back from Windows: focus, minimize, maximize (title bar and taskbar "
+            "stay; full screen is fullscreen, F11), restore, close (\"force quit\" too; only when they asked to close "
+            "it, their words in named), move to a monitor, focus_back (the front back to what was in front before your "
+            "last act), undo (your last move or focus_back put back). By window ([hwnd]) or by app as they said it "
+            "(\"WhatsApp\"; minimize and close: every window of it). A window is not a tab." + _NOW
         ),
         "properties": {
             "window": _WINDOW,
             "app": {"type": "string", "description": "Or the app as they named it, when it is not one [hwnd]."},
-            "action": {"type": "string", "enum": ["focus", "minimize", "maximize", "fullscreen", "restore", "close"]},
+            "action": {"type": "string", "enum": ["focus", "minimize", "maximize", "fullscreen", "restore", "close",
+                                                  *PLACE_OPS]},
+            "monitor": {"type": "string", "description": "move: \"other\" or a monitor's number."},
+            "how": {"type": "string", "enum": ["keep", "maximize", "left", "right"]},
             "named": {"type": "string", "description": "close: their own words asking to close it."},
             "then": _THEN_STEP,
             "say_when_done": _DONE_LINE,
@@ -848,7 +906,8 @@ def talker_hand_tools(skill_keys: Any = ()) -> list[dict[str, Any]]:
     if keys:
         from yuki.skills.menu import talker_tool
 
-        out.append(talker_tool(keys))
+        tool = talker_tool(keys)   # P1.4: the place hint is the voice's field (Hands._skill_hand passes it on)
+        out.append({**tool, "properties": {**tool["properties"], "place": SKILL_PLACE}})
         out.append(KEEP_USUAL_TOOL)
     return out
 #: UI Automation control types (the platform's fixed vocabulary) whose click can send, delete, buy or sign out: such a
@@ -1047,32 +1106,8 @@ class Snapshot:
     wall: float = 0.0
 
 
-def media_line(facts: dict[str, Any]) -> str:
-    """The media sessions as one line of facts (``""`` when there are none)."""
-    parts = []
-    for s in facts.get("media") or []:
-        if not isinstance(s, dict):
-            continue
-        what = " by ".join(x for x in (f"\"{s.get('title')}\"" if s.get("title") else "", s.get("artist") or "") if x)
-        app = str(s.get("app_id") or "?").split("!")[-1]
-        parts.append(f"{app}{' ' + what if what else ''} {s.get('status') or 'unknown'}"
-                     + (" (media keys act on this one)" if s.get("current") else ""))
-    return ("media: " + "; ".join(parts)) if parts else ""
-
-
-#: How the app volumes line marks Yuki's own voice (v3.18).
+#: How the Situation's Sound line marks Yuki's own voice (v3.18).
 OWN_VOICE = "(your own voice)"
-
-
-def audio_line_own(apps: list[dict[str, Any]]) -> str:
-    """The app volumes line (``yuki.actions.app_volume.audio_line``'s facts) with Yuki's own voice marked: an entry
-    whose ``own`` is true is this process's own audio session (an identity of processes, never a name read)."""
-    if not apps:
-        return ""
-    parts = [f"{a['app']} {float(a.get('level') or 0):g}%{' muted' if a.get('muted') else ''}"
-             f"{' playing' if a.get('playing') else ''}{' ' + OWN_VOICE if a.get('own') else ''}"
-             for a in apps if isinstance(a, dict) and a.get("app")]
-    return ("app volumes (Windows volume mixer, each app's own level): " + "; ".join(parts)) if parts else ""
 
 
 def age_words(seconds: float) -> str:
@@ -1399,6 +1434,25 @@ class Hands:
         #: review r1 L4: ``(turn, [(hand, args), ...])``: the hands called in this user turn, in order (RAM only), so
         #: the end check lists all of the turn's steps, never "nothing else" after a hand it does not name
         self._turn_calls: tuple[Any, list[tuple[str, dict[str, Any]]]] | None = None
+        # -- P1.2-P1.4 (18 Oct free-thinker plan): look after acting, and the placement verbs -------------------------
+        #: The one look after acting given in this user turn (never a second in it: no loop of tidy-ups), RAM only:
+        #: ``{"turn", "at"`` (when its result went back: a call that came after it is of the look's own run),
+        #: ``"acts"`` (the act's window ids: new, touched, asked; a tidy move only moves one of them), ``"front"`` (the
+        #: window in front before, when the act took the focus: focus_back's only target there), ``"used"`` (its one
+        #: tidy step was taken)``}``.
+        self._look: dict[str, Any] | None = None
+        #: ``(hwnd, when, turn)``: the window in front before Yuki's last act that moved the focus (focus_back's
+        #: default); an act of a later turn that moves no focus lets it go.
+        self._front_before: tuple[int, float, Any] | None = None
+        #: ``(turn, when)``: an undo refused because the placed window moved since (their next turn's undo forces it).
+        self._undo_stale: tuple[Any, float] | None = None
+        if _is_real_backend(backend):
+            try:
+                from yuki.perception.situation import warm
+
+                warm()   # the first desk read's one-off WinRT media and Core Audio costs, off every path
+            except Exception:  # noqa: BLE001
+                pass
 
     @property
     def skills_on(self) -> bool:
@@ -1423,6 +1477,9 @@ class Hands:
         self.halted = None
         self._order = None
         self._commit_turn = None
+        self._look = None
+        self._front_before = None
+        self._undo_stale = None
 
     def new_user_turn(self) -> None:
         """The user spoke: the talker may use its hands again (after telling them what happened)."""
@@ -1826,16 +1883,9 @@ class Hands:
             snap.foreground = int(payload["foreground_hwnd"]) if payload.get("foreground_hwnd") else None
             cursor = payload.get("cursor")
             snap.cursor = (int(cursor[0]), int(cursor[1])) if cursor else None
-            parts = [text]
-            try:
-                media = media_line(self._dispatcher.activity_facts())
-            except Exception:  # noqa: BLE001 - the windows are the part that matters
-                media = ""
-            if media:
-                parts.append(media)
-            audio = self._audio_line()
-            if audio:
-                parts.append(audio)
+            # P1.1 (18 Oct free-thinker plan): the Situation, per monitor in plain words, replaces the raw window list
+            # (format_overview, still kept above for the thinker's request pack), the media line and the volumes line
+            parts = [self._situation_text(payload, text)]
             titles = {int(w["hwnd"]): str(w.get("title") or "") for w in windows if w.get("hwnd") is not None}
             tabs = self._tabs_line(snap, titles.get(snap.foreground or 0, ""))
             if tabs:
@@ -1957,27 +2007,390 @@ class Hands:
         except Exception:  # noqa: BLE001
             return False
 
-    def _audio_line(self) -> str:
-        """The apps with sound on the output and their own (mixer) volume, one line ("" without it).
-
-        v3.18: the entry that is Yuki's own voice (an entry the backend marks ``own``: this process's audio session) is
-        said so, so "your volume" has something to act on (live 2 Oct 21:27 the talker pressed the system media keys
-        for it: the line never said which app was its own voice)."""
+    def _audio_apps(self) -> list[dict[str, Any]] | None:
+        """The apps with sound on the output and their own (mixer) volume, for the Situation's Sound line (``None``:
+        this desk has no mixer). v3.18: the entry that is Yuki's own voice (one the backend marks ``own``; on the real
+        mixer, this very process's session) is said so, so "your volume" has something to act on (live 2 Oct 21:27
+        the talker pressed the system media keys for it: the line never said which app was its own voice)."""
         read = getattr(self.backend, "audio_apps", None)
         if not callable(read):
-            return ""
+            return None
         try:
-            apps = [dict(a) for a in read() or [] if isinstance(a, dict)]
-            if _is_real_backend(self.backend):
-                # the real mixer: the voice plays from this very process, so its session is the one with this
-                # process's own name (a stand-in desk marks its own entries)
-                own = _own_process_name().casefold()
-                for a in apps:
-                    if own and str(a.get("app") or "").casefold() == own:
-                        a["own"] = True
-            return audio_line_own(apps)
+            apps = [dict(a) for a in read() or [] if isinstance(a, dict) and a.get("app")]
+            own = _own_process_name().casefold() if _is_real_backend(self.backend) else ""
+            for a in apps:
+                if a.get("own") or (own and str(a["app"]).casefold() == own):
+                    name = str(a["app"])
+                    a["app"] = f"{name[:-4] if name.casefold().endswith('.exe') else name} {OWN_VOICE}"
+            return apps
         except Exception:  # noqa: BLE001 - the windows are the part that matters
-            return ""
+            return None
+
+    def _situation_text(self, payload: dict[str, Any], fallback: str = "") -> str:
+        """P1.1: the desk the talker reads, in plain words (``situation.render``, purpose talker, :data:`DESK_CHARS`),
+        from the overview this read already holds (``from_overview``: no window read twice, and a stand-in desk gets
+        the same picture as the real one): per monitor, top window first, with the ``[hwnd]`` ids the hands use, what
+        is in front, covered, playing or has the keyboard, what plays and the sound; then the apps running with no
+        window (the overview's line). A busy desk the budget cuts still gets every window's id and app (the hands take
+        them) and the Sound line (its "(your own voice)" entry is what "your volume" acts on), outside the budget. The
+        holds (a game, a call) are not said twice: the talker's line of them this minute says them. ``fallback`` (the
+        old window list) on a failure. Never raises."""
+        try:
+            from yuki.perception import situation
+            from yuki.perception.windows import MAX_BACKGROUND_APPS
+
+            try:
+                media = (self._dispatcher.activity_facts() or {}).get("media")
+            except Exception:  # noqa: BLE001 - the windows are the part that matters
+                media = None
+            state = situation.from_overview(payload, media=media, audio=self._audio_apps(), master=self._volume(),
+                                            holds="")
+            text = situation.render(state, purpose="talker", max_chars=DESK_CHARS)
+            left = [w for w in state.windows if w.kind == "window" and f"[{w.hwnd}]" not in text]
+            if left:
+                text += "\nAlso open: " + ", ".join(situation.name_of(w, title=False)
+                                                    + (" (minimised)" if w.minimized else "") for w in left) + "."
+            if "\nSound: " not in f"\n{text}":
+                sound = [f"master {float(state.master.get('level') or 0):g}%"
+                         f"{' muted' if state.master.get('muted') else ''}"] if state.master else []
+                sound += [f"{a.app} {a.level:g}%{' muted' if a.muted else ''}{' sounding' if a.playing else ''}"
+                          for a in state.audio]
+                if sound:
+                    text += "\nSound: " + "; ".join(sound) + "."
+            names = [str(a.get("name") or "") for a in payload.get("background_apps") or [] if isinstance(a, dict)]
+            names = [n for n in names if n]
+            if names:
+                more = " and more" if len(names) > MAX_BACKGROUND_APPS else ""
+                text += "\nRunning with no window open: " + ", ".join(names[:MAX_BACKGROUND_APPS]) + more + "."
+            return text
+        except Exception:  # noqa: BLE001 - the old list rather than no desk at all
+            return fallback
+
+    # -- P1.2-P1.4: look after acting, and the placement verbs ------------------------------------------------------
+
+    def _desk_read(self) -> Any:
+        """P1.2: the desk now as a ``situation.DeskState`` for one act's before or after (blocking, a few ms: windows,
+        layout, media; no sound, which no flag reads), or ``None``. The real desktop as the OS has it
+        (``situation.snapshot``: the occlusion grid, the pop-up in front, the keyboard's window); a stand-in desk only
+        through its own overview (``from_overview``), never the real screen (rule 7). Never raises."""
+        try:
+            from yuki.perception import situation
+
+            if _is_real_backend(self.backend):
+                return situation.snapshot(audio=[], master=False, holds="")
+            _text, payload, _ms = self._dispatcher.overview_text()
+            try:
+                media = (self._dispatcher.activity_facts() or {}).get("media")
+            except Exception:  # noqa: BLE001
+                media = None
+            return situation.from_overview(payload, media=media, audio=[], holds="")
+        except Exception:  # noqa: BLE001 - no read: no look after this act
+            return None
+
+    def _look_now(self, turn: Any) -> dict[str, Any] | None:
+        """This user turn's look after acting, once given (:attr:`_look`), else ``None``."""
+        look = self._look
+        return look if look is not None and turn is not None and look.get("turn") == turn else None
+
+    def _brackets(self, name: str, args: dict[str, Any]) -> bool:
+        """Whether this hand's act is bracketed by two desk reads (P1.2): one that can move, raise or open a window.
+        Not the sound hands (no window), a scroll (it only brings up the window they named, which stays: a look could
+        only end quiet), the placement verbs (a tidy-up is never looked after), nor any hand once this user turn had
+        its one look."""
+        if name in AUDIO_HANDS or name in (SKILL_HAND, KEEP_USUAL_HAND, "scroll"):
+            return False
+        if name == "window" and str(args.get("action") or "") in PLACE_OPS:
+            return False
+        return self._look_now(self._call_safely(self.user_turn, None)) is None
+
+    @staticmethod
+    def _scope(name: str, args: dict[str, Any], facts: dict[str, Any], before: Any, after: Any
+               ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        """``(acted, touched)`` for :func:`yuki.perception.diff.compare`: whose change is whose, from the act's own
+        facts (ids and app names, never words). A hand acts on what their words named: its window(s) and whatever its
+        step brought to the front (an opening's window, a link's page), by id, so another window of the same app (the
+        browser window playing their video) is never the ask; its app too only when it targeted every window of it
+        (minimize or close by app: ``_hwnds``). Its app is touched either way. A skill run (``facts["_desk_scope"]``)
+        touches its apps and, when a rung took focus, the window now in front; that window is the ask itself (by id;
+        its apps when no window came forward) for a skill of kind ``open``, or a run that left its window to the user
+        (a draft or an opened chat, never sent: the skill's own sends data); else a side effect (a message sent through
+        Discord)."""
+        fg_before = getattr(before, "foreground", None)
+        fg_after = getattr(after, "foreground", None)
+        moved_front = fg_after if fg_after and fg_after != fg_before else None
+        if name == SKILL_HAND:
+            scope = facts.get("_desk_scope") if isinstance(facts.get("_desk_scope"), dict) else {}
+            apps = [a for a in scope.get("apps") or () if a]
+            front = [int(moved_front)] if scope.get("focus") and moved_front else []
+            asked = (front or apps) if scope.get("open") or scope.get("left") else []
+            return tuple(asked), tuple(apps + front)
+        ids: list[Any] = [args.get("window"), facts.get("live_hwnd"), *(args.get("_hwnds") or [])]
+        ids += [t[3] for t in args.get("_targets") or [] if isinstance(t, (list, tuple)) and len(t) > 3]
+        out: list[Any] = []
+        for h in ids:
+            try:
+                if h is not None and int(h):
+                    out.append(int(h))
+            except (TypeError, ValueError):
+                continue
+        if moved_front:
+            out.append(int(moved_front))
+        app = facts["app"].strip() if isinstance(facts.get("app"), str) else ""
+        every = [app] if app and args.get("_hwnds") else []
+        return tuple(out + every), tuple(out + ([app] if app else []))
+
+    @staticmethod
+    def _act_windows(after: Any, d: Any, acted: tuple[Any, ...], touched: tuple[Any, ...]) -> set[int]:
+        """The act's own windows after it (P1.3: the only ones a tidy move may move): the new ones, the ones it touched
+        or was asked about by id, and every window of an app only when the ask was the whole app (a touched app names
+        no window of its own: the browser window playing their video is theirs, never the act's to move)."""
+        ids = {int(n["hwnd"]) for n in getattr(d, "new_windows", None) or [] if n.get("hwnd")}
+        named = {_app_id(a) for a in acted if isinstance(a, str) and a.strip()}
+        ids |= {int(a) for a in (*acted, *touched) if isinstance(a, int) and not isinstance(a, bool)}
+        ids |= {int(w.hwnd) for w in getattr(after, "windows", None) or [] if _app_id(w.app) in named}
+        return ids
+
+    @staticmethod
+    def _tidy_level() -> str:
+        """The Settings tidy dial (``ui.policy`` kind ``tidy``: "Tidy-ups inside my requests"): ``do`` (do it and tell
+        me, the default and the fallback for a missing kind or file), ``ask``, or ``off``. Read only when an act was
+        flagged (one small file read)."""
+        try:
+            from yuki.ui import policy
+
+            level = policy.load().get("tidy")
+        except Exception:  # noqa: BLE001
+            level = None
+        if level in ("ask", "show_plan"):
+            return "ask"
+        if level in ("off", "suggest"):
+            return "off"
+        return "do"
+
+    async def _look_after(self, params: Any, name: str, args: dict[str, Any], facts: dict[str, Any],
+                          before: Any) -> dict[str, Any] | None:
+        """P1.3: once the act's done line is queued, read the desk again and compare it with ``before``. When the act
+        took something the user had (``diff.any_flag``: measured shares and focus only) and the tidy dial is not off,
+        the result fields of one more talker run: ``{"after": the diff in plain words, "how_to_handle_it": the
+        principle}``; else ``None`` (the done line ends the call, as before: no run, no cost). At most one look per user
+        turn (never a loop), kept with the act's own windows and, when the act took the focus, the window that was in
+        front (what a tidy step may touch, :meth:`_look_check`); the window in front before an act that moved the focus
+        is kept for focus_back. Logs content-free. Never raises."""
+        if before is None:
+            return None
+        try:
+            after = await asyncio.to_thread(self._desk_read)
+            if after is None:
+                return None
+            from yuki.perception import diff as desk_diff
+
+            acted, touched = self._scope(name, args, facts, before, after)
+            d = desk_diff.compare(before, after, acted=acted, touched=touched)
+            turn = self._call_safely(self.user_turn, None)
+            if d.focus_from and d.focus_from != d.focus_to and d.focus_by_act:
+                self._front_before = (int(d.focus_from), time.monotonic(), turn)
+            elif self._front_before is not None and self._front_before[2] != turn:
+                self._front_before = None   # an act of a later turn that moved no focus: an older front is let go
+            level = self._tidy_level() if d.any_flag else ""
+            look = bool(d.any_flag and level != "off" and self._look_now(turn) is None)
+            text = desk_diff.render(d, max_chars=AFTER_CHARS) if look else ""
+            if self.log is not None:
+                self.log.event("hands", op=name, after_look=bool(text), tidy=level or None, call=params.tool_call_id,
+                               **{f"after_{k}": v for k, v in d.facts().items()})
+            if not text:
+                return None
+            taken = bool(d.flags.get("focus_taken")) and d.focus_from
+            self._look = {"turn": turn, "at": time.monotonic(), "acts": self._act_windows(after, d, acted, touched),
+                          "front": int(d.focus_from) if taken else None, "used": False}
+            return {"after": text, "how_to_handle_it": _AFTER_ASK_NOTE if level == "ask" else _AFTER_NOTE}
+        except Exception as exc:  # noqa: BLE001 - no look: the done line ends the call as before
+            if self.log is not None:
+                self.log.event("hands", op=name, after_error=type(exc).__name__)
+            return None
+
+    def _place_verbs(self) -> Any:
+        """Where the placement verbs run: the backend's own (a stand-in desk's ``place_window`` / ``focus_back`` /
+        ``undo_last``), :mod:`yuki.actions.place` on the real desktop, else ``None`` (a stand-in desk never reaches the
+        real screen, rule 7)."""
+        if all(callable(getattr(self.backend, n, None)) for n in ("place_window", "focus_back", "undo_last")):
+            return self.backend
+        if _is_real_backend(self.backend):
+            from yuki.actions import place
+
+            return place
+        return None
+
+    def _place_run(self, op: str, args: dict[str, Any], turn: Any,
+                   look: dict[str, Any] | None = None) -> tuple[bool, str, dict[str, Any]]:
+        """P1.4, blocking: one placement verb of the window hand, inside memory's acting marker (a window Yuki moved or
+        raised is never recorded as the user's own change). ``move``: :func:`place.place_window` (``monitor`` "other"
+        or a number, ``how`` keep/maximize/left/right; never activating); ``focus_back``: the window named, else the one
+        in front before Yuki's last act that moved the focus; ``undo``: :func:`place.undo_last` ("put it back"; after a
+        refusal because the window moved since, their next turn within :data:`_UNDO_CONFIRM_S` forces it). One journal
+        group per user turn, the one a skill run's place hint uses too (the turn's request id), so one undo puts back a
+        whole tidy-up. Undoable, so never judged; the game gate is place's own (a game in front, or a game's window or
+        monitor). ``look``: this call is a look's tidy step (P1.3), held by code to what the look allows: one step, a
+        move of one of the act's own windows or the front given back to the window the act took it from, never an
+        undo. ``(ok, report, facts)``."""
+        facts: dict[str, Any] = {"sent_at": None, "verified": None}
+        try:
+            self._guard_desk("window", args)
+            verbs = self._place_verbs()
+            if verbs is None:
+                raise _Refused("this desktop has no hand to move windows; nothing was done", reason="no_backend")
+            if look is not None:
+                if look.get("used") or op == "undo":
+                    raise _Refused("one tidy step per done line, and putting back is theirs to ask; nothing was done",
+                                   reason="tidy_once")
+                look["used"] = True   # one step per look, taken or not
+            group = self._skill_request_id() or f"voice:{turn}"
+            with self._acting("window"):
+                if op == "move":
+                    args = self._window_args(args)
+                    hwnd = self._window(args)
+                    if look is not None and int(hwnd) not in look.get("acts", ()):
+                        raise _Refused("that window is not one your act changed; their own windows stay where they "
+                                       "are; nothing was done", reason="tidy_not_yours")
+                    facts["live_hwnd"], facts["app"] = hwnd, self._app_at(hwnd)
+                    raw = args.get("monitor")
+                    monitor: Any = "other" if raw is None or not str(raw).strip() else str(raw).strip().casefold()
+                    monitor = int(monitor) if monitor.lstrip("-").isdigit() else monitor
+                    facts["sent_at"] = time.monotonic()
+                    result = verbs.place_window(hwnd, monitor=monitor, how=str(args.get("how") or "keep"),
+                                                activate=False, group=group)
+                elif op == "focus_back":
+                    kept = self._front_before
+                    named = self._window(args) if args.get("window") is not None else 0
+                    if look is not None:
+                        target = int(look.get("front") or 0)
+                        if not target or (named and named != target):
+                            raise _Refused("your act did not take the front from that window of theirs; nothing was "
+                                           "done", reason="tidy_not_yours")
+                    else:
+                        target = named or (int(kept[0]) if kept and time.monotonic() - kept[1] < _FRONT_KEEP_S
+                                           else 0)
+                    if not target:
+                        raise _Refused("no window to give the front back to: name it by window; nothing was done",
+                                       shape=True, reason="no_window")
+                    facts["live_hwnd"], facts["app"] = target, self._app_at(target)
+                    facts["sent_at"] = time.monotonic()
+                    result = verbs.focus_back(target, group=group)
+                else:
+                    stale = self._undo_stale
+                    force = bool(stale and stale[0] != turn and time.monotonic() - stale[1] < _UNDO_CONFIRM_S)
+                    self._undo_stale = None
+                    facts["sent_at"] = time.monotonic()
+                    result = verbs.undo_last(force=force)
+                    facts["forced"] = force
+            ok, report, facts = self._report(result, "", facts)
+            details = getattr(result, "details", None)
+            if isinstance(details, dict) and details.get("stale"):
+                facts["stale_place"] = True
+                self._undo_stale = (turn, time.monotonic())
+            facts["verified"] = ok
+            return ok, report, facts
+        except _Refused as exc:
+            facts["refused"] = "game" if exc.code == "game" else True
+            facts["refused_why"] = exc.code
+            if exc.halted:
+                facts["halted"] = True
+            return False, str(exc), facts
+
+    async def _handle_place(self, params: Any, args: dict[str, Any], gate: dict[str, Any] | None = None,
+                            arrived: float | None = None) -> None:
+        """P1.4: the window hand's placement verbs (:data:`PLACE_OPS`), on a path of their own: done once verified, its
+        line said by code (the call's say_when_done, else code's own), no second model run; never judged, never looked
+        after, never handed over. One step runs once (a repeat in the same user turn, or a second mouth run on the same
+        words, is that step: a window is never moved there and back). A call that came in the run a look after acting
+        started (P1.3: ``arrived`` after the look's result went back) is a tidy-up: held by code to the look's one step
+        (:meth:`_place_run`), not one of the user's parts (the turn's end check never counts it or stands down for it),
+        its ``then`` ignored; a call of the user's own reply queued behind the act is theirs, not a tidy-up. An asked
+        step with a ``then`` gives the talker its turn back for the rest, as a window step does (the rest open until a
+        hand tries it), and an asked step is the talker's own try at a rest already open. A step that did not take
+        effect is said plainly, no other hand."""
+        from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
+
+        name = params.function_name
+        op = str(args.get("action") or "")
+        turn = self._call_safely(self.user_turn, None)
+        look = self._look_now(turn)
+        tidy = look is not None and arrived is not None and arrived >= float(look.get("at") or 0.0)
+        started = time.monotonic()
+        key = _step_key(name, args)
+        if key in self._inflight or (gate is not None and key in gate["done"]):
+            if self.log is not None:
+                self.log.event("hands", op=name, action=op, deduped=True, running=key in self._inflight,
+                               call=params.tool_call_id)
+            await params.result_callback({"already": "the same step was done for these words",
+                                          "how_to_handle_it": _DUPLICATE_NOTE},
+                                         properties=FunctionCallResultProperties(run_llm=False))
+            return
+        prior = None if tidy else self._then_now()
+        if not tidy:
+            self._then_open = None   # pVoice: an asked placement is the talker's own try at an open rest
+            self._note_call(name, args)
+        self._inflight[key] = started
+        if self.bridge is not None:
+            self.bridge.busy_tools += 1
+        try:
+            ok, report, facts = await asyncio.to_thread(self._place_run, op, args, turn, look if tidy else None)
+        except Exception as exc:  # noqa: BLE001 - a crash is a step that did not take effect
+            ok, report, facts = False, f"{type(exc).__name__}: {exc}", {}
+        finally:
+            self._inflight.pop(key, None)
+            if self.bridge is not None:
+                self.bridge.busy_tools = max(0, self.bridge.busy_tools - 1)
+                if self.bridge.gate is not None:
+                    self.bridge.gate.poke()
+        ms = round((time.monotonic() - started) * 1000)
+        if ok and gate is not None:
+            gate["done"].add(key)
+        if self.on_action is not None and facts.get("sent_at") is not None:
+            self.on_action(facts["sent_at"])
+        if not facts.get("halted"):
+            self._keep_record(params, name, args, report, ok=ok, verified=facts.get("verified"), turn=turn,
+                              hwnd=facts.get("live_hwnd"))
+        if self.on_step is not None:
+            try:
+                self.on_step(name, hand_words(name, args, facts.get("app")), bool(ok), report[:400], ms)
+            except Exception:  # noqa: BLE001 - the screen never breaks a hand
+                pass
+        rest = "" if tidy else " ".join(str(args.get("then") or "").split())
+        line = "" if rest else " ".join(str(args.get("say_when_done") or "").split())   # never a done line for half
+        if ok and not rest and args.get("say_when_done") is None:
+            line = _CODE_LINE_PLACE.get(op, "")
+        if self.log is not None:
+            self.log.event("hands", op=name, action=op, ok=ok, ms=ms, tidy=tidy, call=params.tool_call_id,
+                           done_line=bool(ok and line), refused_why=facts.get("refused_why"),
+                           stale=bool(facts.get("stale_place")), forced=facts.get("forced"),
+                           then_open=bool(ok and rest))
+        if facts.get("halted"):
+            await self._halted_result(params, report)
+            return
+        if ok and rest:
+            if turn is not None:
+                steps = list((prior or {}).get("steps") or [])
+                steps.append(await asyncio.to_thread(self._end_step, name, args))
+                self._then_open = {"turn": turn, "steps": steps[-4:], "hand": name, "args": dict(args),
+                                   "report": report[:REST_REPORT_CHARS]}
+            note = self._note(_STEP_THEN_NOTE, _STEP_THEN_NOTE_LEAN)
+            await params.result_callback({"done": report[:700], "then": rest[:200],
+                                          "how_to_handle_it": note.format(rest=rest[:200])})
+            return
+        if ok:
+            if line:
+                await params.llm.push_frame(TTSSpeakFrame(text=line))
+            await params.result_callback({"done": report[:700], "said": line,
+                                          "how_to_handle_it": _SAID_NOTE if line else _SILENT_NOTE},
+                                         properties=FunctionCallResultProperties(run_llm=False))
+            return
+        if facts.get("stale_place"):
+            await params.result_callback({"not_done": report[:700], "how_to_handle_it": _UNDO_STALE_NOTE})
+            return
+        # a tidy-up of Yuki's own that did not take effect ends quietly (nobody asked for it; never a loop of tries);
+        # one they asked for gets the talker's few words
+        await params.result_callback({"failed": report[:700], "how_to_handle_it": _PLACE_FAILED_NOTE},
+                                     properties=FunctionCallResultProperties(run_llm=not tidy))
 
     def _tabs_line(self, snap: Snapshot, title: str) -> str:
         """The foreground window's tabs, recorded on ``snap``: read ahead when still good, else now (bounded)."""
@@ -2226,22 +2639,30 @@ class Hands:
         lVoice (problem 3): in the user turn's order (:meth:`_enter_order`): a reply's calls run one after another,
         in the order written. A call whose turn already went to the thinker by code (an earlier call's fallback carried
         their whole request) is not run; an exact repeat of a step this turn already did, or an address it already
-        opened, is the same step (never twice). ``Hands._act`` and the result shapes are unchanged."""
+        opened, is the same step (never twice). ``Hands._act`` and the result shapes are unchanged. P1.3: a call that
+        came in the run a look after acting started (it arrived after the look's result went back; a reply's calls all
+        arrive at once, before any of them runs) may only be the look's one tidy step (:meth:`_handle_place`)."""
+        arrived = time.monotonic()
         gate = await self._enter_order()
         try:
             name = params.function_name
             args = params.arguments if isinstance(params.arguments, dict) else {}
             spared = name == KEEP_USUAL_HAND or (name == "scroll" and args.get("keep") == "stop")
-            if gate is not None and gate.get("passed") and not spared:
+            look = self._look_now(self._call_safely(self.user_turn, None))
+            in_look = look is not None and arrived >= float(look.get("at") or 0.0)
+            placing = name == "window" and str(args.get("action") or "") in PLACE_OPS
+            if (gate is not None and gate.get("passed") and not spared) or (in_look and not placing and not spared):
                 from pipecat.frames.frames import FunctionCallResultProperties
 
                 if self.log is not None:
-                    self.log.event("hands", op=name, order_passed=True, call=params.tool_call_id)
-                await params.result_callback(dict(_ORDER_PASSED),
+                    self.log.event("hands", op=name, order_passed=not in_look, look_only=in_look,
+                                   call=params.tool_call_id)
+                await params.result_callback({"not_done": _LOOK_ONLY_NOTE} if in_look else dict(_ORDER_PASSED),
                                              properties=FunctionCallResultProperties(run_llm=False))
-                self._follow_planned(name, args)   # review r1 L2: the job that has their request hears of this part
+                if not in_look:
+                    self._follow_planned(name, args)   # review r1 L2: the job that has their request hears of it
                 return
-            await self._handle_one(params, gate)
+            await self._handle_one(params, gate, arrived)
         finally:
             self._leave_order(gate)
 
@@ -2272,10 +2693,14 @@ class Hands:
         except Exception:  # noqa: BLE001
             pass
 
-    async def _handle_one(self, params: Any, gate: dict[str, Any] | None = None) -> None:
+    async def _handle_one(self, params: Any, gate: dict[str, Any] | None = None,
+                          arrived: float | None = None) -> None:
         """One hand, its turn in the gate come (the body :meth:`handle` always had)."""
         name = params.function_name
         args = params.arguments if isinstance(params.arguments, dict) else {}
+        if name == "window" and str(args.get("action") or "") in PLACE_OPS:
+            await self._handle_place(params, args, gate, arrived)   # P1.4: undoable placement verbs, their own path
+            return
         then_open = self._then_now()
         if then_open is not None and not self._moves(name, args):
             # pVoice: a hand that can act after a "then" is the talker's own try at the rest: its outcome decides
@@ -2338,6 +2763,7 @@ class Hands:
                 self.bridge.busy_tools = max(0, self.bridge.busy_tools - 1)
                 if self.bridge.gate is not None:
                     self.bridge.gate.poke()
+        desk_before = facts.pop("_desk_before", None)   # P1.2: the desk right before the act (RAM only)
         self._retry_settle(facts)   # review r1 L5: a retry refused before it acted gives the halt back
         ms = round((time.monotonic() - started) * 1000)
         if self.on_action is not None and facts.get("sent_at") is not None:
@@ -2548,17 +2974,18 @@ class Hands:
             await params.result_callback({"done": report[:700], "said": said, "how_to_handle_it": note.format(
                 shown=said, already=already)})
             return
-        if confirmed and not line:
-            from pipecat.frames.frames import FunctionCallResultProperties
-
-            await params.result_callback({"done": report[:700], "said": "", "how_to_handle_it": _SILENT_NOTE},
-                                         properties=FunctionCallResultProperties(run_llm=False))
-            return
-        if speak:
+        if (confirmed and not line) or speak:
             from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
 
-            await params.llm.push_frame(TTSSpeakFrame(text=line))
-            await params.result_callback({"done": report[:700], "said": line, "how_to_handle_it": _SAID_NOTE},
+            if speak:
+                await params.llm.push_frame(TTSSpeakFrame(text=line))
+            # P1.3: the done line is queued; only an act that took something the user had gets one more run
+            look = await self._look_after(params, name, args, facts, desk_before)
+            if look is not None:
+                await params.result_callback({"done": report[:700], "said": line if speak else "", **look})
+                return
+            await params.result_callback({"done": report[:700], "said": line if speak else "",
+                                          "how_to_handle_it": _SAID_NOTE if speak else _SILENT_NOTE},
                                          properties=FunctionCallResultProperties(run_llm=False))
             return
         if facts.get("held"):
@@ -3920,12 +4347,13 @@ class Hands:
         self._note_values(args, facts.get("_values"))   # lVoice: what it did, for the turn's end check (RAM only)
         if facts.get("verified") is True and gate is not None:
             gate["done"].add(key)
+        desk_before = facts.pop("_desk_before", None)   # P1.2: the desk before its first focus rung (RAM only)
         facts.pop("_values", None)
         facts.pop("_tried", None)
         facts.pop("_words", None)
         try:
             await self._skill_reply(params, name, args, ok, report, facts, ms, hand_id=hand_id, fallback=fallback,
-                                    gate=gate)
+                                    gate=gate, before=desk_before)
         finally:
             self._hand_ids.pop(params.tool_call_id, None)
             if prefs is not None:
@@ -3941,7 +4369,8 @@ class Hands:
 
     async def _skill_reply(self, params: Any, name: str, args: dict[str, Any], ok: bool, report: str,
                            facts: dict[str, Any], ms: float, hand_id: str | None = None,
-                           fallback: dict[str, Any] | None = None, gate: dict[str, Any] | None = None) -> None:
+                           fallback: dict[str, Any] | None = None, gate: dict[str, Any] | None = None,
+                           before: Any = None) -> None:
         """The result of one ``run_skill``: the line code says (done only when verified), a hand-off to the thinker, or
         the report for the talker.
 
@@ -3949,7 +4378,8 @@ class Hands:
         code, to do it the normal way (look at the screen, click, type), with the skill's seed when there is one and a
         plain note of what happened; never a "say so plainly" stop. Only when no fallback may go (a skill that may have
         sent or joined, data that never hands over, a real question) or the hand-off could not start is the skill's own
-        plain line said by code, as before."""
+        plain line said by code, as before. ``before``: the desk before its first focus rung (P1.3: a checked done
+        whose run took something the user had gets one look after its line)."""
         from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
 
         outcome = str(facts.get("outcome") or "")
@@ -4027,6 +4457,14 @@ class Hands:
             self._parts_spawn(params, name, args, report, said=line)
         if line:
             await params.llm.push_frame(TTSSpeakFrame(text=line))
+            # P1.3: a checked done that took something the user had gets one look (never after "Keep this as your
+            # usual?": that question waits for their answer)
+            look = None
+            if verified and not facts.get("keep_question"):
+                look = await self._look_after(params, name, args, facts, before)
+            if look is not None:
+                await params.result_callback({"done": report[:700], "said": line, **look})
+                return
             await params.result_callback({"done" if verified else "result": report[:700], "said": line,
                                           "how_to_handle_it": self._SKILL_SAID_NOTE.format(line=line)},
                                          properties=FunctionCallResultProperties(run_llm=False))
@@ -4257,11 +4695,13 @@ class Hands:
             self._join_grant = (threading.get_ident(), _app_id(skill.app), skill_key)
 
     def _skill_hand(self, args: dict[str, Any], hand_id: str | None = None,
-                    turn: str | None = None) -> tuple[bool, str, dict[str, Any]]:
+                    turn: str | None = None, *, bracket: bool = True) -> tuple[bool, str, dict[str, Any]]:
         """Blocking: resolve and run one skill (:func:`yuki.skills.engine.resolve_and_run`), then learn from the user's
         words: a correction naming another option (:func:`yuki.skills.prefs.note_correction`), the pending "Keep this
         as your usual?", a "still your usual?" card. The acting marker goes up only right before a rung that takes
-        focus (D18: sound-only runs publish none). ``(ok, report, facts)`` as :meth:`SkillResult.as_voice` gives."""
+        focus (D18: sound-only runs publish none). ``(ok, report, facts)`` as :meth:`SkillResult.as_voice` gives.
+        P1.2: with ``bracket`` (not a reflex's run), the desk is read right before the first rung that takes focus, kept
+        as ``facts["_desk_before"]`` with whose change is whose (``facts["_desk_scope"]``) for the look after it."""
         facts: dict[str, Any] = {"sent_at": None, "verified": None}
         skill_key = str(args.get("skill") or "").strip()
         slots = dict(args.get("slots")) if isinstance(args.get("slots"), dict) else {}
@@ -4302,8 +4742,11 @@ class Hands:
         words = [str(w) for w in (self._call_safely(self.words, []) or []) if str(w).strip()]
         marker: dict[str, Any] = {"token": None}
         begin = getattr(memory, "acting_begin", None) if memory is not None else None
+        desk: dict[str, Any] = {}
 
         def on_focus() -> None:
+            if bracket and not sound_only and "before" not in desk:
+                desk["before"] = self._desk_read()   # P1.2: the desk right before the first rung that takes focus
             if marker["token"] is not None or not callable(begin) or sound_only:
                 return   # sound_only: the focus rung is refused by its verb, nothing takes focus (D18)
             token = f"voice-skill-{id(self)}-{time.monotonic_ns()}"
@@ -4329,7 +4772,8 @@ class Hands:
                                 log=self._skill_log,
                                 request_id=turn if hand_id is not None else self._skill_request_id(),
                                 session_id=getattr(memory, "session_id", None), on_focus=on_focus,
-                                verbs=self._skill_verbs(state), game=self._game_strict, hand_id=hand_id)
+                                verbs=self._skill_verbs(state), game=self._game_strict, hand_id=hand_id,
+                                **self._skill_place(engine, args, slots, skill_key))
         try:
             result = engine.resolve_and_run(skill_key, slots, words, ctx, again=bool(args.get("again")),
                                             settings=self.skill_settings, corrects=bool(args.get("corrects")),
@@ -4344,6 +4788,9 @@ class Hands:
         ok, report, more = result.as_voice()
         facts.update(more)
         facts["focus_taken"] = bool(result.focus_taken)
+        if desk.get("before") is not None:
+            facts["_desk_before"] = desk["before"]
+            facts["_desk_scope"] = self._skill_scope(skill_key, result)
         facts["sent_at"] = state.get("sent_at")
         # x3 (3c): what the fallback needs to know (RAM only, never logged): whether a rung may have acted (a verb ran,
         # or a rung's check contradicted it), the run's values and what it tried (the hand-off seed is built from them)
@@ -4389,6 +4836,51 @@ class Hands:
         if facts.get("verified") is True or facts.get("acted") or facts.get("sent_at") is not None:
             facts["commits"] = self._skill_commits(skill_key, slots, facts.get("_values"))   # review r1 M2 (rule 8)
         return ok, report, facts
+
+    @staticmethod
+    def _skill_place(engine: Any, args: dict[str, Any], slots: dict[str, Any], skill_key: str) -> dict[str, Any]:
+        """P1.4: the run's place hint for the engine (``RunContext.place``, :func:`engine.place_hint`): the voice's own
+        ``place`` field of run_skill, or a ``place`` the model put among the slots when the skill has no slot of that
+        name (taken out of them). ``{}`` when none, or on an engine without the hint (the run goes as before)."""
+        value = args.get("place")
+        skill = _skill_def(skill_key) if "place" in slots else None
+        if "place" in slots and not any(getattr(s, "name", "") == "place" for s in getattr(skill, "slots", None) or ()):
+            value = value or slots.pop("place")
+        hint = getattr(engine, "place_hint", None)
+        fields = getattr(engine.RunContext, "__dataclass_fields__", {})
+        if not value or not callable(hint) or "place" not in fields:
+            return {}
+        try:
+            place = hint(value)
+        except Exception:  # noqa: BLE001 - no hint: the run goes as before
+            return {}
+        return {"place": place} if place else {}
+
+    @staticmethod
+    def _skill_scope(skill_key: str, result: Any) -> dict[str, Any]:
+        """P1.2: whose change is whose for a skill run's look after it, from its data (never words): the apps it acts in
+        (its connection's app, and the app value it resolved), whether a rung took focus, and whether bringing that up
+        is the ask itself: a skill of kind ``open``, or a run that left its window to the user (``left``: a skill that
+        can send, its sends data, and these values did not send: a draft typed or a chat opened for them to write in).
+        Else a ``change`` skill's window is a means (Discord for a message sent)."""
+        skill = _skill_def(skill_key)
+        values = getattr(result, "values", None) or {}
+        apps = [str(getattr(skill, "app", "") or "")]
+        value = values.get("app")
+        if isinstance(value, dict):
+            value = value.get("key") or value.get("name")
+        if isinstance(value, str):
+            apps.append(value)
+        left = False
+        if skill is not None and getattr(skill, "sends", False):
+            try:
+                from yuki.skills.connection import sends_with
+
+                left = not sends_with(skill, values)
+            except Exception:  # noqa: BLE001 - unknown: a means, as before
+                left = False
+        return {"apps": [a.strip() for a in apps if a.strip()], "focus": bool(getattr(result, "focus_taken", False)),
+                "open": str(getattr(skill, "kind", "") or "") == "open", "left": left}
 
     def _skill_act_off(self, result: Any, off: str, facts: dict[str, Any], memory: Any) -> str:
         """A run refused in an app whose Settings "Act" switch is off (review r1 M2): the judge's plain line, no
@@ -4712,12 +5204,21 @@ class Hands:
                            f"collide, so nothing was done. Tell the user it will be done after that, or pass it to "
                            f"the running task with tell_yuki intent follow_up", reason="desk_busy")
 
-    def _acting_run(self, name: str, args: dict[str, Any],
-                    hand_id: str | None = None) -> tuple[bool, str, dict[str, Any]]:
+    def _acting_run(self, name: str, args: dict[str, Any], hand_id: str | None = None, *,
+                    bracket: bool = True) -> tuple[bool, str, dict[str, Any]]:
         """:meth:`_run` inside memory's "Yuki is acting" marker (appOpen F3): what a hand puts on screen is recorded as
         Yuki's doing, not the user's (5 Oct the Riot window the open_app hand brought up was logged as the user's own
         for 107 s). Blocking, off the loop; the marker is a small file write. Sound-only hands publish nothing.
-        ``hand_id``: the hand's id (phase F): the marker carries it as its ``request_id``, as the hand's trace does."""
+        ``hand_id``: the hand's id (phase F): the marker carries it as its ``request_id``, as the hand's trace does.
+        ``bracket``: False for a reflex (lSpeed: no look after acting there, so no desk read before it)."""
+        with self._acting(name, hand_id):
+            return self._run(name, args, bracket=bracket)
+
+    @contextlib.contextmanager
+    def _acting(self, name: str, hand_id: str | None = None) -> Any:
+        """Memory's "Yuki is acting" marker around one blocking act (appOpen F3; the placement verbs too, so a window
+        Yuki moved or raised is never recorded as the user's own change). Sound-only hands publish nothing; the marker
+        never breaks an act."""
         memory = self.memory
         begin = getattr(memory, "acting_begin", None) if memory is not None else None
         token = f"voice-hand-{id(self)}-{time.monotonic_ns()}"
@@ -4730,7 +5231,7 @@ class Hands:
             except Exception:  # noqa: BLE001 - the marker never breaks a hand
                 published = False
         try:
-            return self._run(name, args)
+            yield
         finally:
             if published:
                 try:
@@ -4738,7 +5239,8 @@ class Hands:
                 except Exception:  # noqa: BLE001
                     pass
 
-    def _run(self, name: str, args: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:  # noqa: C901
+    def _run(self, name: str, args: dict[str, Any], *,
+             bracket: bool = True) -> tuple[bool, str, dict[str, Any]]:  # noqa: C901
         """Blocking: validate, act through the backend, verify, return ``(ok, report, facts)``."""
         facts: dict[str, Any] = {"sent_at": None, "verified": None}
         if name == "scroll" and args.get("keep") == "stop":
@@ -4757,7 +5259,11 @@ class Hands:
                 args = self._window_args(args)   # kHands: an app's window by its name ("minimize WhatsApp")
             if name != SKILL_HAND:
                 self._check_hand(name, args)   # v3.18: a close, a tab close, a held kind: Yuki's own check first
+            # P1.2: the desk right before the act itself (after every check), for the look after it
+            before = self._desk_read() if bracket and self._brackets(name, args) else None
             ok, report, facts = self._act(name, args, facts)
+            if before is not None:
+                facts["_desk_before"] = before
             if not (ok and facts.get("verified") is True) and not facts.get("settled"):
                 self._halt_now(name, args, report)
             elif ok and facts.get("verified") is True and name in STEP_FIRST_OPS \
@@ -5169,7 +5675,7 @@ class Hands:
             if not names:
                 continue
             title = " ".join(str(w.get("live_title") or w.get("title") or "").split())[:60]
-            add(hwnd, title, names, f'items in [{hwnd}] {w.get("app") or ""} "{title}" (visible, not in front)')
+            add(hwnd, title, names, f"items in [{hwnd}]")   # P1.1: the Situation names it and how much is seen
             others += 1
         with self._lock:
             self.extra_items = extra
@@ -5391,7 +5897,7 @@ class Hands:
             raise _Refused("this desktop has no app volume hand")
         app = str(args.get("app") or "").strip()
         if not app:
-            raise _Refused("name the app as the app volumes line shows it")
+            raise _Refused("name the app as the Sound line shows it")
 
         def number(key: str) -> float | None:
             try:
