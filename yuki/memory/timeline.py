@@ -1346,11 +1346,13 @@ class TimelineRecorder:
         self._app_ids_missing: dict[str, float] = {}
         #: The app key and window last told as in front (``on_front_change``).
         self._front: tuple[str, int] | None = None
-        #: Phase 3.3, the desk record (:class:`DeskRecord`): the watcher's newest layout (set on its thread, taken on
-        #: this one), the desk read from it (RAM), its monitors and setup, and per window the app key it counts as
-        #: (``""``: kept out by the privacy rules, or Yuki's own), cached while the window lives.
+        #: Phase 3.3, the desk record (:class:`DeskRecord`): the watcher's newest layout (set on its thread, never
+        #: cleared here) and the one last read on this thread (by identity), the desk read from it (RAM), its monitors
+        #: and setup, and per window the app key it counts as (``""``: kept out by the privacy rules, or Yuki's own),
+        #: cached while the window lives.
         self._desk = DeskRecord(store, log_error=self._log_error)
         self._desk_layout: Any = None
+        self._desk_layout_read: Any = None
         self._desk_wins: list[DeskWin] | None = None
         self._desk_monitors: list[tuple[int, int, int, int]] = []
         self._desk_screens = ""
@@ -1540,7 +1542,7 @@ class TimelineRecorder:
                             self._log_error("acting", exc)
                         continue
                     if not msg.hWnd and msg.message == WM_APP_DESK:
-                        self._desk_tick(time.time(), fresh=True)
+                        self._desk_tick(time.time())
                         continue
                     u.TranslateMessage(ctypes.byref(msg))
                     u.DispatchMessageW(ctypes.byref(msg))
@@ -2497,17 +2499,19 @@ class TimelineRecorder:
         if self._thread_id and self.alive:
             self._user32.PostThreadMessageW(self._thread_id, WM_APP_DESK, 0, 0)
 
-    def _desk_tick(self, now: float, *, fresh: bool = False) -> None:
-        """Tell the desk record the desk now: the newest layout's windows (``fresh``: a layout came), with what plays,
-        the window in front, full screen, away and Yuki acting applied. Never raises."""
+    def _desk_tick(self, now: float) -> None:
+        """Tell the desk record the desk now: the newest layout's windows (read once per layout, by identity: the
+        watcher's thread only ever replaces the reference, so a layout stored mid-read is read on the next tick), with
+        what plays, the window in front, full screen, away and Yuki acting applied. Never raises."""
         if self._desk.disabled:
             return
         try:
             if self._blocked:
                 self._desk.observe(now, None, screens="")
                 return
-            layout, self._desk_layout = (self._desk_layout, None) if fresh else (None, self._desk_layout)
-            if layout is not None:
+            layout = self._desk_layout
+            if layout is not None and layout is not self._desk_layout_read:
+                self._desk_layout_read = layout
                 self._desk_read(layout)
             if self._desk_wins is None:
                 return   # no layout measured yet (the watcher's visible reads off): nothing to record

@@ -6,16 +6,20 @@ shows (``max`` maximised, ``full`` full screen, ``win`` a plain window), whether
 seconds it was in front and mostly visible. Content-free: app keys, numbers and code words; never a title.
 
 Nightly, :func:`mine` reads the last :data:`LOOKBACK_DAYS` of the user's own present time (not Yuki acting, not a live
-test, not away; the current monitor setup only) and counts **occasions**: a run of desk stretches no more than
-:data:`OCCASION_GAP_S` apart in which the thing holds. Two kinds of habit, each with its counts:
+test, not away; the monitor setup he spent most present time on lately) and counts **occasions**: a run of desk
+stretches no more than :data:`OCCASION_GAP_S` apart in which the thing holds. Two kinds of habit, each with its counts:
 
 * ``keep``: app X sits on monitor N (maximised or not) in ``n`` of the ``m`` occasions X was on screen at all;
 * ``while``: while app P plays (a media session in a visible window) or shows full screen on monitor A, app X sits on
-  monitor B in ``n`` of the ``m`` occasions both were on screen. Kept only when it says more than X's ``keep`` habit
-  (another monitor, or a clearly higher share).
+  monitor B in ``n`` of the ``m`` occasions both were on screen. Kept only when the condition makes the difference:
+  X's share on B beats its share there with nothing playing or full screen on A, on the same days, by
+  :data:`WHILE_GAIN` (over at least :data:`MIN_N` such occasions), and chance would rarely give the difference (a
+  one-sided Fisher exact test, held to a false-discovery rate of :data:`WHILE_FDR` over all the pairs tested that
+  night). Occasions that split their time evenly between monitors count for neither.
 
 A habit is kept only above the bar: at least :data:`MIN_N` occasions on at least :data:`MIN_DAYS` days, and a share of
-at least :data:`MIN_SHARE`. Measured co-occurrence counts on stored app keys only: no word lists, nothing authored. An
+at least :data:`MIN_SHARE`; and the newest :data:`RECENT_DAYS` must not disagree (after a rearrangement the habit is the
+newest days' own, or none). Measured co-occurrence counts on stored app keys only: no word lists, nothing authored. An
 app mostly seen full screen in front (a game, an F11 video) gets no ``keep`` habit: nothing ever places it.
 
 The result is one small JSON in ``nudge_state`` (:data:`STATE_KEY`); :func:`lines` renders the strongest habits in
@@ -33,11 +37,13 @@ Public API (contract D1)::
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from typing import Any
 
 #: Where the mined habits live (``nudge_state``; JSON, content-free).
@@ -55,9 +61,18 @@ OCCASION_MIN_S = 60.0
 MIN_N = 5
 MIN_DAYS = 3
 MIN_SHARE = 0.7
-#: A ``while`` habit naming the same monitor as the app's ``keep`` habit is kept only when its share is this much
-#: higher (it then says something the plain habit does not).
+#: Recency: when the newest RECENT_DAYS hold at least RECENT_MIN of an app's occasions, at least RECENT_AGREE of them
+#: must sit on the habit's monitor (else he has rearranged: the habit is the newest days' own, or none).
+RECENT_DAYS = 7
+RECENT_MIN = 2
+RECENT_AGREE = 0.5
+#: A ``while`` habit is kept only when the app's share on that monitor under the condition beats its share there
+#: with nothing playing or full screen on the condition's monitor, on the same days, by this much (it then says
+#: something the plain habit does not) ...
 WHILE_GAIN = 0.15
+#: ... and not by chance: its one-sided Fisher exact test (n of m with the condition against k of m without) passes
+#: the Benjamini-Hochberg cut at this false-discovery rate over every (condition, app) pair tested that night.
+WHILE_FDR = 0.05
 #: A window counts as seen (for "plays in a visible window") when it was mostly visible this share of its stretch.
 SEEN_SHARE = 0.5
 #: Habits kept in the state (strongest first).
@@ -108,7 +123,14 @@ def parse_windows(text: Any) -> list[tuple[str, int, str, bool, float, float]]:
 
 
 def _day(at: float) -> str:
-    return datetime.fromtimestamp(at).strftime("%Y-%m-%d")
+    """The local day of ``at`` (``YYYY-MM-DD``), cached per quarter hour (every UTC offset is a multiple of 15 min, so
+    local midnight never falls inside a bucket)."""
+    return _quarter_day(int(at // 900))
+
+
+@lru_cache(maxsize=8192)
+def _quarter_day(quarter: int) -> str:
+    return datetime.fromtimestamp(quarter * 900).strftime("%Y-%m-%d")
 
 
 def _sits(row: DeskRow) -> dict[str, dict[int, str]]:
@@ -136,60 +158,74 @@ def _conditions(row: DeskRow) -> set[tuple[str, str, int]]:
     return out
 
 
-@dataclass
 class _Occasion:
-    start: float
-    seconds: float = 0.0
-    #: monitor -> seconds the app sat there; monitor -> seconds it sat there maximised / full screen.
-    on: Counter = field(default_factory=Counter)
-    maxed: Counter = field(default_factory=Counter)
-    full: Counter = field(default_factory=Counter)
+    """One run of an app's stretches: when it started (and the local day), its seconds, and per monitor the seconds
+    it sat there, maximised there, full screen there. Read with :meth:`where` once complete."""
+
+    __slots__ = ("start", "day", "seconds", "on", "maxed", "full", "_where")
+
+    def __init__(self, start: float) -> None:
+        self.start = start
+        self.day = _day(start)
+        self.seconds = 0.0
+        self.on: dict[int, float] = {}
+        self.maxed: dict[int, float] = {}
+        self.full: dict[int, float] = {}
+        self._where: tuple[int, bool, bool] | None | bool = False
 
     def where(self) -> tuple[int, bool, bool] | None:
-        if not self.on:
-            return None
-        mon = max(sorted(self.on), key=lambda m: self.on[m])
-        secs = self.on[mon] or 1.0
-        return mon, self.maxed[mon] >= 0.5 * secs, self.full[mon] >= 0.5 * secs
+        """``(monitor it sat on most, mostly maximised there, mostly full screen there)``; ``None`` when it split its
+        time evenly (a window on each monitor says nothing about where it sits; never broken towards monitor 0);
+        cached."""
+        if self._where is False:
+            ranked = sorted(self.on.items(), key=lambda kv: -kv[1])
+            if not ranked or (len(ranked) > 1 and ranked[1][1] >= ranked[0][1] - 1e-9):
+                self._where = None
+            else:
+                mon, secs = ranked[0][0], ranked[0][1] or 1.0
+                self._where = (mon, self.maxed.get(mon, 0.0) >= 0.5 * secs, self.full.get(mon, 0.0) >= 0.5 * secs)
+        return self._where
 
 
-def _occasions(rows: Sequence[DeskRow], app: str) -> list[_Occasion]:
-    """``app``'s occasions over ``rows`` (already filtered to the stretches that count, oldest first)."""
-    out: list[_Occasion] = []
-    last_end: float | None = None
-    for row in rows:
-        sits = _sits(row).get(app)
-        if not sits:
-            continue
-        if last_end is None or row.started_at - last_end > OCCASION_GAP_S or not out:
-            out.append(_Occasion(start=row.started_at))
-        occ = out[-1]
+#: A desk row with its per-app sits read once (:func:`_sits`): the miner's unit.
+_Item = tuple[DeskRow, dict[str, dict[int, str]]]
+
+
+def _occasions(items: Sequence[_Item], apps: set[str] | None = None) -> dict[str, list[_Occasion]]:
+    """Per app (only ``apps`` when given): its occasions over ``items`` (already filtered to the stretches that
+    count, oldest first), in one pass over the rows."""
+    out: dict[str, list[_Occasion]] = defaultdict(list)
+    last_end: dict[str, float] = {}
+    for row, sits in items:
         secs = row.seconds
-        occ.seconds += secs
-        share = secs / len(sits)
-        for mon, how in sits.items():
-            occ.on[mon] += share
-            if how == "max":
-                occ.maxed[mon] += share
-            elif how == "full":
-                occ.full[mon] += share
-        last_end = row.ended_at
-    return [o for o in out if o.seconds >= OCCASION_MIN_S]
+        for app, mons in sits.items():
+            if not mons or (apps is not None and app not in apps):
+                continue
+            occs = out[app]
+            if not occs or row.started_at - last_end[app] > OCCASION_GAP_S:
+                occs.append(_Occasion(start=row.started_at))
+            occ = occs[-1]
+            occ.seconds += secs
+            share = secs / len(mons)
+            for mon, how in mons.items():
+                occ.on[mon] = occ.on.get(mon, 0.0) + share
+                if how == "max":
+                    occ.maxed[mon] = occ.maxed.get(mon, 0.0) + share
+                elif how == "full":
+                    occ.full[mon] = occ.full.get(mon, 0.0) + share
+            last_end[app] = row.ended_at
+    return {app: [o for o in occs if o.seconds >= OCCASION_MIN_S] for app, occs in out.items()}
 
 
-def _verdict(occs: Sequence[_Occasion]) -> dict[str, Any] | None:
+def _bar(wheres: Sequence[tuple[_Occasion, tuple[int, bool, bool]]]) -> dict[str, Any] | None:
     """The modal monitor over occasions with its counts, or None below the bar."""
-    if not occs:
-        return None
-    wheres = [(o, o.where()) for o in occs]
-    wheres = [(o, w) for o, w in wheres if w is not None]
     m = len(wheres)
     if m < MIN_N:
         return None
     per = Counter(w[0] for _o, w in wheres)
     mon, n = max(sorted(per.items()), key=lambda kv: kv[1])
     support = [(o, w) for o, w in wheres if w[0] == mon]
-    days = {_day(o.start) for o, _w in support}
+    days = {o.day for o, _w in support}
     share = n / m
     if n < MIN_N or len(days) < MIN_DAYS or share < MIN_SHARE:
         return None
@@ -199,15 +235,83 @@ def _verdict(occs: Sequence[_Occasion]) -> dict[str, Any] | None:
     return {"monitor": mon, "how": how, "n": n, "m": m, "days": len(days), "share": round(share, 3)}
 
 
+def _verdict(occs: Sequence[_Occasion], *, now: float, counts: Counter | None = None) -> dict[str, Any] | None:
+    """The habit over ``occs`` (:func:`_bar`), unless the newest :data:`RECENT_DAYS` disagree: with at least
+    :data:`RECENT_MIN` occasions there and fewer than :data:`RECENT_AGREE` of them on the modal monitor, he has
+    rearranged; the habit is then the newest days' own (which must pass the bar alone), else none."""
+    wheres = [(o, w) for o in occs if (w := o.where()) is not None]
+    v = _bar(wheres)
+    recent = [(o, w) for o, w in wheres if o.start >= now - RECENT_DAYS * 86400.0]
+    if len(recent) < RECENT_MIN:
+        return v
+    if v is not None and sum(1 for _o, w in recent if w[0] == v["monitor"]) >= RECENT_AGREE * len(recent):
+        return v
+    if v is not None and counts is not None:
+        counts["stale"] += 1
+    return _bar(recent)
+
+
+def _per_day(occs: Sequence[_Occasion]) -> dict[str, Counter]:
+    """Per local day: how many of the app's occasions sat on each monitor."""
+    out: dict[str, Counter] = defaultdict(Counter)
+    for o in occs:
+        w = o.where()
+        if w is not None:
+            out[o.day][w[0]] += 1
+    return out
+
+
+def _on(per_day: Mapping[str, Counter], days: Iterable[str], monitor: int) -> tuple[int, int]:
+    """``(k, m)``: on ``days``, of ``m`` occasions ``k`` had the app on ``monitor``."""
+    k = m = 0
+    for day in days:
+        got = per_day.get(day)
+        if got:
+            k += got.get(monitor, 0)
+            m += sum(got.values())
+    return k, m
+
+
+def _fisher(n: int, m: int, k0: int, m0: int) -> float:
+    """One-sided Fisher exact test: the chance that ``n`` or more of the ``m`` occasions with the condition sit on the
+    monitor, when ``k0`` of the ``m0`` without it do and the condition makes no difference (both counts measured, so a
+    thin "without" side widens it). Log space: large counts never overflow."""
+    total, on = m + m0, n + k0
+
+    def log_c(a: int, b: int) -> float:
+        return math.lgamma(a + 1) - math.lgamma(b + 1) - math.lgamma(a - b + 1)
+
+    whole = log_c(total, m)
+    p = sum(math.exp(log_c(on, x) + log_c(total - on, m - x) - whole) for x in range(n, min(m, on) + 1))
+    return min(1.0, p)
+
+
+def _setup(rows: Sequence[DeskRow], now: float) -> str:
+    """The monitor setup to mine: the one with the most present (not away) seconds in the newest
+    :data:`RECENT_DAYS` (else the whole window), so a last stretch on a passing setup (a monitor off, a TV on) never
+    decides the month."""
+    for since in (now - RECENT_DAYS * 86400.0, float("-inf")):
+        secs: Counter = Counter()
+        last: dict[str, float] = {}
+        for r in rows:
+            if r.away or not r.screens or r.started_at < since:
+                continue
+            secs[r.screens] += r.seconds
+            last[r.screens] = r.started_at
+        if secs:
+            return max(secs, key=lambda s: (secs[s], last[s]))
+    return rows[-1].screens if rows else ""
+
+
 def mine_rows(rows: Iterable[DeskRow], *, now: float, screens: str | None = None,
               skip: Sequence[tuple[float, float]] = ()) -> dict[str, Any]:
-    """Habits from desk rows (pure). ``screens``: the monitor setup to mine (default: the newest row's); ``skip``:
-    time spans to leave out (the live test's). Returns ``{"screens", "habits": [...], "counts": {...}}``."""
+    """Habits from desk rows (pure). ``screens``: the monitor setup to mine (default :func:`_setup`); ``skip``: time
+    spans to leave out (the live test's). Returns ``{"screens", "habits": [...], "counts": {...}}``."""
     since = now - LOOKBACK_DAYS * 86400.0
     all_rows = sorted((r for r in rows if r.ended_at > since and r.started_at <= now), key=lambda r: r.started_at)
     counts: Counter = Counter(rows_read=len(all_rows))
     if screens is None:
-        screens = all_rows[-1].screens if all_rows else ""
+        screens = _setup(all_rows, now)
     use: list[DeskRow] = []
     for r in all_rows:
         if r.screens != screens:
@@ -216,46 +320,84 @@ def mine_rows(rows: Iterable[DeskRow], *, now: float, screens: str | None = None
             counts["away"] += 1
         elif r.by_yuki:
             counts["by_yuki"] += 1
-        elif any(a <= r.started_at <= b or a <= r.ended_at <= b for a, b in skip):
+        elif any(r.started_at <= b and r.ended_at >= a for a, b in skip):
             counts["test"] += 1
         else:
             use.append(r)
     counts["rows_used"] = len(use)
-    counts["days"] = len({_day(r.started_at) for r in use})
-    apps = sorted({w[0] for r in use for w in r.windows})
-    counts["apps"] = len(apps)
+    items: list[_Item] = [(r, _sits(r)) for r in use]
+    day_of = [_day(r.started_at) for r in use]
+    counts["days"] = len(set(day_of))
+    app_days: dict[str, set[str]] = defaultdict(set)
+    for (_r, sits), day in zip(items, day_of):
+        for app in sits:
+            app_days[app].add(day)
+    counts["apps"] = len(app_days)
+    apps = {app for app, days in app_days.items() if len(days) >= MIN_DAYS}
+    occs = _occasions(items, apps)
     habits: list[dict[str, Any]] = []
-    keep: dict[str, dict[str, Any]] = {}
     fullish: set[str] = set()
-    for app in apps:
-        v = _verdict(_occasions(use, app))
+    for app in sorted(apps):
+        v = _verdict(occs.get(app, []), now=now, counts=counts)
         if v is None:
             continue
         if v["how"] == "full":
             fullish.add(app)   # a game or an F11 video: nothing places it
             counts["full_apps"] += 1
             continue
-        keep[app] = v
         habits.append({"kind": "keep", "app": app, **v})
-    # while P plays / is full screen on A, X sits on B
+    # while P plays / is full screen on A, X sits on B: only when it beats where X sits with A free on the same days
+    # (lift), and not by chance (Fisher exact, Benjamini-Hochberg over the night's pairs)
     by_cond: dict[tuple[str, str, int], list[int]] = defaultdict(list)
+    busy: list[set[int]] = []
     for i, r in enumerate(use):
-        for cond in _conditions(r):
+        conds = _conditions(r)
+        busy.append({c[2] for c in conds})
+        for cond in conds:
             by_cond[cond].append(i)
+    # the comparison, per monitor: the occasions with nothing playing or full screen there (another player on that
+    # monitor would blur it), built once and cut to each condition's days
+    placeable = apps - fullish
+    free: dict[int, dict[str, dict[str, Counter]]] = {}
+    tested: list[tuple[float, dict[str, Any]]] = []
     for cond, idx in sorted(by_cond.items()):
-        if len(idx) < MIN_N:
+        days = {day_of[i] for i in idx}
+        if len(idx) < MIN_N or len(days) < MIN_DAYS:
             continue
-        sub = [use[i] for i in idx]
-        present = sorted({w[0] for r in sub for w in r.windows} - {cond[0]} - fullish)
-        for app in present:
-            v = _verdict(_occasions(sub, app))
+        sub_days: dict[str, set[str]] = defaultdict(set)
+        for i in idx:
+            for app in items[i][1]:
+                sub_days[app].add(day_of[i])
+        present = {app for app, d in sub_days.items() if len(d) >= MIN_DAYS and app != cond[0] and app in placeable}
+        if not present:
+            continue
+        with_occs = _occasions([items[i] for i in idx], present)
+        if cond[2] not in free:
+            free[cond[2]] = {app: _per_day(o) for app, o in _occasions(
+                [it for it, b in zip(items, busy) if cond[2] not in b], placeable).items()}
+        for app in sorted(present):
+            v = _verdict(with_occs.get(app, []), now=now)
             if v is None or v["how"] == "full":
                 continue
-            plain = keep.get(app)
-            if plain is not None and plain["monitor"] == v["monitor"] and v["share"] < plain["share"] + WHILE_GAIN:
-                counts["while_implied"] += 1
+            k0, m0 = _on(free[cond[2]].get(app, {}), days, v["monitor"])
+            if m0 < MIN_N:
+                counts["while_thin"] += 1      # too little of the same days without it to compare with
                 continue
-            habits.append({"kind": "while", "app": app, "player": cond[0], "state": cond[1], "at": cond[2], **v})
+            base = k0 / m0
+            tested.append((_fisher(v["n"], v["m"], k0, m0),
+                           {"kind": "while", "app": app, "player": cond[0], "state": cond[1], "at": cond[2], **v,
+                            "without": round(base, 3), "m_without": m0}))
+    # Benjamini-Hochberg over every pair tested: the largest rank whose p fits under rank / N * WHILE_FDR, and all
+    # stronger ones; then the gain must be real too (the condition changes where it sits, not just how sure we are)
+    tested.sort(key=lambda t: t[0])
+    cut = max((i for i, (p, _h) in enumerate(tested, 1) if p <= i / len(tested) * WHILE_FDR), default=0)
+    counts["while_tested"] = len(tested)
+    counts["while_chance"] = len(tested) - cut
+    for _p, h in tested[:cut]:
+        if h["share"] - h["without"] < WHILE_GAIN:
+            counts["while_no_lift"] += 1   # he keeps it there anyway: the condition adds nothing
+            continue
+        habits.append(h)
     habits.sort(key=lambda h: (-h["n"], -h["share"], h["kind"], h["app"]))
     counts["keep"] = sum(1 for h in habits if h["kind"] == "keep")
     counts["while"] = sum(1 for h in habits if h["kind"] == "while")
@@ -518,5 +660,6 @@ def place_for(store: Any, app: str, *, situation: Any = None) -> dict[str, Any] 
 
 
 __all__ = ["STATE_KEY", "TABLE", "LOOKBACK_DAYS", "PRUNE_DAYS", "OCCASION_GAP_S", "OCCASION_MIN_S", "MIN_N",
-           "MIN_DAYS", "MIN_SHARE", "WHILE_GAIN", "SEEN_SHARE", "DeskRow", "parse_windows", "mine_rows", "mine",
-           "load", "render", "lines", "screens_key", "desk_now", "pick", "place_for"]
+           "MIN_DAYS", "MIN_SHARE", "RECENT_DAYS", "RECENT_MIN", "RECENT_AGREE", "WHILE_GAIN", "WHILE_FDR",
+           "SEEN_SHARE", "DeskRow", "parse_windows", "mine_rows", "mine", "load", "render", "lines", "screens_key",
+           "desk_now", "pick", "place_for"]

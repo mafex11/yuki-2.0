@@ -717,11 +717,11 @@ def habit_place(ctx: RunContext, hwnd: int) -> tuple[str, str] | None:
     """Phase 3.3: the place hint the user's own desk habit gives a run whose caller gave none
     (:func:`yuki.memory.deskhabits.place_for`, learned nightly from where they keep the app), or ``None``.
 
-    Only to keep their screen theirs: a hint comes only when the window shows (or comes back) on a monitor where another
-    app plays or shows full screen now, and their habit for this app, on this desk, is another monitor (e.g. while a
-    video plays on monitor 0 they keep Discord on monitor 1). A window they placed elsewhere stays where it is; an app
-    they keep full screen (a game) has no habit; the place gate still refuses with a game in front. Content-free log
-    line ``skill_place_habit``."""
+    Only to keep their screen theirs: a hint comes only when the window shows on a monitor where another app plays or
+    shows full screen now, and their habit for this app, on this desk, is another monitor (e.g. while a video plays on
+    monitor 0 they keep Discord on monitor 1). A window they placed elsewhere stays where it is; a minimised one gets
+    no hint (the place verb refuses it: "restore it first"); an app they keep full screen (a game) has no habit; the
+    place gate still refuses with a game in front. Content-free log line ``skill_place_habit``."""
     if getattr(ctx, "memory", None) is None or not hwnd:
         return None
     try:
@@ -729,14 +729,14 @@ def habit_place(ctx: RunContext, hwnd: int) -> tuple[str, str] | None:
         from yuki.memory import deskhabits
 
         app = _place._app(hwnd)
-        if not app:
-            return None
+        if not app or _place._state(hwnd) == "minimized":
+            return None   # place_window refuses a minimised window: no hint, no refused move logged
         got = _mem(ctx.memory, "desk_place",
                    lambda c: deskhabits.place_for(_store_of(c), app, situation=_desk_situation),
                    timeout_s=HABIT_PLACE_S)
         if not isinstance(got, Mapping) or got.get("monitor") is None:
             return None
-        where = _place.monitor_index(hwnd)   # a minimised window: where it comes back (MonitorFromWindow)
+        where = _place.monitor_index(hwnd)
     except Exception:  # noqa: BLE001 - no habit: the window goes where its app puts it
         return None
     target = int(got["monitor"])
