@@ -433,7 +433,13 @@ class CommitCheck:
 class OneVerdict:
     """:func:`one`'s answer, in the shape the hands' callers read (``allowed``, ``decision``, ``question``, ``why``,
     ``source``). ``handover``: the hand would send (or join) and goes to the planner instead, never refused silently
-    (L10). ``act_off``: the app's name when its "Act" switch is off. ``row``: the consent row that decided."""
+    (L10). ``act_off``: the app's name when its "Act" switch is off. ``row``: the consent row that decided.
+
+    Phase 4 (oCore, additive; read by ``yuki.one.policy``): ``countdown``: an allowed send runs the send countdown
+    first; ``draft_input`` / ``type_after``: a draft's capability input, and Yuki's own wording typed without Enter
+    once the chat is open (``decision`` ``"draft"``: only when a send declaration was given); ``line``, ``final``,
+    ``focus``, ``code``: the consent verdict's own line, whether a refusal is said as it is, a refused join's window,
+    and its code word (content-free). A caller that passes no ``consent=`` reads every old field exactly as before."""
 
     allowed: bool
     decision: str
@@ -443,12 +449,26 @@ class OneVerdict:
     handover: bool = False
     act_off: str = ""
     row: int = 0
+    countdown: bool = False
+    draft_input: dict[str, Any] | None = None
+    type_after: str = ""
+    line: str = ""
+    final: bool = False
+    focus: int | None = None
+    code: str = ""
+
+
+#: The consent module under a second name: :func:`one` takes a ``consent=`` argument (phase 4), which hides the module's
+#: own name inside it.
+_rule = consent
 
 
 def one(name: str, tool_input: Mapping[str, Any], target: Mapping[str, Any] | None = None, *,
         words: Sequence[str], checker: CommitCheck | None = None, client: Any = None,
         settings: Any = None, earlier: Sequence[str] = (), board: Mapping[str, Any] | None = None,
-        policy: Any = None, log: Callable[..., None] | None = None) -> OneVerdict:
+        policy: Any = None, log: Callable[..., None] | None = None, consent: Mapping[str, Any] | None = None,
+        recent: Sequence[Mapping[str, Any]] | None = None,
+        people_in: Callable[[str], list[list[str]] | None] | None = None) -> OneVerdict:
     """The consent rule (rows 1-6) over one step with a one-step commit check: the talker's hands and rung B.
 
     ``target``: the code facts the hand read (``hwnd``, ``app``: the window's process, ``title``, ``role`` and ``name``
@@ -456,7 +476,15 @@ def one(name: str, tool_input: Mapping[str, Any], target: Mapping[str, Any] | No
     own heard words for this turn (never the talker's wording). ``board``: the Now board (read now when ``None``).
     ``checker``: give a fresh one per turn, or call its ``begin_request()`` each turn; a checker kept across turns
     still drops its memo when the words differ. No plan declares a send, so a hand that would send is handed over
-    (``handover``). Never raises (an error: an ask)."""
+    (``handover``). Never raises (an error: an ask).
+
+    Phase 4 (oCore, additive; each ``None`` is today's behaviour exactly): ``consent``: the ONE agent's send
+    declaration (``{"to", "text", "quote"}``, ``commit`` defaulting to ``send``): rows 3-4 run as for a plan that
+    declared it (an allowed send comes back with ``countdown``; a draft as ``decision="draft"`` with ``draft_input`` /
+    ``type_after``), and nothing is handed over. ``recent``: the user's own last messages to the person the send names
+    (``{"text", "at"}``: row 4's near-duplicate ask). ``people_in``: memory's people index (row 4's recipient checks).
+    ``target["typed_text"]``: the text Yuki typed in that window and has not sent, when known (a question shows it)."""
+    declared = consent
     try:
         target = dict(target or {})
         hwnd = target.get("hwnd")
@@ -467,30 +495,54 @@ def one(name: str, tool_input: Mapping[str, Any], target: Mapping[str, Any] | No
                                                                or ""))
         if board is None:
             board = _board()
-        live = Live(game=consent.game_now(board), calling=consent.calling_windows(board),
-                    typed_pending=frozenset({call.hwnd}) if call.hwnd and target.get("typed_pending") else frozenset(),
+        typed: frozenset[int] | dict[int, str] = frozenset()
+        if call.hwnd and target.get("typed_pending"):
+            text = target.get("typed_text")
+            typed = {call.hwnd: str(text)} if isinstance(text, str) else frozenset({call.hwnd})
+        live = Live(game=_rule.game_now(board), calling=_rule.calling_windows(board),
+                    typed_pending=typed,
                     reads=frozenset({"file"}) if target.get("files_read") else frozenset(),
-                    join_controls=consent.join_controls(), policy=policy)
+                    join_controls=_rule.join_controls(), policy=policy,
+                    recent=tuple(recent or ()), people_in=people_in)
+        plan = _declared(declared) if declared is not None else None
         cv = None
-        if consent.may_commit(call, live):
+        if _rule.may_commit(call, live, plan):
             checker = checker or CommitCheck(client, settings, log)
-            cv = checker.run(list(words), [call], earlier=earlier, typed_pending=live.typed_pending).get(0)
-        v = consent.check(call, None, list(words), live, cv)
+            cv = checker.run(list(words), [call], earlier=earlier, plan=plan,
+                             typed_pending=live.typed_pending).get(0)
+        v = _rule.check(call, plan, list(words), live, cv)
     except Exception as exc:  # noqa: BLE001 - fail closed
         return OneVerdict(False, "ask_user", why=f"the check could not run ({type(exc).__name__})", source="error")
-    if v.result == consent.ALLOW:
-        return OneVerdict(True, "allow", why=v.why, source=f"row{v.row}", row=v.row)
-    if v.result == consent.ASK:
-        return OneVerdict(False, "ask_user", question=v.question, why=v.why, source=f"row{v.row}", row=v.row)
+    if v.result == _rule.ALLOW:
+        return OneVerdict(True, "allow", why=v.why, source=f"row{v.row}", row=v.row, countdown=v.countdown,
+                          code=v.why)
+    if v.result == _rule.ASK:
+        return OneVerdict(False, "ask_user", question=v.question, why=v.why, source=f"row{v.row}", row=v.row,
+                          code=v.why)
+    if v.result == _rule.DRAFT:
+        # only with a declaration (a step with nothing declared is refused before any draft): the capability with its
+        # send slot on a non-sending option
+        return OneVerdict(False, "draft", why=v.line or v.why, source=f"row{v.row}", row=v.row,
+                          draft_input=dict(v.draft_input) if v.draft_input is not None else None,
+                          type_after=v.type_after, line=v.line, code=v.why)
     off = ""
     if v.why == "act_off":
         try:
             off = str((policy or util._shared_reader()).app_off(call.app) or "")
         except Exception:  # noqa: BLE001
             off = ""
-    handover = v.row in (3, 4)
+    handover = v.row in (3, 4) and plan is None
     return OneVerdict(False, "ask_user", why=v.line or v.why, source=f"row{v.row}", handover=handover, act_off=off,
-                      row=v.row)
+                      row=v.row, line=v.line, final=v.final, focus=v.focus, code=v.why)
+
+
+def _declared(declaration: Mapping[str, Any]) -> dict[str, Any]:
+    """Phase 4: the ONE agent's send declaration as the one-step plan :func:`consent.check` reads (``consent.commit``
+    defaulting to ``send``; ``to``, ``text`` and ``quote`` as given)."""
+    commit = str(declaration.get("commit") or "send")
+    return {"consent": {"commit": commit if commit in _rule.COMMITS else "send",
+                        "to": declaration.get("to") or "", "text": declaration.get("text") or "",
+                        "quote": declaration.get("quote") or ""}}
 
 
 def _board() -> Mapping[str, Any] | None:

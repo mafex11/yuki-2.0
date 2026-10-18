@@ -1174,9 +1174,19 @@ class VoiceSession(QObject):
         return self.bridge.owns(job_id)
 
     def interrupt(self) -> None:
-        """Cut Yuki's speech now (the cancel hotkey)."""
+        """Cut Yuki's speech now (the cancel hotkey). oVoice: under ``brain = "one"`` it also stops a send countdown that
+        is open (the island's Stop/Esc reaches here through ``ui.app._on_send_stop`` and :meth:`owns`)."""
         if self._conversation is not None:
             self._conversation.interrupt()
+
+    def send_choice(self, request_id: int, kind: str, value: str) -> bool:
+        """oVoice: a chip tapped on a ONE voice send countdown (``kind`` ``who`` / ``where``): the countdown ends
+        ``changed`` with the swap and the agent sends again to the new choice. ``False`` when this voice did not show
+        that countdown or none is open. Any thread."""
+        if not self.bridge.owns(int(request_id)) or self._conversation is None:
+            return False
+        swap = getattr(self._conversation, "send_choice", None)
+        return bool(swap(str(kind), str(value))) if callable(swap) else False
 
     def shutdown(self) -> None:
         """App exit: end the conversation (bounded join), stop listening, close the mic."""

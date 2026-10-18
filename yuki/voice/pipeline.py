@@ -28,6 +28,9 @@ spoken exchange to memory's turn log (encrypted), marked as voice:
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import itertools
+import weakref
 from collections import deque
 from pathlib import Path
 import os
@@ -46,7 +49,7 @@ from yuki.voice.recall import QUICK_MEMORY
 from yuki.voice.mouth import (
     CHECK_PROGRESS, END_CONVERSATION, GO_QUIET, HAND_OVER, HANDOFF_TOOLS, LEAN_MOUTH_PROMPT, MORE_OF_RESULT,
     MOUTH_PROMPT, STAY_QUIET, TELL_YUKI, MouthMemory, ReplyChannel, mouth_system_blocks, router_on, say_first_words,
-    talker_kind, voice_on_brain, volatile_block, with_markers,
+    talker_kind, voice_on_brain, voice_one, volatile_block, with_markers,
 )
 
 #: The speech channels (``Settings.voice_speech_channel``, v3.16).
@@ -458,6 +461,10 @@ class LlmCall:
     route: str | None = None            # E3a (v3.17): the router's decision for this turn (thinker / talker / None)
     route_ms: float | None = None       # and how long it took from its request
     tool: bool = False                 # kMind: a tool call began in this reply (the claim gate stops checking)
+    one_round: int = 0                 # oVoice: this call's round in a ONE turn (0: no ONE round)
+    one_fresh: bool = False            # oVoice: it answers the user's turn again (a rerun: the turn's block made again)
+    one_thoughts: int = 0              # oVoice: thinking blocks an adaptive ONE round kept for the turn
+    one_eager: bool = False            # oVoice: it answers Flux's eager end of turn (its final words still to come)
 
 
 #: Tools whose spoken acknowledgement travels in the call itself (``say_first``), said as soon as it is written.
@@ -1134,6 +1141,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 hook("reply_calls", [(str(getattr(fc, "tool_call_id", fc)), getattr(fc, "function_name", ""),
                                       getattr(fc, "arguments", None)) for fc in function_calls
                                      if not self._yuki_hold.get(str(getattr(fc, "tool_call_id", fc)), False)])
+            if function_calls:
+                hook("one_reply", function_calls)   # oVoice: the ONE driver keeps the reply's calls, in order
             await super().run_function_calls(function_calls)
 
         async def push_frame(self, frame: Any, direction: Any = None) -> None:
@@ -1157,6 +1166,9 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 # E3a: the reply is over (its calls already ran): a router start it did not take is withdrawn, unless
                 # the reply was speculative and its calls wait for the turn to be confirmed.
                 hook("reply_done", bool(self._yuki_early_pending or self._yuki_held_calls))
+                # oVoice: a ONE round's reply with no call ends the turn (the agent decided it is done)
+                hook("one_reply_end", self._yuki_call,
+                     bool(getattr(getattr(self, "_speculation_gate", None), "is_speculating", False)))
             if isinstance(frame, UserStoppedSpeakingFrame):
                 pending, self._yuki_early_pending = self._yuki_early_pending, None
                 if pending is not None:
@@ -1201,8 +1213,25 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             # E3a (v3.17): the router decides alongside this call whether the turn needs the thinker (off by default).
             call.user_turn = _last_role(context) == "user"
             hook("route_turn", context, call)
+            one = hook("one")
+            if one is not None:
+                # oVoice: the ONE turn this call belongs to, and the budget's round before every model call of it;
+                # spent (the rounds, the hard stop): code said its line and no model call is made
+                call.one_fresh = bool(call.user_turn and hook("rerun", default=False))
+                # the gate's speculation flag is set for this inference before this method runs (process_frame)
+                call.one_eager = bool(getattr(getattr(self, "_speculation_gate", None), "is_speculating", False))
+                try:
+                    go = await one.begin(context, call)
+                except Exception as exc:  # noqa: BLE001 - the reply still goes (every act fails closed at its gate)
+                    one._log("begin_error", error=type(exc).__name__)
+                    go = True
+                if not go:
+                    return
             try:
-                self._yuki_lookup, self._yuki_desk = await hooks.before_call(context, call)
+                if one is None or one.needs_reads(call):
+                    self._yuki_lookup, self._yuki_desk = await hooks.before_call(context, call)
+                else:
+                    self._yuki_lookup, self._yuki_desk = None, None   # oVoice: the turn's block is frozen already
             except Exception:  # noqa: BLE001 - grounding is a hint; never block the reply on it
                 self._yuki_lookup, self._yuki_desk = None, None
             call.grounded = time.monotonic()
@@ -1220,6 +1249,9 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 if ordered != messages:
                     context = LLMContext(messages=ordered, tools=context.tools, tool_choice=context.tool_choice)
             params = super()._get_llm_invocation_params(context)
+            one = hook("one")
+            if one is not None:
+                return self._yuki_one_params(params, one)
             # bTalk: the lean talker's core (design 3) when the conversation has one; else the full one, as before
             talker = "lean" if hook("talker", default="full") == "lean" else "full"
             base = LEAN_MOUTH_PROMPT if talker == "lean" else MOUTH_PROMPT
@@ -1240,6 +1272,40 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 cut=hook("cut", default=None), after_goodbye=bool(hook("after_goodbye", default=False)),
                 channel=channel, rerun=bool(hook("rerun", default=False)), state=hook("state", default=None),
                 talker=talker))
+            return params
+
+        def _yuki_one_params(self, params: Any, one: Any) -> Any:
+            """oVoice (``brain = "one"``): the ONE agent's request. System: ``yuki.one.prompt.voice_blocks`` (the lean
+            talker's layers and cache breakpoints with the ONE core and tools paragraph; the you-card; the last hour).
+            Messages: the turn's block (time, Situation, lookup, notes) made once at round 1 and riding on their own
+            message every round (``OneVoice.volatile``, :func:`with_volatile_at`). Thinking: the turn's mode from round 2
+            (``OneVoice.thinking``)."""
+            from yuki.one.prompt import ONE_CORE, voice_blocks
+
+            composed = self._settings.system_instruction or ONE_CORE
+            tail = composed[len(ONE_CORE):].strip() if composed.startswith(ONE_CORE) else ""
+            call = hooks.call()
+            channel = hook("channel", default="guard")
+            params["system"] = voice_blocks(memory, tail=[tail] if tail else [], call=call,
+                                            call_evidence=hook("call_evidence", default=None),
+                                            marker=channel == "marker", marks=bool(hook("marks", default=True)))
+            messages = params.get("messages")
+            if channel == "marker":
+                messages = with_markers(messages)   # its earlier replies as the channel writes them (v3.16)
+            current = None if getattr(self, "_yuki_warming", False) else self._yuki_call
+
+            def make() -> dict[str, Any]:
+                return volatile_block(
+                    lookup=self._yuki_lookup, desk=self._yuki_desk, call=call, heard=hooks.heard(),
+                    named=bool(hook("named", default=False)), work=None, cut=hook("cut", default=None),
+                    after_goodbye=bool(hook("after_goodbye", default=False)), channel=channel,
+                    rerun=bool(hook("rerun", default=False)), state=one.state(hook("state", default=None)),
+                    talker="lean")
+
+            block, anchor = one.volatile(current, make)
+            params["messages"] = (with_volatile_at(messages, block, anchor) if anchor
+                                  else with_volatile(messages, block))
+            one.thinking(params, current)
             return params
 
         def _sync_cancel_tools(self) -> None:
@@ -1374,6 +1440,10 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             if call is None:
                 return response
             call.opened = time.monotonic()
+            one = hook("one")
+            # oVoice: an adaptive round of a ONE turn keeps its thinking blocks (Pipecat stores them with their
+            # signatures) until the turn ends; every other reply drops them, as before
+            keep_thoughts = bool(one is not None and one.keeps_thoughts(call))
             # v3.16, the marker channel: only text after a say marker line reaches the voice (and so the context);
             # the marker lines and any scratch are taken out of the stream here, before anything downstream sees
             # them, so every stream fact (first text, words in the reply, an early say_first) is about speech only.
@@ -1393,7 +1463,10 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                         if call.first_event is None:
                             call.first_event = now
                         kind = getattr(event, "type", "")
-                        if kind == "content_block_start" and getattr(event.content_block, "type", "") in (
+                        if keep_thoughts and kind == "content_block_start" and getattr(
+                                event.content_block, "type", "") in ("thinking", "redacted_thinking"):
+                            call.one_thoughts += 1
+                        elif kind == "content_block_start" and getattr(event.content_block, "type", "") in (
                                 "thinking", "redacted_thinking"):
                             # kMind (review L1): Sonnet 5.5's notes between tool calls (``between_tools``) are never
                             # spoken, and kept out of the conversation: its history is edited every turn (volatile
@@ -1914,6 +1987,10 @@ class TurnObserver:
         #: lSpeed: ``(turn)``: a user turn opened from a final transcript; the conversation marks it with the reflex that
         #: ran for its words, if one did (set by the conversation).
         self.on_user_turn: Callable[[Any], None] | None = None
+        #: oVoice (phase 4): ``()`` at Flux's start of turn, ``(words)`` at each final transcript (a dismissal's too): a
+        #: ONE send countdown pauses on their speech and their words decide (set by the conversation under one only).
+        self.on_user_started: Callable[[], None] | None = None
+        self.on_user_words: Callable[[str], None] | None = None
 
     def fast_handled(self, kind: str) -> None:
         """vGame: the open user turn was answered by the fast path (``"dismiss"`` or ``"name"``): it was said to Yuki
@@ -2383,10 +2460,20 @@ class TurnObserver:
                 self.hands.prefetch()  # the tabs for the reply's desktop block, read while they talk
             self.set_state("hearing")
             self._activity()
+            if self.on_user_started is not None:
+                try:
+                    self.on_user_started()
+                except Exception:  # noqa: BLE001 - the countdown's own pause limit then
+                    pass
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self.user_speaking = False
             self._activity()
         elif isinstance(frame, TranscriptionFrame):
+            if self.on_user_words is not None:
+                try:
+                    self.on_user_words(frame.text or "")
+                except Exception:  # noqa: BLE001 - the countdown's own pause limit then
+                    pass
             if self.turn is not None and self.turn.trigger == "user" and self.turn.fast == "dismiss":
                 self.turn.user_text = frame.text or self.turn.user_text   # vGame: ended on its eager words already
                 return
@@ -2638,8 +2725,15 @@ class _Hooks:
             return []   # Settings → AI moved the talker: its client retries there and uses only the user's backup
         s = self.c.settings
         model = getattr(self.c, "talker_model", None) or s.voice_mouth_model
-        return [dict(t) for t in (getattr(s, "model_fallbacks", None) or {}).get(model, [])
-                if isinstance(t, dict) and t.get("model")]
+        chain = [dict(t) for t in (getattr(s, "model_fallbacks", None) or {}).get(model, [])
+                 if isinstance(t, dict) and t.get("model")]
+        if getattr(self.c, "one", False):
+            # phase 4 (addendum must-fix 9, oTyped's note): the ONE agent acts, so its chain stops after Sonnet 5 and
+            # holds no Haiku (``brain.settings.one_chain``, as typed's ``one.host.one_client``)
+            from yuki.brain.settings import one_chain
+
+            return one_chain(chain)
+        return chain
 
     def sticky_index(self, size: int) -> int:
         index, until = getattr(self.c, "_failover_sticky", (0, 0.0))
@@ -2824,6 +2918,22 @@ class _Hooks:
 
     def reply_done(self, pending: bool = False) -> None:
         self.c._reply_done(pending)
+
+    # -- oVoice (phase 4, brain = "one"): the ONE driver ------------------------------------------------------------
+
+    def one(self) -> Any:
+        """The conversation's ONE driver (``brain = "one"``), else ``None`` (every other brain: nothing changes)."""
+        return getattr(self.c, "one_driver", None)
+
+    def one_reply(self, calls: Any) -> None:
+        driver = getattr(self.c, "one_driver", None)
+        if driver is not None:
+            driver.reply(calls)
+
+    def one_reply_end(self, call: Any, speculating: bool = False) -> None:
+        driver = getattr(self.c, "one_driver", None)
+        if driver is not None:
+            driver.reply_end(call, speculating)
 
 
 def quiet_answered(messages: list[Any] | None) -> set[int]:
@@ -3412,6 +3522,1428 @@ def talker_you() -> TalkerYou:
     return _talker_you
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# oVoice (phase 4, ``brain = "one"``): the ONE agent's voice driver
+# ---------------------------------------------------------------------------------------------------------------------
+#
+# Design: docs/research/audit-2026-10-18/phase4-design.md with phase4-addendum.md (binding). Under ``brain = "one"``
+# one Sonnet 5.5 agent owns the whole spoken turn: it talks, acts with the generic verbs (``yuki.one.tools``), gets
+# what changed with every result (the runner, ``yuki.one.runner``), and decides itself when it is done; every act
+# passes the one gate (``yuki.one.policy``, called by the runner); the budget (``yuki.one.budget``) is the runaway
+# guard; sends wait in the one countdown (``yuki.one.countdown``). Nothing here runs under any other brain value.
+
+#: The voice controls: the bridge's own handlers, never the runner (sync, as before).
+ONE_CONTROLS: frozenset[str] = frozenset({"stay_quiet", "end_conversation", "go_quiet", "more_of_result"})
+#: Controls that end the conversation: no model run after them.
+ONE_ENDS: frozenset[str] = frozenset({"end_conversation", "go_quiet"})
+#: A runner result's keys that are the driver's alone, never sent to the model (a dict result; a ``OneResult`` gives
+#: the model its own ``for_model()``).
+ONE_PRIVATE: frozenset[str] = frozenset({"settle", "silent", "fallback", "speak", "owed", "decision", "payload",
+                                         "final", "ms", "verb", "tidy", "name", "heard"})
+#: The statuses a call may settle on (``yuki.one.runner.CLEAN``: done, already so, a memory write kept, a send they
+#: stopped), with ``verified`` not false, nothing flagged and no ``then``.
+ONE_CLEAN: frozenset[str] = frozenset({"done", "already", "written", "stopped", "verified"})
+#: A result's fields read off a runner's result object (``yuki.one.runner.OneResult``).
+ONE_FIELDS: tuple[str, ...] = ("name", "status", "verified", "result", "said", "owed", "evidence", "after", "flags",
+                               "flagged", "then", "question", "line", "final", "settle", "silent", "countdown", "swap",
+                               "fallback", "note", "error", "heard")
+#: Review fix H1: the user-words mark of the turn whose call is running on this thread (the runner's worker), read by
+#: the countdown's ``publish`` as it opens: words heard after that mark came after the request the send is for.
+_ONE_CALL_MARK: contextvars.ContextVar[int | None] = contextvars.ContextVar("yuki_one_call_mark", default=None)
+#: Review fix M3: the learned reflexes that run under ``brain = "one"`` (each through the one gate first): the sound
+#: hands and the volume skill (no window, nothing lasting; the same tool and arguments as the ONE agent's own call,
+#: so its call for the same words is matched and never pressed twice). A window, scroll or opening reflex stays off.
+ONE_REFLEX_TOOLS: frozenset[str] = frozenset({"media_key", "app_volume", "run_skill"})
+#: Review fix M3: the runner's fallback for a reflex's press whose effect was not seen (``runner.OWED_LINES``).
+ONE_NOT_CONFIRMED_LINE = "I couldn't confirm that worked."
+#: Thinking once a turn is structurally hard (design 2.6, lead decision 3): adaptive at this effort, with room for it
+#: (the talker's 400-token output ceiling would cut a thought short). Its text is omitted (never spoken, never read).
+ONE_EFFORT = "medium"
+ONE_THINK_MAX_TOKENS = 4000
+#: ``Settings.one_thinking``: ``structure`` (the default: off on round 1, adaptive medium from round 2 when round 1's
+#: reply shows the turn is hard), ``fast`` (never adaptive), ``adaptive_low`` (adaptive at low effort from round 2).
+ONE_THINKING: tuple[str, ...] = ("structure", "fast", "adaptive_low")
+#: A question the gate asked last turn: the yes/no read of their reply is waited for at most this long before a call
+#: of the new turn goes to the gate (it starts with the turn and runs while round 1 is written).
+ONE_ANSWER_WAIT_S = 3.0
+#: A call waits at most this long for the calls written before it in the same reply (they run in order).
+ONE_ORDER_WAIT_S = 75.0
+#: The countdown paused on the user's sound: with no words and no voiced audio this long, it was noise (s).
+ONE_NOISE_S = 2.0
+#: What the model reads on a result that came back after code closed its turn (the hard stop): no run follows it.
+ONE_LATE_NOTE = "The turn ended before this came back: say nothing about it now."
+#: The runner did not load (its lane not merged, an import error, a contract this driver cannot call): every act fails
+#: closed with this.
+ONE_NO_RUNNER: dict[str, Any] = {
+    "status": "failed", "verified": False, "error": "no_runner",
+    "note": "Not done: Yuki's hands are not ready, so nothing was done. Say so in a few words."}
+#: A runner call that raised: something may or may not have happened.
+ONE_RUN_ERROR: dict[str, Any] = {
+    "status": "failed", "verified": False, "error": "runner_error",
+    "note": "Not confirmed: Yuki's hands hit an error, so it may not have happened. Say so in a few words."}
+
+
+def one_thinking_mode(settings: Any) -> str:
+    """``Settings.one_thinking`` (:data:`ONE_THINKING`); anything else: ``structure``."""
+    value = str(getattr(settings, "one_thinking", "") or "structure").strip().lower()
+    return value if value in ONE_THINKING else "structure"
+
+
+def one_kind(name: str) -> str:
+    """``act`` | ``read`` | ``write`` | ``control`` | ``unknown`` for a ONE tool name (``yuki.one.tools.SPECS``)."""
+    if name in ONE_CONTROLS:
+        return "control"
+    from yuki.one import tools as one_tools
+
+    spec = one_tools.SPECS.get(str(name or ""))
+    if spec is None:
+        return "unknown"
+    if spec.acts:
+        return "act"
+    return spec.kind if spec.kind in ("read", "write", "control") else "unknown"
+
+
+def one_result(raw: Any) -> dict[str, Any]:
+    """A runner's result as a plain dict of its facts (the contract: ``run(...) -> dict``, or
+    ``yuki.one.runner.OneResult``: its fields, its ``clean`` as ``_clean`` and its ``for_model()`` as ``_payload``, what
+    the model reads). ``None`` or an unreadable object: a failure."""
+    if raw is None:
+        return {"status": "failed", "verified": False, "error": "no_result"}
+    if isinstance(raw, dict):
+        return dict(raw)
+    out: dict[str, Any] = {key: getattr(raw, key) for key in ONE_FIELDS if hasattr(raw, key)}
+    clean = getattr(raw, "clean", None)
+    if isinstance(clean, bool):
+        out["_clean"] = clean
+    for_model = getattr(raw, "for_model", None)
+    if callable(for_model):
+        try:
+            payload = for_model()
+            if isinstance(payload, dict):
+                out["_payload"] = dict(payload)
+        except Exception:  # noqa: BLE001 - the plain fields then
+            pass
+    return out or {"status": "failed", "verified": False, "error": "unreadable_result"}
+
+
+def one_payload(result: dict[str, Any]) -> dict[str, Any]:
+    """What the model reads of a result: the runner's own ``for_model()`` when it gave one, else every field but the
+    driver's own keys and empty values."""
+    if isinstance(result.get("_payload"), dict):
+        return dict(result["_payload"])
+    return {k: v for k, v in result.items()
+            if k not in ONE_PRIVATE and not str(k).startswith("_") and v is not None and v != "" and v != []
+            and v != {}}
+
+
+def _one_flagged(result: dict[str, Any]) -> bool:
+    """Whether the act's diff came back flagged (it covered what they watched, took the keyboard, left something open):
+    ``flagged`` true, or any truthy flag in ``flags`` (a list, a set or a mapping of flag -> bool)."""
+    if result.get("flagged") is True:
+        return True
+    flags = result.get("flags")
+    if isinstance(flags, dict):
+        return any(bool(v) for v in flags.values())
+    if isinstance(flags, (list, tuple, set, frozenset)):
+        return any(bool(v) for v in flags)
+    if isinstance(flags, str):
+        return bool(flags.strip())
+    return bool(flags)
+
+
+def one_outcome(name: str, args: Any, result: dict[str, Any]) -> dict[str, Any]:
+    """One call's outcome for the settle rule (code facts only): its kind, whether it verified, whether its diff was
+    flagged, its ``then`` (acts only), and whether code settled or the conversation ends with it."""
+    kind = one_kind(name)
+    status = str(result.get("status") or "").strip().lower()
+    if kind == "control":
+        ok = True
+    elif isinstance(result.get("_clean"), bool):
+        ok = bool(result["_clean"])   # the runner's own reading (``OneResult.clean``)
+    else:
+        ok = result.get("verified") is True or (status in ONE_CLEAN and result.get("verified") is not False)
+    then = ""
+    if kind == "act":
+        from yuki.one.tools import then_of
+
+        then = " ".join(str(result.get("then") or "").split()) or then_of(args if isinstance(args, dict) else {})
+    return {"name": str(name or ""), "kind": kind, "verified": bool(ok), "flagged": _one_flagged(result),
+            "then": then, "settle": bool(result.get("settle")), "silent": bool(result.get("silent")),
+            "ends": name in ONE_ENDS}
+
+
+def one_settle(outcomes: list[dict[str, Any]]) -> str:
+    """The settle rule over one reply's outcomes, in order (addendum must-fix 2, lead decision 2): ``end`` (code settled
+    it, or the conversation ends: no model run), ``code`` (every act verified, nothing flagged, every ``then`` empty:
+    code's done lines were the answer, no closing call), ``control`` (only controls: their own handlers decide), or
+    ``model`` (anything else: a read to answer from, a step that did not verify, a flagged diff to tidy, parts left:
+    the agent gets its next round)."""
+    if not outcomes:
+        return "model"
+    if any(o.get("ends") or o.get("settle") for o in outcomes):
+        return "end"
+    work = [o for o in outcomes if o.get("kind") != "control"]
+    if not work:
+        return "control"
+    for o in work:
+        if o.get("kind") not in ("act", "write"):
+            return "model"
+        if not o.get("verified") or o.get("flagged") or o.get("then"):
+            return "model"
+    return "code"
+
+
+def one_hard(calls: list[tuple[str, Any]]) -> bool:
+    """Whether a turn is structurally hard, from round 1's reply (code facts, never words; design 2.6): two or more
+    acting calls (two parts), acts with no skill among them (no skill fits: the verbs work it out), a look, or a send
+    declared (``run_skill`` with ``consent``)."""
+    acting = [(n, a) for n, a in calls if one_kind(n) == "act"]
+    if len(acting) >= 2:
+        return True
+    if any(n == "look" for n, _a in calls):
+        return True
+    if any(n == "run_skill" and isinstance(a, dict) and a.get("consent") for n, a in acting):
+        return True
+    return bool(acting) and not any(n == "run_skill" for n, _a in acting)
+
+
+def is_thought(message: Any) -> bool:
+    """A thinking block Pipecat stored in the context (``LLMSpecificMessage`` with ``{"type": "thought"}``)."""
+    if isinstance(message, dict):
+        return False
+    inner = getattr(message, "message", None)
+    return isinstance(inner, dict) and inner.get("type") == "thought"
+
+
+def strip_thoughts(messages: list[Any]) -> list[Any]:
+    """``messages`` without the thinking blocks Pipecat stored (a turn's end, before any history edit)."""
+    return [m for m in messages or [] if not is_thought(m)]
+
+
+def with_volatile_at(messages: Any, block: dict[str, Any], anchor: str | None) -> Any:
+    """:func:`with_volatile`, but onto the user's own message of this turn (``anchor``: its text), the same bytes every
+    round of the turn (design 3.3.3: no harness text after tool results; the turn stays append-only for the cache and
+    the thinking blocks). That message's cache breakpoint, when it has one, moves onto the block (it is frozen for the
+    turn, so later rounds read it from the cache). No such message (the summary rewrote it): the newest user message,
+    as :func:`with_volatile`. Only the copy sent is changed."""
+    if not isinstance(messages, list) or not anchor:
+        return with_volatile(messages, block)
+    want = " ".join(str(anchor).split())
+    for i in range(len(messages) - 1, -1, -1):
+        message = messages[i]
+        if not (isinstance(message, dict) and message.get("role") == "user"):
+            continue
+        content = message.get("content")
+        parts = [{"type": "text", "text": content}] if isinstance(content, str) else list(content or [])
+        if not any(isinstance(p, dict) and p.get("type") == "text"
+                   and " ".join(str(p.get("text") or "").split()) == want for p in parts):
+            continue
+        added = dict(block)
+        if parts and isinstance(parts[-1], dict) and parts[-1].get("cache_control"):
+            last = dict(parts[-1])
+            added["cache_control"] = last.pop("cache_control")
+            parts[-1] = last
+        out = list(messages)
+        out[i] = {**message, "content": [*parts, added]}
+        return out
+    return with_volatile(messages, block)
+
+
+def _one_bind(fn: Any, values: dict[str, Any]) -> tuple[list[Any], dict[str, Any]] | None:
+    """``fn``'s arguments from ``values`` by parameter name (the runner's contract is read off its own signature);
+    ``None`` when ``fn`` needs a parameter this driver cannot fill."""
+    import inspect
+
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+    args: list[Any] = []
+    kwargs: dict[str, Any] = {}
+    for p in sig.parameters.values():
+        if p.kind in (p.VAR_KEYWORD, p.VAR_POSITIONAL):
+            continue
+        if p.name in values:
+            if p.kind is p.POSITIONAL_ONLY:
+                args.append(values[p.name])
+            else:
+                kwargs[p.name] = values[p.name]
+        elif p.default is p.empty:
+            return None
+    return args, kwargs
+
+
+def _one_in_call(mark: int | None, fn: Callable[..., Any], args: list[Any], kwargs: dict[str, Any]) -> Any:
+    """``fn(*args, **kwargs)`` on the runner's worker thread with the call's turn mark set (review fix H1: a send's
+    countdown opened on this thread reads it)."""
+    token = _ONE_CALL_MARK.set(mark)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _ONE_CALL_MARK.reset(token)
+
+
+def _one_runner_module() -> Any:
+    """``yuki.one.runner`` (lane oRun), or ``None`` until it is merged or when it fails to load (fail closed)."""
+    try:
+        from yuki.one import runner
+
+        return runner
+    except Exception:  # noqa: BLE001 - every act then fails closed (ONE_NO_RUNNER)
+        return None
+
+
+@dataclass
+class _OneReply:
+    """One model reply's calls in the order written, the turn they belong to, and their outcomes as they come back
+    (each call waits for the ones before it: a reply's calls run in order, hotTools' collector keeps them all)."""
+
+    turn: Any
+    ids: list[str]
+    names: dict[str, str]
+    outcomes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    done: dict[str, asyncio.Event] = field(default_factory=dict)
+    verdict: str = ""
+    #: Review fixes M1/M2: each call's arguments and result (every non-success of the reply owes code's fallback, not
+    #: only the last call's), the calls already owed, and whether the reply's own words (or a say_first) were spoken.
+    args: dict[str, dict[str, Any]] = field(default_factory=dict)
+    results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    owed: set[str] = field(default_factory=set)
+    spoke: bool = False
+
+    def before(self, call_id: str) -> list[str]:
+        return self.ids[: self.ids.index(call_id)] if call_id in self.ids else []
+
+    def last(self, call_id: str) -> bool:
+        return bool(self.ids) and self.ids[-1] == call_id
+
+    def in_order(self, skip: str | None = None) -> list[dict[str, Any]]:
+        return [self.outcomes[i] for i in self.ids if i in self.outcomes and i != skip]
+
+
+class OneVoice:
+    """The ONE agent's driver for one voice conversation (``brain = "one"``; made by :class:`Conversation`).
+
+    * **Turns.** A user turn starts at the first model call whose context ends on a new message of theirs: one
+      ``yuki.one.policy.Turn`` (the gate's state, carried from the last turn: unanswered questions, recent sends) with
+      its ``yuki.one.budget.TurnBudget``. A question the gate asked last turn gets its yes/no read now, on a worker.
+    * **Rounds.** Before every model call of the turn, ``budget.round()``; spent: code says its line, no model call.
+      The per-turn block (time, Situation, lookup, notes: ``mouth.volatile_block``) is made once, at round 1, frozen,
+      and rides on their own message every round (:func:`with_volatile_at`).
+    * **Thinking.** Round 1 runs as the lean talker does (``between_tools``); from round 1's reply code picks the
+      turn's mode (:func:`one_hard`): adaptive medium from round 2 when it is hard. Thinking blocks of adaptive rounds
+      stay in the context for the turn and are stripped at its end, before any history edit (the summary).
+    * **Calls.** Every call of a reply runs in order (:class:`_OneReply`), through the runner (``run(call, turn) ->
+      dict``: budget -> gate -> desk -> act -> desk -> diff -> result; code's verified done line through ``speak``).
+      ``quick_memory`` stays the voice's own read (gated here) and the four controls the bridge's.
+    * **Settle.** The last call of a reply settles it (:func:`one_settle`): by code (``run_llm`` false) when every act
+      verified, nothing was flagged and every ``then`` is empty; else the agent's next round. A non-success owes code's
+      fallback (``narrator.OwedLedger``), said only if the agent's round is not heard.
+    * **Hard stop.** A timer of ``budget.hard_left()``: the generation is interrupted, rule #149's line said, the turn
+      closed; late results settle silently.
+    * **Countdown.** One ``yuki.one.countdown.Countdown`` for the conversation (the runner runs sends through it): the
+      island shows it (``VoiceBridge.one_send_pending``), the user's speech pauses it and their words decide (the
+      agent's next round), Stop/Esc cancels it (:meth:`stop_send`), a chip swaps (:meth:`send_choice`).
+    * **Context.** Pipecat's automatic summary never runs inside a turn; at a turn's end it runs when due (8k).
+    """
+
+    def __init__(self, conversation: Any) -> None:
+        self.c = conversation
+        #: The current user turn's gate state (``yuki.one.policy.Turn``), and the last turn that counted (carried from).
+        self.turn: Any = None
+        self.base: Any = None
+        #: The current turn's own message: its identity and its text (the per-turn block rides on it).
+        self.anchor: tuple[int, str] | None = None
+        self.anchor_text: str | None = None
+        #: The per-turn block, frozen at round 1.
+        self.frozen: dict[str, Any] | None = None
+        self.rounds = 0
+        #: ``off`` | ``adaptive`` | ``adaptive_low``, picked from round 1's reply (:meth:`reply`).
+        self.mode = "off"
+        self.decided = False
+        self.over = True
+        self._committed = False
+        #: This turn's facts for the claim gate: an acting call was made; one verified.
+        self.called = False
+        self.acted = False
+        self.replies: dict[str, _OneReply] = {}
+        self._answer: Any = None
+        self._timer: Any = None
+        self._runner: Any = None
+        self._runner_tried = False
+        self._countdown: Any = None
+        self._schemas: list[dict[str, Any]] | None = None
+        self._tokens = itertools.count(1)
+        self._owed: list[int] = []
+        self._seq = 0
+        self._spoke_at = 0.0
+        self._paused_at = 0.0
+        self._words_since = True
+        self._noise_task: Any = None
+        #: Review fix H1: how many final transcripts with words were heard (``user_words``), and each turn's mark: the
+        #: count its own words make (a turn begun on Flux's eager end of turn, before its final words: one more).
+        self._heard_n = 0
+        self._marks: "weakref.WeakKeyDictionary[Any, int]" = weakref.WeakKeyDictionary()
+
+    # -- plumbing ---------------------------------------------------------------------------------------------------
+
+    def _log(self, op: str, **fields: Any) -> None:
+        log = getattr(self.c, "log", None)
+        if log is None:
+            return
+        try:
+            log.event("one_voice", op=op, session=getattr(self.c, "session", None), **fields)
+        except Exception:  # noqa: BLE001 - a log never breaks the voice
+            pass
+
+    def _gate_log(self, event: str, **fields: Any) -> None:
+        """The gate's, the budget's and the countdown's content-free lines, into the voice log."""
+        log = getattr(self.c, "log", None)
+        if log is None:
+            return
+        try:
+            log.event(event, session=getattr(self.c, "session", None), **fields)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _agent(self) -> Any:
+        """The worker lane's agent: its client and settings carry the commit check and the yes/no read (as the hands'
+        own commit check reads them today)."""
+        runtime = getattr(self.c.bridge, "runtime", None)
+        return getattr(getattr(runtime, "worker", None), "agent", None)
+
+    def preload(self) -> None:
+        """The ONE modules imported now, at the conversation's build (never on a live turn's path)."""
+        from yuki.brain import check, consent  # noqa: F401
+        from yuki.memory import contacts  # noqa: F401 - the send's name lookup (row 4, the countdown's name)
+        from yuki.one import budget, countdown, policy, prompt, tools  # noqa: F401
+
+        if _one_runner_module() is None:
+            self._log("runner", ready=False, why="import")
+
+    def schemas(self) -> list[dict[str, Any]]:
+        """This conversation's ONE voice tools (``yuki.one.tools.schemas("voice", keys)``), fixed once."""
+        if self._schemas is None:
+            from yuki.one import tools as one_tools
+
+            keys = list(self.c._skill_keys())
+            self._schemas = one_tools.schemas("voice", keys)
+            self._log("tools", tools=len(self._schemas), chars=one_tools.block_chars(self._schemas), skills=len(keys))
+        return list(self._schemas)
+
+    def register(self, llm: Any) -> None:
+        """Every ONE voice tool on the talker's service: the controls to the bridge (sync, as before), quick_memory to
+        the voice's own read, everything else to the runner. Acts and slow reads are never cancelled by a barge-in
+        (the act may have happened; its result must reach the context); acts have no Pipecat timer (the budget's hard
+        stop and the runner's own backstop end them)."""
+        from yuki.one import tools as one_tools
+
+        for tool in self.schemas():
+            name = str(tool["name"])
+            if name in ONE_CONTROLS:
+                llm.register_function(name, self._control_for(name))
+            elif name == QUICK_MEMORY["name"]:
+                llm.register_function(name, self.quick, cancel_on_interruption=False, timeout_secs=20)
+            else:
+                spec = one_tools.SPECS.get(name)
+                acts = spec is not None and spec.acts
+                llm.register_function(name, self.handle, cancel_on_interruption=False,
+                                      timeout_secs=None if acts else 30)
+
+    def _control_for(self, name: str) -> Callable[[Any], Any]:
+        handler = getattr(self.c.bridge, name)
+
+        async def run(params: Any) -> None:
+            await self.control(params, handler)
+
+        return run
+
+    def hold_summaries(self, summarizer: Any) -> None:
+        """Pipecat's automatic summary never runs inside a turn (it would edit the turn's history, thinking blocks
+        and all): its trigger is held here and fired at a turn's end (:meth:`turn_over`), at the same 8k threshold."""
+        if summarizer is None or getattr(summarizer, "_yuki_should", None) is not None:
+            return
+        should = getattr(summarizer, "_should_summarize", None)
+        if not callable(should):
+            return
+        summarizer._yuki_should = should
+        summarizer._should_summarize = lambda: False
+
+    # -- the people index and the recent messages (row 4's facts, from memory) ---------------------------------------
+
+    def _people_in(self, text: str) -> list[list[str]] | None:
+        memory = getattr(self.c, "memory", None)
+        call = getattr(memory, "call", None)
+        if not callable(call):
+            return None
+
+        def go(client: Any) -> list[list[str]]:
+            from yuki.memory.contacts import named_in
+
+            return [list(c.names) for c, _matched in named_in(getattr(client, "store", client), text)]
+
+        try:
+            got = call("one_people", go, timeout_s=0.8)
+        except Exception:  # noqa: BLE001 - memory can't say
+            return None
+        return got if isinstance(got, list) else None
+
+    def _recent_to(self, to: str) -> list[dict[str, Any]]:
+        memory = getattr(self.c, "memory", None)
+        call = getattr(memory, "call", None)
+        if not callable(call):
+            return []
+
+        def go(client: Any) -> list[dict[str, Any]]:
+            from yuki.memory.contacts import resolve, samples
+
+            store = getattr(client, "store", client)
+            rows: list[dict[str, Any]] = []
+            for person in resolve(store, to)[:1]:
+                for route in person.routes:
+                    rows += samples(store, route, 3)
+            rows.sort(key=lambda r: -float(r.get("at") or 0.0))
+            return rows[:3]
+
+        try:
+            got = call("one_recent", go, timeout_s=0.8)
+        except Exception:  # noqa: BLE001
+            return []
+        return [r for r in got if isinstance(r, dict)] if isinstance(got, list) else []
+
+    # -- turns ------------------------------------------------------------------------------------------------------
+
+    def _words(self) -> tuple[list[str], list[str]]:
+        """Their words for this request (the current exchange, as the hands' commit check reads it) and up to 3
+        earlier turns."""
+        exchange = list(self.c._exchange_words())
+        heard = [t for _at, t in list(getattr(self.c.observer, "recent_heard", ()) or ())]
+        earlier = heard[: max(0, len(heard) - len(exchange))][-3:]
+        return exchange, earlier
+
+    def _checker(self) -> tuple[Any, Any]:
+        """The commit check for a turn's gate (the worker agent's client, as the hands' own reads it) and its
+        settings."""
+        from yuki.brain.check import CommitCheck
+
+        agent = self._agent()
+        settings = getattr(agent, "settings", None) if agent is not None else None
+        settings = settings if settings is not None else self.c.settings
+        return CommitCheck((lambda: agent.client) if agent is not None else None, settings, self._gate_log), settings
+
+    def _new_turn(self, anchor: tuple[int, str] | None, *, eager: bool = False) -> None:
+        from yuki.one import budget as one_budget
+        from yuki.one import policy
+
+        if self.turn is not None and not self.over:
+            self.turn_over("next")   # they spoke on: the last turn ends here (its thinking blocks go, its timer stops)
+        else:
+            self._strip()
+        # review fix H1: their new words while a send counts down (begun before it opened, or an eager end of turn
+        # whose final words are still to come): it pauses now, and their words decide (``user_words``)
+        self._pause_countdown("turn")
+        checker, settings = self._checker()
+        words, earlier = self._words()
+        if anchor is not None and anchor[1] and (not words or words[-1] != anchor[1]):
+            words = [*words, anchor[1]][-4:]   # the newest words before their final transcript was kept
+        self._seq += 1
+        turn = policy.Turn("voice", words, earlier, request_id=f"{getattr(self.c, 'session', '')}-one-{self._seq}",
+                           checker=checker, settings=settings, people_in=self._people_in, recent=self._recent_to,
+                           budget=one_budget.TurnBudget("voice", one_budget.limits_for("voice", self.c.settings)),
+                           log=self._gate_log).carry(self.base)
+        self.turn = turn
+        obs = getattr(self.c, "observer", None)
+        begun = float(getattr(obs, "_user_started_at", 0.0) or 0.0) > float(getattr(obs, "last_user_at", 0.0) or 0.0)
+        # its own final words not heard yet (Flux's eager end of turn): they will make the count one more
+        self._marks[turn] = self._heard_n + (1 if eager and begun else 0)
+        self.anchor, self.anchor_text = anchor, (anchor[1] if anchor is not None else None)
+        self.frozen, self.rounds, self.mode, self.decided = None, 0, "off", False
+        self.over, self._committed, self.called, self.acted = False, False, False, False
+        self._owed = []
+        self._answer = None
+        if turn.asks and self.anchor_text:
+            self._read_answer(turn, self.anchor_text)
+        self._log("turn", n=self._seq, words=len(words), earlier=len(earlier), asks=len(turn.asks),
+                  sent_before=len(turn.sent_before))
+
+    def reflex_turn(self, words: str) -> Any:
+        """Review fix M3: the gate turn for a learned reflex's act on these words (any thread): its own, with no
+        budget and nothing carried (a sound act: the gate's game check, Act switch and row decide it)."""
+        from yuki.one import policy
+
+        checker, settings = self._checker()
+        return policy.Turn("voice", [words] if str(words or "").strip() else [], (),
+                           request_id=f"{getattr(self.c, 'session', '')}-one-reflex-{int(time.time() * 1000)}",
+                           checker=checker,
+                           settings=settings, people_in=self._people_in, recent=self._recent_to, log=self._gate_log)
+
+    def _read_answer(self, turn: Any, reply: str) -> None:
+        """The user answered the gate's question from last turn (or said something else): its yes/no read, on a
+        worker, recorded on the turn as a code fact before any of the turn's calls goes to the gate."""
+        try:
+            question = list(turn.asks.values())[-1][0]
+        except Exception:  # noqa: BLE001
+            return
+        agent = self._agent()
+        client = getattr(agent, "client", None) if agent is not None else None
+        settings = getattr(agent, "settings", None) if agent is not None else None
+        settings = settings if settings is not None else self.c.settings
+
+        def work() -> bool:
+            from yuki.one.policy import read_answer
+
+            yes = bool(read_answer(client, settings, question, reply, log=self._gate_log))
+            turn.answer(yes)
+            return yes
+
+        try:
+            self._answer = asyncio.get_running_loop().run_in_executor(None, work)
+        except RuntimeError:
+            self._answer = None
+
+    async def _wait_answer(self) -> None:
+        pending = self._answer
+        if pending is None or pending.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(pending), ONE_ANSWER_WAIT_S)
+        except Exception:  # noqa: BLE001 - not answered in time: the gate asks again (fail closed)
+            self._log("answer", waited=True, done=False)
+
+    async def begin(self, context: Any, call: Any) -> bool:
+        """Before each model call (the talker service's ``_process_context``): the turn this call belongs to (a new one
+        on their new words), then the budget's round (before every model call of the turn). ``False``: code settled
+        the turn (rounds spent, the hard stop, a closed turn): no model call is made."""
+        anchor: tuple[int, str] | None = None
+        if getattr(call, "user_turn", False):
+            try:
+                messages = list(context.get_messages() or [])
+            except Exception:  # noqa: BLE001
+                messages = []
+            last = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "user"), None)
+            if last is not None:
+                anchor = (id(last), _user_text(last))
+        if self.turn is None or (anchor is not None and anchor != self.anchor):
+            self._new_turn(anchor, eager=bool(getattr(call, "one_eager", False)))
+        turn = self.turn
+        spend = turn.budget.round()
+        if not spend.ok:
+            self._log("round", refused=spend.why, rounds=self.rounds)
+            await self._settle_by_code(spend.line, silent=spend.silent, why=spend.why)
+            return False
+        self.rounds += 1
+        call.one_round = self.rounds
+        if self.over:
+            # review fix L2: a round after code settled the turn (Pipecat's own run after a missing function's result):
+            # the agent speaks in this turn again, so it is open again until that round ends
+            self.over = False
+            self._log("reopened", rounds=self.rounds)
+        if self._timer is None:
+            self._arm()   # review fix L2: every round of the turn runs under the hard stop, not only round 1
+        self._log("round", n=self.rounds, user=bool(getattr(call, "user_turn", False)), thinking=self._thinking_now())
+        return True
+
+    def needs_reads(self, call: Any) -> bool:
+        """Whether this call waits for the lookup and the desktop (only the call that makes the turn's block)."""
+        return self.frozen is None or bool(getattr(call, "one_fresh", False))
+
+    def _thinking_now(self) -> str:
+        return self.mode if self.rounds >= 2 else "off"
+
+    def keeps_thoughts(self, call: Any) -> bool:
+        """An adaptive round's thinking blocks stay in the context for the turn (stripped at its end)."""
+        return int(getattr(call, "one_round", 0) or 0) >= 2 and self.mode != "off"
+
+    def state(self, state: dict[str, Any] | None) -> dict[str, Any]:
+        """The measured states for the ONE turn's block: the conversation's (``_prompt_state``) without the talker's
+        hand notes (they name hand_over; the agent reads each result itself). The learned reflex that ran for these
+        words stays (review fix M3: a sound reflex runs under one too, through the one gate; its note tells the agent
+        it is done, and the agent's same call is matched and never pressed twice)."""
+        return {k: v for k, v in (state or {}).items() if k not in ("hand_trouble", "hand_game", "acted")}
+
+    def volatile(self, call: Any, make: Callable[[], dict[str, Any]]) -> tuple[dict[str, Any], str | None]:
+        """The per-turn block for this call and the text of their message it rides on (``None``: the newest user
+        message, as before): made once per turn at round 1 (made again on a rerun), the same bytes every round."""
+        if call is None or not getattr(call, "one_round", 0) or self.turn is None:
+            return make(), None   # the warm-up, or a call outside a ONE round
+        if self.frozen is None or getattr(call, "one_fresh", False):
+            block = make()
+            if not (self.anchor_text and getattr(call, "user_turn", False)):
+                return block, None   # a turn no words of theirs started: a fresh block each round
+            self.frozen = block
+        return self.frozen, self.anchor_text
+
+    def thinking(self, params: dict[str, Any], call: Any) -> None:
+        """Round 2 on of a hard turn: adaptive thinking at medium effort (``adaptive_low``: low), its text omitted, with
+        room for it. Round 1 and easy turns keep the talker's ``between_tools``."""
+        if call is None or int(getattr(call, "one_round", 0) or 0) < 2 or self.mode == "off":
+            return
+        params["thinking"] = {"type": "adaptive", "display": "omitted"}
+        params["output_config"] = {"effort": "low" if self.mode == "adaptive_low" else ONE_EFFORT}
+        floor = int(getattr(self.c.settings, "voice_mouth_max_tokens", 400) or 400)
+        params["max_tokens"] = max(floor, ONE_THINK_MAX_TOKENS)
+
+    def reply(self, function_calls: Any) -> None:
+        """A reply's calls, complete and about to run (hotTools' collector gave all of them): kept in order as one
+        group, and from the turn's first reply with calls the turn's thinking mode (:func:`one_hard`)."""
+        calls = [(str(getattr(fc, "tool_call_id", "") or ""), str(getattr(fc, "function_name", "") or ""),
+                  getattr(fc, "arguments", None) if isinstance(getattr(fc, "arguments", None), dict) else {})
+                 for fc in function_calls or []]
+        # only calls this driver runs are in the reply's order (a name it has no handler for is answered by Pipecat's
+        # own missing-function path, and nothing would ever wait for it)
+        known = {str(t.get("name") or "") for t in self.schemas()}
+        calls = [c for c in calls if c[0] and c[1] in known]
+        if not calls or calls[0][0] in self.replies:
+            return
+        if self.turn is None:
+            self._new_turn(None)
+        group = _OneReply(turn=self.turn, ids=[c[0] for c in calls], names={c[0]: c[1] for c in calls},
+                          args={c[0]: dict(c[2]) for c in calls}, spoke=self._reply_spoke())
+        for cid, _name, _args in calls:
+            group.done[cid] = asyncio.Event()
+            self.replies[cid] = group
+        if len(self.replies) > 96:
+            for old in list(self.replies)[:48]:
+                del self.replies[old]
+        self._committed = True
+        if any(one_kind(n) == "act" for _c, n, _a in calls):
+            self.called = True
+        if not self.decided:
+            self.decided = True
+            mode = one_thinking_mode(self.c.settings)
+            hard = one_hard([(n, a) for _c, n, a in calls])
+            self.mode = ("off" if mode == "fast" else "adaptive_low" if mode == "adaptive_low"
+                         else ("adaptive" if hard else "off"))
+            self._log("thinking", mode=self.mode, hard=hard, calls=len(calls))
+        self._log("reply", calls=len(calls), tools=[n for _c, n, _a in calls], round=self.rounds)
+
+    def _reply_spoke(self) -> bool:
+        """Review fix M2: whether the reply now making its calls spoke (its words, or a say_first said early), from the
+        talker service's own stream marks (never the words)."""
+        call = getattr(getattr(self.c, "_llm", None), "_yuki_call", None)
+        return bool(call is not None and (getattr(call, "first_text", None) is not None
+                                          or getattr(call, "early_say", None) is not None))
+
+    def reply_end(self, call: Any, speculating: bool = False) -> None:
+        """A reply ended. One with no call of a ONE round ends the turn (the agent decided it is done)."""
+        if speculating or call is None or not getattr(call, "one_round", 0) or self.turn is None or self.over:
+            return
+        if getattr(call, "tool", False):
+            return
+        self._committed = True
+        self.turn_over("model")
+
+    def claim_open(self) -> bool:
+        """The claim gate (speech guard): something was called this turn and nothing of it verified."""
+        return bool(self.called and not self.acted)
+
+    def turn_over(self, why: str) -> None:
+        """The turn ended (the agent's reply with no call, a settle by code, the hard stop, their next words): its
+        timer stops, its thinking blocks leave the context, then the summary runs if it is due."""
+        if self.over:
+            return
+        self.over = True
+        self._cancel_timer()
+        if self._committed and self.turn is not None:
+            self.base = self.turn
+        self._strip()
+        self._summarize()
+        facts = self.turn.budget.facts() if self.turn is not None and self.turn.budget is not None else {}
+        self._log("turn_over", why=why, mode=self.mode, called=self.called, acted=self.acted, **facts)
+
+    def _strip(self) -> None:
+        context = getattr(self.c, "_llm_context", None)
+        if context is None:
+            return
+        try:
+            messages = list(context.get_messages() or [])
+            kept = strip_thoughts(messages)
+            if len(kept) != len(messages):
+                context.set_messages(kept)
+                self._log("thoughts", stripped=len(messages) - len(kept))
+        except Exception as exc:  # noqa: BLE001 - never breaks the turn
+            self._log("thoughts", error=type(exc).__name__)
+
+    def _summarize(self) -> None:
+        summarizer = getattr(self.c, "_summarizer", None)
+        should = getattr(summarizer, "_yuki_should", None)
+        request = getattr(summarizer, "_request_summarization", None)
+        if not callable(should) or not callable(request):
+            return
+        pending = getattr(self, "_summary_task", None)
+        if pending is not None and not pending.done():
+            return   # a turn reopened and ended again before the last request started: never two summaries
+        try:
+            if not should():
+                return
+            self._summary_task = asyncio.ensure_future(request())
+            self._log("summary", requested=True)
+        except Exception as exc:  # noqa: BLE001 - a summary is an optimisation
+            self._log("summary", error=type(exc).__name__)
+
+    # -- the hard stop ------------------------------------------------------------------------------------------------
+
+    def _cancel_timer(self) -> None:
+        timer, self._timer = self._timer, None
+        if timer is not None:
+            timer.cancel()
+
+    def _arm(self) -> None:
+        """The hard stop's timer, for the counted time left (a countdown's pause does not run it down)."""
+        self._cancel_timer()
+        loop, turn = getattr(self.c, "_loop", None), self.turn
+        if loop is None or turn is None or self.over or turn.budget is None:
+            return
+        self._timer = loop.call_later(max(0.05, turn.budget.hard_left()) + 0.05, self._hard_tick, turn)
+
+    def _hard_tick(self, turn: Any) -> None:
+        self._timer = None
+        if turn is not self.turn or self.over or turn.budget.closed:
+            return
+        if not turn.budget.hard_due():
+            self._arm()   # paused time (a countdown) moved the stop
+            return
+        asyncio.ensure_future(self.hard_stop(turn))
+
+    async def hard_stop(self, turn: Any) -> None:
+        """The hard stop (addendum must-fix 6): the generation is interrupted (the pipeline's interruption, as a
+        barge-in), rule #149's line is said, and the turn is closed: every later result settles silently."""
+        from yuki.one.budget import LINE_REST_LEFT
+
+        if turn.budget.closed and self.over:
+            return
+        turn.budget.close("hard")
+        self._log("hard_stop", **turn.budget.facts())
+        self._drop_owed()
+        self.turn_over("hard")   # first: the cut reply's end is not read as the agent ending the turn
+        await self._interrupt()
+        await self.c._speak_owed(LINE_REST_LEFT)
+
+    async def _interrupt(self) -> None:
+        worker = getattr(self.c, "worker", None)
+        if worker is None:
+            return
+        try:
+            from pipecat.frames.frames import InterruptionWorkerFrame
+
+            await worker.queue_frame(InterruptionWorkerFrame())
+            await asyncio.sleep(0.3)   # through the pipeline before the line goes after it
+        except Exception as exc:  # noqa: BLE001 - the line is said anyway
+            self._log("hard_stop", interrupt_error=type(exc).__name__)
+
+    async def _settle_by_code(self, line: str, *, silent: bool, why: str) -> None:
+        self._drop_owed()
+        if line and not silent:
+            await self.c._speak_owed(line)
+        self.turn_over(why)
+
+    # -- the owed fallback ----------------------------------------------------------------------------------------
+
+    def _owe(self, result: dict[str, Any], outcome: dict[str, Any], *, keep: bool = True) -> None:
+        """A non-success act that code said nothing for owes code's fallback (``OwedLedger``): said only if the
+        agent's next round is not heard (it chose silence, or never came within ``RUN_WAIT_S``). ``keep``: the token
+        is the current turn's (dropped when it settles by code); an earlier turn's late result keeps its own (review
+        fix L1). A held call or a reflex's call still under way owes nothing (``_no_owe``: the agent asks or says it)."""
+        ledger = getattr(self.c, "ledger", None)
+        if ledger is None or outcome.get("kind") != "act" or outcome.get("verified") or result.get("said") \
+                or result.get("_no_owe") or str(result.get("status") or "").strip().lower() == "changed":
+            return   # a send their words or a chip changed: nothing failed; their words (or the agent) decide
+        from yuki.one.budget import LINE_REST_LEFT
+
+        question = str(result.get("question") or "").strip()
+        status = str(result.get("status") or "").strip().lower()
+        # the runner's own fallback line (``OneResult.owed``), else rule #149's
+        kind, text = ("ask", question) if question and status in ("ask", "asked") else (
+            "failed", str(result.get("owed") or result.get("fallback") or "").strip() or LINE_REST_LEFT)
+        token = -next(self._tokens)
+        try:
+            if ledger.owe(token, kind, text, int(getattr(self.c.observer, "user_turns", 0))) is not None and keep:
+                self._owed.append(token)
+        except Exception:  # noqa: BLE001 - the agent's round says it anyway
+            pass
+
+    def _owe_group(self, group: _OneReply) -> None:
+        """Review fix M1: when the agent gets its next round, every act of the reply that did not verify and that code
+        said nothing for owes code's fallback, not only the reply's last call (``[failed act, done act]``,
+        ``[failed act, stay_quiet]``). Each call once."""
+        keep = self._current(group)
+        for cid in group.ids:
+            outcome, result = group.outcomes.get(cid), group.results.get(cid)
+            if outcome is None or result is None or cid in group.owed:
+                continue
+            group.owed.add(cid)
+            self._owe(result, outcome, keep=keep)
+
+    @staticmethod
+    def _heard(group: _OneReply) -> bool:
+        """Review fix M2: something of the reply reached them: its own words or a say_first, a line code said for one
+        of its calls (``said``) or heard earlier this turn (``heard``), or an act the agent chose to do in silence
+        (``say_when_done`` given as ``""``: they watch it happen)."""
+        if group.spoke:
+            return True
+        for cid in group.ids:
+            result = group.results.get(cid) or {}
+            if str(result.get("said") or "").strip() or result.get("heard") is True:
+                return True
+            args = group.args.get(cid) or {}
+            if "say_when_done" in args and not " ".join(str(args.get("say_when_done") or "").split()) \
+                    and (group.outcomes.get(cid) or {}).get("kind") == "act":
+                return True
+        return False
+
+    def _drop_owed(self) -> None:
+        ledger = getattr(self.c, "ledger", None)
+        for token in self._owed:
+            try:
+                ledger.drop(token)
+            except Exception:  # noqa: BLE001
+                pass
+        self._owed = []
+
+    # -- the calls ------------------------------------------------------------------------------------------------
+
+    def _group(self, call_id: str, name: str, args: dict[str, Any] | None = None) -> _OneReply:
+        group = self.replies.get(call_id)
+        if group is None:
+            if self.turn is None:
+                self._new_turn(None)
+            group = _OneReply(turn=self.turn, ids=[call_id], names={call_id: name}, args={call_id: dict(args or {})},
+                              spoke=self._reply_spoke())
+            group.done[call_id] = asyncio.Event()
+            self.replies[call_id] = group
+        return group
+
+    async def _after_earlier(self, group: _OneReply, call_id: str) -> None:
+        for prior in group.before(call_id):
+            event = group.done.get(prior)
+            if event is None or event.is_set():
+                continue
+            try:
+                await asyncio.wait_for(event.wait(), ONE_ORDER_WAIT_S)
+            except asyncio.TimeoutError:
+                self._log("order", waited_out=True)
+
+    def _decide(self, group: _OneReply, call_id: str) -> bool:
+        """``run_llm`` for a runner call's result: only the reply's last call runs the agent again, and only when the
+        settle rule says so (a closed turn never). Review fixes: a reply code would settle with nothing heard (a lone
+        ``remember``, a verified act with no line, no words) gets one closing round instead (M2); when the agent gets
+        its round every non-success of the reply owes code's fallback (M1); a result of a turn their next words already
+        ended runs no round of its own (L1: the new turn's round reads it, its fallback stays owed)."""
+        if not group.last(call_id) or group.turn.budget.closed:
+            if group.last(call_id):
+                group.verdict = "end"
+            return False
+        current = self._current(group)
+        verdict = one_settle(group.in_order())
+        if verdict == "code" and current and not self._heard(group):
+            verdict = "model"
+            self._log("closing_round", calls=len(group.ids))
+        group.verdict = verdict
+        if verdict != "model":
+            return False
+        self._owe_group(group)
+        if not current:
+            return self._moved_on_run(group)
+        return True
+
+    def _moved_on_run(self, group: _OneReply) -> bool:
+        """``run_llm`` for a reply that needs the agent but whose turn their newer words moved on from (review fix L1).
+        Their words' own round reads it: no round of its own, and the turn ends if it is still the current one (its
+        timer stops). One exception (addendum must-fix 2: parts left always get the agent's round): their round already
+        began before this came back, and the reply left parts of their request (a ``then``) or a flagged diff, with no
+        send their words changed: one round after theirs carries it on. A failure alone is owed (the ledger), never an
+        extra round."""
+        if group.turn is not self.turn:
+            changed = any(str((group.results.get(cid) or {}).get("status") or "").lower() == "changed"
+                          for cid in group.ids)
+            left = any(o.get("kind") == "act" and (o.get("then") or o.get("flagged"))
+                       for o in group.outcomes.values())
+            if left and not changed:
+                self._log("moved_on", run=True, parts=True)
+                return True
+            return False
+        self._words_moved_on(group)
+        return False
+
+    def _current(self, group: _OneReply) -> bool:
+        """Review fix L1: the reply's turn is still the one their words are on: no newer turn began, and no newer
+        final words of theirs came (their words make their own round, which reads this result: a send their words
+        stopped, a slow act that came back after they spoke on)."""
+        if group.turn is not self.turn:
+            return False
+        mark = self._marks.get(group.turn)
+        return mark is None or self._heard_n <= mark
+
+    def _words_moved_on(self, group: _OneReply) -> None:
+        """A result of a turn their newer words moved on from runs no round of its own (review fix L1); if that turn is
+        still the current one (their words' own round has not begun yet), it ends now (its timer stops: no hard stop
+        line for a turn they moved on from)."""
+        if group.turn is self.turn and not self.over:
+            self.turn_over("words")
+
+    def _decide_inner(self, group: _OneReply, call_id: str, explicit: Any) -> bool | None:
+        """``run_llm`` for a control's or quick_memory's own result (``None``: the handler's own properties stand)."""
+        if not group.last(call_id):
+            return False
+        if group.names.get(call_id) in ONE_ENDS or group.turn.budget.closed:
+            group.verdict = "end"
+            return False
+        current = self._current(group)
+        others = group.in_order(skip=call_id)
+        if others and one_settle(others) == "model":
+            group.verdict = "model"
+            self._owe_group(group)   # review fix M1: the failure is owed even if the agent's round stays quiet
+            if not current:
+                return self._moved_on_run(group)   # review fix L1: their newer words' own round reads this result
+            return True   # an act of this reply needs the agent (a failure, a flag, parts left): never silence
+        group.verdict = one_settle(group.in_order())
+        if not current:
+            if group.verdict == "model":
+                return self._moved_on_run(group)
+            return False   # review fix L1: their newer words' own round reads this result
+        if explicit is not None:
+            return None
+        return {"model": True, "code": False, "end": False}.get(group.verdict)
+
+    def _settled(self, group: _OneReply, call_id: str, run_llm: Any) -> None:
+        """After a reply's last call settled: code settled it, the conversation ends, or a control ended it with no
+        run (stay_quiet): the turn is over. A read answered at once on its own copy (``run_llm`` false there) is not."""
+        if not group.last(call_id) or group.turn is not self.turn:
+            return
+        if group.verdict in ("code", "end") or (group.verdict == "control" and run_llm is False):
+            self.turn_over(group.verdict)
+
+    def _refresh_words(self, turn: Any) -> None:
+        """Their words as the gate reads them, again at the call (their final transcript may have come after round 1
+        began on the eager one)."""
+        if turn is not self.turn:
+            return
+        words, earlier = self._words()
+        if self.anchor_text and (not words or words[-1] != self.anchor_text):
+            words = [*words, self.anchor_text][-4:]
+        turn.words = [" ".join(str(w).split()) for w in words if str(w or "").strip()]
+        turn.earlier = [" ".join(str(w).split()) for w in earlier if str(w or "").strip()][-3:]
+
+    def _runner_obj(self) -> Any:
+        if self._runner_tried:
+            return self._runner
+        self._runner_tried = True
+        module = _one_runner_module()
+        if module is None:
+            self._log("runner", ready=False, why="import")
+            return None
+        hands = getattr(self.c.bridge, "hands", None)
+        values: dict[str, Any] = {
+            "channel": "voice", "hands": hands, "speak": self.speak, "countdown": self.countdown(),
+            "log": self._gate_log, "settings": self.c.settings, "memory": getattr(self.c, "memory", None),
+            "session": getattr(self.c, "session", None), "bridge": self.c.bridge,
+            "runtime": getattr(self.c.bridge, "runtime", None), "quick_memory": getattr(self.c, "quick_memory", None),
+            "menu": str(getattr(getattr(self.c, "mouth_memory", None), "skills", "") or "")}
+        verbs = self._verbs(hands)
+        if verbs is not None:
+            values["verbs"] = verbs   # oRun's verbs layer over this conversation's hands (``voice.hands.Verbs``)
+        factory = getattr(module, "Runner", None)
+        obj: Any = None
+        if callable(factory):
+            bound = _one_bind(factory, values)
+            if bound is not None:
+                try:
+                    obj = factory(*bound[0], **bound[1])
+                except Exception as exc:  # noqa: BLE001 - the module's own run, else fail closed
+                    self._log("runner", ready=False, why=f"make:{type(exc).__name__}")
+        if obj is None and callable(getattr(module, "run", None)):
+            obj = module
+        self._runner = obj
+        self._log("runner", ready=obj is not None, kind="class" if obj is not module else "module")
+        return obj
+
+    @staticmethod
+    def _verbs(hands: Any) -> Any:
+        """The hand verbs the runner acts with (``voice.hands.Verbs(hands)``, lane oRun), or ``None``."""
+        if hands is None:
+            return None
+        try:
+            from yuki.voice import hands as hands_module
+
+            make = getattr(hands_module, "Verbs", None)
+            return make(hands) if callable(make) else None
+        except Exception:  # noqa: BLE001 - no verbs: no runner (fail closed)
+            return None
+
+    async def _run(self, name: str, args: dict[str, Any], turn: Any, call_id: str) -> dict[str, Any]:
+        """One call through the runner (``run(call, turn) -> dict``, its parameters read off its signature), on a
+        worker thread (it takes the desk lease and may wait in the countdown there). Never raises."""
+        runner = self._runner_obj()
+        fn = getattr(runner, "run", None) if runner is not None else None
+        if not callable(fn):
+            return dict(ONE_NO_RUNNER)
+        call = {"name": name, "args": dict(args), "id": call_id, "channel": "voice"}
+        values = {"call": call, "name": name, "tool": name, "args": dict(args), "tool_input": dict(args),
+                  "arguments": dict(args), "turn": turn, "speak": self.speak, "channel": "voice", "call_id": call_id,
+                  "tool_call_id": call_id}
+        bound = _one_bind(fn, values)
+        if bound is None:
+            self._log("runner", ready=False, why="signature")
+            return dict(ONE_NO_RUNNER)
+        mark = self._marks.get(turn) if turn is not None else None
+        try:
+            if asyncio.iscoroutinefunction(fn):
+                token = _ONE_CALL_MARK.set(mark)
+                try:
+                    raw = await fn(*bound[0], **bound[1])
+                finally:
+                    _ONE_CALL_MARK.reset(token)
+            else:
+                import functools
+
+                raw = await asyncio.get_running_loop().run_in_executor(None, functools.partial(
+                    _one_in_call, mark, fn, bound[0], bound[1]))
+                if asyncio.iscoroutine(raw):
+                    raw = await raw
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - fail closed, said as not confirmed
+            self._log("call_error", tool=name, error=type(exc).__name__)
+            return dict(ONE_RUN_ERROR)
+        return one_result(raw)
+
+    def _held_call(self, name: str, call_id: str, args: dict[str, Any], turn: Any) -> bool:
+        """Review fix M4: this act waits for their answer (``Conversation._held``, decided once as the reply ended, the
+        same rule as under ``all``: recognition was unsure of their words and the reply spoke with the act; the sound
+        hands, ``keep_usual`` and a sound-only skill never wait). Only an act of the current turn."""
+        if turn is not self.turn or one_kind(name) != "act":
+            return False
+        held = getattr(self.c, "_held", None)
+        if not callable(held):
+            return False
+        try:
+            return bool(held(name, call_id, args))
+        except Exception:  # noqa: BLE001 - unknown: it runs (the gate decides it, as every act)
+            return False
+
+    #: From a worker thread a line is waited for until it is queued in the voice (at most this long), so an act's
+    #: after-read comes after it (``yuki.one.runner.speaker``).
+    SPEAK_WAIT_S = 1.0
+
+    def speak(self, text: str) -> None:
+        """Code's line said now in the one voice (a verified done line, a final refusal's, "Sending to <name>"): any
+        thread; from a worker it returns once the line is queued (bounded). Never raises."""
+        text = " ".join(str(text or "").split())
+        loop = getattr(self.c, "_loop", None)
+        if not text or loop is None:
+            return
+        try:
+            if not _not_on(loop):
+                asyncio.ensure_future(self.c._speak_result([text]))
+                return
+            asyncio.run_coroutine_threadsafe(self.c._speak_result([text]), loop).result(timeout=self.SPEAK_WAIT_S)
+        except Exception:  # noqa: BLE001 - not queued in time: it still goes
+            pass
+
+    async def handle(self, params: Any) -> None:
+        """The Pipecat handler of every ONE tool but the controls and quick_memory: in the reply's order, through the
+        runner; the reply's last call settles it (:func:`one_settle`)."""
+        from pipecat.frames.frames import FunctionCallResultProperties
+
+        name = str(getattr(params, "function_name", "") or "")
+        call_id = str(getattr(params, "tool_call_id", "") or "")
+        args = dict(params.arguments) if isinstance(getattr(params, "arguments", None), dict) else {}
+        group = self._group(call_id, name, args)
+        run_llm: Any = False
+        try:
+            await self._after_earlier(group, call_id)
+            turn = group.turn
+            started = time.monotonic()
+            how = "runner"
+            if turn.budget.late():
+                result: dict[str, Any] = {"status": "closed", "note": ONE_LATE_NOTE, "settle": True, "silent": True}
+                how = "late"
+            else:
+                # review fix M3: the learned reflex already did this very call for these words (it went through the
+                # one gate first): never pressed twice; its result stands for the call
+                dup = getattr(self.c, "_reflex_one_dup", None)
+                got = await dup(name, args) if callable(dup) else None
+                if isinstance(got, dict):
+                    result, how = got, "reflex"
+                elif self._held_call(name, call_id, args, turn):
+                    # review fix M4: words and this act together on a turn recognition was unsure of: nothing is done
+                    # and nothing was said; the agent's next round asks about the unsure word or calls it again alone
+                    # (no thinker: the hold resolves through the agent itself)
+                    result, how = {"status": "held", "verified": False, "_no_owe": True,
+                                   "note": held_note(getattr(self.c.observer, "heard", None))}, "held"
+                else:
+                    await self._wait_answer()
+                    self._refresh_words(turn)
+                    result = await self._run(name, args, turn, call_id)
+            outcome = one_outcome(name, args, result)
+            group.outcomes[call_id] = outcome
+            group.results[call_id] = result
+            if outcome["kind"] == "act" and outcome["verified"] and turn is self.turn:
+                self.acted = True
+            line = str(result.get("line") or "").strip()
+            if result.get("settle") and not result.get("silent") and line \
+                    and " ".join(line.split()) not in " ".join(str(result.get("said") or "").split()):
+                await self.c._speak_owed(line)   # the turn settled by code (the second refusal): its line, once
+            run_llm = self._decide(group, call_id)   # owes every non-success of the reply when the agent runs
+            if group.verdict == "end" and turn is self.turn:
+                self._drop_owed()
+            payload = one_payload(result)
+            if turn.budget.closed and not result.get("settle"):
+                payload["how_to_handle_it"] = ONE_LATE_NOTE   # came back after the hard stop: no run follows
+            self._log("call", tool=name, kind=outcome["kind"], verified=outcome["verified"],
+                      flagged=outcome["flagged"], then=bool(outcome["then"]), settle=outcome["settle"],
+                      last=group.last(call_id), verdict=group.verdict or None, run_llm=bool(run_llm), how=how,
+                      current=turn is self.turn, ms=round((time.monotonic() - started) * 1000))
+            await params.result_callback(payload, properties=FunctionCallResultProperties(run_llm=bool(run_llm)))
+        finally:
+            event = group.done.get(call_id)
+            if event is not None:
+                event.set()
+            self._settled(group, call_id, run_llm)
+
+    async def quick(self, params: Any) -> None:
+        """``quick_memory`` on the ONE agent: the gate first (a read: allowed, the turn's private read noted; the
+        budget's reads), then the voice's own quick memory (its answer-at-once path kept), in the reply's order."""
+        from pipecat.frames.frames import FunctionCallResultProperties
+
+        name = str(getattr(params, "function_name", "") or "")
+        call_id = str(getattr(params, "tool_call_id", "") or "")
+        args = dict(params.arguments) if isinstance(getattr(params, "arguments", None), dict) else {}
+        group = self._group(call_id, name, args)
+        final: dict[str, Any] = {"run_llm": False}
+        try:
+            await self._after_earlier(group, call_id)
+            turn = group.turn
+            refusal: dict[str, Any] | None = None
+            if turn.budget.late():
+                refusal = {"status": "closed", "note": ONE_LATE_NOTE, "settle": True, "silent": True}
+            elif getattr(self.c, "quick_memory", None) is None:
+                refusal = {"status": "failed", "note": "Memory is not available right now."}
+            else:
+                from yuki.one import policy
+
+                decision = policy.gate(name, args, {}, turn)
+                if not decision.allowed:
+                    refusal = {"status": "refused", "note": decision.line or decision.question,
+                               "settle": decision.settle, "silent": decision.silent, "line": decision.line}
+            if refusal is not None:
+                group.outcomes[call_id] = one_outcome(name, args, refusal)
+                group.results[call_id] = refusal
+                if refusal.get("settle") and not refusal.get("silent") and refusal.get("line"):
+                    await self.c._speak_owed(str(refusal["line"]))
+                run_llm = self._decide(group, call_id)
+                final["run_llm"] = run_llm
+                await params.result_callback(one_payload(refusal),
+                                             properties=FunctionCallResultProperties(run_llm=bool(run_llm)))
+                return
+            original = params.result_callback
+
+            async def settle(result: Any, *, properties: Any = None) -> None:
+                group.outcomes[call_id] = one_outcome(name, args, {"status": "read"})
+                explicit = getattr(properties, "run_llm", None) if properties is not None else None
+                decided = self._decide_inner(group, call_id, explicit)
+                final["run_llm"] = explicit if decided is None else decided
+                props = properties if decided is None else FunctionCallResultProperties(run_llm=decided)
+                await original(result, properties=props)
+
+            params.result_callback = settle
+            await self.c._quick_memory_call(params)
+        finally:
+            event = group.done.get(call_id)
+            if event is not None:
+                event.set()
+            self._settled(group, call_id, final.get("run_llm"))
+
+    async def control(self, params: Any, handler: Callable[[Any], Any]) -> None:
+        """A voice control (stay_quiet, end_conversation, go_quiet, more_of_result): the bridge's own handler, in the
+        reply's order; when it is the reply's last call and an act of the reply needs the agent, the agent runs."""
+        from pipecat.frames.frames import FunctionCallResultProperties
+
+        name = str(getattr(params, "function_name", "") or "")
+        call_id = str(getattr(params, "tool_call_id", "") or "")
+        group = self._group(call_id, name)
+        final: dict[str, Any] = {"run_llm": None}
+        try:
+            await self._after_earlier(group, call_id)
+            if group.turn.budget.late() and name not in ONE_ENDS:
+                group.outcomes[call_id] = one_outcome(name, {}, {"settle": True, "silent": True})
+                final["run_llm"] = False
+                await params.result_callback({"ok": True, "how_to_handle_it": ONE_LATE_NOTE},
+                                             properties=FunctionCallResultProperties(run_llm=False))
+                return
+            original = params.result_callback
+
+            async def settle(result: Any, *, properties: Any = None) -> None:
+                group.outcomes[call_id] = one_outcome(name, {}, {})
+                explicit = getattr(properties, "run_llm", None) if properties is not None else None
+                decided = self._decide_inner(group, call_id, explicit)
+                final["run_llm"] = explicit if decided is None else decided
+                props = properties if decided is None else FunctionCallResultProperties(run_llm=decided)
+                await original(result, properties=props)
+
+            params.result_callback = settle
+            await handler(params)
+        finally:
+            event = group.done.get(call_id)
+            if event is not None:
+                event.set()
+            self._settled(group, call_id, final.get("run_llm"))
+
+    # -- the send countdown -----------------------------------------------------------------------------------------
+
+    def countdown(self) -> Any:
+        """The conversation's one countdown host (``yuki.one.countdown.Countdown``): the island through the bridge,
+        "Sending to <name>" in the one voice, memory's own name for the person; the runner runs every send through it."""
+        if self._countdown is None:
+            from yuki.brain import consent
+            from yuki.one.countdown import Countdown
+
+            agent = self._agent()
+            seconds = getattr(agent, "send_countdown_s", None) if agent is not None else None
+            self._countdown = Countdown(publish=self._publish,
+                                        seconds=float(seconds) if isinstance(seconds, (int, float)) else None,
+                                        say=self.speak, said_name=lambda who: consent.spoken_name(who, self._people_in),
+                                        log=self._gate_log)
+        return self._countdown
+
+    def _publish(self, event: Any) -> None:
+        """The countdown's ``publish`` (its own thread: the runner's worker): to the island through the bridge
+        (``VoiceBridge.one_send_pending``), then, each time it counts (as it opens, and again after a pause that was
+        noise), review fix H1: their words that came after the request this send is for, before it opened, end it
+        (nothing sent; their words decide), and their speech going on as it opens pauses it."""
+        publish = getattr(self.c.bridge, "one_send_pending", None)
+        if callable(publish):
+            try:
+                publish(event)
+            except Exception:  # noqa: BLE001 - presentation only; the countdown runs on
+                pass
+        if str(getattr(event, "state", "") or "") == "counting":
+            try:
+                self._on_counting()
+            except Exception as exc:  # noqa: BLE001 - its own pause limit, Stop and their words still stop it
+                self._log("countdown", error=type(exc).__name__)
+
+    def _on_counting(self) -> None:
+        countdown = self._countdown
+        if countdown is None:
+            return
+        mark = _ONE_CALL_MARK.get()
+        if mark is not None and self._heard_n > mark:
+            # words of theirs came after the request this send is for, before its countdown opened: they decide
+            countdown.user_speaking()
+            if countdown.user_done(words=True):
+                self._log("countdown", spoke=True, before=True)
+            return
+        if getattr(getattr(self.c, "observer", None), "user_speaking", False):
+            self._pause_countdown("speaking")   # they began speaking before it opened: their words decide
+
+    def _pause_countdown(self, why: str) -> bool:
+        """Review fix H1: an open countdown still counting pauses now (their speech began before it opened, or their
+        new words started a turn while it counts); their final words then end it (:meth:`user_words`), and a pause that
+        brings none counts on for the time it had left (:meth:`_noise_watch`). Any thread."""
+        countdown = self._countdown
+        if countdown is None or not countdown.counting or not countdown.user_speaking():
+            return False
+        self._paused_at = time.monotonic()
+        self._words_since = False
+        self._log("countdown", paused=True, why=why)
+        self._watch_noise()
+        return True
+
+    def _watch_noise(self) -> None:
+        loop = getattr(self.c, "_loop", None)
+        if loop is None or (self._noise_task is not None and not self._noise_task.done()):
+            return
+        if _not_on(loop):
+            self._noise_task = asyncio.run_coroutine_threadsafe(self._noise_watch(), loop)
+        else:
+            self._noise_task = asyncio.ensure_future(self._noise_watch())
+
+    def stop_send(self) -> bool:
+        """Stop / Esc on the island (``ui.app._on_send_stop`` -> ``voice.interrupt()``): an open countdown ends
+        cancelled, nothing sent. Any thread."""
+        countdown = self._countdown
+        return bool(countdown is not None and countdown.cancel())
+
+    def send_choice(self, kind: str, value: str) -> bool:
+        countdown = self._countdown
+        return bool(countdown is not None and countdown.swap(kind, value))
+
+    def user_started(self) -> None:
+        """Flux's start of turn: an open countdown pauses at once (their words then decide, through the agent)."""
+        self._spoke_at = time.monotonic()
+        self._words_since = False
+        countdown = self._countdown
+        if countdown is None or not countdown.counting:
+            return
+        if countdown.user_speaking():
+            self._paused_at = self._spoke_at
+            self._log("countdown", paused=True)
+        self._watch_noise()
+
+    def user_words(self, text: str) -> None:
+        """Their final words (any, a dismissal too): an open countdown ends, nothing sent; the agent decides. Review
+        fix H1: a countdown still counting (their speech began before it opened, so nothing paused it) is paused and
+        ended the same way; words with no text resume a paused one (noise)."""
+        words = bool(" ".join(str(text or "").split()))
+        self._words_since = True
+        if words:
+            self._heard_n += 1
+        countdown = self._countdown
+        if countdown is None:
+            return
+        if words and countdown.counting:
+            unpaused = countdown.user_speaking()
+            if countdown.user_done(words=True):
+                self._log("countdown", spoke=True, unpaused=unpaused)
+            return
+        if countdown.user_done(words=words):
+            self._log("countdown", spoke=words)
+
+    async def _noise_watch(self) -> None:
+        """A pause that brought no words, with nobody speaking and no voiced audio for :data:`ONE_NOISE_S`, was noise:
+        the countdown runs on for the time it had left. While they may still be speaking it stays paused (its own
+        limit, ``countdown.PAUSE_MAX_S``, ends it with nothing sent)."""
+        try:
+            while True:
+                await asyncio.sleep(0.25)
+                countdown = self._countdown
+                if countdown is None or not countdown.counting or self._words_since:
+                    return
+                now = time.monotonic()
+                if now - max(self._spoke_at, self._paused_at) < ONE_NOISE_S \
+                        or getattr(self.c.observer, "user_speaking", False):
+                    continue
+                voice = getattr(self.c, "_voice_activity", None)
+                if voice is not None:
+                    _since, last = voice()
+                    if last and now - last < ONE_NOISE_S:
+                        continue
+                if countdown.user_done(words=False):
+                    self._log("countdown", noise=True)
+                return
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 - the countdown's own pause limit ends it then
+            return
+
+    def close(self) -> None:
+        """The conversation ends: the timer stops, an open countdown is cancelled (nothing sent)."""
+        self._cancel_timer()
+        self.stop_send()
+        if not self.over:
+            self.over = True
+            self._log("turn_over", why="closed")
+
+
+def _not_on(loop: Any) -> bool:
+    """Whether the calling thread is not running ``loop`` (a call from another thread)."""
+    try:
+        return asyncio.get_running_loop() is not loop
+    except RuntimeError:
+        return True
+
+
 class Conversation:
     """One conversation's pipeline, run on the current asyncio loop.
 
@@ -3521,6 +5053,15 @@ class Conversation:
         #: kMind: the talker's model: the lean talker's own (``Settings.voice_lean_model``), else the mouth's.
         self.talker_model = str((getattr(settings, "voice_lean_model", "") if self.talker == "lean" else "")
                                 or settings.voice_mouth_model)
+        #: oVoice (phase 4): the ONE agent owns the spoken turn (``brain = "one"``): its driver (:class:`OneVoice`),
+        #: else ``None`` and nothing of it runs. Its model: ``Settings.one_voice_model`` when set, else the lean
+        #: talker's (Sonnet 5.5).
+        self.one = voice_one(settings)
+        self.one_driver: OneVoice | None = OneVoice(self) if self.one else None
+        if self.one_driver is not None:
+            self.talker_model = str(getattr(settings, "one_voice_model", "") or self.talker_model)
+            self.observer.on_user_started = self.one_driver.user_started
+            self.observer.on_user_words = self.one_driver.user_words
         #: yConsumers: the lean talker (voice on the new brain) gets memory's one "you right now" line in its volatile
         #: block, from :class:`TalkerYou`'s background cache; the full talker is byte-for-byte as before.
         self._you_on = self.talker == "lean"
@@ -3993,7 +5534,11 @@ class Conversation:
     REFLEX_LIVE = ("running",) + REFLEX_WENT
 
     def _reflex_on(self) -> bool:
-        """The reflex path runs: the setting (``voice_reflex``), the talker's hands, and a desktop to act on."""
+        """The reflex path runs: the setting (``voice_reflex``), the talker's hands, and a desktop to act on. oVoice
+        (review fix M3): under ``brain = "one"`` too, for the sound reflexes only (:data:`ONE_REFLEX_TOOLS`), each
+        decided by the one gate before it acts (:meth:`_reflex_one_gate`) and matched against the ONE agent's own
+        call so it is never pressed twice (:meth:`_reflex_one_dup`). Under one the book is read, not grown (it learns
+        from the talker's own hands)."""
         s = self.settings
         return bool(getattr(s, "voice_reflex", True) and getattr(s, "voice_hands", True)
                     and getattr(self.bridge, "hands", None) is not None)
@@ -4092,6 +5637,15 @@ class Conversation:
             return "dismiss"
         if self._asked_last():
             return "asked"
+        one = getattr(self, "one_driver", None)
+        if one is not None:
+            # review fix M3: under one, a send counting down (these words may be its stop) or a question the gate asked
+            # that waits for their answer (these words may be it): the agent has the turn
+            countdown = getattr(one, "_countdown", None)
+            if countdown is not None and countdown.counting:
+                return "countdown"
+            if getattr(getattr(one, "turn", None), "asks", None):
+                return "gate_asked"
         bridge = self.bridge
         try:
             if bridge.has_open_voice_job() and not bridge.open_voice_jobs():
@@ -4147,6 +5701,11 @@ class Conversation:
         entry = book().get(key)
         if entry is None:
             return
+        if getattr(self, "one", False) and not self._reflex_one_tool(entry):
+            # review fix M3: under one only a sound reflex runs (a window, scroll or opening reflex stays the agent's)
+            self.log.event("reflex", op="skip", session=self.session, tool=entry.get("tool"), why="one_tool",
+                           eager=not final)
+            return
         why = self._reflex_block()
         hands = self.bridge.hands
         volume = self._reflex_volume()
@@ -4184,6 +5743,12 @@ class Conversation:
         game = closed() if callable(closed) else ""
         if game:
             return False, "", {"skipped": "game"}
+        if getattr(self, "one", False):
+            # review fix M3: under one every act passes the one gate first (a game in front, the Act switch, the row);
+            # anything but an allow runs nothing and the agent does the turn
+            why = self._reflex_one_gate(tool, args, rec)
+            if why:
+                return False, "", {"skipped": why}
         if tool in ("window", "scroll"):
             # the window in front read now only for a reflex learned on it (a scroll, a minimise of what was in front)
             front = (hands._foreground() if (entry.get("target") or {}).get("front")
@@ -4389,6 +5954,103 @@ class Conversation:
             return None
         return {"state": rec.get("state"), "what": rec.get("what") or "",
                 "report": " ".join(str(rec.get("report") or "").split())[:240], "changed": bool(rec.get("changed"))}
+
+    # -- review fix M3: the sound reflexes under brain = "one" ---------------------------------------------------------
+
+    @staticmethod
+    def _reflex_one_tool(entry: Any) -> bool:
+        """A reflex that may run under one (:data:`ONE_REFLEX_TOOLS`): a media key, an app's volume, the volume skill."""
+        from yuki.voice.reflex import VOLUME_SKILL
+
+        entry = entry if isinstance(entry, dict) else {}
+        tool = str(entry.get("tool") or "")
+        if tool not in ONE_REFLEX_TOOLS:
+            return False
+        if tool == "run_skill":
+            return str((entry.get("args") or {}).get("skill") or "") == VOLUME_SKILL
+        return True
+
+    def _reflex_one_gate(self, tool: str, args: dict[str, Any], rec: dict[str, Any]) -> str:
+        """Blocking (the reflex's worker thread): the one gate's decision for a learned reflex's act under one, on its
+        own gate turn (``OneVoice.reflex_turn``): ``""`` when it allows, else why nothing runs (the agent does the
+        turn). Never raises."""
+        one = getattr(self, "one_driver", None)
+        if one is None:
+            return "one_gate"
+        try:
+            from yuki.one import policy
+
+            target: dict[str, Any] = {}
+            if tool == "run_skill":
+                try:
+                    from yuki.skills.catalog import load
+
+                    target["app"] = str(getattr(load().get(str(args.get("skill") or "")), "app", "") or "")
+                except Exception:  # noqa: BLE001 - the gate reads the skill itself
+                    pass
+            decision = policy.gate(tool, dict(args), target, one.reflex_turn(str(rec.get("text") or "")))
+        except Exception as exc:  # noqa: BLE001 - fail closed: nothing runs
+            self.log.event("reflex", op="gate", session=self.session, tool=tool, error=type(exc).__name__)
+            return "gate"
+        if getattr(decision, "allowed", False):
+            return ""
+        self.log.event("reflex", op="gate", session=self.session, tool=tool, verdict=getattr(decision, "kind", None),
+                       reason=getattr(decision, "reason", None))
+        return "gate"
+
+    async def _reflex_one_dup(self, name: str, args: dict[str, Any]) -> dict[str, Any] | None:
+        """The ONE agent's call is the sound reflex's own for these words (the same call by its identity, or the same
+        kind of call when the reflex acted on no app by name), as :meth:`_reflex_dup` reads it for the talker: its
+        result stands for the call (``OneVoice.handle``), nothing is pressed twice. ``None``: no reflex ran for these
+        words, it did not get there (the agent's own call runs), or this is another call."""
+        if not getattr(self, "one", False):
+            return None
+        from yuki.voice.reflex import shape_of, target_of
+
+        rec = self._reflex
+        if rec is None or rec.get("state") in ("skipped", "failed") or rec.get("start") != self._reflex_start():
+            return None
+        entry = rec.get("entry") or {}
+        if name != entry.get("tool") or not self._reflex_one_tool(entry):
+            return None
+        a = args if isinstance(args, dict) else {}
+        hands = getattr(self.bridge, "hands", None)
+        shape = shape_of(name, a, snap=getattr(hands, "last", None), volume_skill=bool(rec.get("volume")))
+        same = shape is not None and shape.sig == entry.get("sig")
+        kind = (not same and not rec.get("changed") and not target_of(entry)
+                and (name != "run_skill" or str(a.get("skill") or "") == str((rec.get("args") or {}).get("skill") or "")))
+        if not same and not kind:
+            return None
+        task = rec.get("task")
+        if rec.get("state") == "running" and task is not None:
+            await asyncio.wait({task}, timeout=self.REFLEX_DUP_WAIT_S)
+        state = rec.get("state")
+        fresh = state == "running" or time.monotonic() - float(rec.get("done_at") or 0.0) <= self.REFLEX_DUP_S
+        if not fresh or state not in self.REFLEX_LIVE:
+            return None
+        from yuki.voice.mouth import (REFLEX_DUP_RUNNING, REFLEX_DUP_SAID, REFLEX_DUP_SETTLED, REFLEX_DUP_SILENT,
+                                      REFLEX_DUP_UNSEEN)
+
+        report = str(rec.get("report") or "")[:700]
+        self.log.event("reflex", op="dup_skipped", session=self.session, tool=name, state=state, one=True)
+        if state == "sent":
+            # it went out once and was not seen to take effect: never a second press (a toggle would undo it)
+            return {"status": "not_confirmed", "verified": None, "result": report, "note": REFLEX_DUP_UNSEEN,
+                    "owed": ONE_NOT_CONFIRMED_LINE}
+        if state == "running":
+            return {"status": "starting", "verified": None, "result": "still being done", "note": REFLEX_DUP_RUNNING,
+                    "_no_owe": True}
+        if state == "settled":
+            return {"status": "no_change", "verified": None, "result": report, "note": REFLEX_DUP_SETTLED,
+                    "_no_owe": True}
+        line = (str((rec.get("facts") or {}).get("done_line") or "") if name == "run_skill"
+                else " ".join(str(a.get("say_when_done") or "").split()))
+        said = ""
+        if line and not rec.get("said"):
+            said = rec["said"] = line
+            await self._speak_result([line])
+        return {"status": "done", "verified": True, "result": report, "said": said,
+                "note": REFLEX_DUP_SAID if said else REFLEX_DUP_SILENT}
 
     async def _reflex_dup(self, params: Any) -> bool:
         """The talker's call is the reflex's own for these words (the same call by its identity, or the same window and
@@ -5063,13 +6725,23 @@ class Conversation:
         return True
 
     def interrupt(self) -> None:
-        """Cut Yuki's current speech (the cancel hotkey). Thread-safe."""
+        """Cut Yuki's current speech (the cancel hotkey). Thread-safe. oVoice: under ``brain = "one"`` an open send
+        countdown is cancelled first (the island's Stop/Esc reaches here): nothing is sent."""
+        one = getattr(self, "one_driver", None)
+        if one is not None:
+            one.stop_send()   # the countdown logs its own end (one_countdown state=cancelled)
         loop, worker = self._loop, self.worker
         if loop is None or worker is None:
             return
         from pipecat.frames.frames import InterruptionWorkerFrame
 
         asyncio.run_coroutine_threadsafe(worker.queue_frame(InterruptionWorkerFrame()), loop)
+
+    def send_choice(self, kind: str, value: str) -> bool:
+        """oVoice: a chip tapped on a ONE send countdown (``who`` / ``where``): it ends with the swap and the agent
+        sends to the new choice. Thread-safe; ``False`` with no ONE countdown open."""
+        one = getattr(self, "one_driver", None)
+        return bool(one is not None and one.send_choice(kind, value))
 
     # -- building ----------------------------------------------------------------
 
@@ -5095,7 +6767,17 @@ class Conversation:
         # reply is in progress and is "owed whatever the conversation moved on to"; here the
         # narrator gate decides when a result is said, and the user's rules ban em dashes.
         lean = getattr(self, "talker", "full") == "lean"
-        llm_service_module.ASYNC_TOOL_INSTRUCTIONS = async_tool_instructions(lean=lean)
+        one = getattr(self, "one_driver", None)
+        if one is not None:
+            # oVoice: the ONE agent's async paragraph (the lean one names hand_over, which it has not) and core
+            from yuki.one.prompt import ONE_ASYNC_TOOL_INSTRUCTIONS, ONE_CORE
+
+            one.preload()
+            llm_service_module.ASYNC_TOOL_INSTRUCTIONS = ONE_ASYNC_TOOL_INSTRUCTIONS
+            base_prompt = ONE_CORE
+        else:
+            llm_service_module.ASYNC_TOOL_INSTRUCTIONS = async_tool_instructions(lean=lean)
+            base_prompt = LEAN_MOUTH_PROMPT if lean else MOUTH_PROMPT
         # Pipecat's final-result note says a result must be spoken whatever the
         # conversation moved on to. Here the narrator gate decides that, and a
         # stale result arrives marked held_back; the note defers to the payload.
@@ -5155,10 +6837,12 @@ class Conversation:
                 thinking=AnthropicLLMService.ThinkingConfig(**thinking_off(self.talker_model)),
                 # The core layer: Pipecat composes its async-tool paragraphs onto it; the
                 # service subclass sends the result as the first of the prompt's layers.
-                system_instruction=LEAN_MOUTH_PROMPT if lean else MOUTH_PROMPT,
+                system_instruction=base_prompt,
             ),
         )
-        if lean:
+        if one is not None:
+            one.register(llm)   # oVoice: every ONE voice tool (the controls to the bridge, the rest to the runner)
+        elif lean:
             # bTalk (design 3): the lean talker hands over with hand_over (the exact words go by code); no
             # check_progress (its model call is gone: "how's it going?" is answered from the work line)
             llm.register_function("hand_over", self._tell_or_hold, cancel_on_interruption=False,
@@ -5167,14 +6851,15 @@ class Conversation:
             llm.register_function("tell_yuki", self._tell_or_hold, cancel_on_interruption=False,
                                   cancellable_by_llm=True, timeout_secs=None)
             llm.register_function("check_progress", self.bridge.check_progress)
-        llm.register_function("more_of_result", self.bridge.more_of_result)
-        llm.register_function("stay_quiet", self.bridge.stay_quiet)
-        llm.register_function("end_conversation", self.bridge.end_conversation)
-        llm.register_function("go_quiet", self.bridge.go_quiet)
+        if one is None:
+            llm.register_function("more_of_result", self.bridge.more_of_result)
+            llm.register_function("stay_quiet", self.bridge.stay_quiet)
+            llm.register_function("end_conversation", self.bridge.end_conversation)
+            llm.register_function("go_quiet", self.bridge.go_quiet)
         hands = getattr(self.bridge, "hands", None)
         if hands is not None:
             self.observer.hands = hands   # the hands' own callbacks are bound with the bridge (_bind_bridge)
-        if s.voice_hands and hands is not None:
+        if one is None and s.voice_hands and hands is not None:
             # The mouth's own one-step hands (§5.6). Not cancelled by a barge-in: the action
             # may already have happened, and its report must reach the context either way.
             # x3 (fix-plan 3d): the skill hand (run_skill with a Skills menu) has no pipecat timer (as hand_over): live
@@ -5195,8 +6880,9 @@ class Conversation:
                                             alone=lambda call_id: call_id in getattr(self._llm, "_yuki_solo", ()),
                                             mark_spoken=lambda call_id: getattr(self._llm, "_yuki_spoke", set()).add(
                                                 str(call_id)))
-            llm.register_function(QUICK_MEMORY["name"], self._quick_memory_call, cancel_on_interruption=False,
-                                  timeout_secs=20)
+            if one is None:   # oVoice: under one it is registered with the ONE tools (gated, in the reply's order)
+                llm.register_function(QUICK_MEMORY["name"], self._quick_memory_call, cancel_on_interruption=False,
+                                      timeout_secs=20)
         from yuki.voice.local_models import DEFAULT_VOICE as LOCAL_DEFAULT_VOICE, is_local_voice
 
         provider = self.tts_provider
@@ -5277,7 +6963,9 @@ class Conversation:
             from yuki.voice.speechguard import SpeechGuard
 
             # bTalk (design 3): under brain = "all" the check makes no model call; its two code rules stay
-            code_only = {"code_only": True} if getattr(self, "brain_voice", False) else {}
+            # oVoice: the same under brain = "one" (the claim gate stays, as built)
+            code_only = ({"code_only": True} if getattr(self, "brain_voice", False) or getattr(self, "one", False)
+                         else {})
             guard = SpeechGuard(self._client, s.voice_mouth_model, log=self.log, session=self.session,
                                 timeout_s=float(getattr(s, "voice_speech_guard_timeout_s", 2.5)),
                                 context=lambda: {"user": self.observer.last_user_text},
@@ -5310,14 +6998,20 @@ class Conversation:
         # Phase S: the hands for this conversation, fixed (the tools head the cached prefix): with a Skills menu the
         # skill hands (run_skill from its keys, keep_usual) and, with the volume skill, no mixer hand or volume keys;
         # else as before phase S (the step-list run_skill only where the old learning path can offer ways)
-        hand_tools = self._talker_hand_tools()
-        # bTalk (design 3): the lean talker's hand_over in tell_yuki's place, and no check_progress
-        head = ((HAND_OVER,) if getattr(self, "talker", "full") == "lean" else (TELL_YUKI, CHECK_PROGRESS))
+        one = getattr(self, "one_driver", None)
+        if one is not None:
+            # oVoice: the ONE agent's voice tools (yuki.one.tools.schemas("voice", keys); its ceiling at import)
+            listed: Any = one.schemas()
+        else:
+            hand_tools = self._talker_hand_tools()
+            # bTalk (design 3): the lean talker's hand_over in tell_yuki's place, and no check_progress
+            head = ((HAND_OVER,) if getattr(self, "talker", "full") == "lean" else (TELL_YUKI, CHECK_PROGRESS))
+            listed = (*head, MORE_OF_RESULT, STAY_QUIET, END_CONVERSATION, GO_QUIET,
+                      *([QUICK_MEMORY] if self.memory is not None else []), *hand_tools)
         tools = ToolsSchema(standard_tools=[
             FunctionSchema(name=t["name"], description=t["description"], properties=t["properties"],
                            required=t["required"])
-            for t in (*head, MORE_OF_RESULT, STAY_QUIET, END_CONVERSATION, GO_QUIET,
-                      *([QUICK_MEMORY] if self.memory is not None else []), *hand_tools)
+            for t in listed
         ])
         self._tools = tools
         context = LLMContext(tools=tools)
@@ -5347,6 +7041,8 @@ class Conversation:
         )
         settle_only_when_newest(assistant_agg)
         self._summarizer = getattr(assistant_agg, "_summarizer", None)
+        if one is not None:
+            one.hold_summaries(self._summarizer)   # oVoice: never inside a turn; at a turn's end when due (8k)
         hold = hold_until_connected(lambda: bool(getattr(stt, "_transport_is_active", lambda: True)()), self.log,
                                     on_connected=self._stt_connected)
         output = self.transport.output()
@@ -5489,6 +7185,8 @@ class Conversation:
                 you_cache.attach(self, False)
             self._scroll_hold(False)
             self._cancel_route()
+            if getattr(self, "one_driver", None) is not None:
+                self.one_driver.close()   # oVoice: the hard stop's timer, an open countdown (nothing sent)
             self._unboost()
             self._log_audio_qos()
             watch.cancel()
@@ -5798,8 +7496,12 @@ class Conversation:
             # (measured: the first turn then missed the cache and wrote it again).
             llm._sync_cancel_tools()
             llm._compose_system_instruction()
-            params = llm._get_llm_invocation_params(LLMContext(messages=[{"role": "user", "content": "."}],
-                                                               tools=self._tools))
+            llm._yuki_warming = True   # oVoice: a warm-up is no ONE round (the turn's block is not touched)
+            try:
+                params = llm._get_llm_invocation_params(LLMContext(messages=[{"role": "user", "content": "."}],
+                                                                   tools=self._tools))
+            finally:
+                llm._yuki_warming = False
             request = {"system": params["system"], "tools": params["tools"], "messages": params["messages"]}
         except Exception as exc:  # noqa: BLE001 - then only the connection is warmed
             self.log.event("warm", note=f"plain warm-up ({type(exc).__name__})")
@@ -5852,7 +7554,12 @@ class Conversation:
 
     def _held(self, name: str, call_id: str | None = None, args: Any = None) -> bool:
         """Whether this call is held: recognition was unsure of the latest words and the mouth spoke with it. The sound
-        hands, ``keep_usual`` and a ``run_skill`` of a sound-only skill (:meth:`_sound_skill`) are never held."""
+        hands, ``keep_usual`` and a ``run_skill`` of a sound-only skill (:meth:`_sound_skill`) are never held. oVoice
+        (review fix M4): under ``brain = "one"`` the same rule, for the ONE agent's acts only (a read, a write, a
+        control never waits); a held act is answered by the ONE driver itself (``OneVoice.handle``: nothing done, the
+        agent's next round asks or calls it again alone), never handed to the old thinker."""
+        if getattr(self, "one", False) and one_kind(str(name or "")) != "act":
+            return False
         from yuki.voice.hands import AUDIO_HANDS
 
         decided = getattr(getattr(self, "_llm", None), "_yuki_hold", None) or {}
@@ -6173,7 +7880,10 @@ class Conversation:
 
     def _note_reply(self, calls: list[tuple[str, str, Any]]) -> None:
         """vRound2: the reply-level rule (:func:`reply_skips`) over a reply of several calls, before Pipecat runs them
-        in parallel: the calls it leaves out are kept here until their handlers start. Logged content-free."""
+        in parallel: the calls it leaves out are kept here until their handlers start. Logged content-free. oVoice: not
+        under ``brain = "one"`` (nothing is handed to a thinker; the reply's calls run in order)."""
+        if getattr(self, "one", False):
+            return
         skips = reply_skips(calls, getattr(self.bridge, "hands", None))
         if not skips:
             return
@@ -6661,6 +8371,9 @@ class Conversation:
             call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
             if call is None or call.tool:
                 return False
+            one = getattr(self, "one_driver", None)
+            if one is not None:
+                return one.claim_open()   # oVoice: the ONE turn's own facts (its runner calls, never the hands')
             hands = getattr(self.bridge, "hands", None)
             called = getattr(hands, "called_this_turn", None)
             if not callable(called) or not called():
@@ -6682,7 +8395,10 @@ class Conversation:
 
     def _acted_this_turn(self) -> bool | None:
         """kMind (the claim gate, ``Hands.acted_this_turn``): ``True`` / ``False`` for a user turn (a reflex that did
-        it counts), ``None`` when there are no hands or this call is not a user turn's. Never raises."""
+        it counts), ``None`` when there are no hands or this call is not a user turn's. Never raises. oVoice: ``None``
+        under ``brain = "one"`` (the agent reads its own results)."""
+        if getattr(self, "one", False):
+            return None
         call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
         if call is not None and not getattr(call, "user_turn", True):
             return None

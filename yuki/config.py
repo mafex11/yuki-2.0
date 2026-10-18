@@ -15,23 +15,25 @@ from typing import Literal
 
 from yuki.core.models import resolve_backend as _resolve_backend
 from yuki.core.paths import state_root as _state_root
+# the one brain-mode helper (phase 4): imports nothing of Yuki at import time
+from yuki.one.modes import BRAIN_MODES
+from yuki.one.modes import DEFAULT_MODE as BRAIN_DEFAULT
+from yuki.one.modes import normalize as brain_mode_of
 
 ScreenshotPolicy = Literal["never", "ask", "auto"]
 
-#: Which requests the new brain (``yuki.brain``: one plan call, the executor, one done-check) takes: ``loop`` none
-#: (today's ``yuki.agent.loop`` for everything), ``typed`` the typed ones (the ask bar, the chat page: release 17a),
-#: ``all`` typed and spoken (release 17b, with the voice wiring). The one rollback switch (brain-design.md 10.1, M10).
-BRAIN_MODES: tuple[str, ...] = ("loop", "typed", "all")
-
-
-#: kMind (audit 17 Oct, decision 4): the shipped brain. The plan-first brain takes typed and spoken requests; ``loop``
-#: (the old step-by-step agent and the full talker) is the rollback setting only.
-BRAIN_DEFAULT = "all"
+# The brain switch (``BRAIN_MODES``, ``BRAIN_DEFAULT``, ``brain_mode_of``: imported above from yuki.one.modes, the
+# only copy): ``all`` (shipped, the rollback) the plan-first brain (``yuki.brain``: one plan call, the executor, one
+# done-check) for typed requests and the voice's hand-overs, the lean talker in front of it on voice; ``one`` (phase 4)
+# ONE Sonnet 5.5 agent owns the whole turn on voice and typed (``yuki.one``); ``loop`` (``yuki.agent.loop`` for
+# everything, the full talker) and ``typed`` (the plan brain for typed requests only), the old values, kept until the
+# final test. An unknown value reads as ``all``, never the old thinker.
 
 
 def _brain_default() -> str:
-    """``YUKI_BRAIN``, else ``brain`` in ``%LOCALAPPDATA%/Yuki/settings.json``, else :data:`BRAIN_DEFAULT` (read once,
-    at start)."""
+    """``YUKI_BRAIN``, else ``brain`` in ``%LOCALAPPDATA%/Yuki/settings.json``, else :data:`BRAIN_DEFAULT`, read each
+    time a :class:`Settings` is made (as before); anything not in :data:`BRAIN_MODES` reads as ``all``
+    (:func:`yuki.one.modes.normalize`)."""
     forced = (os.environ.get("YUKI_BRAIN") or "").strip().lower()
     if forced in BRAIN_MODES:
         return forced
@@ -43,8 +45,7 @@ def _brain_default() -> str:
         data = json.loads(prefs_path().read_text(encoding="utf-8"))
     except (OSError, ValueError, ImportError):
         return BRAIN_DEFAULT
-    value = str(data.get("brain") or "").strip().lower() if isinstance(data, dict) else ""
-    return value if value in BRAIN_MODES else BRAIN_DEFAULT
+    return brain_mode_of(data.get("brain") if isinstance(data, dict) else None)
 
 
 #: The skills switch (failure fix-plan Item 1, 10 Oct): ``on`` everything (the shipped capabilities and the skills Yuki
@@ -863,11 +864,26 @@ class Settings:
     #: A request pack (Agent.build_pack) older than this is rebuilt for its screen half (the memory half is kept).
     pack_max_age_s: float = 20.0
     # -- the brain rebuild (docs/research/audit-2026-10-09/next/brain-design.md rev 2, release 17a) --
-    #: Which requests the new brain takes (:data:`BRAIN_MODES`): ``all`` (typed and spoken; the default since 18 Oct),
-    #: ``typed`` (typed only), ``loop`` (none: the old step-by-step agent and the full talker; the rollback value).
-    #: Read at each request's start (``YUKI_BRAIN`` or ``brain`` in ``settings.json`` at start); anything else is
-    #: ``all``.
+    #: Which brain takes a request (:data:`BRAIN_MODES`, :mod:`yuki.one.modes`): ``all`` (typed and spoken on the plan
+    #: brain; the default since 18 Oct and the rollback), ``one`` (phase 4: ONE Sonnet 5.5 agent owns the whole turn
+    #: on voice and typed, ``yuki.one``), ``typed`` (typed only), ``loop`` (none: the old step-by-step agent and the
+    #: full talker). Read at each request's start (``YUKI_BRAIN`` or ``brain`` in ``settings.json`` at start); anything
+    #: else is ``all``.
     brain: str = field(default_factory=_brain_default)
+    # -- phase 4: the ONE agent (``brain = "one"``; yuki.brain.settings.OneSettings reads these) --
+    #: The ONE agent's model (voice and typed). Its failover chain is this model's, cut after Sonnet 5: no Haiku ever
+    #: drives an act (phase 4 addendum, must-fix 9).
+    one_model: str = "global.anthropic.claude-sonnet-5-5"
+    #: Voice thinking (design 2.6, addendum decision 3; read by the voice driver): ``structure`` (off on the first call,
+    #: adaptive medium from round 1 when the turn is structurally hard), ``fast`` (always off), ``adaptive_low``.
+    one_thinking: str = "structure"
+    #: Typed thinking: ``adaptive`` (every round, at the brain's typed effort rule: medium under ``auto``, today's typed
+    #: effort; design 2.5) or ``fast`` (off on every round).
+    one_typed_thinking: str = "adaptive"
+    #: Who ends a clean simple act (addendum decision 2): ``code`` (every call of the reply verified, nothing flagged,
+    #: every ``then`` empty: code's line ends it, no closing model call) or ``model`` (the model always has the last
+    #: round).
+    one_settle: str = "code"
     #: The planner's model (kBrain, 18 Oct): Sonnet 5.5; the brain falls back to the same model when this is empty.
     brain_model: str = "global.anthropic.claude-sonnet-5-5"
     #: The planner's effort per channel (adaptive thinking on both; pinned for a whole request, tuned from the
@@ -888,8 +904,7 @@ class Settings:
             raise ValueError(f"model_backend must be 'bedrock' or 'anthropic', not {self.model_backend!r}")
         # screenshots never (brain-design.md 5, L1): the ask and auto values are gone; bPrune removes the setting
         self.screenshot_policy = "never"
-        mode = str(self.brain or "").strip().lower()
-        self.brain = mode if mode in BRAIN_MODES else BRAIN_DEFAULT
+        self.brain = brain_mode_of(self.brain)   # yuki.one.modes: an unknown value reads as ``all``
         # the skills switch (Item 1): a bool, or the switch's own word given as ``skills`` ("capabilities"); the
         # learned skills are never on with the skill path off
         switch = skills_mode_of(self.skills)

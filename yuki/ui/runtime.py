@@ -65,6 +65,7 @@ from yuki.log.events import (
     ToolResult,
     content_kept,
 )
+from yuki.one import modes
 from yuki.ui.uilog import UiLog
 
 #: appPT: seconds a plain send waits on the send countdown before it goes (the user's 3 Oct "3 s to stop").
@@ -279,6 +280,12 @@ class Lane(QThread):
         self._brain_lock = threading.Lock()
         #: When making the brain last failed (monotonic; ``None``: never, or it was made since).
         self._brain_failed_at: float | None = None
+        #: Phase 4 (oTyped): this lane's ONE agent under ``brain = "one"`` (``yuki.one.host.build_agent``: a new object
+        #: beside :attr:`agent`, which ``all`` keeps as its host, untouched), made on first use under its own lock, and
+        #: when making it last failed (a job then fails with a plain line: ``yuki.one.host.Unbuilt``).
+        self._one: Any = None
+        self._one_lock = threading.Lock()
+        self._one_failed_at: float | None = None
 
     @property
     def active(self) -> Any:
@@ -287,30 +294,78 @@ class Lane(QThread):
         return self._active or self.agent
 
     def _brain_mode(self) -> str:
-        """``Settings.brain`` now: ``all`` (shipped: the brain takes typed requests and the voice's hand-overs) |
-        ``typed`` | ``loop`` (the rollback value only); anything else reads as ``all``."""
-        from yuki.brain.settings import BRAIN_MODES, DEFAULT_MODE
-
-        mode = str(getattr(getattr(self.runtime, "settings", None), "brain", DEFAULT_MODE) or DEFAULT_MODE)
-        mode = mode.strip().lower()
-        return mode if mode in BRAIN_MODES else DEFAULT_MODE
+        """``Settings.brain`` now (:func:`yuki.one.modes.brain_mode`, the one mode helper): ``all`` (shipped: the
+        brain takes typed requests and the voice's hand-overs) | ``one`` (phase 4: the ONE agent) | ``typed`` |
+        ``loop`` (the rollback values); anything else reads as ``all``, never the old thinker."""
+        return modes.brain_mode(getattr(self.runtime, "settings", None))
 
     def _agent_for(self, job: "Job") -> Any:
-        """Who drives ``job``: the new brain for a typed request when ``Settings.brain`` is ``typed`` or ``all``, and
-        for a spoken one only under ``all`` (bTalk; read now, at the request's start: flipping it back is the
-        rollback), else the old loop agent. Never raises: a brain that can't be made leaves the old loop driving
-        (logged)."""
-        if job.source == "voice" and self._brain_mode() != "all":
+        """Who drives ``job``, read now, at the request's start (flipping the setting back is the rollback):
+
+        * ``brain = "one"``: this lane's ONE agent (:meth:`one`), typed and spoken alike; one that can't be made is a
+          stand-in that fails the job with a plain line, never another brain;
+        * else the new brain for a typed request when ``Settings.brain`` is ``typed`` or ``all``, and for a spoken one
+          only under ``all`` (bTalk), else the old loop agent. A brain that can't be made leaves the old loop driving
+          (logged), as before.
+
+        Never raises."""
+        settings = getattr(self.runtime, "settings", None)
+        if modes.is_one(settings):
+            return self.one()
+        if job.source == "voice" and modes.voice_brain(settings) != modes.ALL:
             return self.agent
         brain = self.brain()
         return brain if brain is not None else self.agent
 
+    def one(self) -> Any:
+        """This lane's ONE agent under ``brain = "one"`` (``yuki.one.host.build_agent``, made once under a lock): the
+        worker acts, the front desk only looks (its Dispatcher on the hands-blocked backend; an act hands the request
+        to the worker). When it can't be made (logged, tried again at most every :data:`BRAIN_RETRY_S`): a stand-in
+        (``yuki.one.host.Unbuilt``) whose run fails the job with a plain line, never the old loop or the plan
+        brain."""
+        from yuki.one.host import Unbuilt
+
+        with self._one_lock:
+            if self._one is None:
+                now = time.monotonic()
+                if self._one_failed_at is not None and now - self._one_failed_at < BRAIN_RETRY_S:
+                    return Unbuilt("retry_wait", getattr(self.agent, "logger", None))
+                try:
+                    self._one = self._make_one()
+                except Exception as exc:  # noqa: BLE001 - the job fails plainly; nothing else drives it
+                    self._one_failed_at = now
+                    self.runtime.ui_log.event("one", lane=self.name, state="unavailable", error=type(exc).__name__)
+                    return Unbuilt(type(exc).__name__, getattr(self.agent, "logger", None))
+                self._one_failed_at = None
+                self.runtime.ui_log.event("one", lane=self.name, state="ready")
+            return self._one
+
+    def _make_one(self) -> Any:
+        """This lane's ONE agent (:func:`yuki.one.host.build_agent`), sharing the loop agent's settings, its session log
+        (the lane's own) and the runtime's memory. The worker acts (its own Dispatcher on the real desktop, the send
+        countdown and the takeover pause taken from the loop agent, as the plan brain's); the front desk only looks."""
+        from yuki.one.host import build_agent
+
+        loop_agent = self.agent
+        settings = getattr(loop_agent, "settings", None) or self.runtime.settings
+        acts = self.name == WORKER
+        dispatcher = None
+        if not acts:
+            dispatcher = Dispatcher(self.blocked if self.blocked is not None else HandsBlockedBackend(),
+                                    screenshot_policy="never",
+                                    tool_timeout_s=float(getattr(settings, "tool_timeout_s", 20.0)))
+        agent = build_agent(lane=self.name, settings=settings, logger=getattr(loop_agent, "logger", None),
+                            memory=self.runtime.memory, dispatcher=dispatcher, hands=acts, loop_agent=loop_agent)
+        agent.on_pause = self._on_pause
+        agent.on_late = lambda text: self.runtime.notice.emit("brain", str(text or ""))
+        return agent
+
     def brain(self) -> Any:
-        """This lane's new brain under ``brain = typed / all`` (made once, under a lock), else ``None`` (``loop``, or
-        it can't be made: logged once per try). bTalk reads ahead on the worker's (``Brain.begin_early``) from a
-        worker thread, so this may run off the lane thread."""
+        """This lane's new brain under ``brain = typed / all`` (made once, under a lock), else ``None`` (``loop``,
+        ``one``, or it can't be made: logged once per try). bTalk reads ahead on the worker's (``Brain.begin_early``)
+        from a worker thread, so this may run off the lane thread."""
         mode = self._brain_mode()
-        if mode not in ("typed", "all"):
+        if modes.typed_brain(getattr(self.runtime, "settings", None)) != modes.ALL:
             return None
         with self._brain_lock:
             if self._brain is None:
@@ -650,6 +705,11 @@ class Lane(QThread):
                                channel="voice" if voice else "typed", request_id=job.log_request_id or "",
                                origin_hwnd=job.origin_hwnd, plan_seed=seed, understanding=job.understanding,
                                late_understanding=lambda job_id=job.id: self._late_seed(job_id))
+            if getattr(agent, "one_agent", False):
+                # phase 4: a ONE agent hands a request over itself (``needed_hands`` at its first call that needs the
+                # worker); the front desk's tool list is the old loop's and names none of its tools, so it is not read
+                # here (else an answered request would run again on the worker); the blocked backend still is
+                allowed = None
             return self._relay(job, agent, events, allowed, refused)
         events = self.agent.run(
             job.request, origin_hwnd=job.origin_hwnd, effort=effort if voice else None,
@@ -1113,9 +1173,10 @@ class AgentRuntime(QObject):
         """kBrain: the worker's brain writes its planner's cached prefix and opens its connection
         (``Brain.warm_cache``: one token out, only when nothing warmed it in the last 50 minutes), on its own daemon
         thread. Called at start and by the voice at a conversation's start; ``False`` under ``brain = "loop"`` or when
-        the brain can't be made. Never raises."""
+        the brain can't be made. Under ``brain = "one"`` the worker's ONE agent warms its typed prefix the same way
+        (``OneAgent.warm_cache``; a stand-in that could not be made warms nothing). Never raises."""
         try:
-            brain = self.worker.brain()
+            brain = self.worker.one() if modes.is_one(self.settings) else self.worker.brain()
         except Exception:  # noqa: BLE001
             brain = None
         warm = getattr(brain, "warm_cache", None)
@@ -1325,10 +1386,11 @@ class AgentRuntime(QObject):
         # text only when no words come, and the answer is a word now, so its subject goes in the context here
         asked = f"The request as it came: {job.request}" if job.typed_words == () and job.request else ""
         context = "\n\n".join(part for part in (asked, job.context or "", note) if part)
-        # bTalk: a spoken request set aside under brain = "all" goes on with its heard turns and now the spoken answer
-        # as the user's words (else it would come back with none, and every send in it would end as a draft)
+        # bTalk: a spoken request set aside under brain = "all" (or "one": the ONE agent takes the heard turns too) goes
+        # on with its heard turns and now the spoken answer as the user's words (else it would come back with none, and
+        # every send in it would end as a draft)
         heard = None
-        if job.source == "voice" and lane._brain_mode() == "all":
+        if job.source == "voice" and modes.voice_brain(self.settings) in (modes.ALL, modes.ONE):
             heard = (*(job.user_words or ()), text)
         _lane, new_id = self.submit(request, origin_hwnd=job.origin_hwnd, source=job.source,
                                     lane=WORKER if lane_name == WORKER else None, typed_words=typed,
