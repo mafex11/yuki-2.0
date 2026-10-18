@@ -9,7 +9,8 @@ already hold the answer, by code, with no model call:
 * **Who** - the portrait's work and interests, first sentence each (planner and judge);
 * **Right now** (planner and judge) - the you-now record (``yuki.memory.younow``: focus, the day, what just changed,
   the thread now);
-* **In the middle of** (talker; decision 3, 18 Oct) - from the same record: the thread now by its title, up to three
+* **Day** and **In the middle of** (talker; decision 3, 18 Oct) - from the same record: when their day at the PC
+  began and whether they are at it, away or just back (``younow.day_words``); the thread now by its title, up to three
   items due soon, who they wait on (``younow.middle_words``, labelled ``younow.MIDDLE_LABEL``: to choose well, never
   recited unasked). The talker's own per-turn line carries the focus and what just changed, and its profile layer the
   people directory, so its card repeats neither;
@@ -23,16 +24,17 @@ already hold the answer, by code, with no model call:
   their weekly routines with days and times (every active one, whatever the day: "what time's my meeting tomorrow");
 * **Where they left off** (planner only) - per site they come back to, the last page they had in front there, with its
   title and address (``Store.links``), so "put my anime back on" is one open;
-* **Open** (planner and judge; the talker's brief slice carries them) - the brief's live items (dated goals, loops,
-  plans), top 3;
+* **Open** - the brief's live items (dated goals, loops, plans), top 3 (the talker's top 2: decision 3, for choosing;
+  its brief slice stays the speaking style);
 * **Lately** (planner and judge) - the last two day digests, one short line each.
 
 Every line says how sure it is ("often", "some days", "once", "you said", "dated"). Sizes: talker at most
 :data:`TALKER_CHARS`, planner and judge at most :data:`WIDE_CHARS`; the deciding lines come first and parts give way
-from the end (lately, then open, then who). The slow part (everything but the live line) is cached in RAM per database
-and purpose for :data:`CACHE_S` and rebuilt sooner when the learned rows, routines, tastes, prefs, contacts or portrait
-change (one stamp query); the live line ("right now", or the talker's "in the middle of") is read fresh on every call
-(the you-now record is in RAM). Never written to disk, never logged (logs carry sizes only), never in the MCP.
+from the end (lately, then open, then who). The slow part (everything but the live lines) is cached in RAM per
+database and purpose for :data:`CACHE_S` and rebuilt sooner when the learned rows, routines, tastes, prefs, contacts or
+portrait change (one stamp query); the live lines ("right now", or the talker's day and "in the middle of") are read
+fresh on every call (the you-now record is in RAM). Never written to disk, never logged (logs carry sizes only), never
+in the MCP.
 
 Public::
 
@@ -60,6 +62,8 @@ SITES_N = (8, 10)
 CHANNELS_N = (6, 10)
 PLAYLISTS_N = (5, 8)
 VOICE_N = (4, 6)
+#: The brief's dated live items on the "Open" line (the talker's card has the day and "in the middle of" before it).
+OPEN_N = (2, 3)
 #: The people block (planner and judge; the talker's profile layer has the directory at 900).
 PEOPLE_CHARS = 700
 #: A routine is "due around now" within this many minutes of its usual time.
@@ -77,7 +81,7 @@ LEFT_OFF_DAYS = 14.0
 LEFT_OFF_MIN_DAYS = 2
 LEFT_OFF_URL_CHARS = 140
 LEFT_OFF_QUERY_CHARS = 40
-#: The talker's "in the middle of" line at most (a thread, three due titles, two names).
+#: The talker's day and "in the middle of" lines at most, each (a thread, three due titles, two names).
 MIDDLE_CHARS = 420
 
 _lock = threading.Lock()
@@ -168,17 +172,16 @@ def _you_record(store: Any) -> Any:
 
 
 def _live(store: Any, purpose: str, now: float) -> list[str]:
-    """The live line: the talker's "in the middle of" (decision 3: its own per-turn line has the focus and the changes),
-    the planner's and the judge's "right now"."""
+    """The live lines: the talker's day and "in the middle of" (decision 3: its own per-turn line has the focus and the
+    changes), the planner's and the judge's "right now"."""
     you = _you_record(store)
     if not you:
         return []
     try:
-        from yuki.memory.younow import middle_words, now_lines
+        from yuki.memory.younow import day_words, middle_words, now_lines
 
         if purpose == "talker":
-            text = middle_words(you, now)
-            return [_clip(text, MIDDLE_CHARS)] if text else []
+            return [_clip(t, MIDDLE_CHARS) for t in (day_words(you, now), middle_words(you, now)) if t]
         lines = now_lines(you, now)
     except Exception:  # noqa: BLE001
         return []
@@ -618,7 +621,7 @@ HEAD = ("[What Yuki knows about the user (code-built from memory; each line says
 
 
 def _slow(store: Any, purpose: str, now: float) -> list[tuple[int, str]]:
-    """``(priority, line)`` of everything but "right now" (lower priority gives way last)."""
+    """``(priority, line)`` of everything but the live lines (lower priority gives way last)."""
     wide = purpose != "talker"
     vals = _values(store)
     lines: list[tuple[int, str]] = []
@@ -629,10 +632,10 @@ def _slow(store: Any, purpose: str, now: float) -> list[tuple[int, str]]:
     if purpose == "planner":
         lines += [(2, x) for x in _left_off(store, now, LEFT_OFF_N)]
     if wide:
-        # the talker has the people directory in its profile layer (900 chars), what it is in the middle of on its live
-        # line and the brief's dated items in its brief slice (decision 3, for choosing); "what did I do" stays a lookup
+        # the talker has the people directory in its profile layer (900 chars); "what did I do" stays a lookup
         lines += [(3, x) for x in _people(store)]
-        lines += [(4, x) for x in _open(store, 3)]
+    lines += [(4, x) for x in _open(store, OPEN_N[wide])]     # the talker's too (decision 3: dated, for choosing)
+    if wide:
         lines += [(4, x) for x in _lately(store)]
     return lines
 

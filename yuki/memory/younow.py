@@ -86,10 +86,10 @@ re-ask instead of polling. The voice wake path never reads it.
 ``render(you, "thinker")`` (the brain's request turn, ≤ 1,200: focus and the day, what just changed for "that" / "it",
 the thread now and the top threads with next steps, due and overdue items, the usual now and the confirmed usuals),
 ``render(you, "talker")`` (one line, ≤ 300: focus words, up to three just-changed items and, when room is left, the
-thread now by its title). Decision 3 (18 Oct) replaced the 25 Sept rule for choosing: :func:`middle_words` (the
-talker's you-card) says what the user is in the middle of (the thread now, up to three items due soon, who they wait
-on), marked :data:`MIDDLE_LABEL`: to choose well, never recited unasked. A question about their day is still answered
-by a lookup.
+thread now by its title). Decision 3 (18 Oct) replaced the 25 Sept rule for choosing: on the talker's you-card,
+:func:`day_words` says when their day began and :func:`middle_words` what the user is in the middle of (the thread
+now, up to three items due soon, who they wait on), marked :data:`MIDDLE_LABEL`: to choose well, never recited unasked.
+A question about their day is still answered by a lookup.
 
 **Publishing** swaps an immutable snapshot by reference: sections are frozen (``MappingProxyType`` and tuples) and
 never changed after publishing; :func:`thaw` gives plain dicts and lists (JSON).
@@ -159,6 +159,7 @@ Public API::
     day_began(clips, config, since=, sessions=None) -> (start, gap) | None
     day_began_from(store, now, config) -> (start, gap) | None
     render(you, "cards" | "thinker" | "talker", now=None) -> str   # <= 2,500 / 1,200 / 300 characters (RAM only)
+    day_words(you, now=None) -> str          # "Day: ..." (the thinker's line and the talker's card), or ""
     middle_words(you, now=None) -> str       # "In the middle of (...): ..." for the talker's card, or ""
     live_builder() -> YouBuilder | None      # this process's live builder (the Now pipe's op "you")
     thaw(you) -> plain dicts and lists
@@ -246,9 +247,11 @@ THINKER_CHANGED, TALKER_CHANGED = 5, 3
 #: The thinker's threads besides the thread now.
 THINKER_THREADS = 3
 #: Decision 3 (18 Oct): what the user is in the middle of, for the talker to choose well (never recited unasked): the
-#: label both the talker's card and its line carry, the items due soon it names at most, the people they wait on at
+#: label the talker's card carries, the items due soon it names at most, the people they wait on at
 #: most (``work.waiting``: names of the open loops judged "waiting", newest first), and a title's room in it.
 MIDDLE_LABEL = "In the middle of (to choose well; never recited unasked)"
+#: The talker's per-turn line names the thread now under this short tag (its wrapper already says "for choosing").
+TALKER_THREAD_TAG = "Thread now"
 MIDDLE_DUE_N = 3
 WAITING_MAX = 2
 MIDDLE_TITLE_CHARS = 60
@@ -2029,18 +2032,9 @@ def _render_thinker(you: Any, now: float) -> list[tuple[int, str]]:
         # "no game, call or meeting" only when no focus hold at all is present, the unknown ones included
         words = [w for w in (_focus_phrase(you, held),) if w] + _unknown_words(held)
         lines.append((0, f"Focus: {'; '.join(words) or 'no game, call or meeting'}."))
-    pres = you.get("presence") or {}
-    p = presence_now(you, now)
-    parts = []
-    if pres.get("day_began"):
-        parts.append(f"their day at the PC began {_hm(pres['day_began'])} after {_dur(pres.get('day_gap_s'))} away "
-                     f"(\"this morning\" and \"today\" mean since then)")
-    if p["away"]:
-        parts.append(f"away for {_dur(p['idle_s'])}" if p["idle_s"] is not None else "away")
-    elif pres.get("at_pc_since"):
-        parts.append(f"at the PC since {_hm(pres['at_pc_since'])}" + ("" if p["settled"] else ", just back"))
-    if parts:
-        lines.append((1, "Day: " + "; ".join(parts) + "."))
+    day = day_words(you, now)
+    if day:
+        lines.append((1, day))
     changes = _newest_changes(you, THINKER_CHANGED)
     if changes:
         lines.append((2, "Just changed (newest first): " + "; ".join(
@@ -2073,11 +2067,31 @@ def _render_thinker(you: Any, now: float) -> list[tuple[int, str]]:
     return lines
 
 
+def day_words(you: Any, now: float | None = None) -> str:
+    """"Day: ..." - when their day at the PC began (what "this morning" and "today" mean) and whether they are at the
+    PC, away or just back; ``""`` with no record or nothing to say. The thinker's line and the talker's you-card
+    (decision 3: its per-turn line has no day). RAM only."""
+    if not you:
+        return ""
+    now = time.time() if now is None else float(now)
+    pres = you.get("presence") or {}
+    p = presence_now(you, now)
+    parts = []
+    if pres.get("day_began"):
+        parts.append(f"their day at the PC began {_hm(pres['day_began'])} after {_dur(pres.get('day_gap_s'))} away "
+                     f"(\"this morning\" and \"today\" mean since then)")
+    if p["away"]:
+        parts.append(f"away for {_dur(p['idle_s'])}" if p["idle_s"] is not None else "away")
+    elif pres.get("at_pc_since"):
+        parts.append(f"at the PC since {_hm(pres['at_pc_since'])}" + ("" if p["settled"] else ", just back"))
+    return "Day: " + "; ".join(parts) + "." if parts else ""
+
+
 def now_lines(you: Any, now: float | None = None) -> list[str]:
     """The planner's and the judge's you-card "right now" (contract C1, ``yuki.memory.youcard``): the focus, the day,
     what just changed and the thread now. The thinker render's own lines (priority <= 2), content in RAM only. ``[]``
-    with no record. (The talker's card has :func:`middle_words` instead: its own line carries the focus and the
-    changes every turn.)"""
+    with no record. (The talker's card has :func:`day_words` and :func:`middle_words` instead: its own line carries
+    the focus and the changes every turn.)"""
     if not you:
         return []
     now = time.time() if now is None else float(now)
@@ -2128,10 +2142,10 @@ def _usual_words(u: Any) -> str:
 
 def _render_talker(you: Any, now: float) -> str:
     """The talker's one volatile line (§3.5): focus words, up to :data:`TALKER_CHANGED` just-changed items and, in the
-    room left, the thread now by its title under :data:`MIDDLE_LABEL` (decision 3; the card names the rest), as of the
-    record's last beat (its cache is refreshed in the background); ``""`` when nothing holds, nothing changed and no
-    thread is open, or when the record is older than :data:`TALKER_STALE_S`. Never to-dos' or threads' contents, news
-    or the usual now."""
+    room left, ``Thread now: "<title>".`` (decision 3; the card says the rest under :data:`MIDDLE_LABEL`; the line's
+    wrapper says it is for choosing, never recited), as of the record's last beat (its cache is refreshed in the
+    background); ``""`` when nothing holds, nothing changed and no thread is open, or when the record is older than
+    :data:`TALKER_STALE_S`. Never to-dos' or threads' contents, news or the usual now."""
     try:
         beat_at = float(you["beat_at"])
     except (KeyError, TypeError, ValueError):
@@ -2152,9 +2166,9 @@ def _render_talker(you: Any, now: float) -> str:
     tail = ("Just now: " + "; ".join(items) + ".") if items else ""
     text = f"{head} {tail}".strip()
     title = " ".join(str(((you.get("work") or {}).get("thread_now") or {}).get("title") or "").split())
-    room = cap - len(text) - len(MIDDLE_LABEL) - 6   # ' ...: "' + '".'
+    room = cap - len(text) - len(TALKER_THREAD_TAG) - 6   # ' ...: "' + '".'
     if title and room >= 16:   # the thread gives way first: a few words of a title say too little
-        text = f'{text} {MIDDLE_LABEL}: "{_text(title, min(room, MIDDLE_TITLE_CHARS))}".'.strip()
+        text = f'{text} {TALKER_THREAD_TAG}: "{_text(title, min(room, MIDDLE_TITLE_CHARS))}".'.strip()
     return text
 
 
@@ -2276,7 +2290,7 @@ __all__ = [
     "SCHEMA_V", "STALE_S", "SECTIONS", "SECTION_CAPS", "RECORD_CAP", "RENDER_CAPS", "CHANGED_KINDS", "SYNTH_KINDS",
     "THINKER_SECTIONS", "TALKER_SECTIONS", "CHANGE_WORDS", "YouConfig", "YouBuilder", "focus_game", "focus_holds",
     "holds_now", "presence_now", "day_began", "day_began_from", "meeting_audio", "render", "change_words", "thaw",
-    "content_free", "live_builder", "now_lines", "middle_words", "MIDDLE_LABEL",
+    "content_free", "live_builder", "now_lines", "day_words", "middle_words", "MIDDLE_LABEL",
 ]
 
 
