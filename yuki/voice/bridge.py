@@ -941,6 +941,36 @@ class VoiceBridge(QObject):
         except Exception as exc:  # noqa: BLE001 - the ledger never breaks the bridge
             self._log("bridge_error", error=f"owe: {type(exc).__name__}: {exc}")
 
+    #: Phase 2 (2.3): the owed ledger's tokens for a hand's or skill's own outcome (negative: never a job's token).
+    _line_tokens = itertools.count(-1, -1)
+
+    def owe_line(self, text: str, kind: str = "failed") -> int | None:
+        """Phase 2 (2.3): code's own line for a hand's or skill run's non-success outcome, kept owed while the talker says
+        the outcome in its own words: the ledger says it by code only when no talker words are heard for it (its run
+        chose silence, wrote only calls, or never came in time). Returns its token (``drop_owed_line``), or ``None``
+        with no ledger. Never raises."""
+        ledger = self.ledger
+        if ledger is None or not " ".join(str(text or "").split()):
+            return None
+        token = next(self._line_tokens)
+        try:
+            turns = int(self.user_turns()) if self.user_turns is not None else 0
+        except Exception:  # noqa: BLE001
+            turns = 0
+        try:
+            return token if ledger.owe(token, kind, text, turns) is not None else None
+        except Exception as exc:  # noqa: BLE001 - the ledger never breaks a hand
+            self._log("bridge_error", error=f"owe_line: {type(exc).__name__}")
+            return None
+
+    def drop_owed_line(self, token: int) -> None:
+        """Phase 2 (2.3): the talker acted on that outcome (its next call): code's fallback line is let go."""
+        if self.ledger is not None:
+            try:
+                self.ledger.drop(token)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _unowe(self, job: Job) -> None:
         if self.ledger is not None:
             try:
@@ -3022,7 +3052,14 @@ class VoiceBridge(QObject):
         if self.on_brain and self._results_by_code and kind == "done" and not job.remember and not job.superseded \
                 and ((job.brain_run and code_line(job.verdict)) or verdict_line(job.verdict, f"{head} {rest}")):
             # bTalk (design 3, "narrator re-voice off for code lines"): the brain's line after an act, or its own code
-            # line, is voice-shaped and says no more than the check saw: said by code word for word, late or not
+            # line, is voice-shaped and says no more than the check saw: said by code word for word, late or not.
+            # Phase 2 (2.3): only a success (checked or likely, whole): any other outcome (not confirmed, failed,
+            # partial, stuck, held, a refusal) is the talker's to word from the outcome's evidence, and this line
+            # waits in the owed ledger as its fallback (``_owed_words``)
+            if not success_line(job.verdict):
+                self._log("bridge", op="outcome_worded", job_id=job.job_id, said_by="talker",
+                          level=str((job.verdict or {}).get("level") or "") or None)
+                return None
             text = " ".join((head or "").split())
             if strip_tags(text).strip():
                 return sentences(text) or None
@@ -4175,6 +4212,16 @@ def code_line(verdict: dict[str, Any] | None) -> bool:
         return False
     level = str(verdict.get("level") or "")
     return level not in ("", "answer") or bool(str(verdict.get("line") or "").strip())
+
+
+def success_line(verdict: dict[str, Any] | None) -> bool:
+    """Phase 2 (2.3): whether a new-brain outcome's code line is a success said fast by code: level ``verified`` or
+    ``likely``, nothing of it partial or left open. Every other outcome (not confirmed, failed, partial, a stuck line, a
+    refusal or decline) is worded by the talker from its evidence. The outcome dict's own fields, never the words."""
+    if not isinstance(verdict, dict):
+        return False
+    level = str(verdict.get("level") or "")
+    return level in ("verified", "likely") and not verdict.get("partial") and not int(verdict.get("open") or 0)
 
 
 def verdict_line(verdict: dict[str, Any] | None, text: str | None) -> bool:
