@@ -938,6 +938,19 @@ def page_host(tree: dict[str, Any] | None) -> str:
     return ""
 
 
+def _one_call() -> Any:
+    """Phase 4 (``brain = "one"``): the ONE runner's call running on this thread (``voice.hands.one_now``), else
+    ``None``. Imports nothing: with the hands module not loaded no ONE call can be running. Never raises."""
+    import sys
+
+    module = sys.modules.get("yuki.voice.hands")
+    now = getattr(module, "one_now", None) if module is not None else None
+    try:
+        return now() if callable(now) else None
+    except Exception:  # noqa: BLE001 - unreadable: no ONE call (the step as before)
+        return None
+
+
 class SkillRunner:
     """Runs one learned way through a :class:`yuki.voice.hands.Hands`' backend, step by step (blocking: off the loop)."""
 
@@ -1415,7 +1428,19 @@ class SkillRunner:
         can close or send anything, a click on a button, menu item or link can send or delete, typing puts words in a
         field - all judged; other clicks only when the user's policy holds them back; nothing at all in an app whose
         "Act" switch is off): the verdict when it holds the step, else ``None``. Reads only their heard words and the
-        calls."""
+        calls.
+
+        Phase 4 (``brain = "one"``): while the ONE runner's call runs on this thread, the ONE gate decides the step
+        (``yuki.one.runner.skill_step``): the Act switch of the step's app and of the run's skill's own app; with the
+        request's desk hands their own steps under the gate's grant, the gate again on the send key (once, for
+        exactly the counted text) and on the join press (their plain words); with any other hands the gate itself.
+        Nothing is handed over. Under ``all`` nothing changes."""
+        one = _one_call()
+        if one is not None:
+            from yuki.one.runner import skill_step
+
+            return skill_step(self.hands, tool, tool_input, target, list(self._earlier),
+                              force=force or self._held_all, ctx=one)
         off = self.hands.act_off(target.get("app")) if callable(getattr(self.hands, "act_off", None)) else None
         if off:
             return SimpleNamespace(allowed=False, question="", source="act_off", act_off=off,

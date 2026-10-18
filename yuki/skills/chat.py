@@ -1736,9 +1736,42 @@ def _wait_mic(ctx: Any, image: str, before: bool | None, budget_s: float) -> boo
 HANDED_OVER = "to_planner"
 
 
+def _one_call() -> Any:
+    """Phase 4 (``brain = "one"``): the ONE runner's call running on this thread (``voice.hands.one_now``), else
+    ``None``. Imports nothing: with the hands module not loaded no ONE call can be running. Never raises."""
+    import sys
+
+    module = sys.modules.get("yuki.voice.hands")
+    now = getattr(module, "one_now", None) if module is not None else None
+    try:
+        return now() if callable(now) else None
+    except Exception:  # noqa: BLE001 - unreadable: no ONE call (the press as before)
+        return None
+
+
 def _judged(hands: Any, hwnd: int, image: str, role: str, name: str) -> str | None:
     """Yuki's own check on pressing the app's button (a join is judged like a send, rule 8): ``None`` allowed,
-    :data:`HANDED_OVER` when the consent rule handed it to the planner, else what to ask or say."""
+    :data:`HANDED_OVER` when the consent rule handed it to the planner, else what to ask or say.
+
+    Phase 4 (``brain = "one"``): while the ONE runner's call runs on this thread, the ONE gate decides the press
+    (``yuki.one.runner.skill_step``: the Act switch of the app and of the run's skill's own app, then the join on
+    their plain words through the gate's grant); never handed over. Under ``all`` nothing changes."""
+    one = _one_call()
+    if one is not None:
+        from yuki.one.runner import skill_step
+
+        element = f'{role} "{name}"'
+        try:
+            verdict = skill_step(hands, "click", {"hwnd": hwnd, "element": element},
+                                 {"hwnd": hwnd, "app": image, "element": element}, [], force=True, ctx=one)
+        except Exception:  # noqa: BLE001 - fail closed
+            return LINE_HELD
+        if verdict is None:
+            return None
+        off = str(getattr(verdict, "act_off", "") or "")
+        if off:
+            return LINE_ACT_OFF.format(app=off)
+        return str(getattr(verdict, "question", "") or "") or LINE_HELD
     act_off = getattr(hands, "act_off", None)
     if callable(act_off):
         try:
