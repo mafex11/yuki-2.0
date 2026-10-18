@@ -3856,10 +3856,12 @@ class PortraitScheduler:
         nothing did), the day digests of the last completed days are written (yuki.memory.daydigest: the line that
         connects one day's chat to the next), then the persona pass writes how Yuki talks. Each logs and never
         raises (a failure waits for the next night). Phase T: after the routine miner, the taste pass
-        (:meth:`_taste`)."""
+        (:meth:`_taste`). Phase 3: after taste, the desk-habit miner (:meth:`_deskhabits`); after the people index,
+        the meanings pass (:meth:`_meanings`: it reads the night's ways, values, tastes and people)."""
         for name, fn in (("dream", self._dream), ("learn", self._learn), ("routines", self._routines),
-                         ("taste", self._taste), ("threads", self._threads), ("contacts", self._contacts),
-                         ("daydigest", self._daydigest), ("persona", self._persona), ("personal", self._personal)):
+                         ("taste", self._taste), ("deskhabits", self._deskhabits), ("threads", self._threads),
+                         ("contacts", self._contacts), ("meanings", self._meanings), ("daydigest", self._daydigest),
+                         ("persona", self._persona), ("personal", self._personal)):
             try:
                 fn(kind)
             except Exception as exc:
@@ -3907,6 +3909,39 @@ class PortraitScheduler:
         got = taste.seed(self.store, now=self.clock(), log=self._log)
         counts = {k: v for k, v in (got.get("yt_channel") or {}).items() if isinstance(v, (int, float))}
         self._log("taste_seed", ms=round((time.monotonic() - started) * 1000, 1), **counts)
+
+    def _deskhabits(self, kind: str) -> None:
+        """Phase 3.3 (contract D1): the nightly desk-habit miner (``yuki.memory.deskhabits.mine``: which monitor and
+        state each app keeps, and what sits beside what, with counts; code only, no model). A build without the
+        module skips it."""
+        try:
+            import yuki.memory.deskhabits as deskhabits
+        except ModuleNotFoundError as exc:   # a build without it; a broken import inside it is an error
+            if exc.name != "yuki.memory.deskhabits":
+                raise
+            return
+        started = time.monotonic()
+        got = deskhabits.mine(self.store, now=self.clock())
+        counts = {k: v for k, v in (got or {}).items() if isinstance(v, (int, float, bool))
+                  and k not in ("kind", "ok", "ms")}
+        self._log("portrait_run", kind="deskhabits", ok=True, ms=round((time.monotonic() - started) * 1000, 1),
+                  **counts)
+
+    def _meanings(self, kind: str) -> None:
+        """Phase 3.2 (contract M1): what the user's things mean to them (``yuki.memory.meanings.nightly``: evidence
+        joined by entity from their own words and the portrait, one Haiku call for the things whose evidence changed,
+        none when nothing did). A build without the module skips it."""
+        try:
+            import yuki.memory.meanings as meanings
+        except ModuleNotFoundError as exc:   # a build without it; a broken import inside it is an error
+            if exc.name != "yuki.memory.meanings":
+                raise
+            return
+        with self.worker._run_lock:   # one portrait run at a time, like the routine miner
+            got = meanings.nightly(self.store, now=self.clock(), worker=self.worker)
+        counts = {k: v for k, v in (got or {}).items() if isinstance(v, (int, float, bool, str))
+                  and k not in ("kind", "ok")}
+        self._log("portrait_run", kind="meanings", ok="error" not in counts, **counts)
 
     def _threads(self, kind: str) -> None:
         from yuki.memory.workthreads import Consolidator

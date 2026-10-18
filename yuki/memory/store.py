@@ -3611,6 +3611,34 @@ MIGRATIONS: tuple[str, ...] = (
     """
     SELECT 1;
     """,
+    # 47 (2026-10-18, bMeaning; phase 3.2, contract M1): what the user's things mean to them (yuki.memory.meanings).
+    # One row per thing (kind: site | playlist | channel | way_group | server | voice_channel | person | app | browser;
+    # name_key: a keyed digest of the kind and the name's words), written by the nightly meanings pass: the name, the
+    # stored aliases (JSON list) and the meaning (at most 8 words; NULL: the evidence gives none) encrypted; the
+    # confidence (said 0.9, clear 0.75, inferred 0.6); sources (JSON, content-free: "c:<conversation fact id>",
+    # "p:<portrait fact id>", "t:<turn id>"); the signature of what was sent (asked again only when it changes); the
+    # model and the portrait run. state: live | gone (its evidence is gone). Not exposed by the MCP. Additive only; one
+    # self-contained entry (renumber freely at a merge).
+    """
+    CREATE TABLE IF NOT EXISTS meanings (
+        id                  INTEGER PRIMARY KEY,
+        kind                TEXT NOT NULL,
+        name_key            TEXT NOT NULL,
+        name_ciphertext     TEXT NOT NULL,
+        aliases_ciphertext  TEXT,
+        meaning_ciphertext  TEXT,
+        confidence          REAL,
+        sources             TEXT,
+        signature           TEXT NOT NULL,
+        model               TEXT,
+        run_id              INTEGER,
+        state               TEXT NOT NULL DEFAULT 'live',
+        created_at          REAL NOT NULL,
+        updated_at          REAL NOT NULL,
+        UNIQUE(kind, name_key)
+    );
+    CREATE INDEX IF NOT EXISTS meanings_state ON meanings(state, updated_at);
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
