@@ -124,6 +124,14 @@ CHOICE_SLOTS: tuple[str, ...] = ("choose", "context")
 CHOOSE_TIMEOUT_S = 4.5
 #: The outcome of a pick held because a call is live (decision 2: never during a call, said so instead).
 HELD_CALL = "held_call"
+#: fHands (live 18 Oct, k_t3_draft): a rung's step stopped by something other than a game (the gate could not check
+#: and failed closed, or another guard refused it: ``yuki.actions.gate.BLOCKED``). A ``RouteResult.held`` of this word
+#: and the run's outcome of the same name: a settled stop said with :data:`LINE_BLOCKED` (or
+#: :data:`LINE_BLOCKED_PARTWAY` once a rung acted), never the game line, never the next rung, never handed over (the
+#: thinker would be stopped the same way).
+HELD_BLOCKED = "blocked"
+LINE_BLOCKED = "Something on the PC stopped me there, so nothing was done."
+LINE_BLOCKED_PARTWAY = "Something on the PC stopped me partway, so I left it there."
 #: At most this many names a route read on screen ride on a seed (``seen``, RAM only), each at most this long.
 SEEN_MAX = 40
 SEEN_NAME_CHARS = 80
@@ -345,6 +353,9 @@ class SkillResult:
             return f"Held: a game is in front, nothing was sent. Say: {self.say}"
         if self.outcome == HELD_CALL:
             return f"Held: a call is live, so nothing was put on. Say: {self.say}"
+        if self.outcome == HELD_BLOCKED:
+            return (f"Stopped: something on the PC (not a game) stopped a step, so nothing more was tried; don't do it "
+                    f"by steps (the same stop applies). Say: {self.say}")
         if self.outcome == "handed_over":
             why = (self.handoff or {}).get("why")
             if why == TO_PLANNER:
@@ -397,9 +408,11 @@ class SkillResult:
                  "ask": self.ask, "options": list(self.options), "held": self.held, "ask_keep": self.ask_keep,
                  "handoff_skill": self.handoff, "skill": self.skill, "outcome": self.outcome, "route": self.route,
                  "run_key": self.run_key,
-                 "settled": self.outcome in ("held_game", HELD_CALL, "other_device", "unverified", "asked",
-                                             "already")}
-        if self.held:
+                 "settled": self.outcome in ("held_game", HELD_CALL, HELD_BLOCKED, "other_device", "unverified",
+                                             "asked", "already")}
+        if self.outcome == HELD_BLOCKED:
+            facts["refused"] = HELD_BLOCKED      # fHands: never said as a game (``held`` stays empty)
+        elif self.held:
             facts["refused"] = "game"
         return self.done, self.report(), facts
 
@@ -498,7 +511,10 @@ def _window(args: Mapping[str, Any]) -> int:
 
 
 def _held_if_refused(details: Mapping[str, Any] | None) -> str | None:
-    return "game" if isinstance(details, Mapping) and details.get("refused") == "game" else None
+    """The refusal kind an action's ``details`` carry (``yuki.actions.gate.carried``): ``"game"`` (held for a game) or
+    :data:`HELD_BLOCKED` (a settled stop, fHands), else ``None``."""
+    value = details.get("refused") if isinstance(details, Mapping) else None
+    return value if value in ("game", HELD_BLOCKED) else None
 
 
 def v_uia_invoke(call: RouteCall) -> RouteResult:
@@ -512,6 +528,9 @@ def v_uia_invoke(call: RouteCall) -> RouteResult:
                 pattern=str(a.get("pattern") or "invoke"), value=a.get("value"), container=a.get("container") or (),
                 budget_s=max(0.2, min(float(a.get("budget_s") or 0.6), call.deadline - call.ctx.clock())))
     facts = {"status": got.outcome, "n": got.n, "ms": got.ms}
+    if got.outcome == "refused" and getattr(got, "kind", "") in ("game", HELD_BLOCKED):
+        # fHands: the gate refused the pattern call (a game's own window, or it failed closed): by its kind
+        return RouteResult(ran=False, held=got.kind, outcome="refused", facts=facts)
     if got.outcome == "pressed":
         return RouteResult(ran=True, outcome="pressed", facts=facts)
     if got.outcome == "ambiguous":
@@ -621,8 +640,9 @@ def v_uia_steps(call: RouteCall) -> RouteResult:
     except SkillRefused:
         return RouteResult(ran=False, outcome="refused_steps")
     done = int(facts.get("steps_done") or 0)
-    if facts.get("refused") == "game" or facts.get("act_off"):
-        return RouteResult(ran=done > 0, held="game" if facts.get("refused") == "game" else None, outcome="refused")
+    kind = _held_if_refused(facts)
+    if kind or facts.get("act_off"):
+        return RouteResult(ran=done > 0, held=kind, outcome="refused")
     if facts.get("to_planner"):
         # bSkill (bTalk merge note 4): the consent rule (brain = "all": hands.authorize -> brain.check.one) handed a
         # step over that would send or join; it did not run. Rung C, never the talker's "exactly this?"
@@ -1222,6 +1242,17 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                                            if isinstance(res.facts, Mapping) else None)
         if isinstance(res.facts_ram, Mapping) and res.facts_ram.get("seen"):
             seen = _seen_names([*seen, *(res.facts_ram.get("seen") or [])])
+        if res.held == HELD_BLOCKED:
+            # fHands: something other than a game stopped this rung's step (the gate failed closed, another guard):
+            # a settled stop said plainly, never the game line, never the next rung (it would meet the same stop),
+            # never handed over (the thinker too). The ledger keeps it as a refusal (never counted against the rung)
+            acted = state["acted"] = acted or bool(res.ran)
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": HELD_BLOCKED})
+            _emit(ctx, "route_try", skill=skill.key, route=route.key, result=HELD_BLOCKED, ms=route_ms)
+            _ledger_finish(ctx, run_key, outcome="refused", checked=None, route=route, ms=route_ms, app=app_done,
+                           acted=acted)
+            return _simple(skill.key, HELD_BLOCKED, ctx, started, say=LINE_BLOCKED_PARTWAY if acted else LINE_BLOCKED,
+                           tried=tried, run_key=run_key, route=route.key, focus_taken=focus_taken, sends=sends)
         if res.held:
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "held_game"})
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result="held_game", ms=route_ms)
@@ -1628,6 +1659,29 @@ def _dropped_handoff(resolved: Any, slots: Mapping[str, Any] | None, words: list
         return None
 
 
+def _asks_whom(resolved: Ask, slots: Mapping[str, Any] | None, loaded: Any) -> bool:
+    """Whether the resolver's question is for a person slot nobody gave (fMsg merge note E1): the asked slot is
+    person-bound by the capability's own data (``resolve._person_bound``: a ``person`` slot, or a text slot bound to a
+    contact, ``message.person``), the caller gave no value for it, and the resolver dropped none there. Data only;
+    never raises (``False``)."""
+    try:
+        from yuki.skills.resolve import _person_bound
+
+        if resolved.slot in set(getattr(resolved, "dropped", None) or ()):
+            return False
+        if _given_text((slots or {}).get(resolved.slot)):
+            return False
+        if loaded is None or not hasattr(loaded, "get"):
+            from yuki.skills.catalog import load
+
+            loaded = load()
+        skill = loaded.get(str(resolved.skill or ""))
+        slot = skill.slot(resolved.slot) if isinstance(skill, Skill) else None
+        return slot is not None and bool(_person_bound(skill, slot))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _dropped(resolved: Ask, slots: Mapping[str, Any] | None, words: list[str], loaded: Any) -> Handoff | None:
     """:func:`_dropped_handoff`'s work (it may raise; the caller keeps the question then)."""
     from yuki.skills.resolve import app_name, check_value
@@ -1948,6 +2002,16 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
               dropped_slots=_slot_flags([k for k, v in handed.filled.items() if v == FROM_UNHEARD]),
               origin=ctx.origin)
         resolved = handed
+    elif isinstance(resolved, Ask) and _asks_whom(resolved, slots, catalog.get("loaded")):
+        # fMsg merge note E1 (live 18 Oct, k_clarify_who_draft): the resolver asks whom a message is for ("Who to?") and
+        # nobody gave the person: noted with the user's turns as they stand, so their very next turn ("to hardish")
+        # answers it and a draft or an open runs as the one person that answer sounds like, never asked twice
+        try:
+            from yuki.skills.chat import note_who_asked
+
+            note_who_asked(list(ctx.words))
+        except Exception:  # noqa: BLE001 - the question stands either way
+            pass
     # tTaste merge note 1 (phase T): a run that opens YouTube's home with no game in front ranks the fresh uploads on a
     # short thread of their own while the page opens; they are named (and noted, so "the B one" can pick one) only
     # after the run's checked done and a non-empty wait; a run that fails, asks or times out names nothing. A card's

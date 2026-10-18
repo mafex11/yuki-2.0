@@ -230,8 +230,8 @@ def join_tail(call: RouteCall, data: Mapping[str, Any], app: str, hwnd: int, ima
                 return RouteResult(ran=True, outcome=TO_PLANNER, app=app)
             if question is not None:
                 return RouteResult(ran=True, ask=question, outcome="held_by_check", app=app)
-            if C_._refused("click", hwnd=hwnd):
-                return RouteResult(ran=True, held="game", outcome="refused", app=app)
+            if kind := C_._refused("click", hwnd=hwnd):
+                return RouteResult(ran=True, held=kind, outcome="refused", app=app)
             pressed = C_._press(hwnd, role, button)
             if pressed == "pressed":
                 joined = C_._wait_mic(call.ctx, image, before, C_.JOIN_WAIT_S)
@@ -291,12 +291,12 @@ def route_voice_link(call: RouteCall) -> RouteResult:
     gate = in_call_gate(call, data, app, pick.name, before)
     if gate is not None:
         return gate
-    if C_._refused("open_url"):
-        return RouteResult(ran=False, held="game", outcome="refused")
+    if kind := C_._refused("open_url"):
+        return RouteResult(ran=False, held=kind, outcome="refused")
     # fMsg: with Discord already running only its window is waited for (the join is checked by the microphone)
     opened = C_._open_uri(uri, running=bool(C_._app_hwnd(data)))
-    if C_._held_by_game(opened):
-        return RouteResult(ran=False, held="game", outcome="refused")
+    if kind := C_._held_by_game(opened):
+        return RouteResult(ran=False, held=kind, outcome="refused")
     if not getattr(opened, "ok", False):
         return RouteResult(ran=False, outcome="not_opened")
     return join_tail(call, data, app, C_._app_hwnd(data), image, before, pick.name, {"known": len(found), "by": "link"})

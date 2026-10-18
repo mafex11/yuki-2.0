@@ -262,11 +262,14 @@ def _log(ctx: Any) -> Callable[..., None]:
     return lambda event, **fields: _emit(ctx, event, **fields)
 
 
-def _refused(action: str, hwnd: int | None = None) -> bool:
-    """D17's backstop asked right here, before a focus or an opened link (the input layer asks again)."""
-    from yuki.memory import gamegate
+def _refused(action: str, hwnd: int | None = None) -> str | None:
+    """D17's backstop asked right here, before a focus or an opened link (the input layer asks again): ``None`` (go
+    ahead), else the refusal's kind (fHands, ``yuki.actions.gate``): ``"game"`` (held for a game) or ``"blocked"``
+    (the gate failed closed, or another guard refused it: the engine's settled stop, never said as a game)."""
+    from yuki.actions import gate
 
-    return gamegate.refuse_input(action, hwnd=hwnd) is not None
+    why = gate.refuse(action, hwnd=hwnd)
+    return None if why is None else gate.kind_of(why)
 
 
 def _words(value: Any) -> str:
@@ -499,9 +502,12 @@ def _handler_key(url: str) -> str:
         return ""
 
 
-def _held_by_game(result: Any) -> bool:
+def _held_by_game(result: Any) -> str | None:
+    """The refusal kind an action's result carries (fHands, ``yuki.actions.gate.carried``): ``"game"`` or
+    ``"blocked"``, else ``None``."""
     details = getattr(result, "details", None) or {}
-    return isinstance(details, Mapping) and details.get("refused") == "game"
+    value = details.get("refused") if isinstance(details, Mapping) else None
+    return value if value in ("game", "blocked") else None
 
 
 def _claim_app(call: RouteCall, app: str) -> None:
@@ -649,8 +655,8 @@ def route_site_tab(call: RouteCall) -> RouteResult:
         if not getattr(cand, "tab_id", ""):
             continue
         hwnd = int(cand.hwnd)
-        if _refused("tab_select", hwnd=hwnd):
-            return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+        if kind := _refused("tab_select", hwnd=hwnd):
+            return RouteResult(ran=False, held=kind, outcome="refused", facts=facts)
         tried += 1
         result = _select_tab(hwnd, cand.tab_id)
         if getattr(result, "ok", False):
@@ -661,12 +667,12 @@ def route_site_tab(call: RouteCall) -> RouteResult:
         # found but not selectable (no RuntimeId, or it won't select): said so; never the told link (a second tab)
         return _say(LINE_TAB_NO_ID.format(**words), "select_failed", **facts)
     hwnd = int(selected.hwnd)
-    if _refused("focus", hwnd=hwnd):
+    if kind := _refused("focus", hwnd=hwnd):
         # the tab is selected (a pattern call, no focus), the browser stays where it is
-        return RouteResult(ran=True, held="game", outcome="refused", facts=facts, app=process or None)
+        return RouteResult(ran=True, held=kind, outcome="refused", facts=facts, app=process or None)
     focused = _focus(hwnd)
-    if _held_by_game(focused):
-        return RouteResult(ran=True, held="game", outcome="refused", facts=facts, app=process or None)
+    if kind := _held_by_game(focused):
+        return RouteResult(ran=True, held=kind, outcome="refused", facts=facts, app=process or None)
     facts["focused"] = bool(getattr(focused, "ok", False))
     return RouteResult(ran=True, outcome="selected", facts=facts, app=process or None,
                        say=LINE_TAB_UP.format(**words),
@@ -705,14 +711,14 @@ def route_told_link(call: RouteCall) -> RouteResult:
         name, key, source = choose_browser(call)
         if source == "ask":
             return _ask_browser(name)
-    if _refused("open_url"):
-        return RouteResult(ran=False, held="game", outcome="refused")
+    if kind := _refused("open_url"):
+        return RouteResult(ran=False, held=kind, outcome="refused")
     if source == "default" and not key:
         key = _handler_key(link)
     _claim_app(call, key)
     result = _open_url(link, name if source != "default" else None, _launch_deadline(call))
-    if _held_by_game(result):
-        return RouteResult(ran=False, held="game", outcome="refused")
+    if kind := _held_by_game(result):
+        return RouteResult(ran=False, held=kind, outcome="refused")
     seen = _launch_seen(result)
     if not getattr(result, "ok", False):
         details = getattr(result, "details", None) or {}
@@ -1320,8 +1326,8 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
     name, key, source = choose_browser(call, hosts=hosts, policy=policy)
     if source == "ask":
         return _ask_browser(name), name, key, source, {}
-    if _refused("open_url"):
-        return RouteResult(ran=False, held="game", outcome="refused"), name, key, source, {}
+    if kind := _refused("open_url"):
+        return RouteResult(ran=False, held=kind, outcome="refused"), name, key, source, {}
     if source == "default" and not key:
         key = _handler_key(url)
     named = source != "default"
@@ -1332,8 +1338,8 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
     _claim_app(call, key)
     tabs_before = _tabs_before(key, url) if key else {}
     result = _open_url(url, name if named else None, _launch_deadline(call))
-    if _held_by_game(result):
-        return RouteResult(ran=False, held="game", outcome="refused"), name, key, source, {}
+    if kind := _held_by_game(result):
+        return RouteResult(ran=False, held=kind, outcome="refused"), name, key, source, {}
     seen = _launch_seen(result)
     seen["tabs_before"] = tabs_before
     if seen["hwnd"]:
@@ -1939,8 +1945,9 @@ def _bar_window(call: RouteCall, key: str, name: str, source: str, end: float) -
     acted in (``noted``); else that browser's top user window by its program (``listed``); else its own window by the
     Start menu app's identity (``launch.app_window``: its AppUserModelID or package, so a packaged browser is found
     whatever its process is called; a window hidden in the background shown, or the browser brought up when it shows
-    none: ``open`` / ``minimized`` / ``hidden`` / ``launched``); ``(0, code)`` when none (``none``, ``no_app``, and
-    ``refused`` with a game in front). Code words only in the facts."""
+    none: ``open`` / ``minimized`` / ``hidden`` / ``launched``); ``(0, code)`` when none (``none``, ``no_app``,
+    ``refused`` with a game in front, and ``blocked`` for a launch stopped by anything but a game: fHands, the gate
+    failed closed or another guard refused it). Code words only in the facts."""
     hwnd = _noted_window(call, key)
     if hwnd:
         return hwnd, "noted"
@@ -2013,10 +2020,14 @@ def route_address_bar(call: RouteCall) -> RouteResult:
     if not hwnd or not pid:
         if window_from == "refused":
             return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+        if window_from == "blocked":
+            # fHands merge note 5: the launch was stopped by something other than a game: the engine's settled stop
+            # (said plainly), never "no_window" and the next rung
+            return RouteResult(ran=False, held="blocked", outcome="refused", facts=facts)
         facts["procs"] = _running_count(key)     # live 17 Oct: "no_window" with Arc up; which it was, next time
         return RouteResult(ran=False, outcome="no_window", facts=facts)
-    if _refused("focus", hwnd=hwnd):
-        return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+    if kind := _refused("focus", hwnd=hwnd):
+        return RouteResult(ran=False, held=kind, outcome="refused", facts=facts)
     seen: dict[str, Any] = {"via": "address_bar", "process": _window_image(hwnd), "front": False, "state": ""}
     # review r1 H1: what each window it will look in shows now (its own first): a page a window already showed is
     # never the page this rung opened, in that window (the done-check compares with these too)
@@ -2029,8 +2040,8 @@ def route_address_bar(call: RouteCall) -> RouteResult:
                            "befores": befores}
     _claim_app(call, key)
     focused = _focus(hwnd)
-    if _held_by_game(focused):
-        return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+    if kind := _held_by_game(focused):
+        return RouteResult(ran=False, held=kind, outcome="refused", facts=facts)
     if not getattr(focused, "ok", False):
         _log_open(call, "address_bar", seen, "not_focused")
         return RouteResult(ran=False, outcome="not_focused", facts=facts)
@@ -2045,8 +2056,8 @@ def route_address_bar(call: RouteCall) -> RouteResult:
                            facts_ram={**ram, "hwnd": hwnd, "before": before_url, "already": True, "arrived": False})
     keys = _keys()
     opened = keys.hotkey(*new_tab, expect_hwnd=hwnd)
-    if _held_by_game(opened):
-        return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+    if kind := _held_by_game(opened):
+        return RouteResult(ran=False, held=kind, outcome="refused", facts=facts)
     if not getattr(opened, "ok", False):
         _log_open(call, "address_bar", seen, "keys_refused")
         return RouteResult(ran=False, outcome="keys_refused", facts=facts)
@@ -2073,8 +2084,8 @@ def route_address_bar(call: RouteCall) -> RouteResult:
         _log_open(call, "address_bar", seen, "no_field")
         return RouteResult(ran=False, outcome="no_address_field", facts=facts)
     typed = keys.type_text(url, expect_hwnd=field_hwnd)
-    if _held_by_game(typed):
-        return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+    if kind := _held_by_game(typed):
+        return RouteResult(ran=False, held=kind, outcome="refused", facts=facts)
     typed_facts = getattr(typed, "details", None) or {}
     if not getattr(typed, "ok", False) or typed_facts.get("readback") != "arrived":
         # not kept, or unreadable: no Enter on an address that may be half there; the field is left as it was opened
@@ -2088,8 +2099,8 @@ def route_address_bar(call: RouteCall) -> RouteResult:
         # the caret, and with nothing selected the key does nothing)
         keys.press("delete", expect_hwnd=field_hwnd)
     entered = keys.press("enter", expect_hwnd=field_hwnd)
-    if _held_by_game(entered):
-        return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+    if kind := _held_by_game(entered):
+        return RouteResult(ran=False, held=kind, outcome="refused", facts=facts)
     if not getattr(entered, "ok", False):
         _log_open(call, "address_bar", seen, "enter_refused")
         return RouteResult(ran=False, outcome="enter_refused", facts=facts)
