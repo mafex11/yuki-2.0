@@ -90,7 +90,8 @@ asks for the send: it goes after the countdown, its send slot on send. quote the
 the person (for one of their ways, the place as they named it), text the message in the words and language they \
 used now (asked to ask or tell someone: those words, turned to that person), the same in the text slot; never \
 translated or restyled. Naming only the person, or asking for a draft, is a draft: type it without submitting. A \
-send that repeats one they made lately is asked about first.
+send that repeats one they made lately is asked about first. Whom it goes to unclear: ask whom, never type it into \
+whichever chat is open.
 - Joining a call or meeting is the user's click: bring its window forward and say so. Only a capability that joins on \
 their plain words may join, with consent.commit join.
 - consent.commit lasting for anything else that cannot be undone (delete, close, buy, change a setting). If their \

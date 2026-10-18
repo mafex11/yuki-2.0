@@ -631,6 +631,34 @@ def _names_recipient(placed: _Placed, rec: _Who) -> bool:
     return placed.gap_named or any(n and span_in(n, span) for n in (rec.to, rec.slot))
 
 
+def _named_in_turn(placed: _Placed, rec: _Who) -> bool:
+    """jBrain (fMsg B2; 18 Oct live A, msg_hemanth_misheard: "message hey meant on this card, ask him when he's gonna
+    join the VC" was asked with ``recipient_unsaid``: the planner's quote stood after the name): the rest of the very
+    turn the quote stands in (the held turns, the quote's own words cut out) names the recipient, by the same rule as
+    :func:`_names_recipient`: memory's people index finds exactly one person there who goes by ``to``, or, finding no
+    one who does, ``to`` or the person slot's words stand there as whole words. The index matches names and the heard
+    forms the user confirmed, never a guess by sound, so a sound-alike still never names anyone for a send. A name said
+    only in another turn is still not named (asked). Code facts only."""
+    from yuki.memory.contacts import span_in
+
+    span = placed.span
+    if not span:
+        return False
+    rest = ""
+    for run in _runs_of(placed.entries, placed.held):
+        at = run.find(span)
+        if at >= 0:
+            rest = f"{run[:at]} {run[at + len(span):]}"
+            break
+    rest = words(rest)
+    if not rest:
+        return False
+    fits = _fits(rec.people(rest), rec.to)
+    if fits:
+        return len(fits) == 1
+    return any(n and span_in(n, rest) for n in (rec.to, rec.slot))
+
+
 def quote_in_words(quote: str, user_words: Sequence[str], names: Sequence[str] = (), *, to: str = "",
                    people_in: Callable[[str], list[list[str]] | None] | None = None) -> bool:
     """Row 4: the plan's quote stands in the user's words, as it is or with each name the recipient goes by
@@ -1459,7 +1487,7 @@ def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str],
         return Verdict(ASK, 4, "duplicate", question=question)
     # whom it goes to: the user's words the quote stands for name the recipient (review r2 M1 a: a name said only
     # outside the quote is asked, never sent unasked)
-    named = _names_recipient(placed, rec)
+    named = _names_recipient(placed, rec) or _named_in_turn(placed, rec)
     if _others(" ".join(turns), rec, body):
         # the turns name someone else too: what of the message goes to the recipient without asking is measured in
         # the words the quote stands for alone (the rest of the turn may be what to tell the other person)

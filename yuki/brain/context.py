@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Mapping, Sequence
 
-from yuki.brain.plan import SEED_RERUN_OK, ExecResult, Plan, StepStatus, seed_sends, skill_family
+from yuki.brain.plan import SEED_RERUN_OK, ExecResult, Plan, StepStatus, person_open, seed_sends, skill_family
 from yuki.brain.prompt import menu_text, profile_text
 
 #: How the request turn labels each part (Yuki's own words about the parts, never the user's).
@@ -83,6 +83,13 @@ SEED_UNSURE_LABEL = ("[A skill's hand-off: it acted but couldn't confirm the res
 SEED_DROPPED_LABEL = ("[A skill's hand-off: a value it was given isn't in their words as heard (misheard, or reworded), "
                       "so it didn't run. Check the values against their words, the people named and memory, then do it "
                       f"by steps (look, then click or type in the app); never run that skill again. {SEED_DONE}]")
+#: jBrain (fMsg B1): a hand-off of a capability with a person slot (a message) that left whom it goes to open (the
+#: slot dropped as unheard, or no one of theirs found by it: ``yuki.brain.plan.person_open``). Never done by steps into
+#: whichever chat is open: the planner asks whom, then runs the capability with that person (it is not spent).
+SEED_WHO_LABEL = ("[A skill's hand-off: whom it goes to isn't in their words as heard, or no one of theirs goes by it, "
+                  "so it didn't run. Ask them whom: a plan kind ask with one short question (name the one person of "
+                  "theirs it sounds like, if one does). Never type it into whichever chat is open. Once they say "
+                  "whom, run that skill with that person.]")
 SEED_LABELS: dict[str, str] = {"unverified": SEED_UNSURE_LABEL, "error": SEED_UNSURE_LABEL,
                                "dropped": SEED_DROPPED_LABEL}
 #: A hand-off whose step would send or join with no plan behind it (``yuki.skills.engine.TO_PLANNER``): that step did
@@ -880,8 +887,9 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "",
     except (TypeError, ValueError):
         body = str(keep)
     why = str(seed.get("why") or "").strip()
-    rerun = why in SEED_RERUN_OK
-    label = SEED_COMMIT_LABEL if rerun else SEED_LABELS.get(why, SEED_LABEL)
+    who = person_open(seed)
+    rerun = why in SEED_RERUN_OK or who
+    label = SEED_WHO_LABEL if who else SEED_COMMIT_LABEL if rerun else SEED_LABELS.get(why, SEED_LABEL)
     draft = not rerun and seed_sends(seed)
     if draft:
         # the skill's check reads a send, never a draft's (the validator gives a plan by steps none for it): the
@@ -895,7 +903,7 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "",
                  f"skill:{family} route, no run_skill of it).")
     if draft:
         text += "\n" + SEED_DRAFT_LINE
-    missing = one_line(seed.get("missing"), 40) if isinstance(seed.get("missing"), str) else ""
+    missing = one_line(seed.get("missing"), 40) if isinstance(seed.get("missing"), str) and not who else ""
     if missing:
         # sBrainFix (review r1 L2): the pick is made, not asked (16 Oct B08: "Which one's your Japanese playlist?"
         # with every name read out, in 3 of 5 runs)

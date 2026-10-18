@@ -492,13 +492,43 @@ def skill_family(key: Any) -> str:
 
 def seed_skill(seed: Mapping[str, Any] | None) -> str | None:
     """The skill a plan seed handed over when running it again would only repeat it (its hand-off's ``why`` is not in
-    :data:`SEED_RERUN_OK`), else ``None``."""
+    :data:`SEED_RERUN_OK`), else ``None``. jBrain (fMsg B1): a hand-off that left the person open
+    (:func:`person_open`) is not spent either: once they say whom, the capability runs with that person."""
     if not isinstance(seed, Mapping):
         return None
     key = str(seed.get("skill") or seed.get("key") or "").strip()
-    if not key or str(seed.get("why") or "").strip() in SEED_RERUN_OK:
+    if not key or str(seed.get("why") or "").strip() in SEED_RERUN_OK or person_open(seed):
         return None
     return key
+
+
+def handoff_person_open(handoff: Mapping[str, Any] | None, slot: str) -> bool:
+    """A hand-off that leaves its person ``slot`` open: dropped as unheard (``why`` dropped, the slot's ``from``
+    unheard: ``yuki.skills.engine``), or the slot its routes found no one by (``missing``). Code words only."""
+    if not isinstance(handoff, Mapping) or not slot:
+        return False
+    if str(handoff.get("missing") or "") == slot:
+        return True
+    slots = handoff.get("slots") if isinstance(handoff.get("slots"), Mapping) else {}
+    entry = slots.get(slot)
+    return str(handoff.get("why") or "") == "dropped" and isinstance(entry, Mapping) and entry.get("from") == "unheard"
+
+
+def person_open(seed: Mapping[str, Any] | None) -> bool:
+    """jBrain (fMsg B1; 18 Oct live A, k_clarify_who_draft: the message capability couldn't place the person and the
+    request was finished by typing into whichever DM was open): a hand-off of a capability with a person slot (a
+    message) that left whom it goes to open (:func:`handoff_person_open`). The planner asks whom then, never does it
+    by steps. Never raises."""
+    if not isinstance(seed, Mapping):
+        return False
+    try:
+        from yuki.brain import util
+        from yuki.brain.consent import person_slot
+
+        slot = person_slot(util.skill(str(seed.get("skill") or seed.get("key") or "")))
+    except Exception:  # noqa: BLE001 - the capability can't be read: not known to be open
+        return False
+    return handoff_person_open(seed, slot)
 
 
 def spent_skills(checks: Checks) -> dict[str, str]:
@@ -1365,4 +1395,5 @@ __all__ = [
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",
     "probe_args_text", "probe_errors", "error_code", "error_codes", "SEED_RERUN_OK", "skill_family", "seed_skill",
     "spent_skills", "unescape", "seed_sends", "step_line", "UNSAID_ACTIONS", "LINE_CAPABILITY_STEP",
+    "person_open", "handoff_person_open",
 ]
