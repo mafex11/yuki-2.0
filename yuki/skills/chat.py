@@ -790,15 +790,16 @@ def _stopped(facts: Mapping[str, Any], app: str, *, acted: bool) -> RouteResult 
         return RouteResult(ran=acted, outcome=TO_PLANNER)
     if facts.get("held"):
         short = int(facts.get("steps_done") or 0) < int(facts.get("steps") or 0)
-        if not str(facts.get("question") or "") and short and _refused("keys"):
-            # a rule's refusal with no question while a game is in front: "after the round?", never "go ahead?"
-            return RouteResult(ran=acted, held="game", outcome="refused")
+        if not str(facts.get("question") or "") and short and (kind := _refused("keys")):
+            # a rule's refusal with no question while a game is in front: "after the round?", never "go ahead?" (a
+            # gate that refused for another reason, fHands: the plain blocked stop, never the game line)
+            return RouteResult(ran=acted, held=kind, outcome="refused")
         return RouteResult(ran=acted, ask=str(facts.get("question") or "") or LINE_HELD, outcome="held_by_check")
     if facts.get("took_over_at"):
         return RouteResult(ran=acted, ask=LINE_TOOK_OVER, outcome="taken_over")
     if not facts.get("refused_steps") and int(facts.get("steps_done") or 0) < int(facts.get("steps") or 0) \
-            and _refused("keys"):
-        return RouteResult(ran=acted, held="game", outcome="refused")
+            and (kind := _refused("keys")):
+        return RouteResult(ran=acted, held=kind, outcome="refused")
     return None
 
 
@@ -1221,11 +1222,14 @@ def _wait_chat(call: RouteCall, data: Mapping[str, Any], route: ChatRoute, since
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _refused(action: str, hwnd: int | None = None) -> bool:
-    """D17's backstop asked here, before a focus, an opened link or keys (the input layer asks again)."""
-    from yuki.memory import gamegate
+def _refused(action: str, hwnd: int | None = None) -> str | None:
+    """D17's backstop asked here, before a focus, an opened link or keys (the input layer asks again): ``None`` (go
+    ahead), else the refusal's kind (fHands, ``yuki.actions.gate``): ``"game"`` (held for a game) or ``"blocked"``
+    (the gate failed closed, or another guard refused it: a settled stop, never said as a game)."""
+    from yuki.actions import gate
 
-    return gamegate.refuse_input(action, hwnd=hwnd) is not None
+    why = gate.refuse(action, hwnd=hwnd)
+    return None if why is None else gate.kind_of(why)
 
 
 def _app_hwnd(data: Mapping[str, Any]) -> int:
@@ -1263,9 +1267,12 @@ def _open_uri(uri: str, *, running: bool = False) -> Any:
     return open_uri(uri)
 
 
-def _held_by_game(result: Any) -> bool:
+def _held_by_game(result: Any) -> str | None:
+    """The refusal kind an action's result carries (fHands, ``yuki.actions.gate.carried``): ``"game"`` or
+    ``"blocked"``, else ``None``."""
     details = getattr(result, "details", None) or {}
-    return isinstance(details, Mapping) and details.get("refused") == "game"
+    value = details.get("refused") if isinstance(details, Mapping) else None
+    return value if value in ("game", "blocked") else None
 
 
 def _mic_held(image: str) -> bool | None:
@@ -1285,11 +1292,11 @@ def _focus_app(data: Mapping[str, Any]) -> tuple[int, RouteResult | None]:
     hwnd = _app_hwnd(data)
     if not hwnd:
         return 0, RouteResult(ran=False, outcome="not_open")
-    if _refused("focus", hwnd=hwnd):
-        return 0, RouteResult(ran=False, held="game", outcome="refused")
+    if kind := _refused("focus", hwnd=hwnd):
+        return 0, RouteResult(ran=False, held=kind, outcome="refused")
     result = _focus(hwnd)
-    if _held_by_game(result):
-        return 0, RouteResult(ran=False, held="game", outcome="refused")
+    if kind := _held_by_game(result):
+        return 0, RouteResult(ran=False, held=kind, outcome="refused")
     if not getattr(result, "ok", False):
         return 0, RouteResult(ran=False, outcome="no_focus")
     return hwnd, None
@@ -1522,13 +1529,13 @@ def route_open_link(call: RouteCall) -> RouteResult:
     as_draft, refused = _send_gate(call, target, route)
     if refused is not None:
         return refused
-    if _refused("open_url"):
-        return RouteResult(ran=False, held="game", outcome="refused")
+    if kind := _refused("open_url"):
+        return RouteResult(ran=False, held=kind, outcome="refused")
     running = _app_hwnd(data)
     since = time.time()
     opened = _open_uri(uri, running=bool(running))
-    if _held_by_game(opened):
-        return RouteResult(ran=False, held="game", outcome="refused")
+    if kind := _held_by_game(opened):
+        return RouteResult(ran=False, held=kind, outcome="refused")
     if not getattr(opened, "ok", False):
         return RouteResult(ran=False, outcome="not_opened")
     return _after_open(call, app, data, target, route, via="link", since=since, hwnd=_app_hwnd(data) or running,

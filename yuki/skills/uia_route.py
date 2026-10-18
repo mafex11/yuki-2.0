@@ -2386,6 +2386,9 @@ class Pressed:
     n: int = 0
     why: str = ""
     ms: float = 0.0
+    #: fHands: a ``refused`` press's kind (``yuki.actions.gate``): ``"game"`` (a game's own window) or ``"blocked"``
+    #: (the gate could not check and failed closed, or another guard refused it: a settled stop, never a game).
+    kind: str = ""
 
 
 def press(hwnd: int, *, role: str, name: str, pattern: str = "invoke", value: Any = None, container: Any = (),
@@ -2393,14 +2396,14 @@ def press(hwnd: int, *, role: str, name: str, pattern: str = "invoke", value: An
     """Find one control by role and name inside its container, then call ``pattern`` on it, in one UIA job on its own
     thread. Refused (nothing sent) when the window belongs to a game (D17: a pattern call on any other window may run
     with a game in front). Never two candidates: ``ambiguous`` and nothing pressed."""
-    from yuki.memory import gamegate
+    from yuki.actions import gate
 
     if pattern not in PATTERNS:
         return Pressed("error", why="pattern")
     if not hwnd:
         return Pressed("no_window")
-    if (why := gamegate.refuse_input("uia_pattern", hwnd=int(hwnd), front_ok=True)) is not None:
-        return Pressed("refused", why=why)
+    if (why := gate.refuse("uia_pattern", hwnd=int(hwnd), front_ok=True)) is not None:
+        return Pressed("refused", why=str(why), kind=gate.kind_of(why))
     t0 = time.perf_counter()
     gone = threading.Event()
 
@@ -2685,9 +2688,9 @@ def route_way(call: Any) -> Any:
            "picked": plan["item"]}
     shown = {"steps": int(facts.get("steps") or 0), "done": done, "pick": plan["item"] or "none",
              "control": bool(plan["control"]), "send": send}
-    if facts.get("refused") == "game" or facts.get("act_off"):
-        return RouteResult(ran=done > 0, held="game" if facts.get("refused") == "game" else None, outcome="refused",
-                           facts=shown, facts_ram=ram, app=app)
+    kind = facts.get("refused") if facts.get("refused") in ("game", "blocked") else None   # fHands: by its kind
+    if kind or facts.get("act_off"):
+        return RouteResult(ran=done > 0, held=kind, outcome="refused", facts=shown, facts_ram=ram, app=app)
     if facts.get("to_planner"):
         return RouteResult(ran=done > 0, outcome=TO_PLANNER, facts=shown, facts_ram=ram, app=app)
     if facts.get("held"):

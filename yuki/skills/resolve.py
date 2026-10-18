@@ -113,6 +113,12 @@ FROM_CHOSEN = "chosen"
 #: today only ``app.way``'s ``way`` naming none of the user's live ways (kWays review L1: the route asks "Which of your
 #: ways?", never runs another way in its place). The engine's word for a given value too (``engine.FROM_GIVEN``).
 FROM_GIVEN = "given"
+#: fBrain merge note (contract C5, live 18 Oct k_resume_anime: "put my anime back on" with ``site = JustAnime`` from the
+#: understanding and the card was dropped as unheard, a 3.8 s hand-off): a given site value the words don't hold that
+#: is one of the user's own known sites (the learner's values, :func:`yuki.skills.learn.values.known`, the you-card's
+#: "Sites they open"; Not mine left out), kept as that known value in the slot's own place right after "words". Never
+#: a guess for taste (not in ``taste.ASKED_FILLS`` or ``GUESS_FILLS``). A code word in the logs.
+FROM_KNOWN = "known"
 #: ``app.way``'s slots (connections/ways.toml, contract C4): which way (a live way's key or name), and where in the app
 #: (a control's label the menu lists, one of their things, or an item's own words).
 WAY_CAPABILITY = "app.way"
@@ -687,6 +693,59 @@ def _heard_confirmed(store: Any) -> Callable[[str, int], bool]:
         return got is not None and bool(got.confirmed) and int(got.contact.id) == int(person_id)
 
     return check
+
+
+def _answers_who(name: str, turns: Sequence[str]) -> bool:
+    """Whether ``name`` is the user's direct answer to Yuki's own "Who to?" (the chat driver's or this resolver's
+    question for a person slot nobody gave, noted by the engine: fMsg merge note E1): their very next turn, the name
+    standing in it (:func:`yuki.skills.chat._answers_who`). Never raises (``False``)."""
+    try:
+        from yuki.skills.chat import _answers_who as answers
+
+        return bool(answers(name, [str(t) for t in turns or () if t]))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _site_forms(value: Any) -> set[str]:
+    """A site value's identities (fixed formats, never a reading of meaning): its words case-folded, the same with the
+    spaces out ("Just Anime"), its scope identity (:func:`yuki.skills.connection.scope_value`: a site file's name, a
+    domain without ``www.``) and, for a domain, its registrable domain's name ("justanime" for justanime.to)."""
+    from yuki.skills.connection import domain_like, scope_value
+
+    text = _words(value.get("name") if isinstance(value, Mapping) else value).casefold()
+    ident = scope_value(text)
+    forms = {f for f in (text, text.replace(" ", ""), ident) if f}
+    if ident and domain_like(ident):
+        try:
+            from yuki.memory.moments import registrable_domain
+
+            forms.add(registrable_domain(ident).split(".")[0])
+        except Exception:  # noqa: BLE001
+            pass
+    return forms
+
+
+def _known_site(store: Any, cap: str, slot_name: str, value: Any, *, now: float) -> str | None:
+    """fBrain merge note (contract C5): the user's own known site (the learner's values for ``cap``'s ``slot_name``,
+    best first, Not mine left out: :func:`yuki.skills.learn.values.known`) that the given ``value`` is by identity
+    (:func:`_site_forms`: its value, label or name), as that known value (the form its runs used); else ``None``.
+    Data only. Never raises."""
+    if store is None or not _words(value.get("name") if isinstance(value, Mapping) else value):
+        return None
+    try:
+        from yuki.skills.learn.values import known
+
+        want = _site_forms(value)
+        for v in known(store, cap, now=now).get(cap) or []:
+            if v.get("slot") != slot_name or v.get("mark"):
+                continue
+            own = _words(v.get("value") or v.get("label"))
+            if own and any(want & _site_forms(v.get(k)) for k in ("value", "label", "name") if _words(v.get(k))):
+                return own
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def _said_for(store: Any) -> Callable[[str, Sequence[str]], tuple[str, str, int] | None]:
@@ -1443,12 +1502,16 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                         # eval's replay, ``until``, asks every time: its phrasings are separate requests)
                         alike = sounds_like(value)
                         confirm_key = (skill.capability or skill.key, slot.name, _words(value).casefold())
-                        if alike is not None and drafting and heard_confirmed(value, alike[1]) and \
+                        if alike is not None and drafting and \
+                                (heard_confirmed(value, alike[1]) or _answers_who(value, heard)) and \
                                 (until is not None or not _confirm_asked(confirm_key, now)):
-                            # lResolve (lMsg's what's left 3): its closest sound is a heard form of that very person
-                            # the user confirmed ("hey mean" near their "hey meant"), on a draft or an open: that
-                            # person, unasked (the done line names them, so a wrong one shows); a send still asks,
-                            # and once asked within CONFIRM_ONCE_S the same words again are a no (r1 L1)
+                            # lResolve (lMsg's what's left 3) and the one draft/open rule (fMsg C2 + fTalk, live 18
+                            # Oct k_clarify_who_draft): the name sounds like exactly one person and a second signal
+                            # agrees - its closest sound is a heard form of that person the user confirmed ("hey
+                            # mean" near their "hey meant"), or it is their direct answer to Yuki's own "Who to?" ("to
+                            # hardish"). On a draft or an open: that person, unasked (the done line names them, so a
+                            # wrong one shows); a send still asks (rule 8: never sent by sound), and once asked within
+                            # CONFIRM_ONCE_S the same words again are a no (r1 L1)
                             value, relaxed = alike[0], True
                         elif alike is not None and (until is not None or _first_confirm(confirm_key, now)):
                             return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=alike[0]), [alike[0]],
@@ -1456,6 +1519,14 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 values[slot.name], filled[slot.name] = value, "words"
                 ask_keep = keep_check(slot, value) or ask_keep
                 continue
+            if skill.bind.get(slot.name) == SITE_BIND and until is None:
+                # fBrain (contract C5): a site the caller gave from the user's own known sites ("my anime" ->
+                # JustAnime, from the card) that the words only hint at: accepted as known, never dropped and handed
+                # to the thinker (a 3.8 s round trip); a site none of theirs still needs its name said
+                site = _known_site(store, cap, slot.name, given[slot.name], now=now)
+                if site is not None:
+                    values[slot.name], filled[slot.name] = site, FROM_KNOWN
+                    continue
             if _granted(slot, given[slot.name], granted):
                 # Item 11's L2: the very text (or person) the brain's consent rule allowed this step and counted down,
                 # as given: Yuki's wording of what the user asked to say ("When will you come?" for "ask him when he
@@ -1481,6 +1552,16 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 # so it counts only once they've spoken since; a repeat of the same words within the exchange is a no
                 # and falls through to the hand-off
                 heard_as = said_for(given[slot.name], heard)
+                if heard_as is not None and drafting:
+                    # the one draft/open rule (fMsg merge note C2 + fTalk): the person the caller inferred
+                    # ("bobsled", "Hemanth") and the name in the user's words that sounds like that same one person
+                    # and nobody else ("Kwix", "hardish") are two signals that agree: on a draft or an open, that
+                    # person, unasked, by their own name (the done line names them, so a wrong one shows). A send
+                    # still asks below (rule 8: whom a message is sent to is never matched by sound); the loop's
+                    # values are checked again after it (``relaxed``)
+                    values[slot.name], filled[slot.name] = heard_as[0], "words"
+                    relaxed = True
+                    continue
                 if heard_as is not None and (until is not None or _note_asked(store, heard_as[1], heard_as[2],
                                                                               sources, now)):
                     return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=heard_as[0]), [heard_as[0]],
