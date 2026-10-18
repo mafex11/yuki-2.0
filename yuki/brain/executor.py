@@ -2701,24 +2701,27 @@ class Executor:
         return done.parts_done([*(self._part(run) for run in runs), result], before=before)
 
     def _derived_probe(self) -> tuple[str, dict[str, Any]] | None:
-        """aBrain (phase 2.5): the probe that reads what this plan's last readable act step changed, for a plan by
-        steps that wrote done none: ``(probe, args)`` from the step's verb, its closed values and the call's own facts
-        (its window, its process), scanning back from the last act step that ran. ``None`` when no act step that ran
-        has a readable effect (a click, a key, a command: their own verdicts stand). Code facts only."""
-        for index in sorted(self._ran_calls, reverse=True):
-            status = self.statuses[index] if index < len(self.statuses) else None
-            if status is None or status.state != "ok":
-                continue
-            got = _effect_probe(self._ran_calls[index], self.steps[index] if index < len(self.steps) else None,
-                                self._open_images.get(index, ""))
-            if got is None:
-                continue
-            resolved = self._probe_args(*got)
-            image = str(resolved.get("process") or "").casefold()
-            if "process" in done.PROBE_ARGS.get(got[0], ((), ()))[0] and not image.endswith(".exe"):
-                continue   # an app name no listed window resolves to its program would never match the one in front
-            return got[0], resolved
-        return None
+        """aBrain (phase 2.5): the probe that reads what this plan's last act step changed, for a plan by steps that
+        wrote done none: ``(probe, args)`` from that step's verb, its closed values and the call's own facts (its
+        window, its process), the arguments as the check reads them. ``None`` when that step has no readable effect (a
+        click, a key, a command: their own verdicts stand), or its program can't be told. Code facts only."""
+        ran = [i for i in sorted(self._ran_calls) if i < len(self.statuses) and self.statuses[i].state == "ok"]
+        if not ran:
+            return None
+        # only the last act step: a later step (a click after typing, a focus back after a focus) may have changed
+        # what an earlier one did, so an earlier step's read would check something that no longer holds
+        index = ran[-1]
+        got = _effect_probe(self._ran_calls[index], self.steps[index] if index < len(self.steps) else None,
+                            self._open_images.get(index, ""))
+        if got is None:
+            return None
+        if got[0] == "page_at" and len(self._seen_pages() or ()) > 1:
+            return None   # several pages, each seen by its own step's report: _steps_seen says them all
+        resolved = self._probe_args(*got)
+        image = str(resolved.get("process") or "").casefold()
+        if "process" in done.PROBE_ARGS.get(got[0], ((), ()))[0] and not image.endswith(".exe"):
+            return None   # an app name no listed window resolves to its program would never match the one in front
+        return got[0], resolved
 
     def ending_facts(self) -> dict[str, str]:
         """aBrain (phase 2.3): what a request that didn't end done can say from the evidence, in plain words for the
