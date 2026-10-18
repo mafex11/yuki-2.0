@@ -14,8 +14,10 @@ already hold the answer, by code, with no model call:
   items due soon, who they wait on (``younow.middle_words``, labelled ``younow.MIDDLE_LABEL``: to choose well, never
   recited unasked). The talker's own per-turn line carries the focus and what just changed, and its profile layer the
   people directory, so its card repeats neither;
-* **Usually now** - the active routines due around this hour, the sites, channels and playlists the user picks most
-  at this hour (``yuki.skills.learn.values`` hour histograms, ``yuki.skills.taste.top``);
+* **Usually now** - the active routines due around this hour; the picks for now (phase 2.2: code's best candidates
+  per kind, a channel's unwatched upload, a playlist, a channel, each with a short code-made why, scored like the
+  recommender: ``yuki.skills.taste.now_picks``), which the talker and the planner may choose from themselves; their
+  other things at this hour (``yuki.skills.learn.values`` hour histograms);
 * **Your things** - sites with their usual browser and a work mark, YouTube channels (by display name, most watched
   first), Spotify playlists with what the user calls them, meeting tabs, the voice channels and servers of the apps
   that join calls (``yuki.skills.discord_route.voice_channels``), the things inside their own ways' apps (their
@@ -83,6 +85,11 @@ LEFT_OFF_URL_CHARS = 140
 LEFT_OFF_QUERY_CHARS = 40
 #: The talker's day and "in the middle of" lines at most, each (a thread, three due titles, two names).
 MIDDLE_CHARS = 420
+#: Phase 2.2, the picks for now on the "Usually around now" line (talker, wide): per kind at most (fewer when the line
+#: is long), a video's title cut to, and the whole line at most.
+PICKS_N = (3, 5)
+TITLE_CHARS = (32, 48)
+USUAL_CHARS = (620, 900)
 
 _lock = threading.Lock()
 #: ``(db path, purpose) -> (built_at, stamp, text)``
@@ -314,40 +321,71 @@ def _values(store: Any) -> dict[str, list[dict[str, Any]]]:
         return {}
 
 
+def _picks_part(store: Any, now: float, wide: bool, n: tuple[int, int, int]) -> str:
+    """Phase 2.2: the picks for now (``yuki.skills.taste.now_picks``: code's candidates, scored like the recommender,
+    each with its code-made why), for the deciders to choose from: per kind (a channel's fresh unwatched upload, a
+    playlist, a channel) at most ``n`` (video, playlist, channel), best first, the kind whose best one fits this hour
+    most (time at this hour, comparable across kinds) first; a channel already named for its upload is not named again.
+    ``""`` with none."""
+    try:
+        from yuki.skills import taste
+
+        got = taste.now_picks(store, now=now)
+    except Exception:  # noqa: BLE001
+        return ""
+    title_n = TITLE_CHARS[1 if wide else 0]
+    shown = {"".join(p.name.casefold().split()) for p in (got.get("video") or [])[:n[0]]}
+    kinds = []
+    for i, (kind, label) in enumerate((("video", "new uploads, unwatched"), ("playlist", "playlists"),
+                                       ("channel", "channels"))):
+        items = [p for p in got.get(kind) or [] if kind != "channel" or "".join(p.name.casefold().split()) not in shown]
+        items = items[:n[i]]
+        if not items:
+            continue
+        bits = [_clip(p.name, 30) + (f' "{_clip(p.title, title_n)}"' if p.title and title_n else "") + f" ({p.why})"
+                for p in items]
+        kinds.append((-max(p.fit for p in items), i, f"{label}: " + "; ".join(bits)))
+    kinds.sort(key=lambda k: (k[0], k[1]))
+    return ("Picks for now, best first: " + " | ".join(text for _f, _i, text in kinds)) if kinds else ""
+
+
 def _usually_now(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, wide: bool) -> list[str]:
+    """The "Usually around now" line, most decisive first: the routines due now, the picks for now
+    (:func:`_picks_part`), their other things at this hour (a value the picks cover, a playlist, is not named twice).
+    At most :data:`USUAL_CHARS`: the picks give way first (fewer per kind), then their things at this hour."""
     from yuki.skills.learn import values as V
 
-    parts: list[str] = []
+    i = 1 if wide else 0
     routines = _routines_near(store, now)
-    if routines:
-        parts.append("Routines: " + "; ".join(routines))
+    head = ["Routines: " + "; ".join(routines)] if routines else []
+    try:
+        from yuki.skills import taste
+
+        covered = {(cap, taste.CHOOSE_SLOTS[k]) for cap, k in taste.CHOOSE_KINDS.items()}
+    except Exception:  # noqa: BLE001
+        covered = set()
     hour_vals = []
     for cap_key, items in vals.items():
         for v in items:
-            if v.get("everyday") is False:
+            if v.get("everyday") is False or (cap_key, v.get("slot")) in covered:
                 continue
             w = V.hour_weight(v, now)
             if w >= HOUR_SHARE and int(v.get("days") or 0) >= 2:
                 hour_vals.append((w * float(v.get("score") or 0.0), v))
     hour_vals.sort(key=lambda x: -x[0])
-    if hour_vals:
-        parts.append("Their things at this hour: " + ", ".join(
-            f"{_clip(v.get('name'), 30)} ({v.get('slot')}, {_sure_days(int(v.get('days') or 0))})"
-            for _s, v in hour_vals[:4]))
-    try:
-        from yuki.skills import taste
-
-        for kind, label in (("youtube_handle", "YouTube channels picked at this hour"),
-                            ("spotify_playlist", "Playlists played at this hour")):
-            got = [t for t in taste.top(store, kind, now=now, n=3 if wide else 2) if t.name and t.score > 0]
-            if got:
-                parts.append(f"{label}: " + ", ".join(_clip(t.name, 30) for t in got) + " (from what they watched or"
-                             " played at this hour)")
-    except Exception:  # noqa: BLE001
-        pass
-    if not parts:
-        return []
-    return ["Usually around now: " + " | ".join(parts)]
+    things = ["Their things at this hour: " + ", ".join(
+        f"{_clip(v.get('name'), 30)} ({v.get('slot')}, {_sure_days(int(v.get('days') or 0))})"
+        for _s, v in hour_vals[:4])] if hour_vals else []
+    line = ""
+    for n in range(PICKS_N[i], 0, -1):
+        picks = _picks_part(store, now, wide, (n, n, n))
+        parts = [*head, *([picks] if picks else []), *things]
+        line = "Usually around now: " + " | ".join(parts) if parts else ""
+        if len(line) <= USUAL_CHARS[i] or not picks:
+            break
+    if len(line) > USUAL_CHARS[i] and things:
+        line = "Usually around now: " + " | ".join([*head, *([picks] if picks else [])])
+    return [_clip(line, USUAL_CHARS[i])] if line else []
 
 
 def _browser_name(store: Any, key: str, names: dict[str, str]) -> str:
