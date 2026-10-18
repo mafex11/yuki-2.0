@@ -971,6 +971,16 @@ class VoiceBridge(QObject):
             except Exception:  # noqa: BLE001
                 pass
 
+    def hold_owed_line(self, token: int, held: bool) -> None:
+        """Review r1 M4: code's fallback line held while the talker's next call for that outcome runs (``True``), or
+        due again because that call was not tried (``False``). Never raises."""
+        hold = getattr(self.ledger, "hold", None) if self.ledger is not None else None
+        if callable(hold):
+            try:
+                hold(token, held)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _unowe(self, job: Job) -> None:
         if self.ledger is not None:
             try:
@@ -3042,8 +3052,10 @@ class VoiceBridge(QObject):
             # line, is voice-shaped and says no more than the check saw: said by code word for word, late or not.
             # Phase 2 (2.3): only a success (checked or likely, whole): any other outcome (not confirmed, failed,
             # partial, stuck, held, a refusal) is the talker's to word from the outcome's evidence, and this line
-            # waits in the owed ledger as its fallback (``_owed_words``)
-            if not success_line(job.verdict):
+            # waits in the owed ledger as its fallback (``_owed_words``). Review r1 M3: an outcome of a send (a lasting
+            # act: ``send`` set) keeps code's own line word for word, so no talker run can make it a "Sent."
+            lasting = isinstance(job.verdict, dict) and bool(job.verdict.get("send"))
+            if not success_line(job.verdict) and not lasting:
                 self._log("bridge", op="outcome_worded", job_id=job.job_id, said_by="talker",
                           level=str((job.verdict or {}).get("level") or "") or None)
                 return None

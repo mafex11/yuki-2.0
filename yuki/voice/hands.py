@@ -310,13 +310,16 @@ _SAY_FIRST = {
 OPEN_HANDS = ("open_app", "open_url")
 _THEN = {
     "type": "string",
-    "description": "Optional: what else their request asks once it is open, in their words (\"restore the pages\"). "
-                   "Then you get the new screen to do it.",
+    "description": "What else their request asks once it is open that no other call of this reply does, in their "
+                   "words (\"restore the pages\"); \"\" when nothing. Then you get the new screen to do it.",
 }
 #: Phase 2 (2.4): the same for a sound hand or a skill run: the talker's own reading of what is left, held by code (a
-#: rest no later call of the reply takes gives the talker its turn back; the blind end check is deleted).
-_THEN_PART = {"type": "string", "description": "Optional: what else their request asks that no other call of yours "
-                                               "does now, in their words."}
+#: rest no later call of the reply takes gives the talker its turn back; the blind end check is deleted). Review r1 H1:
+#: ``then`` is REQUIRED on every acting hand and on run_skill (:data:`THEN_REQUIRED`): the talker states its reading of
+#: the rest on every act ("" = this reply's calls are all of it), so a part it would otherwise drop is declared and held
+#: by code (no model check reads their words for it).
+_THEN_PART = {"type": "string", "description": "What else their request asks that no other call of this reply does, "
+                                               "in their words; \"\" when nothing."}
 #: What the talker reads when an opening with a rest verified (fx2).
 _THEN_NOTE = (
     "It is open, verified, and nothing was said for it. Still to do from their request: \"{rest}\". Your desktop block "
@@ -340,9 +343,11 @@ _THEN_NOTE_LEAN = (
 THEN_HANDS = (*OPEN_HANDS, "window", "tab")
 _THEN_STEP = {
     "type": "string",
-    "description": "Optional: what else their request asks once this step is done, in their words (\"open YouTube in "
-                   "it\"). Then you get the new screen to do it.",
+    "description": "What else their request asks once this step is done that no other call of this reply does, in "
+                   "their words (\"open YouTube in it\"); \"\" when nothing. Then you get the new screen to do it.",
 }
+#: Review r1 H1: the hands whose schema requires ``then`` (and run_skill's, :func:`talker_hand_tools`).
+THEN_REQUIRED = (*THEN_HANDS, *AUDIO_HANDS)
 #: What the talker reads when a window or tab step with a rest verified (x3).
 _STEP_THEN_NOTE = (
     "That step is done, verified, and nothing was said for it. Still to do from their request: \"{rest}\". Your "
@@ -521,6 +526,17 @@ _END_REST_NOTE = (
     "code; its outcome comes back to you. Code said the acknowledgement, if any (said). Say nothing now: no other "
     "hand, never that it is done or playing."
 )
+#: Review r1 M2: the talker's "still to do" looks are spent and no hand-off to the thinker could start: rule #149's one
+#: line, by code (the part done's own line before it), and the call settles with no further look (never a loop).
+_REST_LEFT_LINE = "I couldn't get to the rest of it. Want me to try another way?"
+_REST_LEFT_NOTE = ("Not all done: the rest of their request could not go on, and code said so (said). Say nothing now; "
+                   "their yes is a new ask.")
+#: Review r1 L3: a verified skill run with a rest whose act also took something the user had: its after-look rides
+#: with the "still to do" look (one talker run), as one principle.
+_AFTER_REST = {"act": (" After is what that run did to their screen: what they asked for stays; your own side effect "
+                       "is undone with one undoable step (window move, focus_back) once the rest is done."),
+               "ask": (" After is what that run did to their screen: what they asked for stays; once the rest is done, "
+                       "ask in a few words whether to undo your own side effect.")}
 #: Phase 2 (2.3): a non-success outcome of a hand or a skill run (not confirmed, failed, held, blocked, stopped, timed
 #: out) is said by the talker in its own words from the evidence (the report), never a code template; code's own line
 #: waits in the owed ledger and is said only when the talker's run is not heard in time (``VoiceBridge.owe_line``).
@@ -531,7 +547,6 @@ _OUTCOME_NOTE = (
 )
 #: Code's fallback lines for a hand whose talker run is not heard (fixed words, the outcome's kind only).
 _FALLBACK_LINE = {"failed": "That didn't work.", "not_verified": "I couldn't confirm that worked.",
-                  "not_tried": "That didn't work, so I'll leave it for now.",
                   "blocked": "Something stopped that, so nothing was done."}
 
 
@@ -714,6 +729,10 @@ HAND_TOOLS: list[dict[str, Any]] = [
         "required": ["page"],
     },
 ]
+for _tool in HAND_TOOLS:   # review r1 H1: every acting hand states its reading of the rest ("" = none)
+    if _tool["name"] in THEN_REQUIRED and "then" not in _tool["required"]:
+        _tool["required"] = [*_tool["required"], "then"]
+del _tool
 # The run_skill name among the hands (its schema here is the old step-list one; the talker is only ever given the
 # Skills menu's own run_skill: talker_hand_tools).
 from yuki.skills.uia_route import RUN_SKILL_TOOL  # noqa: E402
@@ -775,7 +794,9 @@ def talker_hand_tools(skill_keys: Any = ()) -> list[dict[str, Any]]:
 
         # P1.4: the place hint is the voice's field (Hands._skill_hand passes it on); phase 2: so is its then
         tool = talker_tool(keys)
-        out.append({**tool, "properties": {**tool["properties"], "place": SKILL_PLACE, "then": _THEN_PART}})
+        required = [r for r in tool.get("required") or [] if r != "then"]
+        out.append({**tool, "properties": {**tool["properties"], "place": SKILL_PLACE, "then": _THEN_PART},
+                    "required": [*required, "then"]})
         out.append(KEEP_USUAL_TOOL)
     return out
 #: UI Automation control types (the platform's fixed vocabulary) whose click can send, delete, buy or sign out: such a
@@ -1192,6 +1213,9 @@ class Hands:
         #: Phase 2 (2.3): ``(token, turn, at)`` of a hand's non-success outcome whose code line waits in the owed
         #: ledger while the talker words it (:meth:`_owe_fallback`); dropped when the talker's next call acts.
         self._owed_line: tuple[int, Any, float] | None = None
+        #: Review r1 M4: the call id of the last call answered "not tried" (:meth:`_halted_result`): a call not tried
+        #: leaves the earlier outcome's own line owed (nothing was tried over it), and owes no line of its own.
+        self._halted_call: Any = None
         #: lVoice (a hook for lSpeed's reflex path, :meth:`reflex_done`): ``{step key: when}`` of steps the reflex ran
         #: for the words being heard, so the talker's own call for the same step is that step, never a second act.
         self._reflex: dict[str, float] = {}
@@ -2046,7 +2070,7 @@ class Hands:
         return "do"
 
     async def _look_after(self, params: Any, name: str, args: dict[str, Any], facts: dict[str, Any],
-                          before: Any) -> dict[str, Any] | None:
+                          before: Any, rest: bool = False) -> dict[str, Any] | None:
         """P1.3: once the act's done line is queued, read the desk again and compare it with ``before``. When the act
         took something the user had (``diff.any_flag``: measured shares and focus only) and the tidy dial is not off,
         the result fields of one more talker run: ``{"after": the diff in plain words, "how_to_handle_it": the
@@ -2078,8 +2102,10 @@ class Hands:
             if not text:
                 return None
             taken = bool(d.flags.get("focus_taken")) and d.focus_from
+            # review r1 L3: ``rest``: the look rides with a "still to do" look, so the calls after it are not held to
+            # the one tidy step (:meth:`handle`)
             self._look = {"turn": turn, "at": time.monotonic(), "acts": self._act_windows(after, d, acted, touched),
-                          "front": int(d.focus_from) if taken else None, "used": False}
+                          "front": int(d.focus_from) if taken else None, "used": False, "rest": bool(rest)}
             return {"after": text, "how_to_handle_it": _AFTER_ASK_NOTE if level == "ask" else _AFTER_NOTE}
         except Exception as exc:  # noqa: BLE001 - no look: the done line ends the call as before
             if self.log is not None:
@@ -2192,7 +2218,10 @@ class Hands:
         op = str(args.get("action") or "")
         turn = self._call_safely(self.user_turn, None)
         look = self._look_now(turn)
-        tidy = look is not None and arrived is not None and arrived >= float(look.get("at") or 0.0)
+        # review r1 L3: after a look that rode with a "still to do" look, a placement may be the rest they asked for:
+        # it goes as an asked step (undoable either way), never held to the tidy step's windows
+        tidy = (look is not None and arrived is not None and arrived >= float(look.get("at") or 0.0)
+                and not look.get("rest"))
         started = time.monotonic()
         key = _step_key(name, args)
         if key in self._inflight or (gate is not None and key in gate["done"]):
@@ -2527,7 +2556,7 @@ class Hands:
             args = params.arguments if isinstance(params.arguments, dict) else {}
             spared = name == KEEP_USUAL_HAND or (name == "scroll" and args.get("keep") == "stop")
             look = self._look_now(self._call_safely(self.user_turn, None))
-            in_look = look is not None and arrived >= float(look.get("at") or 0.0)
+            in_look = look is not None and arrived >= float(look.get("at") or 0.0) and not look.get("rest")
             placing = name == "window" and str(args.get("action") or "") in PLACE_OPS
             if (gate is not None and gate.get("passed") and not spared) or (in_look and not placing and not spared):
                 from pipecat.frames.frames import FunctionCallResultProperties
@@ -2540,7 +2569,13 @@ class Hands:
                 if not in_look:
                     self._follow_planned(name, args)   # review r1 L2: the job that has their request hears of it
                 return
-            await self._handle_one(params, gate, arrived)
+            # phase 2 (2.3): the talker acted on an outcome it was given: its fallback goes once this call's outcome
+            # is known (review r1 M4: a call not tried keeps it owed)
+            taken = self._take_owed(arrived)
+            try:
+                await self._handle_one(params, gate, arrived)
+            finally:
+                self._let_owed_go(taken, params.tool_call_id)
         finally:
             self._leave_order(gate)
 
@@ -2584,7 +2619,6 @@ class Hands:
             # pVoice: a hand that can act after a "then" is the talker's own try at the rest: its outcome decides
             self._then_open = then_open = None
         self._note_call(name, args)   # review r1 L4: the turn's hands (the claim gate, the thinker's list of steps)
-        self._drop_owed(arrived)   # phase 2 (2.3): the talker acted on an outcome it was given: its fallback goes
         if self.skills_on and name in (SKILL_HAND, KEEP_USUAL_HAND):
             await self._handle_skill(params, gate)   # Phase S: one of the user's skills, or the answer to its question
             return
@@ -2765,6 +2799,9 @@ class Hands:
             if self.bridge is not None and await self._rest_over(params, name, args, report, context, _END_REST_NOTE,
                                                                  turn_rest="looks_spent"):
                 return
+            # review r1 M2: no hand-off could start: rule #149's one line by code, never another look
+            await self._rest_left(params, name, line, report)
+            return
         if confirmed and rest:
             # fx2: the rest of their request is still to do: the talker gets its turn back (run_llm) with the screen
             # as it is once it settled (the new window's items, a popup that came with it), and does the rest with
@@ -3292,6 +3329,25 @@ class Hands:
                                      properties=FunctionCallResultProperties(run_llm=False))
         return True
 
+    async def _rest_left(self, params: Any, name: str, line: str, report: str) -> None:
+        """Review r1 M2: the talker's "still to do" looks of this turn are spent and no hand-off could start
+        (:meth:`_rest_over` was refused): ``line`` (the part done's own line, ``""`` when it was said already) and rule
+        #149's one line (:data:`_REST_LEFT_LINE`) said by code, and the call settled with no talker run: never another
+        look (never a loop). Never raises."""
+        from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
+
+        self._then_open = None
+        words = " ".join(w for w in (" ".join(str(line or "").split()), _REST_LEFT_LINE) if w)
+        try:
+            await params.llm.push_frame(TTSSpeakFrame(text=words))
+            said = words
+        except Exception:  # noqa: BLE001 - not said: the note still settles the call
+            said = ""
+        if self.log is not None:
+            self.log.event("hands", op=name, rest_left=True, said=bool(said), call=params.tool_call_id)
+        await params.result_callback({"done": report[:700], "said": said, "how_to_handle_it": _REST_LEFT_NOTE},
+                                     properties=FunctionCallResultProperties(run_llm=False))
+
     async def _say_ack(self, params: Any) -> str:
         """:data:`ACK_LINE` said by code as other code lines are, marked said only once it went to the voice
         (vRound2 review r1 L1). Returns what was said (``""``: not said; the thinker's own outcome is the next they
@@ -3325,15 +3381,40 @@ class Hands:
         self._owed_line = (token, self._call_safely(self.user_turn, None), time.monotonic())
         return True
 
-    def _drop_owed(self, arrived: float | None = None) -> None:
+    def _take_owed(self, arrived: float | None = None) -> tuple[int, Any, float] | None:
         """Phase 2 (2.3): the talker acted on an outcome it was given (a call of the same user turn that arrived after
-        that outcome went back: ``arrived``): the fallback line kept for it is let go, so code never says "That didn't
-        work." over the talker's next try. A call of the same reply (it arrived before) leaves it."""
+        that outcome went back: ``arrived``): the fallback line kept for it is taken, to be let go once this call's
+        outcome is known (:meth:`_let_owed_go`), so code never says "That didn't work." over the talker's next try. A
+        call of the same reply (it arrived before) leaves it. While the call runs the line is held in the ledger (never
+        said by code, still heard by the talker's words). Returns what was taken, else ``None``."""
         got = self._owed_line
         if got is None or (arrived is not None and arrived < got[2]):
-            return
+            return None
         self._owed_line = None
         if got[1] != self._call_safely(self.user_turn, None):
+            return None
+        self._hold_owed(got[0], True)
+        return got
+
+    def _hold_owed(self, token: int, held: bool) -> None:
+        hold = getattr(self.bridge, "hold_owed_line", None) if self.bridge is not None else None
+        if callable(hold):
+            try:
+                hold(token, held)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _let_owed_go(self, got: tuple[int, Any, float] | None, call_id: Any) -> None:
+        """The line :meth:`_take_owed` took for a call, now that its outcome is known: dropped from the ledger, unless
+        the call was "not tried" (review r1 M4, :meth:`_halted_result`): nothing was tried over the earlier outcome, so
+        its own line stays owed (the talker's words for either outcome are heard as one; silence: code says it once).
+        Never raises."""
+        if got is None:
+            return
+        if call_id is not None and call_id == self._halted_call:
+            self._hold_owed(got[0], False)
+            if self._owed_line is None:
+                self._owed_line = got
             return
         drop = getattr(self.bridge, "drop_owed_line", None) if self.bridge is not None else None
         if callable(drop):
@@ -3537,11 +3618,13 @@ class Hands:
         passed = bool((self._halt or {}).get("passed"))
         if self.log is not None:
             self.log.event("hands", op=params.function_name, halted=True, thinker_has=passed, call=params.tool_call_id)
+        self._halted_call = params.tool_call_id
         if passed:
             await params.result_callback({"not_tried": report[:400], "how_to_handle_it": _HALTED_PASSED_NOTE},
                                          properties=FunctionCallResultProperties(run_llm=False))
             return
-        self._owe_fallback(_FALLBACK_LINE["not_tried"])
+        # review r1 M4: no line of its own is owed: the earlier failure's line stays owed (:meth:`_let_owed_go`), so
+        # the talker's silence after saying it already is never followed by a second failure line
         await params.result_callback({"not_tried": report[:400], "how_to_handle_it": _HALTED_NOTE})
 
     def take_step_line(self, max_age_s: float = STEP_LINE_OWED_S) -> str | None:
@@ -3989,21 +4072,46 @@ class Hands:
             self._commit_turn = self._call_safely(self.user_turn, None)
         rest = " ".join(str(args.get("then") or "").split()) if verified else ""
         turn = self._call_safely(self.user_turn, None)
-        if rest and not self._queued_behind(gate) and turn is not None and not self._turn_sent() \
-                and self._given(self._then_looks, turn) < THEN_LOOKS_PER_TURN:
+        if rest and not self._queued_behind(gate):
             # phase 2 (2.4): the talker's own reading of what is left of their request ("play my playlist" then "turn
-            # it down"): its line names only its part and is said at once; the talker gets its look for the rest
-            self._then_looks = (turn, self._given(self._then_looks, turn) + 1)
+            # it down"): its line names only its part and is said at once; the talker gets its look for the rest.
+            # Review r1 M1: a declared rest is never dropped: looks spent goes to the thinker by code (as a hand's
+            # does), else rule #149's line; after a send or join the talker gets its own look and code hands nothing on
+            sent = self._turn_sent()
+            spent = turn is not None and self._given(self._then_looks, turn) >= THEN_LOOKS_PER_TURN
             step = await asyncio.to_thread(self._end_step, name, args)
-            self._then_open = {"turn": turn, "steps": [step], "hand": name, "args": dict(args),
-                               "report": report[:REST_REPORT_CHARS]}
             if line:
                 await params.llm.push_frame(TTSSpeakFrame(text=line))
+            if spent:
+                self._then_open = None
+                if not sent and self.bridge is not None:
+                    context = _END_REST_CONTEXT["then"].format(steps=step[:REST_REPORT_CHARS] or "a step",
+                                                               earlier=self._earlier_not_done())
+                    if await self._rest_over(params, name, args, report, context, _END_REST_NOTE,
+                                             turn_rest="looks_spent"):
+                        return
+                await self._rest_left(params, name, "", report)
+                return
+            if turn is not None:
+                self._then_looks = (turn, self._given(self._then_looks, turn) + 1)
+                if not sent:   # after a send or join, a quiet look hands nothing on by code (never a second send)
+                    self._then_open = {"turn": turn, "steps": [step], "hand": name, "args": dict(args),
+                                       "report": report[:REST_REPORT_CHARS]}
+            note = self._note(_STEP_THEN_NOTE, _PART_THEN_NOTE_LEAN).format(rest=rest[:200])
+            extra: dict[str, Any] = {}
+            if not facts.get("keep_question"):
+                # review r1 L3: the run's after-look rides with this look when it flags (one talker run; the rest's
+                # calls stay open: the look is marked as one with a rest)
+                look = await self._look_after(params, name, args, facts, before, rest=True)
+                if look is not None:
+                    ask = look.get("how_to_handle_it") == _AFTER_ASK_NOTE
+                    extra = {"after": look.get("after")}
+                    note += _AFTER_REST["ask" if ask else "act"]
             if self.log is not None:
-                self.log.event("hands", op=name, then_open=True, steps=1, call=params.tool_call_id)
-            await params.result_callback({"done": report[:700], "said": line, "then": rest[:200],
-                                          "how_to_handle_it": self._note(_STEP_THEN_NOTE, _PART_THEN_NOTE_LEAN).format(
-                                              rest=rest[:200])})
+                self.log.event("hands", op=name, then_open=True, steps=1, sent_turn=sent, after_look=bool(extra),
+                               call=params.tool_call_id)
+            await params.result_callback({"done": report[:700], "said": line, "then": rest[:200], **extra,
+                                          "how_to_handle_it": note})
             return
         if line and talk and self._owe_fallback(line):
             # phase 2 (2.3): held, stopped, not confirmed, failed or timed out: the talker says it in one line of its
