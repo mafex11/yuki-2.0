@@ -68,7 +68,17 @@ Two parts:
     meeting app using the microphone counts as present without input
     (``passive_s``) and as ``mic_s``.
 
-The PC's own power history (:mod:`yuki.memory.power`) lives in the same table
+**The desk record** (phase 3.3, :class:`DeskRecord`, table ``desk_stretches``): beside the window in front, the
+recorder keeps how the whole desk stands. Each layout the watcher measures anyway (its show/hide/move/minimise and
+foreground events, :func:`yuki.memory.watcher.add_layout_listener`; no measure of its own) gives per window on a
+monitor its app key, monitor index (geometry against the layout's monitors), maximised / full screen / plain
+(``IsZoomed``), mostly visible or not; the media reads above say which window plays; a full-screen window in front
+(when the watcher measures nothing) is placed by one rectangle read. One row per stretch of the desk staying the same
+(app, monitor, how, plays; away; Yuki acting), with per window the seconds in front and mostly visible. App keys,
+numbers and code words only: no title is written, the privacy rules' blocked apps and Yuki's own windows are left
+out, nothing is recorded while paused or locked. :mod:`yuki.memory.deskhabits` mines it nightly.
+
+The PC's own power history (:mod:`yuki.memory.power`) lives in the timeline table
 as rows with state ``off`` / ``asleep`` / ``unknown`` (no app, no counters):
 the helpers here show them as what they are - "PC off 23:10-08:05" - so a
 hole in the timeline is either one of those or time the PC was on and memory
@@ -152,6 +162,12 @@ BREAK_S = 600.0
 #: Aggregation: stretches of one meeting service closer than this are one meeting
 #: (the user looked at another window for a while during the call).
 MEETING_GAP_S = 300.0
+
+#: Desk record (phase 3.3): a desk stretch shorter than this (s) is not written (an alt-tab's flicker, a window
+#: passing by); the same desk coming back within it continues the stretch before.
+DESK_MIN_S = 15.0
+#: A window counts as mostly visible (``seen``) at this visible share.
+DESK_SEEN_SHARE = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -883,6 +899,172 @@ def describe_meeting(m: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The desk record (phase 3.3; no Win32 here: the recorder below feeds it)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DeskWin:
+    """One window on the desk as the desk record sees it: app key, monitor index, how it shows (``max`` | ``full`` |
+    ``win``), mostly visible (``seen``), in front, a media session plays in it. ``hwnd`` and ``title`` stay in RAM
+    (the title only ties a playing session to one of several windows of its app, the way ``_shows`` does); neither
+    is ever written."""
+
+    hwnd: int
+    app: str
+    monitor: int
+    how: str
+    seen: bool = False
+    front: bool = False
+    play: bool = False
+    title: str = ""
+
+
+def desk_monitor(rect: Sequence[int] | None, monitors: Sequence[Sequence[int]]) -> int | None:
+    """The index (position in ``monitors``, ``list_monitors`` order) of the monitor holding most of ``rect``."""
+    if not rect or not monitors:
+        return None
+    best, best_area = None, 0
+    for i, m in enumerate(monitors):
+        area = (max(0, min(rect[2], m[2]) - max(rect[0], m[0]))
+                * max(0, min(rect[3], m[3]) - max(rect[1], m[1])))
+        if area > best_area:
+            best, best_area = i, area
+    return best
+
+
+def desk_covers(rect: Sequence[int], monitor: Sequence[int]) -> bool:
+    """Whether ``rect`` covers the whole monitor (full screen)."""
+    return rect[0] <= monitor[0] and rect[1] <= monitor[1] and rect[2] >= monitor[2] and rect[3] >= monitor[3]
+
+
+class DeskRecord:
+    """Writes the desk record (table ``desk_stretches``, migration 48): one row per stretch of the desk staying the
+    same, mined nightly by :mod:`yuki.memory.deskhabits`.
+
+    The desk is the set of ``(app, monitor, how, plays)`` over the windows on a monitor (the user's privacy rules and
+    Yuki's own windows already left out by the caller), plus whether the user is away and whether Yuki is acting.
+    Within a stretch each entry also counts its seconds in front and mostly visible, so switching windows on an
+    unchanged desk writes nothing new. A stretch shorter than :data:`DESK_MIN_S` is dropped, and the same desk coming
+    back within :data:`DESK_MIN_S` continues the stretch before (an alt-tab, a window passing by). A stretch is
+    written once it is :data:`DESK_MIN_S` old and updated every :data:`FLUSH_EVERY_S` (``flush``), like the timeline.
+
+    Single-threaded (the timeline's thread). Content-free: app keys, monitor indexes, code words and seconds. A write
+    that fails (no table yet) switches the record off for this run, logged once."""
+
+    def __init__(self, store: Any, *, log_error: Callable[[str, BaseException], None] | None = None) -> None:
+        self.store = store
+        self._log_error = log_error
+        self._key: tuple | None = None          # (screens, frozenset of (app, monitor, how, plays), away, by_yuki)
+        self._start = 0.0
+        self._at = 0.0
+        self._acc: dict[tuple, list[float]] = {}
+        self._flags: dict[tuple, tuple[bool, bool]] = {}
+        self._row_id: int | None = None
+        self._written_at = 0.0
+        self._last: tuple | None = None         # the last stretch written and closed: (key, end, row_id, start, acc)
+        self.disabled = False
+        self.counters: Counter = Counter()
+
+    def observe(self, now: float, wins: Sequence[DeskWin] | None, *, screens: str, away: bool = False,
+                by_yuki: bool = False) -> None:
+        """The desk now (``wins`` ``None``: nothing to record, e.g. paused or locked): the time since the last pass goes
+        to the open stretch as it was; a different desk closes it and opens another."""
+        self._account(now)
+        if not wins or not screens:   # nothing to record (paused, locked), or nothing on any monitor
+            self.close(now)
+            return
+        entries: dict[tuple, tuple[bool, bool]] = {}
+        for w in wins:
+            k = (w.app, int(w.monitor), w.how, bool(w.play))
+            front, seen = entries.get(k, (False, False))
+            entries[k] = (front or bool(w.front), seen or bool(w.seen))
+        key = (screens, frozenset(entries), bool(away), bool(by_yuki))
+        if key != self._key:
+            self.close(now)
+            self._open(now, key)
+        self._flags = entries
+
+    def flush(self, now: float) -> None:
+        """Write the open stretch once it is :data:`DESK_MIN_S` old, then every :data:`FLUSH_EVERY_S`."""
+        if self._key is None or now - self._start < DESK_MIN_S:
+            return
+        if self._row_id is None or now - self._written_at >= FLUSH_EVERY_S:
+            self._account(now)
+            self._write(now)
+
+    def close(self, end: float) -> None:
+        if self._key is None:
+            return
+        if end - self._start >= DESK_MIN_S:
+            self._write(end)
+            self._last = (self._key, end, self._row_id, self._start, self._acc)
+        else:
+            self.counters["desk_short"] += 1
+        self._key, self._acc, self._flags, self._row_id = None, {}, {}, None
+
+    def _open(self, now: float, key: tuple) -> None:
+        last = self._last
+        if last is not None and last[0] == key and now - last[1] <= DESK_MIN_S and last[2] is not None:
+            self._start, self._row_id, self._acc = last[3], last[2], last[4]
+            self._last = None
+            self.counters["desk_resumed"] += 1
+        else:
+            self._start, self._row_id, self._acc = now, None, {}
+        self._key, self._at = key, now
+
+    def _account(self, now: float) -> None:
+        last, self._at = self._at, now
+        if self._key is None or now <= last:
+            return
+        if now - last > MAX_TICK_GAP_S:   # the process did not run (sleep): the gap is left out
+            self._at = last
+            self.close(last)
+            self._at = now
+            return
+        dt = now - last
+        for k, (front, seen) in self._flags.items():
+            acc = self._acc.setdefault(k, [0.0, 0.0])
+            if front:
+                acc[0] += dt
+            if seen:
+                acc[1] += dt
+
+    def windows_json(self) -> str:
+        import json
+
+        assert self._key is not None
+        rows = []
+        for app, mon, how, play in sorted(self._key[1]):
+            front, seen = self._acc.get((app, mon, how, play), (0.0, 0.0))
+            rows.append([app, mon, how, int(play), round(front, 1), round(seen, 1)])
+        return json.dumps(rows, separators=(",", ":"))
+
+    def _write(self, end: float) -> None:
+        if self.disabled or self._key is None:
+            return
+        screens, _entries, away, by_yuki = self._key
+        windows = self.windows_json()
+        row_id, start = self._row_id, self._start
+
+        def op(conn: Any) -> int:
+            if row_id is not None:
+                conn.execute("UPDATE desk_stretches SET ended_at=?, windows=? WHERE id=?", (end, windows, row_id))
+                return row_id
+            cur = conn.execute("INSERT INTO desk_stretches(started_at, ended_at, screens, windows, away, by_yuki)"
+                               " VALUES (?,?,?,?,?,?)", (start, end, screens, windows, int(away), int(by_yuki)))
+            return int(cur.lastrowid)
+
+        try:
+            self._row_id = self.store._write(op)
+            self._written_at = end
+            self.counters["desk_writes"] += 1
+        except Exception as exc:  # noqa: BLE001 - no table (migration 48 not run): the record is off for this run
+            self.disabled = True
+            if self._log_error is not None:
+                self._log_error("desk_write", exc)
+
+
+# ---------------------------------------------------------------------------
 # Recorder (Win32; imported lazily so the functions above stay cheap)
 # ---------------------------------------------------------------------------
 
@@ -892,6 +1074,7 @@ _WM_QUIT = 0x0012
 WM_APP_PAUSE = _WM_APP + 21
 WM_APP_PAGE = _WM_APP + 22
 WM_APP_ACTING = _WM_APP + 23
+WM_APP_DESK = _WM_APP + 24
 _PM_REMOVE = 0x0001
 _PM_NOREMOVE = 0x0000
 _QS_ALLINPUT = 0x04FF
@@ -1163,6 +1346,18 @@ class TimelineRecorder:
         self._app_ids_missing: dict[str, float] = {}
         #: The app key and window last told as in front (``on_front_change``).
         self._front: tuple[str, int] | None = None
+        #: Phase 3.3, the desk record (:class:`DeskRecord`): the watcher's newest layout (set on its thread, taken on
+        #: this one), the desk read from it (RAM), its monitors and setup, and per window the app key it counts as
+        #: (``""``: kept out by the privacy rules, or Yuki's own), cached while the window lives.
+        self._desk = DeskRecord(store, log_error=self._log_error)
+        self._desk_layout: Any = None
+        self._desk_wins: list[DeskWin] | None = None
+        self._desk_monitors: list[tuple[int, int, int, int]] = []
+        self._desk_screens = ""
+        self._desk_apps: dict[int, tuple[int, str]] = {}
+        self._desk_rules: Any = None
+        u.IsZoomed.argtypes = [wintypes.HWND]
+        u.IsZoomed.restype = wintypes.BOOL
 
     # -- public ------------------------------------------------------------
 
@@ -1259,7 +1454,14 @@ class TimelineRecorder:
             "meetings_config_error": self._meetings.last_error or None,
             "meetings_on": len(self._meeting_sites),
             "av": self._signals.stats() if self._signals is not None and hasattr(self._signals, "stats") else None,
+            "desk": self._desk_stats(),
         }
+
+    def _desk_stats(self) -> dict[str, Any] | None:
+        try:
+            return {**dict(self._desk.counters), "off": self._desk.disabled}
+        except RuntimeError:   # the timeline thread added a key mid-copy
+            return None
 
     # -- logging -------------------------------------------------------------
 
@@ -1309,6 +1511,9 @@ class TimelineRecorder:
                       flush_every_s=FLUSH_EVERY_S, paused=self._paused,
                       presence=presence() if callable(presence) else None)
             self._foreground(self._root(int(u.GetForegroundWindow() or 0)), now)
+            add_listener = getattr(self._w, "add_layout_listener", None)
+            if callable(add_listener):
+                add_listener(self._on_layout)   # the desk record: the watcher's own layouts, measured once
         except BaseException as exc:
             self._start_error = exc
             self._ready.set()
@@ -1334,6 +1539,9 @@ class TimelineRecorder:
                         except Exception as exc:
                             self._log_error("acting", exc)
                         continue
+                    if not msg.hWnd and msg.message == WM_APP_DESK:
+                        self._desk_tick(time.time(), fresh=True)
+                        continue
                     u.TranslateMessage(ctypes.byref(msg))
                     u.DispatchMessageW(ctypes.byref(msg))
                 if quit_seen:
@@ -1350,12 +1558,16 @@ class TimelineRecorder:
                 now = time.time()
                 self._advance(now)
                 self._close(now)
+                self._desk.observe(now, None, screens="")
             except Exception as exc:
                 self._log_error("final_close", exc)
             self._cleanup()
             self._log("timeline_stop", stats=self.stats())
 
     def _cleanup(self) -> None:
+        remove_listener = getattr(self._w, "remove_layout_listener", None)
+        if callable(remove_listener):
+            remove_listener(self._on_layout)
         self._unhook_names()
         if self._fg_hook:
             self._user32.UnhookWinEvent(self._fg_hook)
@@ -1573,6 +1785,7 @@ class TimelineRecorder:
             self._gap_state()["blocked"] = True   # paused or locked: the time until the next row is no gap
             self._advance(now)
             self._close(now)
+            self._desk_tick(now)   # the desk stretch ends here too
             self._unhook_names()
             return True
         self._acc_at = now
@@ -2276,6 +2489,114 @@ class TimelineRecorder:
         except Exception as exc:   # never breaks the timeline
             self._log_error("on_front_change", exc)
 
+    # -- the desk record (phase 3.3) ----------------------------------------------------
+
+    def _on_layout(self, layout: Any) -> None:
+        """The watcher measured the desk (its hook thread): keep the layout, wake this thread. Returns at once."""
+        self._desk_layout = layout
+        if self._thread_id and self.alive:
+            self._user32.PostThreadMessageW(self._thread_id, WM_APP_DESK, 0, 0)
+
+    def _desk_tick(self, now: float, *, fresh: bool = False) -> None:
+        """Tell the desk record the desk now: the newest layout's windows (``fresh``: a layout came), with what plays,
+        the window in front, full screen, away and Yuki acting applied. Never raises."""
+        if self._desk.disabled:
+            return
+        try:
+            if self._blocked:
+                self._desk.observe(now, None, screens="")
+                return
+            layout, self._desk_layout = (self._desk_layout, None) if fresh else (None, self._desk_layout)
+            if layout is not None:
+                self._desk_read(layout)
+            if self._desk_wins is None:
+                return   # no layout measured yet (the watcher's visible reads off): nothing to record
+            st = self._current
+            self._desk.observe(now, self._desk_now(self._desk_wins), screens=self._desk_screens,
+                               away=st is not None and st.state == "away", by_yuki=self._acting is not None)
+            self._desk.flush(now)
+        except Exception as exc:  # noqa: BLE001 - never breaks the timeline
+            self._log_error("desk", exc)
+
+    def _desk_read(self, layout: Any) -> None:
+        """The windows of a measured layout as the desk record keeps them: per user window on a monitor its app key
+        (by its process, cached per window; the privacy rules' blocked apps and Yuki's own windows left out), monitor
+        (geometry against the layout's own monitors: no extra call), how it shows (``IsZoomed``; covering its monitor
+        = full screen) and whether it is mostly visible."""
+        from yuki.memory.deskhabits import screens_key
+
+        monitors = [tuple(int(v) for v in m) for m in layout.monitors]
+        self._desk_monitors = monitors
+        self._desk_screens = screens_key(monitors)
+        rules = self.privacy.rules()
+        if rules is not self._desk_rules:
+            self._desk_apps.clear()
+            self._desk_rules = rules
+        out: list[DeskWin] = []
+        alive: set[int] = set()
+        for s in layout.surfaces:
+            if s.kind != "window":
+                continue
+            alive.add(s.hwnd)
+            known = self._desk_apps.get(s.hwnd)
+            if known is None or known[0] != s.pid:
+                facts = self._procs.get(s.pid)
+                key = app_key(facts.process_name) or ""
+                if facts.is_own or rules.check_app(facts.process_name, facts.app_name):
+                    key = ""
+                known = (s.pid, key)
+                self._desk_apps[s.hwnd] = known
+            mon = desk_monitor(s.rect, monitors) if known[1] else None
+            if mon is None:
+                continue
+            if self._user32.IsZoomed(s.hwnd):
+                how = "max"
+            elif desk_covers(s.rect, monitors[mon]):
+                how = "full"
+            else:
+                how = "win"
+            out.append(DeskWin(hwnd=s.hwnd, app=known[1], monitor=mon, how=how,
+                               seen=s.visible_share >= DESK_SEEN_SHARE, title=s.title or ""))
+        for hwnd in [h for h in self._desk_apps if h not in alive]:
+            del self._desk_apps[hwnd]
+        self._desk_wins = out
+
+    def _desk_now(self, wins: list[DeskWin]) -> list[DeskWin]:
+        """``wins`` with the window in front, a full-screen window in front (the watcher measures no layout then: it
+        shows full screen on its monitor, one rectangle read) and what plays: a playing session's app key (as the
+        media reads resolve it) ties to its one window on the desk, else to the one whose title shows the session's
+        title (two strings the OS and the app wrote, compared in RAM), else to its app's top window."""
+        fg = self._fg
+        out = [replace(w, front=w.hwnd == fg, play=False) for w in wins]
+        st = self._current
+        if st is not None and st.fullscreen and st.hwnd == fg and st.process and not st.own:
+            key = app_key(st.process) or ""
+            try:
+                mon = desk_monitor(self._w._window_rect(fg), self._desk_monitors)
+            except Exception:  # noqa: BLE001
+                mon = None
+            if key and mon is not None:
+                out = [w for w in out if w.hwnd != fg]
+                out.insert(0, DeskWin(hwnd=fg, app=key, monitor=mon, how="full", seen=True, front=True))
+        titles: dict[str, list[str]] = {}
+        for app_id, _label, title in list(self._playing):
+            key = self._app_ids.get(app_id) or app_key(app_id) or ""
+            if key:
+                titles.setdefault(key, []).append(title)
+        for key, said in titles.items():
+            mine = [w for w in out if w.app == key]
+            if not mine:
+                continue
+            pick = mine[0]
+            if len(mine) > 1:
+                wanted = [" ".join(t.casefold().split()) for t in said]
+                named = [w for w in mine if any(len(t) >= 3 and t in " ".join(w.title.casefold().split())
+                                                for t in wanted)]
+                if len(named) == 1:
+                    pick = named[0]
+            pick.play = True
+        return out
+
     # -- tick --------------------------------------------------------------------------
 
     def _tick(self, now: float) -> None:
@@ -2319,6 +2640,7 @@ class TimelineRecorder:
             # an unsettled stretch waits for its page (at most PAGE_WAIT_S): its privacy is not known yet
             if st is not None and self._current is st and st.settled:
                 self._write(st, now)
+        self._desk_tick(now)   # what plays, away, full screen and Yuki acting may have changed the desk
 
     def _on_title(self, now: float) -> None:
         st = self._current
