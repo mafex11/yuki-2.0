@@ -3604,19 +3604,57 @@ MIGRATIONS: tuple[str, ...] = (
     """
     SELECT 1;
     """,
+    # 46 (2026-10-18, pMem; docs/research/audit-2026-10-18/builds/pMem.md section 3): data only, no schema change.
+    # Migration 45 ran early under a test of the new build while the old build was still installed, and the old demo
+    # learner wrote 13 more rows (state candidate) at 03:43-03:46 that night. Every row of RETIRED_PLAYBOOK_ORIGINS not
+    # yet retired is retired the same way (Store._migrate_46); the count goes to nudge_state CLEANUP_STATE_46.
+    """
+    SELECT 1;
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
 #: -> the :class:`Store` method's name): data moves that need the store's key (an HMAC identity, a decryption).
-PY_MIGRATIONS: dict[int, str] = {26: "_migrate_27", 44: "_migrate_45"}
-#: Migration 45: the playbook origins the old learners wrote (the demo learner, the habit miner, the old loop's
+PY_MIGRATIONS: dict[int, str] = {26: "_migrate_27", 44: "_migrate_45", 45: "_migrate_46"}
+#: Migrations 45 and 46: the playbook origins the old learners wrote (the demo learner, the habit miner, the old loop's
 #: session pitfalls and slider ways, the run learner's post-mortems and distills, the know-how intake). All retired.
 RETIRED_PLAYBOOK_ORIGINS: tuple[str, ...] = ("demo", "miner", "session", "postmortem", "knowhow", "distill", "slider")
 #: Migration 45: the old learners' state rows in nudge_state (names, and prefixes ending in ":").
 RETIRED_STATE_ROWS: tuple[str, ...] = ("trace:demos", "trace:demos_state", "trace:go_tos_served", "trace:habits",
                                        "trace:habits:app:", "trace:learn", "trace:tasks", "trace:tasks:noise")
-#: Where migration 45 leaves its counts (JSON, content-free).
+#: Where migrations 45 and 46 leave their counts (JSON, content-free).
 CLEANUP_STATE = "cleanup:v45"
+CLEANUP_STATE_46 = "cleanup:v46"
+
+
+def _retire_old_learners(conn: sqlite3.Connection, now: float) -> dict[str, int]:
+    """Migrations 45 and 46 (inside their transaction): every playbook row of :data:`RETIRED_PLAYBOOK_ORIGINS` not yet
+    retired (its state, or no ``valid_to``) retired, and the old learners' state rows (:data:`RETIRED_STATE_ROWS`)
+    removed. Counts only; idempotent (a second run changes nothing)."""
+    marks = ",".join("?" * len(RETIRED_PLAYBOOK_ORIGINS))
+    out: dict[str, int] = {}
+    try:
+        out["playbooks_retired"] = int(conn.execute(
+            f"UPDATE playbooks SET state = 'retired', valid_to = coalesce(valid_to, ?), updated_at = ? WHERE"
+            f" (valid_to IS NULL OR state != 'retired') AND origin IN ({marks})",
+            (now, now, *RETIRED_PLAYBOOK_ORIGINS)).rowcount or 0)
+    except sqlite3.OperationalError:   # an older database without practice memory
+        out["playbooks_retired"] = 0
+    gone = 0
+    for name in RETIRED_STATE_ROWS:
+        if name.endswith(":"):
+            gone += int(conn.execute("DELETE FROM nudge_state WHERE name >= ? AND name < ?",
+                                     (name, name[:-1] + chr(ord(":") + 1))).rowcount or 0)
+        else:
+            gone += int(conn.execute("DELETE FROM nudge_state WHERE name = ?", (name,)).rowcount or 0)
+    out["state_rows"] = gone
+    return out
+
+
+def _put_cleanup(conn: sqlite3.Connection, name: str, counts: dict[str, int], now: float) -> None:
+    conn.execute("INSERT INTO nudge_state(name, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE"
+                 " SET value = excluded.value, updated_at = excluded.updated_at",
+                 (name, json.dumps(counts, sort_keys=True), now))
 #: When the timeline began judging meetings by call evidence live (written by migration 27): meeting rows that ended
 #: before it are checked against the call rows when read (:meth:`Store._meetings_proven`).
 MEETING_GATE_CHECKPOINT = "meeting_evidence_since"
@@ -3959,26 +3997,18 @@ class Store:
         from yuki.memory import testtag
 
         now = time.time()
-        marks = ",".join("?" * len(RETIRED_PLAYBOOK_ORIGINS))
-        out: dict[str, int] = {}
-        try:
-            out["playbooks_retired"] = int(conn.execute(
-                f"UPDATE playbooks SET state = 'retired', valid_to = ?, updated_at = ? WHERE valid_to IS NULL AND"
-                f" origin IN ({marks})", (now, now, *RETIRED_PLAYBOOK_ORIGINS)).rowcount or 0)
-        except sqlite3.OperationalError:   # an older database without practice memory
-            out["playbooks_retired"] = 0
-        gone = 0
-        for name in RETIRED_STATE_ROWS:
-            if name.endswith(":"):
-                gone += int(conn.execute("DELETE FROM nudge_state WHERE name >= ? AND name < ?",
-                                         (name, name[:-1] + chr(ord(":") + 1))).rowcount or 0)
-            else:
-                gone += int(conn.execute("DELETE FROM nudge_state WHERE name = ?", (name,)).rowcount or 0)
-        out["state_rows"] = gone
+        out = _retire_old_learners(conn, now)
         out.update({f"test_{k}": v for k, v in testtag.purge(conn, self._dec, now=now).items()})
-        conn.execute("INSERT INTO nudge_state(name, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE"
-                     " SET value = excluded.value, updated_at = excluded.updated_at",
-                     (CLEANUP_STATE, json.dumps(out, sort_keys=True), now))
+        _put_cleanup(conn, CLEANUP_STATE, out, now)
+        return out
+
+    def _migrate_46(self, conn: sqlite3.Connection) -> dict[str, int]:
+        """Migration 46's data step (inside its transaction): what the old build wrote after migration 45 had run
+        under it (13 demo rows, state candidate, and its state rows again) retired and removed as 45 does. Counts only,
+        kept in ``nudge_state`` :data:`CLEANUP_STATE_46`; idempotent."""
+        now = time.time()
+        out = _retire_old_learners(conn, now)
+        _put_cleanup(conn, CLEANUP_STATE_46, out, now)
         return out
 
     def _migrate_27(self, conn: sqlite3.Connection) -> dict[str, int]:

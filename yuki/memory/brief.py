@@ -28,9 +28,10 @@ machine format). What fails is dropped and logged, never cut blind.
   (typed and voice alike: the voice thinker had no portrait at all);
 * ``talker`` - ``with_him``, names and relations, ``own_bits`` and ``careful``, at most :data:`TALKER_CHARS`: how to
   speak with the user. It is the talker's speaking style only, never what limits a decision: what the user would like,
-  their usual, their things and what they do at this hour reach every decider through the you-card
-  (``yuki.memory.youcard``, audit 17 Oct contract C1). The 25 Sept rule stays a rule about answering (a question about
-  their day is answered from the day digest or a lookup, never from this slice), not about choosing;
+  their usual, their things, what they are in the middle of and the brief's dated live items reach every decider
+  through the you-card (``yuki.memory.youcard``; decision 3, 18 Oct, lifted the 25 Sept "tone and names, never news"
+  rule for choosing). A question about their day is still answered from the day digest or a lookup, never from this
+  slice;
 * ``cards`` - the whole brief as the card writers' ABOUT THE USER lines, instead of portrait facts.
 
 **Measuring personal-ness** (P4): every reply and card records which brief lines and memory items were in its context
@@ -586,7 +587,8 @@ def slice_for(brief: dict[str, Any] | None, consumer: str, *, at: float | None =
     if consumer == "thinker":
         when = f" ({datetime.fromtimestamp(at):%Y-%m-%d})" if at else ""
         return {"text": _render(lines, THINKER_HEAD.format(when=when)), "ids": [i for i, _s, _t in lines], "at": at}
-    # talker: the speaking style (no "now", no routine, no routes: those reach every decider in the you-card)
+    # talker: the speaking style (no "now", no routine, no routes: those reach every decider in the you-card, the
+    # talker's included: decision 3)
     people = [p for p in (brief or {}).get("people") or [] if isinstance(p, dict) and p.get("name")]
     with_him = [x for x in lines if x[1] == "with_him"]
     bits = [x for x in lines if x[1] == "own_bits"]
