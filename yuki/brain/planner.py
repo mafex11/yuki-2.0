@@ -414,19 +414,16 @@ class ModelCall:
         emit: Pushes events to the caller (thread-safe).
         cancelled: Whether the request was cancelled.
         log: ``log(type, **fields)`` (content-free fields only).
-        voice: Hand a voice step's words on as ``Partial("step", ...)``.
     """
 
     def __init__(self, client: Any, params: dict[str, Any], *, checks: Checks, emit: Callable[[AgentEvent], None],
-                 cancelled: Callable[[], bool], log: Callable[..., Any], voice: bool = False,
-                 stream: bool = True) -> None:
+                 cancelled: Callable[[], bool], log: Callable[..., Any], stream: bool = True) -> None:
         self._client = client
         self.params = params
         self.checks = checks
         self._emit = emit
         self.cancelled = cancelled
         self._log = log
-        self._voice = voice
         self._stream_mode = stream
         self._mgr: Any = None
         self._stream: Any = None

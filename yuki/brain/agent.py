@@ -1746,10 +1746,9 @@ class Brain:
             params = build_params(model=bs.model, max_tokens=state.max_tokens or bs.max_tokens, system=system,
                                   messages=conv.messages(), effort=effort, thinking_display=bs.thinking_display,
                                   stream=bs.stream, eager=bs.eager)
-            # a tidy-up turn's steps are said after the request's line, never as they stream (P1.3)
+            # no step is said as it streams (aBrain, phase 2.3: the executor says a slow one in the goal's words)
             call = ModelCall(self.client, params, checks=checks, emit=self._push, cancelled=self._cancelled.is_set,
-                             log=self.logger.log, voice=req.channel == "voice" and not self._tidying(state),
-                             stream=bs.stream)
+                             log=self.logger.log, stream=bs.stream)
             state.calls += 1
             result: ExecResult | None = None
             try:
