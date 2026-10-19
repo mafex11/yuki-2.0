@@ -242,7 +242,8 @@ QUESTION_PART_CALLS = 2
 #: (code's question). No flag: no turn, no cost.
 TIDY_CALLS = 1
 #: The read verbs whose results are content for the user (a look reads the screen to check or to find a control).
-ANSWER_READ_VERBS: frozenset[str] = frozenset({"memory", "fetch"})
+#: desk22 (A13): a ``keep_way`` step's result (code's line on what was kept) is answered from too.
+ANSWER_READ_VERBS: frozenset[str] = frozenset({"memory", "fetch", "keep_way"})
 #: pBrain (B35, bRound2 "Sending to हेमंत"): the bound on the people-index read that gives a spoken line memory's own
 #: name for a send's recipient (:meth:`Brain._said_name`).
 SAID_NAME_TIMEOUT_S = 0.8
@@ -2229,6 +2230,15 @@ class Brain:
                 return ToolRun("fetch", "fetch_url", False, "Not run: an outbound read after a private one goes "
                                                             "through the executor's check.")
             run = run_fetch(self.dispatcher, {"url": value} if web else {"path": value}, nonce=nonce)
+        elif step.verb == "keep_way":
+            # desk22 (A13): with no executor nothing acted here, so the steps kept are the newest request's
+            from yuki.brain.executor import LINE_WAY_FAILED, LINE_WAY_KEPT, LINE_WAY_NONE, keep_way
+
+            name = " ".join(str(step.value or "").split())
+            key, why = keep_way(self.memory, name)
+            text = (LINE_WAY_KEPT.format(name=name) if key else LINE_WAY_NONE if why == "no_steps"
+                    else LINE_WAY_FAILED)
+            run = ToolRun("keep_way", "keep_way", key is not None, text)
         else:
             seconds = min(10.0, max(0.0, float(step.value or 0)))
             self._cancelled.wait(seconds)
@@ -2448,10 +2458,18 @@ class Brain:
         tidy-up turn's does); the :class:`Final` is that line and code's tidy words after it (the step it took, or
         plainly that it did not take; none when it was left), with ``outcome["said_first"]`` the part already said.
         Once per request (``state.tidied``). ``True`` when the request ended here; ``False``: no such step (the
-        planner's tidy-up turn as before, :meth:`_tidy_turn`)."""
+        planner's tidy-up turn as before, :meth:`_tidy_turn`).
+
+        desk22 (decision D6): a window flag with no legal step (``Executor.flag_words``: code's measured line about
+        what is covered, "Discord is covering Chrome.") ends the same way, with that line after the request's and no
+        planner turn for it (the dial at "do" or "ask": no step means nothing to ask about), never silence."""
         executor = getattr(self, "_executor", None)
         if (not result.after or state.tidied or executor is None or not hasattr(executor, "take_tidy_step")
-                or not executor.has_tidy_step() or self._cancelled.is_set()):
+                or self._cancelled.is_set()):
+            return False
+        stepped = executor.has_tidy_step()
+        flagged = getattr(executor, "has_flag_words", None)
+        if not stepped and not (callable(flagged) and flagged()):
             return False
         from yuki.brain.util import TIDY_OFF, tidy_mode
 
@@ -2460,11 +2478,14 @@ class Brain:
             return False
         state.tidied = True
         self._push(Say(line))
-        words = " ".join(str(executor.take_tidy_step(mode) or "").split())
+        told = getattr(executor, "flag_words", None)
+        words = " ".join(str((executor.take_tidy_step(mode) if stepped else told() if callable(told) else "")
+                             or "").split())
         text = f"{line.rstrip()} {words}".strip() if words else line
         # review M2 (as the tidy-up turn's ending): the line went out as code said it, so no talker re-words it
         ended = {**dict(outcome or {}), "said_first": line, "evidence": "", **({"line": text} if words else {})}
-        self.logger.log("brain_tidy", given=False, by_code=True, mode=mode, status=result.status, said=bool(words))
+        self.logger.log("brain_tidy", given=False, by_code=True, mode=mode, status=result.status, said=bool(words),
+                        step=stepped)
         self._final(text, ended)
         return True
 

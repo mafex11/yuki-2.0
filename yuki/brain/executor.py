@@ -100,7 +100,9 @@ ACT_VERBS: tuple[str, ...] = ("launch_app", "focus_window", "open_url", "window_
                               "hotkey", "press", "scroll", "set_slider", "app_volume", "run_powershell",
                               "write_clipboard", "run_skill", "open_yuki")
 READ_VERBS: tuple[str, ...] = ("look", "memory", "fetch")
-VERBS: tuple[str, ...] = ACT_VERBS + READ_VERBS + ("wait",)
+#: desk22 (A13): the plan's step that keeps the steps just done as the user's own told way (contract C13)
+KEEP_WAY_VERB = "keep_way"
+VERBS: tuple[str, ...] = ACT_VERBS + READ_VERBS + ("wait", KEEP_WAY_VERB)
 #: ``look``'s ``value``: what to read, and the Dispatcher tool that reads it.
 LOOK_TOOLS: dict[str, str] = {"window": "look_at_window", "desktop": "look_at_desktop", "focus": "look_at_focus",
                               "page": "read_page", "tabs": "read_tabs", "clipboard": "read_clipboard",
@@ -185,10 +187,15 @@ LINE_BEHIND_TAB = "What was playing is still playing behind it."
 TIDY_WHERE: dict[str, str] = {"other": "your other screen", "left": "the left half", "right": "the right half"}
 #: aBrain (phase 2.3; 18 Oct live A: "Opening a page in Google Chrome." and "Clicking in Google Chrome." said by code
 #: as every narrated step started): nothing is said as a step starts. A step still running after SLOW_STEP_S (s) is
-#: said once, in the plan's goal's words (voice only; never a tidy-up step), so a quick step is silent and a slow one
-#: says what Yuki is after, not which verb runs. Once per goal: a replan with the same goal says nothing again.
+#: said once (voice only; never a tidy-up step), so a quick step is silent. desk22 (A12, final-D msg_hemanth_misheard:
+#: "Still on it: Ask Hemanth ..." read the plan's goal, the user's own words, back word for word): the line is code's
+#: words for the step that is slow and the app it acts in (:data:`STOPPED_WHAT_APP`: "Still on it: typing in
+#: Discord."), else the app alone ("Still on it in Discord."), else plainly; never the goal's or the step's free text.
+#: Once per request: a replan says nothing again.
 SLOW_STEP_S = 2.5
-LINE_SLOW_STEP = "Still on it: {goal}."
+LINE_SLOW_STEP = "Still on it: {what}."
+LINE_SLOW_APP = "Still on it in {app}."
+LINE_SLOW_PLAIN = "Still on it."
 #: aBrain (phase 2.5, "a done probe is required when an act can be read"): a plan by steps that wrote done none is read
 #: by the probe its last readable act step's effect names (verb and its closed values -> probe; data, never a reading
 #: of their words): what the act changed (the page, the front, a window's state, a closed window or tab, a typed box,
@@ -220,6 +227,130 @@ def _warm_desk() -> None:
         situation.warm()
     except Exception:  # noqa: BLE001
         pass
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# desk22 (A13, contract C13): "remember how I do this": a told way kept at once from the steps a request just ran
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: The verbs a told way may be built from (desk acts, our own verb names): a skill run, a read, a volume, a script
+#: or a clipboard write is no part of a way's recorded path.
+WAY_VERBS: frozenset[str] = frozenset({"launch_app", "focus_window", "open_url", "window_action", "tab", "click",
+                                       "type_text", "hotkey", "press", "scroll", "set_slider"})
+#: How long the newest request's steps stay what "the steps just done" means (s), and the most kept.
+LAST_STEPS_KEEP_S = 1800.0
+LAST_STEPS_MAX = 24
+#: Code's lines for the keep, said by whoever asked (the talker's hand, the planner's step result).
+LINE_WAY_KEPT = "Got it: I'll do it that way when you ask for {name}."
+LINE_WAY_NONE = "I haven't done any steps yet that I could keep as your way."
+LINE_WAY_FAILED = "I couldn't keep that as your way."
+_last_steps: dict[str, Any] = {}
+_last_lock = threading.Lock()
+
+
+def way_step(verb: Any, *, app: Any = "", role: Any = "", name: Any = "", value: Any = None, submit: bool = False,
+             ok: bool = True) -> dict[str, Any] | None:
+    """One step of an act in the shape ``ways.spec_from_steps`` takes (contract C13): ``{"verb", "app", "role",
+    "name", "value", "submit", "ok"}``. ``verb``: our own verb names (:data:`WAY_VERBS`; the talker's hands map to
+    them: :func:`yuki.voice.hands.way_step_of`); ``app``: the program the step acted in (raw, as Windows names it);
+    ``role`` / ``name``: the control as the window's read showed it; ``value``: the step's closed values only (a click's
+    button, a window or tab action, a chord or key, an app's name, a page's address); typed text is never kept (a
+    ``type_text`` step's value is ``None``: the way's text is a slot). ``None`` for any other verb. Pure."""
+    verb = str(verb or "")
+    if verb not in WAY_VERBS:
+        return None
+    kept = None if verb == "type_text" or value is None else " ".join(str(value).split())[:300] or None
+    return {"verb": verb, "app": " ".join(str(app or "").split()), "role": " ".join(str(role or "").split())[:60],
+            "name": " ".join(str(name or "").split())[:120], "value": kept, "submit": bool(submit),
+            "ok": bool(ok)}
+
+
+def way_end(steps: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The checked end a told way's steps came to, in ways' own terms (``END_FACTS``): text submitted in a field (the
+    last step a ``type_text`` with Enter after, or an Enter right after typing) -> ``{"kind": "field_submitted"}``,
+    else ``None``. Our own verbs and values, never words. Pure."""
+    acts = [s for s in steps or () if isinstance(s, Mapping)]
+    if not acts:
+        return None
+    last = acts[-1]
+    if last.get("verb") == "type_text" and last.get("submit"):
+        return {"kind": "field_submitted"}
+    if (len(acts) > 1 and last.get("verb") == "press" and str(last.get("value") or "").casefold() == "enter"
+            and acts[-2].get("verb") == "type_text"):
+        return {"kind": "field_submitted"}
+    return None
+
+
+def note_steps(steps: Sequence[Mapping[str, Any]], *, source: str) -> None:
+    """The newest request's act steps (``source``: ``planner`` or ``talker``), in :func:`way_step`'s shape, kept in
+    RAM for "remember how I do this" (:func:`keep_way`); a request with no such step keeps the older ones. Never
+    raises."""
+    try:
+        kept = [dict(s) for s in steps or () if isinstance(s, Mapping) and s.get("verb") in WAY_VERBS]
+        if not kept:
+            return
+        with _last_lock:
+            _last_steps.clear()
+            _last_steps.update({"steps": kept[-LAST_STEPS_MAX:], "at": time.monotonic(), "source": str(source)})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def last_steps(max_age_s: float = LAST_STEPS_KEEP_S) -> dict[str, Any] | None:
+    """The newest request's kept act steps (:func:`note_steps`) while fresh: ``{"steps", "at", "source"}``, else
+    ``None``."""
+    with _last_lock:
+        got = dict(_last_steps) if _last_steps else None
+    if not got or time.monotonic() - float(got.get("at") or 0.0) > max_age_s:
+        return None
+    return got
+
+
+def _way_app(steps: Sequence[Mapping[str, Any]]) -> str:
+    """The app a told way runs in: the program its last acting step with an app acted in (raw)."""
+    for s in reversed(list(steps or ())):
+        app = " ".join(str(s.get("app") or "").split()) if isinstance(s, Mapping) else ""
+        if app:
+            return app
+    return ""
+
+
+def keep_way(memory: Any, name: str, steps: Sequence[Mapping[str, Any]] | None = None) -> tuple[str | None, str]:
+    """desk22 (A13, contract C13): keep the steps just done (``steps``, else :func:`last_steps`) as the user's own told
+    way, named ``name`` (their words for it): ``ways.spec_from_steps(app, steps, end=...)`` builds the spec (skill22),
+    ``ways.keep_told(store, app=..., spec=..., name=...)`` keeps it at once; both read through ``getattr`` (no-op
+    before skill22's helper lands). ``memory``: a ``MemoryAccess`` (its ``call``) or a client / store holder.
+    Returns ``(key or None, why)``: ``why`` is a content-free code word (``kept``, ``no_name``, ``no_steps``,
+    ``no_helper``, ``no_spec``, ``no_memory``, ``failed``). Never raises."""
+    name = " ".join(str(name or "").split())
+    if not name:
+        return None, "no_name"
+    try:
+        got = list(steps) if steps else list((last_steps() or {}).get("steps") or [])
+        got = [dict(s) for s in got if isinstance(s, Mapping) and s.get("verb") in WAY_VERBS and s.get("ok", True)]
+        if not got:
+            return None, "no_steps"
+        from yuki.skills.learn import ways
+
+        build = getattr(ways, "spec_from_steps", None)
+        keep = getattr(ways, "keep_told", None)
+        if not callable(build) or not callable(keep):
+            return None, "no_helper"
+        app = _way_app(got)
+        spec = build(app, got, end=way_end(got))
+        if not isinstance(spec, Mapping) or not spec:
+            return None, "no_spec"
+        if memory is None:
+            return None, "no_memory"
+
+        def run(client: Any) -> Any:
+            return keep(getattr(client, "store", client), app=app, spec=dict(spec), name=name)
+
+        call = getattr(memory, "call", None)
+        key = call("keep_told", run, timeout_s=2.0) if callable(call) and not hasattr(memory, "store") else run(memory)
+        return (str(key), "kept") if key else (None, "failed")
+    except Exception:  # noqa: BLE001
+        return None, "failed"
 
 
 def _foreground_now() -> int:
@@ -550,16 +681,21 @@ class Executor:
         #: place / maximize / fullscreen / restore, a skill run given a place: ``diff.arranges``): code's tidy step
         #: never moves one away again (``diff.tidy_guard``'s ``asked_place``)
         self._desk_arranged: set[int] = set()
+        #: desk22 (A24): the windows (ids) and browsers (names) this request's steps opened a page in (an open_url, a
+        #: skill of kind ``open``): ``diff.compare``'s ``opened``, for the single-session autoplay tab cover
+        self._desk_opened: set[Any] = set()
         #: integration review c2desk-1: the apps whose mixer rows this request's acts set (an app_volume step's app, a
         #: skill run's measured apps): the after-look's ``left_silent`` scope only, never its window scope
         self._desk_sound: set[Any] = set()
         #: integration review c2desk-2: the after-look's measured line for what didn't reach its purpose ("" none)
         self._purpose_line = ""
+        #: desk22 (D6): the after-look's measured line for a window flag with no legal step ("" none: :meth:`flag_words`)
+        self._flag_line = ""
         #: P1.3: the after-look's diff when a flag was up (what a tidy-up may touch: :meth:`_tidy_mine`), and how many
         #: tidy steps changed something (a done re-check that reads after one is not a false done)
         self._after_diff: Any = None
         self._tidy_changed = 0
-        #: aBrain: the goals a slow step was said in (:meth:`_slow_watch`: once each)
+        #: aBrain: whether a slow step was said in this request (:meth:`_slow_watch`: desk22 A12, once a request)
         self._slow_said: set[str] = set()
         #: P1.3: the tidy-up turn, while it runs (:meth:`tidy_up`): ``{"mode", "acts", "words"}``; ``None`` otherwise
         self.tidy: dict[str, Any] | None = None
@@ -651,6 +787,10 @@ class Executor:
         if verb == "wait":
             self._join_reads()
             return self._stop_if(self._wait(index, step))
+        if verb == KEEP_WAY_VERB:
+            # desk22 (A13): in the plan's order, after the acts before it (never beside them)
+            self._join_reads()
+            return self._stop_if(self._keep_way_step(index, step))
         call, why = self._resolve(index, step)
         if call is None:
             return self._stop_if(self._mismatch_result(index, why))
@@ -703,6 +843,14 @@ class Executor:
                     self._join_reads()
                     return self._finished(stop)
             self._join_reads()
+            for i, step in enumerate(self.steps):
+                # desk22 (A13): an answer plan's keep_way ("remember how I do this" after a request): kept now, its
+                # line among the reads the planner answers from (an ask plan keeps nothing before their answer)
+                if self.statuses[i].state == "pending" and self._verb(step) == KEEP_WAY_VERB:
+                    if kind == "answer":
+                        self._keep_way_step(i, step)
+                    else:
+                        self.statuses[i].state, self.statuses[i].why = "skipped", "kept only in an act or answer plan"
             if kind == "ask":
                 self.lease.release()   # the desk is free while the user answers; the next act step takes it again
                 return self._finished(RunResult("ask", line=words(field_of(self.head, "question", ""))))
@@ -716,6 +864,10 @@ class Executor:
             # words, said after the request's line; no done-check, no after-look again
             said = " ".join(w for w in self.tidy["words"] if w)
             return self._finished(RunResult("done", line=said, final=True, outcome={}))
+        if (any(self._verb(s) == KEEP_WAY_VERB for s in self.steps)
+                and not any(self._verb(s) in ACT_VERBS for s in self.steps)):
+            # desk22 (A13): a plan that only kept a way (and read) acted on nothing: its result is read and answered
+            return self._finished(RunResult("answer", reads=list(self.read_results)))
         result = self._done_check()
         if result.status == "done":
             result.after, result.after_facts = self.after_look()
@@ -753,6 +905,7 @@ class Executor:
         self.lease.release()
         if self._pool is not None:
             self._pool.shutdown(wait=False)
+        note_steps(self.way_steps(), source="planner")   # desk22 (A13): "remember how I do this" reads these next
         run = self._run_row(reply=reply, outcome=outcome)
         thread = self._recheck
         if thread is not None and thread.is_alive():
@@ -775,6 +928,7 @@ class Executor:
         """What this request's acts did to the desk (module docstring): ``(the "After:" block, the diff's facts)``;
         the block is ``""`` when no flag is up (no turn, no cost). Logged content-free. Never raises."""
         self._purpose_line = ""   # integration review c2desk-2: this look's own, never an earlier plan's
+        self._flag_line = ""   # desk22 (D6): this look's own too
         self._after_step = self._after_state = self._after_front = None
         if self.tidy is not None or self._desk_first is None:
             return "", {}
@@ -791,7 +945,8 @@ class Executor:
             # by id, a launched or acted-in program, an owner among the acts' windows); else the user opened it
             d = desk_diff.compare(self._desk_first, after, acted=tuple(self._desk_asked),
                                   touched=tuple(self._desk_touched), sound_apps=tuple(self._desk_sound | named),
-                                  fresh=tuple(self._desk_launched | self._desk_programs))
+                                  fresh=tuple(self._desk_launched | self._desk_programs),
+                                  opened=tuple(self._desk_opened))
             facts = d.facts()
             self._emit_log("after_look", ms=round(float(getattr(after, "ms", 0.0) or 0.0), 1), **facts)
             if not d.any_flag:
@@ -813,7 +968,11 @@ class Executor:
             step = desk_diff.tidy_step(d, self._tidy_ours(d), front, len(getattr(after, "monitors", None) or ()))
             self._after_step = step
             self._after_state, self._after_front = after, done.as_hwnd(getattr(after, "foreground", None))
-            self._emit_log("after_step", action=(step or {}).get("action"), flag=(step or {}).get("flag"))
+            # desk22 (decision D6): a window flag with no legal step gets code's one measured line about what is
+            # covered (said after the request's line by the Brain, :meth:`flag_words`), never silence
+            self._flag_line = "" if step else desk_diff.flag_line(d, name=util.app_name)
+            self._emit_log("after_step", action=(step or {}).get("action"), flag=(step or {}).get("flag"),
+                           flag_line=bool(self._flag_line))
             return f"After:\n{text}\n\nThe desk now:\n{desk}", facts
         except Exception as exc:  # noqa: BLE001 - no look: the request ends as before
             self._emit_log("after_look", error=type(exc).__name__)
@@ -843,6 +1002,20 @@ class Executor:
     def has_tidy_step(self) -> bool:
         """tidy21: whether the latest after-look holds one legal tidy step for code to take (:meth:`take_tidy_step`)."""
         return bool(self._after_step) and self._after_diff is not None and self.tidy is None
+
+    def has_flag_words(self) -> bool:
+        """desk22 (D6): whether the latest after-look holds code's no-step line (:meth:`flag_words`)."""
+        return bool(self._flag_line) and self.tidy is None
+
+    def flag_words(self) -> str:
+        """desk22 (decision D6): code's one line when the latest after-look flagged a window but measured no legal
+        step (``diff.flag_line``: "Discord is covering Chrome."); ``""`` otherwise. Taken once per request (the Brain
+        says it after the request's line, with no planner turn for it). Never raises."""
+        line, self._flag_line = self._flag_line, ""
+        if line:
+            self._emit_log("tidy", verb="window_action", action=None, state="said", by_code=True, why="no_step",
+                           said=True)
+        return line if self.tidy is None and not self._closed else ""
 
     def take_tidy_step(self, mode: str) -> str:
         """tidy21 (the user's decision 1, 19 Oct; final-D S1: the planner's tidy turns took 0 of 3 steps): the Brain's
@@ -998,7 +1171,8 @@ class Executor:
             named = {a for a in self._desk_asked | self._desk_touched if isinstance(a, str)}
             d = desk_diff.compare(self._desk_first, now, acted=tuple(self._desk_asked),
                                   touched=tuple(self._desk_touched), sound_apps=tuple(self._desk_sound | named),
-                                  fresh=tuple(self._desk_launched | self._desk_programs))
+                                  fresh=tuple(self._desk_launched | self._desk_programs),
+                                  opened=tuple(self._desk_opened))
             front = d.focus_from if (d.flags or {}).get("focus_taken") else None
             again = desk_diff.tidy_step(d, self._tidy_ours(d), front, len(getattr(now, "monitors", None) or ()))
             hwnd = done.as_hwnd(step.get("hwnd"))
@@ -1164,11 +1338,41 @@ class Executor:
             elif call.tool == "focus_window":
                 # safety WW6: the window they asked to come up is where they asked for it (as a window focus)
                 self._desk_arranged |= {int(h) for h in hwnds}
-            elif call.tool == "run_skill" and words(call.input.get("place")):
+            elif call.tool == "run_skill" and self._skill_placed(call):
+                # desk22 (A22): a place given in the skill's slots counts as asked too (as the engine reads it)
                 self._desk_arranged |= {int(h) for h in hwnds}
                 self._desk_arranged |= {h for h in (done.as_hwnd(w) for w in payload.get("acted_windows") or ()) if h}
+            # desk22 (A24): the windows a step opened a page in (an open_url, a skill of kind open): the diff's
+            # single-session autoplay tab cover reads only these (a click or the next video never counts)
+            if call.tool == "open_url":
+                self._desk_opened |= hwnds
+                self._desk_opened |= {words(a) for a in (call.app, call.input.get("app")) if words(a)}
+            elif call.tool == "run_skill":
+                key = consent.skill_input(call, self.head)[0]
+                sk = util.skill(key) if key else None
+                if sk is not None and str(getattr(sk, "kind", "") or "") == "open":
+                    self._desk_opened |= hwnds
+                    self._desk_opened |= {h for h in (done.as_hwnd(w) for w in payload.get("acted_windows") or ())
+                                          if h}
+                    self._desk_opened |= {words(a) for a in payload.get("acted_apps") or () if words(a)}
         except Exception:  # noqa: BLE001 - bookkeeping only
             pass
+
+    def _skill_placed(self, call: Call) -> bool:
+        """desk22 (A22): whether a ``run_skill`` step was given a place, read as the engine reads it
+        (``engine.place_arg``: the step's ``place``, else a ``place`` among its slots when the skill has no slot of
+        that name). Our own field names, never words. Never raises (``False``)."""
+        try:
+            if words(call.input.get("place")):
+                return True
+            key, slots = consent.skill_input(call, self.head)
+            if not isinstance(slots, Mapping) or "place" not in slots:
+                return False
+            from yuki.skills.engine import place_arg
+
+            return place_arg(str(key or ""), dict(call.input or {}), dict(slots))[0] is not None
+        except Exception:  # noqa: BLE001
+            return False
 
     def _tidy_gate(self, index: int, call: Call) -> RunResult | None:
         """The tidy-up turn's bounds: an undoable window step (``plan.TIDY_ACTIONS``) on a window :meth:`_tidy_mine`
@@ -1371,6 +1575,8 @@ class Executor:
             self._join_reads()
             if verb == "wait":
                 result = self._wait(i, step)
+            elif verb == KEEP_WAY_VERB:
+                result = self._keep_way_step(i, step)   # desk22 (A13)
             else:
                 result = self._run_act(i, step)
             if result is not None:
@@ -1395,7 +1601,7 @@ class Executor:
                 if kind:
                     reads.add(kind)
                 continue
-            if verb == "wait":
+            if verb in ("wait", KEEP_WAY_VERB):
                 continue
             call = self._predicted(i, step, payload)
             if call is None:
@@ -1793,8 +1999,8 @@ class Executor:
         from yuki.brain.plan import PLACE_ACTIONS
 
         # aBrain (phase 2.3): nothing is said as the step starts; a step still running after SLOW_STEP_S is said once
-        # in the goal's words (a tidy-up's words come after the request's line, never here)
-        slow = self._slow_watch() if speak and self.tidy is None else None
+        # (desk22 A12: in code's words for the step and its app; a tidy-up's words come after the request's line)
+        slow = self._slow_watch(call) if speak and self.tidy is None else None
         try:
             with self._dispatch_lock:
                 if call.tool == "window_action" and str(call.input.get("action") or "") in PLACE_ACTIONS:
@@ -3618,6 +3824,68 @@ class Executor:
         except Exception:  # noqa: BLE001 - the trace never breaks a run
             pass
 
+    def way_steps(self) -> list[dict[str, Any]]:
+        """desk22 (A13): this request's act steps that took (their own report or the step check saw them), in
+        :func:`way_step`'s shape (contract C13): the verb, the program it acted in, the control's role and name, the
+        closed values only (never typed text). A tidy-up step (code's own) is no part of it. Never raises."""
+        out: list[dict[str, Any]] = []
+        try:
+            for s in self.trace:
+                if not isinstance(s, Mapping) or s.get("kind") != "action" or s.get("why") == "tidy_by_code":
+                    continue
+                if s.get("refused") or s.get("ok") is False or s.get("verdict") is False:
+                    continue
+                tool = str(s.get("tool") or "")
+                given = s.get("input") if isinstance(s.get("input"), Mapping) else {}
+                role, _bar, name = str(s.get("control") or "").partition("|")
+                value: Any = None
+                if tool == "click":
+                    value = "double" if given.get("clicks") == 2 else given.get("button")
+                elif tool in ("window_action", "tab"):
+                    value = given.get("action")
+                elif tool == "hotkey":
+                    keys = given.get("keys")
+                    value = "+".join(str(k) for k in keys) if isinstance(keys, (list, tuple)) else keys
+                elif tool == "press":
+                    value = given.get("key")
+                elif tool == "launch_app":
+                    value = given.get("query")
+                elif tool == "open_url":
+                    value = given.get("url")
+                step = way_step(tool, app=s.get("app") or "", role=role, name=name, value=value,
+                                submit=bool(given.get("press_enter")) if tool == "type_text" else False)
+                if step is not None:
+                    out.append(step)
+        except Exception:  # noqa: BLE001 - nothing kept
+            return out
+        return out
+
+    def _keep_way_step(self, index: int, step: Any) -> RunResult | None:
+        """desk22 (A13, contract C13): a plan's ``keep_way`` step ("remember how I do this"): this request's act steps
+        so far (:meth:`way_steps`), else the newest earlier request's (:func:`last_steps`: the planner's or the
+        talker's), kept at once as the user's own told way named by the step's value (:func:`keep_way`). Its result is
+        a read the planner answers from (code's line in it). Runs in the plan's order, never beside its acts. Logged
+        content-free. Never raises (the step fails)."""
+        status = self.statuses[index]
+        started = time.perf_counter()
+        name = words(field_of(step, "value", ""))
+        try:
+            own = self.way_steps()
+            key, why = keep_way(getattr(self.host, "memory", None), name, own or None)
+            ok = key is not None
+            line = (LINE_WAY_KEPT.format(name=name) if ok else LINE_WAY_NONE if why == "no_steps"
+                    else LINE_WAY_FAILED)
+        except Exception as exc:  # noqa: BLE001
+            ok, why, line = False, type(exc).__name__, LINE_WAY_FAILED
+            own = []
+        ms = round((time.perf_counter() - started) * 1000, 1)
+        status.state, status.tool, status.ms = ("ok" if ok else "failed"), "keep_way", ms
+        status.result = line
+        self.read_results.append({"i": index, "verb": "keep_way", "tool": "keep_way", "ok": ok, "text": line,
+                                  "ms": ms})
+        self._emit_log("keep_way", ok=ok, why=why, steps=len(own) or None, ms=ms)
+        return None
+
     def _run_row(self, *, reply: str, outcome: str) -> dict[str, Any]:
         """The run row (``MemoryAccess.record_run``), in the shape the old loop writes, with the done-check's verdict."""
         result = self._last_done
@@ -3686,18 +3954,40 @@ class Executor:
         except Exception:  # noqa: BLE001 - presentation only
             return ""
 
-    def _slow_watch(self) -> threading.Timer | None:
-        """aBrain (phase 2.3): a timer that says the plan's goal once (:data:`LINE_SLOW_STEP`) if the step about to run
-        is still running after :data:`SLOW_STEP_S`; the caller cancels it when the step returns. Voice only; ``None``
-        when nothing would be said (typed, no goal, that goal said already). Never raises."""
+    def _slow_line(self, call: Call | None) -> tuple[str, str]:
+        """desk22 (A12): ``(line, form)``: the slow step in code's words, from code facts only: the step's verb and the
+        app it acts in (its target window's program, else the plan's target app: :data:`STOPPED_WHAT_APP`, as
+        :meth:`_stop_words` names a stopped step), else the app alone, else the verb alone (:data:`STOPPED_WHAT`), else
+        plainly. Never the plan's goal or a step's free text. ``form`` is content-free (``step_app``, ``app``,
+        ``step``, ``plain``) for the log. Never raises."""
+        try:
+            target = field_of(field_of(self.head, "target", None), "app", None) if self.head is not None else None
+            tool = str(getattr(call, "tool", "") or "")
+            raw = str(getattr(call, "app", "") or "")
+            app = util.app_name(raw) if raw else (words(target) if target else "")
+            app = "" if app in ("", "It") else app
+            if app and tool in STOPPED_WHAT_APP:
+                return LINE_SLOW_STEP.format(what=STOPPED_WHAT_APP[tool].format(app=app)), "step_app"
+            if app:
+                return LINE_SLOW_APP.format(app=app), "app"
+            if tool in STOPPED_WHAT:
+                return LINE_SLOW_STEP.format(what=STOPPED_WHAT[tool]), "step"
+        except Exception:  # noqa: BLE001 - the plain line
+            pass
+        return LINE_SLOW_PLAIN, "plain"
+
+    def _slow_watch(self, call: Call | None = None) -> threading.Timer | None:
+        """aBrain (phase 2.3): a timer that says the slow step once if the step about to run is still running after
+        :data:`SLOW_STEP_S`; the caller cancels it when the step returns. desk22 (A12): in code's words for that step
+        and its app (:meth:`_slow_line`), never the goal read back; once per request. Voice only; ``None`` when nothing
+        would be said (typed, said already). Never raises."""
         try:
             if getattr(self.host, "channel", "") != "voice":
                 return None
-            goal = words(field_of(self.head, "goal", "")).rstrip(" .")
-            key = goal.casefold()
-            if not goal or key in self._slow_said:
+            if self._slow_said:
                 return None
-            line = LINE_SLOW_STEP.format(goal=goal)
+            line, form = self._slow_line(call)
+            key = "said"
 
             def fire() -> None:
                 try:
@@ -3705,7 +3995,7 @@ class Executor:
                         return
                     self._slow_said.add(key)
                     self._emit(Say(line[:160]))
-                    self._emit_log("slow_step", chars=len(line), after_s=SLOW_STEP_S)
+                    self._emit_log("slow_step", chars=len(line), after_s=SLOW_STEP_S, form=form)
                 except Exception:  # noqa: BLE001 - a line only
                     pass
 

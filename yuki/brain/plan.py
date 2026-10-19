@@ -44,7 +44,11 @@ ACT_VERBS: tuple[str, ...] = (
 )
 #: Read verbs: they change nothing (an answer plan holds only these). ``wait`` is a bounded pause.
 READ_VERBS: tuple[str, ...] = ("look", "memory", "fetch", "wait")
-VERBS: tuple[str, ...] = ACT_VERBS + READ_VERBS
+#: desk22 (A13, contract C13): "remember how I do this": a step that keeps the act steps just done (this request's,
+#: else the newest earlier one's) as the user's own told way, named by its value (``ways.keep_told``). It touches no
+#: window, so any plan kind may hold it; the executor runs it in the plan's order (``Executor._keep_way_step``).
+KEEP_VERBS: tuple[str, ...] = ("keep_way",)
+VERBS: tuple[str, ...] = ACT_VERBS + READ_VERBS + KEEP_VERBS
 
 KINDS: tuple[str, ...] = ("act", "answer", "ask")
 COMMITS: tuple[str, ...] = ("none", "send", "join", "lasting")
@@ -75,7 +79,7 @@ def probe_args_text() -> str:
         if name == "window_state":
             names = [n if n != "state" else "state=" + "|".join(_done.WINDOW_STATES) for n in names]
         parts.append(f"{name} {','.join(names)}")
-    return "done/expect args as a JSON string (? optional): " + "; ".join(parts)
+    return "done/expect args, JSON string (? optional): " + "; ".join(parts)
 
 #: What ``look`` reads (a step's value, the ``look`` tool's ``what``) and the windows it needs.
 LOOK_WHATS: tuple[str, ...] = ("desktop", "window", "page", "tabs", "focus", "clipboard", "system")
@@ -135,25 +139,26 @@ MEMORY_KINDS: tuple[str, ...] = (
 VERB_FIELDS: dict[str, str] = {
     "launch_app": "value: app name",
     "focus_window": "window",
-    "open_url": "window: its browser; value: address, file or folder",
+    "open_url": "window: its browser; value: url, file or folder",
     "window_action": "window; value: minimize|maximize|fullscreen|restore|focus|close|focus_back|undo|"
                      "place[:index|other|with:hwnd[:keep|maximize|left|right]]",
     "tab": "window; element: the tab; value: select|close",
     "click": "element; value: null|right|middle|double",
     "type_text": "element or focus; value: text; submit: Enter after",
-    "hotkey": "value: chord (ctrl+t)",
+    "hotkey": "value: chord, ctrl+t",
     "press": "value: one key",
-    "scroll": "element or window; value: notches, + is up",
+    "scroll": "element or window; value: notches (+ up)",
     "set_slider": "element; value: 0-100",
-    "app_volume": "target.app; value: 0-100, +N, -N, mute|unmute",
+    "app_volume": "target.app; value: 0-100|+N|-N|mute|unmute",
     "run_powershell": "value: command",
     "write_clipboard": "value: text",
     "run_skill": "value: JSON {\"skill\": id, \"slots\": {}, \"place\"?: monitor[:how]}",
     "open_yuki": "value: page",
-    "look": "value: what, as the look tool; window",
+    "look": "value: what (as look); window",
     "memory": "value: JSON memory args",
-    "fetch": "value: address or file path",
-    "wait": "value: seconds (max 10)",
+    "fetch": "value: url or path",
+    "wait": "value: seconds, max 10",
+    "keep_way": "value: a name; keeps the steps just done as their way",
 }
 
 #: String caps, enforced in code (strict mode has no ``maxLength``). Goal and question are cut to fit (display text);
@@ -249,7 +254,7 @@ def plan_schema() -> dict[str, Any]:
         "required": ["verb", "window", "element", "value", "submit", "expect"],
         "properties": {
             "verb": {"type": "string", "enum": list(VERBS)},
-            "window": _nullable("string", "An hwnd or a title."),
+            "window": _nullable("string", "An hwnd or title."),
             "element": element,
             "value": _nullable("string"),
             "submit": {"type": "boolean"},
@@ -1139,7 +1144,8 @@ def _check_verb(step: Step, header: Plan, checks: Checks, prior: Sequence[Step],
     if step.index >= MAX_STEPS:
         raise PlanError([f"{where}a plan holds at most {MAX_STEPS} steps: plan the first part, then look"])
     text = (value or "").strip()
-    if verb in ("launch_app", "open_url", "hotkey", "press", "run_powershell", "fetch", "open_yuki") and not text:
+    if verb in ("launch_app", "open_url", "hotkey", "press", "run_powershell", "fetch", "open_yuki",
+                "keep_way") and not text:
         errors.append(f"{where}{verb} needs value ({VERB_FIELDS[verb]})")
     if verb in ("type_text", "write_clipboard") and value is None:
         errors.append(f"{where}{verb} needs value ({VERB_FIELDS[verb]})")
@@ -1461,7 +1467,8 @@ class ExecResult:
 
 __all__ = [
     "send_text_error", "LINE_SEND_TEXT", "join_target_error", "join_slot_error", "LINE_JOIN_UNKNOWN",
-    "ACT_VERBS", "READ_VERBS", "VERBS", "KINDS", "COMMITS", "SKILL_PROBES", "GENERIC_PROBES", "PROBES", "PROBE_ARGS",
+    "ACT_VERBS", "READ_VERBS", "KEEP_VERBS", "VERBS", "KINDS", "COMMITS", "SKILL_PROBES", "GENERIC_PROBES", "PROBES",
+    "PROBE_ARGS",
     "ENGINE_ONLY_PROBES", "LOOK_WHATS", "WINDOW_ACTIONS", "PLACE_ACTION", "PLACE_ACTIONS", "PLACE_HOWS", "TIDY_ACTIONS",
     "WINDOWLESS_ACTIONS", "place_spec", "window_op", "TAB_ACTIONS", "MEMORY_KINDS", "VERB_FIELDS", "PLAN_TOOL",
     "STEPS_ROUTE", "SKILL_ROUTE_PREFIX", "MAX_STEPS", "plan_schema", "Target", "Consent", "Probe", "Element", "Step",

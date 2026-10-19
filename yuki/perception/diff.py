@@ -50,6 +50,14 @@ session: the playing tab was not what was asked (the new tab was), so it counts 
 the window is the ask's (a kind ``open`` skill marks the browser asked); it is the act's when the window is one of the
 act's (touched or asked), else the user's own (``(not from your act)``).
 
+desk22 (A24, desk19 review nit: "a tab cover missed when Chrome's single session turns into a new video autoplaying in
+the new tab"): a browser that shows one media session only (one session of that app id on both sides) moves it to the
+new tab that plays, so "the same session plays on" can't be read. When the act opened a page in that very window
+(``opened``: the caller's open acts, by id or app) and the window's one session now plays another title that the
+window's own title now holds (the new tab plays), it is a tab cover too, marked ``autoplay``: the new tab started
+playing over what was on. Without ``opened`` (a click on another video in the same tab, the next video, a pause) it is
+never one.
+
 The thresholds are measured shares (the 16 px occlusion grid) and text the OS and the apps wrote, compared as text
 (the window title holding the session's title: ``situation.map_media``'s own test), never a guess at meaning. Media and
 volume changes are only read when both snapshots read that part (``DeskState.errors``).
@@ -66,9 +74,13 @@ measured sentence for a tab the act put over what played (no window step touches
 whose own place or state the request asked for: :data:`ARRANGE_ACTIONS`), and says :func:`tidy_line`. "ask" keeps the
 yes/no question; "off" does nothing.
 
+**No legal step** (desk22, decision D6): a window flag up with no step that undoes it (one monitor and nothing taken, a
+minimised window, a cover by a window that is not the act's own, a pop-up) gets one short measured line of code's
+own, :func:`flag_line` ("Discord is covering Chrome."), never silence and never a model round for it.
+
 Public API::
 
-    compare(before, after, *, acted=(), touched=(), fresh=()) -> DeskDiff
+    compare(before, after, *, acted=(), touched=(), fresh=(), opened=()) -> DeskDiff
     render(diff, max_chars=500) -> str      # plain words for the decider (no header: the caller titles it "After:")
     DeskDiff.facts() -> dict                # content-free, for log lines
     tidy_step(d, acts, front, monitors) -> dict | None   # the one legal undoable window step (C7)
@@ -78,6 +90,7 @@ Public API::
     arranges(action) -> bool                # a window verb's action that sets the window's own place or state
     tidy_line(step, app, ok=True) -> str    # code's line for the step it took (or that did not take) (tidy21)
     step_app(step, state) -> str            # the raw app of the step's window in a desk read (tidy21)
+    flag_line(d, name=None) -> str          # code's line for a window flag no legal step undoes (desk22, D6)
 """
 
 from __future__ import annotations
@@ -148,6 +161,7 @@ class DeskDiff(_Rec):
         """Content-free, for log lines: counts and flags only."""
         return {"new": len(self.new_windows), "gone": len(self.gone_windows), "moved": len(self.moved),
                 "covered": len(self.covered), "tabs": sum(1 for c in self.covered if c.get("kind") == "tab"),
+                "tab_autoplay": sum(1 for c in self.covered if c.get("kind") == "tab" and c.get("autoplay")),
                 "uncovered": len(self.uncovered),
                 "focus_moved": self.focus_from != self.focus_to, "media": len(self.media_changes),
                 "volume": len(self.volume_changes), **{k: bool(v) for k, v in self.flags.items()},
@@ -194,18 +208,21 @@ def _moved(a: Window, b: Window) -> bool:
 
 def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
             touched: Iterable[Any] = (), sound_apps: Iterable[Any] | None = None,
-            fresh: Iterable[Any] = ()) -> DeskDiff:
+            fresh: Iterable[Any] = (), opened: Iterable[Any] = ()) -> DeskDiff:
     """What changed from ``before`` to ``after`` (two :func:`~yuki.perception.situation.snapshot` reads around one
     act), with the four flags (module docstring). ``acted``: what the request was about; ``touched``: the windows the
     act itself brought up or focused (ids or app names). ``sound_apps`` (integration review c2desk-1): when given, the
     apps whose mixer rows are the act's for ``left_silent`` alone (an app whose volume the act set touched none of its
     windows); ``None``: those of ``acted`` and ``touched``, as before. ``fresh`` (safety T-1): the programs (or ids)
     whose windows new since the before are the act's though no other window of theirs is (a launch's measured process,
-    a skill run's measured apps). Pure: no OS call. Never raises on odd input."""
+    a skill run's measured apps). ``opened`` (desk22, A24): the windows (ids or apps) an act opened a page in (an
+    open_url hand or step, a skill of kind ``open``), for the single-session autoplay tab cover only; ``()``: as before.
+    Pure: no OS call. Never raises on odd input."""
     diff = DeskDiff()
     acted_hwnds, acted_apps = _acted_sets(acted)
     touched_hwnds, touched_apps = _acted_sets(touched)
     fresh_hwnds, fresh_apps = _acted_sets(fresh)
+    opened_hwnds, opened_apps = _acted_sets(opened)
     old = {w.hwnd: w for w in before.windows}
     new = {w.hwnd: w for w in after.windows}
     act_ids = acted_hwnds | touched_hwnds
@@ -327,6 +344,12 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
         # a tab over what played (module docstring): the window that showed the playing session's title now shows
         # another one, and the same session plays on, in no other window; judged by the session, never "asked"
         if "media" not in before.errors and "media" not in after.errors:
+            def sessions_of(state: DeskState, sid: Any) -> list[Any]:
+                return [x for x in state.media if (x.app_id or x.app) == sid]
+
+            def opened_it(w: Window) -> bool:
+                return w.hwnd in opened_hwnds or (bool(opened_apps) and _key(w.app) in opened_apps)
+
             for m in before.media:
                 a = old.get(m.hwnd or 0) if m.playing else None
                 b = new.get(a.hwnd) if a is not None else None
@@ -338,7 +361,19 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
                 sid = m.app_id or m.app
                 on = next((x for x in after.media if x.playing and (x.app_id or x.app) == sid
                            and _squash(x.title) == title), None)
-                if on is None or (on.hwnd and on.hwnd != b.hwnd):
+                autoplay = False
+                if on is None:
+                    # desk22 (A24): a browser with one session (one of this app id on both sides) moved it to the new
+                    # tab the act opened in this very window, which plays another title the window now shows
+                    now = sessions_of(after, sid)
+                    playing_now = now[0] if len(now) == 1 and now[0].playing else None
+                    shown = _squash(playing_now.title) if playing_now is not None else ""
+                    if (not opened_it(b) or len(sessions_of(before, sid)) != 1 or playing_now is None
+                            or len(shown) < MEDIA_TITLE_MIN or shown == title or shown not in _squash(b.title)
+                            or (playing_now.hwnd and playing_now.hwnd != b.hwnd)):
+                        continue
+                    autoplay = True
+                elif on.hwnd and on.hwnd != b.hwnd:
                     continue
                 if any(c["hwnd"] == b.hwnd and c.get("kind") == "tab" for c in diff.covered):
                     continue
@@ -348,7 +383,7 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
                                      "after": round(float(b.visible), 3), "by": None, "by_app": None,
                                      "minimised": False, "attention": b.hwnd in diff.attention, "playing": True,
                                      "was_front": a.foreground, "asked": False, "by_act": mine, "side_effect": mine,
-                                     "by_mine": False, "media": m.title})
+                                     "by_mine": False, "media": m.title, "autoplay": autoplay})
 
         diff.focus_from, diff.focus_to = before.foreground, after.foreground
         diff.focus_by_act = bool(diff.focus_from != diff.focus_to and of_act(front_after))
@@ -479,6 +514,10 @@ def render(diff: DeskDiff, max_chars: int = 500) -> str:
         if c.get("kind") == "tab":
             # the window's own title is the new tab's now: said by id and app, with what plays on behind it
             playing = f'"{_title(c["media"], 40)}"' if c.get("media") else "what was playing"
+            if c.get("autoplay"):
+                # desk22 (A24): the browser's one session moved to the new tab, which started playing over it
+                lines.append(f"[{c['hwnd']}] {c['app']} (playing): a new tab started playing over {playing}{mine}.")
+                continue
             lines.append(f"[{c['hwnd']}] {c['app']} (playing): now shows another tab, {playing} plays on behind it"
                          f"{mine}.")
             continue
@@ -655,19 +694,26 @@ def tidy_step(d: Any, acts: Iterable[Any], front: Any, monitors: Any = None) -> 
 #: :func:`cover_line`'s words: what played, said by its own title when the session gave one (``{title}``), else plainly.
 LINE_TAB_COVER = "\"{title}\" is still playing in the other tab."
 LINE_TAB_COVER_PLAIN = "What was playing is still playing in the other tab."
+#: desk22 (A24): the single-session case: the new tab the act opened started playing over what was on (the session
+#: moved to it, so whether the old one still plays can't be read: what is measured is said).
+LINE_TAB_AUTOPLAY = "The new tab started playing over \"{title}\"."
+LINE_TAB_AUTOPLAY_PLAIN = "The new tab started playing over what was on."
 
 
 def cover_line(d: Any) -> str:
     """desk20 (final-D S3; contract C7): the measured sentence for a tab the act put over what played (a covered
     entry of kind ``tab`` that is the act's: ``side_effect``), said after the act's own line ("GitHub is up." then
     ``"BETA SQUAD UNO" is still playing in the other tab.``); ``""`` when there is none, or the cover is the user's own
-    (not from the act). No window step can touch a tab, so this is said, never undone. The session's title is content
-    (RAM only, never logged). Pure; never raises."""
+    (not from the act). desk22 (A24): an ``autoplay`` cover (the new tab started playing) says so
+    (:data:`LINE_TAB_AUTOPLAY`). No window step can touch a tab, so this is said, never undone. The session's title is
+    content (RAM only, never logged). Pure; never raises."""
     try:
         for c in getattr(d, "covered", None) or ():
             if c.get("kind") != "tab" or not c.get("side_effect"):
                 continue
             title = _title(c.get("media") or "", 40) if c.get("media") else ""
+            if c.get("autoplay"):
+                return LINE_TAB_AUTOPLAY.format(title=title) if title else LINE_TAB_AUTOPLAY_PLAIN
             return LINE_TAB_COVER.format(title=title) if title else LINE_TAB_COVER_PLAIN
         return ""
     except Exception:  # noqa: BLE001
@@ -729,6 +775,64 @@ def step_app(step: Any, state: Any) -> str:
         return ""
 
 
+#: desk22 (decision D6, 19 Oct: "no legal step, so the quiet note stays" -> one line about what is covered): code's
+#: measured line for a window flag no single undoable step undoes (``{by}``: the covering app, ``{app}``: the covered
+#: one, as people say them), said once after the act's line, never a model round for it.
+LINE_FLAG_COVERED = "{by} is covering {app}."
+LINE_FLAG_HIDDEN = "{app} is mostly hidden now."
+LINE_FLAG_MINIMISED = "{app} got minimised."
+LINE_FLAG_POPUP = "A {app} pop-up is in front."
+
+
+def _plain_app(raw: Any) -> str:
+    text = " ".join(str(raw or "").split())
+    return text[:-4] if text.casefold().endswith(".exe") else text
+
+
+def flag_line(d: Any, name: Any = None) -> str:
+    """desk22 (decision D6): code's one short line for a window flag that :func:`tidy_step` has no step for (one
+    monitor and nothing taken, a minimised window, a cover by a window that is not the act's own, a pop-up left in
+    front), from the measure alone: the act's cover of a window of theirs (playing first, then the one that was in
+    front: :data:`LINE_FLAG_COVERED`, or :data:`LINE_FLAG_HIDDEN` with no coverer measured, :data:`LINE_FLAG_MINIMISED`),
+    else the act's new pop-up in front. ``name``: the caller's display name for a raw app
+    (``brain.util.app_name``; default: the program without ``.exe``). ``""`` when no window flag is up. App names only
+    (no title), so it may be said; never logged. Pure; never raises."""
+    try:
+        if d is None or not window_flag(d):
+            return ""
+
+        def said(raw: Any) -> str:
+            try:
+                text = name(raw) if callable(name) else _plain_app(raw)
+            except Exception:  # noqa: BLE001
+                text = _plain_app(raw)
+            text = " ".join(str(text or "").split())
+            return text if text and text != "It" else TIDY_NO_APP
+
+        covered = sorted((c for c in getattr(d, "covered", None) or () if _cover_of_window(c)),
+                         key=lambda c: (not c.get("playing"), not c.get("was_front")))
+        for c in covered:
+            app = said(c.get("app"))
+            if c.get("minimised"):
+                return LINE_FLAG_MINIMISED.format(app=app)
+            if c.get("by_app"):
+                by = said(c.get("by_app"))
+                if by.casefold() != app.casefold():
+                    return LINE_FLAG_COVERED.format(by=by, app=app)
+            return LINE_FLAG_HIDDEN.format(app=app)
+        flags = getattr(d, "flags", None) or {}
+        if flags.get("new_popup"):
+            popup = next((n for n in getattr(d, "new_windows", None) or ()
+                          if (n.get("foreground") or n.get("keyboard")) and not n.get("asked") and n.get("by_act")),
+                         None)
+            if popup is not None:
+                return LINE_FLAG_POPUP.format(app=said(popup.get("app")))
+        # a front taken always has its step (the front given back: tidy_step rule 3), so it never comes here
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def tidy_guard(step: Any, d: Any, front_now: Any, front_after: Any, arranged: Iterable[Any] = ()) -> str:
     """tidy21 (decision 1): whether code may take :func:`tidy_step`'s step right now, from measured facts only: ``""``
     when it may, else a code word why not (code then leaves the desk as it is and says nothing):
@@ -769,6 +873,8 @@ def tidy_guard(step: Any, d: Any, front_now: Any, front_after: Any, arranged: It
         return "error"
 
 
-__all__ = ["ARRANGE_ACTIONS", "COVER_KEEP", "COVER_MIN_LOSS", "DeskDiff", "LINE_TAB_COVER", "LINE_TAB_COVER_PLAIN",
-           "LINE_TIDY_DONE", "LINE_TIDY_FAILED", "MOSTLY", "NOT_YOURS", "TIDY_NO_APP", "arranges", "compare",
-           "cover_line", "render", "step_app", "tidy_guard", "tidy_line", "tidy_step", "window_flag"]
+__all__ = ["ARRANGE_ACTIONS", "COVER_KEEP", "COVER_MIN_LOSS", "DeskDiff", "LINE_FLAG_COVERED", "LINE_FLAG_HIDDEN",
+           "LINE_FLAG_MINIMISED", "LINE_FLAG_POPUP", "LINE_TAB_AUTOPLAY", "LINE_TAB_AUTOPLAY_PLAIN", "LINE_TAB_COVER",
+           "LINE_TAB_COVER_PLAIN", "LINE_TIDY_DONE", "LINE_TIDY_FAILED", "MOSTLY", "NOT_YOURS", "TIDY_NO_APP",
+           "arranges", "compare", "cover_line", "flag_line", "render", "step_app", "tidy_guard", "tidy_line",
+           "tidy_step", "window_flag"]

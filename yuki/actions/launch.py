@@ -4037,10 +4037,29 @@ _BAR_FLOOR_S = 6.0
 #: How many address hand-offs in a row an app may ignore (keep the very page it had) before :func:`open_url` types the
 #: address at once (the hand-off's page wait skipped), and for how long that holds. One when Windows already refused
 #: the app's protocol activation (its link path failed once), else two: a single slow page must not turn a working
-#: browser's link path into keystrokes (x8WebArc review r1 L1). RAM only, this process.
+#: browser's link path into keystrokes (x8WebArc review r1 L1).
+#:
+#: desk22 (A16, final-D browser B4: the note lived in RAM, so the first Arc open after every start paid the whole
+#: ignored hand-off again): the note is a measured per-browser fact kept across restarts in a small state file in
+#: Yuki's own data folder (:data:`HANDOFF_FILE_NAME`: app ids, counts, times and the refused-protocol mark only; no
+#: address, no page). It is capped and expired by measure: at most :data:`_IGNORED_CAP` browsers (the oldest go), each
+#: count capped at :data:`_IGNORED_COUNT_MAX`, cleared the moment a hand-off is seen to open its page, and held only
+#: :data:`_IGNORED_KEEP_S` after the last ignored hand-off measured. Once it has expired the next hand-off is measured
+#: again (an updated browser may take addresses now) with its page wait capped at :data:`_RECHECK_PAGE_S` (as a
+#: refused package's watch): ignored again, the note holds again at once; opened, it is cleared. The web skill's own
+#: hand-off (``address_bar=False``) to a browser the note holds gets the same capped wait.
 _IGNORED_AFTER = 2
-_IGNORED_KEEP_S = 4 * 3600.0
-_ignored_handoffs: dict[str, tuple[int, float]] = {}
+_IGNORED_KEEP_S = 7 * 86400.0
+_IGNORED_CAP = 16
+_IGNORED_COUNT_MAX = 8
+_RECHECK_PAGE_S = 3.0
+HANDOFF_FILE_NAME = "browser_handoffs.json"
+#: Where the note is kept: ``None`` = :func:`yuki.core.paths.data_dir`'s :data:`HANDOFF_FILE_NAME` (a checker or a
+#: test sets a path of its own here, or ``YUKI_HANDOFF_FILE``, so the user's file is never touched).
+HANDOFF_FILE: str | None = None
+#: ``{appid lowercased: (count, wall time of the last ignored hand-off, protocol refused)}``, read from the file once.
+_ignored_handoffs: dict[str, tuple[int, float, bool]] = {}
+_ignored_loaded: list[str] = []
 _ignored_lock = threading.Lock()
 #: ``Clients\StartMenuInternet``: where Windows lists the desktop browsers it knows (its own default-apps list reads
 #: it).
@@ -4059,27 +4078,123 @@ def _appid_of(app: str) -> str:
     return str(chosen.get("appid") or "") if chosen else ""
 
 
+def _handoff_path() -> str:
+    """The note's file (:data:`HANDOFF_FILE`, else ``YUKI_HANDOFF_FILE``, else the data folder's)."""
+    if HANDOFF_FILE:
+        return HANDOFF_FILE
+    if os.environ.get("YUKI_HANDOFF_FILE"):
+        return os.environ["YUKI_HANDOFF_FILE"]
+    from yuki.core.paths import data_dir
+
+    return str(data_dir() / HANDOFF_FILE_NAME)
+
+
+def _load_ignored() -> None:
+    """desk22 (A16): the kept note, read once per process (under the lock); a missing or unreadable file is no note.
+    Entries past :data:`_IGNORED_KEEP_S` stay (their count re-arms the note on the next ignored hand-off measured)
+    until the cap pushes them out. Never raises."""
+    path = _handoff_path()
+    if _ignored_loaded and _ignored_loaded[0] == path:
+        return
+    _ignored_loaded[:] = [path]
+    _ignored_handoffs.clear()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        for key, value in (raw.get("browsers") or {}).items() if isinstance(raw, dict) else ():
+            if not isinstance(key, str) or not key or not isinstance(value, dict):
+                continue
+            count = max(0, min(_IGNORED_COUNT_MAX, int(value.get("n") or 0)))
+            at = float(value.get("at") or 0.0)
+            if count and at > 0:
+                _ignored_handoffs[key.lower()] = (count, at, bool(value.get("refused")))
+    except Exception:  # noqa: BLE001 - no file yet, or one that can't be read: no note
+        _ignored_handoffs.clear()
+
+
+def _save_ignored() -> None:
+    """desk22 (A16): the note written whole (under the lock), the newest :data:`_IGNORED_CAP` browsers only, by an
+    atomic replace. A file that can't be written costs a slow hand-off after a restart, never the caller."""
+    path = _handoff_path()
+    try:
+        newest = sorted(_ignored_handoffs.items(), key=lambda kv: kv[1][1], reverse=True)[:_IGNORED_CAP]
+        _ignored_handoffs.clear()
+        _ignored_handoffs.update(newest)
+        body = {"v": 1, "browsers": {k: {"n": n, "at": round(at, 1), "refused": refused}
+                                     for k, (n, at, refused) in newest}}
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(body, fh, separators=(",", ":"))
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _note_ignored(appid: str, ignored: bool) -> None:
-    """One more address hand-off ``appid`` ignored (``ignored``), or one it opened (the count is cleared)."""
+    """One more address hand-off ``appid`` ignored (``ignored``), or one it opened (the note is cleared). desk22 (A16):
+    kept across restarts (:func:`_save_ignored`); an ignored one re-arms an expired note at once (its count is kept),
+    and marks whether Windows had refused the app's protocol activation (so one ignored hand-off is enough next time).
+    """
     key = str(appid or "").lower()
     if not key:
         return
     with _ignored_lock:
+        _load_ignored()
+        got = _ignored_handoffs.get(key)
         if ignored:
-            _ignored_handoffs[key] = (_ignored_handoffs.get(key, (0, 0.0))[0] + 1, time.monotonic())
+            count = min(_IGNORED_COUNT_MAX, (got[0] if got else 0) + 1)
+            _ignored_handoffs[key] = (count, time.time(), bool(key in _NO_PROTOCOL or (got and got[2])))
+        elif got is None:
+            return
         else:
             _ignored_handoffs.pop(key, None)
+        _save_ignored()
+
+
+def _handoff_state(appid: str) -> str:
+    """desk22 (A16): the kept note for ``appid``: ``"ignores"`` (it ignored enough hand-offs in a row, the latest
+    within :data:`_IGNORED_KEEP_S`: type the address at once), ``"recheck"`` (it did, but the note has expired: hand
+    it over once more, its page wait capped at :data:`_RECHECK_PAGE_S`, and measure it again), else ``""``."""
+    key = str(appid or "").lower()
+    if not key:
+        return ""
+    with _ignored_lock:
+        _load_ignored()
+        got = _ignored_handoffs.get(key)
+    if not got:
+        return ""
+    if got[0] < (1 if key in _NO_PROTOCOL or got[2] else _IGNORED_AFTER):
+        return ""
+    age = time.time() - got[1]
+    # a wall clock set back (or the file's rounding) leaves a time a little ahead: still within the keep either way
+    return "ignores" if -_IGNORED_KEEP_S < age < _IGNORED_KEEP_S else "recheck"
 
 
 def _ignores_handoff(appid: str) -> bool:
     """Whether ``appid`` ignored enough address hand-offs in a row (:data:`_IGNORED_AFTER`; one once its protocol
-    activation was refused), the latest within :data:`_IGNORED_KEEP_S`."""
-    key = str(appid or "").lower()
-    with _ignored_lock:
-        got = _ignored_handoffs.get(key)
-    if not got or time.monotonic() - got[1] >= _IGNORED_KEEP_S:
-        return False
-    return got[0] >= (1 if key in _NO_PROTOCOL else _IGNORED_AFTER)
+    activation was refused, now or when the note was kept), the latest within :data:`_IGNORED_KEEP_S`
+    (:func:`_handoff_state`)."""
+    return _handoff_state(appid) == "ignores"
+
+
+def handoff_note(app: str) -> str:
+    """desk22 (A16, for the web skill's own hand-off: merge note to skill22): the kept note for the browser ``app``
+    names (a Start menu name, as :func:`open_url` takes it): ``"ignores"``, ``"recheck"`` or ``""``
+    (:func:`_handoff_state`). Never raises."""
+    try:
+        return _handoff_state(_appid_of(app))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def note_handoff(app: str, ignored: bool) -> None:
+    """desk22 (A16, merge note to skill22): one address hand-off to the browser ``app`` names, measured ignored (it
+    kept the page it had, or showed none) or opened: kept in the same note :func:`open_url` reads. Never raises."""
+    try:
+        _note_ignored(_appid_of(app), bool(ignored))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _registered_browser_images() -> frozenset[str]:
@@ -4397,8 +4512,12 @@ def open_url(
             by the page). After two ignored hand-offs in a row (one once its
             protocol activation was refused) the hand-off is skipped and the
             address typed at once; once that typing got as far as Enter, it is
-            the answer (never handed over too). ``False``: the hand-off's own
-            result only (the web skill, whose next rung types it itself).
+            the answer (never handed over too). desk22 (A16): that note is
+            kept across restarts and expires by measure (:data:`_IGNORED_KEEP_S`
+            after the last ignored hand-off; then one hand-off is measured
+            again, its page wait capped at :data:`_RECHECK_PAGE_S`). ``False``:
+            the hand-off's own result only (the web skill, whose next rung
+            types it itself); its measure is still kept in the note.
 
     A web address handed to a browser that was already running is checked
     against what its windows showed right before (:func:`_pages_before`): an
@@ -4433,9 +4552,15 @@ def open_url(
     if app is not None and app.strip():
         address = _page_address(target)
         typed_first = None
-        if address and address_bar:
+        capped = False
+        if address:
             appid = _appid_of(app)
-            if appid and _ignores_handoff(appid):
+            state = _handoff_state(appid) if appid else ""
+            # desk22 (A16): the hand-off's page wait is capped when the kept note says this browser ignores them: an
+            # expired note's hand-off is measured once more ("recheck"), and the web skill (``address_bar=False``)
+            # still hands it over as it asked, its next rung typing it once the short wait shows nothing
+            capped = state == "recheck" or (state == "ignores" and not address_bar)
+            if state == "ignores" and address_bar:
                 # it ignored the last hand-offs (kept the very page it had): the address goes into its own address
                 # bar at once, not after the whole page wait (x8WebArc review r1 L1, carried to the hand)
                 typed_first = _address_bar_open(app, address, deadline=deadline,
@@ -4447,9 +4572,12 @@ def open_url(
                     typed_first.details["url"] = target
                     typed_first.details["handoff_skipped"] = True
                     return typed_first
-        launched = launch_app(app, args=[target], content_timeout_s=content_timeout_s, deadline=deadline)
+        wait_s = min(float(content_timeout_s), _RECHECK_PAGE_S) if capped else content_timeout_s
+        launched = launch_app(app, args=[target], content_timeout_s=wait_s, deadline=deadline)
         launched.details["url"] = target
-        if not address or not address_bar:
+        if capped:
+            launched.details["handoff_capped"] = True   # code word only: the kept note capped the page wait
+        if not address:
             return launched
         ld = launched.details
         appid = str(ld.get("appid") or "")
@@ -4467,8 +4595,11 @@ def open_url(
         blank_page = ld.get("reason") == "page_blank"
         if same or blank_page:
             # kept the very page it had, or (review r1 M1) a refused package's start showed no page at all: the next
-            # address goes straight into its address bar (one such hand-off is enough once protocol was refused)
+            # address goes straight into its address bar (one such hand-off is enough once protocol was refused).
+            # desk22 (A16): measured on the web skill's hand-off too (``address_bar=False``), and kept across restarts
             _note_ignored(appid, True)
+        if not address_bar:
+            return launched
         page_check = ld.get("page_check") if isinstance(ld.get("page_check"), dict) else {}
         # its windows show no page at all after a packaged app's alias or activation carried the address (percFix: Arc
         # started cold on its own new-tab view); a program started with the address on its command line is left alone
