@@ -68,8 +68,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 from yuki.skills.connection import (Check, Route, Skill, fill, fill_value, sends_with, strictest, template_names,
                                     window_state_reader)
-from yuki.skills.resolve import (FROM_CARD, FROM_CHOSEN, FROM_MENU, HELD_LINE, Ask, Handoff, Held, Live, Plan, Refused,
-                                 canonical, done_line, shown_value)
+from yuki.skills.resolve import (FROM_CARD, FROM_CHOSEN, FROM_MENU, GUESS_SOURCES, HELD_LINE, Ask, Handoff, Held,
+                                 Live, Plan, Refused, canonical, done_line, shown_value)
 
 #: The time a request may take from the words to the done line (PLAN.md §5: p90 <= 5 s).
 BUDGET_S = 5.0
@@ -98,6 +98,17 @@ WHY_DROPPED = "dropped"
 #: looks first and finishes only what isn't done (never on a skill that sends, or one with a rung whose data says
 #: nothing may follow it).
 WHY_ERROR = "error"
+#: skill20 (final-D B2): the wall-clock time a rung's done-check said "done", stamped on that rung's RAM facts
+#: (``RouteResult.facts_ram``) right before its re-check, so a second source read before the verdict (a board read
+#: taken while the browser came forward, before the new tab drew) is never counted as a contradiction.
+DONE_AT = "done_at"
+#: skill20 (final-D P1): the fill sources that are Yuki's guess, never the user's own word (``RouteCall.fill_sources``):
+#: the taste fill, Yuki's own pick (``chosen``) and a given value the words don't hold (``resolve.GUESS_SOURCES``).
+GUESS_FILLS: frozenset[str] = frozenset({*GUESS_SOURCES, "taste", FROM_CHOSEN})
+#: skill20 (contract C10): a rung's code fact that it never read the state it needed (a cold window, a read that timed
+#: out or wasn't built): ``RouteResult.facts[UNREAD] = True``. The run's evidence and voice facts list such rungs
+#: (``unread``), so a caller may run the skill once more (nothing was pressed there).
+UNREAD = "unread"
 #: The resolver's refusals before anything ran whose report sends the caller to the normal way (by steps), each in
 #: plain words: a key no skill has (the model's own slip), skills switched off, memory too slow to know the user's
 #: usuals (the skill can't run blind, but steps need none of them; the thinker's origin only: the voice says its own
@@ -268,7 +279,10 @@ class RouteResult:
 @dataclass
 class RouteCall:
     """What a verb gets: the skill, the rung, its arguments with the slots filled, all the values, the run's context
-    and its time left (monotonic deadline)."""
+    and its time left (monotonic deadline). skill20 (final-D P1): ``fill_sources``, each slot's fill source as the
+    resolver gave it (``Plan.filled``: ``words``, ``again``, ``told``, ``live``, ``pref``, ``taste``, ``default``, or a
+    given value's ``chosen`` / ``menu`` / ``card`` / ``screen`` / ``reading`` / ``granted`` / ``worded``), so a driver
+    that learns from a run (Spotify's pairing) can tell the user's own value from Yuki's guess (:data:`GUESS_FILLS`)."""
 
     skill: Skill
     route: Route
@@ -276,6 +290,7 @@ class RouteCall:
     values: dict[str, Any]
     ctx: "RunContext"
     deadline: float
+    fill_sources: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -387,6 +402,15 @@ class SkillResult:
     #: Running it sends something to other people (its ``sends`` data with these values): an unconfirmed send is
     #: never tried again (rule 8).
     sends: bool = False
+    #: skill20 (final-D messages §6): on a sending run that ended unconfirmed, whether the rung's send key went out by
+    #: its own code fact (``facts["pressed"]``: the chat driver's dispatch): ``False`` it never did (nothing can have
+    #: been sent), ``True`` it did, ``None`` unknown. "It may have sent already" is said only when it is not ``False``.
+    sent_key: bool | None = None
+    #: skill20 (contract C10): each slot's fill source as the resolver gave it (``Plan.filled``: ``words``, ``live``,
+    #: ``chosen``, ``reading`` ...), and the rungs that never read what they needed (``RouteResult.facts[UNREAD]``: a
+    #: cold window, a read that timed out). Code words only; set on every return path of a resolved run.
+    fill_sources: dict[str, str] = field(default_factory=dict)
+    unread: list[str] = field(default_factory=list)
     #: Why a run was refused before anything ran (the resolver's code word: ``unknown_skill``, ``skills_off``, ...),
     #: or ``repeat`` on a hand-off that ran no rung because the same thing ran unconfirmed moments ago.
     why: str = ""
@@ -467,9 +491,15 @@ class SkillResult:
             head = ("It ran, but the PC couldn't confirm it." if self.sends
                     else "It ran, but the PC couldn't confirm the result.")
             say = " ".join(str(self.say or "").split())
-            # rule 8: a send may have gone already, so a second try could send it twice
-            rest = ("It may have sent already: never send it again." if self.sends
-                    else "Don't run this skill again: doing it again could do it twice.")
+            # rule 8: a send may have gone already, so a second try could send it twice. skill20 (final-D, one, the
+            # misheard-name draft row: Enter was refused, the driver's own fact said no send key went out, and "it may
+            # have sent" was still said): only when the send key went out, or that is unknown
+            if self.sends and self.sent_key is False:
+                rest = "The send key never went out, so it wasn't sent; don't run this skill again."
+            elif self.sends:
+                rest = "It may have sent already: never send it again."
+            else:
+                rest = "Don't run this skill again: doing it again could do it twice."
             return f"{head} Say so plainly: {say}\n{rest}" if say else f"{head}\n{rest}"
         if self.outcome == "other_device":
             return f"Not changed: {self.say}"
@@ -499,6 +529,12 @@ class SkillResult:
         # skill19 (C1): what the run measurably touched (the hands' look after it reads the result itself too)
         facts["acted_apps"] = list(self.acted_apps)
         facts["acted_windows"] = list(self.acted_windows)
+        # skill20 (C10): code words only; ``unread`` only when a rung never read (a caller may run it once more)
+        facts["fill_sources"] = dict(self.fill_sources)
+        if self.unread:
+            facts["unread"] = list(self.unread)
+        if self.sends and self.sent_key is not None:
+            facts["sent_key"] = bool(self.sent_key)
         if self.outcome == HELD_BLOCKED:
             facts["refused"] = HELD_BLOCKED      # fHands: never said as a game (``held`` stays empty)
         elif self.held:
@@ -1329,6 +1365,9 @@ def evidence_words(ev: Mapping[str, Any] | None) -> str:
         parts.append("seen there instead: " + " | ".join(str(n) for n in ev["seen"]))
     if ev.get("reason"):
         parts.append(f"stopped: {ev['reason']}")
+    if ev.get(UNREAD):
+        # skill20 (C10): a rung that never read the app pressed nothing there
+        parts.append("never read the app, so nothing was pressed there: " + ", ".join(str(r) for r in ev[UNREAD]))
     # skill19: the chat opened and nothing was typed (C3), what holds the keyboard; the control's level read (O5); a
     # code-typed value given in another form than the slot takes (RC5a)
     if ev.get("not_typed") or ev.get("reason") == "not_typed":
@@ -1455,7 +1494,29 @@ def run(resolved: Any, ctx: RunContext | None = None) -> SkillResult:
             measure.stamp(result, bool(state.get("acted")))
         except Exception:  # noqa: BLE001 - the declared values stand
             pass
+    _stamp_sources(result, resolved, state)
     return result
+
+
+def _stamp_sources(result: SkillResult, resolved: Any, state: Mapping[str, Any]) -> None:
+    """skill20 (contract C10): the run's ``fill_sources`` (the resolver's ``filled``: a plan's or a hand-off's) and
+    ``unread`` (the rungs whose own fact says they never read: :data:`UNREAD`), on the result and, when it has any, in
+    its evidence (the caller reads them with ``.get``). Code words only. Never raises."""
+    try:
+        filled = getattr(resolved, "filled", None) if isinstance(resolved, (Plan, Handoff)) else None
+        if isinstance(filled, Mapping) and not result.fill_sources:
+            result.fill_sources = {str(k): str(v) for k, v in filled.items() if v}
+        tried = result.tried or state.get("tried") or []
+        unread = [str(t.get("route")) for t in tried
+                  if isinstance(t, Mapping) and t.get(UNREAD) is True and t.get("route")]
+        result.unread = list(dict.fromkeys([*result.unread, *unread]))
+        if isinstance(result.evidence, dict) and result.evidence:
+            if result.fill_sources:
+                result.evidence["fill_sources"] = dict(result.fill_sources)
+            if result.unread:
+                result.evidence[UNREAD] = list(result.unread)
+    except Exception:  # noqa: BLE001 - the result stands without them
+        pass
 
 
 def _error_handoff(resolved: Any, ctx: RunContext, started: float,
@@ -1501,6 +1562,17 @@ def _settled(res: RouteResult, evidence: Any) -> bool:
         return any(reason_in(v, depth + 1) for v in ev.values() if isinstance(v, Mapping))
 
     return reason_in(evidence)
+
+
+def _sent_key(res: RouteResult) -> bool | None:
+    """skill20 (final-D messages §6): whether a sending rung's send key went out, by its own code fact
+    (``facts["pressed"]``, a boolean: the chat driver's dispatch of the send key), else ``None`` (unknown: "it may
+    have sent" stands)."""
+    for facts in (res.facts, res.facts_ram):
+        pressed = facts.get("pressed") if isinstance(facts, Mapping) else None
+        if isinstance(pressed, bool):
+            return pressed
+    return None
 
 
 def _not_typed(res: RouteResult) -> bool:
@@ -1846,7 +1918,7 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             _ledger_app(ctx, run_key, app_now)
             run_app = app_now
         fn = ctx.verbs.get(route.via) or VERB_FUNCS.get(route.via)
-        call = RouteCall(skill, route, args, dict(plan.values), ctx, deadline)
+        call = RouteCall(skill, route, args, dict(plan.values), ctx, deadline, dict(plan.filled))
         base = _baseline(route, plan.values, ctx)
         front0 = measure.read()        # skill19 (C1): the front right before this rung
         r0 = ctx.clock()
@@ -1956,6 +2028,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                                run_key=run_key, route=route.key, tried=tried, values=dict(plan.values))
         if res.ran is False:
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": res.outcome or "no"})
+            if isinstance(res.facts, Mapping) and res.facts.get(UNREAD) is True:
+                tried[-1][UNREAD] = True      # skill20 (C10): it never read what it needed; nothing was pressed there
             unsure = isinstance(res.facts, Mapping) and res.facts.get("not_run") == NOT_RUN_UNSURE
             _ledger_try(ctx, run_key, route, None, "unverified" if unsure else "failed", route_ms)
             _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key,
@@ -2019,7 +2093,7 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                            evidence={"numbers": _numbers(plan.values), "check": waited.evidence})
             return _simple(skill.key, "unverified", ctx, started, verified=None, say=say, route=route.key,
                            tried=tried, run_key=run_key, values=dict(plan.values), focus_taken=focus_taken,
-                           sends=sends, guessed=guesses,
+                           sends=sends, sent_key=_sent_key(res) if sends else None, guessed=guesses,
                            evidence=evidence(route=route, waited=waited,
                                              reason="settled" if _settled(res, waited.evidence) else "", line=say))
         tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "contradicted"})
@@ -2053,9 +2127,12 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                             missing=missing, seen=seen,
                             evidence=evidence(route=last_route, reason="not_typed", line=line))
         _ledger_finish(ctx, run_key, outcome="unverified", checked=None, route=last_route, acted=acted)
+        # skill20 review: the driver's code fact says nothing was typed, and any later rung that acted on a send
+        # returned above, so no send key went out (never "it may have sent already")
         return _simple(skill.key, "unverified", ctx, started, verified=None, say=line, tried=tried, run_key=run_key,
                        route=last_route.key if last_route is not None else None, values=dict(plan.values),
-                       sends=sends, guessed=guesses, evidence=evidence(route=last_route, reason="not_typed", line=line))
+                       sends=sends, sent_key=False if sends else None, guessed=guesses,
+                       evidence=evidence(route=last_route, reason="not_typed", line=line))
     if plan.handoff and skill.handoff and ctx.origin != "eval":
         return _handoff(skill, plan.values, plan.filled, tried, ctx, started, why="routes_failed", run_key=run_key,
                         acted=acted, routes=list(plan.routes), missing=missing, seen=seen,
@@ -2113,6 +2190,10 @@ def _after_done(ctx: RunContext, skill: Skill, route: Route, plan: Plan, probe_c
     if route.recheck is None or ctx.recheck == "off":
         return
     recheck = route.recheck
+    # skill20 (final-D B2): when the verdict was given, for a second source that must have read after it
+    ram = getattr(getattr(probe_ctx, "result", None), "facts_ram", None)
+    if isinstance(ram, dict):
+        ram[DONE_AT] = time.time()
 
     def job() -> None:
         from yuki.skills import registry
@@ -2294,20 +2375,25 @@ def _live_now(game: str, hands: Any = None, *, media: bool = True, skill: Skill 
     playing (only when a slot of the skill fills from them), whether a call is live (only when a slot asks in a
     call), and the skill's window-state reader for the ``game = "states"`` rule (its driver's hook)."""
     playing: tuple[str, ...] = ()
+    sessions: tuple[str, ...] = ()
     try:
         if not media:
             raise LookupError
         from yuki.perception.system import media_sessions
         from yuki.actions.media import app_key_of
 
-        playing = tuple(dict.fromkeys(app_key_of(str(s.get("app_id") or "")) for s in media_sessions(timeout_s=0.2)
-                                      if str(s.get("status") or "") == "playing" and s.get("app_id")))
+        # one read: the sessions playing, and every session whatever its status (skill20 review: the apps the playing
+        # measure can see, so a reading of one of them yields to the one app playing and a game's never does)
+        got = [s for s in media_sessions(timeout_s=0.2) if s.get("app_id")]
+        playing = tuple(dict.fromkeys(app_key_of(str(s.get("app_id") or "")) for s in got
+                                      if str(s.get("status") or "") == "playing"))
+        sessions = tuple(dict.fromkeys(app_key_of(str(s.get("app_id") or "")) for s in got))
     except Exception:  # noqa: BLE001 - nothing known playing
-        playing = ()
+        playing, sessions = (), ()
     wants_call = skill is not None and any(s.ask_in_call for s in skill.slots)
     in_call = _in_call(hands, memory) if wants_call else False
     states = skill is not None and any(r.game == "states" for r in skill.routes)
-    return Live(game=game, playing=playing, in_call=in_call,
+    return Live(game=game, playing=playing, in_call=in_call, sessions=sessions,
                 window_state=window_state_reader(skill) if states else None)
 
 
@@ -2604,6 +2690,55 @@ def _choice_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunCon
                  "words" if choice.named else FROM_CHOSEN, choice, taste_kind)
 
 
+def _title_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunContext,
+                   live: Live) -> tuple[str, dict[str, Any], str] | None:
+    """skill20 (final-D B6): a title handed for a slot every rung of which runs only with a link
+    (``taste.takes_offers``: web.open_video's ``video``), with no link and none of the uploads just offered: that title
+    as one video's own link
+    by code (:func:`yuki.skills.web_route.link_for_title`: the uploads cached from the user's channels' feeds, then the
+    links of the page shown in front or in the browser asked for; a string measure, one clear fit only). ``(slot, value,
+    where it came from)`` for the resolver's ``chosen``: ``words`` when the title stands in the user's words, else
+    ``card`` (one of their channels' uploads) or ``screen`` (a link on the page): a guess the done line names. ``None``:
+    no such slot, a link already given, a game in front (nothing is read then), or no clear fit (the run goes on as
+    before: no route, the caller does it by steps). Called only when no pick of Yuki's fills the run
+    (:func:`_choice_request`). Read-only; content stays in RAM, the log line holds code words."""
+    from yuki.skills import taste
+    from yuki.skills.catalog import load
+
+    if live.game:
+        return None
+    skill = load().get(str(skill_key or ""))
+    given = dict(slots or {})
+    if skill is None:
+        return None
+    for slot in skill.slots:
+        value = given.get(slot.name)
+        if not taste.takes_offers(skill, slot) or (isinstance(value, Mapping) and value.get("ref")):
+            continue
+        title = _given_text(value)
+        if not title or _offered_pick(ctx, title):
+            continue
+        from yuki.skills import web_route
+
+        # the feed's uploads on memory's own side (one bounded call), then the page's links (a read-only UIA job)
+        got = _mem(ctx.memory, "skill_title_link",
+                   lambda c, t=title: web_route.link_for_title(t, store=_store_of(c)), timeout_s=0.8) \
+            if ctx.memory is not None else None
+        if got is None:
+            got = web_route.link_for_title(title, windows=web_route.title_windows(given.get("browser")))
+        if got is None:
+            _emit(ctx, "skill_resolve", skill=skill.key, result="title_link", reason="no_fit", origin=ctx.origin)
+            return None
+        from yuki.skills.uia_route import said
+
+        where = "words" if said(title, ctx.words) else (FROM_CARD if got.get("via") == "feed" else "screen")
+        _emit(ctx, "skill_resolve", skill=skill.key, result="title_link", reason=str(got.get("via") or ""),
+              fit=got.get("fit"), slot_source=[where], origin=ctx.origin)
+        value = {k: got[k] for k in ("name", "ref", "key") if got.get(k)}
+        return slot.name, value, where
+    return None
+
+
 def _offered_pick(ctx: RunContext, name: str) -> bool:
     """Whether ``name`` picks one of the uploads just offered aloud ("the Deji one": the offer's own path)."""
     from yuki.skills import taste
@@ -2784,10 +2919,17 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     picked = _choice_request(str(skill_key or ""), slots, ctx, live, settings)
     if isinstance(picked, SkillResult):
         return picked
+    titled = None
     if picked is not None:
         skill_key, slots = picked.skill_key, picked.slots
-    elif slots and any(k in slots for k in CHOICE_SLOTS):
-        slots = {k: v for k, v in slots.items() if k not in CHOICE_SLOTS}
+    else:
+        if slots and any(k in slots for k in CHOICE_SLOTS):
+            slots = {k: v for k, v in slots.items() if k not in CHOICE_SLOTS}
+        try:
+            # skill20 (final-D B6): a title handed with no link, as its own link by code (or None: as before)
+            titled = _title_request(str(skill_key or ""), slots, ctx, live)
+        except Exception:  # noqa: BLE001 - the run goes on as before
+            titled = None
     step = float(setting(settings, "skills_volume_step") or 10)
     disable_after = int(setting(settings, "skills_disable_after") or 2)
     catalog: dict[str, Any] = {}
@@ -2813,6 +2955,8 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
             extra["granted"] = dict(granted)
         if picked is not None:
             extra.update(chosen=dict(picked.chosen), chosen_from=picked.chosen_from)
+        elif titled is not None:
+            extra.update(chosen={titled[0]: dict(titled[1])}, chosen_from=titled[2])
         if ctx.given_from:
             extra["given_from"] = ctx.given_from
         if ctx.why:

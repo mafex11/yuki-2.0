@@ -1317,7 +1317,14 @@ def _pair_request(call: Any, row: str, *, acted: bool) -> int | None:
     and when this rung acted the watch's generation comes back (reopened first when it had settled on another row: the
     newest pick wins) for the rung's own check to settle on once it sees the row play (:func:`_played`; the paused
     playlist resumed counts too: review r1 L2). Any other request ends the watch: its row is never kept as the earlier
-    words' meaning."""
+    words' meaning.
+
+    skill20 (final-D P1: "not this one, the other playlist" ran with Yuki's own pick, and the watch settled the
+    user's earlier words = that pick in their taste memory, so the next ask in those words played Yuki's pick): a row
+    whose run's value came from a guess (``call.fill_sources``: Yuki's pick, the taste fill, the caller's reading or
+    menu pick, :data:`yuki.skills.engine.GUESS_FILLS`) ends the watch unsettled (``outcome=guess``): Yuki's own pick
+    never teaches what the user's earlier words meant. The old pairing may still be dropped (:func:`_said_doubt`, the
+    safe direction)."""
     p = _pair_pending()
     if p is None:
         return None
@@ -1328,6 +1335,9 @@ def _pair_request(call: Any, row: str, *, acted: bool) -> int | None:
     if not _words_hold(getattr(call.ctx, "words", None), asked):
         _pair_end(p.get("gen"), "other_request")
         return None
+    if _guess_filled(call):
+        _pair_end(p.get("gen"), "guess")
+        return None
     if not acted:
         return None
     settled = p.get("settled")
@@ -1336,6 +1346,20 @@ def _pair_request(call: Any, row: str, *, acted: bool) -> int | None:
     if _fold(settled) == _fold(row):
         return None
     return _pair_reopen(int(p["gen"]), str(settled))
+
+
+def _guess_filled(call: Any) -> bool:
+    """skill20 (final-D P1): whether this run's playlist value is Yuki's guess by its fill source
+    (``RouteCall.fill_sources``, :data:`yuki.skills.engine.GUESS_FILLS`); a run with no fill sources (an older caller)
+    is not taken for one."""
+    sources = getattr(call, "fill_sources", None)
+    if not isinstance(sources, Mapping):
+        return False
+    try:
+        from yuki.skills.engine import GUESS_FILLS
+    except Exception:  # noqa: BLE001
+        return False
+    return str(sources.get(PLAYLIST_SLOT) or "") in GUESS_FILLS
 
 
 def _pair_reopen(gen: int, settled: str) -> int | None:
@@ -1526,7 +1550,10 @@ def _after_look(call: Any, look: Look, status: str, app_id: str, facts: dict[str
         if learns is None:
             return got
         _said_doubt(look.name, meant)
-        if got.ran is not False and not got.already and look.details.get("meant_why") != "mood":
+        # skill20 (final-D P1): words that are Yuki's own guess (the caller's reading, its pick) are never kept as the
+        # user's name for a row
+        if got.ran is not False and not got.already and look.details.get("meant_why") != "mood" and \
+                not _guess_filled(call):
             log = _logger(call)
             with _pair_lock:
                 # remembered like a play reached through a pairing (_said_note): another row put on within the watch's
@@ -1832,6 +1859,13 @@ def _check_name(look: Look, want: str) -> str:
 
 #: Reads that saw no row at all (nothing to say "missing" about): a watch may still learn what the words meant.
 UNREAD = ("not_built", "no_library", "no_rows", "timeout", "error")
+#: skill20 (final-D P6): the library reads that, on a window believed warm, get one fresh warm-up and one more read
+#: within the time left: a frame not built yet, and a read that timed out (a one-off UIA stall; it pressed nothing).
+REREAD = ("not_built", "timeout")
+#: skill20 (contract C10): the rung's code fact that it never read what it needed (``engine.UNREAD``): a window that
+#: never built, and these reads that never completed (a read that found no Library or no rows did read).
+UNREAD_FACT = "unread"
+NEVER_READ = ("not_built", "timeout", "error")
 
 
 def play_library(call: Any) -> Any:
@@ -1861,11 +1895,17 @@ def play_library(call: Any) -> Any:
     if not _ensure_warm(DESK, win, call, facts):
         _log_read(call, "library", state, facts, None)
         _pair_unread(call, want, status)
+        if _cold(facts) == "cold":
+            facts[UNREAD_FACT] = True    # skill20 (C10): the window never built, nothing was read or pressed
         return _rr(ran=False, outcome=_cold(facts), facts=facts)
     learned = _learned_wording(call.ctx.memory)
     look = _look_named(call, win.hwnd, want, learned=learned, press=True)
-    if look.status == "not_built" and facts.get("warm") == "skipped":
-        # seen warm before, frame only now: one fresh warm-up within the time left, then once more
+    if look.status in REREAD and facts.get("warm") == "skipped":
+        # seen warm before, frame only now (or, skill20 final-D P6, a read that timed out on a window believed warm: a
+        # one-off UIA stall of 1004 ms with no call answered ended the rung, then the link rung took the front): one
+        # fresh warm-up within the time left, then once more. A timed-out read pressed nothing (the press happens only
+        # inside the job after its read, and never once the caller stopped waiting: :func:`_look`)
+        facts["reread"] = look.status
         if _ensure_warm(DESK, win, call, facts, force=True):
             look = _look_named(call, win.hwnd, want, learned=learned, press=True)
     look = _confirm_flip(call, win.hwnd, _check_name(look, want), learned, look, state, facts, ram)
@@ -1873,6 +1913,8 @@ def play_library(call: Any) -> Any:
     _feed_seen(call, look)
     if look.status in UNREAD:
         _pair_unread(call, want, status)
+    if look.status in NEVER_READ:
+        facts[UNREAD_FACT] = True        # skill20 (C10): the read never completed, so nothing was pressed
     return _with_track(_after_look(call, look, status, app_id, facts), ram)
 
 

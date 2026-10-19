@@ -32,7 +32,9 @@ serves = [{ end = "volume_change", target = "level" }]
 bind = { target = "app", level = "value", control = "means" }
 
 # Whose volume: the app the user names (its key), else the one app playing (two playing: asked), else the whole PC.
-# A call live and no app named: asked (never the call's own app by guess).
+# A call live and no app named: asked (never the call's own app by guess). The names each option goes by in the user's
+# words, as an app's names are its identity (skill20, final-D P2): an option counts as their word only when their words
+# hold one of its names; given otherwise, it is the caller's reading, and the one app playing (live) fills the slot.
 [[capability.volume.slot]]
 name = "target"
 type = "app"
@@ -42,6 +44,10 @@ live = "playing"
 ask_in_call = true
 default = "system"
 ask = "Whose volume: an app's or the whole PC's?"
+
+[capability.volume.slot.option_names]
+system = ["system", "PC", "computer", "laptop", "master"]
+own_voice = ["own voice", "your voice", "Yuki's voice"]
 
 [[capability.volume.slot]]
 name = "change"

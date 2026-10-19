@@ -177,13 +177,15 @@ CONFIRM_ONCE_S = 120.0
 class Live:
     """The live facts the resolver may use (built by the caller: the voice's own picture, the Now board, local reads;
     an eval passes none): the game in front, the app keys of media sessions playing now, the app in front, whether a
-    call is live, and a window-state reader for the "states" game rule."""
+    call is live, a window-state reader for the "states" game rule, and the app keys of every media session now,
+    whatever its status (paused and stopped too: the apps the playing measure can see)."""
 
     game: str = ""
     playing: tuple[str, ...] = ()
     front_app: str = ""
     in_call: bool = False
     window_state: Callable[[str], str | None] | None = None
+    sessions: tuple[str, ...] = ()
 
 
 @dataclass
@@ -454,11 +456,56 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
     return ok, got
 
 
+#: skill20 (final-D P2): the names each option of a slot goes by in the user's words (``option_names`` on the slot in
+#: its connection file: data, as an app's names are), read once per file version.
+_option_cache: dict[str, tuple[float, dict[tuple[str, str], dict[str, tuple[str, ...]]]]] = {}
+_option_lock = threading.Lock()
+
+
+def option_names(skill: Skill, slot: Slot) -> dict[str, tuple[str, ...]]:
+    """``{option: (its names...)}`` for ``slot`` of ``skill`` (a learned skill reads its capability's file), from the
+    slot's ``option_names`` table in the connection file; ``{}`` when it has none. Never raises."""
+    try:
+        from yuki.skills.connection import CONNECTIONS_DIR
+
+        file = str(getattr(skill, "file", "") or "")
+        cap = str(getattr(skill, "capability", "") or getattr(skill, "key", "") or "")
+        if not file and cap:
+            base = load().get(cap)
+            file = str(getattr(base, "file", "") or "")
+        if not file or not cap:
+            return {}
+        path = CONNECTIONS_DIR / file
+        mtime = path.stat().st_mtime
+        with _option_lock:
+            got = _option_cache.get(file)
+        if got is None or got[0] != mtime:
+            import tomllib
+
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+            table: dict[tuple[str, str], dict[str, tuple[str, ...]]] = {}
+            for key, raw in (data.get("capability") or {}).items():
+                for sl in (raw.get("slot") or []) if isinstance(raw, Mapping) else []:
+                    names = sl.get("option_names") if isinstance(sl, Mapping) else None
+                    if isinstance(names, Mapping):
+                        table[(str(key), str(sl.get("name") or ""))] = {
+                            str(o): tuple(str(n) for n in (v if isinstance(v, (list, tuple)) else [v])
+                                          if str(n).strip())
+                            for o, v in names.items()}
+            got = (mtime, table)
+            with _option_lock:
+                _option_cache[file] = got
+        return dict(got[1].get((cap, slot.name)) or {})
+    except Exception:  # noqa: BLE001 - no names: the option itself only
+        return {}
+
+
 def _check(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Sequence[str] = (),
            told: Any = None, people: Callable[[str], dict[str, Any] | None] | None = None,
            heard_person: Callable[[str, Sequence[str]], str | None] | None = None,
            app_names: Callable[[str], tuple[str, list[str]]] | None = None,
-           site: bool = False, loose: bool = False) -> tuple[bool, Any, str]:
+           site: bool = False, loose: bool = False,
+           options_said: Mapping[str, Sequence[str]] | None = None) -> tuple[bool, Any, str]:
     """``(valid, canonical value, where it was found)`` of one given slot value (step 1). Identity and whole-word
     spans, plus checks on the user's own data: ``heard_person(name, words) -> the person's name | None`` (a person
     slot, or a text slot bound to a contact: the people index resolves the name to exactly one person whom the words
@@ -469,7 +516,11 @@ def _check(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Sequence
     may also be heard by :func:`yuki.skills.taste.heard_as`'s closed-set tier (the caller's taste slots only; review
     M2). Where: :data:`FROM_WORDS` (as written, an identity, a told value, an option or a number), :data:`FROM_HEARD`
     (by sound or a heard form) or :data:`FROM_MENU` (a name listed for the slot that the words don't hold); ``""``
-    when not valid."""
+    when not valid. ``options_said`` (skill20, final-D P2: the talker's ``target: "system"`` for a bare "bit louder"
+    raised the PC's volume as if the user had said so): an app slot's option counts as the user's word only when the
+    words hold the option or one of its names (:func:`option_names`); else it is not valid here, and the resolver takes
+    it as the caller's reading (a guess, named), which a single measured live fill beats. ``None``: an option counts
+    as given (every other caller, as before)."""
     if value is None or value == "":
         return False, None, ""
     t = slot.type
@@ -497,8 +548,11 @@ def _check(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Sequence
         return False, None, ""
     text = _words(value)
     if t == "app":
-        if any(text.casefold() == o.casefold() for o in slot.options):
-            return True, next(o for o in slot.options if o.casefold() == text.casefold()), FROM_WORDS
+        opt = next((o for o in slot.options if o.casefold() == text.casefold()), None)
+        if opt is not None:
+            if options_said is None or any(_said(n, words) for n in (opt, *(options_said.get(opt) or ()))):
+                return True, opt, FROM_WORDS
+            return False, None, ""
         # the app's identity and every name it goes by ("Discord.exe" / "discord.com" for "Discord", "Google Chrome"
         # for "Chrome"); kept by its key, the form the routes and the mixer compare
         key, names = app_names(text) if app_names is not None else (app_name(text), [text])
@@ -1071,12 +1125,13 @@ def _chat_titles() -> dict[str, tuple[str, set[str]]]:
 
 def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str, Any]]:
     """The user's own programs as their timeline shows them (never Yuki's rows): ``{app key: {"names": [...],
-    "sound": bool, "mic": bool}}``. ``names``: the display name it is shown under most, its key tidied ("chrome":
-    "Google Chrome", "Chrome") and a chat app's title from its connection data ("whatsapp.root": "WhatsApp"); a name
-    two programs share names neither (Yuki's own windows carry its name in several). ``sound``: in those rows it played
-    media, in front or behind, or held a call's microphone (measured, never a list of audio apps); ``mic``: it held a
-    call's microphone (a program a call may be in). Cached per database for
-    :data:`APPS_TTL_S` (an eval's ``until`` reads as of then, uncached). Never raises (``{}``)."""
+    "sound": bool, "mic": bool, "media": bool}}``. ``names``: the display name it is shown under most, its key tidied
+    ("chrome": "Google Chrome", "Chrome") and a chat app's title from its connection data ("whatsapp.root":
+    "WhatsApp"); a name two programs share names neither (Yuki's own windows carry its name in several). ``sound``: in
+    those rows it played media, in front or behind, or held a call's microphone (measured, never a list of audio apps);
+    ``mic``: it held a call's microphone (a program a call may be in); ``media``: it played media (a media session
+    measured playing, in front or behind; the microphone never counts). Cached per database for :data:`APPS_TTL_S` (an
+    eval's ``until`` reads as of then, uncached). Never raises (``{}``)."""
     if store is None:
         return {}
     cache_key = str(getattr(store, "path", id(store)))
@@ -1099,6 +1154,7 @@ def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str,
     shown: dict[str, dict[str, int]] = {}
     sound: dict[str, bool] = {}
     held_mic: dict[str, bool] = {}
+    media_of: dict[str, bool] = {}
     for process, app, n, media, mic in rows:
         key = app_name(process)
         if not key:
@@ -1109,6 +1165,7 @@ def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str,
             shown.setdefault(key, {})
         sound[key] = sound.get(key, False) or float(media or 0) > 0 or float(mic or 0) > 0
         held_mic[key] = held_mic.get(key, False) or float(mic or 0) > 0
+        media_of[key] = media_of.get(key, False) or float(media or 0) > 0
     # a background player is named by its display name: the one program shown under that name
     by_display: dict[str, set[str]] = {}
     for key, names in shown.items():
@@ -1122,7 +1179,7 @@ def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str,
         for n, seconds in (got.items() if isinstance(got, dict) else []):
             keys = by_display.get(_name_key(n), set())
             if len(keys) == 1 and (_num(seconds) or 0.0) > 0:
-                sound[next(iter(keys))] = True
+                sound[next(iter(keys))] = media_of[next(iter(keys))] = True
     chats = _chat_titles()
     names_of: dict[str, list[str]] = {}
     for key, counts in shown.items():
@@ -1135,7 +1192,7 @@ def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str,
         for n in names:
             owners.setdefault(_name_key(n), set()).add(key)
     out = {key: {"names": [n for n in names if len(owners.get(_name_key(n), ())) == 1], "sound": sound.get(key, False),
-                 "mic": held_mic.get(key, False)}
+                 "mic": held_mic.get(key, False), "media": media_of.get(key, False)}
            for key, names in names_of.items()}
     if until is None:
         with _apps_lock:
@@ -1198,6 +1255,39 @@ def _app_forms(value: Any, *, store: Any = None, until: float | None = None) -> 
     except Exception:  # noqa: BLE001 - its key alone
         pass
     return {f for f in forms if f}
+
+
+def _seen_by_measure(mine: set[str], live: "Live", *, store: Any = None, until: float | None = None) -> bool:
+    """Whether the playing measure can see an app (its identities ``mine``): it has a media session now, whatever the
+    session's status (:attr:`Live.sessions`, the ones playing included), or its timeline shows it playing media
+    (:func:`known_apps` ``media``: a session measured playing; a call's microphone never counts). An app with no media
+    session (a game, a DAW, a chat app outside a call) is never seen, so "not playing" is no fact about it."""
+    now = [a for a in dict.fromkeys((*live.playing, *live.sessions)) if a]
+    if any(mine & _app_forms(a, store=store, until=until) for a in now):
+        return True
+    apps = known_apps(store, until=until) if store is not None else {}
+    media = [k for k, a in apps.items() if a.get("media")]
+    if mine & set(media):
+        return True
+    return any(mine & _app_forms(k, store=store, until=until) for k in media)
+
+
+def _live_beats(reading: Any, slot: Slot, live: "Live", *, store: Any = None, until: float | None = None) -> bool:
+    """skill20 (final-D P2): whether the one app measured playing fills an app slot in place of the caller's reading
+    (a value the words don't hold). It does for the slot's own default option (it names no more than the default
+    would, and the slot's fill order puts the live fact before the default), and for a reading of an app the playing
+    measure can see (:func:`_seen_by_measure`: it says that app isn't the one playing). It does not for another of the
+    slot's options (Yuki's own voice) nor for an app the measure can never see (a game, a DAW, a chat app outside a
+    call: "turn the game down" with a playlist playing turns the game, named as a guess). Identities only
+    (:func:`_app_forms`)."""
+    mine = _app_forms(reading, store=store, until=until)
+    if not mine:
+        return False
+    if slot.default not in (None, "") and mine & _app_forms(slot.default, store=store, until=until):
+        return True
+    if any(mine & _app_forms(o, store=store, until=until) for o in slot.options):
+        return False
+    return _seen_by_measure(mine, live, store=store, until=until)
 
 
 def just_acted(store: Any, *, now: float, until: float | None = None, skills: Collection[str] = ()) -> set[str]:
@@ -1661,7 +1751,9 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                                     told=told.get(slot.name), people=people,
                                     heard_person=heard_person if _person_bound(skill, slot) else None,
                                     app_names=app_names, site=skill.bind.get(slot.name) == SITE_BIND,
-                                    loose=bool(slot.taste))
+                                    loose=bool(slot.taste),
+                                    options_said=option_names(skill, slot) if (slot.type == "app" and slot.options)
+                                    else None)
             if ok:
                 value, mine = own(slot, value, menu_names, offered)
                 if mine == FROM_HEARD and how == FROM_WORDS:
@@ -1771,6 +1863,18 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 # with a call live, a slot that asks in a call never takes the call's own app unasked (audio.toml:
                 # "turn it down" on a call asks whose volume)
                 reading = None
+            if reading is not None and slot.type == "app" and slot.live == "playing" and \
+                    not (slot.ask_in_call and live.in_call):
+                playing = list(dict.fromkeys(live.playing))
+                if len(playing) == 1 and _live_beats(reading, slot, live, store=store, until=until):
+                    # skill20 (final-D P2: "Bit louder bro." with a playlist playing, the talker's ``target: system``
+                    # raised the PC from 82.7 to 92.7 while Spotify's slider stayed at 40): a reading the words don't
+                    # hold (the slot's own default, or an app the playing measure can see) never beats the one app
+                    # measured playing (the slot's FILL_ORDER: live before default); that app fills it, not a guess.
+                    # Another option (Yuki's own voice) or an app the measure can't see (a game) stands as a named
+                    # guess, and with none or two playing, or a call live, every reading stands as before
+                    values[slot.name], filled[slot.name] = playing[0], "live"     # a fill: never in ``origin``
+                    continue
             if reading is not None:
                 src = _given_source(given_from, slot.name)
                 theirs = False

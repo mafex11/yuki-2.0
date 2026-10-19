@@ -95,7 +95,7 @@ import time
 from typing import Any, Callable, Mapping, Sequence
 
 from yuki.skills.connection import domain_like
-from yuki.skills.engine import RouteCall, RouteResult
+from yuki.skills.engine import DONE_AT, RouteCall, RouteResult
 
 #: What Yuki says when it does nothing for a site's tab (asked or told plainly; never a "done"). Templates: the service
 #: as memory keeps its product name, the browser as people say it.
@@ -1699,19 +1699,236 @@ def route_open_video(call: RouteCall) -> RouteResult:
                           already_line=_browser_line(already, name, source))
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# skill20 (final-D B6): a video title handed to web.open_video, as its own link, by code
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: A title is taken for one video's link only when that link's words hold at least this share of the title's words
+#: (a string measure, never a meaning), the next other video's at most :data:`TITLE_GAP` less, and the title has at
+#: least :data:`TITLE_MIN_WORDS` distinct words (a one-word name fits too many links to say which).
+TITLE_FIT = 0.8
+TITLE_GAP = 0.15
+TITLE_MIN_WORDS = 3
+#: How long the links of a shown page may take to read (one UIA job), how many of them are kept, and how many windows
+#: are read (the window in front, then the asked browser's top window).
+TITLE_LINKS_S = 1.0
+TITLE_LINKS_MAX = 600
+TITLE_WINDOWS = 2
+
+
+def _title_words(text: Any) -> list[str]:
+    """The words of a text for :func:`title_fit` (letters and digits, case folded): a machine split, never meaning."""
+    import re
+
+    return re.findall(r"\w+", str(text or "").casefold())
+
+
+def title_fit(title: Any, text: Any) -> float:
+    """The share of ``title``'s words that ``text`` holds (each word counted as often as the title has it): ``1.0``
+    when a link named "<title> by <channel> 1.2M views" carries every word of the title. Pure."""
+    want = _title_words(title)
+    if not want:
+        return 0.0
+    have: dict[str, int] = {}
+    for w in _title_words(text):
+        have[w] = have.get(w, 0) + 1
+    hit = 0
+    for w in want:
+        if have.get(w, 0) > 0:
+            have[w] -= 1
+            hit += 1
+    return hit / len(want)
+
+
+def best_title_link(title: Any, candidates: Sequence[tuple[str, str]]) -> tuple[str, str, float] | None:
+    """``(the link, its text, its fit)`` of the one video page among ``candidates`` (``(text, address)`` pairs) whose
+    text fits ``title`` clearly (:data:`TITLE_FIT`, ahead of every other video by :data:`TITLE_GAP`); one video
+    reached by several links counts once (its page identity, :func:`video_page`). ``None``: no title of enough words,
+    no page of a site file with an entity, none fits, or two videos fit alike. Pure apart from the site files."""
+    if len(set(_title_words(title))) < TITLE_MIN_WORDS:
+        return None
+    kinds = _video_kinds()
+    best: dict[str, tuple[float, str, str]] = {}
+    for text, url in candidates:
+        got = video_page(url)
+        if got is None or (got[1].get("site"), got[1].get("kind")) not in kinds:
+            continue
+        ident = f"{got[1].get('site')}:{got[1].get('kind')}:{got[1].get('entity')}"
+        fit = title_fit(title, text)
+        if fit > best.get(ident, (-1.0, "", ""))[0]:
+            best[ident] = (fit, got[0], str(text or ""))
+    ranked = sorted(best.values(), key=lambda b: -b[0])
+    if not ranked or ranked[0][0] < TITLE_FIT:
+        return None
+    if len(ranked) > 1 and ranked[1][0] > ranked[0][0] - TITLE_GAP:
+        return None
+    fit, url, text = ranked[0]
+    return url, text, fit
+
+
+def _video_kinds() -> set[tuple[str, str]]:
+    """The ``(site, page kind)`` a video's own page is, as the picks build their links (``youtube_feed``'s site and
+    watch page): a channel's page or a home page that a title happens to fit is never taken for a video."""
+    try:
+        from yuki.skills import youtube_feed
+
+        return {(str(youtube_feed.SITE), str(youtube_feed.WATCH_PAGE))}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def page_links(hwnd: int, budget_s: float = TITLE_LINKS_S) -> list[tuple[str, str]]:
+    """``[(name, address)]`` of the links on the main page window ``hwnd`` shows (its Document whose address is the
+    main page's, :func:`_main_page`; never a background tab's), at most :data:`TITLE_LINKS_MAX`. One read-only UIA job
+    on its own thread (FindAll of Hyperlinks under that Document): nothing is focused, pressed or selected. ``[]`` when
+    no main page is shown or the read doesn't answer in ``budget_s``."""
+    main, _status = _main_page(hwnd)
+    if not main:
+        return []
+    from yuki.connect.spotify_desktop import UiaTree, run_uia
+
+    def job(automation: Any, shared: dict) -> None:
+        tree = UiaTree(automation, int(hwnd))
+        doc = next((d for d in tree.find("Document") if d.value == main), None)
+        if doc is None:
+            return
+        links = tree.find("Hyperlink", scope=doc.ref)
+        shared["links"] = [(str(a.name or ""), str(a.value or "")) for a in links
+                           if a.value and "://" in str(a.value)][:TITLE_LINKS_MAX]
+
+    shared, late = run_uia(job, max(0.2, float(budget_s)), name="yuki-skill-links")
+    if late:
+        return []
+    return list(shared.get("links") or [])
+
+
+def _feed_titles(store: Any) -> list[tuple[str, str, str]]:
+    """``[(title and channel name, the video's page address, its key)]`` of the uploads memory cached from the user's
+    channels' feeds (``yt_videos``, decrypted in this process only), each video's own page by the site file's
+    template. ``[]`` when there are none. Never raises."""
+    try:
+        from yuki.connect.templates import fill
+        from yuki.skills import youtube_feed
+
+        rows = store.yt_videos()
+        names = store.yt_channels(sorted({str(r.get("channel_key") or "") for r in rows if r.get("channel_key")}))
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[tuple[str, str, str]] = []
+    for r in rows:
+        vid = str(r.get("video_id") or "")
+        url = fill(youtube_feed.SITE, youtube_feed.WATCH_PAGE, id=vid) if vid else None
+        if not url:
+            continue
+        channel = str((names.get(str(r.get("channel_key") or "")) or {}).get("name") or "")
+        out.append((" ".join(f"{r.get('title') or ''} {channel}".split()), url, str(r.get("video_key") or "")))
+    return out
+
+
+def link_for_title(title: Any, *, store: Any = None, windows: Sequence[int] = ()) -> dict[str, Any] | None:
+    """skill20 (final-D B6: the agent read a video's title off YouTube's home page in Arc and handed web.open_video
+    that title with no link; every rung needs a link, so the run ended no_route in 1 ms and the agent gave up): the
+    title as one video's own link, by code. First the uploads memory cached from the user's channels' feeds
+    (:func:`_feed_titles`), then the links of the main page each of ``windows`` shows (:func:`page_links`), each by
+    :func:`best_title_link` (a string measure: one clear fit, never two alike). ``{"name", "ref", "via", "fit"}`` (and
+    the upload's ``key`` from the feed): ``via`` ``feed`` or ``page``. ``None`` when none fits clearly (the run goes on
+    as before). Read-only; content stays in RAM."""
+    if len(set(_title_words(title))) < TITLE_MIN_WORDS:
+        return None
+    if store is not None:
+        feed = _feed_titles(store)
+        got = best_title_link(title, [(text, url) for text, url, _key in feed])
+        if got is not None:
+            key = next((k for _t, u, k in feed if u == got[0]), "")
+            return {"name": _words(title), "ref": got[0], "via": "feed", "fit": round(got[2], 2),
+                    **({"key": key} if key else {})}
+    for hwnd in list(dict.fromkeys(int(h) for h in windows if h))[:TITLE_WINDOWS]:
+        got = best_title_link(title, page_links(hwnd))
+        if got is not None:
+            url = got[0]
+            canon = _canonical_video(url)
+            return {"name": _words(title), "ref": canon or url, "via": "page", "fit": round(got[2], 2)}
+    return None
+
+
+def _canonical_video(url: str) -> str | None:
+    """A video page's address as its site file builds it (``https://www.youtube.com/watch?v=<id>`` for a link that
+    carried more query parameters), or ``None`` when the template can't be filled."""
+    try:
+        from yuki.connect.templates import fill, page_of
+
+        m = page_of(url)
+        if m is None or not m.values:
+            return None
+        return fill(m.site, m.kind, **m.values)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _web_window(hwnd: int, image: str = "", pid: int | None = None) -> bool:
+    """Whether window ``hwnd``'s program is a web browser by machine data (:func:`yuki.voice.hands.web_app`: Windows
+    lists it as a browser, or its package declares web addresses, as Arc's does). A chat app that draws a site in its
+    own window never is. Read-only; ``False`` when it can't be told."""
+    try:
+        if pid is None or not image:
+            import win32process
+
+            pid = int(win32process.GetWindowThreadProcessId(int(hwnd))[1])
+            if not image:
+                from yuki.skills.donecheck import _image_of
+
+                image = _image_of(pid)
+        from yuki.voice.hands import web_app
+
+        return bool(web_app(image, pid))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def title_windows(browser: Any = None) -> list[int]:
+    """The windows whose shown page :func:`link_for_title` reads: the window in front, then the top window of the
+    browser the request named (its app key), read only, and each only when it is a browser's by machine data
+    (:func:`_web_window`; skill20 review: a link a friend posted in a chat app is never the match)."""
+    out: list[int] = []
+    front, image = _front()
+    if front and _web_window(int(front), image):
+        out.append(int(front))
+    key = _app_key(browser)
+    if key:
+        out.extend(h for h, pid in _app_windows(key)[:1] if _web_window(int(h), pid=int(pid)))
+    return list(dict.fromkeys(out))[:TITLE_WINDOWS]
+
+
 def _front_urls(hwnd: int) -> list[str] | None:
-    """The addresses of the Documents of window ``hwnd`` (a browser's page), read in one UIA job (never the foreground:
-    the caller names the window)."""
+    """The addresses of every Document of window ``hwnd`` (a browser's pages), read in one UIA job (never the
+    foreground: the caller names the window). skill20 (final-D B1): every one, never the first few; this read can't
+    tell the page shown from a background tab's (Chrome exposed 6-8 of those on 19 Oct), so :func:`_shown_page` uses it
+    only when the main-page read found nothing, and never takes a hit here as the page shown while it holds others."""
     from yuki.connect.spotify_desktop import UiaTree, run_uia
 
     def job(automation: Any, shared: dict) -> None:
         docs = UiaTree(automation, int(hwnd)).find("Document")
-        shared["urls"] = [d.value for d in docs if d.value and "://" in d.value][:4]
+        shared["urls"] = [d.value for d in docs if d.value and "://" in d.value]
 
     shared, late = run_uia(job, FRONT_READ_S, name="yuki-skill-page")
     if late:
         return None
     return list(shared.get("urls") or [])
+
+
+def _main_page(hwnd: int) -> tuple[str, str]:
+    """skill20 (final-D B1): the address of the main page window ``hwnd`` shows, by the reader the rungs themselves
+    watch with (:func:`yuki.perception.tree.wait_for_page`: its page-only pass leaves background tabs' and stacked
+    pages out, the main one first). ``(address, "page")``; ``("", "no_page")`` read and no main page shown (a tab
+    still loading); ``("", "timeout")`` the window didn't answer in :data:`PAGE_READ_S`."""
+    wait = _page_wait(lambda: [hwnd], bool, PAGE_READ_S)
+    if wait is None:
+        return "", "timeout"
+    main = next((p for p in getattr(wait, "seen", None) or [] if p.main and int(p.hwnd) == int(hwnd)), None)
+    url = str(getattr(main, "url", "") or "")
+    if url:
+        return url, "page"
+    return "", ("no_page" if getattr(wait, "answered", False) else "timeout")
 
 
 def _page_window(ctx: Any) -> tuple[int, str]:
@@ -1785,30 +2002,42 @@ def _shown_page(ctx: Any, matches: Callable[[str], bool]) -> tuple[bool | None, 
 
     A rung that found the very page asked for already showing (RAM ``already``; review r1 M1) is True on it (the
     engine's "already" path, never a fresh "done"). No window, or no readable page: None. Evidence (content-free):
-    ``status``, ``via`` (which window was read) and ``process`` (that window's program)."""
+    ``status``, ``via`` (which window was read), ``process`` (that window's program) and ``reader``.
+
+    skill20 (final-D B1: Chrome exposed its background tabs' pages, the first four Documents were read as the page
+    shown, and ``other_page`` came 11-13 times over 6 s while the video played): the window's **main page** is read
+    first, by the rungs' own page-only reader (:func:`_main_page`, ``reader = "main_page"``). Only when that finds no
+    page are the window's Documents read (``reader = "documents"``): no Document of the page anywhere in the window is
+    False (unless the rung saw the page arrive: then True, ``arrived``); a hit there while the window holds other
+    Documents too can't be told from a background tab, so it is None (``background_only``), never a done and never a
+    contradiction. ``other_page`` is said only on a main-page read, or with no Document of the page at all."""
     hwnd, how = _page_window(ctx)
     if not hwnd:
         return (None if how == "front" else False), {"status": "unread" if how == "front" else "no_window", "via": how}
     ev: dict[str, Any] = {"via": how, "process": _window_image(hwnd)}
     ram = _ram(ctx)
-    urls = _front_urls(hwnd)
-    if not urls:
-        # fSkills (live 18 Oct, Arc: "no_document" on 17 reads over 6 s after the address-bar rung saw the page arrive,
-        # then "couldn't confirm"): the Documents' own read found none, so the page-only pass the rungs watch with
-        # reads the window's main page (another reader of the same window, never the window in front)
-        page = _first_page(lambda: [hwnd], bool, PAGE_READ_S)
-        url = str(getattr(page, "url", "") or "")
-        if url:
-            urls, ev["reader"] = [url], "page_pass"
-        elif ram.get("arrived") is True and _ram_hwnd(ram) == hwnd:
-            # neither reader reads this window's page, and the rung itself saw the page newly arrive in this very
-            # window after it acted (a page-only read of it, RAM ``arrived``): that sighting stands
-            return True, {**ev, "status": "arrived"}
-        else:
+    seen_arrive = ram.get("arrived") is True and _ram_hwnd(ram) == hwnd
+    main, read = _main_page(hwnd)
+    if main:
+        ev["reader"] = "main_page"
+        hits = [main] if matches(main) else []
+        if not hits:
+            return False, {**ev, "status": "other_page"}
+    elif seen_arrive:
+        # the main-page reader reads no page in this window now (a tab still drawing, a provider stall), and the rung
+        # itself saw the page newly arrive in this very window after it acted (a page-only read of it, RAM
+        # ``arrived``): that sighting stands; never "other page" without a main-page read (fSkills, live 18 Oct Arc)
+        return True, {**ev, "status": "arrived", "reader": read}
+    else:
+        urls = _front_urls(hwnd)
+        ev["reader"] = "documents"
+        if not urls:
             return None, {**ev, "status": "timeout" if urls is None else "no_document"}
-    hits = [url for url in urls if matches(url)]
-    if not hits:
-        return False, {**ev, "status": "other_page"}
+        hits = [url for url in urls if matches(url)]
+        if not hits:
+            return False, {**ev, "status": "other_page"}
+        if len(urls) > 1:
+            return None, {**ev, "status": "background_only"}
     if ram.get("already") is True:
         return True, {**ev, "status": "already"}
     if ram.get("arrived") is not True:
@@ -2238,9 +2467,16 @@ def probe_video_playing(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None,
 
 
 def probe_page_seen(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
-    """web.open_page's re-check from a second source: memory's own read of the window in front (the watcher's Now
-    board, read after the run began) shows the page the route opened (``site`` / ``kind`` in the check: any page of
-    them). A stale or blocked read: None."""
+    """web.open_page's re-check from a second source: memory's own read of the window the route opened the page in
+    (the watcher's Now board) shows that page (``site`` / ``kind`` in the check: any page of them). A stale, blocked
+    or empty read: None.
+
+    skill20 (final-D B2: three of these said "false done" on pages that had opened, read while Chrome came forward
+    and before the new tab drew, and two such marks disabled the rung for 24 h): only a board read taken **after the
+    done verdict** counts (the engine stamps it, :data:`yuki.skills.engine.DONE_AT`; with none, after the run began),
+    of the very window the route opened the page in when it named one (the window in front only when it named none),
+    with an address read. Anything else is a source that never read the page: None (``stale`` / ``not_read`` /
+    ``no_url``), never a contradiction."""
     ram = _ram(ctx)
     expect = ram.get("expect")
     if not isinstance(expect, Mapping) or not expect:
@@ -2251,19 +2487,37 @@ def probe_page_seen(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dic
     if not board:
         return None, {"status": "no_board"}
     windows = [w for w in board.get("windows") or [] if isinstance(w, Mapping)]
-    try:
-        want = int(ram.get("hwnd") or 0)
-    except (TypeError, ValueError):
-        want = 0
-    # x8WebArc: the window the route opened the page in, when the watcher read it; else the one in front
-    front = next((w for w in windows if want and int(w.get("hwnd") or 0) == want), None) or \
-        next((w for w in windows if w.get("foreground")), None)
+    want = _ram_hwnd(ram)
+    # x8WebArc: the window the route opened the page in; the one in front only when the route named no window
+    if want:
+        front = next((w for w in windows if _int(w.get("hwnd")) == want), None)
+        if front is None:
+            return None, {"status": "not_read"}
+    else:
+        front = next((w for w in windows if w.get("foreground")), None)
     if front is None:
         return None, {"status": "no_front"}
-    if front.get("blocked") or not front.get("read_at") or float(front["read_at"]) < float(ctx.since):
+    after = max(float(getattr(ctx, "since", 0.0) or 0.0), _float(ram.get(DONE_AT)))
+    if front.get("blocked") or not front.get("read_at") or _float(front.get("read_at")) < after:
         return None, {"status": "stale"}
+    if not str(front.get("url") or "").strip():
+        return None, {"status": "no_url"}
     ok = page_matches(front.get("url"), expect)
     return ok, {"status": "page" if ok else "other_page"}
+
+
+def _int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _board_now(wait_s: float = 0.15) -> dict[str, Any] | None:
