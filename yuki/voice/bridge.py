@@ -704,6 +704,9 @@ class VoiceBridge(QObject):
         #: Set while a conversation is being torn down: a cancelled handler
         #: then must not cancel the brain's job (only the user can, §16).
         self.closing = False
+        #: Integration review VC-2: the last :meth:`cancel_passed_on` found the job's send gone already (nothing was
+        #: stopped; the talker is told it went, never "will not go on").
+        self.cancel_found_sent = False
         #: Called (on the voice loop) with a payload for a result that has no
         #: open tell_yuki call to go to (a correction that arrived too late).
         self.announce: Callable[[dict[str, Any]], Any] | None = None
@@ -4468,6 +4471,12 @@ class VoiceBridge(QObject):
                     # pause limit ends it with nothing sent
                     self._log("bridge", op="send_words_unsteered", job_id=job.job_id, turns=turns)
                     return
+                if self.closing or self._loop is None:
+                    # integration review VC-1: the conversation is ending (a dismissal the fast path took, or any end):
+                    # never counted on past it; the brain's pause limit ends it with nothing sent, as brain one's
+                    # close() does
+                    self._log("bridge", op="send_held_closing", job_id=job.job_id)
+                    return
                 job.send_held = False
                 self._gui(lambda: self._send_mark(job, SEND_GO_ON_MARK))
                 self._log("bridge", op="send_go_on", job_id=job.job_id, words=words, view=busy is not None,
@@ -4485,7 +4494,9 @@ class VoiceBridge(QObject):
         stopped: this user turn's, else the newest of this conversation (p24_countdown_cancel: the send was passed on
         in turn 1, "wait, no, don't send it" was turn 2, and the cancel tool answered "no hand_over call is running"
         five times). Nothing more of it is said (the talker says it is stopping in the same reply), unless its send
-        went. ``True`` when one was stopped. Never under brain one. State only; never raises."""
+        went. ``True`` when one was stopped. Integration review VC-2: one whose send went already is not stopped
+        (``False``, with :attr:`cancel_found_sent` set). Never under brain one. State only; never raises."""
+        self.cancel_found_sent = False
         try:
             if getattr(self, "one", False):
                 return False
@@ -4501,6 +4512,12 @@ class VoiceBridge(QObject):
                 return False
             same = [j for j in live if now is not None and j.user_turn == now[1]]
             job = max(same or live, key=lambda j: j.started_at)
+            if job.sent:
+                # integration review VC-2: its send went already (state "going"): nothing is stopped, and the caller
+                # says it went (:attr:`cancel_found_sent`), never that it will not go on
+                self.cancel_found_sent = True
+                self._log("bridge", op="cancel_passed_on", found=True, job_id=job.job_id, sent=True)
+                return False
             job.talker_cancelled = True
             job.cancel_requested = True
             self._gui(lambda: self._cancel(job))

@@ -214,6 +214,11 @@ def is_test_fact(fact: Any, turn_ids: frozenset[int] | set[int]) -> bool:
 #: Test sessions closer than this (s) are one span; a span is padded by :data:`SPAN_PAD_S` on each side.
 SPAN_JOIN_S = 300.0
 SPAN_PAD_S = 120.0
+#: Integration review MH1: the spans a purge took the turns of are kept here (``nudge_state``, JSON ``[[from, to],
+#: ...]``: times only), so the browser measure leaves out a purged block's own rows too (r24 purges before every block),
+#: for as long as that measure looks back (``web_route.BAND_DAYS``).
+KEPT_SPANS_STATE = "testtag:spans"
+KEPT_SPANS_DAYS = 28.0
 #: Real use that confirms a "said" pairing or a name alias (phase 3, 3.4): a real exchange holding its words whose own
 #: skill run (joined by request id; else one within this long after it, s) finished done or already, read back this
 #: many days.
@@ -335,12 +340,62 @@ def test_spans(conn: sqlite3.Connection) -> list[tuple[float, float]]:
 
 def store_test_spans(store: Any) -> list[tuple[float, float]]:
     """:func:`test_spans` through a store's own read (``store._query``), for a reader that holds a store, not a
-    connection (skill19 review L5: the measured browsers leave the test's own tabs out). The spans are known only
-    while the test's turns are kept (a purge deletes them). Never raises (``[]``)."""
+    connection (skill19 review L5: the measured browsers leave the test's own tabs out), with the spans earlier purges
+    kept (integration review MH1: :data:`KEPT_SPANS_STATE`; a purge deletes the turns they came from). Never raises
+    (``[]``)."""
     try:
-        return _merge_spans(store._query(_SPANS_SQL, _session_range()))
+        spans = _merge_spans(store._query(_SPANS_SQL, _session_range()))
     except Exception:  # noqa: BLE001 - no conversation table (an old or a test database): no spans
+        spans = []
+    try:
+        rows = store._query("SELECT value FROM nudge_state WHERE name = ?", (KEPT_SPANS_STATE,))
+        kept = _kept_spans(rows[0][0] if rows else None)
+    except Exception:  # noqa: BLE001 - no state table: the turns' spans alone
+        kept = []
+    return _union_spans(spans, kept)
+
+
+def _kept_spans(raw: Any) -> list[tuple[float, float]]:
+    """The spans a purge kept (:data:`KEPT_SPANS_STATE`'s JSON), ``[]`` when unreadable."""
+    try:
+        got = json.loads(raw) if raw else []
+        return [(float(a), float(b)) for a, b in got if float(a) <= float(b)]
+    except (TypeError, ValueError):
         return []
+
+
+def _union_spans(*groups: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Spans already padded, overlapping ones joined, oldest first."""
+    out: list[list[float]] = []
+    for a, b in sorted((float(a), float(b)) for g in groups for a, b in g):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+def _state_value(conn: sqlite3.Connection, name: str) -> Any:
+    """One ``nudge_state`` row's value through ``conn``, ``None`` when there is none (or no such table)."""
+    if not _has(conn, "nudge_state", "value"):
+        return None
+    row = conn.execute("SELECT value FROM nudge_state WHERE name = ?", (name,)).fetchone()
+    return row[0] if row else None
+
+
+def _keep_spans(conn: sqlite3.Connection, spans: Sequence[tuple[float, float]], now: float) -> None:
+    """Integration review MH1: before a purge deletes the test's turns, their spans (with those kept before, the last
+    :data:`KEPT_SPANS_DAYS`) go to :data:`KEPT_SPANS_STATE`. Times only. Idempotent."""
+    if not _has(conn, "nudge_state", "value"):
+        return
+    raw = _state_value(conn, KEPT_SPANS_STATE)
+    since = float(now) - KEPT_SPANS_DAYS * 86400.0
+    kept = [s for s in _union_spans(_kept_spans(raw), spans) if s[1] >= since]
+    if not kept and raw is None:
+        return
+    conn.execute("INSERT INTO nudge_state(name, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET"
+                 " value = excluded.value, updated_at = excluded.updated_at",
+                 (KEPT_SPANS_STATE, json.dumps([[round(a, 3), round(b, 3)] for a, b in kept]), float(now)))
 
 
 def sql_outside_spans(column: str, spans: Sequence[tuple[float, float]]) -> tuple[str, list[float]]:
@@ -554,6 +609,19 @@ def _purge_run_effects(conn: sqlite3.Connection, turn_ids: set[int] | frozenset[
             gone += [(int(r[0]), str(r[1])) for r in conn.execute(
                 f"SELECT pref_id, type FROM pref_events WHERE source IN ({marks})", part).fetchall()]
             count("pref_events", conn.execute(f"DELETE FROM pref_events WHERE source IN ({marks})", part).rowcount)
+        # integration review MH2: a run's event whose run row is gone (an earlier purge took the row before purges
+        # kept its events; a run whose row never landed) is a test's only inside a test's span (this purge's, or one
+        # an earlier purge kept): outside one it is not provably a test's (the engine runs on with its own key when
+        # the ledger write fails), so it stays. A keyless run's bare "skill_run:" is never matched.
+        known = _union_spans(spans, _kept_spans(_state_value(conn, KEPT_SPANS_STATE)))
+        if known and _has(conn, "skill_runs", "run_key"):
+            cond, params = _in_spans("at", known)
+            orphans = conn.execute(
+                "SELECT id, pref_id, type FROM pref_events WHERE substr(source, 1, 10) = 'skill_run:' AND"
+                f" length(source) > 10 AND {cond} AND NOT EXISTS (SELECT 1 FROM skill_runs WHERE"
+                " skill_runs.run_key = substr(pref_events.source, 11))", params).fetchall()
+            gone += [(int(r[1]), str(r[2])) for r in orphans]
+            count("pref_events_orphaned", _delete_ids(conn, "pref_events", "id", [int(r[0]) for r in orphans]))
         if gone and _has(conn, "prefs", "state"):
             for kind, n in _refresh_prefs(conn, gone).items():
                 count(kind, n)
@@ -677,6 +745,8 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
     if _has(conn, "conversation_batches", "session_id"):
         count("conversation_batches", conn.execute("DELETE FROM conversation_batches WHERE session_id >= ? AND"
                                                    " session_id < ?", (lo, hi)).rowcount)
+    if spans:
+        _keep_spans(conn, spans, now)   # integration review MH1: the spans outlive the turns they came from
     _delete_ids(conn, "conversation_turn_vec", "turn_id", turn_ids)
     count("conversation_turns", _delete_ids(conn, "conversation_turns", "id", turn_ids))
     if _has(conn, "runs", "run_key"):

@@ -401,15 +401,17 @@ def _launch_seen(result: Any) -> dict[str, Any]:
             "timings": _stage_ms(details.get("timings_ms"))}
 
 
-def _stage_ms(timings: Any) -> str:
-    """A launch's ``timings_ms`` (stage -> ms) as one content-free ``stage=ms`` list, or ``""``."""
+def _stage_ms(timings: Any) -> dict[str, int]:
+    """A launch's ``timings_ms`` (stage -> ms) as ``{stage: ms}`` numbers (code-word stages, at most 16), or ``{}``.
+    Integration review F5: kept a mapping of numbers, which a content-free log keeps (one ``stage=ms`` string was
+    only its length there)."""
     if not isinstance(timings, Mapping):
-        return ""
-    parts = []
+        return {}
+    out: dict[str, int] = {}
     for stage, ms in timings.items():
-        if isinstance(ms, (int, float)) and not isinstance(ms, bool):
-            parts.append(f"{str(stage)[:24]}={float(ms):.0f}")
-    return ",".join(parts[:16])
+        if isinstance(ms, (int, float)) and not isinstance(ms, bool) and len(out) < 16:
+            out[str(stage)[:24]] = int(round(float(ms)))
+    return out
 
 
 def _log_open(call: RouteCall, rung: str, seen: Mapping[str, Any], status: str) -> None:
@@ -418,7 +420,7 @@ def _log_open(call: RouteCall, rung: str, seen: Mapping[str, Any], status: str) 
     window it acted in and whether that window came to the front."""
     _log(call.ctx)("web_open", stage=rung, via=str(seen.get("via") or ""), status=status,
                    process=str(seen.get("process") or ""), front=bool(seen.get("front")),
-                   state=str(seen.get("state") or ""), ms=str(seen.get("timings") or ""))
+                   state=str(seen.get("state") or ""), stage_ms=dict(seen.get("timings") or {}) or None)
 
 
 # x8WebArc: the window a rung of this run opened (or tried to open) a page in, for the next rung of the same run (the

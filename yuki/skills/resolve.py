@@ -81,6 +81,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable, Collection, Mapping, Sequence
 
@@ -386,6 +387,13 @@ def _point_token(token: str) -> str:
     return "".join(ch for ch in token if ch.isalnum() or ch in "+-.").strip(".")
 
 
+def _unread_sign(token: str) -> bool:
+    """Integration review F4: a token holding a sign this form doesn't read (a minus sign U+2212, a dash, "±": a math
+    symbol or a dash other than ``+`` / ``-``). :func:`_point_token` would drop it and read the number as a step up, so
+    the value is no form at all (the caller is told the form). Format only."""
+    return any(ch not in "+-" and unicodedata.category(ch) in ("Sm", "Pd") for ch in token)
+
+
 def points_value(value: Any) -> str | float | None:
     """skill19 (live 19 Oct, spotify RC5a: ``change: "down a little"`` was dropped and the skill asked "Louder,
     quieter, or to what level?"): a ``points`` slot's value in the schema's own form, ``None`` when it holds none.
@@ -403,7 +411,10 @@ def points_value(value: Any) -> str | float | None:
         return x if x != 0.0 else None
     if not isinstance(value, str):
         return None
-    tokens = [_point_token(t) for t in _words(value).casefold().split()]
+    raw = _words(value).casefold().split()
+    if any(_unread_sign(t) for t in raw):
+        return None
+    tokens = [_point_token(t) for t in raw]
     tokens = [t for t in tokens if t]
     dirs = {t for t in tokens if t in DIRECTIONS}
     nums = [n for n in (_num(t) for t in tokens) if n is not None]

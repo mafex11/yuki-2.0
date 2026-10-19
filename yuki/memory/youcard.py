@@ -22,7 +22,7 @@ reason from, not a catalog, in this order (the situation on the screens stays se
    :data:`HOUR_MIN_DAYS` days or more: "a couple of times" never leads the card); their weekly routines with days and
    times (every active one, whatever the day: "what time's my meeting tomorrow"); their routine as the nightly
    portrait writes it (final-B: sleep, work hours, the usual meeting; the brief leaves it to the card; the planner's
-   in the first priority, :data:`ROUTINE_PRIORITY`); their own ways (contract C4: run only when asked, never offered);
+   and the judge's in the first priority, :data:`ROUTINE_PRIORITY`); their own ways (contract C4: run only when asked, never offered);
 3. **Their things, each with what it means to them** (``yuki.memory.meanings.meaning_of``, contract M1: "mafex (the
    MacBook's projects)", next to the thing) - sites with their usual browser (the preference's own answer:
    ``values.known`` reads it from ``yuki.skills.prefs``, one truth with what Yuki opens them in) and a work mark, weak
@@ -41,9 +41,8 @@ Every line says how sure it is ("often", "some days", "n of m", "you said", "dat
 :data:`TALKER_CHARS` (one less: the mouth's cut), planner and judge at most :data:`WIDE_CHARS`. When a card is over
 (:func:`_fit`), by priority from the least: the lists give their tails first (a weak item first, one with a meaning
 last, never below a few), then whole lines go; a priority gives its tails only once the lines two or more priorities
-below it are gone (the first priority: Open, Lately, the desk, Usually now, Left off, People, the planner's routine),
-and the live lines never go. The slow part (everything but the
-live lines) is cached in RAM per database and purpose for :data:`CACHE_S` and rebuilt sooner when the learned rows,
+below it are gone (the first priority: Open, Lately, the desk, Usually now, Left off, People, the planner's and the
+judge's routine), and the live lines never go. The slow part (everything but the live lines) is cached in RAM per database and purpose for :data:`CACHE_S` and rebuilt sooner when the learned rows,
 routines, tastes, prefs, contacts, portrait, day digests, meanings or desk habits change (one stamp query, and the
 meanings' own); the live lines are read fresh on every call (the you-now record is in RAM). Never written to disk,
 never logged (logs carry sizes only), never in the MCP.
@@ -111,9 +110,12 @@ USE_DAYS = 14.0
 ROUTINE_CHARS = (300, 400)
 #: The routine line's priority per card (:func:`_fit`). The planner reads the brief only when there is no card
 #: (``brain.context.read_context``) and its memory reads never carry the routine, so the card is its one way to it:
-#: first priority there (desk19 review M1: at the second it always gave way on the full planner card). The talker's
-#: memory search carries it too (``voice.recall.routine_line``) and the judge's card holds it at the second.
-ROUTINE_PRIORITY = {"talker": 2, "planner": 1, "judge": 2}
+#: first priority there (desk19 review M1: at the second it always gave way on the full planner card). Integration
+#: review MH3: the live lines (the day, "in the middle of": priority 0, up to MIDDLE_CHARS each) take the room first,
+#: so at the second priority the line gave way on most talker cards and nearly every judge card (measured on a copy
+#: with live lines of a realistic size). The judge has no other way to it (its tomorrow and rest check-ins): first
+#: priority there too. The talker keeps it at the second: its memory search carries it (``voice.recall.routine_line``).
+ROUTINE_PRIORITY = {"talker": 2, "planner": 1, "judge": 1}
 #: "Lately": each day digest's first sentence at most.
 LATELY_CHARS = 130
 #: "Where they left off" (planner): the LEFT_OFF_N sites they come back to most (the most days; never fewer than

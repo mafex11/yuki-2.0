@@ -1374,6 +1374,12 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                     await original({"cancelled": True, "note": "Stopped: the request it passed on will not go on."},
                                    properties=FunctionCallResultProperties(run_llm=False))
                     return
+                if hook("passed_on_sent", default=None):
+                    # integration review VC-2: its message went before the cancel: nothing was stopped, and the talker
+                    # says so in its own words (a turn of its own), never that it will not go on
+                    await original({"cancelled": False, "note": "Not stopped: what it passed on had already been "
+                                                                "sent before the cancel."})
+                    return
 
             async def settle(result: Any, *, properties: Any = None) -> None:
                 if isinstance(result, dict) and result.get("cancelled"):
@@ -2988,6 +2994,11 @@ class _Hooks:
             return bool(cancel())
         except Exception:  # noqa: BLE001 - Pipecat's own refusal then
             return None
+
+    def passed_on_sent(self) -> bool:
+        """Integration review VC-2: the last :meth:`cancel_passed_on` found that job's send gone already
+        (``VoiceBridge.cancel_found_sent``). Never raises."""
+        return getattr(self.c.bridge, "cancel_found_sent", False) is True
 
     def one_reply(self, calls: Any) -> None:
         driver = getattr(self.c, "one_driver", None)

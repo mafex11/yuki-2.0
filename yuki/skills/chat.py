@@ -1201,6 +1201,34 @@ def _tidy_switch(call: RouteCall, hands: Any, data: Mapping[str, Any], run: dict
         call.ctx.sleep(POLL_S)
 
 
+def _shortcut_closed(data: Mapping[str, Any] | None, before: tuple[int, int, str, str] | None,
+                     held_before: tuple[int, int, str, str] | None) -> str:
+    """Integration review F2: whether the switcher's shortcut closed what held the keyboard before it rather than
+    opening something, from the app's own UI only (UIA role and name, never the user's words): what held it (``before``
+    when it was a text field, else the focus read's holder) is looked up once in its own window (read only). A code
+    word: ``gone`` (no longer there: the shortcut closed a switcher or dialog that was already open, and the field that
+    took the keyboard is the app's own), ``there`` (still there: the shortcut opened something new), ``unknown`` (the
+    look-up couldn't run, more than one control fits, or the holder has no role and name to look by), ``root`` (the
+    holder is the window itself, which no shortcut closes) or ``unread`` (nothing was read before the shortcut)."""
+    held = before if before is not None else held_before
+    if held is None:
+        return "unread"
+    window, hwnd, role, name = held
+    if not window and data is not None:
+        window = _app_hwnd(data)
+    if hwnd and window and int(hwnd) == int(window):
+        return "root"
+    if not window or not role or not name:
+        return "unknown"
+    try:
+        from yuki.skills.uia_route import find_in
+
+        status = str(find_in(int(window), role=role, name=name).status)
+    except Exception:  # noqa: BLE001 - a look-up that can't run is no answer
+        return "unknown"
+    return "gone" if status == "missing" else "there" if status == "found" else "unknown"
+
+
 def _run_switch(call: RouteCall, hands: Any, steps: list[dict[str, Any]], *, apps: Sequence[str], key: str,
                 way_text: str, data: Mapping[str, Any] | None = None) -> tuple[bool, dict[str, Any]]:
     """The switcher's (or search's) steps, its shortcut first on its own: the name is typed and Enter pressed only once
@@ -1213,7 +1241,11 @@ def _run_switch(call: RouteCall, hands: Any, steps: list[dict[str, Any]], *, app
     before the open key or the pick) closes what it opened (:func:`_tidy_switch`, the app's ``[chat] close`` from
     ``data``) and says so: ``facts["switcher"]`` ``unseen`` / ``unfinished``, ``facts["finished"]`` False. The text
     field the switcher gave the keyboard to is kept as ``facts["switcher_field"]`` (RAM: the caller compares later
-    focus reads with it)."""
+    focus reads with it).
+
+    Integration review F2: a shortcut that closed what held the keyboard (:func:`_shortcut_closed`) types nothing and
+    presses nothing more: ``facts["switcher"]`` ``closed_own``, ``facts["switcher_closed"]`` ``by_shortcut`` (seen
+    gone) or ``untold`` (a quick switcher in an app with no composer shapes, where it couldn't be told)."""
     before = _field(hands)
     if before is None:
         before = _settled_field(call.ctx, hands)
@@ -1236,6 +1268,18 @@ def _run_switch(call: RouteCall, hands: Any, steps: list[dict[str, Any]], *, app
         first["switcher"] = "unfinished" if not ok else "unseen"
         if data is not None:
             _tidy_switch(call, hands, data, first, apps=apps, key=key, before=held_before, opened=opened)
+        return False, first
+    # integration review F2: the composer shapes above exist only where the app's data has a composer label (none for
+    # Slack or WhatsApp, none for Discord outside its listed languages), so the structure decides too: what held the
+    # keyboard before the shortcut no longer there means the shortcut closed a switcher already open and the field
+    # that took the keyboard is the app's own. A quick switcher (the toggling shortcut M2 is about) in an app with no
+    # composer shapes also stops when that can't be told while a text field held the keyboard. Nothing more is sent
+    # and nothing is tidied (it closed itself)
+    shut = _shortcut_closed(data, before, held_before)
+    if shut == "gone" or (shut == "unknown" and before is not None and data is not None and data.get("switcher")
+                          and not composer_shapes(data)):
+        first["switcher"] = "closed_own"
+        first["switcher_closed"] = "by_shortcut" if shut == "gone" else "untold"
         return False, first
     ok, rest = run_steps(hands, steps[1:], words=call.ctx.words, apps=apps, key=key, way_text=way_text)
     merged = dict(rest)

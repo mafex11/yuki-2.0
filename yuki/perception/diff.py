@@ -166,10 +166,12 @@ def _moved(a: Window, b: Window) -> bool:
 
 
 def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
-            touched: Iterable[Any] = ()) -> DeskDiff:
+            touched: Iterable[Any] = (), sound_apps: Iterable[Any] | None = None) -> DeskDiff:
     """What changed from ``before`` to ``after`` (two :func:`~yuki.perception.situation.snapshot` reads around one
     act), with the four flags (module docstring). ``acted``: what the request was about; ``touched``: the windows the
-    act itself brought up or focused (ids or app names). Pure: no OS call. Never raises on odd input."""
+    act itself brought up or focused (ids or app names). ``sound_apps`` (integration review c2desk-1): when given, the
+    apps whose mixer rows are the act's for ``left_silent`` alone (an app whose volume the act set touched none of its
+    windows); ``None``: those of ``acted`` and ``touched``, as before. Pure: no OS call. Never raises on odd input."""
     diff = DeskDiff()
     acted_hwnds, acted_apps = _acted_sets(acted)
     touched_hwnds, touched_apps = _acted_sets(touched)
@@ -363,7 +365,7 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
     # left silent (module docstring): a control turned toward sound whose sound is still off after the act; an app's
     # mixer row only when that app is the act's (the master as before: one control, whoever's act it was)
     over = after.master if "master" not in after.errors and after.master else None
-    act_apps = acted_apps | touched_apps
+    act_apps = _acted_sets(sound_apps)[1] if sound_apps is not None else acted_apps | touched_apps
     for v in diff.volume_changes:
         if not ((v["muted_from"] and not v["muted_to"]) or v["level_to"] - v["level_from"] >= LEVEL_EPS):
             continue

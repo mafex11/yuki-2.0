@@ -4692,6 +4692,8 @@ class Dispatcher:
         payload["focus_taken"] = bool(result.focus_taken)
         payload["acted"] = bool(result.acted)
         payload["acted_apps"] = [str(a) for a in result.acted_apps or ()]
+        # integration review F3: the windows its rungs measurably brought forward, the brain's after-look scope by id
+        payload["acted_windows"] = [int(h) for h in result.acted_windows or () if isinstance(h, int)]
         if blocked or result.held:
             payload["refused"] = details["refused"]
         return ToolOutcome(name="run_skill", ok=ok, summary=text.split("\n", 1)[0][:200],

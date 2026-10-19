@@ -167,6 +167,13 @@ LINE_TIDY_ASK: dict[str, str] = {"place": "Should I move {app} to {where}?", "pl
                                  "focus_back": "Should I put {app} back in front?"}
 #: A tidy-up step's window when Windows names no app for it.
 TIDY_NO_APP = "that window"
+#: Integration review c2desk-2: code's one measured line after the request's own when the after-look shows what they
+#: asked for did not reach its purpose (no tidy step can touch either): a control turned toward sound still silent
+#: (``diff`` ``left_silent``: its own level or mute, else the PC's), and what played now behind another tab.
+LINE_STILL_LEVEL = "It's still at {level}%."
+LINE_STILL_MUTED = "It's still muted."
+LINE_PC_SILENT = {"muted": "The PC's own volume is still muted.", "level": "The PC's own volume is still at {level}%."}
+LINE_BEHIND_TAB = "What was playing is still playing behind it."
 #: Where a placed window went, in words: another monitor, else a half of the same one (else ``place_here``).
 TIDY_WHERE: dict[str, str] = {"other": "your other screen", "left": "the left half", "right": "the right half"}
 #: aBrain (phase 2.3; 18 Oct live A: "Opening a page in Google Chrome." and "Clicking in Google Chrome." said by code
@@ -525,6 +532,11 @@ class Executor:
         self._desk_first: Any = None
         self._desk_asked: set[Any] = set()
         self._desk_touched: set[Any] = set()
+        #: integration review c2desk-1: the apps whose mixer rows this request's acts set (an app_volume step's app, a
+        #: skill run's measured apps): the after-look's ``left_silent`` scope only, never its window scope
+        self._desk_sound: set[Any] = set()
+        #: integration review c2desk-2: the after-look's measured line for what didn't reach its purpose ("" none)
+        self._purpose_line = ""
         #: P1.3: the after-look's diff when a flag was up (what a tidy-up may touch: :meth:`_tidy_mine`), and how many
         #: tidy steps changed something (a done re-check that reads after one is not a false done)
         self._after_diff: Any = None
@@ -677,6 +689,10 @@ class Executor:
         result = self._done_check()
         if result.status == "done":
             result.after, result.after_facts = self.after_look()
+            sent = isinstance(result.outcome, Mapping) and bool(result.outcome.get("send"))
+            if self._purpose_line and result.line and not sent:
+                # integration review c2desk-2: said after the request's own line (never on a send's, consent's own)
+                result.line = f"{result.line.rstrip()} {self._purpose_line}"
         return self._finished(result)
 
     def run(self, plan: Any, *, stop_reason: str | None = None) -> RunResult:
@@ -728,6 +744,7 @@ class Executor:
     def after_look(self) -> tuple[str, dict[str, Any]]:
         """What this request's acts did to the desk (module docstring): ``(the "After:" block, the diff's facts)``;
         the block is ``""`` when no flag is up (no turn, no cost). Logged content-free. Never raises."""
+        self._purpose_line = ""   # integration review c2desk-2: this look's own, never an earlier plan's
         if self.tidy is not None or self._desk_first is None:
             return "", {}
         try:
@@ -737,12 +754,15 @@ class Executor:
             after = self._desk_now()
             if after is None:
                 return "", {}
+            named = {a for a in self._desk_asked | self._desk_touched if isinstance(a, str)}
             d = desk_diff.compare(self._desk_first, after, acted=tuple(self._desk_asked),
-                                  touched=tuple(self._desk_touched))
+                                  touched=tuple(self._desk_touched), sound_apps=tuple(self._desk_sound | named))
             facts = d.facts()
             self._emit_log("after_look", ms=round(float(getattr(after, "ms", 0.0) or 0.0), 1), **facts)
             if not d.any_flag:
                 return "", facts
+            # integration review c2desk-2: no tidy step touches the sound or a tab, so code says it, from the measure
+            self._purpose_line = self._purpose_words(d)
             if not self._tidy_can_act(d):
                 # integration (desk19 merge note 5): only flags the tidy turn's window steps can't touch (the sound
                 # left silent, a tab over what played): no turn, so no planner call is spent on it
@@ -755,6 +775,31 @@ class Executor:
         except Exception as exc:  # noqa: BLE001 - no look: the request ends as before
             self._emit_log("after_look", error=type(exc).__name__)
             return "", {}
+
+    @staticmethod
+    def _purpose_words(d: Any) -> str:
+        """Integration review c2desk-2: code's measured words for what the request's acts left short of its purpose
+        (:data:`LINE_STILL_LEVEL` and the rest): the first control turned toward sound that is still silent (its own
+        level or mute, else the PC's), and a tab of the act's over what played. ``""`` for neither. Never raises."""
+        try:
+            out: list[str] = []
+            for v in getattr(d, "volume_changes", None) or ():
+                why = list(v.get("silent") or ())
+                if not why:
+                    continue
+                if "muted" in why:
+                    out.append(LINE_STILL_MUTED)
+                elif "level" in why:
+                    out.append(LINE_STILL_LEVEL.format(level=round(float(v.get("level_to") or 0.0))))
+                elif "master" in why:
+                    out.append(LINE_PC_SILENT["muted"] if v.get("master_muted") else LINE_PC_SILENT["level"].format(
+                        level=round(float(v.get("master_level") or 0.0))))
+                break
+            if any(c.get("kind") == "tab" and c.get("side_effect") for c in getattr(d, "covered", None) or ()):
+                out.append(LINE_BEHIND_TAB)
+            return " ".join(out)
+        except Exception:  # noqa: BLE001 - no words: the request's line stands
+            return ""
 
     @staticmethod
     def _tidy_can_act(d: Any) -> bool:
@@ -810,11 +855,18 @@ class Executor:
             self._desk_touched |= hwnds
             if call.tool == "run_skill":
                 key, slots = consent.skill_input(call, self.head)
+                # integration review F3 (contract C1): the windows the engine measured its rungs bringing forward are
+                # the act's by id (Spotify raised by its library rung is never "not from your act"); the apps its
+                # rungs acted in are the act's for their sound only (c2desk-1: a volume run touched no window)
+                measured = {h for h in (done.as_hwnd(w) for w in payload.get("acted_windows") or ()) if h}
+                self._desk_touched |= measured
+                self._desk_sound |= {words(a) for a in payload.get("acted_apps") or () if words(a)}
                 if not hwnds:
                     self._desk_touched |= set(self._skill_programs(payload, key, slots))
             elif call.tool == "app_volume" and words(call.input.get("app")):
-                # integration (desk19 merge note 7): the app whose mixer row this act set is the act's own
-                self._desk_touched.add(words(call.input.get("app")))
+                # integration review c2desk-1 (desk19 merge note 7): the app whose mixer row this act set is the act's
+                # for left_silent only; its windows stay out of the act's window scope
+                self._desk_sound.add(words(call.input.get("app")))
             elif call.tool in ASKED_VERBS:
                 self._desk_asked |= hwnds
                 if call.tool == "launch_app" and not hwnds and words(call.input.get("query")):

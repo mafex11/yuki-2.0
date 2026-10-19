@@ -213,6 +213,18 @@ _AFTER_ASK_NOTE = (
     "theirs: what they asked for stays; when your own act left a side effect worth undoing, ask in a few words whether "
     "to (the question alone, no call; their yes is the ask); otherwise stay quiet."
 )
+#: Integration review c2desk-2 (desk19 merge note 6, all-desk RC2): with the After lines when the measure shows what
+#: they asked for did not reach its purpose (``left_silent``, a tab of the act's over what played), whatever the tidy
+#: dial says: the look's one step may then be a volume step (:meth:`handle`).
+_AFTER_PURPOSE = (
+    " When After shows what they asked for did not reach its purpose (a sound still silent, or what played now behind "
+    "another tab), finish it with one step (a volume step, for a sound still silent) or say so in a few words."
+)
+#: ... and the look's principle with the tidy dial off: no window tidy-up, only that.
+_AFTER_PURPOSE_NOTE = (
+    "Done and verified; said is what was heard already. After is what your act did to their screen; their windows "
+    "stay as they are." + _AFTER_PURPOSE + " Otherwise stay quiet."
+)
 #: A placement verb that did not take effect: said plainly, no other hand (never a loop of tidy-ups).
 _PLACE_FAILED_NOTE = (
     "It did not take effect, as the report says. Say so in a few words if they asked for it; if it was your own "
@@ -2279,9 +2291,10 @@ class Hands:
     async def _look_after(self, params: Any, name: str, args: dict[str, Any], facts: dict[str, Any],
                           before: Any, rest: bool = False) -> dict[str, Any] | None:
         """P1.3: once the act's done line is queued, read the desk again and compare it with ``before``. When the act
-        took something the user had (``diff.any_flag``: measured shares and focus only) and the tidy dial is not off,
-        the result fields of one more talker run: ``{"after": the diff in plain words, "how_to_handle_it": the
-        principle}``; else ``None`` (the done line ends the call, as before: no run, no cost). At most one look per user
+        took something the user had (``diff.any_flag``: measured shares and focus only) and the tidy dial is not off
+        (integration review c2desk-2: or, whatever the dial, what they asked for did not reach its purpose: the sound
+        left silent, a tab of the act's over what played; :data:`_AFTER_PURPOSE`), the result fields of one more talker
+        run: ``{"after": the diff in plain words, "how_to_handle_it": the principle}``; else ``None`` (the done line ends the call, as before: no run, no cost). At most one look per user
         turn (never a loop), kept with the act's own windows and, when the act took the focus, the window that was in
         front (what a tidy step may touch, :meth:`_look_check`); the window in front before an act that moved the focus
         is kept for focus_back. Logs content-free. Never raises."""
@@ -2318,7 +2331,12 @@ class Hands:
             elif self._front_before is not None and self._front_before[2] != turn:
                 self._front_before = None   # an act of a later turn that moved no focus: an older front is let go
             level = self._tidy_level() if d.any_flag else ""
-            look = bool(d.any_flag and level != "off" and self._look_now(turn) is None)
+            # integration review c2desk-2: what they asked for that did not reach its purpose (measured: the sound left
+            # silent, a tab of the act's over what played) is theirs to hear whatever the dial says; the dial gates
+            # only the window tidy-up
+            purpose = bool(d.flags.get("left_silent")) or any(c.get("kind") == "tab" and c.get("side_effect")
+                                                              for c in d.covered)
+            look = bool(d.any_flag and (purpose or level != "off") and self._look_now(turn) is None)
             text = desk_diff.render(d, max_chars=AFTER_CHARS) if look else ""
             if self.log is not None:
                 self.log.event("hands", op=name, after_look=bool(text), tidy=level or None, call=params.tool_call_id,
@@ -2330,9 +2348,17 @@ class Hands:
             taken = bool(d.flags.get("focus_taken")) and d.focus_from
             # review r1 L3: ``rest``: the look rides with a "still to do" look, so the calls after it are not held to
             # the one tidy step (:meth:`handle`)
-            self._look = {"turn": turn, "at": time.monotonic(), "acts": self._act_windows(after, d, acted, touched),
-                          "front": int(d.focus_from) if taken else None, "used": False, "rest": bool(rest)}
-            return {"after": text, "how_to_handle_it": _AFTER_ASK_NOTE if level == "ask" else _AFTER_NOTE}
+            # integration review c2desk-2: with the dial off no window step is the look's (no act windows, no front);
+            # ``silent`` lets its one step be a volume step (:meth:`handle`)
+            off = level == "off"
+            self._look = {"turn": turn, "at": time.monotonic(),
+                          "acts": set() if off else self._act_windows(after, d, acted, touched),
+                          "front": int(d.focus_from) if taken and not off else None, "used": False,
+                          "rest": bool(rest), "silent": bool(d.flags.get("left_silent")), "ask": level == "ask",
+                          "off": off, "purpose": purpose}
+            note = _AFTER_PURPOSE_NOTE if off else (_AFTER_ASK_NOTE if level == "ask" else _AFTER_NOTE) + (
+                _AFTER_PURPOSE if purpose else "")
+            return {"after": text, "how_to_handle_it": note}
         except Exception as exc:  # noqa: BLE001 - no look: the done line ends the call as before
             if self.log is not None:
                 self.log.event("hands", op=name, after_error=type(exc).__name__)
@@ -2793,7 +2819,15 @@ class Hands:
             look = self._look_now(self._call_safely(self.user_turn, None))
             in_look = look is not None and arrived >= float(look.get("at") or 0.0) and not look.get("rest")
             placing = name == "window" and str(args.get("action") or "") in PLACE_OPS
-            if (gate is not None and gate.get("passed") and not spared) or (in_look and not placing and not spared):
+            # integration review c2desk-2: a look whose After shows the sound still silent lets one volume step through
+            # (its one step, as a placement's is); everything else stays held
+            sound_step = bool(in_look and look.get("silent") and not look.get("used") and (
+                name == "app_volume" or (name == "media_key" and str(args.get("key") or "") in _VOLUME_KEYS)
+                or (name == SKILL_HAND and str(args.get("skill") or "").strip() == VOLUME_SKILL)))
+            if sound_step:
+                look["used"] = True
+            if (gate is not None and gate.get("passed") and not spared) or (
+                    in_look and not placing and not spared and not sound_step):
                 from pipecat.frames.frames import FunctionCallResultProperties
 
                 if self.log is not None:
@@ -4256,10 +4290,12 @@ class Hands:
         first_line = report.split("\n", 1)[0]
         record = self._keep_record(params, name, args, first_line, ok=ok, verified=facts.get("verified"),
                                    turn=self._call_safely(self.user_turn, None))
-        if record is not None and verified and facts.get("focus_taken"):
+        if record is not None and verified and (facts.get("focus_taken") or facts.get("focus_declared")):
             # fHands (k_tab_close_it): a skill that opened a page leaves no tab identity of its own, so "close it" had
             # no referent among two tabs titled "GitHub": the tab showing in the window in front once it ran is kept
-            # on its line, read off the reply's path
+            # on its line, read off the reply's path. Integration review F1: a page opened as a new tab in the browser
+            # already in front changes no measured front, so a rung's declared focus counts here too (never the bare
+            # ``acted``: a verified volume run with Chrome in front would claim the user's own tab)
             self._place_record(record)
         if self.on_step is not None:
             try:
@@ -4346,9 +4382,12 @@ class Hands:
                 # calls stay open: the look is marked as one with a rest)
                 look = await self._look_after(params, name, args, facts, before, rest=True)
                 if look is not None:
-                    ask = look.get("how_to_handle_it") == _AFTER_ASK_NOTE
+                    kept = self._look or {}
                     extra = {"after": look.get("after")}
-                    note += _AFTER_REST["ask" if ask else "act"]
+                    if not kept.get("off"):
+                        note += _AFTER_REST["ask" if kept.get("ask") else "act"]
+                    if kept.get("purpose"):
+                        note += _AFTER_PURPOSE   # integration review c2desk-2
             if self.log is not None:
                 self.log.event("hands", op=name, then_open=True, steps=1, sent_turn=sent, after_look=bool(extra),
                                call=params.tool_call_id)
@@ -4714,6 +4753,7 @@ class Hands:
         ok, report, more = result.as_voice()
         facts.update(more)
         facts["focus_taken"] = bool(result.focus_taken)
+        facts["focus_declared"] = bool(getattr(result, "focus_declared", False))   # integration review F1
         if desk.get("before") is not None:
             facts["_desk_before"] = desk["before"]
             facts["_desk_scope"] = self._skill_scope(skill_key, result)

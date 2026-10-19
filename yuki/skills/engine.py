@@ -371,6 +371,10 @@ class SkillResult:
     #: foreground before it is not the one after it). Only a rung whose front couldn't be read (or an eval run) falls
     #: back to its route's declaration (``needs_focus``). Set on every return path of a run that reached its rungs.
     focus_taken: bool = False
+    #: Integration review F1: a rung that ran declared it takes the front (``needs_focus``), whatever the measure saw:
+    #: a page opened as a new tab in the browser window already in front changes no foreground, yet the voice's tab
+    #: record (fHands' "close it") is placed on it. Only that consumer reads it; the desk scope reads the measure.
+    focus_declared: bool = False
     #: skill19 (contract C1): something on the PC was touched by this run: a rung acted by its own word (``ran``), or
     #: the measured front changed under a rung (a window came to the front, or the window in front lost most of its
     #: visible share), even when the rung itself said it couldn't (Spotify's link rung raised Spotify, then "page not
@@ -762,6 +766,9 @@ class _Measure:
             self.settle()
         except Exception:  # noqa: BLE001 - the per-rung measure stands
             pass
+        # integration review F1: the run loop's declared value (every constructor passes it) is kept before the
+        # measure takes its place
+        result.focus_declared = bool(result.focus_taken)
         result.focus_taken = bool(self.focus)
         result.acted = bool(acted or self.touched)
         result.acted_apps = list(self.apps)
