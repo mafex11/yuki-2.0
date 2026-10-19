@@ -13,7 +13,11 @@ One :class:`TurnBudget` per user turn (voice) or request (typed). Every number i
 * **Answers**: a turn with no act yet gets at most ``reads`` read calls (voice 8, typed 12) or ``answer_s`` of work.
 * **Retry window**: after the first act that did not take effect, other undoable tries go for 8 s
   (``voice.hands.RETRY_BUDGET_S``), never after; a lasting act (a send, a join) that missed is never tried again in the
-  turn.
+  turn. fb (final-F B6, multi_japanese_and_volume): the calls of one model reply are one try, judged at the reply's
+  arrival (its first call, keyed by :attr:`TurnBudget.rounds`), so a later call of the reply is never refused because
+  an earlier one ran long; an act whose effect could not be read (a skill run the engine settled ``unverified``:
+  ``after_call(unsure=True)``) is no miss of the window (it is still never run again as the same step, and still the
+  closing hold's one miss).
 * **Same failing step**: refused at once, keyed by :func:`step_key` (``voice.hands._step_key``'s identity, on the
   resolved target: the window the gate found, whatever named it; one20, final-D one-core §3.4).
 * **Refusals**: the second refusal in a turn settles it: no model run (``run_llm=False``), code's rule-#149 line.
@@ -135,7 +139,8 @@ def step_key(name: str, args: Mapping[str, Any] | None, target: Mapping[str, Any
     target inside that window, and a browser's tab names carry live text (a memory figure) that changes between two
     reads, so the tab's own title is not the key."""
     raw = dict(args or {})
-    keep = {k: v for k, v in raw.items() if k not in ("say_first", "say_when_done", "named", "then")}
+    # fb (B8): ``own_step`` says whose the call is (its intent), never what it acts on
+    keep = {k: v for k, v in raw.items() if k not in ("say_first", "say_when_done", "named", "then", "own_step")}
     if isinstance(keep.get("url"), str):
         keep["url"] = keep["url"].strip().rstrip("/").casefold()
     if isinstance(keep.get("name"), str):
@@ -194,6 +199,14 @@ class TurnBudget:
         self.unfinished = 0
         #: :attr:`acts` when the newest miss (or unfinished run) came back: an act after it raises the count.
         self._acts_at_miss: int | None = None
+        #: fb (B6): acts whose effect could not be read (``after_call(unsure=True)``): barred as the same step, no
+        #: miss of the retry window; the counted seconds at the first of them (the closing hold's time bound).
+        self.unsure = 0
+        self._unsure_at: float | None = None
+        #: fb (B6): the reply whose calls are coming in (:attr:`rounds` at its first call) and its arrival (counted
+        #: seconds): the retry window judges every call of that reply at its arrival.
+        self._reply_round: int | None = None
+        self._reply_at: float | None = None
         self.closed = False
         self.closed_why = ""
 
@@ -297,6 +310,9 @@ class TurnBudget:
             if now_s >= self.limits.hard_s:
                 self._close("hard")
                 return Spend(False, "hard", LINE_REST_LEFT, settle=True)
+            if self.rounds and self._reply_round != self.rounds:
+                # fb (B6): the first call of a new model reply (every model call is a round): the reply arrived now
+                self._reply_round, self._reply_at = self.rounds, now_s
             if not acts:
                 if self.reads >= self.limits.reads:
                     return Spend(False, "reads", LINE_READS_SPENT)
@@ -317,8 +333,11 @@ class TurnBudget:
             if lasting and self.lasting_missed:
                 return Spend(False, "lasting_retry", LINE_LASTING_RETRY)
             # oRun's note to oCore (phase 4 integration): the retry window runs on the counted clock, so a wait the
-            # budget excludes (an ask, the send countdown, a typed lease wait) does not run it down
-            if self.first_miss is not None and now_s - self.first_miss > self.limits.retry_s:
+            # budget excludes (an ask, the send countdown, a typed lease wait) does not run it down. fb (B6): judged at
+            # the arrival of the reply this call is part of (one reply's calls are one try); a driver that counts no
+            # rounds: now, as before
+            at = self._reply_at if self.rounds and self._reply_at is not None else now_s
+            if self.first_miss is not None and at - self.first_miss > self.limits.retry_s:
                 return Spend(False, "retry", LINE_RETRY_SPENT)
             self.acts += 1
             return OK
@@ -334,15 +353,25 @@ class TurnBudget:
             return OK
 
     def after_call(self, name: str, args: Mapping[str, Any] | None = None, *, acts: bool = True, ok: bool = True,
-                   lasting: bool = False, target: Mapping[str, Any] | None = None) -> None:
+                   lasting: bool = False, target: Mapping[str, Any] | None = None, unsure: bool = False) -> None:
         """After one acting call: a call that did not take effect opens the retry window (its first miss) and is never
         tried again this turn (keyed on ``target`` as :meth:`before_call` read it); a lasting one that missed stops
-        every later lasting act."""
+        every later lasting act.
+
+        fb (B6): ``unsure``: it acted and its effect could not be read (a skill run the engine settled
+        ``unverified``): no miss of the retry window (other ways and the next parts of their request go on), but
+        never the same step again (it may have landed: a second press can undo it), and still the one miss the
+        closing hold reads. A lasting act is never unsure: a send or join that may have gone is a miss."""
         if not acts or ok:
             return
         with self._lock:
-            if self.first_miss is None:
-                self.first_miss = self._elapsed()   # counted seconds since round 1, as before_call reads it
+            now_s = self._elapsed()   # counted seconds since round 1, as before_call reads it
+            if unsure and not lasting:
+                self.unsure += 1
+                if self._unsure_at is None:
+                    self._unsure_at = now_s
+            elif self.first_miss is None:
+                self.first_miss = now_s
             self.failed.add(step_key(name, args, target))
             self._acts_at_miss = self.acts
             if lasting:
@@ -371,7 +400,9 @@ class TurnBudget:
                 now_s = self._elapsed()
                 if now_s >= self.limits.soft_s or now_s >= self.limits.hard_s:
                     return None
-                if self.first_miss is not None and now_s - self.first_miss > self.limits.retry_s:
+                # fb (B6): an unsure act's hold keeps the window's time bound from when it came back
+                miss_at = self.first_miss if self.first_miss is not None else self._unsure_at
+                if miss_at is not None and now_s - miss_at > self.limits.retry_s:
                     return None
                 return LINE_HOLD_MISS
         except Exception:  # noqa: BLE001 - no hold
@@ -397,7 +428,8 @@ class TurnBudget:
         with self._lock:
             return {"channel": self.channel, "rounds": self.rounds, "acts": self.acts, "reads": self.reads,
                     "refusals": self.refusals, "elapsed_s": round(self._elapsed(), 2), "missed": len(self.failed),
-                    "unfinished": self.unfinished, "closed": self.closed_why if self.closed else ""}
+                    "unsure": self.unsure, "unfinished": self.unfinished,
+                    "closed": self.closed_why if self.closed else ""}
 
 
 #: Contract C9's name ("budget.py ``Turn.closing_hold()``"): the turn's budget. The gate's ``policy.Turn`` has a

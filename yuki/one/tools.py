@@ -91,17 +91,24 @@ def _from_anthropic(tool: Mapping[str, Any], **changes: Any) -> dict[str, Any]:
 # The verbs
 # ---------------------------------------------------------------------------------------------------------------------
 
+#: fb (final-F B8, contract K-A, writer side): ``own_step`` true marks a window call that is Yuki's own means (to read
+#: or check), not their ask; missing or false: their ask (the hands' ``arranged_windows`` reads it: only their asked
+#: placements are kept from code's tidy step). The intent is the model's structured field, never a word of theirs.
+_OWN_STEP = {"type": "boolean", "description": "true: your own step to read or check, not their ask."}
+
 WINDOW_TOOL = _tool(
     "window",
     "A window, read back: focus, minimize, maximize, fullscreen, restore, close (only when they asked; named: their "
     "words), move (to monitor; how), focus_back (the front back to what it was before your last act), undo (your last "
-    "move or focus_back). By [hwnd] or app as they named it (minimize, close: all its windows). Not a tab.",
+    "move or focus_back). By [hwnd] or app as they named it (minimize, close: all its windows). Not a tab; a message "
+    "in a chat is run_skill message.",
     {"window": _WINDOW,
      "app": {"type": "string"},
      "action": {"type": "string", "enum": list(WINDOW_ACTIONS)},
      "monitor": {"type": "string", "description": "\"other\" or a number."},
      "how": {"type": "string", "enum": ["keep", "maximize", "left", "right"]},
      "named": {"type": "string"},
+     "own_step": _OWN_STEP,
      "say_when_done": _DONE, "then": _THEN},
     ["action", "then"])
 
@@ -145,8 +152,9 @@ CLICK_TOOL = _tool(
 
 TYPE_TOOL = _tool(
     "type",
-    "Type exact text into the field that has the keyboard (or a field's [id] from look window); never in a chat: text "
-    "for a person is run_skill message. enter: press Enter after it. Verified by reading the field back.",
+    "Type exact text into the field that has the keyboard (or a field's [id] from look window); never in a chat "
+    "(refused there): a message or draft is run_skill message. enter: press Enter after it. Verified by reading the "
+    "field back.",
     {"window": _WINDOW, "text": {"type": "string"}, "id": {"type": "integer"}, "enter": {"type": "boolean"},
      "say_when_done": _DONE, "then": _THEN},
     ["window", "text", "then"])
