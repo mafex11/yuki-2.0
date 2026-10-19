@@ -837,9 +837,11 @@ def measured_browsers(store: Any, *, now: float | None = None, days: float = BRO
     (an app that draws one site in its own window, such as a chat app, shows one or two). ``min_hosts`` / ``by_site``
     are the definition's two knobs, for the replay that chose them (``scripts/browser_rule_replay.py``). bRound2: a
     page Yuki itself opened counts for nothing here, however long the user then looked at it
-    (:data:`NOT_YUKIS_VISIT_SQL`). Never raises (``[]``)."""
+    (:data:`NOT_YUKIS_VISIT_SQL`), and neither does a row inside a live test's span (skill19 review L5: tabs a test left
+    open are no use of the user's; :func:`_outside_tests`). Never raises (``[]``)."""
     now = time.time() if now is None else float(now)
     hosts = [str(h).casefold() for h in site_hosts if h]
+    outside, outside_args = _outside_tests(store, now - days * 86400.0, now)
     marks = ",".join("?" * len(hosts))
     site_sql = (f"max(CASE WHEN t.host IN ({marks}) THEN t.ended_at END)" if hosts else "NULL")
     # skill19 (all-browser R6): the user's own visits of the site per browser (its rows), for the site's share
@@ -851,11 +853,11 @@ def measured_browsers(store: Any, *, now: float | None = None, days: float = BRO
             f"count(DISTINCT t.host) AS n, {site_sql} AS site_last, {site_n_sql} AS site_n FROM timeline t "
             "WHERE t.host IS NOT NULL "
             "AND t.started_at >= ? AND t.started_at <= ? AND t.by_yuki = 0 AND t.state = 'present' "
-            "AND t.process IS NOT NULL{own} GROUP BY t.process ORDER BY s DESC",
-            (*hosts, *hosts, now - days * 86400.0, now))
+            f"AND t.process IS NOT NULL AND {outside}{{own}} GROUP BY t.process ORDER BY s DESC",
+            (*hosts, *hosts, now - days * 86400.0, now, *outside_args))
     except Exception:  # noqa: BLE001
         return []
-    weights = _recent_weights(store, now, days)
+    weights = _recent_weights(store, now, days, outside=(outside, outside_args))
     out = []
     for process, seconds, last, n_hosts, site_last, site_n in rows:
         key = _app_key(process)
@@ -876,17 +878,20 @@ def measured_browsers(store: Any, *, now: float | None = None, days: float = BRO
     return out
 
 
-def _recent_weights(store: Any, now: float, days: float) -> dict[str, float]:
+def _recent_weights(store: Any, now: float, days: float,
+                    outside: tuple[str, Sequence[float]] | None = None) -> dict[str, float]:
     """``{timeline process: the user's own page seconds of the last days, each weighted by its age}``
     (:data:`BROWSER_HALF_LIFE_DAYS`; by the day, so one grouped read): what "the one used most" ranks by. Never a page
-    Yuki itself opened (:data:`NOT_YUKIS_VISIT_SQL`). Never raises (``{}``: the raw seconds rank)."""
+    Yuki itself opened (:data:`NOT_YUKIS_VISIT_SQL`), nor a row inside a live test's span (``outside``: the condition
+    :func:`_outside_tests` made). Never raises (``{}``: the raw seconds rank)."""
+    cond, cond_args = outside if outside is not None else _outside_tests(store, now - days * 86400.0, now)
     try:
         rows = own_rows_query(
             store,
             "SELECT t.process, CAST((? - t.started_at) / 86400.0 AS INTEGER) AS d, sum(t.active_s + t.passive_s) "
             "FROM timeline t WHERE t.host IS NOT NULL AND t.started_at >= ? AND t.started_at <= ? AND t.by_yuki = 0 "
-            "AND t.state = 'present' AND t.process IS NOT NULL{own} GROUP BY t.process, d",
-            (now, now - days * 86400.0, now))
+            f"AND t.state = 'present' AND t.process IS NOT NULL AND {cond}{{own}} GROUP BY t.process, d",
+            (now, now - days * 86400.0, now, *cond_args))
     except Exception:  # noqa: BLE001
         return {}
     out: dict[str, float] = {}
@@ -894,6 +899,20 @@ def _recent_weights(store: Any, now: float, days: float) -> dict[str, float]:
         w = 0.5 ** ((max(0.0, float(age_d or 0)) + 0.5) / BROWSER_HALF_LIFE_DAYS)
         out[str(process)] = out.get(str(process), 0.0) + float(seconds or 0.0) * w
     return out
+
+
+def _outside_tests(store: Any, lo: float, hi: float) -> tuple[str, list[float]]:
+    """Skill19 review L5 (all-browser R3: about 75 rows of a site in the browser a live test drove, on 19 Oct): a SQL
+    condition on ``t.started_at`` that leaves out the live test's spans overlapping ``lo``..``hi``
+    (:func:`yuki.memory.testtag.store_test_spans`, a content-free time filter), ``("1", [])`` with none. Known only
+    while the test's own turns are kept (a purge deletes them, and the timeline rows stay). Never raises."""
+    try:
+        from yuki.memory.testtag import sql_outside_spans, store_test_spans
+
+        spans = [(a, b) for a, b in store_test_spans(store) if b >= lo and a <= hi]
+        return sql_outside_spans("t.started_at", spans)
+    except Exception:  # noqa: BLE001 - no spans: every row counts, as before
+        return "1", []
 
 
 def fresh_keys(measured: Sequence[Mapping[str, Any]]) -> list[str]:

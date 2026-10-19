@@ -115,7 +115,13 @@ SETTLED_REASONS: tuple[str, ...] = ("other_device", "row_stale")
 #: skill19 (live 19 Oct RC1): ``row_stale`` is Spotify's check after a press on a window that isn't drawing: the
 #: session plays now (it did not before the press) with sound here, and only the row's label never redrew. Said plainly
 #: as "couldn't confirm it's that one", never handed to the thinker (it would raise the window to read the row) and
-#: never followed by a second rung (a second press would pause it).
+#: never followed by a second rung (a second press would pause it). Review M3: also after a switch while one played,
+#: when the session plays another track than before the press.
+#: Review M3 (skill19): a rung that did not run by its own reads, but whose reads couldn't tell (its act may have been
+#: taken: a press on an app whose state showed no change it could read), says ``facts["not_run"] =`` this word: the
+#: next rung still tries, and its try is "couldn't confirm" (``unverified``), never a "couldn't" counted against it
+#: (``registry.by_record``: a rung's place by its own record).
+NOT_RUN_UNSURE = "unsure"
 #: The origins whose unconfirmed or dropped runs go to rung C: the talker and the thinker. A card never starts an agent
 #: run (``yuki.ui.nudges``: a hand-off there is dropped) and an eval measures the skill itself.
 HANDOFF_ORIGINS: tuple[str, ...] = ("voice", "thinker")
@@ -692,6 +698,7 @@ class _Measure:
         self.apps: list[str] = []
         self.hwnds: list[int] = []
         self.own: set[str] = set()
+        self.first: Any = None     # review L4: the first rung's "before" read (the run's end is compared with it)
         if skill is not None:
             self.own.add(_app_key_of(skill.app))
             for slot in getattr(skill, "slots", ()) or ():
@@ -711,20 +718,14 @@ class _Measure:
     def fold(self, route: Route, before: Any, after: Any, *, acted: bool, app: str | None) -> dict[str, Any]:
         """Fold one rung's change in; ``acted``: the rung acted by its own word; ``app``: :func:`acted_app`'s app for
         it. Returns the change (for its ``route_try`` line)."""
+        if self.first is None and isinstance(before, FrontRead):
+            self.first = before
         own = set(self.own) | {_app_key_of(app)}
         own.discard("")
         ch = front_change(before, after, own=(lambda _h, pid: _pid_app(pid) in own) if own else None)
         if ch.get("read"):
-            self.focus = self.focus or bool(ch.get("taken"))
+            self._take(ch)
             moved = bool(ch.get("taken") or ch.get("covered"))
-            self.touched = self.touched or moved
-            if ch.get("taken"):
-                hwnd = int(ch.get("hwnd") or 0)
-                if hwnd and hwnd not in self.hwnds:
-                    self.hwnds.append(hwnd)
-                front_app = _pid_app(int(ch.get("pid") or 0))
-                if front_app and front_app not in self.apps:
-                    self.apps.append(front_app)
         else:
             self.focus = self.focus or bool(route.needs_focus)
             moved = False
@@ -732,7 +733,35 @@ class _Measure:
             self.apps.append(str(app))
         return ch
 
+    def _take(self, ch: Mapping[str, Any]) -> None:
+        """A measured change (:func:`front_change`, read) folded into the run's focus / touched / windows / apps."""
+        self.focus = self.focus or bool(ch.get("taken"))
+        self.touched = self.touched or bool(ch.get("taken") or ch.get("covered"))
+        if ch.get("taken"):
+            hwnd = int(ch.get("hwnd") or 0)
+            if hwnd and hwnd not in self.hwnds:
+                self.hwnds.append(hwnd)
+            front_app = _pid_app(int(ch.get("pid") or 0))
+            if front_app and front_app not in self.apps:
+                self.apps.append(front_app)
+
+    def settle(self) -> None:
+        """Review L4: one more read when the run ends, against the first rung's "before": a window a rung raised while
+        its check waited (an async raise after an open or a press) counts too. Only a window of an app the run acts
+        in (or one new on screen) counts, as for each rung. A front that couldn't be read changes nothing."""
+        if not self.on or not isinstance(self.first, FrontRead):
+            return
+        own = set(self.own) | {_app_key_of(a) for a in self.apps}
+        own.discard("")
+        ch = front_change(self.first, self.read(), own=(lambda _h, pid: _pid_app(pid) in own) if own else None)
+        if ch.get("read"):
+            self._take(ch)
+
     def stamp(self, result: "SkillResult", acted: bool) -> None:
+        try:
+            self.settle()
+        except Exception:  # noqa: BLE001 - the per-rung measure stands
+            pass
         result.focus_taken = bool(self.focus)
         result.acted = bool(acted or self.touched)
         result.acted_apps = list(self.apps)
@@ -1789,6 +1818,14 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
         except KeyError:
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "no_value"})
             continue
+        if not_typed is not None and _app_key_of(acted_app(skill, route, args)) == not_typed.get("app", ""):
+            # review M2 (skill19): after "opened, nothing typed" something of that app that is no text field holds its
+            # keyboard (a dialog left open), so no later rung acts in the same app (its shortcut's effect there is
+            # unknowable: Ctrl+K could close the dialog and type the chat's name into the open chat's composer); the
+            # caller looks first (rung C below)
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "after_not_typed"})
+            _emit(ctx, "route_try", skill=skill.key, route=route.key, result="skipped", reason="after_not_typed")
+            continue
         if route.needs_focus:
             if ctx.on_focus is not None:
                 try:
@@ -1863,14 +1900,16 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             # skill19 (contract C3; live 19 Oct all-messaging RC1: "I opened your chat with Hemanth, but couldn't type
             # it." asked as a final question on every Discord draft, so the talker's own hands never typed it as on 18
             # Oct): the chat driver's code fact says no typing went out, so nothing can have been sent and nothing
-            # would be done twice. Never a turn-ending question: the next rung tries, and with none left the run is
-            # handed to the caller unconfirmed (rung C: the thinker or the agent types it in the chat now open). Its
-            # try is "couldn't confirm" (never counted against the rung); the chat it opened is the PC touched
+            # would be done twice. Never a turn-ending question: a later rung in another app may try (none that acts in
+            # this app: review M2, the loop's top), and with none left the run is handed to the caller unconfirmed
+            # (rung C: the thinker or the agent looks, then types it in the chat now open). Its try is "couldn't
+            # confirm" (never counted against the rung); the chat it opened is the PC touched
             acted = state["acted"] = acted or bool(res.ran)
             facts_nt = res.facts if isinstance(res.facts, Mapping) else {}
             holder = facts_nt.get("holder")
             not_typed = {"holder": str(holder)[:60] if isinstance(holder, str) and holder.strip() else None,
-                         "line": res.unverified_line or res.say or res.ask or ""}
+                         "line": res.unverified_line or res.say or res.ask or "",
+                         "app": _app_key_of(app_done)}
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "not_typed"})
             last_route = route
             _ledger_try(ctx, run_key, route, None, "unverified", route_ms)
@@ -1910,7 +1949,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                                run_key=run_key, route=route.key, tried=tried, values=dict(plan.values))
         if res.ran is False:
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": res.outcome or "no"})
-            _ledger_try(ctx, run_key, route, None, "failed", route_ms)
+            unsure = isinstance(res.facts, Mapping) and res.facts.get("not_run") == NOT_RUN_UNSURE
+            _ledger_try(ctx, run_key, route, None, "unverified" if unsure else "failed", route_ms)
             _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key,
                   result=res.outcome or "not_run", ms=route_ms, observed=res.facts)
             continue

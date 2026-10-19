@@ -63,6 +63,7 @@ Public API::
     sql_real_run(alias="") -> str                             # practice memory's runs: session id and run key
     sql_real_skill_run(alias="") -> str;  sql_real_route_try(alias="") -> str
     test_turn_ids(store) -> frozenset[int]
+    store_test_spans(store) -> list[(start, end)];  sql_outside_spans(column, spans) -> (SQL, params)
     is_test_journal(entry, turn_ids) -> bool;  is_test_fact(fact, turn_ids) -> bool
     report(db_path=None, *, show=False) -> dict               # read-only; the database is opened ?mode=ro
     purge(conn, dec, *, now) -> dict[str, int]                # inside the caller's write transaction; counts
@@ -319,12 +320,40 @@ def _delete_ids(conn: sqlite3.Connection, table: str, column: str, ids: Iterable
     return n
 
 
+#: The live test sessions' first and last turn, one row per session (the session index's range).
+_SPANS_SQL = ("SELECT min(at), max(at) FROM conversation_turns WHERE session_id >= ? AND session_id < ?"
+              " GROUP BY session_id ORDER BY 1")
+
+
 def test_spans(conn: sqlite3.Connection) -> list[tuple[float, float]]:
     """The live test's sessions as time spans (first to last turn of each, sessions closer than
     :data:`SPAN_JOIN_S` joined, each padded by :data:`SPAN_PAD_S`), oldest first. ``[]`` with no test turns."""
-    rows = conn.execute("SELECT min(at), max(at) FROM conversation_turns WHERE session_id >= ? AND session_id < ?"
-                        " GROUP BY session_id ORDER BY 1", _session_range()).fetchall() if _has(
+    rows = conn.execute(_SPANS_SQL, _session_range()).fetchall() if _has(
         conn, "conversation_turns", "session_id") else []
+    return _merge_spans(rows)
+
+
+def store_test_spans(store: Any) -> list[tuple[float, float]]:
+    """:func:`test_spans` through a store's own read (``store._query``), for a reader that holds a store, not a
+    connection (skill19 review L5: the measured browsers leave the test's own tabs out). The spans are known only
+    while the test's turns are kept (a purge deletes them). Never raises (``[]``)."""
+    try:
+        return _merge_spans(store._query(_SPANS_SQL, _session_range()))
+    except Exception:  # noqa: BLE001 - no conversation table (an old or a test database): no spans
+        return []
+
+
+def sql_outside_spans(column: str, spans: Sequence[tuple[float, float]]) -> tuple[str, list[float]]:
+    """A SQL condition (and its parameters) true for a row whose ``column`` (code's own name) lies in none of
+    ``spans``; ``("1", [])`` with none."""
+    if not spans:
+        return "1", []
+    cond, params = _in_spans(column, spans)
+    return f"NOT {cond}", params
+
+
+def _merge_spans(rows: Iterable[Any]) -> list[tuple[float, float]]:
+    """Session ``(first, last)`` rows, oldest first, as joined and padded spans (:func:`test_spans`)."""
     merged: list[list[float]] = []
     for a, b in rows:
         if a is None:
@@ -426,13 +455,22 @@ def _purge_corrections(conn: sqlite3.Connection, dec: Callable[[Any], str | None
 def _refresh_prefs(conn: sqlite3.Connection, gone: Sequence[tuple[int, str]]) -> dict[str, int]:
     """After preference events were deleted (``gone``: their ``(pref_id, type)``), each preference row they touched
     stands as its remaining events say (``skills.prefs.record``'s own bookkeeping, redone): no event left -> the row
-    goes; a ``confirmed``, ``said`` or ``declined`` gone -> a usual only while a confirmed one remains (else
-    ``proposed`` while an unanswered ``said`` remains, else ``seen``), and its quote goes when no said remains; the
-    said / corrected / rejected counters and ``last_at`` recounted. Content-free counts."""
+    goes; a ``confirmed``, ``said`` or ``declined`` gone -> with no confirmed one left, ``proposed`` while an
+    unanswered ``said`` remains, else ``seen``, and its quote goes when no said remains; the said / corrected /
+    rejected counters and ``last_at`` recounted. Then (review L3) each slot and context with such a row has its one
+    usual elected again as ``record`` keeps it: the row with the newest remaining ``confirmed`` event (a test's confirm
+    had stepped the user's own usual down to ``seen``), every other usual of that slot and context ``seen``
+    (``record`` lets no other event step a usual down). Content-free counts."""
     out: dict[str, int] = {}
     by_pref: dict[int, set[str]] = {}
     for pid, typ in gone:
         by_pref.setdefault(int(pid), set()).add(str(typ or ""))
+    groups: set[tuple[str, str]] = set()
+    for pid, types in by_pref.items():
+        if types & {"confirmed", "said", "declined"}:
+            row = conn.execute("SELECT slot, context FROM prefs WHERE id = ?", (pid,)).fetchone()
+            if row is not None:
+                groups.add((str(row[0]), str(row[1] or "")))
     for pid, types in by_pref.items():
         rows = conn.execute("SELECT type, at FROM pref_events WHERE pref_id = ? ORDER BY at", (pid,)).fetchall()
         if not rows:
@@ -448,16 +486,30 @@ def _refresh_prefs(conn: sqlite3.Connection, gone: Sequence[tuple[int, str]]) ->
             said_at = max((float(r[1]) for r in rows if str(r[0]) == "said"), default=None)
             declined_at = max((float(r[1]) for r in rows if str(r[0]) == "declined"), default=None)
             if confirmed:
-                state, at = "usual", max(confirmed)
-            elif said_at is not None and (declined_at is None or declined_at < said_at):
-                state, at = "proposed", None
+                pass        # review L3: which row of its slot and context is the usual is elected below
             else:
-                state, at = "seen", None
-            conn.execute("UPDATE prefs SET state = ?, confirmed_at = ? WHERE id = ? AND ended_at IS NULL",
-                         (state, at, pid))
+                state = ("proposed" if said_at is not None and (declined_at is None or declined_at < said_at)
+                         else "seen")
+                conn.execute("UPDATE prefs SET state = ?, confirmed_at = NULL WHERE id = ? AND ended_at IS NULL",
+                             (state, pid))
             if said_at is None:
                 conn.execute("UPDATE prefs SET quote_ciphertext = NULL WHERE id = ?", (pid,))
         out["prefs_restated"] = out.get("prefs_restated", 0) + 1
+    for slot, context in sorted(groups):
+        # review L3: one usual per slot and context, the newest remaining confirm's (record's own rule, replayed)
+        best = conn.execute(
+            "SELECT p.id, max(e.at) AS at FROM prefs p JOIN pref_events e ON e.pref_id = p.id AND e.type = 'confirmed' "
+            "WHERE p.slot = ? AND p.context = ? AND p.ended_at IS NULL GROUP BY p.id ORDER BY at DESC, p.id DESC "
+            "LIMIT 1", (slot, context)).fetchone()
+        if best is None:
+            continue        # no confirm left: the rows stand as restated above (a usual with no event is left alone)
+        keep, at = int(best[0]), float(best[1])
+        n = int(conn.execute("UPDATE prefs SET state = 'seen' WHERE slot = ? AND context = ? AND state = 'usual' AND "
+                             "ended_at IS NULL AND id != ?", (slot, context, keep)).rowcount or 0)
+        n += int(conn.execute("UPDATE prefs SET state = 'usual', confirmed_at = ? WHERE id = ? AND (state != 'usual' "
+                              "OR confirmed_at IS NOT ?)", (at, keep, at)).rowcount or 0)
+        if n:
+            out["prefs_usual_reelected"] = out.get("prefs_usual_reelected", 0) + 1
     return out
 
 
@@ -991,7 +1043,8 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = ["TEST_SESSION_PREFIX", "is_test_session", "is_test_request", "is_test_item", "keep_real",
            "sql_real_session", "sql_real_request", "sql_real_run", "sql_real_skill_run", "sql_real_route_try",
-           "test_turn_ids", "is_test_journal", "is_test_fact", "test_spans", "purge", "report", "format_report",
+           "test_turn_ids", "is_test_journal", "is_test_fact", "test_spans", "store_test_spans",
+           "sql_outside_spans", "purge", "report", "format_report",
            "main", "real_uses", "CONFIRM_RUN_S", "CONFIRM_DAYS"]
 
 

@@ -396,25 +396,25 @@ def heard_as(names: Any, said: Any, *, loose: bool = False) -> str | None:
 def heard_in(names: Any, turns: Any) -> str | None:
     """skill19 (live 19 Oct, all-browser R7: "NDL" heard as "MBL", the talker rewrote it to "MrBeastGaming" and that
     reading ran): the one of the user's own ``names`` (a closed set: their channels, their playlists) that the user's
-    own words hold by sound or spelling distance (:func:`heard_as`, its closed-set tier included), read from the newest
-    turn back; the first turn that holds exactly one wins, a turn that holds two decides nothing. ``None`` when none
-    does. The caller names it as a guess ("I took that as NDL"). Never raises."""
+    own words hold by sound or spelling distance (:func:`heard_as`, its closed-set tier included), in their newest turn
+    only (review L1: the request's own words; an earlier request of the exchange that named another of their names is
+    never taken for this one). A turn that holds two decides nothing. ``None`` when none does. The caller names it as
+    a guess ("I took that as NDL"). Never raises."""
     pool = [" ".join(str(n or "").split()) for n in names or [] if str(n or "").strip()]
     if not pool:
         return None
     seq = [turns] if isinstance(turns, str) else [str(t) for t in turns or [] if str(t or "").strip()]
-    for turn in reversed(seq):
-        try:
-            padded = f" {_norm(turn)} "
-            literal = {_norm(n): n for n in pool if _norm(n) and f" {_norm(n)} " in padded}
-            if literal:
-                return next(iter(literal.values())) if len(literal) == 1 else None
-            got = heard_as(pool, turn, loose=True)
-        except Exception:  # noqa: BLE001 - a turn that can't be read by sound
-            got = None
-        if got:
-            return got
-    return None
+    if not seq:
+        return None
+    turn = seq[-1]
+    try:
+        padded = f" {_norm(turn)} "
+        literal = {_norm(n): n for n in pool if _norm(n) and f" {_norm(n)} " in padded}
+        if literal:
+            return next(iter(literal.values())) if len(literal) == 1 else None
+        return heard_as(pool, turn, loose=True) or None
+    except Exception:  # noqa: BLE001 - a turn that can't be read by sound
+        return None
 
 
 #: fSkills (live 18 Oct: "MBL's YouTube channel" heard for the user's channel NDL): how each Latin letter is said when

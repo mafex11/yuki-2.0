@@ -390,10 +390,12 @@ def points_value(value: Any) -> str | float | None:
     """skill19 (live 19 Oct, spotify RC5a: ``change: "down a little"`` was dropped and the skill asked "Louder,
     quieter, or to what level?"): a ``points`` slot's value in the schema's own form, ``None`` when it holds none.
     A number (or a numeric string, "+5", "-10%") that isn't 0 is itself; a value whose words hold exactly one of the
-    schema's direction words (:data:`DIRECTIONS`: "down a little", "a bit up") is that direction, signed by it when
-    it also holds one number ("down 10" -> -10). Two directions, two numbers, or neither: ``None``. The schema's own
-    words found inside the value, never a guess at what other words mean ("quieter" holds none: dropped, and the
-    caller is told the form, ``menu.slot_form``)."""
+    schema's direction words (:data:`DIRECTIONS`: "down a little", "a bit up") and no number is that direction; a
+    direction and a number with nothing else ("down 10", "10 down", "up 10%") is the number signed by it. A number
+    beside any other word ("up to 80", "down to 20": a level, not a step), two directions, two numbers, or neither:
+    ``None`` (review M1: never a relative jump read out of a level). The schema's own words found inside the value,
+    never a guess at what other words mean ("quieter" holds none: dropped, and the caller is told the form,
+    ``menu.slot_form``)."""
     if isinstance(value, bool):
         return None
     x = _num(value)
@@ -412,7 +414,10 @@ def points_value(value: Any) -> str | float | None:
         return None
     way = next(iter(dirs))
     if nums:
-        return DIRECTIONS[way] * abs(nums[0]) if nums[0] != 0.0 else None
+        # only the two tokens themselves sign the number: any other word beside it may make it a level ("up to 80")
+        if len(tokens) != 2 or nums[0] == 0.0:
+            return None
+        return DIRECTIONS[way] * abs(nums[0])
     return way
 
 
