@@ -198,12 +198,22 @@ def read(name: str, args: Mapping[str, Any] | None, *, dispatcher: Any = None, m
                       private=tool in PRIVATE_TOOLS, input=dict(tool_input))
 
 
+def _header_block(lines: list[str]) -> int:
+    """How many leading lines of a window read are its header block: every line before the first element line
+    (:func:`_element_line`). The look's text is the dispatcher's own ``window N "..." (...): K elements, ...`` line,
+    then the tree's header (``page: ...``), then the element lines (``agent.tools`` look_at_window)."""
+    for n, line in enumerate(lines):
+        if _element_line(line) is not None:
+            return n
+    return len(lines)
+
+
 def is_page_read(text: str) -> bool:
-    """Whether a window read shows a page: its header (the first line) leads with the page fact
+    """Whether a window read shows a page: a line of its header block leads with the page fact
     (``perception.tree.format_window_tree``: ``page: "<title>" <url>``; contract C8 keeps that lead and may name the
     page Document's element id in it). Yuki's own format, read as such."""
-    head = str(text or "").split("\n", 1)[0].lstrip()
-    return head.startswith("page")
+    lines = str(text or "").split("\n")
+    return any(line.lstrip().startswith("page:") for line in lines[:_header_block(lines)])
 
 
 def _element_line(line: str) -> tuple[int, int, str] | None:
@@ -257,12 +267,14 @@ def _fit(lines: list[str], room: int) -> str:
 
 def page_first(text: str, *, page_chars: int, rest_chars: int = LOOK_CHARS) -> str:
     """One20 (final-D S4): a window read that shows a page (:func:`is_page_read`) with the page's own part first: the
-    header line, then the shown page's Document line and every line below it (deeper indented), at most
+    header block, then the shown page's Document line and every line below it (deeper indented), at most
     ``page_chars``, then the rest of the window (its tabs, toolbar, bookmarks) at most ``rest_chars`` with the header.
     Each part is cut at a line end with a note of what was cut. Works on today's order (the page after the browser's
-    own controls) and on contract C8's (the page first). A read with no page Document comes back cut as before."""
+    own controls) and on contract C8's (the page first). A read with no page Document comes back cut as before. The
+    header is the whole block before the first element line (the dispatcher's line, then the tree's ``page: ...``)."""
     lines = str(text or "").split("\n")
-    header, body = lines[0], lines[1:]
+    split = _header_block(lines)
+    header, body = "\n".join(lines[:split]), lines[split:]
     at = _page_document(header, body)
     if at is None:
         return str(text or "")[: rest_chars]

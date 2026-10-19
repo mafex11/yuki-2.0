@@ -99,7 +99,7 @@ LINE_CHAT_TYPE = ("Not typed: this window is a chat's; text for a person goes on
 #: One20 (final-D S1 fallback, contract C9): a closing reply while the turn's flagged diff has its one legal undoable
 #: step untaken (code's fact; the agent takes it, never code).
 LINE_HOLD_TIDY = ("Not done yet: After shows a side effect of your act on their screen, and one undoable step undoes "
-                  "it: {step}. Take it now, then say so in a few words.")
+                  "it: {step}. Take it unless their words asked for what it undoes, then say so in a few words.")
 #: The tidy dial says ask: the step in code's words (``executor.LINE_TIDY_ASK``).
 LINE_TIDY_ASK: dict[str, str] = {"place": "Should I move {app} to your other screen?",
                                  "focus_back": "Should I put {app} back in front?"}
@@ -349,6 +349,9 @@ class Turn:
         #: One20: the windows this turn's own acts acted in or brought up (the runner's, :meth:`note_acted`): an Escape
         #: there dismisses what an act of the turn opened (a tidy step, never "another way" after a miss).
         self.own_windows: set[int] = set()
+        #: The windows an own Escape (:func:`_own_escape`) was allowed in this turn: one per window per turn, never
+        #: counted in :attr:`Tidy.acts` (the flagged diff's legal step and its closing hold stay its own).
+        self.escapes: set[int] = set()
         #: One20 (final-D S17): the chat windows a message skill of this turn opened (:meth:`note_chat`): the agent's
         #: own typing there is allowed; in any other chat window it is refused toward run_skill message.
         self.chats_opened: set[int] = set()
@@ -783,11 +786,11 @@ def _decide(name: str, spec: T.Spec, verb: str, vinput: dict[str, Any], args: di
             turn.tidy.acts += 1
         elif not inner and _own_escape(verb, vinput, facts, turn):
             # one20 (final-D one-core §2b): an Escape dismissing what an act of this turn opened in its window (a
-            # quick switcher the agent's own hotkey opened) is a tidy step, counted with the flagged diff's when one
-            # is open
+            # quick switcher the agent's own hotkey opened) is a tidy step: once per window per turn, and not one of
+            # the flagged diff's steps (its legal window step, and the closing hold for it, stay open)
             decision = replace(decision, tidy=True)
-            if turn.tidy.open:
-                turn.tidy.acts += 1
+            with turn._lock:
+                turn.escapes.add(_hwnd(facts.get("hwnd")))
         if verb == "type_text" and hwnd:
             if vinput.get("press_enter") is True:
                 clear_typed(hwnd)
@@ -993,14 +996,13 @@ def _carries(url: Any) -> bool:
 
 
 def _own_escape(verb: str, vinput: Mapping[str, Any], facts: Mapping[str, Any], turn: Turn) -> bool:
-    """One20: Escape pressed once, alone, in a window this turn's own acts acted in (:attr:`Turn.own_windows`), while
-    the flagged diff (if one is open) has a tidy step left. Key names and the turn's own windows only."""
+    """One20: Escape pressed once, alone, in a window this turn's own acts acted in (:attr:`Turn.own_windows`), the
+    first such Escape there this turn (:attr:`Turn.escapes`: one per window per turn). Key names and the turn's own
+    windows only."""
     if verb != "press" or _fold(vinput.get("key")) not in ESCAPE_KEYS or vinput.get("times") not in (None, 1):
         return False
     hwnd = _hwnd(facts.get("hwnd"))
-    if hwnd is None or hwnd not in turn.own_windows:
-        return False
-    return not turn.tidy.open or turn.tidy.acts < TIDY_STEPS
+    return hwnd is not None and hwnd in turn.own_windows and hwnd not in turn.escapes
 
 
 def _tidy_like(verb: str, vinput: Mapping[str, Any], facts: Mapping[str, Any], turn: Turn) -> bool:

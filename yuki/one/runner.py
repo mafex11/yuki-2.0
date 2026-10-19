@@ -110,9 +110,10 @@ LINE_CHAT_UNCONFIRMED = "I couldn't confirm the chat is open, so I didn't type a
 #: The skill engine's outcomes after which a send did not go (``executor.NOT_SENT_OUTCOMES``).
 NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "held_call", "failed"})
 #: One20 (final-D S1 fallback, contract C7): the flagged result's one legal undoable step, for the agent (code facts:
-#: the diff's flags and :func:`yuki.perception.diff.tidy_step`; the agent takes it, never code).
+#: the diff's flags and :func:`yuki.perception.diff.tidy_step`; the agent takes it, never code, and keeps its judgement:
+#: their words may have asked for what the step would undo; held decision #1 is the user's).
 TIDY_STEP_NOTE = ("the flags are a side effect of your act on their screen; one undoable step undoes it: {step}. Take "
-                  "it now, then say so in a few words; their request isn't done before it.")
+                  "it unless their words asked for what it undoes, then say so in a few words.")
 #: How long the window in front before an act that moved the front is kept for a ``focus_back`` with no window
 #: (``voice.hands._FRONT_KEEP_S``: the same "put it back" reach as under ``all``).
 FRONT_KEEP_S = 600.0
@@ -126,10 +127,11 @@ OPEN_OUTCOMES = frozenset({"handed_over", "failed"})
 #: The engine's hand-off reasons after which nothing may run again (it may have acted, or a step was the user's):
 #: ``engine.WHY_UNVERIFIED``, ``engine.WHY_ERROR``, ``engine.TO_PLANNER``, ``engine.WHY_DROPPED``.
 NO_SECOND_RUN = frozenset({"unverified", "error", "to_planner", "dropped"})
-#: The pick kinds a second way re-runs with ``choose`` (``taste.CHOOSE_KINDS``' skills whose pick slot is the request's
-#: own subject). ``web.open_page`` is left out: the engine never chooses for it with an item given
-#: (``engine._choice_request``), so its re-run would drop the item and open another page than asked.
-PICK_RERUN_CAPS = frozenset({"web.open_video", "spotify.playlist"})
+#: A second way re-runs every pick kind (``taste.CHOOSE_KINDS``, read through :meth:`Runner._pick_slot`, so a new pick
+#: kind is covered by its data) with ``choose``, except the engine's structural exception: ``engine._choice_request``
+#: never chooses for ``web.open_page`` when an item is given (its ``item`` slot is any site's page, not only a pick),
+#: so its re-run would drop the item and open another page than asked.
+NO_PICK_RERUN = frozenset({"web.open_page"})
 #: The fill sources that are only the caller's reading of their words (``resolve.FROM_READING``).
 READING_SOURCES = frozenset({"reading"})
 #: A value counts as read off the screen this turn when this share of its words are words of one read (S12).
@@ -1078,17 +1080,17 @@ class Runner:
                 budget.after_call(name, ctx.first_args or args, acts=True,
                                   ok=status in (DONE, ALREADY, NO_CHANGE, STARTING), lasting=lasting,
                                   target=ctx.facts)
-        elif name == "run_skill" and budget is not None and decision is not None and result.status == REFUSED \
-                and str(facts.get("outcome") or "") in OPEN_OUTCOMES and not facts.get("refused"):
-            # one20 (C9): a run that handed back with nothing done leaves a part of their request open (no verb ran: no
-            # retry window, but the closing hold counts it)
-            note = getattr(budget, "unfinished_run", None)
-            if callable(note):
-                note()
             try:
                 self.verbs.record(name, resolved, report, ok=bool(ok), verified=verified, facts=facts)
             except Exception:  # noqa: BLE001 - a record never breaks an act
                 pass
+        elif name == "run_skill" and budget is not None and decision is not None and result.status == REFUSED \
+                and str(facts.get("outcome") or "") in OPEN_OUTCOMES and not facts.get("refused"):
+            # one20 (C9): a run that handed back with nothing done leaves a part of their request open (no verb ran: no
+            # retry window, but the closing hold counts it); like main, a run that did nothing is not recorded
+            note = getattr(budget, "unfinished_run", None)
+            if callable(note):
+                note()
         return result
 
     @staticmethod
@@ -1234,8 +1236,8 @@ class Runner:
 
     def _cover(self, d: Any, result: OneResult, turn: policy.Turn, state: RunState, say: Any) -> None:
         """One20 (S3, contract C7): ``perception.diff.cover_line(d)``, the measured tab-cover sentence ("GitHub is up;
-        X plays on in the other tab"): said by code after a done line it belongs to (the agent never owned it, and an
-        unmarked round lost it in final-D), else on the result for the agent to word. Never raises."""
+        X plays on in the other tab"): said by code right after a done line code said (the agent never owned it, and
+        an unmarked round lost it in final-D), else on the result for the agent to word. Never raises."""
         helper = _desk_helper("cover_line")
         if helper is None:
             return
@@ -1248,7 +1250,9 @@ class Runner:
             return
         budget = getattr(turn, "budget", None)
         late = budget is not None and budget.late()
-        if result.status == DONE and not late:
+        if result.status == DONE and not late and result.said:
+            # review fix: only right after a done line code said (a result with ``then`` and no done line said leaves
+            # the cover to the agent, after its own words)
             said, _heard = self._speak(line, say, state)
             if said:
                 result.said = f"{result.said} {said}".strip()
@@ -1583,11 +1587,16 @@ class Runner:
         if facts.get("refused") or facts.get("held") or facts.get("act_off") or facts.get("memory_slow"):
             return None
         ev = facts.get("evidence") if isinstance(facts.get("evidence"), Mapping) else {}
+        if facts.get("acted") is True or ev.get("acted") is True or facts.get("settled"):
+            # review fix: a rung touched the PC (``Hands._skill``'s measured ``acted``: a send, an unverified rung, a
+            # contradicted check, the engine's own ``acted``) or nothing more may be tried: a second run could do it
+            # twice (rule 8); an ``unread`` rung says only that one rung never read, not that none acted
+            return None
         pin = facts.get("handoff_skill") if isinstance(facts.get("handoff_skill"), Mapping) else {}
         why = str(pin.get("why") or ev.get("reason") or "")
         if why in NO_SECOND_RUN:
             return None
-        tried = [*(facts.get("_tried") or ()), *(ev.get("tried") or ())]
+        tried =[*(facts.get("_tried") or ()), *(ev.get("tried") or ())]
         if any(isinstance(t, Mapping) and str(t.get("outcome") or "") == "contradicted" for t in tried):
             return None   # a rung acted and its own check said no: a second run could do it twice (x5Fallback)
         return ev, pin, why
@@ -1596,10 +1605,11 @@ class Runner:
                     turn: policy.Turn, state: RunState) -> tuple[str, dict[str, Any]] | None:
         """One20 (final-D S5, one-core §3 fix 1): the second way code takes inside the call, once: ``("unread", the
         same input)`` when a rung never read (contract C10's ``unread``); ``("choose", the input as Yuki's pick)`` when
-        a pick-kind skill (:data:`PICK_RERUN_CAPS`) found no route for its value or no item for its pick slot: the
-        value goes to ``context``, ``choose`` true, ``corrects`` when the same skill ran verified this turn or the
-        turn before (:meth:`policy.Turn.ran_before`; that value is named in the context as the one not wanted). Never
-        for a value that is only the agent's reading of their words (S12 asks instead). Engine and turn facts only."""
+        a pick-kind skill (``taste.CHOOSE_KINDS`` but :data:`NO_PICK_RERUN`) found no route for its value or no item
+        for its pick slot: the value goes to ``context``, ``choose`` true, ``corrects`` when the same skill ran verified
+        this turn or the turn before (:meth:`policy.Turn.ran_before`; that value is named in the context as the one not
+        wanted). Never for a value that is only the agent's reading of their words (S12 asks instead), never after a
+        rung touched the PC (:meth:`_open_run`). Engine and turn facts only."""
         if sk is None:
             return None
         got = self._open_run(facts)
@@ -1610,7 +1620,7 @@ class Runner:
             return "unread", dict(run_args)
         cap = str(getattr(sk, "capability", "") or getattr(sk, "key", "") or "")
         pick = self._pick_slot(sk)
-        if cap not in PICK_RERUN_CAPS or not pick:
+        if cap in NO_PICK_RERUN or not pick:
             return None
         slots = dict(run_args.get("slots") or {}) if isinstance(run_args.get("slots"), Mapping) else {}
         value = _value_text(slots.get(pick))
