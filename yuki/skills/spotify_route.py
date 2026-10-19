@@ -1045,6 +1045,9 @@ def _log_read(call: Any, trigger: str, state: str | None, facts: Mapping[str, An
 
         fields = {"trigger": f"skill_{trigger}", "state": state or "unknown", "warm": facts.get("warm"),
                   "this_pc": facts.get("this_pc")}
+        if facts.get("page_link"):
+            fields["page_link"] = facts.get("page_link")      # skill19 (RC2): the link check's last code word
+            fields["page_reads"] = facts.get("page_reads")
         if look is not None:
             fields.update(look.counts())
             fields["ms"] = look.ms
@@ -1910,6 +1913,15 @@ def play_link(call: Any) -> Any:
             # review r2 L2: only the opened page's own button (its container shows the learned link), never a
             # same-named header of the view still in front while Spotify navigates
             look = _look(DESK, win.hwnd, name, learned=learned, press=True, page=True, grid=False, link=uri)
+            # skill19 (RC2: "page_not_shown" in every try, its reason never logged): the link check's own code word
+            # per read (ok / other / none / unread: the button's container held the learned link, another page's links,
+            # none, or couldn't be read), the last one and how often each came (content-free)
+            word = str(look.details.get("page_link") or "") if look.status == "not_shown" else ""
+            if word:
+                facts["page_link"] = word
+                seen_words = facts.setdefault("page_links", {})
+                seen_words[word] = int(seen_words.get(word, 0)) + 1
+            facts["page_reads"] = int(facts.get("page_reads", 0)) + 1
             if look.status in ("ok", "ambiguous"):
                 break
         if clock() + POLL_S > until:
@@ -2271,9 +2283,43 @@ def probe_playing_here(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, 
         _set_line(ctx, unconfirmed)
         return None, ev
     _set_line(ctx, unconfirmed)
+    if look.status == "ok" and look.state == "play" and status == "playing" and audio is True \
+            and _stale_row(ctx, look):
+        # skill19 (live 19 Oct, RC1: Spotify minimised, row pressed, the session went paused -> playing with sound here
+        # and the playlist audibly on, yet "contradicted", and two such marks disabled the library rung for 24 h): a
+        # window that isn't drawing (minimised or covered) doesn't refresh its row's label, so "Play {name}" there while
+        # the session plays now, and did not before the press, with Spotify sounding on this PC, is unread, never a
+        # contradiction (the stale-label rule :func:`_confirm_flip` applies at the press). Which playlist plays is
+        # unknown, so never True either: "couldn't confirm", which never counts against the rung
+        ev["reason"] = "row_stale"
+        return None, ev
     if look.status == "ok" and (look.state == "play" or status in ("paused", "stopped")):
         return False, ev
     return None, ev
+
+
+#: The window states in which Spotify's Chromium window draws nothing new (its row labels go stale).
+NOT_DRAWING = ("minimised", "covered")
+
+
+def _stale_row(ctx: Any, look: Look) -> bool:
+    """Whether a "Play {name}" row read by a rung's own check may be a label the window never redrew: the rung
+    pressed it (no ``already``), the session was not playing before the press (the route's own read,
+    ``facts["session"]``), and the window isn't drawing (the route's read of its state, or the state now:
+    :data:`NOT_DRAWING`). Code facts only; never raises."""
+    try:
+        result = getattr(ctx, "result", None)
+        facts = getattr(result, "facts", None) or {}
+        if result is None or _not_pressed(ctx) or getattr(result, "ran", None) is False:
+            return False
+        if str(facts.get("session") or "") == "playing":
+            return False
+        if str(facts.get("state") or "") in NOT_DRAWING:
+            return True
+        win = DESK.window()
+        return win is not None and DESK.state(win.hwnd) in NOT_DRAWING
+    except Exception:  # noqa: BLE001 - unknown: the row stands as read
+        return False
 
 
 def probe_still_playing(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
@@ -2314,6 +2360,44 @@ def _amount(values: Mapping[str, Any]) -> tuple[float | None, float | None, bool
 
 def _no_amount(level: float | None, change: float | None, mute: bool | None) -> bool:
     return level is None and change is None and mute is None
+
+
+#: skill19 (live 19 Oct compare O5: ``change: down, level: 85`` set 50 -> 90 against "lower it a little"): a call whose
+#: level would move the control against its own change, asked once with the level read now.
+ASK_LEVEL_WAY = "It's at {now:g}% now, so {level:g}% would turn it {way}. Louder, quieter, or to what level?"
+#: The same call again within this long (their answer, or the caller holding to it) runs its level: asked once.
+LEVEL_WAY_ONCE_S = 120.0
+_level_way_asked: dict[tuple[str, int, int], float] = {}
+_level_way_lock = threading.Lock()
+
+
+def _level_against_change(values: Mapping[str, Any], now: float | None, app: str) -> Any:
+    """skill19 (O5): a level and a change given together whose directions disagree against the control's level read
+    now (``now``: a code read; 70 asked as "down" on a control at 50) -> the question once, carrying that level
+    (``facts["current"]``); the same call again within :data:`LEVEL_WAY_ONCE_S` runs its level. ``None``: no such
+    contradiction (one of the two not given, the level unread, or within :data:`LEVEL_TOLERANCE` of now)."""
+    def num(v: Any) -> float | None:
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    level, change = num(values.get("level")), num(values.get("change"))
+    if level is None or change is None or change == 0.0 or now is None:
+        return None
+    toward = float(level) - float(now)
+    if abs(toward) <= LEVEL_TOLERANCE or toward * change > 0:
+        return None
+    key = (str(app or ""), int(round(level)), 1 if change > 0 else -1)
+    at = time.monotonic()
+    with _level_way_lock:
+        for old in [k for k, t in _level_way_asked.items() if at - t > LEVEL_WAY_ONCE_S]:
+            _level_way_asked.pop(old, None)
+        if key in _level_way_asked:
+            _level_way_asked.pop(key, None)
+            return None                    # asked once already: the level runs
+        _level_way_asked[key] = at
+    way = "up" if toward > 0 else "down"
+    return _rr(ran=False, ask=ASK_LEVEL_WAY.format(now=round(float(now), 1), level=float(level), way=way),
+               outcome="level_against_change", app=app or None,
+               facts={"current": round(float(now), 1), "level": float(level), "change_sign": key[2]})
 
 
 def _slider_result(look: Look, facts: dict[str, Any], *, how: str = "") -> Any:
@@ -2364,6 +2448,11 @@ def volume_slider(call: Any) -> Any:
     if not _ensure_warm(DESK, win, call, facts):
         _log_read(call, "volume", state, facts, None)
         return _rr(ran=False, outcome=_cold(facts), facts=facts)
+    if call.values.get("level") is not None and call.values.get("change") is not None:
+        first = _read_slider(DESK, win.hwnd)      # skill19 (O5): only when a level and a change came together
+        against = _level_against_change(call.values, first.slider if first.status == "ok" else None, "spotify")
+        if against is not None:
+            return against
     look = _set_slider(DESK, win.hwnd, to=level, by=change, budget_s=_left(call))
     _log_read(call, "volume", state, facts, look)
     return _slider_result(look, facts)
@@ -2387,6 +2476,9 @@ def volume_keys(call: Any) -> Any:
     if first.status != "ok" or first.slider is None:
         return _rr(ran=False, outcome="slider_" + first.status, facts=facts)
     v0 = v = float(first.slider)
+    against = _level_against_change(call.values, v0, "spotify")      # skill19 (O5)
+    if against is not None:
+        return against
     target = max(0.0, min(100.0, level if level is not None else v0 + float(change or 0.0)))
     if abs(target - v0) <= LEVEL_TOLERANCE / 2:
         return _rr(ran=False, already=True, verified=True, value=v0, outcome="already", facts=facts,
@@ -2450,6 +2542,9 @@ def volume_restored(call: Any) -> Any:
     if first.status in ("missing", "ambiguous"):
         # the minimised window reads, and its slider isn't there by its label or shape: restoring wouldn't help
         return _rr(ran=False, outcome="slider_" + first.status, facts=facts)
+    against = _level_against_change(call.values, first.slider if first.status == "ok" else None, "spotify")
+    if against is not None:
+        return against                     # skill19 (O5): asked before anything is restored
     prev = DESK.foreground()
     got = DESK.focus(win.hwnd)
     if kind := _refused(got):
@@ -2506,6 +2601,10 @@ def volume_spotify_mixer(call: Any) -> Any:
     if where == "other":
         return _other_device(facts, volume=True)
     before_slider = _read_slider(DESK, win.hwnd) if win is not None else None
+    if call.values.get("level") is not None and call.values.get("change") is not None:
+        against = _level_against_change(call.values, DESK.mixer_level(image), "spotify")    # skill19 (O5)
+        if against is not None:
+            return against
     result = DESK.app_volume(image, level=level, change=change, mute=None)
     ran, verified, before, after = _mixer_after(result)
     if not ran:
@@ -2565,6 +2664,10 @@ def volume_mixer(call: Any) -> Any:
         if where == "other":
             return _other_device(facts, volume=True)
         before_slider = _read_slider(DESK, win.hwnd) if win is not None else None
+    if values.get("level") is not None and values.get("change") is not None:
+        against = _level_against_change(values, DESK.mixer_level(target), target)    # skill19 (O5)
+        if against is not None:
+            return against
     result = DESK.app_volume(target, level=level, change=change, mute=mute)
     ran, verified, before, after = _mixer_after(result)
     if not ran:
@@ -2596,6 +2699,9 @@ def volume_system(call: Any) -> Any:
         # app_volume's N1 for the PC: a level that can't move (already there, or at its top or bottom) is a no-op,
         # read and said as one, and nothing is set
         now0 = DESK.master_level()
+        against = _level_against_change(call.values, now0, "master")      # skill19 (O5)
+        if against is not None:
+            return against
         if now0 is not None:
             want = max(0.0, min(100.0, float(level) if level is not None else now0 + float(change or 0.0)))
             if abs(want - now0) <= 0.6:
@@ -2627,6 +2733,10 @@ def volume_own_voice(call: Any) -> Any:
     image = DESK.own_process()
     if not image:
         return _rr(ran=False, outcome="no_process")
+    if call.values.get("level") is not None and call.values.get("change") is not None:
+        against = _level_against_change(call.values, DESK.mixer_level(image), image)    # skill19 (O5)
+        if against is not None:
+            return against
     result = DESK.app_volume(image, level=level, change=change, mute=mute)
     ran, verified, _before, after = _mixer_after(result)
     if not ran:

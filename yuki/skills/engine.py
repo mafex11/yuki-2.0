@@ -312,6 +312,10 @@ class RunContext:
     #: Phase 2.1: the caller's word for where the values it gave came from (:data:`NOTE_SLOTS` ``from``), for the
     #: resolver's ``given_from``.
     given_from: Any = None
+    #: skill19 (contract C1): the desk's front read before and after each rung (:func:`front_now`: the foreground
+    #: window and every window's visible share), replaced by name in tests and replays; ``None``: the live read (an eval
+    #: run reads nothing: its focus is the route's declaration).
+    front: Callable[[], Any] | None = None
 
     def game_now(self) -> str:
         """D9, read now (fails closed: a check that raised counts as a game)."""
@@ -353,7 +357,19 @@ class SkillResult:
     recheck_thread: threading.Thread | None = None
     recheck_verdict: bool | None = None
     values: dict[str, Any] = field(default_factory=dict)
+    #: skill19 (contract C1): measured per rung (:func:`front_change`): a rung brought another window to the front (the
+    #: foreground before it is not the one after it). Only a rung whose front couldn't be read (or an eval run) falls
+    #: back to its route's declaration (``needs_focus``). Set on every return path of a run that reached its rungs.
     focus_taken: bool = False
+    #: skill19 (contract C1): something on the PC was touched by this run: a rung acted by its own word (``ran``), or
+    #: the measured front changed under a rung (a window came to the front, or the window in front lost most of its
+    #: visible share), even when the rung itself said it couldn't (Spotify's link rung raised Spotify, then "page not
+    #: shown"). Every return path.
+    acted: bool = False
+    #: skill19 (C1): the apps the rungs acted on (:func:`acted_app` per rung that acted or changed the front, and the
+    #: app of a window a rung brought to the front), app keys in order, each once; and those windows' handles.
+    acted_apps: list[str] = field(default_factory=list)
+    acted_windows: list[int] = field(default_factory=list)
     #: Running it sends something to other people (its ``sends`` data with these values): an unconfirmed send is
     #: never tried again (rule 8).
     sends: bool = False
@@ -392,6 +408,12 @@ class SkillResult:
         if self.done:
             return f"Done and checked: {self.done_line or self.say}"
         if self.outcome == "asked":
+            # skill19 (RC5a / C5): a value given for a code-typed slot that isn't a form it takes is never dropped
+            # silently: the caller reads which slot and the form it takes (the question stays the user's)
+            forms = (self.evidence or {}).get("form") if isinstance(self.evidence, Mapping) else None
+            if isinstance(forms, Mapping) and forms:
+                given = "; ".join(f"{k} as given isn't a form it takes ({v})" for k, v in forms.items())
+                return f"Ask them: {self.ask}\n{given}: pass it in that form when their words give it."
             return f"Ask them: {self.ask}"
         if self.outcome == "held_game":
             return f"Held: a game is in front, nothing was sent. Say: {self.say}"
@@ -460,6 +482,9 @@ class SkillResult:
             facts["guessed"] = [dict(g) for g in self.guessed]
         if self.evidence and not self.done:
             facts["evidence"] = dict(self.evidence)
+        # skill19 (C1): what the run measurably touched (the hands' look after it reads the result itself too)
+        facts["acted_apps"] = list(self.acted_apps)
+        facts["acted_windows"] = list(self.acted_windows)
         if self.outcome == HELD_BLOCKED:
             facts["refused"] = HELD_BLOCKED      # fHands: never said as a game (``held`` stays empty)
         elif self.held:
@@ -542,6 +567,184 @@ def acted_app(skill: Skill, route: Route, args: Mapping[str, Any] | None, res: "
     if isinstance(apps, (list, tuple)) and apps and isinstance(apps[0], str) and apps[0].strip():
         return apps[0]
     return skill.app
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# skill19 (contract C1; live 19 Oct all-desk RC1(b), one-desk D5): the front, measured before and after each rung
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@dataclass
+class FrontRead:
+    """The desk's front at one instant (read-only): the foreground window, every window's visible share (the
+    occlusion grid's, 0..1) and each window's process id. Content-free (no titles)."""
+
+    fg: int = 0
+    shares: dict[int, float] = field(default_factory=dict)
+    pids: dict[int, int] = field(default_factory=dict)
+
+
+def front_now() -> FrontRead | None:
+    """The front now (:func:`yuki.perception.visibility.layout`: one EnumWindows pass and the 16 px grid, about 3-4 ms;
+    no focus, no input). ``None`` when the desk couldn't be read. Never raises."""
+    try:
+        from yuki.perception.visibility import layout
+
+        lay = layout()
+        if not lay.surfaces:
+            return None
+        return FrontRead(fg=int(lay.foreground or 0),
+                         shares={int(s.hwnd): float(s.visible_share) for s in lay.surfaces},
+                         pids={int(s.hwnd): int(s.pid) for s in lay.surfaces})
+    except Exception:  # noqa: BLE001 - unread: the route's declaration stands
+        return None
+
+
+def front_change(before: Any, after: Any, own: Callable[[int, int], bool] | None = None) -> dict[str, Any]:
+    """What a rung did to the front, from two :class:`FrontRead` (code facts): ``read`` (both read), ``taken`` (the
+    foreground after is another window than before), ``covered`` (the window in front before lost most of its visible
+    share: perception.diff's own cover rule, ``COVER_KEEP`` / ``COVER_MIN_LOSS``; a window that left the screen counts
+    as 0), ``hwnd`` / ``pid`` (the window in front after, when it is another).
+
+    ``own(hwnd, pid)``: whether a window that came up is the rung's (it acts in that window's app); a window that was
+    not on screen before the rung is always its. A change no window of the rung's made (the user switched windows
+    while the rung waited) is ``other`` and neither ``taken`` nor ``covered``. Without ``own`` every change counts.
+    Pure but for ``own``."""
+    if not isinstance(before, FrontRead) or not isinstance(after, FrontRead):
+        return {"read": False}
+    try:
+        from yuki.perception.diff import COVER_KEEP, COVER_MIN_LOSS
+    except Exception:  # noqa: BLE001 - the same rule's numbers
+        COVER_KEEP, COVER_MIN_LOSS = 0.50, 0.20
+
+    def mine(hwnd: int) -> bool:
+        if own is None or hwnd not in before.shares:
+            return True
+        try:
+            return bool(own(int(hwnd), int(after.pids.get(hwnd) or 0)))
+        except Exception:  # noqa: BLE001 - unknown: counted (a rung's change is never missed by an error)
+            return True
+
+    taken = bool(after.fg) and after.fg != before.fg
+    covered = False
+    s0 = before.shares.get(before.fg) if before.fg else None
+    if s0 is not None and s0 > 0.0:
+        s1 = float(after.shares.get(before.fg, 0.0))
+        covered = (s0 - s1) >= COVER_MIN_LOSS and s1 < COVER_KEEP * s0
+    out: dict[str, Any] = {"read": True, "taken": False, "covered": False, "other": False}
+    if taken:
+        if mine(int(after.fg)):
+            out.update(taken=True, hwnd=int(after.fg), pid=int(after.pids.get(after.fg) or 0))
+        else:
+            out["other"] = True
+    if covered:
+        # the windows that came up over it: newly on screen, or a share gained by at least the cover's own loss
+        gainers = [h for h, s in after.shares.items() if h != before.fg
+                   and (h not in before.shares or float(s) - float(before.shares.get(h, 0.0)) >= COVER_MIN_LOSS)]
+        if not gainers or any(mine(h) for h in gainers):
+            out["covered"] = True
+        else:
+            out["other"] = True
+    return out
+
+
+def _pid_app(pid: int) -> str:
+    """The app key of a process (its image name as the timeline keys it), ``""`` unknown. Never raises."""
+    if not pid:
+        return ""
+    try:
+        import psutil
+
+        from yuki.memory.store import app_key
+
+        return str(app_key(psutil.Process(int(pid)).name()) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _app_key_of(app: Any) -> str:
+    """An app as the timeline keys it (``"Spotify"`` -> ``"spotify"``), ``""`` none. Never raises."""
+    if not app or not isinstance(app, str):
+        return ""
+    try:
+        from yuki.memory.store import app_key
+
+        return str(app_key(app) or "")
+    except Exception:  # noqa: BLE001
+        return app.casefold()
+
+
+class _Measure:
+    """One run's measured front (C1): what every rung did to it, folded (:func:`front_change`). A rung whose front
+    couldn't be read counts by its route's declaration, as before (``needs_focus``). A window that came up counts as
+    the rung's when it is new on screen or belongs to an app the run acts in (the skill's app, its app-typed slots'
+    values, the app each rung names: :func:`acted_app`), so the user's own switch while a rung waited is no act."""
+
+    def __init__(self, ctx: "RunContext", skill: Skill | None = None, values: Mapping[str, Any] | None = None) -> None:
+        self.ctx = ctx
+        self.on = ctx.origin != "eval"
+        self.focus = False
+        self.touched = False
+        self.apps: list[str] = []
+        self.hwnds: list[int] = []
+        self.own: set[str] = set()
+        if skill is not None:
+            self.own.add(_app_key_of(skill.app))
+            for slot in getattr(skill, "slots", ()) or ():
+                if getattr(slot, "type", "") == "app":
+                    v = (values or {}).get(slot.name)
+                    self.own.add(_app_key_of(v.get("key") or v.get("name") if isinstance(v, Mapping) else v))
+        self.own.discard("")
+
+    def read(self) -> Any:
+        if not self.on:
+            return None
+        try:
+            return self.ctx.front() if self.ctx.front is not None else front_now()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def fold(self, route: Route, before: Any, after: Any, *, acted: bool, app: str | None) -> dict[str, Any]:
+        """Fold one rung's change in; ``acted``: the rung acted by its own word; ``app``: :func:`acted_app`'s app for
+        it. Returns the change (for its ``route_try`` line)."""
+        own = set(self.own) | {_app_key_of(app)}
+        own.discard("")
+        ch = front_change(before, after, own=(lambda _h, pid: _pid_app(pid) in own) if own else None)
+        if ch.get("read"):
+            self.focus = self.focus or bool(ch.get("taken"))
+            moved = bool(ch.get("taken") or ch.get("covered"))
+            self.touched = self.touched or moved
+            if ch.get("taken"):
+                hwnd = int(ch.get("hwnd") or 0)
+                if hwnd and hwnd not in self.hwnds:
+                    self.hwnds.append(hwnd)
+                front_app = _pid_app(int(ch.get("pid") or 0))
+                if front_app and front_app not in self.apps:
+                    self.apps.append(front_app)
+        else:
+            self.focus = self.focus or bool(route.needs_focus)
+            moved = False
+        if (acted or moved) and app and str(app) not in self.apps:
+            self.apps.append(str(app))
+        return ch
+
+    def stamp(self, result: "SkillResult", acted: bool) -> None:
+        result.focus_taken = bool(self.focus)
+        result.acted = bool(acted or self.touched)
+        result.acted_apps = list(self.apps)
+        result.acted_windows = list(self.hwnds)
+        if isinstance(result.evidence, dict) and result.evidence:
+            # Phase 2.3's "nothing on the PC was touched" only when nothing measurably was (one-desk D5)
+            result.evidence["acted"] = result.acted
+
+
+def _front_word(ch: Mapping[str, Any]) -> str:
+    """A rung's front change as one code word for its log line: ``taken`` / ``covered`` / ``other`` (a change no window
+    of the rung's made) / ``kept`` / ``unread``."""
+    if not ch.get("read"):
+        return "unread"
+    return ("taken" if ch.get("taken") else "covered" if ch.get("covered") else "other" if ch.get("other")
+            else "kept")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1086,6 +1289,16 @@ def evidence_words(ev: Mapping[str, Any] | None) -> str:
         parts.append("seen there instead: " + " | ".join(str(n) for n in ev["seen"]))
     if ev.get("reason"):
         parts.append(f"stopped: {ev['reason']}")
+    # skill19: the chat opened and nothing was typed (C3), what holds the keyboard; the control's level read (O5); a
+    # code-typed value given in another form than the slot takes (RC5a)
+    if ev.get("not_typed") or ev.get("reason") == "not_typed":
+        parts.append("the chat opened but nothing was typed" + (f" ({ev['holder']} has the keyboard)"
+                                                                 if ev.get("holder") else ""))
+    if isinstance(ev.get("current"), (int, float)) and not isinstance(ev.get("current"), bool):
+        parts.append(f"the control reads {float(ev['current']):g}% now")
+    forms = ev.get("form") if isinstance(ev.get("form"), Mapping) else {}
+    for k, v in forms.items():
+        parts.append(f"{k} as given isn't a form it takes ({v})")
     if ev.get("fallback_line"):
         parts.append(f"code's fallback line: \"{ev['fallback_line']}\"")
     return "Evidence: " + "; ".join(parts) + "."
@@ -1177,22 +1390,32 @@ def run(resolved: Any, ctx: RunContext | None = None) -> SkillResult:
     # the run's ledger key and what it tried, while it runs (a run that breaks partway still finishes its row)
     state: dict[str, Any] = {}
     try:
-        return _run(resolved, ctx, started, state)
+        result = _run(resolved, ctx, started, state)
     except Exception as exc:  # noqa: BLE001 - a broken run is an error outcome, never a crash
         key = getattr(getattr(resolved, "skill", None), "key", None) or str(getattr(resolved, "skill", "") or "")
         _emit(ctx, "skill_run", skill=key, result="error", error=type(exc).__name__)
         handed = _error_handoff(resolved, ctx, started, state)
         if handed is not None:
-            return handed
-        _ledger_finish(ctx, state.get("run_key"), outcome="error", checked=None, error=type(exc).__name__,
-                       acted=bool(state.get("acted")))
-        tried = [dict(t) for t in state.get("tried") or [] if isinstance(t, Mapping)]
-        ev: dict[str, Any] = {"acted": bool(state.get("acted")), "reason": "error", "fallback_line": LINE_FAILED}
-        if tried:
-            ev["tried"] = [{"route": t.get("route"), "via": t.get("via"), "outcome": t.get("outcome")}
-                           for t in tried][-6:]
-        return SkillResult(skill=key, outcome="error", say=LINE_FAILED,
-                           ms=round((ctx.clock() - started) * 1000.0, 1), evidence=ev)
+            result = handed
+        else:
+            _ledger_finish(ctx, state.get("run_key"), outcome="error", checked=None, error=type(exc).__name__,
+                           acted=bool(state.get("acted")))
+            tried = [dict(t) for t in state.get("tried") or [] if isinstance(t, Mapping)]
+            ev: dict[str, Any] = {"acted": bool(state.get("acted")), "reason": "error", "fallback_line": LINE_FAILED}
+            if tried:
+                ev["tried"] = [{"route": t.get("route"), "via": t.get("via"), "outcome": t.get("outcome")}
+                               for t in tried][-6:]
+            result = SkillResult(skill=key, outcome="error", say=LINE_FAILED,
+                                 ms=round((ctx.clock() - started) * 1000.0, 1), evidence=ev)
+    measure = state.get("measure")
+    if isinstance(measure, _Measure):
+        # skill19 (contract C1): every return path of a run that reached its rungs (a done, a hand-off, routes_failed,
+        # a rung's question, a hold, an error) carries what the rungs measurably did to the front
+        try:
+            measure.stamp(result, bool(state.get("acted")))
+        except Exception:  # noqa: BLE001 - the declared values stand
+            pass
+    return result
 
 
 def _error_handoff(resolved: Any, ctx: RunContext, started: float,
@@ -1238,6 +1461,42 @@ def _settled(res: RouteResult, evidence: Any) -> bool:
         return any(reason_in(v, depth + 1) for v in ev.values() if isinstance(v, Mapping))
 
     return reason_in(evidence)
+
+
+def _not_typed(res: RouteResult) -> bool:
+    """skill19 (contract C3): whether a rung's result is the chat driver's "opened, nothing typed": its code fact
+    ``facts["why"] == "not_typed"`` (contract C3), or, from a chat driver before C3, the outcome word ``not_typed`` on a
+    rung that acted (it opened the chat) and asked its line. No typing went out, so nothing was sent and nothing would
+    be done twice. A rung that did not run and says ``not_typed`` (the address bar's: nothing typed, nothing opened)
+    is an ordinary "couldn't". Code words only."""
+    facts = res.facts if isinstance(res.facts, Mapping) else {}
+    if str(facts.get("why") or "") == "not_typed":
+        return True
+    return str(res.outcome or "") == "not_typed" and res.ran is not False and bool(res.ask)
+
+
+#: The slot types whose given value code checks with no words (an option, a number, a signed change, a switch).
+_CODE_TYPES = ("enum", "number", "points", "bool")
+
+
+def _code_slot_forms(skill: Skill | None, dropped: Sequence[str] | None) -> dict[str, str]:
+    """skill19 (RC5a / C5): ``{slot: the form it takes}`` for each slot the resolver dropped that code checks by its
+    type alone (:func:`yuki.skills.menu.slot_form`: "up | down | signed points"), so a value given in another form is
+    never dropped silently: the caller reads what it takes. ``{}`` for none. Never raises."""
+    if skill is None or not dropped:
+        return {}
+    try:
+        from yuki.skills.menu import slot_form
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, str] = {}
+    for name in dropped:
+        slot = skill.slot(str(name)) if callable(getattr(skill, "slot", None)) else None
+        if slot is not None and slot.type in _CODE_TYPES and _SLOT_NAME.fullmatch(str(name)):
+            form = slot_form(slot)
+            if form:
+                out[str(name)] = form
+    return out
 
 
 def _absolute_values(skill: Skill, values: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -1422,9 +1681,17 @@ def _commit_gate(skill: Skill, ctx: RunContext, started: float) -> SkillResult |
 def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] | None = None) -> SkillResult:
     if isinstance(resolved, Ask):
         _emit(ctx, "skill_resolve", skill=resolved.skill, result="asked", slot_source="ask")
+        asked_ev: dict[str, Any] = {"acted": False, "reason": "asked", "fallback_line": resolved.question}
+        try:
+            from yuki.skills.catalog import load
+
+            forms = _code_slot_forms(load().get(str(resolved.skill or "")), getattr(resolved, "dropped", None))
+        except Exception:  # noqa: BLE001
+            forms = {}
+        if forms:
+            asked_ev["form"] = forms      # skill19 (RC5a): a dropped code-typed value is never dropped silently
         return _simple(resolved.skill, "asked", ctx, started, ask=resolved.question, options=list(resolved.options),
-                       say=resolved.question, evidence={"acted": False, "reason": "asked",
-                                                        "fallback_line": resolved.question})
+                       say=resolved.question, evidence=asked_ev)
     if isinstance(resolved, Held):
         _emit(ctx, "skill_resolve", skill=resolved.skill, result="held_game", gate="game")
         return _simple(resolved.skill, "held_game", ctx, started, held="game", say=resolved.say,
@@ -1464,13 +1731,19 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
     guessed = list(plan.guessed)
     # Phase 2.1: where each given value came from (code words: words / heard / menu / card / screen / reading ...) and
     # which slots are Yuki's guess, by their schema names only
+    # skill19 (RC2): a rung its own record put last (``reordered``) or rests for now (``rested``: skipped "couldnt")
+    planned = [r.key for r in plan.routes]
+    in_file = [r.key for r in skill.routes if r.key in set(planned)]
+    rested = sum(1 for why in (plan.skipped or {}).values() if why == "couldnt")
     _emit(ctx, "skill_resolve", skill=skill.key, result="plan", routes=len(plan.routes),
           slot_source=sorted(set(plan.filled.values())), slots=len(plan.filled), named=len(plan.named),
           dropped=len(plan.dropped), dropped_slots=_slot_flags(plan.dropped), skipped=len(plan.skipped),
-          source=sorted(set(sources.values())) or None, guessed_slots=_slot_flags(guessed), origin=ctx.origin)
+          source=sorted(set(sources.values())) or None, guessed_slots=_slot_flags(guessed), origin=ctx.origin,
+          reordered=True if planned != in_file else None, rested=rested or None)
     deadline = started + float(ctx.budget_s)
     tried: list[dict[str, Any]] = []
-    state.update(run_key=run_key, tried=tried, acted=False)
+    measure = _Measure(ctx, skill, plan.values)
+    state.update(run_key=run_key, tried=tried, acted=False, measure=measure)
     focus_taken = False
     acted = False
     sends = sends_with(skill, plan.values)
@@ -1478,10 +1751,22 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                for k in guessed]
     last_wait: Any = None     # the last done-check read (Phase 2.3's evidence when every rung failed)
     last_route: Route | None = None
+    # skill19 (contract C3): a rung that opened the chat but typed nothing (the chat driver's code fact): what holds
+    # the keyboard (content-free) and the driver's own line, for the caller who takes it on
+    not_typed: dict[str, Any] | None = None
+    # skill19 (RC5a / C5): a value given for a code-typed slot that wasn't a form it takes, and that form
+    forms = _code_slot_forms(skill, plan.dropped)
 
     def evidence(*, route: Route | None = None, waited: Any = None, reason: str = "", line: str = "") -> dict[str, Any]:
-        return _evidence(skill, plan.values, tried, acted=acted, route=route, waited=waited, missing=missing,
-                         seen=seen, sources=sources, reason=reason, line=line)
+        ev = _evidence(skill, plan.values, tried, acted=acted or measure.touched, route=route, waited=waited,
+                       missing=missing, seen=seen, sources=sources, reason=reason, line=line)
+        if forms:
+            ev["form"] = dict(forms)
+        if not_typed is not None:
+            ev["not_typed"] = True
+            if not_typed.get("holder"):
+                ev["holder"] = not_typed["holder"]
+        return ev
 
     # IF-seed: the slot a rung found no item for on screen, and the names it read there (RAM only)
     missing: str | None = None
@@ -1515,6 +1800,7 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
         fn = ctx.verbs.get(route.via) or VERB_FUNCS.get(route.via)
         call = RouteCall(skill, route, args, dict(plan.values), ctx, deadline)
         base = _baseline(route, plan.values, ctx)
+        front0 = measure.read()        # skill19 (C1): the front right before this rung
         r0 = ctx.clock()
         try:
             res = fn(call) if fn is not None else RouteResult(ran=False, outcome="no_verb")
@@ -1522,6 +1808,10 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             res = RouteResult(ran=None, outcome="error", facts={"error_kind": type(exc).__name__})
         route_ms = round((ctx.clock() - r0) * 1000.0, 1)
         app_done = acted_app(skill, route, args, res)
+        # skill19 (C1; all-desk RC1(b), one-desk D5): what this rung measurably did to the front, whatever it declared
+        # (``needs_focus``) and whatever it said it did (a ``ran=False`` that raised a window still touched the PC)
+        change = measure.fold(route, front0, measure.read(), acted=res.ran is not False, app=app_done)
+        front_w = _front_word(change)
         # IF-seed (x5Fallback): a rung that found no item by the name asked says which slot, and what it read instead
         missing = missing or _missing_slot(skill, (res.facts or {}).get("missing")
                                            if isinstance(res.facts, Mapping) else None)
@@ -1533,7 +1823,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             # never handed over (the thinker too). The ledger keeps it as a refusal (never counted against the rung)
             acted = state["acted"] = acted or bool(res.ran)
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": HELD_BLOCKED})
-            _emit(ctx, "route_try", skill=skill.key, route=route.key, result=HELD_BLOCKED, ms=route_ms)
+            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result=HELD_BLOCKED,
+                  ms=route_ms)
             _ledger_finish(ctx, run_key, outcome="refused", checked=None, route=route, ms=route_ms, app=app_done,
                            acted=acted)
             line = LINE_BLOCKED_PARTWAY if acted else LINE_BLOCKED
@@ -1542,7 +1833,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                            evidence=evidence(reason=HELD_BLOCKED, line=line))
         if res.held:
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "held_game"})
-            _emit(ctx, "route_try", skill=skill.key, route=route.key, result="held_game", ms=route_ms)
+            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="held_game",
+                  ms=route_ms)
             if res.ran:
                 acted = state["acted"] = True
                 if sends or not route.retry_after_acting:
@@ -1559,21 +1851,46 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             acted = acted or bool(res.ran)
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": TO_PLANNER})
             _ledger_try(ctx, run_key, route, None, "refused", route_ms)
-            _emit(ctx, "route_try", skill=skill.key, route=route.key, result=TO_PLANNER, ms=route_ms)
+            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result=TO_PLANNER,
+                  ms=route_ms)
             return _to_planner(skill, plan, tried, ctx, started, run_key=run_key, acted=acted, missing=missing,
                                seen=seen, evidence=evidence(route=route, reason=TO_PLANNER))
+        if _not_typed(res):
+            # skill19 (contract C3; live 19 Oct all-messaging RC1: "I opened your chat with Hemanth, but couldn't type
+            # it." asked as a final question on every Discord draft, so the talker's own hands never typed it as on 18
+            # Oct): the chat driver's code fact says no typing went out, so nothing can have been sent and nothing
+            # would be done twice. Never a turn-ending question: the next rung tries, and with none left the run is
+            # handed to the caller unconfirmed (rung C: the thinker or the agent types it in the chat now open). Its
+            # try is "couldn't confirm" (never counted against the rung); the chat it opened is the PC touched
+            acted = state["acted"] = acted or bool(res.ran)
+            facts_nt = res.facts if isinstance(res.facts, Mapping) else {}
+            holder = facts_nt.get("holder")
+            not_typed = {"holder": str(holder)[:60] if isinstance(holder, str) and holder.strip() else None,
+                         "line": res.unverified_line or res.say or res.ask or ""}
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "not_typed"})
+            last_route = route
+            _ledger_try(ctx, run_key, route, None, "unverified", route_ms)
+            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="not_typed",
+                  ms=route_ms, observed=res.facts)
+            if not route.retry_after_acting:
+                break        # its data says nothing may follow it once it acted: the caller takes it on (rung C)
+            continue
         if res.ask:
             _ledger_finish(ctx, run_key, outcome="asked", checked=None, route=route, ms=route_ms, app=app_done,
                            acted=acted)
-            _emit(ctx, "route_try", skill=skill.key, route=route.key, result="asked", ms=route_ms)
+            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="asked", ms=route_ms)
+            asked_ev = evidence(route=route, reason=res.outcome or "asked", line=res.ask)
+            current = (res.facts or {}).get("current") if isinstance(res.facts, Mapping) else None
+            if isinstance(current, (int, float)) and not isinstance(current, bool):
+                asked_ev["current"] = float(current)    # skill19 (O5): the control's level as the rung read it
             return _simple(skill.key, "asked", ctx, started, ask=res.ask, options=list(res.options), say=res.ask,
-                           run_key=run_key, route=route.key, tried=tried,
-                           evidence=evidence(route=route, reason=res.outcome or "asked", line=res.ask))
+                           run_key=run_key, route=route.key, tried=tried, evidence=asked_ev)
         if res.outcome == "other_device":
             say = res.say or LINE_OTHER_DEVICE.format(app=_app_title(skill.app))
             _ledger_finish(ctx, run_key, outcome="other_device", checked=None, route=route, ms=route_ms,
                            app=app_done, acted=acted)
-            _emit(ctx, "route_try", skill=skill.key, route=route.key, result="other_device", ms=route_ms)
+            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="other_device",
+                  ms=route_ms)
             return _simple(skill.key, "other_device", ctx, started, say=say, run_key=run_key, route=route.key,
                            tried=tried, evidence=evidence(route=route, reason="other_device", line=say))
         probe_ctx = _probe_ctx(ctx, t0, plan.values, res, base)
@@ -1590,16 +1907,16 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
         if res.ran is False:
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": res.outcome or "no"})
             _ledger_try(ctx, run_key, route, None, "failed", route_ms)
-            _emit(ctx, "route_try", skill=skill.key, route=route.key, result=res.outcome or "not_run", ms=route_ms,
-                  observed=res.facts)
+            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key,
+                  result=res.outcome or "not_run", ms=route_ms, observed=res.facts)
             continue
         acted = state["acted"] = True
         # review r2 M3: once a rung acted, its check gets its own within_s (<= MAX_WAIT_S) even past the request
         # budget: a check cut short before the app could react is no contradiction (a False there would count against
         # a working rung and run the next one, doing a relative change twice)
         waited = _wait(route.done, probe_ctx, None, ctx)
-        _emit(ctx, "route_try", skill=skill.key, route=route.key, result=res.outcome or "ran", ms=route_ms,
-              observed=res.facts)
+        _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result=res.outcome or "ran",
+              ms=route_ms, observed=res.facts)
         _emit(ctx, "done_check", skill=skill.key, route=route.key,
               check=(route.done.probe if route.done else "read_back"),
               result={True: "done", False: "contradicted", None: "unverified"}[waited.verdict], ms=waited.ms,
@@ -1674,6 +1991,20 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
         _ledger_finish(ctx, run_key, outcome="held_game", checked=None, route=None, acted=acted)
         return _simple(skill.key, "held_game", ctx, started, held="game", say=HELD_LINE, tried=tried,
                        run_key=run_key, evidence=evidence(reason="game", line=HELD_LINE))
+    if not_typed is not None:
+        # skill19 (contract C3): a chat opened and nothing typed, and no later rung got there: an unconfirmed result the
+        # caller takes on (the talker's or the thinker's rung C, the agent's own hands), never a question that ends
+        # the turn. Nothing went out, so a send's consent is still the caller's to ask (the seed says it sends)
+        line = " ".join(str(not_typed.get("line") or "").split()) or LINE_UNVERIFIED
+        if plan.handoff and skill.handoff and ctx.origin in HANDOFF_ORIGINS:
+            return _handoff(skill, plan.values, plan.filled, tried, ctx, started, why=WHY_UNVERIFIED,
+                            run_key=run_key, acted=acted, routes=list(plan.routes), unconfirmed=True,
+                            missing=missing, seen=seen,
+                            evidence=evidence(route=last_route, reason="not_typed", line=line))
+        _ledger_finish(ctx, run_key, outcome="unverified", checked=None, route=last_route, acted=acted)
+        return _simple(skill.key, "unverified", ctx, started, verified=None, say=line, tried=tried, run_key=run_key,
+                       route=last_route.key if last_route is not None else None, values=dict(plan.values),
+                       sends=sends, guessed=guesses, evidence=evidence(route=last_route, reason="not_typed", line=line))
     if plan.handoff and skill.handoff and ctx.origin != "eval":
         return _handoff(skill, plan.values, plan.filled, tried, ctx, started, why="routes_failed", run_key=run_key,
                         acted=acted, routes=list(plan.routes), missing=missing, seen=seen,
@@ -2637,4 +2968,4 @@ __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_O
            "run_for_thinker", "granted_values", "place_arg", "place_hint", "place_for", "habit_place",
            "HABIT_PLACE_S",
            "CHOICE_SLOTS", "CHOOSE_TIMEOUT_S", "HELD_CALL", "asks_choice", "NOTE_SLOTS", "LINE_WHICH",
-           "GUESS_KEEP_S", "note_args", "evidence_words"]
+           "GUESS_KEEP_S", "note_args", "evidence_words", "FrontRead", "front_now", "front_change"]

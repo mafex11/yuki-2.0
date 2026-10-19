@@ -840,20 +840,24 @@ def measured_browsers(store: Any, *, now: float | None = None, days: float = BRO
     (:data:`NOT_YUKIS_VISIT_SQL`). Never raises (``[]``)."""
     now = time.time() if now is None else float(now)
     hosts = [str(h).casefold() for h in site_hosts if h]
-    site_sql = (f"max(CASE WHEN t.host IN ({','.join('?' * len(hosts))}) THEN t.ended_at END)" if hosts else "NULL")
+    marks = ",".join("?" * len(hosts))
+    site_sql = (f"max(CASE WHEN t.host IN ({marks}) THEN t.ended_at END)" if hosts else "NULL")
+    # skill19 (all-browser R6): the user's own visits of the site per browser (its rows), for the site's share
+    site_n_sql = (f"sum(CASE WHEN t.host IN ({marks}) THEN 1 ELSE 0 END)" if hosts else "0")
     try:
         rows = own_rows_query(
             store,
             f"SELECT t.process, sum(t.active_s + t.passive_s) AS s, max(t.ended_at) AS last, "
-            f"count(DISTINCT t.host) AS n, {site_sql} AS site_last FROM timeline t WHERE t.host IS NOT NULL "
+            f"count(DISTINCT t.host) AS n, {site_sql} AS site_last, {site_n_sql} AS site_n FROM timeline t "
+            "WHERE t.host IS NOT NULL "
             "AND t.started_at >= ? AND t.started_at <= ? AND t.by_yuki = 0 AND t.state = 'present' "
             "AND t.process IS NOT NULL{own} GROUP BY t.process ORDER BY s DESC",
-            (*hosts, now - days * 86400.0, now))
+            (*hosts, *hosts, now - days * 86400.0, now))
     except Exception:  # noqa: BLE001
         return []
     weights = _recent_weights(store, now, days)
     out = []
-    for process, seconds, last, n_hosts, site_last in rows:
+    for process, seconds, last, n_hosts, site_last, site_n in rows:
         key = _app_key(process)
         if not key or not (int(n_hosts or 0) >= int(min_hosts) or (by_site and site_last is not None)):
             continue
@@ -866,7 +870,7 @@ def measured_browsers(store: Any, *, now: float | None = None, days: float = BRO
             pass
         out.append({"key": key, "name": name or key, "seconds": float(seconds or 0.0), "last": float(last or 0.0),
                     "hosts": int(n_hosts or 0), "site_last": float(site_last) if site_last is not None else None,
-                    "weight": float(weights.get(str(process), float(seconds or 0.0)))})
+                    "weight": float(weights.get(str(process), float(seconds or 0.0))), "site_n": int(site_n or 0)})
     # lSkills: most used first by recent weight (a switch of browser shows within days, not after the 14-day window)
     out.sort(key=lambda m: (-m["weight"], -m["seconds"], m["key"]))
     return out
@@ -976,7 +980,10 @@ def browser_rule(*, named: str | None, said: bool, front: str | None, recent: st
 
     lSkills (live 17 Oct): ``measured`` comes most used by recent weight first (:func:`measured_browsers`), and
     ``band`` and ``most`` take only a browser still in use (:func:`fresh_keys`): Arc, unused since 12 Oct while Chrome
-    ran every day, fills nothing by them; named, the usual, ``site`` and front/recent are as before."""
+    ran every day, fills nothing by them; named, the usual, ``site`` and front/recent are as before.
+
+    skill19 (live 19 Oct, R6): before ``most``, a site whose own visits are concentrated in one browser
+    (:func:`site_browser`, from ``measured`` read with the site's hosts) opens in that browser, ``site``."""
     keys = [str(m.get("key") or "") for m in measured if m.get("key")]
     fresh = fresh_keys(measured) or keys
     if named and said:
@@ -997,9 +1004,33 @@ def browser_rule(*, named: str | None, said: bool, front: str | None, recent: st
         shown = [m for m in measured if m.get("key") and m.get("site_last") is not None]
         if shown:
             return str(max(shown, key=lambda m: float(m["site_last"]))["key"]), "site"
+    lives = site_browser(measured)
+    if lives:
+        # skill19 (live 19 Oct, all-browser R6: Excalidraw, 15 of 15 visits in Arc, opened in Chrome by "most"): a
+        # site whose own visits are concentrated in one browser opens there (its storage and login live there), fresh
+        # or not, before the browser used most. A measured share bar, never a list of sites
+        return lives, "site"
     if fresh:
         return fresh[0], "most"
     return "", "default"
+
+
+#: skill19 (R6): a site "lives" in one browser when at least this share of the user's own visits of it (timeline rows on
+#: its hosts, :func:`measured_browsers`' ``site_n``) were in that browser (prefs' rule 2 bar, ``prefs.SHARE``)...
+SITE_SHARE = 0.8
+#: ...over at least this many visits (``prefs.MIN_N``: one visit is no habit).
+SITE_MIN_VISITS = 3
+
+
+def site_browser(measured: Sequence[Mapping[str, Any]]) -> str | None:
+    """The browser a site's own visits are concentrated in (:data:`SITE_SHARE` of at least :data:`SITE_MIN_VISITS`,
+    from :func:`measured_browsers` read with the site's hosts), else ``None``. Pure."""
+    counts = [(str(m.get("key") or ""), int(m.get("site_n") or 0)) for m in measured if m.get("key")]
+    total = sum(n for _k, n in counts if n > 0)
+    if total < SITE_MIN_VISITS:
+        return None
+    key, n = max(counts, key=lambda kn: kn[1])
+    return key if key and n / total >= SITE_SHARE else None
 
 
 def site_hosts(site_name: str) -> list[str]:
@@ -1464,8 +1495,20 @@ def site_file(site_word: Any) -> str:
     return ""
 
 
+def _said_in(text: str, words: Sequence[str]) -> bool:
+    """Whether ``text`` stands in ``words`` as whole words (:func:`yuki.skills.uia_route.said`). Never raises."""
+    if not text:
+        return False
+    try:
+        from yuki.skills.uia_route import said
+
+        return bool(said(text, [str(w) for w in words if w]))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words: Sequence[str], *,
-              now: float | None = None) -> tuple[str | None, str | None, str]:
+              now: float | None = None, heard: Sequence[str] | None = None) -> tuple[str | None, str | None, str]:
     """fSkills (live 18 Oct: the talker gave ``page = "Deji"`` for "Deezy's YouTube channel" and ``page = "MBL
     channel"`` for the user's NDL; both pages were dropped and YouTube's front page opened, or nothing): a site page's
     kind and value as the site's data and the user's own names read them: ``(page kind, item, how)``.
@@ -1477,6 +1520,10 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
       (review L4: "channel" + "MBL" is their channel NDL's handle page, never a channel id no link gives);
     * else a page that is one of the site file's page kinds stays (``kind``: data, like an option of an enum), unless
       its address takes a value and no item came (review L4: ``page = handle`` alone is no page to open);
+    * skill19 (R7): the item given that the user's words don't hold (the caller's own rewrite, "MrBeastGaming" for the
+      heard "MBL"): the user's own words (``heard``: the exchange's turns, else ``words``) matched against their own
+      names of the page kind by sound or spelling (:func:`yuki.skills.taste.heard_in`) -> that page of that name
+      (``heard_words``: Yuki's guess, the done line names it);
     * otherwise ``(None, None, "")``: nothing changed.
 
     Never raises."""
@@ -1492,8 +1539,10 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
         item = _words(item_word if not isinstance(item_word, Mapping) else item_word.get("name"))
         said = item or ("" if page in pages else _words(page_word))
         kinds = [(kind, str(pk)) for kind, site, pk, _var in taste.site_kinds() if site == name] if said else []
+        named: list[tuple[str, list[str]]] = []
         for kind, pk in kinds:
             names = [n for n in taste.candidates(store, kind, now=now) if n]
+            named.append((pk, names))
             exact = next((n for n in names if _words(n).casefold() == said.casefold()), None)
             if exact is not None:
                 return pk, exact, "listed"
@@ -1501,6 +1550,15 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
             if alike and any(taste.heard_as([alike], str(w), loose=True)
                              or _words(alike).casefold() in str(w).casefold() for w in words if w):
                 return pk, alike, "heard"
+        if named and not _said_in(said, heard if heard is not None else words):
+            # skill19 (live 19 Oct, all-browser R7: "NDL" heard as "MBL", the talker passed its own "MrBeastGaming"
+            # and @MrBeastGaming opened): the caller's value isn't in the user's words, so before it is taken as the
+            # caller's reading, the user's own words are matched against their own names of this page kind by sound
+            # or spelling (taste.heard_in: "MBL" -> NDL); a hit is Yuki's guess, named in the done line
+            for pk, names in named:
+                hit = taste.heard_in(names, heard if heard is not None else words)
+                if hit:
+                    return pk, hit, "heard_words"
         if page not in pages or (not item and "{" in pages[page]):
             # no page kind, or one whose address needs a value none came with: nothing changed (the resolver checks
             # the page as given, and drops it unless the words hold it: the site's front page)
@@ -2275,4 +2333,4 @@ __all__ = ["ROUTES", "PROBES", "route_site_tab", "route_told_link", "route_open_
            "known_services", "service_of", "page_address", "page_matches", "video_page", "domain_like",
            "chat_web_address", "read_whole", "BROWSER_MIN_HOSTS", "BROWSER_POLICIES", "LINE_TAB_UNREADABLE",
            "LINE_TAB_PARTIAL", "LINE_TAB_NONE", "LINE_TAB_UNKNOWN", "LINE_BROWSER_CLOSED", "LINE_TAB_NO_ID",
-           "ASK_TAB_WHICH", "LINE_TAB_UP"]
+           "ASK_TAB_WHICH", "LINE_TAB_UP", "site_browser", "SITE_SHARE", "SITE_MIN_VISITS"]

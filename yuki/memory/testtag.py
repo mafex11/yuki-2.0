@@ -21,9 +21,13 @@ user said purge) deletes it, idempotent: once by migration 45 and again with ``-
 the journal facts conversation memory drew from their exchanges (and ends the portrait facts resting on those alone),
 the conversation facts (rules, preferences, commitments) resting on test exchanges only, the unanswered questions
 resting on test material only, Yuki's run traces and their playbook events, skill runs (their ``uses`` taken back,
-``last_used_at`` back to the latest real run), surfaced cards, moments and asked occasions of test requests.
+``last_used_at`` back to the latest real run), surfaced cards, moments and asked occasions of test requests;
+skill19: the preference events those runs and exchanges wrote (an "in Arc" said, a correction, a usual's answer; the
+preference rows restated by what remains) and a false-done mark a test's repeat left on a real run
+(:func:`_purge_run_effects`).
 By the test sessions' own span (the harness drove the desktop while the user was away; these rows carry no tag): the
-know-how, the "said" taste pairings, the misheard-name aliases, the episodes, Yuki's own journal facts, the moments
+know-how, the "said" taste pairings, the misheard-name aliases, the episodes, Yuki's own journal facts, the taste events
+(Yuki's picks, skips and offers) and the videos' watched / offered stamps, the moments
 and occasions (with the preference observations fed from them) learned inside it, and the corrections said in it
 (ended, with the journal and portrait changes their pass made undone). **Except what real use confirmed** (phase 3,
 3.4; dots audit 18 Oct: the purge took "lumen = chill" and the Japanese playlist's meaning, learned in test sessions):
@@ -419,6 +423,120 @@ def _purge_corrections(conn: sqlite3.Connection, dec: Callable[[Any], str | None
     return out
 
 
+def _refresh_prefs(conn: sqlite3.Connection, gone: Sequence[tuple[int, str]]) -> dict[str, int]:
+    """After preference events were deleted (``gone``: their ``(pref_id, type)``), each preference row they touched
+    stands as its remaining events say (``skills.prefs.record``'s own bookkeeping, redone): no event left -> the row
+    goes; a ``confirmed``, ``said`` or ``declined`` gone -> a usual only while a confirmed one remains (else
+    ``proposed`` while an unanswered ``said`` remains, else ``seen``), and its quote goes when no said remains; the
+    said / corrected / rejected counters and ``last_at`` recounted. Content-free counts."""
+    out: dict[str, int] = {}
+    by_pref: dict[int, set[str]] = {}
+    for pid, typ in gone:
+        by_pref.setdefault(int(pid), set()).add(str(typ or ""))
+    for pid, types in by_pref.items():
+        rows = conn.execute("SELECT type, at FROM pref_events WHERE pref_id = ? ORDER BY at", (pid,)).fetchall()
+        if not rows:
+            n = int(conn.execute("DELETE FROM prefs WHERE id = ?", (pid,)).rowcount or 0)
+            out["prefs_removed"] = out.get("prefs_removed", 0) + n
+            continue
+        kinds = [str(r[0]) for r in rows]
+        last_at = max(float(r[1]) for r in rows)
+        conn.execute("UPDATE prefs SET said = ?, corrected = ?, rejected = ?, last_at = ? WHERE id = ?",
+                     (kinds.count("said"), kinds.count("corrected"), kinds.count("rejected"), last_at, pid))
+        if types & {"confirmed", "said", "declined"}:
+            confirmed = [float(r[1]) for r in rows if str(r[0]) == "confirmed"]
+            said_at = max((float(r[1]) for r in rows if str(r[0]) == "said"), default=None)
+            declined_at = max((float(r[1]) for r in rows if str(r[0]) == "declined"), default=None)
+            if confirmed:
+                state, at = "usual", max(confirmed)
+            elif said_at is not None and (declined_at is None or declined_at < said_at):
+                state, at = "proposed", None
+            else:
+                state, at = "seen", None
+            conn.execute("UPDATE prefs SET state = ?, confirmed_at = ? WHERE id = ? AND ended_at IS NULL",
+                         (state, at, pid))
+            if said_at is None:
+                conn.execute("UPDATE prefs SET quote_ciphertext = NULL WHERE id = ?", (pid,))
+        out["prefs_restated"] = out.get("prefs_restated", 0) + 1
+    return out
+
+
+def _purge_run_effects(conn: sqlite3.Connection, turn_ids: set[int] | frozenset[int], questions: Sequence[int],
+                       spans: Sequence[tuple[float, float]]) -> dict[str, int]:
+    """skill19: what the live test's runs and exchanges left that changes later behaviour, by the test's own ids
+    (content-free, before the test's skill runs are deleted):
+
+    * the preference events a test run or a test exchange wrote (``pref_events.source``: ``skill_run:<a test run's
+      key>`` from the engine's "said" and the voice's corrections and "Keep this as your usual?" answers,
+      ``turn:<a test turn id>`` from conversation memory, ``question:<a question this purge deleted>``), the
+      preference rows they touched restated by what remains (:func:`_refresh_prefs`): an "in Arc" said in a test is no
+      basis for a later real choice;
+    * a false-done mark a test request's repeat left on a real run (``skill_runs.recheck = 0`` on the user's own done
+      run that a test run of the same skill and values followed within ``registry.FALSE_DONE_S``, with no real run of
+      that skill in between): back to unknown (NULL), so the rung trust (computed from the ledger) never counts a
+      test's repeat against the user's rung. A rung's disable is never stored apart (``registry.trust`` computes it
+      from ``skill_runs`` / ``skill_route_tries``; ``skill_routes.disabled_at`` is only ever cleared), so the test's
+      own rows going takes their part of it too;
+    * taste events inside the test's span (``taste_events``: Yuki's picks, skips, offers and their outcomes there: the
+      recommender's skip weights and the offers' live check read them), and a video's ``watched_at`` / ``offered_at``
+      stamped inside it (``yt_videos``: a video the test played is no video the user watched).
+
+    Counts per kind."""
+    out: dict[str, int] = {}
+
+    def count(kind: str, n: int) -> None:
+        if n:
+            out[kind] = out.get(kind, 0) + int(n)
+
+    test_keys: list[str] = []
+    if _has(conn, "skill_runs", "run_key"):
+        test_keys = [str(r[0]) for r in conn.execute(
+            f"SELECT run_key FROM skill_runs WHERE run_key IS NOT NULL AND NOT ({sql_real_skill_run()})").fetchall()]
+    if _has(conn, "pref_events", "source"):
+        sources = ([f"skill_run:{k}" for k in test_keys] + [f"turn:{int(i)}" for i in sorted(turn_ids)]
+                   + [f"question:{int(q)}" for q in questions])
+        gone: list[tuple[int, str]] = []
+        for i in range(0, len(sources), 400):
+            part = sources[i:i + 400]
+            marks = ",".join("?" * len(part))
+            gone += [(int(r[0]), str(r[1])) for r in conn.execute(
+                f"SELECT pref_id, type FROM pref_events WHERE source IN ({marks})", part).fetchall()]
+            count("pref_events", conn.execute(f"DELETE FROM pref_events WHERE source IN ({marks})", part).rowcount)
+        if gone and _has(conn, "prefs", "state"):
+            for kind, n in _refresh_prefs(conn, gone).items():
+                count(kind, n)
+    if test_keys and _has(conn, "skill_runs", "recheck") and _has(conn, "skill_runs", "slots_digest"):
+        from yuki.skills.registry import FALSE_DONE_S
+
+        marked = conn.execute(
+            "SELECT run_key, skill, slots_digest, coalesce(t_done, t0) FROM skill_runs WHERE recheck = 0 AND outcome ="
+            f" 'done' AND slots_digest IS NOT NULL AND {sql_real_skill_run()}").fetchall()
+        for run_key, skill, digest, done_at in marked:
+            if done_at is None:
+                continue
+            after = conn.execute(
+                "SELECT min(t0) FROM skill_runs WHERE skill = ? AND slots_digest = ? AND t0 > ? AND t0 <= ? AND NOT"
+                f" ({sql_real_skill_run()})", (skill, digest, float(done_at), float(done_at) + FALSE_DONE_S)
+            ).fetchone()[0]
+            if after is None:
+                continue
+            between = conn.execute(
+                f"SELECT 1 FROM skill_runs WHERE skill = ? AND t0 > ? AND t0 < ? AND {sql_real_skill_run()} LIMIT 1",
+                (skill, float(done_at), float(after))).fetchone()
+            if between is None:
+                count("false_done_marks_cleared", conn.execute(
+                    "UPDATE skill_runs SET recheck = NULL WHERE run_key = ?", (run_key,)).rowcount)
+    if spans and _has(conn, "taste_events", "at"):
+        cond, params = _in_spans("at", spans)
+        count("taste_events", conn.execute(f"DELETE FROM taste_events WHERE {cond}", params).rowcount)
+    if spans and _has(conn, "yt_videos", "watched_at"):
+        for column in ("watched_at", "offered_at"):
+            cond, params = _in_spans(column, spans)
+            count(f"yt_videos_{column.split('_')[0]}_reset", conn.execute(
+                f"UPDATE yt_videos SET {column} = NULL WHERE {column} IS NOT NULL AND {cond}", params).rowcount)
+    return out
+
+
 def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: float) -> dict[str, int]:
     """Delete what the live test left and what was learned from it (module docstring), inside the caller's write
     transaction (``conn``; ``dec`` decrypts a stored field). Idempotent: a second run finds nothing. Counts per kind,
@@ -466,6 +584,7 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
                 conn.execute("UPDATE portrait_facts SET valid_to = ? WHERE id = ?", (now, int(r["id"])))
                 ended += 1
         count("portrait_facts_ended", ended)
+    gone_questions: list[int] = []
     if (gone_journal or turn_ids) and _has(conn, "questions", "source_ids"):
         # unanswered questions resting only on test material: a conversation question's sources are exchange (turn)
         # ids, any other's are journal ids. An answered one keeps: its answer is the user's own
@@ -480,6 +599,7 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
                 qs.append(int(r["id"]))
         _delete_ids(conn, "question_vec", "question_id", qs)
         count("questions", _delete_ids(conn, "questions", "id", qs))
+        gone_questions.extend(qs)
     _delete_ids(conn, "journal_vec", "journal_id", gone_journal)
     count("journal_facts", _delete_ids(conn, "journal", "id", gone_journal))
     # conversation facts (rules, preferences, commitments) resting on test exchanges only
@@ -512,6 +632,10 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
     if _has(conn, "playbook_events", "run_key"):
         count("playbook_events", conn.execute(
             f"DELETE FROM playbook_events WHERE NOT {sql_real_request('run_key')}").rowcount)
+    # skill19 (live 19 Oct: one "in Arc" said in a test run made Arc the browser of later real asks; a test's repeat
+    # marked runs false done): what test runs left that changes later behaviour, before their rows go
+    for kind, n in _purge_run_effects(conn, turn_ids, gone_questions, spans).items():
+        count(kind, n)
     if _has(conn, "skill_runs", "request_id"):
         # the uses a test run added to its skill (registry.finish counts a done or already run once, and stamps
         # last_used_at)

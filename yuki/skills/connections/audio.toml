@@ -24,7 +24,7 @@ state_reader = "spotify_route"
 [capability.volume]
 end = "volume_change"
 kind = "change"
-menu = "set the volume of an app, the whole PC (system) or Yuki's own voice (own_voice)"
+menu = "volume of an app, the PC (system) or Yuki's voice (own_voice)"
 done_line = "Volume set."
 offer_class = "everyday"
 handoff = true

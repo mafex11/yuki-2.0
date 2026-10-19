@@ -345,6 +345,12 @@ def false_done_after(store: Any, skill_key: str, *, now: float | None = None, di
     row = rows[0]
     if row.get("outcome") != "done" or row.get("checked") != 1 or row.get("recheck") == 0:
         return None
+    if not corrects and row.get("recheck") == 1:
+        # skill19 (live 19 Oct, RC1: the library rung disabled for 24 h): a repeat that is no correction never marks a
+        # run whose second probe agreed. The second source already saw the end state hold after the "done", so the same
+        # values asked again later are a new ask (the PC changed in between: a scenario's own setup paused it), never
+        # proof that the run did not do it
+        return None
     t_done = row.get("t_done") if row.get("t_done") is not None else row.get("t0")
     if t_done is None or now - float(t_done) > within_s:
         return None
@@ -379,6 +385,20 @@ class RouteTrust:
     #: When the connection file last changed for this rung: the streak counts only runs after it (B.2).
     hash_changed_at: float | None = None
     ms: list[float] = field(default_factory=list)
+    #: skill19 (live 19 Oct, RC2: Spotify's link rung ended "page_not_shown" in every try, 4.4-5.3 s each, and was
+    #: never charged): the newest tries in a row that ended "couldn't" (the rung did not run: ``skill_route_tries``
+    #: outcome ``failed`` with no verdict), newest first, after the connection file's last change; the time each took
+    #: and when the newest was. Any other end (done, contradicted, acted unconfirmed) ends the streak.
+    couldnt: int = 0
+    couldnt_ms: list[float] = field(default_factory=list)
+    last_couldnt_at: float | None = None
+
+    @property
+    def couldnt_p50_ms(self) -> float | None:
+        if not self.couldnt_ms:
+            return None
+        xs = sorted(self.couldnt_ms)
+        return xs[len(xs) // 2]
 
     @property
     def verified(self) -> int:
@@ -422,20 +442,32 @@ def trust(store: Any, skill_key: str, *, now: float | None = None, until: float 
         lo = now - TRUST_DAYS * 86400.0
         runs_real, tries_real = _real_filters(real_only)
         rows = store._query(
-            "SELECT rung, variant, via, checked, recheck, t, ms FROM ("
-            "SELECT rung, variant, via, checked, recheck, coalesce(t_done, t0) AS t, ms, id FROM skill_runs "
+            "SELECT rung, variant, via, checked, recheck, t, ms, outcome FROM ("
+            "SELECT rung, variant, via, checked, recheck, coalesce(t_done, t0) AS t, ms, id, outcome FROM skill_runs "
             "WHERE skill = ? AND rung IS NOT NULL AND t0 >= ? AND t0 < ? AND outcome NOT IN ('running', 'held_game', "
             "'asked', 'refused', 'cancelled', 'other_device')" + runs_real + " "
-            "UNION ALL SELECT rung, variant, via, checked, NULL, at, ms, id FROM skill_route_tries "
+            "UNION ALL SELECT rung, variant, via, checked, NULL, at, ms, id, outcome FROM skill_route_tries "
             "WHERE skill = ? AND at >= ? AND at < ?" + tries_real + " AND " + TRY_NOT_LAST + ") "
             "ORDER BY t DESC, id DESC",
             (skill_key, lo, hi, skill_key, lo, hi))
     except Exception:  # noqa: BLE001 - no trust yet
         return out
     streak_open: dict[str, bool] = {}
-    for rung, variant, via, checked, recheck, t0, ms in rows:
+    couldnt_open: dict[str, bool] = {}
+    for rung, variant, via, checked, recheck, t0, ms, outcome in rows:
         k = _route_key(rung, variant, via)
         t = out.setdefault(k, RouteTrust(key=k))
+        if t.hash_changed_at is not None and float(t0) < t.hash_changed_at:
+            couldnt_open[k] = False     # tries before the file changed say nothing of the rung as it is now
+        if couldnt_open.get(k, True):
+            # skill19 (RC2): the rung's own record of "couldn't" (it did not run), newest first, until any other end
+            if checked is None and str(outcome or "") == "failed":
+                t.couldnt += 1
+                t.last_couldnt_at = max(t.last_couldnt_at or 0.0, float(t0))
+                if ms is not None:
+                    t.couldnt_ms.append(float(ms))
+            else:
+                couldnt_open[k] = False
         if checked is None:
             t.unverified += 1
             continue
@@ -471,6 +503,35 @@ def _real_filters(real_only: bool) -> tuple[str, str]:
     from yuki.memory.testtag import sql_real_route_try, sql_real_skill_run
 
     return f" AND {sql_real_skill_run()}", f" AND {sql_real_route_try()}"
+
+
+#: skill19 (RC2): a rung whose last this many tries in a row all ended "couldn't" runs after every other rung...
+COULDNT_LAST = 3
+#: ...and after this many it is left out for :data:`COULDNT_REST_S` from its newest such try (then it gets one try
+#: again, last: one more "couldn't" rests it again; anything else ends the streak).
+COULDNT_REST = 5
+COULDNT_REST_S = 6 * 3600.0
+#: Only a "couldn't" that costs real time counts (its median try at least this share of the request's budget,
+#: ``engine.BUDGET_S``): a rung that checks a state cheaply and passes on (Spotify's restore when Spotify isn't
+#: minimised, 4 ms) costs nothing where it stands, and may be the one that works once the state is there.
+COULDNT_COST_SHARE = 0.2
+
+
+def by_record(route: Route, t: RouteTrust | None, *, now: float | None = None,
+              budget_s: float = 5.0) -> str:
+    """skill19 (live 19 Oct, RC2): where a usable rung stands by its own measured record (never a fixed list):
+    ``"rest"`` (leave it out for now: its last :data:`COULDNT_REST` tries all ended "couldn't", each costing time, the
+    newest within :data:`COULDNT_REST_S`), ``"last"`` (run it after the others: its last :data:`COULDNT_LAST` did),
+    else ``""`` (its place in the file). Pure."""
+    if t is None or t.couldnt < COULDNT_LAST:
+        return ""
+    cost = t.couldnt_p50_ms
+    if cost is None or cost < COULDNT_COST_SHARE * float(budget_s) * 1000.0:
+        return ""
+    now = time.time() if now is None else float(now)
+    if t.couldnt >= COULDNT_REST and t.last_couldnt_at is not None and now - float(t.last_couldnt_at) < COULDNT_REST_S:
+        return "rest"
+    return "last"
 
 
 def usable(route: Route, t: RouteTrust | None, *, now: float | None = None) -> tuple[bool, str]:
@@ -595,4 +656,4 @@ __all__ = ["DISABLE_AFTER", "RETRY_AFTER_S", "OPEN_RUNS", "CHANGE_RUNS", "OUTCOM
            "CAPABILITY_ORIGIN", "SEEDED_ORIGINS", "TRY_NOT_LAST",
            "skill_ids", "new_run_key", "start_run", "finish_run", "set_run_app", "record_route_try", "set_recheck",
            "mark_false_done", "trust", "usable", "offer_ready", "menu_version", "last_runs", "import_evidence",
-           "table_counts", "runs_between"]
+           "table_counts", "runs_between", "by_record", "COULDNT_LAST", "COULDNT_REST", "COULDNT_REST_S"]

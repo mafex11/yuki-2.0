@@ -157,6 +157,9 @@ SITE_BIND = "site"
 #: The bind source that marks a text slot as one of a site's page kinds (``web.open_page``'s ``page``): data, never a
 #: reading (Phase 2.1).
 PAGE_BIND = "page"
+#: skill19 (R7): the key :func:`_site_page_given` marks a page item with when it is the user's own name matched in their
+#: words in place of the caller's value (a guess): internal, never a slot name (no slot may hold a colon).
+SITE_GUESS_KEY = ":guessed_item"
 #: The question when the user said a name none of their people (nor a group chat or channel) goes by, and it sounds
 #: like exactly one of them: asked, never swapped (a message to someone who merely sounds alike is a wrong send).
 CONFIRM_PERSON = "Did you mean {name}?"
@@ -312,7 +315,7 @@ def _site_said(value: str, words: Sequence[str]) -> bool:
 
 
 def _site_page_given(skill: Skill, given: Mapping[str, Any], words: Sequence[str], store: Any,
-                     now: float) -> dict[str, Any]:
+                     now: float, heard: Sequence[str] | None = None) -> dict[str, Any]:
     """fSkills: for a capability that binds a site, a page kind and an entity (web.open_page), the page and item values
     :func:`yuki.skills.web_route.site_page` reads from what the caller gave (a page kind of that site as data; a name
     given as the page, or an item, that is one of the user's own names for that site's pages, as written or by sound
@@ -327,8 +330,8 @@ def _site_page_given(skill: Skill, given: Mapping[str, Any], words: Sequence[str
     try:
         from yuki.skills.web_route import site_page
 
-        kind, item, _how = site_page(store, given[site_slot], given.get(page_slot), given.get(item_slot), words,
-                                     now=now)
+        kind, item, how = site_page(store, given[site_slot], given.get(page_slot), given.get(item_slot), words,
+                                    now=now, heard=heard)
     except Exception:  # noqa: BLE001
         return {}
     out: dict[str, Any] = {}
@@ -336,6 +339,10 @@ def _site_page_given(skill: Skill, given: Mapping[str, Any], words: Sequence[str
         out[page_slot] = kind
     if item:
         out[item_slot] = {"name": item}
+        if how == "heard_words":
+            # skill19 (R7): their own name matched in their words in place of the caller's rewrite: Yuki's guess,
+            # named in the done line ("I took that as NDL"), so one word corrects it
+            out[SITE_GUESS_KEY] = item_slot
     return out
 
 
@@ -371,6 +378,42 @@ def _num(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return x if x == x and abs(x) != float("inf") else None
+
+
+def _point_token(token: str) -> str:
+    """A token as a points value may spell it: its letters, digits, sign and decimal point (a trailing "%" or a comma
+    off). Format only."""
+    return "".join(ch for ch in token if ch.isalnum() or ch in "+-.").strip(".")
+
+
+def points_value(value: Any) -> str | float | None:
+    """skill19 (live 19 Oct, spotify RC5a: ``change: "down a little"`` was dropped and the skill asked "Louder,
+    quieter, or to what level?"): a ``points`` slot's value in the schema's own form, ``None`` when it holds none.
+    A number (or a numeric string, "+5", "-10%") that isn't 0 is itself; a value whose words hold exactly one of the
+    schema's direction words (:data:`DIRECTIONS`: "down a little", "a bit up") is that direction, signed by it when
+    it also holds one number ("down 10" -> -10). Two directions, two numbers, or neither: ``None``. The schema's own
+    words found inside the value, never a guess at what other words mean ("quieter" holds none: dropped, and the
+    caller is told the form, ``menu.slot_form``)."""
+    if isinstance(value, bool):
+        return None
+    x = _num(value)
+    if x is not None:
+        return x if x != 0.0 else None
+    if not isinstance(value, str):
+        return None
+    tokens = [_point_token(t) for t in _words(value).casefold().split()]
+    tokens = [t for t in tokens if t]
+    dirs = {t for t in tokens if t in DIRECTIONS}
+    nums = [n for n in (_num(t) for t in tokens) if n is not None]
+    if not dirs:
+        # a number alone ("-10%") is itself; a number among other words ("10 lower") says no direction of the schema's
+        return nums[0] if len(tokens) == 1 and len(nums) == 1 and nums[0] != 0.0 else None
+    if len(dirs) > 1 or len(nums) > 1:
+        return None
+    way = next(iter(dirs))
+    if nums:
+        return DIRECTIONS[way] * abs(nums[0]) if nums[0] != 0.0 else None
+    return way
 
 
 def app_name(value: Any) -> str:
@@ -428,11 +471,8 @@ def _check(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Sequence
             return False, None, ""
         return True, x, FROM_WORDS
     if t == "points":
-        if isinstance(value, str) and _words(value).casefold() in DIRECTIONS:
-            return True, _words(value).casefold(), FROM_WORDS
-        x = _num(value)
-        ok = x is not None and x != 0.0
-        return ok, x, (FROM_WORDS if ok else "")
+        got = points_value(value)
+        return (got is not None), got, (FROM_WORDS if got is not None else "")
     if t == "bool":
         # a JSON boolean only (review r1 L5): the one shipped bool slot is discord.voice's join_in_call, a join gate
         # (true leaves the current call), so no string spelling ("yes", "on", "1") ever answers it
@@ -1345,13 +1385,17 @@ def ladder(skill: Skill, values: Mapping[str, Any], *, store: Any = None, live: 
            now: float | None = None, until: float | None = None,
            disable_after: int = 2) -> tuple[list[Route], dict[str, str]]:
     """The rungs that may run now, in order, and why each other one may not (``when``, ``disabled``,
-    ``untrusted``, ``game``). With a game in front only no-focus routes the data allows; never rung C."""
+    ``untrusted``, ``game``, ``couldnt``). With a game in front only no-focus routes the data allows; never rung C.
+    skill19 (live 19 Oct, RC2): a rung's own measured record orders it (:func:`yuki.skills.registry.by_record`): one
+    whose last tries all ended "couldn't", each costing time, runs after every other rung, and after more of them is
+    left out for a while (``couldnt``); never a fixed list."""
     from yuki.skills import registry
 
     live = live or Live()
     table = registry.trust(store, skill.key, now=now, until=until, disable_after=disable_after) \
         if store is not None else {}
     ok: list[Route] = []
+    last: list[Route] = []
     skipped: dict[str, str] = {}
     for r in skill.routes:
         if not _when_ok(r, values):
@@ -1360,6 +1404,10 @@ def ladder(skill: Skill, values: Mapping[str, Any], *, store: Any = None, live: 
         usable, why = registry.usable(r, table.get(r.key), now=now)
         if not usable:
             skipped[r.key] = why
+            continue
+        place = registry.by_record(r, table.get(r.key), now=now) if r.via != "agent" else ""
+        if place == "rest":
+            skipped[r.key] = "couldnt"
             continue
         if live.game:
             if r.needs_focus or r.game == "never":
@@ -1370,7 +1418,11 @@ def ladder(skill: Skill, values: Mapping[str, Any], *, store: Any = None, live: 
                 if state not in r.game_states:
                     skipped[r.key] = "game"
                     continue
-        ok.append(r)
+        (last if place == "last" else ok).append(r)
+    if last:
+        # after every other rung that may run, before rung C (the agent rung ends the engine's ladder)
+        at = next((i for i, r in enumerate(ok) if r.via == "agent"), len(ok))
+        ok[at:at] = last
     return ok, skipped
 
 
@@ -1478,7 +1530,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     given = {k: v for k, v in dict(slots or {}).items() if v is not None and v != ""}
     # fSkills (live 18 Oct): a site page's kind and item as the site's data and the user's own names read them
     # (``page = "Deji"`` is the handle page of their channel Deji; "MBL" heard for their channel NDL)
-    derived = _site_page_given(skill, given, sources, store, now)
+    derived = _site_page_given(skill, given, sources, store, now, heard=heard)
+    guessed_item = derived.pop(SITE_GUESS_KEY, None)
     told = told_values(store, skill.key)
     people = people or _person(store)
     heard_person = heard_person or _heard_person(store)
@@ -1566,6 +1619,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
         if slot.name in derived:
             values[slot.name], filled[slot.name] = derived[slot.name], "words"
             origin[slot.name] = FROM_WORDS
+            if slot.name == guessed_item:
+                filled[slot.name] = origin[slot.name] = FROM_CARD    # skill19 (R7): one of theirs, Yuki's guess
             continue
         way_slot = cap == WAY_CAPABILITY and slot.name == WAY_SLOT and slot.type == "entity" and store is not None
         if way_slot and slot.name in given:
@@ -1712,6 +1767,15 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 elif slot.type == "entity":
                     reading, mine = own(slot, reading, menu_names, offered)
                     theirs = bool(mine)
+                    if not theirs and slot.taste and menu_names and store is not None:
+                        # skill19 (live 19 Oct, all-browser R7): the caller's reading is none of theirs and isn't in
+                        # the user's words; before it is taken, their own words are matched against their own names
+                        # by sound or spelling (taste.heard_in): a hit is one of theirs, Yuki's guess (named)
+                        hit = taste.heard_in(menu_names, heard)
+                        if hit:
+                            mapped, mine = own(slot, {"name": hit}, menu_names, offered)
+                            if mine:
+                                reading, theirs = mapped, True
                 src = src or (FROM_CARD if theirs else FROM_READING)
                 values[slot.name], filled[slot.name] = reading, src
                 origin[slot.name] = src

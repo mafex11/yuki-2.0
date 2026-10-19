@@ -11,9 +11,10 @@ taste entity key (a keyed digest, never a name in clear). The quote behind ``sai
    (then one "still your usual?" card goes out, :func:`still_usual_question`);
 2. otherwise the top observed option when its share is at least 0.8 with an effective count of at least 3 (observed
    events decay with a 30-day half-life);
-3. otherwise the most recent choice in this context, **named aloud** when used, so one word corrects it. A choice
-   memory only watched the user make (:func:`feed_observed`, source ``occasion:``) counts in rule 2 only: it never
-   counts against a confirmed usual (design §5: "a confirmed usual still wins first"), so it informs the choice only
+3. otherwise the most recent choice in this context, **named aloud** when used, so one word corrects it; never an
+   unanswered ``said`` alone (skill19: a proposal whose "Keep this as your usual?" nobody answered is no choice). A
+   choice memory only watched the user make (:func:`feed_observed`, source ``occasion:``) counts in rule 2 only: it
+   never counts against a confirmed usual (design §5: "a confirmed usual still wins first"), so it informs the choice only
    while no usual is confirmed (or after the user's own choices outvoted it), and never here: below rule 2's bar a
    learned skill's fill policy picks the program (design §5, critique M8: "last used" is one candidate policy, never
    shipped ahead of the scorer), and an unknown means slot asks once.
@@ -109,7 +110,11 @@ def choose(store: Any, slot: str, *, context: str = "", now: float | None = None
         if opt is None:
             continue
         watched = typ == "observed" and str(source or "").startswith(OBSERVED_SOURCE)
-        if typ in ("observed", "said", "corrected", "confirmed") and not watched:
+        # skill19 (live 19 Oct, all-browser R5: one "in Arc" said in a thinker run made Arc every later video's
+        # browser): a ``said`` alone is a proposal whose "Keep this as your usual?" was never answered (a yes is a
+        # ``confirmed``, "just this time" an ``observed``; the thinker's runs never ask it), so it is no basis for rule
+        # 3: below rule 2's bar the route's own measured fill decides instead
+        if typ in ("observed", "corrected", "confirmed") and not watched:
             if latest is None or float(at) >= latest[0]:
                 latest = (float(at), opt)
         if typ == "observed":
