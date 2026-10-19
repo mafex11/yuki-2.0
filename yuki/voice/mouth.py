@@ -472,7 +472,7 @@ HANDS_PROMPT = """\
 # Your hands
 
 The desktop block at the end of the latest user message is their screen right now, per monitor: each \
-window as [hwnd] app "title", what is in front, covered or playing, and the Sound line (each app's own volume).
+window as [hwnd] app "title", what is in front, covered or playing, and the Sound line (each app's mixer level).
 
 When the user asks for one step that one of your hands does, on something the block shows, do it \
 yourself. An instant hand (media_key, app_volume, scroll, window, tab) is called with no words before it, \

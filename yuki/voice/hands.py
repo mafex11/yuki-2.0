@@ -2118,12 +2118,10 @@ class Hands:
                 text += "\nAlso open: " + ", ".join(situation.name_of(w, title=False)
                                                     + (" (minimised)" if w.minimized else "") for w in left) + "."
             if "\nSound: " not in f"\n{text}":
-                sound = [f"master {float(state.master.get('level') or 0):g}%"
-                         f"{' muted' if state.master.get('muted') else ''}"] if state.master else []
-                sound += [f"{a.app} {a.level:g}%{' muted' if a.muted else ''}{' sounding' if a.playing else ''}"
-                          for a in state.audio]
+                # integration (desk19 merge note 4): the render's own wording, so the mixer label is the same here
+                sound = situation.sound_line(state)
                 if sound:
-                    text += "\nSound: " + "; ".join(sound) + "."
+                    text += "\n" + sound
             names = [str(a.get("name") or "") for a in payload.get("background_apps") or [] if isinstance(a, dict)]
             names = [n for n in names if n]
             if names:

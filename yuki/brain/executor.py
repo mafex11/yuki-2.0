@@ -743,6 +743,11 @@ class Executor:
             self._emit_log("after_look", ms=round(float(getattr(after, "ms", 0.0) or 0.0), 1), **facts)
             if not d.any_flag:
                 return "", facts
+            if not self._tidy_can_act(d):
+                # integration (desk19 merge note 5): only flags the tidy turn's window steps can't touch (the sound
+                # left silent, a tab over what played): no turn, so no planner call is spent on it
+                self._emit_log("after_look_skip", why="not_window")
+                return "", facts
             self._after_diff = d
             text = desk_diff.render(d, max_chars=AFTER_DIFF_CHARS)
             desk = situation.render(after, purpose="planner", max_chars=AFTER_DESK_CHARS)
@@ -750,6 +755,17 @@ class Executor:
         except Exception as exc:  # noqa: BLE001 - no look: the request ends as before
             self._emit_log("after_look", error=type(exc).__name__)
             return "", {}
+
+    @staticmethod
+    def _tidy_can_act(d: Any) -> bool:
+        """Whether a flag is up that the tidy turn's undoable window steps (``plan.TIDY_ACTIONS``) could act on: the
+        front taken, a pop-up left, or a window of theirs covered. A tab over what played (a tab switch is no tidy
+        step) and the sound left silent (no volume step) are not."""
+        flags = getattr(d, "flags", None) or {}
+        if flags.get("focus_taken") or flags.get("new_popup"):
+            return True
+        return any(c.get("attention") and not c.get("asked") and c.get("side_effect") and c.get("kind") != "tab"
+                   for c in getattr(d, "covered", None) or ())
 
     def _desk_now(self) -> Any:
         """The desk now (``situation.snapshot``: windows, visible shares, the keyboard, media, the mixer; the holds are
@@ -796,6 +812,9 @@ class Executor:
                 key, slots = consent.skill_input(call, self.head)
                 if not hwnds:
                     self._desk_touched |= set(self._skill_programs(payload, key, slots))
+            elif call.tool == "app_volume" and words(call.input.get("app")):
+                # integration (desk19 merge note 7): the app whose mixer row this act set is the act's own
+                self._desk_touched.add(words(call.input.get("app")))
             elif call.tool in ASKED_VERBS:
                 self._desk_asked |= hwnds
                 if call.tool == "launch_app" and not hwnds and words(call.input.get("query")):
