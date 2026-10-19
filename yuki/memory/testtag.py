@@ -21,9 +21,13 @@ user said purge) deletes it, idempotent: once by migration 45 and again with ``-
 the journal facts conversation memory drew from their exchanges (and ends the portrait facts resting on those alone),
 the conversation facts (rules, preferences, commitments) resting on test exchanges only, the unanswered questions
 resting on test material only, Yuki's run traces and their playbook events, skill runs (their ``uses`` taken back,
-``last_used_at`` back to the latest real run), surfaced cards, moments and asked occasions of test requests.
+``last_used_at`` back to the latest real run), surfaced cards, moments and asked occasions of test requests;
+skill19: the preference events those runs and exchanges wrote (an "in Arc" said, a correction, a usual's answer; the
+preference rows restated by what remains) and a false-done mark a test's repeat left on a real run
+(:func:`_purge_run_effects`).
 By the test sessions' own span (the harness drove the desktop while the user was away; these rows carry no tag): the
-know-how, the "said" taste pairings, the misheard-name aliases, the episodes, Yuki's own journal facts, the moments
+know-how, the "said" taste pairings, the misheard-name aliases, the episodes, Yuki's own journal facts, the taste events
+(Yuki's picks, skips and offers) and the videos' watched / offered stamps, the moments
 and occasions (with the preference observations fed from them) learned inside it, and the corrections said in it
 (ended, with the journal and portrait changes their pass made undone). **Except what real use confirmed** (phase 3,
 3.4; dots audit 18 Oct: the purge took "lumen = chill" and the Japanese playlist's meaning, learned in test sessions):
@@ -59,6 +63,7 @@ Public API::
     sql_real_run(alias="") -> str                             # practice memory's runs: session id and run key
     sql_real_skill_run(alias="") -> str;  sql_real_route_try(alias="") -> str
     test_turn_ids(store) -> frozenset[int]
+    store_test_spans(store) -> list[(start, end)];  sql_outside_spans(column, spans) -> (SQL, params)
     is_test_journal(entry, turn_ids) -> bool;  is_test_fact(fact, turn_ids) -> bool
     report(db_path=None, *, show=False) -> dict               # read-only; the database is opened ?mode=ro
     purge(conn, dec, *, now) -> dict[str, int]                # inside the caller's write transaction; counts
@@ -315,12 +320,40 @@ def _delete_ids(conn: sqlite3.Connection, table: str, column: str, ids: Iterable
     return n
 
 
+#: The live test sessions' first and last turn, one row per session (the session index's range).
+_SPANS_SQL = ("SELECT min(at), max(at) FROM conversation_turns WHERE session_id >= ? AND session_id < ?"
+              " GROUP BY session_id ORDER BY 1")
+
+
 def test_spans(conn: sqlite3.Connection) -> list[tuple[float, float]]:
     """The live test's sessions as time spans (first to last turn of each, sessions closer than
     :data:`SPAN_JOIN_S` joined, each padded by :data:`SPAN_PAD_S`), oldest first. ``[]`` with no test turns."""
-    rows = conn.execute("SELECT min(at), max(at) FROM conversation_turns WHERE session_id >= ? AND session_id < ?"
-                        " GROUP BY session_id ORDER BY 1", _session_range()).fetchall() if _has(
+    rows = conn.execute(_SPANS_SQL, _session_range()).fetchall() if _has(
         conn, "conversation_turns", "session_id") else []
+    return _merge_spans(rows)
+
+
+def store_test_spans(store: Any) -> list[tuple[float, float]]:
+    """:func:`test_spans` through a store's own read (``store._query``), for a reader that holds a store, not a
+    connection (skill19 review L5: the measured browsers leave the test's own tabs out). The spans are known only
+    while the test's turns are kept (a purge deletes them). Never raises (``[]``)."""
+    try:
+        return _merge_spans(store._query(_SPANS_SQL, _session_range()))
+    except Exception:  # noqa: BLE001 - no conversation table (an old or a test database): no spans
+        return []
+
+
+def sql_outside_spans(column: str, spans: Sequence[tuple[float, float]]) -> tuple[str, list[float]]:
+    """A SQL condition (and its parameters) true for a row whose ``column`` (code's own name) lies in none of
+    ``spans``; ``("1", [])`` with none."""
+    if not spans:
+        return "1", []
+    cond, params = _in_spans(column, spans)
+    return f"NOT {cond}", params
+
+
+def _merge_spans(rows: Iterable[Any]) -> list[tuple[float, float]]:
+    """Session ``(first, last)`` rows, oldest first, as joined and padded spans (:func:`test_spans`)."""
     merged: list[list[float]] = []
     for a, b in rows:
         if a is None:
@@ -419,6 +452,143 @@ def _purge_corrections(conn: sqlite3.Connection, dec: Callable[[Any], str | None
     return out
 
 
+def _refresh_prefs(conn: sqlite3.Connection, gone: Sequence[tuple[int, str]]) -> dict[str, int]:
+    """After preference events were deleted (``gone``: their ``(pref_id, type)``), each preference row they touched
+    stands as its remaining events say (``skills.prefs.record``'s own bookkeeping, redone): no event left -> the row
+    goes; a ``confirmed``, ``said`` or ``declined`` gone -> with no confirmed one left, ``proposed`` while an
+    unanswered ``said`` remains, else ``seen``, and its quote goes when no said remains; the said / corrected /
+    rejected counters and ``last_at`` recounted. Then (review L3) each slot and context with such a row has its one
+    usual elected again as ``record`` keeps it: the row with the newest remaining ``confirmed`` event (a test's confirm
+    had stepped the user's own usual down to ``seen``), every other usual of that slot and context ``seen``
+    (``record`` lets no other event step a usual down). Content-free counts."""
+    out: dict[str, int] = {}
+    by_pref: dict[int, set[str]] = {}
+    for pid, typ in gone:
+        by_pref.setdefault(int(pid), set()).add(str(typ or ""))
+    groups: set[tuple[str, str]] = set()
+    for pid, types in by_pref.items():
+        if types & {"confirmed", "said", "declined"}:
+            row = conn.execute("SELECT slot, context FROM prefs WHERE id = ?", (pid,)).fetchone()
+            if row is not None:
+                groups.add((str(row[0]), str(row[1] or "")))
+    for pid, types in by_pref.items():
+        rows = conn.execute("SELECT type, at FROM pref_events WHERE pref_id = ? ORDER BY at", (pid,)).fetchall()
+        if not rows:
+            n = int(conn.execute("DELETE FROM prefs WHERE id = ?", (pid,)).rowcount or 0)
+            out["prefs_removed"] = out.get("prefs_removed", 0) + n
+            continue
+        kinds = [str(r[0]) for r in rows]
+        last_at = max(float(r[1]) for r in rows)
+        conn.execute("UPDATE prefs SET said = ?, corrected = ?, rejected = ?, last_at = ? WHERE id = ?",
+                     (kinds.count("said"), kinds.count("corrected"), kinds.count("rejected"), last_at, pid))
+        if types & {"confirmed", "said", "declined"}:
+            confirmed = [float(r[1]) for r in rows if str(r[0]) == "confirmed"]
+            said_at = max((float(r[1]) for r in rows if str(r[0]) == "said"), default=None)
+            declined_at = max((float(r[1]) for r in rows if str(r[0]) == "declined"), default=None)
+            if confirmed:
+                pass        # review L3: which row of its slot and context is the usual is elected below
+            else:
+                state = ("proposed" if said_at is not None and (declined_at is None or declined_at < said_at)
+                         else "seen")
+                conn.execute("UPDATE prefs SET state = ?, confirmed_at = NULL WHERE id = ? AND ended_at IS NULL",
+                             (state, pid))
+            if said_at is None:
+                conn.execute("UPDATE prefs SET quote_ciphertext = NULL WHERE id = ?", (pid,))
+        out["prefs_restated"] = out.get("prefs_restated", 0) + 1
+    for slot, context in sorted(groups):
+        # review L3: one usual per slot and context, the newest remaining confirm's (record's own rule, replayed)
+        best = conn.execute(
+            "SELECT p.id, max(e.at) AS at FROM prefs p JOIN pref_events e ON e.pref_id = p.id AND e.type = 'confirmed' "
+            "WHERE p.slot = ? AND p.context = ? AND p.ended_at IS NULL GROUP BY p.id ORDER BY at DESC, p.id DESC "
+            "LIMIT 1", (slot, context)).fetchone()
+        if best is None:
+            continue        # no confirm left: the rows stand as restated above (a usual with no event is left alone)
+        keep, at = int(best[0]), float(best[1])
+        n = int(conn.execute("UPDATE prefs SET state = 'seen' WHERE slot = ? AND context = ? AND state = 'usual' AND "
+                             "ended_at IS NULL AND id != ?", (slot, context, keep)).rowcount or 0)
+        n += int(conn.execute("UPDATE prefs SET state = 'usual', confirmed_at = ? WHERE id = ? AND (state != 'usual' "
+                              "OR confirmed_at IS NOT ?)", (at, keep, at)).rowcount or 0)
+        if n:
+            out["prefs_usual_reelected"] = out.get("prefs_usual_reelected", 0) + 1
+    return out
+
+
+def _purge_run_effects(conn: sqlite3.Connection, turn_ids: set[int] | frozenset[int], questions: Sequence[int],
+                       spans: Sequence[tuple[float, float]]) -> dict[str, int]:
+    """skill19: what the live test's runs and exchanges left that changes later behaviour, by the test's own ids
+    (content-free, before the test's skill runs are deleted):
+
+    * the preference events a test run or a test exchange wrote (``pref_events.source``: ``skill_run:<a test run's
+      key>`` from the engine's "said" and the voice's corrections and "Keep this as your usual?" answers,
+      ``turn:<a test turn id>`` from conversation memory, ``question:<a question this purge deleted>``), the
+      preference rows they touched restated by what remains (:func:`_refresh_prefs`): an "in Arc" said in a test is no
+      basis for a later real choice;
+    * a false-done mark a test request's repeat left on a real run (``skill_runs.recheck = 0`` on the user's own done
+      run that a test run of the same skill and values followed within ``registry.FALSE_DONE_S``, with no real run of
+      that skill in between): back to unknown (NULL), so the rung trust (computed from the ledger) never counts a
+      test's repeat against the user's rung. A rung's disable is never stored apart (``registry.trust`` computes it
+      from ``skill_runs`` / ``skill_route_tries``; ``skill_routes.disabled_at`` is only ever cleared), so the test's
+      own rows going takes their part of it too;
+    * taste events inside the test's span (``taste_events``: Yuki's picks, skips, offers and their outcomes there: the
+      recommender's skip weights and the offers' live check read them), and a video's ``watched_at`` / ``offered_at``
+      stamped inside it (``yt_videos``: a video the test played is no video the user watched).
+
+    Counts per kind."""
+    out: dict[str, int] = {}
+
+    def count(kind: str, n: int) -> None:
+        if n:
+            out[kind] = out.get(kind, 0) + int(n)
+
+    test_keys: list[str] = []
+    if _has(conn, "skill_runs", "run_key"):
+        test_keys = [str(r[0]) for r in conn.execute(
+            f"SELECT run_key FROM skill_runs WHERE run_key IS NOT NULL AND NOT ({sql_real_skill_run()})").fetchall()]
+    if _has(conn, "pref_events", "source"):
+        sources = ([f"skill_run:{k}" for k in test_keys] + [f"turn:{int(i)}" for i in sorted(turn_ids)]
+                   + [f"question:{int(q)}" for q in questions])
+        gone: list[tuple[int, str]] = []
+        for i in range(0, len(sources), 400):
+            part = sources[i:i + 400]
+            marks = ",".join("?" * len(part))
+            gone += [(int(r[0]), str(r[1])) for r in conn.execute(
+                f"SELECT pref_id, type FROM pref_events WHERE source IN ({marks})", part).fetchall()]
+            count("pref_events", conn.execute(f"DELETE FROM pref_events WHERE source IN ({marks})", part).rowcount)
+        if gone and _has(conn, "prefs", "state"):
+            for kind, n in _refresh_prefs(conn, gone).items():
+                count(kind, n)
+    if test_keys and _has(conn, "skill_runs", "recheck") and _has(conn, "skill_runs", "slots_digest"):
+        from yuki.skills.registry import FALSE_DONE_S
+
+        marked = conn.execute(
+            "SELECT run_key, skill, slots_digest, coalesce(t_done, t0) FROM skill_runs WHERE recheck = 0 AND outcome ="
+            f" 'done' AND slots_digest IS NOT NULL AND {sql_real_skill_run()}").fetchall()
+        for run_key, skill, digest, done_at in marked:
+            if done_at is None:
+                continue
+            after = conn.execute(
+                "SELECT min(t0) FROM skill_runs WHERE skill = ? AND slots_digest = ? AND t0 > ? AND t0 <= ? AND NOT"
+                f" ({sql_real_skill_run()})", (skill, digest, float(done_at), float(done_at) + FALSE_DONE_S)
+            ).fetchone()[0]
+            if after is None:
+                continue
+            between = conn.execute(
+                f"SELECT 1 FROM skill_runs WHERE skill = ? AND t0 > ? AND t0 < ? AND {sql_real_skill_run()} LIMIT 1",
+                (skill, float(done_at), float(after))).fetchone()
+            if between is None:
+                count("false_done_marks_cleared", conn.execute(
+                    "UPDATE skill_runs SET recheck = NULL WHERE run_key = ?", (run_key,)).rowcount)
+    if spans and _has(conn, "taste_events", "at"):
+        cond, params = _in_spans("at", spans)
+        count("taste_events", conn.execute(f"DELETE FROM taste_events WHERE {cond}", params).rowcount)
+    if spans and _has(conn, "yt_videos", "watched_at"):
+        for column in ("watched_at", "offered_at"):
+            cond, params = _in_spans(column, spans)
+            count(f"yt_videos_{column.split('_')[0]}_reset", conn.execute(
+                f"UPDATE yt_videos SET {column} = NULL WHERE {column} IS NOT NULL AND {cond}", params).rowcount)
+    return out
+
+
 def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: float) -> dict[str, int]:
     """Delete what the live test left and what was learned from it (module docstring), inside the caller's write
     transaction (``conn``; ``dec`` decrypts a stored field). Idempotent: a second run finds nothing. Counts per kind,
@@ -466,6 +636,7 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
                 conn.execute("UPDATE portrait_facts SET valid_to = ? WHERE id = ?", (now, int(r["id"])))
                 ended += 1
         count("portrait_facts_ended", ended)
+    gone_questions: list[int] = []
     if (gone_journal or turn_ids) and _has(conn, "questions", "source_ids"):
         # unanswered questions resting only on test material: a conversation question's sources are exchange (turn)
         # ids, any other's are journal ids. An answered one keeps: its answer is the user's own
@@ -480,6 +651,7 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
                 qs.append(int(r["id"]))
         _delete_ids(conn, "question_vec", "question_id", qs)
         count("questions", _delete_ids(conn, "questions", "id", qs))
+        gone_questions.extend(qs)
     _delete_ids(conn, "journal_vec", "journal_id", gone_journal)
     count("journal_facts", _delete_ids(conn, "journal", "id", gone_journal))
     # conversation facts (rules, preferences, commitments) resting on test exchanges only
@@ -512,6 +684,10 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
     if _has(conn, "playbook_events", "run_key"):
         count("playbook_events", conn.execute(
             f"DELETE FROM playbook_events WHERE NOT {sql_real_request('run_key')}").rowcount)
+    # skill19 (live 19 Oct: one "in Arc" said in a test run made Arc the browser of later real asks; a test's repeat
+    # marked runs false done): what test runs left that changes later behaviour, before their rows go
+    for kind, n in _purge_run_effects(conn, turn_ids, gone_questions, spans).items():
+        count(kind, n)
     if _has(conn, "skill_runs", "request_id"):
         # the uses a test run added to its skill (registry.finish counts a done or already run once, and stamps
         # last_used_at)
@@ -867,7 +1043,8 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = ["TEST_SESSION_PREFIX", "is_test_session", "is_test_request", "is_test_item", "keep_real",
            "sql_real_session", "sql_real_request", "sql_real_run", "sql_real_skill_run", "sql_real_route_try",
-           "test_turn_ids", "is_test_journal", "is_test_fact", "test_spans", "purge", "report", "format_report",
+           "test_turn_ids", "is_test_journal", "is_test_fact", "test_spans", "store_test_spans",
+           "sql_outside_spans", "purge", "report", "format_report",
            "main", "real_uses", "CONFIRM_RUN_S", "CONFIRM_DAYS"]
 
 

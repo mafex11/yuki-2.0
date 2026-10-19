@@ -60,6 +60,9 @@ Heavy imports are lazy (``import yuki.skills.spotify_route`` loads the standard 
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
 import threading
 import time
 import tomllib
@@ -105,6 +108,9 @@ LINE_OTHER_VOLUME = "Spotify is playing on another device, so I left its volume.
 LINE_OTHER_AFTER = ("Spotify took it, but there's no sound from Spotify on this PC: it's playing on another device. "
                     "Say pause to stop it.")
 LINE_PLAY_UNCONFIRMED = "I pressed play on it, but I couldn't confirm it's playing."
+#: skill19 (RC1): the press took (the session plays now, with sound here) but the window, minimised or covered, never
+#: redrew its row, so which playlist plays is unread.
+LINE_PLAY_STALE = "Spotify's playing now, but its window didn't update, so I couldn't confirm it's {name}."
 LINE_ALREADY_UNCONFIRMED = "Spotify shows it as already playing, but I couldn't confirm that, so I left it."
 LINE_VOLUME_UNCONFIRMED = "I moved it, but I couldn't confirm the new level."
 LINE_KEYS_SHORT = "I moved Spotify's volume to {now:g}%, but ran out of time before {target:g}%."
@@ -268,16 +274,22 @@ class Desk:
     def spotify_status(self, pid: int | None) -> tuple[str, str]:
         """Spotify's media session: ``(status, app_id)``; status ``playing`` / ``paused`` / ``stopped`` / ...,
         ``none`` (no session) or ``unread``."""
+        status, app_id, _track = self.spotify_read(pid)
+        return status, app_id
+
+    def spotify_read(self, pid: int | None) -> tuple[str, str, str]:
+        """:meth:`spotify_status` and the session's track identity from the same read (:func:`_track_id`: a keyed
+        digest that never leaves this process; ``""`` unread)."""
         try:
             from yuki.perception.system import media_sessions
 
             rows = media_sessions(timeout_s=0.3)
         except Exception:  # noqa: BLE001
-            return "unread", ""
+            return "unread", "", ""
         s = _sd().spotify_session([r for r in rows or [] if isinstance(r, dict)], pid=pid or None)
         if not s:
-            return "none", ""
-        return (str(s.get("status") or "").casefold() or "unknown"), str(s.get("app_id") or "")
+            return "none", "", ""
+        return (str(s.get("status") or "").casefold() or "unknown"), str(s.get("app_id") or ""), _track_id(s)
 
     def render_active(self) -> bool | None:
         """Whether Spotify.exe has an active render session on this PC (it sounds here); None: couldn't read."""
@@ -1045,6 +1057,9 @@ def _log_read(call: Any, trigger: str, state: str | None, facts: Mapping[str, An
 
         fields = {"trigger": f"skill_{trigger}", "state": state or "unknown", "warm": facts.get("warm"),
                   "this_pc": facts.get("this_pc")}
+        if facts.get("page_link"):
+            fields["page_link"] = facts.get("page_link")      # skill19 (RC2): the link check's last code word
+            fields["page_reads"] = facts.get("page_reads")
         if look is not None:
             fields.update(look.counts())
             fields["ms"] = look.ms
@@ -1583,7 +1598,12 @@ def _after_row(call: Any, look: Look, status: str, app_id: str, facts: dict[str,
         return _rr(ran=False, outcome="media_" + outcome, facts=facts)
     if look.pressed and look.details.get("not_taken"):
         # a no-focus press on a Spotify not in front that its row never showed (Chromium took the Invoke and did
-        # nothing): not run, so the window-state rule's restore may run, and the rung isn't charged
+        # nothing): not run, so the window-state rule's restore may run, and the rung isn't charged. Review M3: when
+        # the session couldn't tell (it played before, a track unread) the try is no "couldn't" against the rung either
+        if look.details.get("not_taken_unsure"):
+            from yuki.skills.engine import NOT_RUN_UNSURE
+
+            facts["not_run"] = NOT_RUN_UNSURE
         return _rr(ran=False, outcome="not_taken", facts=facts)
     if look.pressed:
         return _rr(ran=True, outcome="pressed", say=said, facts=facts, entity_digest=digest,
@@ -1595,22 +1615,28 @@ def _after_row(call: Any, look: Look, status: str, app_id: str, facts: dict[str,
     return _rr(ran=False, outcome="press_failed" if look.pressed is False else "not_pressed", facts=facts)
 
 
-def _this_pc(call: Any, facts: dict[str, Any], pid: int | None) -> tuple[str, str, str]:
+def _this_pc(call: Any, facts: dict[str, Any], pid: int | None,
+             ram: dict[str, Any] | None = None) -> tuple[str, str, str]:
     """Spotify's session (its window's process, or with no window any Spotify session: closed to the tray, Spotify
-    still controls the device that plays) and M2's verdict: ``(status, app_id, where)``."""
-    status, app_id = DESK.spotify_status(pid)
+    still controls the device that plays) and M2's verdict: ``(status, app_id, where)``. ``ram``: a rung that presses
+    a row keeps the session's track identity before the press there (``ram["track"]``, RAM only: review M3)."""
+    if ram is not None:
+        status, app_id, ram["track"] = _session_read(pid)
+    else:
+        status, app_id = DESK.spotify_status(pid)
     facts["session"] = status if status.isalpha() else "unknown"
     where = where_playing(DESK, status, _clock(call), _sleeper(call), run=call.ctx)
     facts["this_pc"] = where
     return status, app_id, where
 
 
-def _prologue(call: Any, facts: dict[str, Any], *, volume: bool = False) -> tuple[Any, str, str, Any]:
+def _prologue(call: Any, facts: dict[str, Any], *, volume: bool = False,
+              ram: dict[str, Any] | None = None) -> tuple[Any, str, str, Any]:
     """Spotify's window, its session and the "this PC" check: ``(window, status, app_id, early result or None)``.
     The check runs with no window too (closed to the tray and playing on the phone: "another device", never a
-    hand-off)."""
+    hand-off). ``ram``: as :func:`_this_pc`."""
     win = DESK.window()
-    status, app_id, where = _this_pc(call, facts, win.pid if win is not None else None)
+    status, app_id, where = _this_pc(call, facts, win.pid if win is not None else None, ram)
     if where == "other":
         return win, status, app_id, _other_device(facts, volume=volume)
     if win is None:
@@ -1620,7 +1646,7 @@ def _prologue(call: Any, facts: dict[str, Any], *, volume: bool = False) -> tupl
 
 
 def _confirm_flip(call: Any, hwnd: int, want: str, learned: Mapping[str, str] | None, look: Look,
-                  state: str | None, facts: dict[str, Any]) -> Look:
+                  state: str | None, facts: dict[str, Any], ram: Mapping[str, Any] | None = None) -> Look:
     """After a no-focus press on a Spotify that isn't in front: its row re-read (row reads only, at most
     :data:`FLIP_WAIT_S` and the request's time left) until it reads "Pause {name}". Still "Play {name}" at the end ->
     ``details["not_taken"]`` (a backgrounded Chromium window took the Invoke and did nothing). A row that can't be read
@@ -1641,13 +1667,75 @@ def _confirm_flip(call: Any, hwnd: int, want: str, learned: Mapping[str, str] | 
     if seen == "play":
         # fSkills (live 18 Oct: "not_taken" 0.2 s before the playlist audibly started, then the link rung and the
         # thinker, 18 s): the row's own label lags the press, so Spotify's media session is read too; a session that
-        # plays now and didn't before the press is the press taken (the done-check still checks which playlist)
-        status, _app_id = DESK.spotify_status(None)
-        if status == "playing" and facts.get("session") != "playing":
-            facts["flip"] = "session"
-        else:
-            look.details["not_taken"] = True
+        # plays now and didn't before the press is the press taken (the done-check still checks which playlist), and
+        # so is one that played before and plays another track now (review M3: a switch while one plays)
+        _mark_taken(look, facts, ram)
     return look
+
+
+def _mark_taken(look: Look, facts: dict[str, Any], ram: Mapping[str, Any] | None) -> None:
+    """A press whose row still reads "Play {name}" on a window that isn't in front, by what the session shows
+    (:func:`_press_taken`): taken -> ``facts["flip"]`` says how; else ``details["not_taken"]``, and when the session
+    can't tell (it played before and a track couldn't be read) ``details["not_taken_unsure"]`` too."""
+    how = _press_taken(facts, ram)
+    if how in ("session", "track"):
+        facts["flip"] = how
+        return
+    look.details["not_taken"] = True
+    if how == "unsure":
+        look.details["not_taken_unsure"] = True
+
+
+#: review M3 (skill19): the key of the session's track identity (:func:`_track_id`), drawn when the process starts and
+#: never stored: the digests compare a track before and after a press inside one process and mean nothing outside it.
+_TRACK_KEY = os.urandom(16)
+
+
+def _track_id(session: Mapping[str, Any] | None) -> str:
+    """A media session's track as a keyed digest of its title and artist (RAM only, never logged or stored; ``""``
+    when it shows neither). Content-free."""
+    if not isinstance(session, Mapping):
+        return ""
+    title = " ".join(str(session.get("title") or "").split())
+    artist = " ".join(str(session.get("artist") or "").split())
+    if not title and not artist:
+        return ""
+    return hmac.new(_TRACK_KEY, f"{title}\x1f{artist}".encode("utf-8", "replace"), hashlib.sha256).hexdigest()[:16]
+
+
+def _session_read(pid: int | None) -> tuple[str, str, str]:
+    """``(status, app_id, track identity)`` of Spotify's session in one read; a stand-in desk without
+    ``spotify_read`` reads its status alone (track ``""``). Never raises."""
+    reader = getattr(DESK, "spotify_read", None)
+    if callable(reader):
+        try:
+            status, app_id, track = reader(pid)
+            return str(status or "unread"), str(app_id or ""), str(track or "")
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        status, app_id = DESK.spotify_status(pid)
+    except Exception:  # noqa: BLE001
+        return "unread", "", ""
+    return status, app_id, ""
+
+
+def _press_taken(facts: Mapping[str, Any], ram: Mapping[str, Any] | None) -> str:
+    """Review M3 (skill19): whether a press whose row label still reads "Play {name}" was taken, by Spotify's session
+    read now against the rung's own read before the press (``facts["session"]``, ``ram["track"]``): ``"session"``
+    (it plays now and did not before), ``"track"`` (it played before and plays another track now: a playlist switched
+    while one played, where the session's status can't show it), ``"unsure"`` (it played before and plays now, and a
+    track couldn't be read: the press may have been taken), ``""`` (not taken: not playing, or the same track plays
+    on). Code facts only; the digests never leave RAM."""
+    status, _app_id, track = _session_read(None)
+    if status != "playing":
+        return ""
+    if str(facts.get("session") or "") != "playing":
+        return "session"
+    before = str((ram or {}).get("track") or "")
+    if before and track:
+        return "track" if track != before else ""
+    return "unsure"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1762,7 +1850,8 @@ def play_library(call: Any) -> Any:
 
         taste.prewarm()
     facts: dict[str, Any] = {}
-    win, status, app_id, early = _prologue(call, facts)
+    ram: dict[str, Any] = {}      # review M3: the session's track before the press (RAM only)
+    win, status, app_id, early = _prologue(call, facts, ram=ram)
     if early is not None:
         if early.outcome == "no_window":
             _pair_unread(call, want, status)
@@ -1779,12 +1868,20 @@ def play_library(call: Any) -> Any:
         # seen warm before, frame only now: one fresh warm-up within the time left, then once more
         if _ensure_warm(DESK, win, call, facts, force=True):
             look = _look_named(call, win.hwnd, want, learned=learned, press=True)
-    look = _confirm_flip(call, win.hwnd, _check_name(look, want), learned, look, state, facts)
+    look = _confirm_flip(call, win.hwnd, _check_name(look, want), learned, look, state, facts, ram)
     _log_read(call, "library", state, facts, look)
     _feed_seen(call, look)
     if look.status in UNREAD:
         _pair_unread(call, want, status)
-    return _after_look(call, look, status, app_id, facts)
+    return _with_track(_after_look(call, look, status, app_id, facts), ram)
+
+
+def _with_track(got: Any, ram: Mapping[str, Any]) -> Any:
+    """A pressing rung's result with the session's track before its press in ``facts_ram["track0"]`` (RAM only), for
+    its own check's stale-row rule (:func:`_stale_row`)."""
+    if ram.get("track") and isinstance(getattr(got, "facts_ram", None), dict):
+        got.facts_ram["track0"] = str(ram["track"])
+    return got
 
 
 def play_restored(call: Any) -> Any:
@@ -1910,6 +2007,15 @@ def play_link(call: Any) -> Any:
             # review r2 L2: only the opened page's own button (its container shows the learned link), never a
             # same-named header of the view still in front while Spotify navigates
             look = _look(DESK, win.hwnd, name, learned=learned, press=True, page=True, grid=False, link=uri)
+            # skill19 (RC2: "page_not_shown" in every try, its reason never logged): the link check's own code word
+            # per read (ok / other / none / unread: the button's container held the learned link, another page's links,
+            # none, or couldn't be read), the last one and how often each came (content-free)
+            word = str(look.details.get("page_link") or "") if look.status == "not_shown" else ""
+            if word:
+                facts["page_link"] = word
+                seen_words = facts.setdefault("page_links", {})
+                seen_words[word] = int(seen_words.get(word, 0)) + 1
+            facts["page_reads"] = int(facts.get("page_reads", 0)) + 1
             if look.status in ("ok", "ambiguous"):
                 break
         if clock() + POLL_S > until:
@@ -1999,7 +2105,8 @@ def play_search(call: Any) -> Any:
     if not extra_control("library_search") or not extra_control("library_filter"):
         return _rr(ran=False, outcome="no_label")
     facts: dict[str, Any] = {}
-    win, status, app_id, early = _prologue(call, facts)
+    ram: dict[str, Any] = {}      # review M3: the session's track before the press (RAM only)
+    win, status, app_id, early = _prologue(call, facts, ram=ram)
     if early is not None:
         return early
     state = DESK.state(win.hwnd)
@@ -2046,7 +2153,7 @@ def play_search(call: Any) -> Any:
                 seen = again.state if again.status == "ok" else seen
             facts_ram["row_seen"] = seen or ""
             if look.pressed and state != "front" and reads and last_ok and seen == "play":
-                look.details["not_taken"] = True      # as _confirm_flip: a backgrounded window ignored the Invoke
+                _mark_taken(look, facts, ram)      # as _confirm_flip: a backgrounded window may have ignored the Invoke
     finally:
         cleared = _search_job(DESK, win.hwnd, step="clear")
         if late_fill or cleared.get("late"):
@@ -2109,7 +2216,8 @@ def play_launch(call: Any) -> Any:
     if not _ensure_warm(DESK, win, call, facts, force=True, floor_s=LAUNCH_WARM_S):
         return _rr(ran=False, outcome="cold_after_launch", facts=facts)
     # the session as the started Spotify shows it: still the phone playing -> left there, nothing pressed
-    status, app_id, where = _this_pc(call, facts, win.pid)
+    ram: dict[str, Any] = {}      # review M3: the session's track before the press (RAM only)
+    status, app_id, where = _this_pc(call, facts, win.pid, ram)
     if where == "other":
         return _other_device(facts)
     learned = _learned_wording(call.ctx.memory)
@@ -2122,11 +2230,11 @@ def play_launch(call: Any) -> Any:
         look = _look_named(call, win.hwnd, want, learned=learned, press=True)
         reads += 1
     facts["row_reads"] = reads
-    look = _confirm_flip(call, win.hwnd, _check_name(look, want), learned, look, state, facts)
+    look = _confirm_flip(call, win.hwnd, _check_name(look, want), learned, look, state, facts, ram)
     _log_read(call, "launch", state, facts, look)
     _feed_seen(call, look)
     status, app_id = DESK.spotify_status(win.pid)
-    return _after_look(call, look, status, app_id, facts)
+    return _with_track(_after_look(call, look, status, app_id, facts), ram)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2271,9 +2379,51 @@ def probe_playing_here(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, 
         _set_line(ctx, unconfirmed)
         return None, ev
     _set_line(ctx, unconfirmed)
+    if look.status == "ok" and look.state == "play" and status == "playing" and audio is True \
+            and _stale_row(ctx, look):
+        # skill19 (live 19 Oct, RC1: Spotify minimised, row pressed, the session went paused -> playing with sound here
+        # and the playlist audibly on, yet "contradicted", and two such marks disabled the library rung for 24 h): a
+        # window that isn't drawing (minimised or covered) doesn't refresh its row's label, so "Play {name}" there while
+        # the session plays now, and did not before the press, with Spotify sounding on this PC, is unread, never a
+        # contradiction (the stale-label rule :func:`_confirm_flip` applies at the press). Which playlist plays is
+        # unknown, so never True either: "couldn't confirm", which never counts against the rung
+        ev["reason"] = "row_stale"
+        # settled by the engine (``engine.SETTLED_REASONS``): said plainly, never handed to the thinker to look (it would
+        # bring the window up to read a row the press already took) and never a second rung (a second press pauses it)
+        _set_line(ctx, LINE_PLAY_STALE.format(name=look.name or str(args.get("name") or "it")))
+        return None, ev
     if look.status == "ok" and (look.state == "play" or status in ("paused", "stopped")):
         return False, ev
     return None, ev
+
+
+#: The window states in which Spotify's Chromium window draws nothing new (its row labels go stale).
+NOT_DRAWING = ("minimised", "covered")
+
+
+def _stale_row(ctx: Any, look: Look) -> bool:
+    """Whether a "Play {name}" row read by a rung's own check may be a label the window never redrew: the rung
+    pressed it (no ``already``), the session was not playing before the press (the route's own read,
+    ``facts["session"]``), and the window isn't drawing (the route's read of its state, or the state now:
+    :data:`NOT_DRAWING`). Code facts only; never raises."""
+    try:
+        result = getattr(ctx, "result", None)
+        facts = getattr(result, "facts", None) or {}
+        if result is None or _not_pressed(ctx) or getattr(result, "ran", None) is False:
+            return False
+        if str(facts.get("session") or "") == "playing":
+            # review M3: it played before the press; only another track playing now says the press took (the track
+            # before is the rung's own read, ``facts_ram["track0"]``; both RAM-only digests)
+            before = str((getattr(result, "facts_ram", None) or {}).get("track0") or "")
+            _status, _app_id, track = _session_read(None)
+            if not (before and track and track != before):
+                return False
+        if str(facts.get("state") or "") in NOT_DRAWING:
+            return True
+        win = DESK.window()
+        return win is not None and DESK.state(win.hwnd) in NOT_DRAWING
+    except Exception:  # noqa: BLE001 - unknown: the row stands as read
+        return False
 
 
 def probe_still_playing(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
@@ -2314,6 +2464,62 @@ def _amount(values: Mapping[str, Any]) -> tuple[float | None, float | None, bool
 
 def _no_amount(level: float | None, change: float | None, mute: bool | None) -> bool:
     return level is None and change is None and mute is None
+
+
+#: skill19 (live 19 Oct compare O5: ``change: down, level: 85`` set 50 -> 90 against "lower it a little"): a call whose
+#: level would move the control against its own change, asked once with the level read now.
+ASK_LEVEL_WAY = "It's at {now:g}% now, so {level:g}% would turn it {way}. Louder, quieter, or to what level?"
+#: The same call again within this long, after a new turn of the user's (their answer), runs its level: asked once.
+LEVEL_WAY_ONCE_S = 120.0
+#: ``{(app, level, change sign): (when asked, the user's words then as a digest)}`` (RAM only)
+_level_way_asked: dict[tuple[str, int, int], tuple[float, str]] = {}
+_level_way_lock = threading.Lock()
+
+
+def _words_digest(words: Any) -> str:
+    """The user's words of a call as a digest (RAM only, never logged): whether a new turn came since. ``""`` none."""
+    seq = [words] if isinstance(words, str) else [str(w) for w in words or () if str(w or "").strip()]
+    if not seq:
+        return ""
+    return hashlib.sha256("\x1e".join(" ".join(w.split()) for w in seq).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _heard(call: Any) -> Any:
+    """The user's words of a call (``ctx.words``), ``()`` with none."""
+    return getattr(getattr(call, "ctx", None), "words", None) or ()
+
+
+def _level_against_change(values: Mapping[str, Any], now: float | None, app: str, words: Any = ()) -> Any:
+    """skill19 (O5): a level and a change given together whose directions disagree against the control's level read
+    now (``now``: a code read; 70 asked as "down" on a control at 50) -> the question once, carrying that level
+    (``facts["current"]``); the same call again within :data:`LEVEL_WAY_ONCE_S` runs its level only when the user's
+    words (``words``: the call's ``ctx.words``) changed since it was asked (review L2: their answer; a caller retrying
+    at once with the same words is asked again). ``None``: no such contradiction (one of the two not given, the level
+    unread, or within :data:`LEVEL_TOLERANCE` of now)."""
+    def num(v: Any) -> float | None:
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    level, change = num(values.get("level")), num(values.get("change"))
+    if level is None or change is None or change == 0.0 or now is None:
+        return None
+    toward = float(level) - float(now)
+    if abs(toward) <= LEVEL_TOLERANCE or toward * change > 0:
+        return None
+    key = (str(app or ""), int(round(level)), 1 if change > 0 else -1)
+    heard = _words_digest(words)
+    at = time.monotonic()
+    with _level_way_lock:
+        for old in [k for k, (t, _h) in _level_way_asked.items() if at - t > LEVEL_WAY_ONCE_S]:
+            _level_way_asked.pop(old, None)
+        asked = _level_way_asked.get(key)
+        if asked is not None and heard and asked[1] != heard:
+            _level_way_asked.pop(key, None)
+            return None                    # asked once, and the user has spoken since: the level runs
+        _level_way_asked[key] = (at, heard)
+    way = "up" if toward > 0 else "down"
+    return _rr(ran=False, ask=ASK_LEVEL_WAY.format(now=round(float(now), 1), level=float(level), way=way),
+               outcome="level_against_change", app=app or None,
+               facts={"current": round(float(now), 1), "level": float(level), "change_sign": key[2]})
 
 
 def _slider_result(look: Look, facts: dict[str, Any], *, how: str = "") -> Any:
@@ -2364,6 +2570,12 @@ def volume_slider(call: Any) -> Any:
     if not _ensure_warm(DESK, win, call, facts):
         _log_read(call, "volume", state, facts, None)
         return _rr(ran=False, outcome=_cold(facts), facts=facts)
+    if call.values.get("level") is not None and call.values.get("change") is not None:
+        first = _read_slider(DESK, win.hwnd)      # skill19 (O5): only when a level and a change came together
+        against = _level_against_change(call.values, first.slider if first.status == "ok" else None, "spotify",
+                                        _heard(call))
+        if against is not None:
+            return against
     look = _set_slider(DESK, win.hwnd, to=level, by=change, budget_s=_left(call))
     _log_read(call, "volume", state, facts, look)
     return _slider_result(look, facts)
@@ -2387,6 +2599,9 @@ def volume_keys(call: Any) -> Any:
     if first.status != "ok" or first.slider is None:
         return _rr(ran=False, outcome="slider_" + first.status, facts=facts)
     v0 = v = float(first.slider)
+    against = _level_against_change(call.values, v0, "spotify", _heard(call))      # skill19 (O5)
+    if against is not None:
+        return against
     target = max(0.0, min(100.0, level if level is not None else v0 + float(change or 0.0)))
     if abs(target - v0) <= LEVEL_TOLERANCE / 2:
         return _rr(ran=False, already=True, verified=True, value=v0, outcome="already", facts=facts,
@@ -2450,6 +2665,10 @@ def volume_restored(call: Any) -> Any:
     if first.status in ("missing", "ambiguous"):
         # the minimised window reads, and its slider isn't there by its label or shape: restoring wouldn't help
         return _rr(ran=False, outcome="slider_" + first.status, facts=facts)
+    against = _level_against_change(call.values, first.slider if first.status == "ok" else None, "spotify",
+                                    _heard(call))
+    if against is not None:
+        return against                     # skill19 (O5): asked before anything is restored
     prev = DESK.foreground()
     got = DESK.focus(win.hwnd)
     if kind := _refused(got):
@@ -2506,6 +2725,10 @@ def volume_spotify_mixer(call: Any) -> Any:
     if where == "other":
         return _other_device(facts, volume=True)
     before_slider = _read_slider(DESK, win.hwnd) if win is not None else None
+    if call.values.get("level") is not None and call.values.get("change") is not None:
+        against = _level_against_change(call.values, DESK.mixer_level(image), "spotify", _heard(call))    # skill19 (O5)
+        if against is not None:
+            return against
     result = DESK.app_volume(image, level=level, change=change, mute=None)
     ran, verified, before, after = _mixer_after(result)
     if not ran:
@@ -2565,6 +2788,10 @@ def volume_mixer(call: Any) -> Any:
         if where == "other":
             return _other_device(facts, volume=True)
         before_slider = _read_slider(DESK, win.hwnd) if win is not None else None
+    if values.get("level") is not None and values.get("change") is not None:
+        against = _level_against_change(values, DESK.mixer_level(target), target, _heard(call))    # skill19 (O5)
+        if against is not None:
+            return against
     result = DESK.app_volume(target, level=level, change=change, mute=mute)
     ran, verified, before, after = _mixer_after(result)
     if not ran:
@@ -2596,6 +2823,9 @@ def volume_system(call: Any) -> Any:
         # app_volume's N1 for the PC: a level that can't move (already there, or at its top or bottom) is a no-op,
         # read and said as one, and nothing is set
         now0 = DESK.master_level()
+        against = _level_against_change(call.values, now0, "master", _heard(call))      # skill19 (O5)
+        if against is not None:
+            return against
         if now0 is not None:
             want = max(0.0, min(100.0, float(level) if level is not None else now0 + float(change or 0.0)))
             if abs(want - now0) <= 0.6:
@@ -2627,6 +2857,10 @@ def volume_own_voice(call: Any) -> Any:
     image = DESK.own_process()
     if not image:
         return _rr(ran=False, outcome="no_process")
+    if call.values.get("level") is not None and call.values.get("change") is not None:
+        against = _level_against_change(call.values, DESK.mixer_level(image), image, _heard(call))    # skill19 (O5)
+        if against is not None:
+            return against
     result = DESK.app_volume(image, level=level, change=change, mute=mute)
     ran, verified, _before, after = _mixer_after(result)
     if not ran:

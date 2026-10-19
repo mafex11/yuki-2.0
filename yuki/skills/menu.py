@@ -76,10 +76,25 @@ def _value(value: Any) -> str:
     return _clip(str(value or ""), VALUE_CHARS)
 
 
+def slot_form(slot: Any) -> str:
+    """skill19 (live 19 Oct, spotify RC5a; contract C5): the form a slot's value takes, from its schema type alone
+    (``""`` when its type says none): an enum's options; a ``points`` slot's direction words and a signed number
+    ("up | down | ±points": ``resolve.DIRECTIONS``, the schema's own words, or a signed number), so "down a little"
+    is never sent for a slot that takes "down". The menu shows it beside the slot; the engine names it when a value
+    given in another form was dropped."""
+    t = str(getattr(slot, "type", "") or "")
+    if t == "enum" and getattr(slot, "options", None):
+        return " | ".join(slot.options)
+    if t == "points":
+        from yuki.skills.resolve import DIRECTIONS
+
+        return " | ".join([*DIRECTIONS, "±points"])     # a signed number of points ("-10"), within the line cap
+    return ""
+
+
 def _slot_part(slot: Any) -> str:
-    if slot.type == "enum" and slot.options:
-        return f"[{slot.name}: {' | '.join(slot.options)}]"
-    return f"[{slot.name}]"
+    form = slot_form(slot)
+    return f"[{slot.name}: {form}]" if form else f"[{slot.name}]"
 
 
 def skill_line(skill: Skill, *, values: str = "") -> str:
@@ -87,7 +102,11 @@ def skill_line(skill: Skill, *, values: str = "") -> str:
     :data:`MENU_LINE_CHARS` (the options give way first), then the user's values for it (``values``, from
     :func:`values_part`, in a budget of their own)."""
     head = f"- {skill.key}: {skill.menu}"
-    tries = ([head, *(_slot_part(s) for s in skill.slots)], [head, *(f"[{s.name}]" for s in skill.slots)], [head])
+    # skill19 (RC5a / C5): when every form doesn't fit, a points slot's keeps its form before an enum's options (a
+    # change in another form is dropped; an enum's options are its names, which the caller rarely misses)
+    tries = ([head, *(_slot_part(s) for s in skill.slots)],
+             [head, *(_slot_part(s) if s.type == "points" else f"[{s.name}]" for s in skill.slots)],
+             [head, *(f"[{s.name}]" for s in skill.slots)], [head])
     line = _clip(" ".join(tries[-1]), MENU_LINE_CHARS)
     for parts in tries:
         if len(" ".join(parts)) <= MENU_LINE_CHARS:
@@ -390,6 +409,7 @@ def thinker_tool(menu: str, keys: list[str] | tuple[str, ...]) -> dict[str, Any]
 
 
 __all__ = ["MENU_CHARS", "TALKER", "THINKER", "PLANNER", "AUDIENCES", "VALUES_CHARS", "TALKER_HEAD", "PLANNER_HEAD",
+           "slot_form",
            "names_other_key", "menu_skills", "skill_line", "voice_channels", "values_part", "way_lines", "menu_lines",
            "menu_text",
            "planner_menu", "request_key", "talker_tool", "THINKER_HEAD", "thinker_tool"]

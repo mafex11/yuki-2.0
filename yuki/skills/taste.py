@@ -393,6 +393,30 @@ def heard_as(names: Any, said: Any, *, loose: bool = False) -> str | None:
     return _closest_heard(pool, text) if loose else None
 
 
+def heard_in(names: Any, turns: Any) -> str | None:
+    """skill19 (live 19 Oct, all-browser R7: "NDL" heard as "MBL", the talker rewrote it to "MrBeastGaming" and that
+    reading ran): the one of the user's own ``names`` (a closed set: their channels, their playlists) that the user's
+    own words hold by sound or spelling distance (:func:`heard_as`, its closed-set tier included), in their newest turn
+    only (review L1: the request's own words; an earlier request of the exchange that named another of their names is
+    never taken for this one). A turn that holds two decides nothing. ``None`` when none does. The caller names it as
+    a guess ("I took that as NDL"). Never raises."""
+    pool = [" ".join(str(n or "").split()) for n in names or [] if str(n or "").strip()]
+    if not pool:
+        return None
+    seq = [turns] if isinstance(turns, str) else [str(t) for t in turns or [] if str(t or "").strip()]
+    if not seq:
+        return None
+    turn = seq[-1]
+    try:
+        padded = f" {_norm(turn)} "
+        literal = {_norm(n): n for n in pool if _norm(n) and f" {_norm(n)} " in padded}
+        if literal:
+            return next(iter(literal.values())) if len(literal) == 1 else None
+        return heard_as(pool, turn, loose=True) or None
+    except Exception:  # noqa: BLE001 - a turn that can't be read by sound
+        return None
+
+
 #: fSkills (live 18 Oct: "MBL's YouTube channel" heard for the user's channel NDL): how each Latin letter is said when
 #: a short all-capital word is spelled out letter by letter (an initialism as speech recognition writes it), the
 #: alphabet's own spoken names: a format conversion, like :func:`yuki.memory.contacts.romanize`, never a word list.
@@ -2174,7 +2198,8 @@ def now_picks(store: Any, *, now: float | None = None, n: int = NOW_N) -> dict[s
 __all__ = ["SIGMA_MIN", "FALLBACK_MASS", "MENU_CANDIDATES", "OPTIONS_N", "SEEN_SOURCE", "SEEN_MAX", "SAID_SUFFIX",
            "Taste", "hour_score", "score_at", "top", "candidates", "seen_names", "options", "said_kind", "said_target",
            "said_words", "find", "offered", "find_offered", "takes_offers", "MEANING_WAIT_S", "MEANING_TTL_S",
-           "MEANING_ITEMS", "MEANING_TITLES", "MEANING_DAYS", "MEANING_WHYS", "Meant", "heard_as", "described", "judge",
+           "MEANING_ITEMS", "MEANING_TITLES", "MEANING_DAYS", "MEANING_WHYS", "Meant", "heard_as", "heard_in",
+           "described", "judge",
            "prewarm",
            "SEED_DAYS", "HALF_LIFE_DAYS",
            "SESSION_GAP_S", "FLOOR", "OPAQUE_VAR", "RETIRED_KINDS", "ASKED_FILLS", "GUESS_FILLS", "OFFER_FIELDS",
