@@ -769,10 +769,24 @@ def item_for(client: Any, hit: dict[str, Any], *, now: float | None = None) -> d
             return None
         link = found[0]
         secs = links.seconds_of(store, [link]).get(link.id)
-        return {**base, "kind": "link", "at": _iso(link.last_seen), "until": None, "url": link.url,
-                "text": links.describe(link, secs, now),
-                "source": ("a link shared in a conversation" if link.how == "shared" else "a page the user had open")
-                          + f", {_day(link.last_seen)}"}
+        # S19 (mem22, the user's decision D3): a viewed page is dated by the user's own last visit (links.own_last:
+        # never a sighting while Yuki acted or a live test ran), so a test's or Yuki's reopen of an older episode
+        # never reads as their page "today"; a page Yuki opened is said to be Yuki's
+        own = links.own_last(store, link, now=now)
+        at = own if own is not None and own < float(link.last_seen) else float(link.last_seen)
+        if link.how == "shared":
+            source = f"a link shared in a conversation, {_day(link.last_seen)}"
+        elif own is not None:
+            source = f"a page the user had open, their own last visit {_day(at)}"
+        elif link.by_yuki:
+            source = f"a page Yuki opened at the user's request (not their own progress), {_day(link.last_seen)}"
+        elif link.how == "viewed" and link.page_key and getattr(link, "attention", None) != "visible":
+            # its key comes from the timeline's present stretches (never pruned), and none of them is the user's own
+            source = f"a page up only while Yuki acted or a test ran (not their own progress), {_day(link.last_seen)}"
+        else:
+            source = f"a page the user had open, {_day(link.last_seen)}"
+        return {**base, "kind": "link", "at": _iso(at), "until": None, "url": link.url,
+                "text": links.describe(link, secs, now, own_last=own), "source": source}
     return None
 
 

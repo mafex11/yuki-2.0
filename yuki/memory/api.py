@@ -4192,6 +4192,7 @@ class MemoryClient:
             return None
         d = describe_thread(self.store, t)
         secs = _links.seconds_of(self.store, d["links"])
+        own = _links.own_lasts(self.store, d["links"])   # S19 (mem22): dated by the user's own visits
         return {
             **self._thread_dict(t),
             **self._thread_extras([t]).get(int(t.id), {}),
@@ -4203,7 +4204,8 @@ class MemoryClient:
             "calls": [{"ref": f"call:{c.id}", "app": c.app, "start": _iso(c.recording_started_at or c.detected_at),
                        "end": _iso(c.ended_at)} for c in d["calls"]],
             "chats": [{"start": _iso(s.started_at), "end": _iso(s.ended_at), "text": s.text} for s in d["chats"]],
-            "links": [{"url": link.url, "title": link.title, "line": _links.describe(link, secs.get(link.id))}
+            "links": [{"url": link.url, "title": link.title,
+                       "line": _links.describe(link, secs.get(link.id), own_last=own.get(int(link.id)))}
                       for link in d["links"]],
         }
 
@@ -4272,13 +4274,12 @@ class MemoryClient:
                                   query, since=_time_arg(since), until=_time_arg(until), how=how, limit=limit)
             secs = _links.seconds_of(self.store, found)
             # S19 (mem22): how far the user themselves got on each page (never a sighting of Yuki's or a test's)
-            own = _links.own_visits(self.store, [link.page_key for link in found
-                                                 if link.how == "viewed" and link.page_key])
+            own = _links.own_lasts(self.store, found)
         except Exception:
             return []
 
         def own_last(link: Any) -> float | None:
-            return own.get(link.page_key) if link.how == "viewed" and link.page_key else None
+            return own.get(int(link.id))
 
         return [{"ref": f"link:{link.id}", "url": link.url, "title": link.title, "host": link.host, "app": link.app,
                  "how": link.how, "sender": link.sender, "where": link.where, "first_seen": _iso(link.first_seen),

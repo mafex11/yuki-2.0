@@ -721,7 +721,8 @@ def _purge_run_effects(conn: sqlite3.Connection, turn_ids: set[int] | frozenset[
 
 
 def _purge_knowhow(conn: sqlite3.Connection, known: Sequence[tuple[float, float]],
-                   test_ats: set[float] | frozenset[float]) -> dict[str, int]:
+                   test_ats: set[float] | frozenset[float],
+                   dec: Callable[[Any], str | None] | None = None) -> dict[str, int]:
     """mem22 (A2b): the know-how learned from a live test. The table carries no session, but each row is dated by
     what it was learned from (``valid_from``): conversation memory dates the know-how it draws from exchanges
     (``conversation`` / ``taught`` / ``failed``) at its newest cited exchange's own time, exactly; Yuki's own
@@ -732,7 +733,9 @@ def _purge_knowhow(conn: sqlite3.Connection, known: Sequence[tuple[float, float]
     test's own when the worker drew it after the span. A real row a test row had superseded (a restatement: its
     ``valid_to`` and ``superseded_by``) is current again when no row that stays carries its line on, and so is one
     whose successor an earlier purge already took (its ``superseded_by`` names no row, or a row that did not start the
-    moment it ended: the id was given again). Idempotent. Content-free counts."""
+    moment it ended: the id was given again). Never one a current row that stays restates word for word (same app,
+    the same text through ``dec``: the identity part of ``Store.knowhow_duplicate``; an older purge may have taken the
+    test row between it and a real successor that carries it on): it stays ended. Idempotent. Content-free counts."""
     if not (known or test_ats) or not _has(conn, "knowhow", "valid_from"):
         return {}
     real_ats: set[float] = set()
@@ -773,6 +776,8 @@ def _purge_knowhow(conn: sqlite3.Connection, known: Sequence[tuple[float, float]
             # its successor is gone: only a purge deletes know-how (an earlier one took a test's restatement and
             # left this row ended; the id may since be another row's - a successor starts the moment it ended)
             restore.append((kid, sup))
+    if restore and dec is not None:
+        restore = _restore_unless_restated(conn, dec, restore, current - gone, gone, unlink)
     if not gone and not restore:
         return {}
     out: dict[str, int] = {}
@@ -789,6 +794,35 @@ def _purge_knowhow(conn: sqlite3.Connection, known: Sequence[tuple[float, float]
     if n:
         out["knowhow"] = n
     return out
+
+
+def _restore_unless_restated(conn: sqlite3.Connection, dec: Callable[[Any], str | None],
+                             restore: list[tuple[int, int]], stays: set[int], gone: set[int],
+                             unlink: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """The rows of ``restore`` no current row that stays (``stays``) restates word for word on the same app; one that
+    is restated stays ended (its pointer to a deleted test row goes to ``unlink``). Only the candidates' apps are
+    decrypted. A read that fails restores none (nothing is lost: the next purge decides again)."""
+    try:
+        apps = {int(r[0]): str(r[1] or "").casefold() for r in conn.execute("SELECT id, app FROM knowhow")}
+        want = {apps.get(kid) for kid, _sup in restore}
+        ids = {kid for kid, _sup in restore} | {kid for kid in stays if apps.get(kid) in want}
+        texts: dict[int, str] = {}
+        for i in range(0, len(ids), 400):
+            part = sorted(ids)[i:i + 400]
+            for r in conn.execute(f"SELECT id, text_ciphertext FROM knowhow WHERE id IN ({','.join('?' * len(part))})",
+                                  part):
+                texts[int(r[0])] = str((dec(r[1]) if r[1] else None) or "").strip().casefold()
+    except Exception:  # noqa: BLE001
+        return []
+    kept: list[tuple[int, int]] = []
+    for kid, sup in restore:
+        text = texts.get(kid)
+        if text and any(o != kid and apps.get(o) == apps.get(kid) and texts.get(o) == text for o in stays):
+            if sup in gone:
+                unlink.append((kid, sup))
+            continue
+        kept.append((kid, sup))
+    return kept
 
 
 def _purge_links(conn: sqlite3.Connection, known: Sequence[tuple[float, float]]) -> dict[str, int]:
@@ -971,7 +1005,7 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
     count("moments", _delete_ids(conn, "moments", "id", moment_ids))
     # mem22 (A2a, A2b): the test's spans with the ones earlier purges kept (their turns are gone, their rows may not be)
     known = _union_spans(spans, _kept_spans(_state_value(conn, KEPT_SPANS_STATE)))
-    for kind, n in _purge_knowhow(conn, known, test_ats).items():
+    for kind, n in _purge_knowhow(conn, known, test_ats, dec).items():
         count(kind, n)
     for kind, n in _purge_links(conn, known).items():
         count(kind, n)

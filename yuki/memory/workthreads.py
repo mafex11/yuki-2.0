@@ -568,9 +568,8 @@ def typed_entities(store: Any, threads: Sequence[WorkThread], *, now: float | No
 MAX_CHANGES = 10
 #: Thread pairs at least this close are shown as look-alikes (merge candidates the model judges).
 LOOKALIKE_COSINE = 0.62
-#: Threads finished or merged longer ago than this are not shown to the nightly pass; nor (mem22, A1) a paused thread
-#: untouched this long whose card is written and that has no look-alike among the threads shown: nothing new can be
-#: decided about it (on 19 Oct all 20 paused threads were idle 14 days or more, shown every night since).
+#: Threads finished or merged longer ago than this are not shown to the nightly pass (a paused one always is: the
+#: night may still close it; on 19 Oct all 20 paused threads were idle 14 days or more).
 SHOW_DONE_DAYS = 14
 #: Inactivity, measured (days since a thread was last touched): from PAUSE_AFTER_DAYS the nightly pass is told a
 #: quiet thread is set aside unless something shows it still going (its judgement); one still active after
@@ -788,26 +787,11 @@ class Consolidator:
         self.embedder = embedder if embedder is not None else getattr(worker, "embedder", None)
 
     def shown(self, now: float) -> list[WorkThread]:
-        """The threads the night judges: the open ones and those finished within :data:`SHOW_DONE_DAYS`; a paused one
-        quiet that long with its card written only while it looks like one still shown (a merge it may take part in;
-        measured, :data:`LOOKALIKE_COSINE`)."""
-        threads = [t for t in self.store.work_threads(("active", "paused", "done"))
-                   if t.status != "done" or now - t.last_seen <= SHOW_DONE_DAYS * 86400]
-        quiet = {t.id for t in threads if t.status == "paused" and t.shown
-                 and now - float(t.last_seen) > SHOW_DONE_DAYS * 86400}
-        if not quiet:
-            return threads
-        keep: set[int] = set()
-        try:
-            vecs = {i: _unit(v) for i, v in self.store.work_thread_vectors([t.id for t in threads]).items()}
-        except Exception:   # no vectors to measure by: the quiet ones wait (they come back the moment they are touched)
-            vecs = {}
-        others = [v for t in threads if t.id not in quiet and (v := vecs.get(t.id)) is not None]
-        for tid in quiet:
-            q = vecs.get(tid)
-            if q is not None and any(v.shape == q.shape and float(v @ q) >= LOOKALIKE_COSINE for v in others):
-                keep.add(tid)
-        return [t for t in threads if t.id not in quiet or t.id in keep]
+        """The threads the night judges: the open ones (a paused one however long it is quiet: the night may still mark
+        it done or dismissed; the parts bound the output, :func:`chunks`) and those finished within
+        :data:`SHOW_DONE_DAYS`."""
+        return [t for t in self.store.work_threads(("active", "paused", "done"))
+                if t.status != "done" or now - t.last_seen <= SHOW_DONE_DAYS * 86400]
 
     def signals(self, threads: Sequence[WorkThread]) -> tuple[dict[int, dict[str, Any]], list[tuple[int, int, float]]]:
         """Per thread: events, distinct days, apps, the latest states; and look-alike pairs (measured)."""
@@ -1023,8 +1007,9 @@ class Consolidator:
         (``dry_run``: decide, write nothing; ``result.decisions`` is the plan). Each part's changes are written when it
         is decided; a part whose call fails leaves its threads as they are for a night (``result.ok`` False, the other
         parts stand), and one whose call still hits the output cap is split once more (:data:`MAX_SPLITS`). The night's
-        cap (:attr:`max_changes`) and its two questions are for all parts together; the measured auto pause runs after
-        them, whatever they decided. ``plan``: the decisions of an earlier dry run (:func:`save_plan`), checked again
+        cap (:attr:`max_changes`) and its two questions are for all parts together, the cap shared by the parts' sizes
+        (a part's unused share carries on to the next); the measured auto pause runs after them, whatever they
+        decided. ``plan``: the decisions of an earlier dry run (:func:`save_plan`), checked again
         against the threads as they are now and written with no model call (what was reviewed is what is written).
         Every change keeps its thread's before-image under this run (:meth:`undo` takes the run back). Never raises."""
         from yuki.memory.store import PortraitRunStats
@@ -1073,6 +1058,11 @@ class Consolidator:
                     ids = {t.id for t in part}
                     part_pairs = [p for p in pairs if p[0] in ids and p[1] in ids]
                     left = max(0, self.max_changes - made)
+                    # the night's cap shared by the parts by their size, what one leaves unused carried on to the
+                    # next (the parts run newest-touched first; the older ones hold the stale closes and merges)
+                    waiting = len(part) + sum(len(p) for p, _d in queue)
+                    if waiting > len(part) and left:
+                        left = min(left, max(1, left * len(part) // waiting))
                     label = (f"This is one part ({len(part)} of the {len(threads)} threads) of tonight's tidy; the "
                              f"other threads are tidied in their own calls, so decide only about the threads here, "
                              f"and make at most {left} changes in this part." if several or depth else "")
