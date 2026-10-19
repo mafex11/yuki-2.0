@@ -465,6 +465,11 @@ class LlmCall:
     one_fresh: bool = False            # oVoice: it answers the user's turn again (a rerun: the turn's block made again)
     one_thoughts: int = 0              # oVoice: thinking blocks an adaptive ONE round kept for the turn
     one_eager: bool = False            # oVoice: it answers Flux's eager end of turn (its final words still to come)
+    #: final-B (one-voice RC A): the marker channel's reading of this reply's own text (content-free): no marker line
+    #: (none of it spoken), the marker it began with, and whether it was held back as a verbatim repeat
+    one_unmarked: bool = False
+    one_marker: str | None = None
+    one_repeat: bool = False
 
 
 #: Tools whose spoken acknowledgement travels in the call itself (``say_first``), said as soon as it is written.
@@ -707,11 +712,13 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
     def tail_ratio(k: str, t: str, before: str) -> float:
         # Final-B (all-questions RC5): the name's first sound went into the word before ("the|scored" for
         # "dis|cord"): the heard word keeps the start of the name's tail (its first one or two letters dropped,
-        # :data:`NEAR_TAIL_HEAD`) and most of its letters, and the two words together span about the name. Measures
-        # of the strings' letters and lengths only, no word list.
+        # :data:`NEAR_TAIL_HEAD`) and most of its letters, and the two words together span about the name. Review fix
+        # F5: the word before must have at least as many letters as the head it took ("the|scored" yes; "I|scored",
+        # "a|..." no). Measures of the strings' letters and lengths only, no word list.
         if len(k) < LOW_WORD_MIN_LETTERS or not before or len(before) + len(k) > len(t) + NEAR_TAIL_HEAD:
             return 0.0
-        tails = [t[j:] for j in range(1, NEAR_TAIL_HEAD + 1) if len(t) - j >= LOW_WORD_MIN_LETTERS]
+        tails = [t[j:] for j in range(1, NEAR_TAIL_HEAD + 1)
+                 if len(t) - j >= LOW_WORD_MIN_LETTERS and len(before) >= j]
         return max((difflib.SequenceMatcher(None, k, tail).ratio() for tail in tails if tail[:1] == k[:1]
                     and k != t), default=0.0)
 
@@ -3879,7 +3886,8 @@ class _OneReply:
     owed: set[str] = field(default_factory=set)
     spoke: bool = False
     #: Final-B (one-voice RC B/O1b): the turn's owed tokens this reply took on (held while its calls run, dropped once
-    #: their results are in), and the calls of it that were tried (ran through the runner, a reflex or a read).
+    #: their results are in), and the calls of it that were tried (an act or write that ran through the runner or a
+    #: reflex; never a read: review fix F4).
     took: list[int] = field(default_factory=list)
     tried: set[str] = field(default_factory=set)
     released: bool = False
@@ -4409,8 +4417,9 @@ class OneVoice:
         """A reply ended. One with no call of a ONE round ends the turn (the agent decided it is done)."""
         if speculating or call is None or not getattr(call, "one_round", 0) or self.turn is None or self.over:
             return
+        rerun, self._rerun = self._rerun, ("" if self._rerun == "asked" else self._rerun)
         if getattr(call, "tool", False):
-            return
+            return   # (a rerun answered with calls: a later closing reply of the turn is judged as any other)
         self._committed = True
         if self._closing_unheard(call):
             # final-B (one-voice RC A): its closing words had no marker line, so nothing of them was spoken and
@@ -4419,12 +4428,23 @@ class OneVoice:
             self._rerun, self._rerun_at = "due", time.monotonic()
             self._log("unheard_close", round=int(getattr(call, "one_round", 0) or 0))
             return
-        if self._rerun == "asked" and not self.heard_since(float(getattr(call, "entered", 0.0) or 0.0)) \
-                and not self._owed_pending():
-            # the rerun was not heard either and nothing is owed: the error tone says so (a non-speech notice)
+        if rerun == "asked" and self._rerun_silent(call) and not self._owed_pending():
+            # the rerun spoke nothing either and nothing is owed: the error tone says so (a non-speech notice)
             self.c._tone("error")
             self._log("unheard_close", round=int(getattr(call, "one_round", 0) or 0), gave_up=True)
         self.turn_over("model")
+
+    def _rerun_silent(self, call: Any) -> bool:
+        """Review fix F1: the rerun's closing reply gave them nothing, judged from its own stream facts when it ends
+        (its words reach the speaker only after this, so "heard since" is not known yet): no marker line, or no
+        words of it and no say_first went to the voice, and nothing else of Yuki's was heard since it began. A
+        ``quiet`` marker (silence chosen) or a line held back as a verbatim repeat (heard already) is no give-up,
+        as under every other brain (``_unanswered``, ``_give_up``)."""
+        if getattr(call, "one_marker", None) == "quiet" or getattr(call, "one_repeat", False):
+            return False
+        spoke = not getattr(call, "one_unmarked", False) and (
+            getattr(call, "first_text", None) is not None or getattr(call, "early_say", None) is not None)
+        return not spoke and not self.heard_since(float(getattr(call, "entered", 0.0) or 0.0))
 
     def _closing_unheard(self, call: Any) -> bool:
         """Final-B (one-voice RC A): a closing reply (no call) of a result round of a turn their words began, whose text
@@ -4682,7 +4702,8 @@ class OneVoice:
     def _let_owed_go(self, group: _OneReply) -> None:
         """Final-B (one-voice RC B/O1b, the hands' ``_let_owed_go``): once a reply's calls are all in, the owed lines
         it took on (:meth:`reply`) are dropped: the agent went on with what it was given, and its new results owe
-        their own lines. Nothing of it tried (every call held, or late): they stay owed (held while the turn is open).
+        their own lines. Nothing of it tried (every call held, late, or a read): they stay owed (held while the turn is
+        open).
         Once per reply. Never raises."""
         if group.released or not group.took or any(not e.is_set() for e in group.done.values()):
             return
@@ -4703,6 +4724,15 @@ class OneVoice:
             except Exception:  # noqa: BLE001
                 pass
         self._log("owed", took=len(took), dropped=tried)
+
+    @staticmethod
+    def _tried(group: _OneReply, call_id: str, name: str) -> None:
+        """Review fix F4 (the hands' rule: a fallback goes only after the talker's next act): a call of the reply that
+        ran counts as tried for :meth:`_let_owed_go` only when it acts or writes (the tool's own spec,
+        :func:`one_kind`). A read (look, quick_memory, the memory reads) keeps the turn's owed lines held until the
+        turn is over, when the ledger marks them heard if the agent's words came."""
+        if one_kind(name) in ("act", "write"):
+            group.tried.add(call_id)
 
     # -- the calls ------------------------------------------------------------------------------------------------
 
@@ -4970,7 +5000,7 @@ class OneVoice:
                 got = await dup(name, args) if callable(dup) else None
                 if isinstance(got, dict):
                     result, how = got, "reflex"
-                    group.tried.add(call_id)
+                    self._tried(group, call_id, name)
                 elif self._held_call(name, call_id, args, turn):
                     # review fix M4: words and this act together on a turn recognition was unsure of: nothing is done
                     # and nothing was said; the agent's next round asks about the unsure word or calls it again alone
@@ -4981,7 +5011,7 @@ class OneVoice:
                     await self._wait_answer()
                     self._refresh_words(turn)
                     await self._say_first_if_silent(params, group, call_id, name, args, turn)
-                    group.tried.add(call_id)
+                    self._tried(group, call_id, name)
                     result = await self._run(name, args, turn, call_id)
             outcome = one_outcome(name, args, result)
             group.outcomes[call_id] = outcome
@@ -5101,7 +5131,7 @@ class OneVoice:
                                              properties=FunctionCallResultProperties(run_llm=bool(run_llm)))
                 return
             original = params.result_callback
-            group.tried.add(call_id)
+            # (a read: review fix F4, it never takes the turn's owed lines off them: :meth:`_tried`)
 
             async def settle(result: Any, *, properties: Any = None) -> None:
                 group.outcomes[call_id] = one_outcome(name, args, {"status": "read"})
@@ -8970,14 +9000,16 @@ class Conversation:
             turn.marker = facts.get("marker") or turn.marker
             turn.scratch += int(facts.get("scratch_chars") or 0)
             turn.unmarked = bool(turn.unmarked or facts.get("unmarked"))
-        if call is not None:
-            try:
-                # final-B (one-voice RC A): this reply's own reading, for the ONE driver's closing-reply check
-                call.one_unmarked = bool(facts.get("unmarked"))
-            except Exception:  # noqa: BLE001 - a stand-in call that takes no attribute
-                pass
             if facts.get("repeat_dropped"):
                 turn.repeat_dropped = True   # V9: answered again with the repeat note, never with the same line
+        if call is not None:
+            try:
+                # final-B (one-voice RC A): this reply's own reading, for the ONE driver's closing-reply checks
+                call.one_unmarked = bool(facts.get("unmarked"))
+                call.one_marker = facts.get("marker")
+                call.one_repeat = bool(facts.get("repeat_dropped"))
+            except Exception:  # noqa: BLE001 - a stand-in call that takes no attribute
+                pass
         if facts.get("marker") is not None or facts.get("scratch_chars"):
             self.log.event("marker", session=self.session, user_turn=bool(getattr(call, "user_turn", False)),
                            turn=turn.n if turn is not None else None, **facts)

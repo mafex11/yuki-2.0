@@ -674,6 +674,7 @@ class Runner:
         self.lease = bool(lease)
         self.lease_wait_s = float(lease_wait_s)
         self.effect_budget_s = float(effect_budget_s)
+        self._desk_shape: str | None = None   # review fix F2: the verbs' desk_read form, read once
 
     @property
     def memory(self) -> Any:
@@ -1077,19 +1078,47 @@ class Runner:
 
     def _desk_read(self, app: str = "") -> Any:
         """The desk now (``situation.DeskState``) for an act's before or after: final-B contract C2, with the master
-        level and mute and ``app``'s own mixer row (``master=True, audio=[app]``), so the diff sees what an act did to
-        the sound. Verbs whose ``desk_read`` takes neither (before hands19's change) are read as before. ``None``: no
-        read."""
+        level and mute and ``app``'s own mixer row, so the diff sees what an act did to the sound. The call's shape is
+        chosen once from the verbs' own signature (:meth:`_desk_read_shape`), never by catching a TypeError (that
+        would hide one raised inside a real read). ``None``: no read."""
         read = getattr(self.verbs, "desk_read", None)
         if not callable(read):
             return None
+        shape = self._desk_read_shape(read)
+        rows = [app] if app else []
         try:
-            try:
-                return read(master=True, audio=[app] if app else [])
-            except TypeError:
-                return read()
-        except Exception:  # noqa: BLE001
+            if shape == "apps":
+                return read(apps=rows)                  # hands19: the master always, and these apps' mixer rows
+            if shape == "master_audio":
+                return read(master=True, audio=rows)
+            return read()
+        except Exception as exc:  # noqa: BLE001
+            self._emit("one_desk_read", op="error", shape=shape, error=type(exc).__name__)
             return None
+
+    def _desk_read_shape(self, read: Callable[..., Any]) -> str:
+        """Review fix F2: which form the verbs' ``desk_read`` takes, from its signature (read once): ``apps`` (hands19's
+        ``desk_read(apps=...)``; the master is always read), ``master_audio`` (``master=..., audio=...``), else
+        ``plain`` (no sound parts: the diff never sees the acted app's mixer row). A plain read is logged once,
+        content-free, so a live test shows C2 is not wired."""
+        if self._desk_shape is not None:
+            return self._desk_shape
+        import inspect
+
+        try:
+            params = inspect.signature(read).parameters
+        except (TypeError, ValueError):
+            params = {}
+        names = set(params)
+        if "apps" in names:
+            shape = "apps"
+        elif {"master", "audio"} <= names:
+            shape = "master_audio"
+        else:
+            shape = "plain"
+            self._emit("one_desk_read", op="fallback", shape=shape)
+        self._desk_shape = shape
+        return shape
 
     def _facts_of(self, hwnd: Any) -> dict[str, Any]:
         if hwnd is None:
@@ -1181,8 +1210,14 @@ class Runner:
             # final-B (contract C1): the engine's measured front change when the run's payload carries it (else a run
             # on the desk path may have taken the front: counted as the act's, as before); the app-typed slot's value
             # is the act's too (one-desk RC1(b): by slot type, never words)
+            # Review fix F6: the engine's measured ``acted`` False (no rung touched the PC, the front never changed) and
+            # no draft typed after it: no change on the desk is this run's (its apps are not the act's); its measured
+            # ``acted_apps`` are the act's too, as the hands' ``_skill_scope`` takes them
             measured = facts.get("focus_taken")
-            scope = {"apps": [a for a in dict.fromkeys((app, ctx.sound_app)) if a],
+            untouched = facts.get("acted") is False and measured is not True and not drafted
+            apps = [] if untouched else [a for a in dict.fromkeys(
+                (app, ctx.sound_app, *(facts.get("acted_apps") or ()))) if a]
+            scope = {"apps": apps,
                      "focus": measured if isinstance(measured, bool) else True,
                      "open": str(getattr(sk, "kind", "") or "") == "open", "left": drafted}
         line = _words(facts.get("done_line")) if facts.get("verified") is True else ""
@@ -1321,6 +1356,10 @@ class Runner:
                                  "sent_at": started if payload.get("outcome") not in ("refused", None) else None}
         if isinstance(payload.get("focus_taken"), bool):
             facts["focus_taken"] = payload["focus_taken"]   # contract C1: measured per rung by the engine
+        if isinstance(payload.get("acted"), bool):
+            facts["acted"] = payload["acted"]               # C1 (review fix F6): something on the PC was touched
+        if isinstance(payload.get("acted_apps"), (list, tuple)):
+            facts["acted_apps"] = [str(a) for a in payload["acted_apps"] if isinstance(a, str) and a.strip()]
         if isinstance(payload.get("evidence"), Mapping):
             facts["evidence"] = dict(payload["evidence"])
         if refused:
