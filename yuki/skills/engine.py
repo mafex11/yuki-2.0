@@ -491,9 +491,9 @@ class SkillResult:
             head = ("It ran, but the PC couldn't confirm it." if self.sends
                     else "It ran, but the PC couldn't confirm the result.")
             say = " ".join(str(self.say or "").split())
-            # rule 8: a send may have gone already, so a second try could send it twice. skill20 (final-D, one
-            # msg_hemanth_misheard: Enter was refused, the driver's own fact said no send key went out, and "it may have
-            # sent" was still said): only when the send key went out, or that is unknown
+            # rule 8: a send may have gone already, so a second try could send it twice. skill20 (final-D, one, the
+            # misheard-name draft row: Enter was refused, the driver's own fact said no send key went out, and "it may
+            # have sent" was still said): only when the send key went out, or that is unknown
             if self.sends and self.sent_key is False:
                 rest = "The send key never went out, so it wasn't sent; don't run this skill again."
             elif self.sends:
@@ -2127,9 +2127,12 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                             missing=missing, seen=seen,
                             evidence=evidence(route=last_route, reason="not_typed", line=line))
         _ledger_finish(ctx, run_key, outcome="unverified", checked=None, route=last_route, acted=acted)
+        # skill20 review: the driver's code fact says nothing was typed, and any later rung that acted on a send
+        # returned above, so no send key went out (never "it may have sent already")
         return _simple(skill.key, "unverified", ctx, started, verified=None, say=line, tried=tried, run_key=run_key,
                        route=last_route.key if last_route is not None else None, values=dict(plan.values),
-                       sends=sends, guessed=guesses, evidence=evidence(route=last_route, reason="not_typed", line=line))
+                       sends=sends, sent_key=False if sends else None, guessed=guesses,
+                       evidence=evidence(route=last_route, reason="not_typed", line=line))
     if plan.handoff and skill.handoff and ctx.origin != "eval":
         return _handoff(skill, plan.values, plan.filled, tried, ctx, started, why="routes_failed", run_key=run_key,
                         acted=acted, routes=list(plan.routes), missing=missing, seen=seen,
@@ -2372,20 +2375,25 @@ def _live_now(game: str, hands: Any = None, *, media: bool = True, skill: Skill 
     playing (only when a slot of the skill fills from them), whether a call is live (only when a slot asks in a
     call), and the skill's window-state reader for the ``game = "states"`` rule (its driver's hook)."""
     playing: tuple[str, ...] = ()
+    sessions: tuple[str, ...] = ()
     try:
         if not media:
             raise LookupError
         from yuki.perception.system import media_sessions
         from yuki.actions.media import app_key_of
 
-        playing = tuple(dict.fromkeys(app_key_of(str(s.get("app_id") or "")) for s in media_sessions(timeout_s=0.2)
-                                      if str(s.get("status") or "") == "playing" and s.get("app_id")))
+        # one read: the sessions playing, and every session whatever its status (skill20 review: the apps the playing
+        # measure can see, so a reading of one of them yields to the one app playing and a game's never does)
+        got = [s for s in media_sessions(timeout_s=0.2) if s.get("app_id")]
+        playing = tuple(dict.fromkeys(app_key_of(str(s.get("app_id") or "")) for s in got
+                                      if str(s.get("status") or "") == "playing"))
+        sessions = tuple(dict.fromkeys(app_key_of(str(s.get("app_id") or "")) for s in got))
     except Exception:  # noqa: BLE001 - nothing known playing
-        playing = ()
+        playing, sessions = (), ()
     wants_call = skill is not None and any(s.ask_in_call for s in skill.slots)
     in_call = _in_call(hands, memory) if wants_call else False
     states = skill is not None and any(r.game == "states" for r in skill.routes)
-    return Live(game=game, playing=playing, in_call=in_call,
+    return Live(game=game, playing=playing, in_call=in_call, sessions=sessions,
                 window_state=window_state_reader(skill) if states else None)
 
 

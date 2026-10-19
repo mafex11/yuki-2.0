@@ -1865,16 +1865,37 @@ def _canonical_video(url: str) -> str | None:
         return None
 
 
+def _web_window(hwnd: int, image: str = "", pid: int | None = None) -> bool:
+    """Whether window ``hwnd``'s program is a web browser by machine data (:func:`yuki.voice.hands.web_app`: Windows
+    lists it as a browser, or its package declares web addresses, as Arc's does). A chat app that draws a site in its
+    own window never is. Read-only; ``False`` when it can't be told."""
+    try:
+        if pid is None or not image:
+            import win32process
+
+            pid = int(win32process.GetWindowThreadProcessId(int(hwnd))[1])
+            if not image:
+                from yuki.skills.donecheck import _image_of
+
+                image = _image_of(pid)
+        from yuki.voice.hands import web_app
+
+        return bool(web_app(image, pid))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def title_windows(browser: Any = None) -> list[int]:
     """The windows whose shown page :func:`link_for_title` reads: the window in front, then the top window of the
-    browser the request named (its app key), read only."""
+    browser the request named (its app key), read only, and each only when it is a browser's by machine data
+    (:func:`_web_window`; skill20 review: a link a friend posted in a chat app is never the match)."""
     out: list[int] = []
-    front, _image = _front()
-    if front:
+    front, image = _front()
+    if front and _web_window(int(front), image):
         out.append(int(front))
     key = _app_key(browser)
     if key:
-        out.extend(h for h, _pid in _app_windows(key)[:1])
+        out.extend(h for h, pid in _app_windows(key)[:1] if _web_window(int(h), pid=int(pid)))
     return list(dict.fromkeys(out))[:TITLE_WINDOWS]
 
 

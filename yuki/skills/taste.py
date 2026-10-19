@@ -896,9 +896,11 @@ RETIRED_KINDS: tuple[str, ...] = ("yt_channel",)
 #: taste guess and Yuki's own pick for "something I'd like" (``chosen``, kTaste): ``pref`` fills means slots only
 #: (``connection.py`` derives ``Slot.pref`` for ``role = "means"``: which browser, never which entity), so "open Deji's channel" in the usual browser is still the user's pick (tTaste r1 M1).
 #: Phase 2.1's own guesses too (aResolve's note): ``menu``, a listed name the words don't hold (a pick from the
-#: candidates), and ``reading``, the model's reading that nothing holds.
+#: candidates), and ``reading``, the model's reading that nothing holds; ``card`` and ``screen`` (skill20 review: a
+#: name read off a card or the screen, such as a title made a link from the feed or the page), as in
+#: ``engine.GUESS_FILLS``.
 ASKED_FILLS: frozenset[str] = frozenset({"words", "again", "told"})
-GUESS_FILLS: frozenset[str] = frozenset({"taste", "chosen", "menu", "reading"})
+GUESS_FILLS: frozenset[str] = frozenset({"taste", "chosen", "menu", "card", "screen", "reading"})
 #: The fields an offered option's value carries beyond its name (``youtube_feed.Offer.value``): a slot every route of
 #: which needs one of them is filled from the offers (:func:`takes_offers`).
 OFFER_FIELDS: frozenset[str] = frozenset({"key", "ref"})

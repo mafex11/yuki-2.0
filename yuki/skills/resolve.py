@@ -177,13 +177,15 @@ CONFIRM_ONCE_S = 120.0
 class Live:
     """The live facts the resolver may use (built by the caller: the voice's own picture, the Now board, local reads;
     an eval passes none): the game in front, the app keys of media sessions playing now, the app in front, whether a
-    call is live, and a window-state reader for the "states" game rule."""
+    call is live, a window-state reader for the "states" game rule, and the app keys of every media session now,
+    whatever its status (paused and stopped too: the apps the playing measure can see)."""
 
     game: str = ""
     playing: tuple[str, ...] = ()
     front_app: str = ""
     in_call: bool = False
     window_state: Callable[[str], str | None] | None = None
+    sessions: tuple[str, ...] = ()
 
 
 @dataclass
@@ -1123,12 +1125,13 @@ def _chat_titles() -> dict[str, tuple[str, set[str]]]:
 
 def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str, Any]]:
     """The user's own programs as their timeline shows them (never Yuki's rows): ``{app key: {"names": [...],
-    "sound": bool, "mic": bool}}``. ``names``: the display name it is shown under most, its key tidied ("chrome":
-    "Google Chrome", "Chrome") and a chat app's title from its connection data ("whatsapp.root": "WhatsApp"); a name
-    two programs share names neither (Yuki's own windows carry its name in several). ``sound``: in those rows it played
-    media, in front or behind, or held a call's microphone (measured, never a list of audio apps); ``mic``: it held a
-    call's microphone (a program a call may be in). Cached per database for
-    :data:`APPS_TTL_S` (an eval's ``until`` reads as of then, uncached). Never raises (``{}``)."""
+    "sound": bool, "mic": bool, "media": bool}}``. ``names``: the display name it is shown under most, its key tidied
+    ("chrome": "Google Chrome", "Chrome") and a chat app's title from its connection data ("whatsapp.root":
+    "WhatsApp"); a name two programs share names neither (Yuki's own windows carry its name in several). ``sound``: in
+    those rows it played media, in front or behind, or held a call's microphone (measured, never a list of audio apps);
+    ``mic``: it held a call's microphone (a program a call may be in); ``media``: it played media (a media session
+    measured playing, in front or behind; the microphone never counts). Cached per database for :data:`APPS_TTL_S` (an
+    eval's ``until`` reads as of then, uncached). Never raises (``{}``)."""
     if store is None:
         return {}
     cache_key = str(getattr(store, "path", id(store)))
@@ -1151,6 +1154,7 @@ def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str,
     shown: dict[str, dict[str, int]] = {}
     sound: dict[str, bool] = {}
     held_mic: dict[str, bool] = {}
+    media_of: dict[str, bool] = {}
     for process, app, n, media, mic in rows:
         key = app_name(process)
         if not key:
@@ -1161,6 +1165,7 @@ def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str,
             shown.setdefault(key, {})
         sound[key] = sound.get(key, False) or float(media or 0) > 0 or float(mic or 0) > 0
         held_mic[key] = held_mic.get(key, False) or float(mic or 0) > 0
+        media_of[key] = media_of.get(key, False) or float(media or 0) > 0
     # a background player is named by its display name: the one program shown under that name
     by_display: dict[str, set[str]] = {}
     for key, names in shown.items():
@@ -1174,7 +1179,7 @@ def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str,
         for n, seconds in (got.items() if isinstance(got, dict) else []):
             keys = by_display.get(_name_key(n), set())
             if len(keys) == 1 and (_num(seconds) or 0.0) > 0:
-                sound[next(iter(keys))] = True
+                sound[next(iter(keys))] = media_of[next(iter(keys))] = True
     chats = _chat_titles()
     names_of: dict[str, list[str]] = {}
     for key, counts in shown.items():
@@ -1187,7 +1192,7 @@ def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str,
         for n in names:
             owners.setdefault(_name_key(n), set()).add(key)
     out = {key: {"names": [n for n in names if len(owners.get(_name_key(n), ())) == 1], "sound": sound.get(key, False),
-                 "mic": held_mic.get(key, False)}
+                 "mic": held_mic.get(key, False), "media": media_of.get(key, False)}
            for key, names in names_of.items()}
     if until is None:
         with _apps_lock:
@@ -1252,19 +1257,37 @@ def _app_forms(value: Any, *, store: Any = None, until: float | None = None) -> 
     return {f for f in forms if f}
 
 
-def _live_beats(reading: Any, slot: Slot, playing: str, *, store: Any = None, until: float | None = None) -> bool:
+def _seen_by_measure(mine: set[str], live: "Live", *, store: Any = None, until: float | None = None) -> bool:
+    """Whether the playing measure can see an app (its identities ``mine``): it has a media session now, whatever the
+    session's status (:attr:`Live.sessions`, the ones playing included), or its timeline shows it playing media
+    (:func:`known_apps` ``media``: a session measured playing; a call's microphone never counts). An app with no media
+    session (a game, a DAW, a chat app outside a call) is never seen, so "not playing" is no fact about it."""
+    now = [a for a in dict.fromkeys((*live.playing, *live.sessions)) if a]
+    if any(mine & _app_forms(a, store=store, until=until) for a in now):
+        return True
+    apps = known_apps(store, until=until) if store is not None else {}
+    media = [k for k, a in apps.items() if a.get("media")]
+    if mine & set(media):
+        return True
+    return any(mine & _app_forms(k, store=store, until=until) for k in media)
+
+
+def _live_beats(reading: Any, slot: Slot, live: "Live", *, store: Any = None, until: float | None = None) -> bool:
     """skill20 (final-D P2): whether the one app measured playing fills an app slot in place of the caller's reading
-    (a value the words don't hold). It does for a reading of an app (the measure sees apps playing: a guess never beats
-    it) and for the slot's own default option (it names no more than the default would, and the slot's fill order puts
-    the live fact before the default). It does not for another of the slot's options (Yuki's own voice: no media
-    session the measure could see, so "speak up" read as it stays a named guess). Identities only
+    (a value the words don't hold). It does for the slot's own default option (it names no more than the default
+    would, and the slot's fill order puts the live fact before the default), and for a reading of an app the playing
+    measure can see (:func:`_seen_by_measure`: it says that app isn't the one playing). It does not for another of the
+    slot's options (Yuki's own voice) nor for an app the measure can never see (a game, a DAW, a chat app outside a
+    call: "turn the game down" with a playlist playing turns the game, named as a guess). Identities only
     (:func:`_app_forms`)."""
     mine = _app_forms(reading, store=store, until=until)
     if not mine:
         return False
     if slot.default not in (None, "") and mine & _app_forms(slot.default, store=store, until=until):
         return True
-    return not any(mine & _app_forms(o, store=store, until=until) for o in slot.options)
+    if any(mine & _app_forms(o, store=store, until=until) for o in slot.options):
+        return False
+    return _seen_by_measure(mine, live, store=store, until=until)
 
 
 def just_acted(store: Any, *, now: float, until: float | None = None, skills: Collection[str] = ()) -> set[str]:
@@ -1843,13 +1866,13 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             if reading is not None and slot.type == "app" and slot.live == "playing" and \
                     not (slot.ask_in_call and live.in_call):
                 playing = list(dict.fromkeys(live.playing))
-                if len(playing) == 1 and _live_beats(reading, slot, playing[0], store=store, until=until):
+                if len(playing) == 1 and _live_beats(reading, slot, live, store=store, until=until):
                     # skill20 (final-D P2: "Bit louder bro." with a playlist playing, the talker's ``target: system``
                     # raised the PC from 82.7 to 92.7 while Spotify's slider stayed at 40): a reading the words don't
-                    # hold (an app, or the slot's own default) never beats the one app measured playing (the slot's
-                    # FILL_ORDER: live before default); that app fills it, not a guess. Another option ("speak up"
-                    # read as Yuki's own voice, which the measure can't see) stands as a named guess, and with none or
-                    # two playing, or a call live, every reading stands as before
+                    # hold (the slot's own default, or an app the playing measure can see) never beats the one app
+                    # measured playing (the slot's FILL_ORDER: live before default); that app fills it, not a guess.
+                    # Another option (Yuki's own voice) or an app the measure can't see (a game) stands as a named
+                    # guess, and with none or two playing, or a call live, every reading stands as before
                     values[slot.name], filled[slot.name] = playing[0], "live"     # a fill: never in ``origin``
                     continue
             if reading is not None:
