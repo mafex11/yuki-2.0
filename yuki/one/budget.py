@@ -399,7 +399,7 @@ class TurnBudget:
 
 
 #: Contract C9's name ("budget.py ``Turn.closing_hold()``"): the turn's budget. The gate's ``policy.Turn`` has a
-#: ``closing_hold()`` too (this one's, and a tidy step still open), so a driver may ask either through ``getattr``.
+#: ``closing_hold()`` too (this one's miss reason only, contract C12), so a driver may ask either through ``getattr``.
 Turn = TurnBudget
 
 

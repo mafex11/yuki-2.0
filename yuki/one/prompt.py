@@ -72,8 +72,8 @@ a skill's last run (that skill again, corrects true).
 - Every act's result says what it did and what changed on their screen (After): read it before the next step. A step \
 that didn't take: another way, never the same step.
 - Keep their screen theirs: open things where they won't cover what they watch (place "other"). A result's \
-side_effect is what your act took from their screen and the one undoable step that undoes it: take it and say so in a \
-few words. A tidy-up never touches their own windows, drafts or work.
+tidied says what code already did about their windows: never redo it; a side_effect is a tidy-up to ask about (their \
+settings ask first). A tidy-up never touches their own windows, drafts or work.
 - You end the turn: done when After shows what their words were for, every part of it, and no side_effect is left; \
 then say nothing more, or one short line when there is something to say. Stuck after one other way of yours: \
 say so in one line and offer one other way; never loop.

@@ -1648,6 +1648,7 @@ class Executor:
         if self.tidy is None and call.tool in DESK_VERBS:
             self._desk_note(call, outcome)
         self._note_numbers(call, outcome)
+        self._names_log(call, outcome)
         self._read_cache.pop(int(call.hwnd or 0), None)
         if call.tool == "open_url" and _web_host(call.input.get("url")):
             # the browser a later page_at reads: the one this address went to by name; one that went to Windows'
@@ -3352,6 +3353,22 @@ class Executor:
         except Exception:  # noqa: BLE001 - presentation only
             pass
         return about
+
+    def _names_log(self, call: Call, outcome: Any) -> None:
+        """names21 (merge note 5): a ``launch_app`` that took a misheard name for one of the user's own apps or sites
+        (its result's ``details["names_match"]``, which the Dispatcher's outcome carries as it came) logs the measure,
+        content-free: kind, how, source, score, margin; never the name or the words. Never raises."""
+        if call.tool != "launch_app":
+            return
+        try:
+            payload = outcome.payload if isinstance(getattr(outcome, "payload", None), dict) else {}
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            match = details.get("names_match")
+            if isinstance(match, dict):
+                self._emit_log("names_match", verb=call.tool, kind=match.get("kind"), how=match.get("how"),
+                               source=match.get("source"), score=match.get("score"), margin=match.get("margin"))
+        except Exception:  # noqa: BLE001 - a log line only
+            pass
 
     def _note_numbers(self, call: Call, outcome: Any) -> None:
         for key in ("hwnd", "expect_hwnd", "element", "read", "x", "y"):

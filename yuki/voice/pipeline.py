@@ -3849,7 +3849,7 @@ def _code_word(why: str) -> dict[str, Any]:
 
 def _hold_text(why: str) -> str:
     """voice20 review M1 (contract C9): what a held closing reply is answered with: the sentence Lane ONE's
-    ``closing_hold()`` gave (code's own words to the agent, e.g. its miss or its tidy step), else :data:`ONE_MISS_HOLD`
+    ``closing_hold()`` gave (code's own words to the agent: its miss, contract C12), else :data:`ONE_MISS_HOLD`
     (nothing, or a bare code word). A shape test on code's string, never the user's words."""
     text = " ".join(str(why or "").split())
     return ONE_MISS_HOLD if not text or "why" in _code_word(text) else text

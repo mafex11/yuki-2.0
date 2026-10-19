@@ -284,6 +284,9 @@ class OneResult:
     cover: str = ""
     #: One20 (S5): what code already did as the second way inside this call (a code word: ``unread``, ``choose``).
     second: str = ""
+    #: names21 (merge note 5): an ``open_app`` whose launch took a misheard name for one of the user's own apps or
+    #: sites: the measure's content-free facts (kind, how, score, margin, source), for the log line only.
+    names_match: Mapping[str, Any] | None = None
 
     @property
     def refused(self) -> bool:
@@ -343,6 +346,7 @@ class OneResult:
                 "tidy": self.tidy, "tidy_step": bool(self.tidy_step), "tidied": self.tidy_state or None,
                 "cover": bool(self.cover),
                 "second": self.second or None,
+                "names_match": dict(self.names_match) if self.names_match else None,
                 "countdown": self.countdown or None, "result_chars": len(self.result), "after_chars": len(self.after),
                 "evidence": len(self.evidence), "ms": round(self.ms, 1)}
 
@@ -1094,6 +1098,8 @@ class Runner:
         text = str(report or "") if facts.get("read") else str(report or "")[:RESULT_CHARS]
         result = OneResult(name, status, verified=verified, result=text, said=said, heard=heard, then=then,
                            decision=decision, verb=verb, tidy=bool(getattr(decision, "tidy", False)))
+        if isinstance(facts.get("names_match"), Mapping):
+            result.names_match = dict(facts["names_match"])   # names21 (merge note 5): the launch's measure, logged
         if asked:
             result.question = str(facts.get("_asked") or "")
         elif status not in CLEAN and status not in (NO_CHANGE, STARTING, READ):

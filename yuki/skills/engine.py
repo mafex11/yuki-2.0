@@ -1851,7 +1851,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
           slot_source=sorted(set(plan.filled.values())), slots=len(plan.filled), named=len(plan.named),
           dropped=len(plan.dropped), dropped_slots=_slot_flags(plan.dropped), skipped=len(plan.skipped),
           source=sorted(set(sources.values())) or None, guessed_slots=_slot_flags(guessed), origin=ctx.origin,
-          reordered=True if planned != in_file else None, rested=rested or None)
+          reordered=True if planned != in_file else None, rested=rested or None,
+          **_measured_fields(getattr(plan, "measured", None)))
     deadline = started + float(ctx.budget_s)
     tried: list[dict[str, Any]] = []
     measure = _Measure(ctx, skill, plan.values)
@@ -2221,6 +2222,31 @@ def _slot_flags(names: Any) -> dict[str, bool] | None:
     (plain lower-case identifiers; anything else is left out), never their values. ``None`` when there are none."""
     flags = {str(n): True for n in names or () if isinstance(n, str) and _SLOT_NAME.fullmatch(n)}
     return flags or None
+
+
+def _measured_fields(measured: Any) -> dict[str, Any]:
+    """names21 (merge note 1): the plan's names measure (:attr:`yuki.skills.resolve.Plan.measured`) for the content-free
+    ``skill_resolve`` line: the slots it took (``names_slots``, schema names only), how many by where the words came
+    from (``names_by_value``, ``names_by_turn``, ``names_agreed``: an agreed slot is ``heard`` in ``source`` too), how
+    many are sites (``names_sites``), the lowest score and margin (``names_score``, ``names_margin``). Never a value or
+    a name. ``{}`` when nothing was measured; never raises."""
+    try:
+        from yuki.skills.names import SITE
+        from yuki.skills.resolve import HOW_AGREE, HOW_TURN, HOW_VALUE
+
+        got = {k: v for k, v in dict(measured or {}).items() if isinstance(v, Mapping)}
+        if not got:
+            return {}
+        hows = [str(v.get("how") or "") for v in got.values()]
+        scores = [float(v["score"]) for v in got.values() if isinstance(v.get("score"), (int, float))]
+        margins = [float(v["margin"]) for v in got.values() if isinstance(v.get("margin"), (int, float))]
+        return {"names_slots": _slot_flags(list(got)), "names_by_value": hows.count(HOW_VALUE) or None,
+                "names_by_turn": hows.count(HOW_TURN) or None, "names_agreed": hows.count(HOW_AGREE) or None,
+                "names_sites": sum(1 for v in got.values() if v.get("kind") == SITE) or None,
+                "names_score": round(min(scores), 3) if scores else None,
+                "names_margin": round(min(margins), 3) if margins else None}
+    except Exception:  # noqa: BLE001 - a log field never breaks a run
+        return {}
 
 
 #: x5Fallback: the hand-offs whose rung acted unconfirmed (or whose run broke partway) in the last

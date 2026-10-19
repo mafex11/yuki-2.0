@@ -3244,6 +3244,10 @@ class Hands:
             gate["done"].add(key)   # lVoice: this step is done for these words (a repeat of it is the same step)
             if url:
                 gate["urls"].add(url)
+            elif facts.get("opened_url"):
+                # names21 (merge note 6): a site open_app opened by a measured name is that address opened this turn
+                # (a later open_url of it is the same step, never a second tab)
+                gate["urls"].add(_url_key({"url": facts["opened_url"]}))
         # fx2: an opening that leaves part of their request to do (the talker's own "then") is not the whole request;
         # x3 (3b): nor is a window or tab step that does (a focus, a restore, a tab shown or opened first); phase 2
         # (2.4): nor a sound hand's ("pause it" then "mute the PC"): the talker's own reading of what is left
@@ -3304,6 +3308,9 @@ class Hands:
                            refused_at=facts.get("refused_at"), action=(op or None),
                            # desk20 (S21): a launch's stage ends (code words and numbers only)
                            **({"stage_ms": facts["stage_ms"]} if isinstance(facts.get("stage_ms"), dict) else {}),
+                           # names21 (merge note 5): a launch's names measure (code words and numbers only)
+                           **({"names_match": dict(facts["names_match"])}
+                              if isinstance(facts.get("names_match"), dict) else {}),
                            **{k: v for k, v in facts.items()
                               if (isinstance(v, (int, float, bool)) or v is None)
                               and k not in ("question", "request_id", "refused_why", "refused_at")})
@@ -3339,7 +3346,8 @@ class Hands:
         if confirmed and rest and turn is not None and self._given(self._then_looks, turn) >= THEN_LOOKS_PER_TURN:
             # phase 2 (2.4): the talker had its "still to do" looks in this turn: what is left goes to the thinker by
             # code (never a loop, never silence)
-            steps = [*list((then_open or {}).get("steps") or []), await asyncio.to_thread(self._end_step, name, args)]
+            steps = [*list((then_open or {}).get("steps") or []),
+                     await asyncio.to_thread(self._end_step, name, args, facts)]
             context = _END_REST_CONTEXT["then"].format(steps="; ".join(s for s in steps if s)[:REST_REPORT_CHARS],
                                                        earlier=self._earlier_not_done())
             self._then_open = None
@@ -3359,7 +3367,7 @@ class Hands:
             if turn is not None:
                 self._then_looks = (turn, self._given(self._then_looks, turn) + 1)
                 steps = list((then_open or {}).get("steps") or [])
-                steps.append(await asyncio.to_thread(self._end_step, name, args))
+                steps.append(await asyncio.to_thread(self._end_step, name, args, facts))
                 self._then_open = {"turn": turn, "steps": steps[-4:], "hand": name,
                                    "args": {**dict(args), "then": rest}, "report": report[:REST_REPORT_CHARS]}
                 if self.log is not None:
@@ -3976,10 +3984,11 @@ class Hands:
 
     # -- what is left of a request: the steps in code's words, a rest still open --------------------------------------
 
-    def _end_step(self, name: str, args: dict[str, Any]) -> str:
+    def _end_step(self, name: str, args: dict[str, Any], facts: dict[str, Any] | None = None) -> str:
         """One hand's step in code's words for the thinker (a fact of its call: what it opened, brought up or scrolled,
-        in which app; the address the call gave; never a report or a title). Blocking (it may read the window's app):
-        called off the loop. Never raises."""
+        in which app; the address the call gave; never a report or a title). names21 (merge note 2): an ``open_app``
+        whose launch took a misheard name for one of the user's own apps or sites (``facts``) names what opened.
+        Blocking (it may read the window's app): called off the loop. Never raises."""
         try:
             op = str(args.get("action") or ("show" if name == "tab" else ""))
             # kHands r1 L9: a window or tab call that named the app is in that app (the window found from it, or the
@@ -3995,7 +4004,10 @@ class Hands:
                 where = " ".join(str(args.get("app") or "").split())[:40] or "the browser"
                 return f"opened the address {url} in {where}"
             if name == "open_app":
-                return "opened the app " + " ".join(str(args.get("name") or "").split())[:60]
+                named = _opened_name(facts)
+                if named and (facts or {}).get("names_match", {}).get("kind") == "site":
+                    return f"opened their site {named}"
+                return "opened the app " + (named or " ".join(str(args.get("name") or "").split())[:60])
             if name == "tab" and op == "new":
                 return (f"opened the address {url} in a new tab of {app or 'the browser'}" if url
                         else f"opened an empty new tab in {app or 'the browser'}")
@@ -4154,7 +4166,10 @@ class Hands:
                                       and str(args.get("url") or "").strip()):
                 return "It's up."   # verified at the address and titled (never silent after "On it.")
             if name == "open_app":
-                return "It's open."   # its own window verified in front
+                # names21 (the user's decision 3): a misheard name taken as one of their own apps or sites is named as
+                # what opened ("Opened Discord."), never a warning; else its own window verified in front
+                named = _opened_name(facts)
+                return f"Opened {named}." if named else "It's open."
         except Exception:  # noqa: BLE001
             return ""
         return ""
@@ -5874,6 +5889,17 @@ class Hands:
                 facts["verified"] = ok   # a backend that does not report it (stubs written before appOpen)
             if _detail(result, "process_name"):
                 facts["app"] = str(_detail(result, "process_name"))
+            match = _detail(result, "names_match")
+            if isinstance(match, dict):
+                # names21 (merge note 5): the launch took a misheard name for one of the user's own apps or sites: its
+                # measure, content-free (code words and numbers), for the hands' log and ONE's step facts
+                facts["names_match"] = {k: match.get(k) for k in ("kind", "how", "score", "margin", "source")}
+                # merge note 2: what opened (an app's Start name, a site's host), for code's done line and the step
+                # words only; a string fact, never logged (the hands' log keeps numbers and flags)
+                site = str(_detail(result, "site") or "") if match.get("kind") == "site" else ""
+                facts["opened_name"] = " ".join((site or str(_detail(result, "name") or "")).split())[:60]
+                if site and _detail(result, "url"):
+                    facts["opened_url"] = str(_detail(result, "url"))   # merge note 6: the turn's url gate
             if _detail(result, "hwnd"):
                 facts["live_hwnd"] = _detail(result, "hwnd")   # lVoice: the action log's line holds while it is up
             if ok and _detail(result, "starting") and isinstance(_detail(result, "launcher"), dict):
@@ -7659,6 +7685,17 @@ class _ResolveWait:
 
             self.slow = True
             return Refused(self._skill_key, "memory_slow")
+
+
+def _opened_name(facts: dict[str, Any] | None) -> str:
+    """names21 (merge note 2): what an ``open_app`` opened when its launch took a misheard name for one of the user's
+    own apps or sites (``facts["names_match"]``): the app's Start name or the site's host, else ``""``. Never raises."""
+    try:
+        if not isinstance((facts or {}).get("names_match"), dict):
+            return ""
+        return " ".join(str(facts.get("opened_name") or "").split())[:60]
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _url_key(args: dict[str, Any]) -> str:
