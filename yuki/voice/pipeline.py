@@ -2033,6 +2033,7 @@ class _Turn:
     claim_dropped: bool = False          # kMind: a line of its reply claimed something done with nothing done (dropped)
     claim_rerun: bool = False            # ... and it was answered again for that (the rerun is told so)
     opened_quiet: bool = False           # voice21 (S10): its quiet marker on their opening words was waived once
+    quiet_refused: bool = False          # integration F4: its quiet on their opening words was refused (S10, any path)
     # vGame (5 Oct): said to Yuki by measured evidence, and what the fast path did with it
     named: bool = False                  # the name was heard with it (the wake word), or it came right after the name
     fast: str | None = None              # "dismiss" (ended at once) | "name" (the name alone, answered at once)
@@ -2470,9 +2471,11 @@ class TurnObserver:
         stay_quiet: its judgement that the words were for someone else), "unanswered" when, in a call, the next
         words came before Yuki said or did anything - nobody judged those words, so memory's extractor reads them
         and judges from their content (report 77b: 15 of 23 such turns were followed by a request Yuki answered,
-        and were kept out of memory as talk to the others by this timing alone), else "yuki"."""
+        and were kept out of memory as talk to the others by this timing alone), else "yuki". Integration F4: a turn
+        whose quiet on their opening words was refused (S10: said to Yuki; the answer came in a turn of its own) is
+        never "others"."""
         if not reply and not turn.counted:
-            if turn.quiet:
+            if turn.quiet and not getattr(turn, "quiet_refused", False):
                 return "others"
             if turn.call:
                 return "unanswered"
@@ -3175,22 +3178,45 @@ def quiet_answered(messages: list[Any] | None) -> set[int]:
 
     Read from the context's own structure (which tool the next assistant message called), so the
     thinker is never handed those words as what the user said to Yuki. Plumbing, no words read.
+    Integration F1 (voice21 S10): a stay_quiet whose own result refused it (a ``not_quiet`` key: the opened-first,
+    held and owed refusals, ONE's) answers nothing; the next assistant message (the rerun's reply) decides.
     """
     out: set[int] = set()
     items = list(messages or [])
     for i, message in enumerate(items):
         if not (isinstance(message, dict) and message.get("role") == "user"):
             continue
-        for nxt in items[i + 1:]:
+        for j, nxt in enumerate(items[i + 1:], start=i + 1):
             if not isinstance(nxt, dict) or nxt.get("role") == "user":
                 break
             if nxt.get("role") == "assistant":
                 calls = nxt.get("tool_calls") or []
                 names = [(c.get("function") or {}).get("name") for c in calls if isinstance(c, dict)]
                 if names and all(n == "stay_quiet" for n in names) and not nxt.get("content"):
+                    ids = {str(c.get("id")) for c in calls if isinstance(c, dict)}
+                    if _quiet_refused(items[j + 1:], ids):
+                        continue
                     out.add(id(message))
                 break
     return out
+
+
+def _quiet_refused(items: list[Any], call_ids: set[str]) -> bool:
+    """Integration F1: whether one of ``call_ids`` (stay_quiet calls) got a result that refused it: a tool message for
+    it whose JSON content is a mapping with the ``not_quiet`` key. A structural key, never words. Never raises."""
+    import json
+
+    for m in items:
+        if not (isinstance(m, dict) and m.get("role") == "tool" and str(m.get("tool_call_id")) in call_ids):
+            continue
+        content = m.get("content")
+        try:
+            body = content if isinstance(content, dict) else json.loads(content or "")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(body, dict) and "not_quiet" in body:
+            return True
+    return False
 
 
 def _last_role(context: Any) -> str | None:
@@ -4191,6 +4217,10 @@ class OneVoice:
         self._hold_why = ""
         self._hold_src = ""
         self._hold_asks = False
+        #: Integration F2: the turn budget the hold paused while it waits on speech and quiet (waits are not counted,
+        #: as the countdown's: the retry window stays open for the held round), resumed when the round goes or the turn
+        #: ends (:meth:`_hold_resume`); ``None``: none paused.
+        self._hold_paused: Any = None
         #: voice20 (final-D S22d): the owed tokens of acts whose announcing words (a say_first, or the reply's words
         #: before the call) were heard and that did not take: kept owed past a later try, until words are heard.
         self._claimed: set[int] = set()
@@ -4413,6 +4443,7 @@ class OneVoice:
         self._quiet_refused, self._rerun, self._rerun_used = False, "", False
         self._hold, self._hold_used, self._hold_why = "", False, ""
         self._hold_src, self._hold_asks = "", False
+        self._hold_resume()   # integration F2: never a budget left paused (the last turn's own ended above)
         self._claimed = set()
         self._answer = None
         if turn.asks and self.anchor_text:
@@ -4656,6 +4687,12 @@ class OneVoice:
             # review L1) the reply watch gives the agent one more round with ONE's own sentence as the note
             self._hold, self._hold_at, self._hold_used, self._hold_why = "due", time.monotonic(), True, why
             self._hold_asks = bool(getattr(call, "one_asks", False))
+            # integration F2: the wait on the words' end and their quiet is not counted (the budget's own rule for
+            # waits): the retry window the hold offers is still open when the held round's act comes
+            budget = getattr(self.turn, "budget", None)
+            if budget is not None and self._hold_paused is None and callable(getattr(budget, "pause", None)):
+                budget.pause()
+                self._hold_paused = budget
             self._log("hold", closing="words", round=int(getattr(call, "one_round", 0) or 0), source=self._hold_src,
                       asks=self._hold_asks, **_code_word(why))
             return
@@ -4802,8 +4839,18 @@ class OneVoice:
         note = f"[{_hold_text(self._hold_why)}]"
         return f"{note}\n{MARKER_REMINDER}" if getattr(self.c, "channel", "") == "marker" else note
 
+    def _hold_resume(self) -> None:
+        """Integration F2: the budget the hold paused counts again (the held round's own generation is counted)."""
+        budget, self._hold_paused = self._hold_paused, None
+        if budget is not None:
+            try:
+                budget.resume()
+            except Exception as exc:  # noqa: BLE001 - never breaks the turn
+                self._log("hold", resume_error=type(exc).__name__)
+
     def hold_go(self) -> str:
         """The reply watch gives the held turn its round now (once a turn): the note it runs with."""
+        self._hold_resume()
         self._hold = "asked"
         self._log("hold", go=True, round=self.rounds, waited_ms=round((time.monotonic() - self._hold_at) * 1000),
                   source=self._hold_src, asks=self._hold_asks, **_code_word(self._hold_why))
@@ -4839,6 +4886,7 @@ class OneVoice:
         self.over = True
         self._rerun = ""
         self._hold = ""
+        self._hold_resume()   # integration F2: a hold that expired, or their new words: the wait is over
         self._cancel_timer()
         # final-B (one-voice RC B/O1c): the turn is over: what it still owes falls due now (said by code at the next
         # quiet moment unless the agent's own words were heard for it)
@@ -9391,6 +9439,7 @@ class Conversation:
             if one is not None and one.heard_this_turn():
                 return False
             self._opened_quiet_used = True
+            turn.quiet_refused = True   # integration F4: their words were for Yuki (memory never files them as others')
             self.log.event("session", state="opened_quiet_refused", session=self.session, opened=how, via=via)
             return True
         except Exception:  # noqa: BLE001
@@ -9403,9 +9452,9 @@ class Conversation:
         other than the reflex's mark (a hand, run_skill, a hand-off; the calls that never act, :data:`NOT_ACTING`,
         do not count, nor ONE's reads); a call that closes it (end_conversation, go_quiet); a learned reflex for these
         words that went through (``turn.reflex`` in :attr:`REFLEX_WENT`) or is still running
-        (:meth:`_reflex_state`); a hand acting now (``busy_tools``) or a task whose outcome will be said
-        (``VoiceBridge._answer_on_its_way``). Stream and job facts only, never the words. Never raises (unsure: acted,
-        so the quiet stands)."""
+        (:meth:`_reflex_state`); a hand acting now (``busy_tools``) or a task for these words whose outcome will be
+        said (``VoiceBridge._answer_for_words``). Stream and job facts only, never the words. Never raises (unsure:
+        acted, so the quiet stands)."""
         try:
             tools = list(getattr(turn, "tools", None) or ())
             if [t for t in self._acting_tools(tools) if t not in NOT_ACTING and t != "reflex"]:
@@ -9420,7 +9469,9 @@ class Conversation:
             if bridge is not None:
                 if int(getattr(bridge, "busy_tools", 0) or 0) > 0:
                     return True
-                on_way = getattr(bridge, "_answer_on_its_way", None)
+                # integration F3: only a task for these words (this conversation's current turn); a task of an
+                # earlier conversation still running never holds the refusal back
+                on_way = getattr(bridge, "_answer_for_words", None) or getattr(bridge, "_answer_on_its_way", None)
                 if callable(on_way) and on_way():
                     return True
             return False

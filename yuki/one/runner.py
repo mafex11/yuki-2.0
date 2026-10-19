@@ -1085,6 +1085,12 @@ class Runner:
             given = args.get("say_when_done") if name != "run_skill" else None
             line = (done_line if done_line is not None else
                     (_words(given) if given is not None else self.verbs.code_line(name, resolved, facts)))
+            named = _words(facts.get("opened_name")) \
+                if name == "open_app" and isinstance(facts.get("names_match"), Mapping) else ""
+            if named and done_line is None and named.casefold() not in line.casefold():
+                # integration F2 (decision 3): a misheard name taken as one of their own apps or sites is said as what
+                # opened (code's line), never the words as heard in the agent's line written before the act
+                line = self.verbs.code_line(name, resolved, facts)
             if not line and done_line is None:
                 # a window or tab step the hands said their own step line for (what it left showing: "Arc is showing
                 # ..."), as they do under ``all``: never a silent focus
@@ -1254,20 +1260,27 @@ class Runner:
                 # review F1: a move of a window the turn's acts placed or sized as asked is no side effect: code
                 # leaves it (its guard's ``asked_place``), at "ask" too (no question about it, as the planner)
                 as_asked = step is not None and step.get("action") == "place" and step.get("hwnd") in state.arranged
+                # integration (one-tidy-on-unlanded-act): code's step only after an act that took, as the hands' look
+                # (a failed or unconfirmed try's turn goes on to another way, whose own diff or the tidy debt takes it)
+                landed = result.status in (DONE, ALREADY)
                 if do and state.tidied:
                     # review F4: code already decided this turn's one tidy step (taken or left): a later flagged act
                     # settles by code too, as under "all" (one look a turn), never handed to the agent
                     settled = True
                 elif step is not None and (do or as_asked):
-                    pending = step
+                    if landed or not do:
+                        pending = step
+                    # else: code's one step waits (``state.tidied`` and ``Tidy.given`` stay unset, the flags stay on
+                    # the result); under "do" the agent never takes or asks for it
                 else:
                     result.tidy_step = words
+            # r25 harness (H9): the diff's own record first, so a code tidy step's ``one_run`` row comes after it
+            self._emit("one_diff", tool=name, **d.facts(), legal_step=bool(pending or result.tidy_step) or None)
             self._cover(d, result, turn, state, say)
             if pending is not None:
                 self._tidy_result(pending, d, after, result, turn, state, say)
             elif settled:
                 self._tidy_settled(result, "", turn)
-            self._emit("one_diff", tool=name, **d.facts(), legal_step=bool(pending or result.tidy_step) or None)
         except Exception as exc:  # noqa: BLE001 - no diff: the result stands
             self._emit("one_diff_error", tool=name, error=type(exc).__name__)
 
@@ -1430,6 +1443,12 @@ class Runner:
             why = why or type(exc).__name__
         self._emit("one_tidy_code", action=str(step.get("action") or ""), state=done, why=why or None, ok=bool(ok),
                    said=bool(said), ms=round((time.perf_counter() - started) * 1000, 1))
+        if done != "left" or facts.get("refused"):
+            # r25 harness (H9): code's step as the act row it is (the "all" talker's ``hands op=window tidy=True``):
+            # the window verb, its status, a tidy step by code; content-free
+            self._emit("one_run", tool="window", verb="window", status=(DONE if ok else FAILED if done == "failed"
+                                                                         else REFUSED),
+                       tidy=True, by_code=True, said=bool(said), ms=round((time.perf_counter() - started) * 1000, 1))
         return done, said
 
     def _cover(self, d: Any, result: OneResult, turn: policy.Turn, state: RunState, say: Any) -> None:

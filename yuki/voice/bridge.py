@@ -3171,6 +3171,19 @@ class VoiceBridge(QObject):
         return any(j.source == "voice" and not j.remember and j.state in (QUEUED, RUNNING) and not j.unadopted
                    for j in jobs)
 
+    def _answer_for_words(self) -> bool:
+        """Integration F3 (voice21 S10): a task handed over for the user's current words (this conversation's current
+        turn, ``(convo, user_turn)`` as :meth:`_turn_now` reads it) is queued or running, so its outcome will answer
+        them. A job of an earlier turn or conversation never counts (the bridge outlives conversations). The turn
+        unread: :meth:`_answer_on_its_way` (unsure: on its way)."""
+        now = self._turn_now()
+        if now is None:
+            return self._answer_on_its_way()
+        with self._lock:
+            jobs = list(self._jobs.values())
+        return any(j.source == "voice" and not j.remember and j.state in (QUEUED, RUNNING) and not j.unadopted
+                   and (j.convo, j.user_turn) == now for j in jobs)
+
     def _outcome_said(self, job: Job) -> None:
         """The outcome of what they asked last is being said: no acknowledgement may come after it (v3.13)."""
         now = self._turn_now()

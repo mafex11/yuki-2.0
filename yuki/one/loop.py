@@ -660,6 +660,9 @@ class OneAgent(Brain):
                 # final-B (one-desk D3/F6): an earlier flagged act's cover still there with no tidy step taken: the
                 # net After goes on this reply's last result and the model gets one round (once a turn)
                 debt = tidy_debt(runner, turn)
+                # integration T5: under "do" the debt's own step is code's, and its line went to ``_speak`` after the
+                # reply's lines were taken: it is part of this reply (never cleared unseen by the next request)
+                lines += self._take_lines()
                 if debt is None:
                     # addendum decision 2 / must-fix 2: a clean reply ends in code, as today, by the runner's one
                     # settle rule: code's verified line (said at verification) is the reply, no closing model call

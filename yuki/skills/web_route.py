@@ -1669,8 +1669,9 @@ def _target(call: RouteCall, opens: str) -> tuple[str | None, dict[str, Any], st
     url, expect = page_address(said, call.values.get("page"), call.values.get("item"))
     if not url and expect.get("why") == "no_address" and not _words(call.values.get("page")):
         # names21 (final-D S18; the user's decision 3): a site value no site file and no address names ("Porbex
-        # Kaladra") that is, measured, one of the user's own sites (excalidraw.com) opens that site, named in the done
-        # line ("Excalidraw.com is up."); none clearly: as before (no address, the next rung or the hand-off)
+        # Kaladra") that is, measured as a name (the value alone, never the turn: integration F1), one of the user's
+        # own sites (excalidraw.com) opens that site, named in the done line ("Excalidraw.com is up."); none clearly:
+        # as before (no address, the next rung or the hand-off)
         took = measured_site(call, said)
         if took:
             said = took
@@ -1684,12 +1685,12 @@ def _target(call: RouteCall, opens: str) -> tuple[str | None, dict[str, Any], st
 def measured_site(call: RouteCall, said: str) -> str:
     """names21 (final-D S18): the user's own site (its host, :func:`yuki.skills.names.own_site_entries`) a site value
     with no address is a mishearing of: the value measured as a name given to the act
-    (:func:`yuki.skills.names.best_match` ``as_name``: "Porbex Kaladra" -> excalidraw.com), else the user's newest turn
-    measured whole (the stricter turn bar: a value that is the model's description, "drawing site", for "Open Porbex
-    Kaladra"; mishearings only: a site the turn names as written is the user's own word for another site, never this
-    one, so "close youtube and open my drawing site" is no youtube.com, names21 review F2); one clear winner, else
-    ``""``. Logged content-free (``names_match``: where the words came from, the name's source, the score and the
-    margin). Never raises."""
+    (:func:`yuki.skills.names.best_match` ``as_name``: "Porbex Kaladra" -> excalidraw.com); one clear winner, else
+    ``""``. Integration F1: the value only, never the rest of the turn. Every web.open_page run went through the
+    resolver, which already read the newest turn for a value the words don't hold (with what Yuki just opened left
+    out) and deliberately not for a value the words hold (names21 review F1: "You opened kit hub again, I said my
+    drawing site" must never open github.com again). Logged content-free (``names_match``: where the words came from,
+    the name's source, the score and the margin). Never raises."""
     try:
         from yuki.skills import names as N
 
@@ -1698,10 +1699,6 @@ def measured_site(call: RouteCall, said: str) -> str:
         if not sites:
             return ""
         got, how = (N.best_match(said, sites, as_name=True), "value") if said else (None, "value")
-        if got is None:
-            turns = [str(w) for w in getattr(call.ctx, "words", None) or () if str(w or "").strip()]
-            if turns:
-                got, how = N.best_match(turns[-1], sites, literal_ok=False), "turn"
         if got is None:
             return ""
         name, score, margin = got

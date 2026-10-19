@@ -19,7 +19,10 @@ with no single close control then goes by the browser's own close-tab key, from 
 :func:`yuki.actions.launch.web_app`): the tab is found by its RuntimeId in the strip (never inside a web page's
 Document: the strip walk never enters one, and the tab's own ancestors are checked again before any key), the Act
 switch and the game gate are asked first, the tab is selected and seen selected, the window is brought to the front
-and seen there, the key is sent to that window only, and the strip is read again to see the tab gone.
+and seen there, the key is sent to that window only, and the strip is read again to see the tab gone. Integration T4:
+once it is seen gone, the rung undoes its own side effects: the tab the user was on is selected again (UIA, no key)
+and the window that was in front gets the front back (``place.focus_back``, gated and undoable), while the browser is
+still in front (``details["keys_rung"]``: ``reselected``, ``front_back``).
 
 desk20 review: the close key closes every selected tab (a browser's strip is multiselectable), so right before the key
 the tab must be the one and only selected TabItem of the whole strip, read whole (:func:`_only_selected`; a user's
@@ -483,6 +486,9 @@ def _close_by_keys(hwnd: int, tab_id: str, keys: tuple[str, ...]) -> dict[str, A
         if _inside_document(automation, element):
             shared["why"] = "in_page"   # a page's own tab widget: never a key
             return
+        # integration T4: the tab the user was on (the strip's selected tab other than this one), selected again once
+        # this one is gone (:func:`_reselect`)
+        shared["was_on"] = [str(t.tab_id) for t, _e in found if t.selected and t.tab_id and t.tab_id != tab_id]
         state = _only_selected(found, tab_id, whole)
         if state:
             # review 1: not selected, or other tabs selected with it (a multi-selection the key would close too), or
@@ -499,11 +505,14 @@ def _close_by_keys(hwnd: int, tab_id: str, keys: tuple[str, ...]) -> dict[str, A
         shared["state"] = state
 
     picked = _Pending(select, "yuki-tab-keys", KEYS_SELECT_S).wait()
+    out["was_on"] = list(picked.get("was_on") or [])   # integration T4: a select may have run already
     if picked.get("why") or picked.get("state") != "":
         out["why"] = picked.get("why") or picked.get("state") or "not_selected"
         return out
     started = time.monotonic()
-    if int(_user32.GetForegroundWindow() or 0) != int(hwnd):
+    front = int(_user32.GetForegroundWindow() or 0)
+    if front != int(hwnd):
+        out["front_before"] = front or None   # integration T4: given back once the tab is gone (:func:`_front_back`)
         focused = focus_window(int(hwnd))
         details = getattr(focused, "details", None) or {}
         if not focused.ok:
@@ -544,6 +553,65 @@ def _close_by_keys(hwnd: int, tab_id: str, keys: tuple[str, ...]) -> dict[str, A
         return out
     out["how"] = f"the browser's close-tab key ({out['keys']})"
     return out
+
+
+def _reselect(hwnd: int, was_on: list[str]) -> str:
+    """Integration T4: after the keyboard rung closed its tab, the tab the user was on before its select (the strip's
+    one other selected tab, by RuntimeId) is selected again through UI Automation (SelectionItem.Select, no key), so the
+    browser shows what it showed before. A code word: ``reselected``, ``already`` (it is the selected one),
+    ``gone`` (no longer in the strip), ``none`` (no single tab to go back to: the closed tab was the one showing, or
+    several were selected), ``failed``. Blocking, bounded; never raises."""
+    if len(was_on) != 1:
+        return "none"
+    from yuki.actions.input import _Pending
+    from yuki.perception.tree import _uia_core
+
+    def job(automation: Any, shared: dict) -> None:
+        tab, element, _found, _whole = _find(automation, hwnd, was_on[0], KEYS_SELECT_S * 0.4)
+        if tab is None:
+            shared["got"] = "gone"
+            return
+        if tab.selected:
+            shared["got"] = "already"
+            return
+        shared["got"] = "reselected" if _select(element, _uia_core()) else "failed"
+
+    try:
+        got = _Pending(job, "yuki-tab-keys-back", KEYS_SELECT_S).wait()
+        return str(got.get("got") or "failed")
+    except Exception:  # noqa: BLE001
+        return "failed"
+
+
+def _front_back(hwnd: int, front_before: Any) -> str:
+    """Integration T4: the window that was in front before the keyboard rung raised ``hwnd`` gets the front back
+    (``yuki.actions.place.focus_back``: gated, journaled, undoable), only while ``hwnd`` is still in front (the user
+    did not move the front meanwhile), the window still exists and shows, and it is none of Yuki's own. A code word:
+    ``given``, ``moved_on`` (the front is no longer ``hwnd``), ``gone``, ``own``, ``failed``; ``none`` when the rung
+    raised nothing. Never raises."""
+    try:
+        front_before = int(front_before or 0)
+    except (TypeError, ValueError):
+        return "none"
+    if not front_before:
+        return "none"
+    try:
+        import win32gui
+
+        from yuki.actions.input import _user32
+        from yuki.agent.tools import _is_own_window
+
+        if not win32gui.IsWindow(front_before) or not win32gui.IsWindowVisible(front_before):
+            return "gone"
+        if _is_own_window(front_before):
+            return "own"
+        if int(_user32.GetForegroundWindow() or 0) != int(hwnd):
+            return "moved_on"
+        from yuki.actions.place import focus_back
+
+        return "given" if focus_back(front_before).ok else "failed"
+    except Exception:  # noqa: BLE001
+        return "failed"
 
 
 def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
@@ -629,7 +697,7 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
         # desk20 (S9): no single close control was chosen (Chrome's TabItems have no child at all): the browser's own
         # close-tab key on that very tab, every check first (:func:`_close_by_keys`), then the strip watched
         rung = _close_by_keys(int(hwnd), tab_id, keys)
-        details["keys_rung"] = {k: v for k, v in rung.items() if k not in ("said",)}
+        details["keys_rung"] = {k: v for k, v in rung.items() if k not in ("said", "was_on", "front_before")}
         if rung.get("refused"):
             details["refused"] = rung["refused"]
         if rung.get("sent"):
@@ -647,6 +715,12 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
                 shared["after"], shared["after_complete"] = seen["after"], seen.get("after_complete", True)
             else:
                 shared["after"], shared["after_complete"] = [], False   # no read after the key: never the old one
+            if shared["seen"]:
+                # integration T4: the rung undoes its own side effects (the brains' tidy steps can't: a tab switch is
+                # no window step, and the raised window counts as asked): the tab they were on shows again, and the
+                # window that was in front gets the front back
+                details["keys_rung"]["reselected"] = _reselect(int(hwnd), list(rung.get("was_on") or []))
+                details["keys_rung"]["front_back"] = _front_back(int(hwnd), rung.get("front_before"))
         else:
             shared["keys_why"], shared["keys_said"] = rung.get("why"), rung.get("said")
     tab = shared.get("tab") or {}
@@ -699,12 +773,26 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
         return finish(False, f"asked {where} to close ({shared.get('how')}), but it is still in the strip after "
                              f"{CLOSE_WATCH_S:g} s" + (f"; {len(lost)} other tab(s) left the strip meanwhile"
                                                        if lost else ""))
+    back = _KEYS_BACK_SAID.get(str((details.get("keys_rung") or {}).get("reselected") or ""), "") \
+        + _KEYS_FRONT_SAID.get(str((details.get("keys_rung") or {}).get("front_back") or ""), "")
     if not whole:
         return finish(True, f"closed {where} ({shared.get('how')}); seen gone from the strip (the last read of it was "
-                            f"cut short)")
+                            f"cut short){back}")
     return finish(True, f"closed {where} ({shared.get('how')}); the strip, read again, has {len(after)} tabs"
-                        + (f"; {len(lost)} other tab(s) left the strip with it" if lost else ""))
+                        + (f"; {len(lost)} other tab(s) left the strip with it" if lost else "") + back)
 
+
+#: Integration T4: what the keyboard rung put back after its close, in words for the report (codes from
+#: :func:`_reselect` and :func:`_front_back`; the ones that changed nothing say nothing).
+_KEYS_BACK_SAID: dict[str, str] = {
+    "reselected": "; the tab that was showing before is showing again",
+    "gone": "; the tab that was showing before is gone, so the browser shows another one",
+    "failed": "; the tab that was showing before could not be shown again",
+}
+_KEYS_FRONT_SAID: dict[str, str] = {
+    "given": "; the window that was in front before is in front again",
+    "failed": "; the window that was in front before could not be brought back to the front",
+}
 
 #: Why the keyboard rung sent no key, in words for the report (codes from :func:`_close_by_keys`).
 _KEYS_WHY: dict[str, str] = {

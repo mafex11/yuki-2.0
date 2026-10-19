@@ -419,8 +419,8 @@ def best_match(heard: Any, names: Iterable[Any], *, literal_ok: bool = True, as_
     by its last words, never by a part before them; bar :data:`BAR`). ``heard`` may also be a list or tuple of texts,
     the parts of one turn a caller cut (resolve: the turn outside the message's own text): a run never spans two
     parts. ``literal_ok=False``: a name whose form stands in the words as written is left out (a caller that wants
-    only mishearings: a name heard right needs no help). ``bar``: another bar (a caller with a second signal: a
-    model's own pick that the turn's winner agrees with is confirmed at :data:`BAR`). Pure; never raises
+    only mishearings: a name heard right needs no help). ``bar``: another bar for a caller that has one (resolve's
+    agreement with a model's own pick reads a turn at :data:`TURN_BAR` too: integration F3). Pure; never raises
     (``None``)."""
     try:
         got = _heard_of(heard)

@@ -12,8 +12,9 @@ flagged). ``touched``: the windows the act itself brought up or focused (the rou
 act's windows are the new ones, the touched ones and the asked ones; a change made by any other window (the user
 alt-tabbing during a countdown) is the user's own: it raises nothing, and :func:`render` marks it
 :data:`NOT_YOURS` so a look after acting never undoes it. Both take window ids (``int``) and/or app names
-(``"Discord"``, ``"Discord.exe"``). Each covered entry says ``by_act`` (the act's windows did it) and
-``side_effect`` (more than the ask itself).
+(``"Discord"``, ``"Discord.exe"``). Each covered entry says ``by_act`` (the act's windows did it),
+``side_effect`` (more than the ask itself) and ``by_mine`` (the covering window itself is one of the act's: the only
+cover whose window a tidy step may move; integration T1).
 
 Four flags earn the decider one look after acting (P1.3): three say when the act took something the user had, the
 fourth when a sound the act turned on is still off. "Attention" windows are the ones that, before the act, were in
@@ -22,7 +23,8 @@ front, held the keyboard, or had a session playing in them:
 * ``covered_attention``: an attention window the request was not about lost most of its visible share (under
   :data:`COVER_KEEP` of what it had left, losing at least :data:`COVER_MIN_LOSS`), or got minimised, and the act did it:
   the window over it (for a minimised one: the new front) is one of the act's windows, or the act touched that window
-  itself. When that window, or the new front, is the asked one, a merely-front window going under it is the ask
+  itself (unless it stayed where it was and a measured window none of the act's lies over it: the user's own cover,
+  integration T1). When that window, or the new front, is the asked one, a merely-front window going under it is the ask
   ("open Notepad" covers what was in front): it counts only when it was playing, or sits on another monitor than the
   asked window.
 * ``focus_taken``: the window in front before is still there and was not the ask, but the front (or the keyboard)
@@ -237,6 +239,11 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
         whether that is more than the ask itself. ``by``: the window over it now (for a minimised one: the new
         front)."""
         if touched_it(b):
+            # integration T1: a touched window that stayed where it was, now under a measured window that is none of
+            # the act's, was covered by the user (they brought their own window over it while the act ran)
+            if (by is not None and not of_act(by) and not b.minimized and a.monitor == b.monitor
+                    and not _moved(a, b)):
+                return False, False
             return True, True
         if not of_act(by):
             return False, False
@@ -285,7 +292,7 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
                                      "by_app": by.app if by is not None else None, "minimised": minimised,
                                      "attention": hwnd in diff.attention, "playing": hwnd in playing,
                                      "was_front": a.foreground, "asked": asked(b), "by_act": did,
-                                     "side_effect": side})
+                                     "side_effect": side, "by_mine": of_act(by)})
             elif -loss >= UNCOVER_GAIN:
                 remember(b)
                 diff.uncovered.append({"hwnd": hwnd, "app": b.app, "before": round(float(a.visible), 3),
@@ -315,7 +322,7 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
                                      "after": round(float(b.visible), 3), "by": None, "by_app": None,
                                      "minimised": False, "attention": b.hwnd in diff.attention, "playing": True,
                                      "was_front": a.foreground, "asked": False, "by_act": mine, "side_effect": mine,
-                                     "media": m.title})
+                                     "by_mine": False, "media": m.title})
 
         diff.focus_from, diff.focus_to = before.foreground, after.foreground
         diff.focus_by_act = bool(diff.focus_from != diff.focus_to and of_act(front_after))
@@ -582,7 +589,8 @@ def tidy_step(d: Any, acts: Iterable[Any], front: Any, monitors: Any = None) -> 
             ranked = sorted(covered, key=lambda c: (not c.get("playing"), not c.get("was_front")))
             for c in ranked:
                 by = _hwnd(c.get("by"))
-                if not by or by not in mine or c.get("minimised") or not c.get("by_act"):
+                # integration T1: the covering window itself must be the act's (``by_mine``), whatever ``acts`` holds
+                if not by or by not in mine or c.get("minimised") or not c.get("by_act") or not c.get("by_mine"):
                     continue
                 theirs = _hwnd(c.get("hwnd"))
                 tag = " (playing)" if c.get("playing") else ""

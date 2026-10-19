@@ -2321,7 +2321,8 @@ class Hands:
         step brought to the front (an opening's window, a link's page), by id, so another window of the same app (the
         browser window playing their video) is never the ask; its app too only when it targeted every window of it
         (minimize or close by app: ``_hwnds``). Its app is touched either way. A skill run (``facts["_desk_scope"]``)
-        touches its apps and, when a rung took focus, the window now in front; that window is the ask itself (by id;
+        touches its apps and, when a rung took focus, the window now in front when it is measurably the run's (one of
+        its measured windows, a new one, or one of its apps': integration T2); that window is the ask itself (by id;
         its apps when no window came forward) for a skill of kind ``open``, or a run that left its window to the user
         (a draft or an opened chat, never sent: the skill's own sends data); else a side effect (a message sent through
         Discord)."""
@@ -2331,6 +2332,18 @@ class Hands:
         if name == SKILL_HAND:
             scope = facts.get("_desk_scope") if isinstance(facts.get("_desk_scope"), dict) else {}
             apps = [a for a in scope.get("apps") or () if a]
+            if moved_front:
+                # integration T2: the window in front after the run is the run's only when it is measurably so (one of
+                # its measured windows, a window new since the before, or a window of one of its apps); else the user
+                # brought it forward while the run went, and it is never the act's
+                win = after.window(moved_front) if callable(getattr(after, "window", None)) else None
+                own_apps = {_app_id(a) for a in (*apps, *(scope.get("touched_apps") or ()))
+                            if isinstance(a, str) and a.strip()}
+                ids = {int(h) for h in scope.get("touched_windows") or ()
+                       if isinstance(h, int) and not isinstance(h, bool)}
+                fresh = callable(getattr(before, "window", None)) and before.window(moved_front) is None
+                if not (int(moved_front) in ids or fresh or (win is not None and _app_id(win.app) in own_apps)):
+                    moved_front = None
             front = [int(moved_front)] if scope.get("focus") and moved_front else []
             asked = (front or apps) if scope.get("open") or scope.get("left") else []
             # hands19 review H1: the app-typed slots' apps, the measured acted apps and windows: touched only
@@ -3221,6 +3234,12 @@ class Hands:
         if confirmed and omitted:
             # lVoice (fix (d)): say_when_done is optional; left out, code says its own line for what verified (a window
             # or tab brought up: its step line, below)
+            line = self._code_line(name, args, facts)
+            coded = bool(line)
+        named = _opened_name(facts) if confirmed and name == "open_app" else ""
+        if named and named.casefold() not in " ".join(line.casefold().split()):
+            # integration F2 (decision 3): a misheard name taken as one of their own apps or sites is said as what
+            # opened (code's line), never the words as heard in the model's line written before the act
             line = self._code_line(name, args, facts)
             coded = bool(line)
         game = _game_trouble(facts)
@@ -6696,6 +6715,11 @@ class Hands:
         for _n, title, tab_id, hwnd in targets:   # each in its own window (every: kHands r1 L10)
             result = act(int(hwnd), tab_id, "close")
             good = bool(getattr(result, "ok", False)) and bool(_detail(result, "verified"))
+            rung = _detail(result, "keys_rung")
+            if isinstance(rung, dict) and "reselected" in rung:
+                # integration T4: what the keyboard rung put back after its close (logged: booleans only)
+                facts["tab_reselected"] = rung.get("reselected") == "reselected"
+                facts["tab_front_back"] = rung.get("front_back") == "given"
             (closed if good else failed).append(title)
             lines.append(str(getattr(result, "summary", "")))
             facts["action_ms"] = round(float(getattr(result, "elapsed_ms", 0.0) or 0.0))

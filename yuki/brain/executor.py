@@ -534,6 +534,9 @@ class Executor:
         self._desk_first: Any = None
         self._desk_asked: set[Any] = set()
         self._desk_touched: set[Any] = set()
+        #: integration T3: the program keys (``situation._key``) this request's launches measured (the launch's process,
+        #: its identity's image names): a new window of one of them in front after the acts is the ask, by id
+        self._desk_launched: set[str] = set()
         #: tidy21 review F1: the windows whose own place or state this request's acts were asked for (a window_action
         #: place / maximize / fullscreen / restore, a skill run given a place: ``diff.arranges``): code's tidy step
         #: never moves one away again (``diff.tidy_guard``'s ``asked_place``)
@@ -770,6 +773,7 @@ class Executor:
             after = self._desk_now()
             if after is None:
                 return "", {}
+            self._launched_front(after)
             named = {a for a in self._desk_asked | self._desk_touched if isinstance(a, str)}
             d = desk_diff.compare(self._desk_first, after, acted=tuple(self._desk_asked),
                                   touched=tuple(self._desk_touched), sound_apps=tuple(self._desk_sound | named))
@@ -799,6 +803,27 @@ class Executor:
         except Exception as exc:  # noqa: BLE001 - no look: the request ends as before
             self._emit_log("after_look", error=type(exc).__name__)
             return "", {}
+
+    def _launched_front(self, after: Any) -> None:
+        """Integration T3 (the talker's rule, ``Hands._scope``, narrowed to a launch): the window in front after the
+        acts is the ask, by id, when it is new (not on the desk before the first act) and its program is one this
+        request's launches measured (:attr:`_desk_launched`): the app a launch opened, whose window came after the
+        launch's own wait or after a splash it reported. Other windows of that program (a browser window playing their
+        video) stay theirs. Never raises."""
+        try:
+            if not self._desk_launched or self._desk_first is None:
+                return
+            from yuki.perception.situation import _key
+
+            front = done.as_hwnd(getattr(after, "foreground", None))
+            if front is None or front in {int(w.hwnd) for w in self._desk_first.windows}:
+                return
+            w = next((w for w in after.windows if int(w.hwnd) == front), None)
+            if w is not None and _key(w.app) in self._desk_launched:
+                self._desk_asked.add(front)
+                self._desk_touched.add(front)
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            pass
 
     def has_tidy_step(self) -> bool:
         """tidy21: whether the latest after-look holds one legal tidy step for code to take (:meth:`take_tidy_step`)."""
@@ -997,8 +1022,18 @@ class Executor:
                 self._desk_sound.add(words(call.input.get("app")))
             elif call.tool in ASKED_VERBS:
                 self._desk_asked |= hwnds
-                if call.tool == "launch_app" and not hwnds and words(call.input.get("query")):
-                    self._desk_asked.add(words(call.input.get("query")))
+                if call.tool == "launch_app":
+                    # integration T3: the launch's measured programs (its process, its identity's image names), never
+                    # the query's words (a misheard name, "the scored", names no window); after_look takes a new
+                    # window of one of them in front as the ask, by id
+                    from yuki.perception.situation import _key
+
+                    identity = details.get("identity") if isinstance(details.get("identity"), dict) else {}
+                    launched = {_key(n) for n in (details.get("process_name"), *(identity.get("image_names") or ()))
+                                if isinstance(n, str) and _key(n)}
+                    self._desk_launched |= launched
+                    if not hwnds and not launched and words(details.get("name")):
+                        self._desk_asked.add(words(details.get("name")))   # the resolved Start entry's name
             # tidy21 review F1: a step whose ask is its window's own place or state (by our verb names, never words)
             if call.tool == "window_action":
                 from yuki.perception.diff import arranges
@@ -1046,7 +1081,9 @@ class Executor:
         step's window or its report's), new windows, the act's window over one of theirs, the front its acts took."""
         ours = {h for h in self._desk_touched if isinstance(h, int) and not isinstance(h, bool)}
         ours |= {done.as_hwnd(n.get("hwnd")) for n in d.new_windows}
-        ours |= {done.as_hwnd(c.get("by")) for c in d.covered if c.get("by_act")}
+        # integration T1: only a covering window that is itself the act's (new, touched or asked: ``by_mine``); a
+        # window the user brought over a window a step touched stays theirs
+        ours |= {done.as_hwnd(c.get("by")) for c in d.covered if c.get("by_mine")}
         if d.focus_by_act:
             ours.add(done.as_hwnd(d.focus_to))
         ours.discard(None)
