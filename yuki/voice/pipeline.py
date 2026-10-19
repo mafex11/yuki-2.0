@@ -1344,6 +1344,9 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             #: hotTools: every tool_use block of the reply being streamed (Pipecat queues only the last; see
             #: :class:`ReplyToolCalls`), taken by :meth:`run_function_calls` when that reply's calls come in.
             self._yuki_reply_tools: ReplyToolCalls | None = None
+            #: integ22 (desk22 merge note 1, D4): the names of the reply's function calls (every one, the hand-offs
+            #: included), given to the hands when the reply ends, then cleared (a plain answer gives none).
+            self._yuki_reply_names: tuple[str, ...] = ()
 
         def _yuki_every_call(self, function_calls: Any) -> Any:
             """hotTools: the reply's every call, in the order written, where Pipecat queued only its last (its stream
@@ -1380,6 +1383,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             # hotTools: Pipecat hands over only the reply's last call; the ones it dropped go back in front, so
             # everything below (holds, words, the reply rule, the order gate) sees the whole reply as written
             function_calls = self._yuki_every_call(function_calls)
+            self._yuki_reply_names = tuple(str(getattr(fc, "function_name", "") or "") for fc in function_calls or [])
             for fc in function_calls or []:
                 # review r1 L3: the call's arguments decide too (a sound-only skill runs like the sound hands); a
                 # stand-in without would_hold_call answers by the name alone
@@ -1430,12 +1434,16 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
 
         async def push_frame(self, frame: Any, direction: Any = None) -> None:
             from pipecat.frames.frames import (
-                EagerEndOfTurnCancelFrame, InterruptionFrame, LLMFullResponseEndFrame, LLMTextFrame,
-                UserStoppedSpeakingFrame,
+                EagerEndOfTurnCancelFrame, InterruptionFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame,
+                LLMTextFrame, UserStoppedSpeakingFrame,
             )
             from pipecat.processors.frame_processor import FrameDirection
 
             direction = FrameDirection.DOWNSTREAM if direction is None else direction
+            if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseStartFrame):
+                # integ22 (D4): a new reply's call names start empty (a speculative reply's held calls, released after
+                # its end, never stand for the next reply)
+                self._yuki_reply_names = ()
             if direction == FrameDirection.DOWNSTREAM and self._yuki_words is not None:
                 if isinstance(frame, LLMTextFrame):
                     self._yuki_words.append(frame)  # said when the reply is judged (run_function_calls, or its end)
@@ -1449,6 +1457,10 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 # E3a: the reply is over (its calls already ran): a router start it did not take is withdrawn, unless
                 # the reply was speculative and its calls wait for the turn to be confirmed.
                 hook("reply_done", bool(self._yuki_early_pending or self._yuki_held_calls))
+                # integ22 (desk22 merge note 1, D4): the hands learn the reply ended and which calls it made (a
+                # deferred two-part tidy step is taken, left to a hand of it, or dropped on a hand-off)
+                names, self._yuki_reply_names = self._yuki_reply_names, ()
+                hook("hands_reply_done", names)
                 # oVoice: a ONE round's reply with no call ends the turn (the agent decided it is done)
                 hook("one_reply_end", self._yuki_call,
                      bool(getattr(getattr(self, "_speculation_gate", None), "is_speculating", False)))
@@ -3300,6 +3312,21 @@ class _Hooks:
 
     def reply_done(self, pending: bool = False) -> None:
         self.c._reply_done(pending)
+
+    def hands_reply_done(self, calls: tuple[str, ...] = ()) -> None:
+        """integ22 (desk22 merge note 1, D4): the talker's reply ended, ``calls`` the names of every function call it
+        made (``tell_yuki`` / ``hand_over`` included; empty for a plain answer): ``Hands.reply_done``. Not under
+        ``brain = "one"`` (the ONE driver ends its own turns). Sync, never raises; safe while the calls still run."""
+        if getattr(self.c, "one", False):
+            return
+        hands = getattr(self.c.bridge, "hands", None) if self.c.settings.voice_hands else None
+        done = getattr(hands, "reply_done", None) if hands is not None else None
+        if not callable(done):
+            return
+        try:
+            done(tuple(calls or ()))
+        except Exception:  # noqa: BLE001 - the deferred step is dropped at their next words, as before
+            pass
 
     # -- oVoice (phase 4, brain = "one"): the ONE driver ------------------------------------------------------------
 
@@ -5727,8 +5754,15 @@ class OneVoice:
         """Final-B (one-desk D3/F6): the reply's last call would settle the turn by code while an earlier act's
         flagged diff of the turn is still open with no tidy step taken: the runner measures the desk against that
         act's own before (``Runner.tidy_debt``, once a turn, a few ms on a worker); still flagged, this result carries
-        the net After and its flags, so the agent gets one round to tidy (never a loop). Never raises."""
-        if not group.last(call_id) or turn is not self.turn or turn.budget.closed:
+        the net After and its flags, so the agent gets one round to tidy (never a loop). Never raises.
+
+        integ22 (one22 merge note 1, A23): measured too when every later call of the reply is a ``stay_quiet``
+        (``[act, stay_quiet]``: the bridge's own handler answers the quiet, which never reaches the runner), not only
+        at the reply's last call."""
+        if call_id not in group.ids or turn is not self.turn or turn.budget.closed:
+            return
+        later = group.ids[group.ids.index(call_id) + 1:]
+        if any(group.names.get(i) != "stay_quiet" for i in later):
             return
         tidy = getattr(turn, "tidy", None)
         if tidy is None or not getattr(tidy, "open", False) or getattr(tidy, "acts", 0) or getattr(tidy, "given", True):

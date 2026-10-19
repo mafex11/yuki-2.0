@@ -2207,13 +2207,19 @@ class Executor:
             self._who_unsettled = False
             return None
         status = self.statuses[index]
+        payload = outcome.payload if isinstance(getattr(outcome, "payload", None), dict) else {}
+        evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+        if state == "asked" and _form_recall(evidence):
+            # integ22 (skill22 merge note 8, A19): the engine's re-call (a slot sent in another form than it takes,
+            # nothing done) holds no question: the planner reads the report's first line and calls once more, never
+            # LINE_WHO
+            return None
         if state == "asked":
             self._who_unsettled = True
             ask = _engine_ask(outcome)
             status.state, status.why = "failed", "asked"
             self._emit_log("brain_who", how="ask", own=bool(ask))
             return RunResult("ask", line=ask or LINE_WHO)
-        payload = outcome.payload if isinstance(outcome.payload, dict) else {}
         handoff = payload.get("handoff") if isinstance(payload.get("handoff"), dict) else {}
         from yuki.brain.plan import handoff_person_open
 
@@ -4476,6 +4482,20 @@ def _refused_kind(payload: Mapping[str, Any]) -> str | None:
     details = payload.get("details") if isinstance(payload.get("details"), Mapping) else {}
     kinds = {carried(payload), carried(details)}
     return "game" if "game" in kinds else ("blocked" if "blocked" in kinds else None)
+
+
+def _form_recall(evidence: Mapping[str, Any]) -> bool:
+    """integ22 (skill22 merge note 8): whether a ``run_skill`` result's evidence carries the engine's form re-call
+    (``engine.FORM_RECALL``: a slot sent in another form than it takes, handed back to be called once more), read by
+    name (``"recall"`` when the engine is not importable). Never raises."""
+    try:
+        from yuki.skills.engine import FORM_RECALL as key
+    except Exception:  # noqa: BLE001
+        key = "recall"
+    try:
+        return evidence.get(key) is True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _engine_ask(outcome: Any) -> str:

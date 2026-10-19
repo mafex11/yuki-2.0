@@ -135,7 +135,9 @@ TIDY_ASK_NOTE = ("the flags are a side effect of your act on their screen; one u
 TIDIED: dict[str, str] = {
     "taken": "code undid that side effect with its one undoable step and said so (said)",
     "failed": "code's one undoable step to undo that side effect did not take, and code said so (said)",
-    "left": "code left their windows as they are, on purpose"}
+    "left": "code left their windows as they are, on purpose",
+    # integ22 (desk22 merge note 4b, D6): no legal step for a window flag: code said its one line about what is covered
+    "told": "no one undoable step undoes it, so code said what is covered (said) and left their windows as they are"}
 #: The name of code's own tidy step's call context: no ONE tool, so the gate judges it as an inner step (never counted
 #: on the agent's budget or refusals), at row 8 like any tidy step.
 CODE_TIDY = "tidy_by_code"
@@ -222,6 +224,24 @@ def _desk_helper(name: str) -> Callable[..., Any] | None:
         return None
     got = getattr(desk_diff, name, None)
     return got if callable(got) else None
+
+
+def _opened_of(name: str, args: Mapping[str, Any], facts: Mapping[str, Any], acted: Sequence[Any],
+               touched: Sequence[Any]) -> tuple[Any, ...]:
+    """integ22 (desk22 merge note 4a, A24): the windows an act opened a page in, for the diff's ``opened``
+    (``voice.hands._opens_page``: an open_url, a tab's ``new``, a skill run of kind open, by its scope's ``open``): the
+    act's windows by id when measured, its apps only when none was (another window of the same browser is never the
+    act's tab), as the talker's look passes them. ``()`` for any other act. Never raises."""
+    try:
+        from yuki.voice.hands import _opens_page
+
+        if not _opens_page(str(name), dict(args or {}), dict(facts or {})):
+            return ()
+        found = [x for x in (*acted, *touched) if isinstance(x, int) and not isinstance(x, bool)]
+        found = found or [x for x in (*acted, *touched) if isinstance(x, str) and x.strip()]
+        return tuple(dict.fromkeys(found))
+    except Exception:  # noqa: BLE001 - no opened scope: the classic tab cover only
+        return ()
 
 
 def _step_call(step: Any) -> dict[str, Any] | None:
@@ -1389,6 +1409,7 @@ class Runner:
             if scope is not None:
                 scoped["_desk_scope"] = dict(scope)
             acted, touched = self.verbs.scope(name, resolved, scoped, ctx.before, after)
+            opened = _opened_of(name, resolved, scoped, acted, touched)
             open_tidy = getattr(turn, "tidy", None)
             if open_tidy is not None and open_tidy.open and open_tidy.before is not None:
                 # safety WW4: a later act of the turn joins the open tidy-up's scope (as the hands' ``_turn_before``
@@ -1396,7 +1417,10 @@ class Runner:
                 # the flagged act's side effects (a new flagged diff below opens a tidy-up of its own, as before)
                 open_tidy.acted = tuple(dict.fromkeys([*(open_tidy.acted or ()), *acted]))
                 open_tidy.touched = tuple(dict.fromkeys([*(open_tidy.touched or ()), *touched]))
-            d = desk_diff.compare(ctx.before, after, acted=acted, touched=touched)
+                open_tidy.opened = tuple(dict.fromkeys([*(getattr(open_tidy, "opened", None) or ()), *opened]))
+            # integ22 (desk22 merge note 4a, A24): a new tab's autoplay over what played is a tab cover only in a window
+            # this act opened a page in
+            d = desk_diff.compare(ctx.before, after, acted=acted, touched=touched, opened=opened)
             state.arranged |= self._arranged(name, resolved, scoped, ctx.before, after)
             own = {int(h) for h in self.verbs.act_windows(after, d, acted, touched) if h}
             state.own |= own
@@ -1410,7 +1434,7 @@ class Runner:
             elif self._front_kept is not None and self._front_kept[2] is not state:
                 self._front_kept = None   # an act of a later turn that moved no front lets an older one go (as all)
             pending: dict[str, Any] | None = None
-            settled = False
+            settled = told = False
             if result.flagged and not result.tidy:
                 # a new flagged diff opens a tidy-up on its windows; a tidy step's own flagged diff never renews it
                 # (its two steps per flagged diff stay counted)
@@ -1420,7 +1444,7 @@ class Runner:
                 # it for the question only (the gate's row 8 asks before it runs)
                 step, words = self._legal_step(d, own, after, turn)
                 turn.flag(own=sorted(own), attention=attention, before=ctx.before, acted=acted, touched=touched,
-                          sound_app=ctx.sound_app, focus_from=moved, step=step, step_words=words)
+                          sound_app=ctx.sound_app, focus_from=moved, step=step, step_words=words, opened=opened)
                 do = util.tidy_mode(getattr(turn, "policy", None)) == util.TIDY_DO
                 # review F1: a move of a window the turn's acts placed or sized as asked is no side effect: code
                 # leaves it (its guard's ``asked_place``), at "ask" too (no question about it, as the planner)
@@ -1439,11 +1463,16 @@ class Runner:
                     # the result); under "do" the agent never takes or asks for it
                 else:
                     result.tidy_step = words
+                    # integ22 (desk22 merge note 4b, decision D6): no legal step for a window flag after an act that
+                    # took: code's one measured line about what is covered (never silence), said after the cover line
+                    told = step is None and landed
             # r25 harness (H9): the diff's own record first, so a code tidy step's ``one_run`` row comes after it
             self._emit("one_diff", tool=name, **d.facts(), legal_step=bool(pending or result.tidy_step) or None)
             self._cover(d, result, turn, state, say)
             if pending is not None:
                 self._tidy_result(pending, d, after, result, turn, state, say)
+            elif told and self._flag_said(d, turn, state, say, result):
+                self._tidy_settled(result, "told", turn)   # the agent gets no window round for it
             elif settled:
                 self._tidy_settled(result, "", turn)
         except Exception as exc:  # noqa: BLE001 - no diff: the result stands
@@ -1620,6 +1649,43 @@ class Runner:
                        tidy=True, by_code=True, said=bool(said), ms=round((time.perf_counter() - started) * 1000, 1))
         return done, said
 
+    def _flag_said(self, d: Any, turn: policy.Turn, state: RunState, say: Any,
+                   result: OneResult | None = None) -> bool:
+        """integ22 (desk22 merge note 4b, the user's decision D6): a window flag up with no legal tidy step
+        (``diff.tidy_step`` found none: one monitor and nothing taken, a minimised window, a cover by a window that
+        isn't the act's own, a pop-up) gets code's one measured line (``diff.flag_line``: "Discord is covering
+        Chrome.", app names only), said like the tidy line, once a turn (:attr:`RunState.tidied`: code's one tidy-up
+        decision of the turn). At the dial "do" and "ask" (no step means nothing to ask about); "off": nothing. Not
+        once their next turn began (safety timing 4) or after the hard stop. ``True`` when code said it (``result``'s
+        ``said`` gains it). Logs content-free (``one_tidy_code ... why=no_step``). Never raises."""
+        try:
+            if state.tidied or util.tidy_mode(getattr(turn, "policy", None)) == util.TIDY_OFF:
+                return False
+            if getattr(turn, "moved_on", False):
+                return False
+            budget = getattr(turn, "budget", None)
+            if budget is not None and budget.late():
+                return False
+            helper = _desk_helper("flag_line")
+            line = _words(helper(d, name=util.app_name)) if helper is not None else ""
+            if not line:
+                return False
+            said, _heard = self._speak(line, say, state)
+            if not said:
+                return False
+            state.tidied = True
+            tidy = getattr(turn, "tidy", None)
+            if tidy is not None:
+                tidy.given = True   # code decided this flagged diff's tidy-up: never a tidy-debt round for it
+            if result is not None:
+                result.said = f"{result.said} {said}".strip()
+                result.heard = True
+            self._emit("one_tidy_code", action="", state="said", why="no_step", ok=True, said=True)
+            return True
+        except Exception as exc:  # noqa: BLE001 - nothing said: the agent reads the After as before
+            self._emit("one_tidy_code", error=type(exc).__name__)
+            return False
+
     def _cover(self, d: Any, result: OneResult, turn: policy.Turn, state: RunState, say: Any) -> None:
         """One20 (S3, contract C7): ``perception.diff.cover_line(d)``, the measured tab-cover sentence ("GitHub is up;
         X plays on in the other tab"): said by code right after a done line code said (the agent never owned it, and
@@ -1677,7 +1743,8 @@ class Runner:
                 return None
             from yuki.perception import diff as desk_diff
 
-            d = desk_diff.compare(tidy.before, now, acted=tidy.acted, touched=tidy.touched)
+            d = desk_diff.compare(tidy.before, now, acted=tidy.acted, touched=tidy.touched,
+                                  opened=tuple(getattr(tidy, "opened", None) or ()))
             self._emit("one_tidy_debt", **d.facts())
             if not d.any_flag:
                 return None
@@ -1705,6 +1772,12 @@ class Runner:
             if words:
                 # the dial at "ask": the step for the question only (the voice driver copies ``after`` and ``flags``)
                 debt["after"] = f"{after}\n{TIDY_ASK_NOTE.format(step=words)}".strip()
+            elif self._flag_said(d, turn, state, state.speaker or self.speak):
+                # integ22 (desk22 merge note 4b, D6): no legal step for the net diff's window flag: code said its one
+                # line; nothing left for the agent unless a sound is silent
+                if not dict(d.flags).get("left_silent"):
+                    return None
+                return {"after": f"{after}\n{TIDIED['told']}".strip(), "flags": ["left_silent"]}
             return debt
         except Exception as exc:  # noqa: BLE001 - no measure: code settles as before
             self._emit("one_tidy_debt_error", error=type(exc).__name__)

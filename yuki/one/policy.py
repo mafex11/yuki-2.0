@@ -282,6 +282,9 @@ class Tidy:
     touched: Any = None
     sound_app: str = ""
     given: bool = False
+    #: integ22 (desk22 merge note 4a, A24): the windows (by id, else their apps) the turn's acts opened a page in
+    #: (``hands._opens_page``: an open_url, a new tab, a skill of kind open), the diff's ``opened`` for the tidy debt.
+    opened: Any = None
     #: One20 (final-D S2): the window in front before the flagged act, measured (``DeskDiff.focus_from`` when the act
     #: moved the front, ``focus_by_act``): a ``focus_back`` with no window is filled with it (it reaches row 8).
     focus_from: int | None = None
@@ -595,15 +598,17 @@ class Turn:
 
     def flag(self, *, own: Sequence[Any] = (), attention: Sequence[Any] = (), before: Any = None, acted: Any = None,
              touched: Any = None, sound_app: str = "", focus_from: Any = None,
-             step: Mapping[str, Any] | None = None, step_words: str = "") -> None:
+             step: Mapping[str, Any] | None = None, step_words: str = "", opened: Any = None) -> None:
         """An act's diff came back flagged (it covered what they watched, took the keyboard, left something open):
         a tidy-up may follow, on these windows only. ``before`` and the scope (``acted``, ``touched``, ``sound_app``):
         that act's own before and whose change was whose, for the turn's tidy debt (``Runner.tidy_debt``).
         ``focus_from``: the measured front before it (one20 S2, a focus_back's window); ``step`` / ``step_words``: the
-        one legal undoable step (one20, contract C7) and its words for the agent."""
+        one legal undoable step (one20, contract C7) and its words for the agent. ``opened``: integ22 (A24), the
+        windows the act opened a page in (the diff's ``opened``)."""
         self.tidy = Tidy(open=True, own={h for h in map(_hwnd, own) if h},
                          attention={h for h in map(_hwnd, attention) if h}, before=before, acted=acted,
                          touched=touched, sound_app=str(sound_app or ""), focus_from=_hwnd(focus_from),
+                         opened=tuple(opened or ()),
                          step=dict(step) if isinstance(step, Mapping) else None,
                          step_words=" ".join(str(step_words or "").split()),
                          acts_at=int(getattr(self.budget, "acts", 0) or 0))

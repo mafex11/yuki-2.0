@@ -4489,6 +4489,47 @@ def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: 
                          f"of it at that address was seen within {watch:.1f} s", "not_seen")
 
 
+def _own_channel(url: str) -> dict | None:
+    """integ22 (skill22 merge note 1, A6): :func:`yuki.skills.names.own_url` on a raw address (no store: this
+    process's open memory, a bounded call), ``{"url", "name", "kind", "how", "score", "margin", "source"}`` or
+    ``None`` (the address as given). Never raises."""
+    try:
+        from yuki.skills.names import own_url
+
+        took = own_url(url)
+    except Exception:  # noqa: BLE001 - no measure: the address as given
+        return None
+    return took if isinstance(took, dict) and took.get("url") else None
+
+
+def _channel_named(result: ActionResult, took: dict, given: str) -> ActionResult:
+    """integ22 (A6): an open of the user's own channel a raw address was a mishearing of: ``details["names_match"]``
+    content-free (kind, how, score, margin, source) and the summary led by what opened, as a measured app or site is
+    (:data:`MEASURED_OPENED_LINE` / :data:`MEASURED_TAKEN_LINE`: "Opened Deji's page (heard as 'Deezy')."). The heard
+    value is read from the address as given (its page kind's one value). Never raises."""
+    try:
+        details = result.details if isinstance(result.details, dict) else {}
+        details["names_match"] = {k: took[k] for k in ("kind", "how", "score", "margin", "source") if k in took}
+        heard = given
+        try:
+            from urllib.parse import unquote
+
+            from yuki.connect.templates import page_of
+
+            m = page_of(str(given or "").strip())
+            if m is not None and m.entity:
+                heard = " ".join(unquote(str(m.entity)).split()).lstrip("@") or given
+        except Exception:  # noqa: BLE001
+            pass
+        line = MEASURED_OPENED_LINE if result.ok else MEASURED_TAKEN_LINE
+        result.details = details
+        named = f"{took.get('name') or 'their channel'}'s page"
+        result.summary = line.format(name=named, query=heard) + str(result.summary or "")
+    except Exception:  # noqa: BLE001 - the open's own result as it is
+        pass
+    return result
+
+
 def open_url(
     url: str, *, app: str | None = None, content_timeout_s: float = CONTENT_WAIT_S,
     deadline: float | None = None, address_bar: bool = True,
@@ -4555,6 +4596,14 @@ def open_url(
     # D17: an opened link brings its handler forward (a browser, Spotify, Discord): never with a game in front
     if (refused := _gate.refuse("open_url")) is not None:
         return finish(False, refused, {"url": target, "refused": _gate.kind_of(refused)})
+    if address_bar and (took := _own_channel(target)) is not None:
+        # integ22 (skill22 merge note 1, A6; final-D youtube_channel_deji_arc): a raw address of a page named by a
+        # value that is none of the user's own channels as written but measures as one of them ("@Deezy" for their
+        # Deji) opens that channel's own address, named as what opened (decision 3: never a question). The hands' path
+        # only: the web skill's own call (``address_bar=False``) has skill19's heard match already. The channel's
+        # address is one of theirs as written, so the call below measures nothing more.
+        return _channel_named(open_url(took["url"], app=app, content_timeout_s=content_timeout_s, deadline=deadline,
+                                       address_bar=address_bar), took, target)
     if app is not None and app.strip():
         address = _page_address(target)
         typed_first = None

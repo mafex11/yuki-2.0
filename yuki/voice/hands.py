@@ -1090,6 +1090,28 @@ def _window_shown(hwnd: Any) -> bool:
         return False
 
 
+def typed_none(outcome: Any) -> bool:
+    """integ22 (one22 merge note 2, A21): whether a typing's dispatch that did not take put no character out, read from
+    the dispatcher's outcome as it plains it (the typing's own result, or its ``type_text`` part after an element's
+    focus click): its details carry no ``method`` (it refused at the foreground, game or ready checks, or the focus
+    click failed, before the first character), or the dispatcher refused it before running (an ``error`` with no
+    details). A backend that broke (``exception``) or an unknown shape is no proof: ``False`` (the safe side, the mark
+    stays). Never raises."""
+    try:
+        if bool(getattr(outcome, "ok", False)):
+            return False
+        payload = getattr(outcome, "payload", None)
+        if not isinstance(payload, dict) or payload.get("exception"):
+            return False
+        typed = payload["type_text"] if isinstance(payload.get("type_text"), dict) else payload
+        details = typed.get("details")
+        if isinstance(details, dict):
+            return "method" not in details
+        return bool(payload.get("error"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def real_now_board(wait_s: float = 0.05) -> dict[str, Any] | None:
     """Memory's Now picture of the real screen (``yuki.memory.now``), popups no longer shown left out; ``None`` without
     a service or an answer within ``wait_s`` (p50 2-5 ms measured)."""
@@ -5031,6 +5053,18 @@ class Hands:
                                       skill=fallback.get("pin"), told=told, why=why, hand_id=hand_id, ms=ms,
                                       facts=facts):
                 return
+        if outcome == "asked" and facts.get("shape") and not verified:
+            # integ22 (skill22 merge note 2b, A19): a slot sent in another form than it takes, nothing done (the
+            # engine's re-call, ``shape``): given back once in this turn to be called again as the report's first
+            # line says, as a hand's own shape retry is (``_shape_given``); no owed line, never a question
+            shape_turn = self._call_safely(self.user_turn, None)
+            if shape_turn is not None and self._given(self._shape_given, shape_turn) < 1:
+                self._shape_given = (shape_turn, self._given(self._shape_given, shape_turn) + 1)
+                self._skill_reply_log(params, name, ok, report, facts, ms, hand_id, line=False, fallback=None)
+                if self.log is not None:
+                    self.log.event("hands", op=name, shape_retry=True, call=params.tool_call_id)
+                await params.result_callback({"not_done": report[:700], "how_to_handle_it": _SHAPE_NOTE})
+                return
         line = ""
         talk = False   # phase 2 (2.3): a non-success outcome the talker says in its own words (code's line: fallback)
         if verified:
@@ -5462,6 +5496,10 @@ class Hands:
                                 request_id=turn if hand_id is not None else self._skill_request_id(),
                                 session_id=getattr(memory, "session_id", None), on_focus=on_focus,
                                 verbs=self._skill_verbs(state), game=self._game_strict, hand_id=hand_id,
+                                # integ22 (skill22 merge note 2a, A19): a slot sent in another form than it takes
+                                # comes back once to be called again (``_skill_reply``'s shape give-back; ONE's agent
+                                # reads the report), never the user's question first
+                                form_recall=True,
                                 **self._skill_place(engine, args, slots, skill_key))
         if bracket and not sound_only:
             # hands19 (all-desk RC1(a)): the desk right before the run, whatever its rungs declare (on_focus keeps only
@@ -6696,6 +6734,8 @@ class Hands:
         verified, why = action_verdict("type_text", outcome)
         facts["verified"] = verified if outcome.ok else False
         facts["action_ms"] = round(outcome.elapsed_ms)
+        if typed_none(outcome):
+            facts["typed_any"] = False   # integ22 (one22 merge note 2): no character went out: no unsent mark
         return outcome.ok, f"typed into {getattr(snap, 'role', '') or 'the field'}: {outcome.summary} ({why})", facts
 
     def _title(self, hwnd: int) -> str:
@@ -7195,6 +7235,13 @@ class Hands:
         result = opener(url, **kw)
         ok, report, facts = self._report(result, "", facts)
         details = getattr(result, "details", None) or {}
+        match = details.get("names_match") if isinstance(details.get("names_match"), dict) else None
+        if match is not None and match.get("kind") == "channel" and details.get("url"):
+            # integ22 (skill22 merge note 1, A6): the launch took the address for one of the user's own channels (a
+            # misheard handle): its measure, content-free, for the hands' log and ONE's step facts, and the address
+            # that opened in this hand's report (the launch's summary names what opened)
+            facts["names_match"] = {k: match.get(k) for k in ("kind", "how", "score", "margin", "source")}
+            url = str(details.get("url"))
         page = details.get("page") if isinstance(details.get("page"), dict) else {}
         hwnd = details.get("hwnd")
         stages = _stage_ms(details.get("timings_ms"))
@@ -8509,6 +8556,8 @@ class Verbs:
         refused = (outcome.payload or {}).get("refused") if isinstance(outcome.payload, dict) else None
         if refused:
             facts["refused"] = "game" if refused == "game" else True
+        if verb == "type_text" and typed_none(outcome):
+            facts["typed_any"] = False   # integ22 (one22 merge note 2): no character went out: no unsent mark
         return bool(outcome.ok), f"{outcome.summary} ({why})", facts
 
     def _type_enter(self, args: dict[str, Any], hand_id: str | None) -> tuple[bool, str, dict[str, Any]]:
