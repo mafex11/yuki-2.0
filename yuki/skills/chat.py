@@ -37,7 +37,18 @@ send check would refuse is refused before the chat opens.
   picked by the keyed digest of that name), run through the voice hands' step runner (each step checked, Yuki's own
   check on every key and every typed text, the user's hands stop it), into the app's own window only, brought forward
   first by the guarded ``focus_window``. The name is typed only once another text field took the keyboard after the
-  shortcut (the switcher or the search box opened; :func:`_run_switch`); otherwise nothing more is sent.
+  shortcut (the switcher or the search box opened; :func:`_run_switch`); otherwise nothing more is sent. chat19 (final
+  test 19 Oct, RC1): a switcher run whose shortcut went out but that didn't finish closes what it opened with the app's
+  own close key (``[chat] close``, on its own judged run: :func:`_tidy_switch`) and ends ``switcher_failed``; the chat
+  is never "opened" by the shortcut alone.
+
+**The keyboard in the composer** (chat19, :func:`_composer_focus`): before anything is typed, the opened chat's
+composer gets the keyboard: found by the app's own label for it (``[chat.labels.<lang>] composer``, Discord's
+``Edit "Message @<name>"``) and focused through UIA (the game gate and the Act switch asked as for any focus), or the
+field the app itself gives the keyboard (structure), confirmed by the focus read within ``uia_route.FOCUS_WAIT_S``.
+A dialog holding the keyboard is closed only when this very run's switcher opened it; otherwise nothing is typed and
+the result says what holds it (contract C3, :func:`_not_typed`: a failed result with ``why = "not_typed"``, never a
+question, so the engine's next rung or the caller's own hands may take it on).
 
 **Checked open by encrypted ids, never a title** (:func:`chat_state`): memory's own read of the window in front (the
 watcher's Now board, read after the run began) is looked up as a capture thread (``Store.find_thread``: a keyed digest
@@ -1066,17 +1077,23 @@ def _field(hands: Any) -> tuple[int, int, str, str] | None:
             str(getattr(snap, "role", "") or ""), str(getattr(snap, "name", "") or ""))
 
 
-def _field_changed(ctx: Any, hands: Any, before: tuple[int, int, str, str] | None) -> bool:
-    """Whether another text field took the keyboard after the shortcut (the switcher's or the search box's), read
-    every :data:`POLL_S` for at most :data:`SWITCHER_WAIT_S`."""
+def _field_opened(ctx: Any, hands: Any, before: tuple[int, int, str, str] | None
+                  ) -> tuple[int, int, str, str] | None:
+    """The other text field that took the keyboard after the shortcut (the switcher's or the search box's), read
+    every :data:`POLL_S` for at most :data:`SWITCHER_WAIT_S`; ``None`` when none did."""
     deadline = ctx.clock() + SWITCHER_WAIT_S
     while True:
         now = _field(hands)
         if now is not None and now != before:
-            return True
+            return now
         if ctx.clock() + POLL_S > deadline:
-            return False
+            return None
         ctx.sleep(POLL_S)
+
+
+def _field_changed(ctx: Any, hands: Any, before: tuple[int, int, str, str] | None) -> bool:
+    """Whether another text field took the keyboard after the shortcut (:func:`_field_opened`)."""
+    return _field_opened(ctx, hands, before) is not None
 
 
 def _settled_field(ctx: Any, hands: Any) -> tuple[int, int, str, str] | None:
@@ -1090,28 +1107,122 @@ def _settled_field(ctx: Any, hands: Any) -> tuple[int, int, str, str] | None:
         ctx.sleep(POLL_S)
 
 
+def _holder(hands: Any) -> Any:
+    """chat19: what has the keyboard now, text field or not (the hands' focus read: a ``FocusSnapshot``), or ``None``
+    when it can't be read. Read in RAM; only its control type is ever logged (:func:`_holder_facts`)."""
+    read = getattr(hands, "_focus", None)
+    if not callable(read):
+        return None
+    try:
+        snap = read(timeout_s=0.4)
+    except Exception:  # noqa: BLE001
+        return None
+    return snap if snap is not None and getattr(snap, "ok", True) else None
+
+
+def _ident(snap: Any) -> tuple[int, int, str, str] | None:
+    """A focus read as an identity (its window, native window, role and name: UI facts, never read for meaning)."""
+    if snap is None:
+        return None
+    return (int(getattr(snap, "window", 0) or 0), int(getattr(snap, "hwnd", 0) or 0),
+            str(getattr(snap, "role", "") or ""), str(getattr(snap, "name", "") or ""))
+
+
+def _close_key(data: Mapping[str, Any]) -> list[str]:
+    """The app's own key that closes its quick switcher or search (``[chat] close``, data); ``[]`` when it has none."""
+    return [str(k) for k in data.get("close") or [] if str(k).strip()]
+
+
+def _close_own(call: RouteCall, hands: Any, data: Mapping[str, Any], *, apps: Sequence[str], key: str) -> str:
+    """chat19: the app's own close key (:func:`_close_key`) on its own run (each key judged by Yuki's own check and the
+    game gate like the switcher's, into the app's own window only), for a switcher or search this very run opened and
+    did not finish. A code word: ``sent`` (the key went out), ``not_sent`` (refused, held or stopped), ``no_key`` (the
+    app's data has none: nothing is pressed)."""
+    keys = _close_key(data)
+    if not keys:
+        return "no_key"
+    _ok, facts = run_steps(hands, [{"do": "keys", "keys": keys}], words=call.ctx.words, apps=apps, key=key)
+    return "sent" if _dispatched(facts, "keys") else "not_sent"
+
+
+def _tidy_switch(call: RouteCall, hands: Any, data: Mapping[str, Any], run: dict[str, Any], *, apps: Sequence[str],
+                 key: str, before: tuple[int, int, str, str] | None, opened: tuple[int, int, str, str] | None) -> None:
+    """chat19 (all-messaging RC1: a Quick Switcher Ctrl+K opened and never closed held Discord's keyboard for every
+    later draft, both brains): the shortcut went out but the switcher's run didn't finish, so what it opened is closed
+    with the app's own close key, judged on its own run. Never when the user took over (their hands are on it) or a
+    game stopped it (the gate would refuse the key anyway). With no text field seen taking the keyboard (``opened``
+    None), the key goes only when the focus read shows something else holding the keyboard than before the shortcut
+    (measured; a switcher whose own window, not a field, has the keyboard), or can't be read: never into an app where
+    nothing changed. ``run["switcher_closed"]``: ``yes`` / ``no`` (still held by what the shortcut opened) /
+    ``unknown`` (the focus can't be read) / ``unchanged`` (nothing opened) / ``theirs`` / ``no_key`` / ``not_sent``."""
+    if run.get("took_over_at"):
+        run["switcher_closed"] = "theirs"
+        return
+    if _refused("keys"):
+        run["switcher_closed"] = "not_sent"
+        return
+    now = _ident(_holder(hands))
+    if opened is None and before is not None and now is not None and now == before:
+        run["switcher_closed"] = "unchanged"
+        return
+    held_by = opened if opened is not None else now
+    sent = _close_own(call, hands, data, apps=apps, key=key)
+    if sent != "sent":
+        run["switcher_closed"] = sent
+        return
+    deadline = call.ctx.clock() + SWITCHER_WAIT_S
+    while True:
+        after = _ident(_holder(hands))
+        if after is not None and after != held_by:
+            run["switcher_closed"] = "yes"
+            return
+        if call.ctx.clock() + POLL_S > deadline:
+            run["switcher_closed"] = "unknown" if after is None else "no"
+            return
+        call.ctx.sleep(POLL_S)
+
+
 def _run_switch(call: RouteCall, hands: Any, steps: list[dict[str, Any]], *, apps: Sequence[str], key: str,
-                way_text: str) -> tuple[bool, dict[str, Any]]:
+                way_text: str, data: Mapping[str, Any] | None = None) -> tuple[bool, dict[str, Any]]:
     """The switcher's (or search's) steps, its shortcut first on its own: the name is typed and Enter pressed only once
     a different text field took the keyboard (the switcher opened). If it didn't, nothing more is sent (a name typed
     into the open chat's composer and Enter would send it): ``facts["switcher"] = "unseen"``. When no text field has
     the keyboard as the app comes forward, the read waits for focus to settle first (review r2 L3), so a composer that
-    takes the keyboard late is the "before", never the switcher."""
+    takes the keyboard late is the "before", never the switcher.
+
+    chat19: a run whose shortcut went out but that did not finish (the switcher unseen, a step held, refused or stopped
+    before the open key or the pick) closes what it opened (:func:`_tidy_switch`, the app's ``[chat] close`` from
+    ``data``) and says so: ``facts["switcher"]`` ``unseen`` / ``unfinished``, ``facts["finished"]`` False. The text
+    field the switcher gave the keyboard to is kept as ``facts["switcher_field"]`` (RAM: the caller compares later
+    focus reads with it)."""
     before = _field(hands)
     if before is None:
         before = _settled_field(call.ctx, hands)
+    held_before = _ident(_holder(hands))
     ok, first = run_steps(hands, steps[:1], words=call.ctx.words, apps=apps, key=key)
     first["steps"] = len(steps)
-    if not ok or int(first.get("steps_done") or 0) < 1:
-        return False, first
-    if not _field_changed(call.ctx, hands, before):
-        first["switcher"] = "unseen"
+    first["finished"] = False
+    if not _dispatched(first, "keys"):
+        return False, first          # the shortcut never went out: nothing opened, nothing to close
+    # the switcher's field, waited for even when the shortcut's own run stopped there (a dialog it brought up, no
+    # change seen yet): what it opened is then known before it is closed
+    opened = _field_opened(call.ctx, hands, before)
+    if not ok or opened is None:
+        first["switcher"] = "unfinished" if not ok else "unseen"
+        if data is not None:
+            _tidy_switch(call, hands, data, first, apps=apps, key=key, before=held_before, opened=opened)
         return False, first
     ok, rest = run_steps(hands, steps[1:], words=call.ctx.words, apps=apps, key=key, way_text=way_text)
     merged = dict(rest)
     merged["steps"] = len(steps)
     merged["steps_done"] = int(first.get("steps_done") or 0) + int(rest.get("steps_done") or 0)
     merged["results"] = list(first.get("results") or []) + list(rest.get("results") or [])
+    merged["switcher_field"] = opened
+    merged["finished"] = bool(ok) and merged["steps_done"] >= len(steps)
+    if not merged["finished"]:
+        merged["switcher"] = "unfinished"
+        if data is not None:
+            _tidy_switch(call, hands, data, merged, apps=apps, key=key, before=held_before, opened=opened)
     return ok, merged
 
 
@@ -1366,11 +1477,241 @@ def _send_gate(call: RouteCall, target: Target, route: ChatRoute) -> tuple[bool,
                               facts={"mode": "send", "held_at": "send_check"})
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# chat19: the keyboard is put in the opened chat's composer before anything is typed (all-messaging RC1, one-desk D2:
+# every Discord draft of the final test failed with the keyboard held by a Quick Switcher; the type step only finds a
+# text field that already has the keyboard, and its first-step read waits 0.4 s)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def composer_labels(data: Mapping[str, Any], route: ChatRoute) -> list[tuple[str, str]]:
+    """The opened chat's composer as the app labels it, per display language: ``[chat.labels.<lang>] composer = [role,
+    template]`` (Discord: ``["Edit", "Message {chat}"]``), the template's ``{chat}`` being the chat as the app's quick
+    switcher names it (its kind's filter character and its name as memory keeps it: :func:`switcher_query`, "@name" for
+    a DM). ``(role, name)`` pairs, data only; ``[]`` when the app's data has none or memory keeps no name."""
+    if not _words(route.chat):
+        return []
+    labels = data.get("labels") if isinstance(data.get("labels"), Mapping) else {}
+    chat = switcher_query(data, route)
+    out: list[tuple[str, str]] = []
+    for lang in labels.values():
+        spec = lang.get("composer") if isinstance(lang, Mapping) else None
+        if not isinstance(spec, (list, tuple)) or len(spec) != 2:
+            continue
+        role, template = str(spec[0] or "").strip(), str(spec[1] or "")
+        if not role or "{chat}" not in template:
+            continue
+        pair = (role, _words(template.replace("{chat}", chat)))
+        if pair not in out:
+            out.append(pair)
+    return out
+
+
+def composer_shapes(data: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    """The composer label templates' shapes: ``(role, the words before {chat}, the words after)`` (Discord's
+    ``("Edit", "Message ", "")``), data only. A field the app itself focused whose name fits one is the composer even
+    when memory keeps the chat under another name than the app shows; a quick switcher's or a search box's field never
+    fits."""
+    labels = data.get("labels") if isinstance(data.get("labels"), Mapping) else {}
+    out: list[tuple[str, str, str]] = []
+    for lang in labels.values():
+        spec = lang.get("composer") if isinstance(lang, Mapping) else None
+        if not isinstance(spec, (list, tuple)) or len(spec) != 2:
+            continue
+        role, template = str(spec[0] or "").strip(), str(spec[1] or "")
+        head, sep, tail = template.partition("{chat}")
+        if role and sep and (head.strip() or tail.strip()) and (role, head, tail) not in out:
+            out.append((role, head, tail))
+    return out
+
+
+def _is_field(snap: Any) -> bool:
+    return snap is not None and bool(getattr(snap, "accepts_text", False)) and not getattr(snap, "is_password", False)
+
+
+def _labelled(snap: Any, labels: Sequence[tuple[str, str]]) -> bool:
+    role, name = str(getattr(snap, "role", "") or "").casefold(), _words(getattr(snap, "name", "")).casefold()
+    return any(role == r.casefold() and name == n.casefold() for r, n in labels)
+
+
+def _fits(snap: Any, shapes: Sequence[tuple[str, str, str]]) -> bool:
+    role = str(getattr(snap, "role", "") or "").casefold()
+    name = " ".join(str(getattr(snap, "name", "") or "").split()).casefold()
+    return any(role == r.casefold() and len(name) > len(h) + len(t) and name.startswith(h.casefold())
+               and name.endswith(t.casefold()) for r, h, t in shapes)
+
+
+def _in_composer(snap: Any, hwnd: int, labels: Sequence[tuple[str, str]], own_field: Any = None,
+                 shapes: Sequence[tuple[str, str, str]] = ()) -> bool:
+    """Whether the keyboard is in the opened chat's composer: a text field (never a password field) in the app's own
+    window ``hwnd``, not the field this very run's switcher gave it to (``own_field``: still open), and, with
+    ``labels``, the control the app's data labels as the composer; else, with ``shapes``, one whose name fits the
+    label's template (:func:`composer_shapes`); with neither (an app with no label data), the field itself."""
+    if not _is_field(snap):
+        return False
+    if hwnd and int(getattr(snap, "window", 0) or 0) != int(hwnd):
+        return False
+    if own_field is not None and _ident(snap) == tuple(own_field):
+        return False
+    if labels:
+        return _labelled(snap, labels)
+    return not shapes or _fits(snap, shapes)
+
+
+def _await_composer(ctx: Any, hands: Any, hwnd: int, labels: Sequence[tuple[str, str]], own_field: Any,
+                    wait_s: float, shapes: Sequence[tuple[str, str, str]] = ()) -> Any:
+    """The focus read every :data:`POLL_S` for at most ``wait_s`` until the keyboard is in the composer
+    (:func:`_in_composer`): that read, else ``None``."""
+    deadline = ctx.clock() + max(0.0, float(wait_s))
+    while True:
+        snap = _holder(hands)
+        if _in_composer(snap, hwnd, labels, own_field, shapes):
+            return snap
+        if ctx.clock() + POLL_S > deadline:
+            return None
+        ctx.sleep(POLL_S)
+
+
+def _focus_control(hwnd: int, role: str, name: str) -> str:
+    """The control's own UIA ``SetFocus`` (``uia_route.press`` pattern ``focus``: found by role and exact name in the
+    app's window, never two; the game gate asked as for any focus). Its outcome code word (``pressed``, ``missing``,
+    ``ambiguous``, ``refused``, ...)."""
+    from yuki.skills.uia_route import press
+
+    try:
+        return str(press(int(hwnd), role=role, name=name, pattern="focus").outcome)
+    except Exception:  # noqa: BLE001
+        return "error"
+
+
+def _act_off(hands: Any, image: str) -> str | None:
+    act_off = getattr(hands, "act_off", None)
+    if not callable(act_off):
+        return None
+    try:
+        return str(act_off(image) or "") or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@dataclass
+class _Keyboard:
+    """Where the keyboard went before the typing (:func:`_composer_focus`): ``ok`` in the composer; ``how`` a code word;
+    ``holder`` the last focus read (RAM); ``stop`` a result that ends the route now (Act off, a game)."""
+
+    ok: bool
+    how: str
+    holder: Any = None
+    stop: RouteResult | None = None
+
+
+def _put_in_composer(call: RouteCall, hands: Any, hwnd: int, labels: Sequence[tuple[str, str]],
+                     own_field: Any, shapes: Sequence[tuple[str, str, str]] = ()) -> tuple[str, Any]:
+    """One try: the composer found by the app's own label (:func:`composer_labels`), focused through UIA
+    (:func:`_focus_control`) and confirmed by the focus read within ``uia_route.FOCUS_WAIT_S`` (never the step
+    runner's 0.4 s first-step read); with no label in the app's data, or that label nowhere in its window, the text
+    field the app itself gives the keyboard as the chat opens (structure), waited for as long, and only one whose name
+    fits the label's template when the app has one (``shapes``: never a switcher's or a search box's field). ``(how,
+    focus read or None)``."""
+    from yuki.skills.uia_route import FOCUS_WAIT_S
+
+    for role, name in labels:
+        outcome = _focus_control(hwnd, role, name)
+        if outcome == "pressed":
+            got = _await_composer(call.ctx, hands, hwnd, labels, own_field, FOCUS_WAIT_S)
+            return ("focused", got) if got is not None else ("not_taken", None)
+        if outcome == "refused":
+            return "refused", None
+    got = _await_composer(call.ctx, hands, hwnd, [], own_field, FOCUS_WAIT_S, shapes)
+    if got is not None:
+        return "settled", got
+    return ("no_composer" if labels else "no_field"), None
+
+
+def _composer_focus(call: RouteCall, app: str, data: Mapping[str, Any], route: ChatRoute, hwnd: int, *,
+                    own_field: Any = None) -> _Keyboard:
+    """chat19: before anything is typed, the keyboard goes into the opened chat's composer instead of being hoped to be
+    there: already there (``in_composer``), or focused by its label through UIA (``focused``), or the app's own field
+    (``settled``), confirmed by the focus read. The rows a focus meets are asked first, as for the app's window
+    (:func:`_focus_app`): the app's Act switch (told, nothing done) and the game gate (held). Something else holding
+    the keyboard (a dialog) is closed only when this very run opened it: the switcher whose field still has the
+    keyboard (``own_field``), with the app's own close key on its own judged run (``closed_own``); anything else is
+    left as it is and reported as a code fact by the caller (:func:`_not_typed`), since it may be the user's."""
+    hands = call.ctx.hands
+    labels = composer_labels(data, route)
+    shapes = composer_shapes(data)
+    snap = _holder(hands)
+    if _in_composer(snap, hwnd, labels, own_field):
+        return _Keyboard(True, "in_composer", snap)
+    image = str((data.get("images") or [""])[0])
+    off = _act_off(hands, image)
+    if off:
+        return _Keyboard(False, "act_off", snap, stop=RouteResult(ran=True, ask=LINE_ACT_OFF.format(app=off),
+                                                                  outcome="act_off", app=app))
+    if not hwnd:
+        from yuki.skills.uia_route import FOCUS_WAIT_S
+
+        got = _await_composer(call.ctx, hands, 0, [], own_field, FOCUS_WAIT_S, shapes)
+        return _Keyboard(got is not None, "settled" if got is not None else "no_window", got or _holder(hands))
+    if kind := _refused("focus", hwnd=hwnd):
+        return _Keyboard(False, "refused", snap, stop=RouteResult(ran=True, held=kind, outcome="refused", app=app))
+    closed = False
+    while True:
+        how, got = _put_in_composer(call, hands, hwnd, labels, own_field, shapes)
+        if got is not None:
+            return _Keyboard(True, "closed_own" if closed else how, got)
+        holder = _holder(hands)
+        if how == "refused" and (kind := _refused("focus", hwnd=hwnd)):
+            return _Keyboard(False, "refused", holder, stop=RouteResult(ran=True, held=kind, outcome="refused",
+                                                                        app=app))
+        if closed or own_field is None or _ident(holder) != tuple(own_field):
+            return _Keyboard(False, how, holder)
+        # the switcher this very run opened still holds the keyboard (its open key went and the chat showed, but it
+        # stayed): closed with the app's own close key, then the composer once more
+        if _close_own(call, hands, data, apps=list(data.get("images") or []), key="message") != "sent":
+            return _Keyboard(False, "own_left", holder)
+        closed = True
+
+
+def _holder_facts(snap: Any, hwnd: int) -> tuple[dict[str, Any], str]:
+    """What has the keyboard, as content-free facts (its control type, a code word; whether it is in the app's window;
+    whether it takes text) and, for RAM only, its role and name as the caller may read them (``Window "Quick
+    Switcher"``: a name can be the user's content, so it never reaches a log)."""
+    if snap is None:
+        return {"holder": "unread"}, ""
+    role = str(getattr(snap, "role", "") or "")
+    window = int(getattr(snap, "window", 0) or 0)
+    facts = {"holder": role if role.isalnum() else ("none" if not role else "other"),
+             "holder_in_app": bool(hwnd) and window == int(hwnd), "holder_takes_text": _is_field(snap)}
+    if not role:
+        return facts, "nothing"
+    return facts, f'{role} "{_words(getattr(snap, "name", ""))[:60]}"'
+
+
+def _not_typed(call: RouteCall, app: str, name: str, hwnd: int, facts: Mapping[str, Any], ram: Mapping[str, Any],
+               holder: Any = None, *, read: bool = True) -> RouteResult:
+    """chat19 (contract C3): the chat is open and nothing could be typed. Never a question (``LINE_NOT_TYPED`` as a
+    final ask ended the turn and stopped the caller's own hands from finishing it): an acted, failed result with code
+    facts ``{"status": "failed", "why": "not_typed", "holder": <control type of what has the keyboard>}`` and, in RAM,
+    ``facts_ram["holder"]`` (its role and name), so the engine passes it on as unverified for the next rung or the
+    caller's own hands to take on. ``LINE_NOT_TYPED`` stays its fallback line. ``holder``: the focus read already
+    taken, else read now (``read``)."""
+    snap = holder if holder is not None or not read else _holder(call.ctx.hands)
+    held, shown = _holder_facts(snap, hwnd)
+    return RouteResult(ran=True, outcome="failed", app=app, unverified_line=LINE_NOT_TYPED.format(name=name),
+                       facts={**facts, "typed": "no", "pressed": False, "status": "failed", "why": "not_typed",
+                              **held},
+                       facts_ram={**ram, "typed": False, "pressed": False, "holder": shown})
+
+
 def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Target, route: ChatRoute, *, via: str,
-                since: float, hwnd: int, as_draft: bool = False) -> RouteResult:
-    """After the chat was asked to open: wait until it is seen open, then (only then) type the user's words, and press
-    send when they plainly said so. The route's result: acted, with its RAM facts for the done-check. ``as_draft``
-    (:func:`_send_gate`): a send to a person matched by sound, answered since: typed and left, said so."""
+                since: float, hwnd: int, as_draft: bool = False, own_field: Any = None) -> RouteResult:
+    """After the chat was asked to open: wait until it is seen open, then (only then) put the keyboard in its composer
+    (chat19, :func:`_composer_focus`), type the user's words, and press send when they plainly said so. The route's
+    result: acted, with its RAM facts for the done-check. ``as_draft`` (:func:`_send_gate`): a send to a person matched
+    by sound, answered since: typed and left, said so. ``own_field``: the text field this very run's switcher gave the
+    keyboard to (its own to close if it still holds it). Nothing typed: :func:`_not_typed` (contract C3), never a
+    question."""
     text, send = _text_mode(call.values)
     send = send and not as_draft
     name = target.name
@@ -1397,6 +1738,16 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
         return RouteResult(ran=True, outcome="chat_unconfirmed" if chat is None else "other_chat", app=app,
                            unverified_line=LINE_UNSURE_CHAT.format(app=_title(app), name=name), facts=facts,
                            facts_ram=ram)
+    # chat19: the keyboard into the opened chat's composer first (found by the app's label data or by structure,
+    # focused through UIA, confirmed by the focus read); nothing is read, typed or pressed anywhere else
+    keyboard = _composer_focus(call, app, data, route, hwnd, own_field=own_field)
+    facts["keyboard"] = keyboard.how
+    if keyboard.stop is not None:
+        keyboard.stop.facts.update(facts)
+        keyboard.stop.facts_ram = {**ram, "typed": False, "pressed": False}
+        return keyboard.stop
+    if not keyboard.ok:
+        return _not_typed(call, app, name, hwnd, facts, ram, keyboard.holder, read=False)
     # The composer is read before anything is typed (review r1 L6, r2 H1), the field's own text (never the caret
     # context, fMsg). Exactly these words already there (a draft Yuki typed on an earlier run whose send key was held,
     # kept by the app): never typed a second time; only the send key, if asked. Exactly another text Yuki typed into
@@ -1492,23 +1843,20 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
                            facts={**facts, "held_at": "box"}, facts_ram=ram)
     if not kept and not went and not blind and not as_draft:
         # fMsg review M1: no typing went out (the select-all or the typing was refused or stopped without a reason
-        # the user hears): said so, never "typed"
-        return RouteResult(ran=True, ask=LINE_NOT_TYPED.format(name=name), outcome="not_typed", app=app,
-                           facts=facts, facts_ram=ram)
+        # the user hears): never "typed". chat19 (C3): a failed result with the code facts, never a question
+        return _not_typed(call, app, name, hwnd, facts, ram)
     if blind:
         # sWire r1 M1: a composer that couldn't be read; the send key was never pressed. Told, not asked, either way
         if typed is not False and went:
             return RouteResult(ran=True, ask=LINE_TYPED_UNREAD.format(name=name), outcome="typed_unread", app=app,
                                facts={**facts, "held_at": "composer"}, facts_ram=ram)
-        ram.update(typed=False)
-        return RouteResult(ran=True, ask=LINE_NOT_TYPED.format(name=name), outcome="not_typed", app=app,
-                           facts={**facts, "typed": "no"}, facts_ram=ram)
+        return _not_typed(call, app, name, hwnd, facts, ram)
     if as_draft:
         # review r1 H1: the send they asked for, to a person matched by sound and answered since, is typed and left;
         # told plainly, never "Sent" (the done-check would wait for a send that never goes)
         if typed is False:
-            return RouteResult(ran=True, ask=LINE_NOT_TYPED.format(name=name), outcome="not_typed", app=app,
-                               facts={**facts, "held_at": "whom"}, facts_ram=ram)
+            # chat19 (C3): not typed is a failed result; ``held_at = whom`` tells the caller it is never sent by sound
+            return _not_typed(call, app, name, hwnd, {**facts, "held_at": "whom"}, ram)
         return RouteResult(ran=True, ask=LINE_TYPED_ALIKE.format(name=name), outcome="typed_alike", app=app,
                            facts={**facts, "held_at": "whom"}, facts_ram=ram)
     say = (SAY_SENT if send else SAY_DRAFT).format(name=name, where=where)
@@ -1582,17 +1930,32 @@ def route_switcher(call: RouteCall) -> RouteResult:
     if failed is not None:
         return failed
     since = time.time()
-    ok, run = _run_switch(call, hands, steps, apps=list(data.get("images") or []), key="message", way_text=way_text)
+    ok, run = _run_switch(call, hands, steps, apps=list(data.get("images") or []), key="message", way_text=way_text,
+                          data=data)
     done = int(run.get("steps_done") or 0)
+    tidy = _switch_facts(run, steps)
     stop = _stopped(run, app, acted=done > 0)
     if stop is not None:
+        stop.facts.update(tidy)
         return stop
     if run.get("switcher") == "unseen":
         # review r1 L1: the shortcut went but no other field took the keyboard: nothing typed, nothing sent
-        return RouteResult(ran=False, outcome="switcher_unseen", facts={"steps": len(steps), "steps_done": done})
-    if done == 0:
-        return RouteResult(ran=False, outcome="switcher_failed", facts={"steps": len(steps)})
-    return _after_open(call, app, data, target, route, via="switcher", since=since, hwnd=hwnd, as_draft=as_draft)
+        return RouteResult(ran=False, outcome="switcher_unseen", facts=tidy)
+    if not run.get("finished"):
+        # chat19 (RC1): never on to the chat with only part of the switcher done (the shortcut alone counted before,
+        # and the chat already on screen passed for the one opened while the switcher kept the keyboard); what it
+        # opened was closed (:func:`_tidy_switch`), nothing typed, nothing sent
+        return RouteResult(ran=False, outcome="switcher_failed", facts=tidy)
+    return _after_open(call, app, data, target, route, via="switcher", since=since, hwnd=hwnd, as_draft=as_draft,
+                       own_field=run.get("switcher_field"))
+
+
+def _switch_facts(run: Mapping[str, Any], steps: Sequence[Any]) -> dict[str, Any]:
+    """A switcher run's content-free facts: its steps, how many went, and (chat19) whether what it opened was closed."""
+    out: dict[str, Any] = {"steps": len(steps), "steps_done": int(run.get("steps_done") or 0)}
+    if run.get("switcher_closed"):
+        out["switcher_closed"] = str(run["switcher_closed"])
+    return out
 
 
 def _switch_steps(call: RouteCall, data: Mapping[str, Any], route: ChatRoute) -> tuple[list[dict[str, Any]], str]:
@@ -1690,7 +2053,8 @@ def probe_message_done(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, 
         if text:
             if chat is True and ram.get("typed") is True:
                 return True, {"status": "typed"}
-            return None, {"status": "unconfirmed"}
+            # chat19 (C3): a draft the route couldn't type says so in the check's own word (the evidence's status)
+            return None, {"status": "not_typed" if ram.get("typed") is False else "unconfirmed"}
         if chat is True:
             return True, {"status": "open"}
     store = _probe_store(ctx)
@@ -1988,16 +2352,19 @@ def route_voice_join(call: RouteCall) -> RouteResult:
     steps = [{"do": "keys", "keys": [str(k) for k in data["switcher"]]}, {"do": "type", "text": query},
              {"do": "keys", "keys": [str(k) for k in data.get("open") or ["enter"]]}]
     ok, run = _run_switch(call, hands, steps, apps=list(data.get("images") or []), key="discord.voice",
-                          way_text=query)
+                          way_text=query, data=data)
     done = int(run.get("steps_done") or 0)
+    tidy = _switch_facts(run, steps)
     stop = _stopped(run, app, acted=done > 0)
     if stop is not None:
+        stop.facts.update(tidy)
         return stop
     if run.get("switcher") == "unseen":
         # review r1 L1: the switcher never took the keyboard: the channel's name is never typed into a chat
-        return RouteResult(ran=False, outcome="switcher_unseen", facts={"steps": len(steps), "steps_done": done})
-    if done == 0:
-        return RouteResult(ran=False, outcome="switcher_failed", facts={"steps": len(steps)})
+        return RouteResult(ran=False, outcome="switcher_unseen", facts=tidy)
+    if not run.get("finished"):
+        # chat19 (RC1): a switcher left partway is closed by its own run (:func:`_tidy_switch`); no Join pressed
+        return RouteResult(ran=False, outcome="switcher_failed", facts=tidy)
     return join_tail(call, data, app, hwnd, image, before, name, {"steps_done": done})
 
 

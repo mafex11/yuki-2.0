@@ -1495,6 +1495,11 @@ def _activate_packaged(
 # ---------------------------------------------------------------------------
 # Verifying that a page opened: the address, not the window title
 # ---------------------------------------------------------------------------
+#: chat19: the URL schemes whose address a browser window's page shows as it was handed (the web's own; a fixed
+#: machine format, :func:`_page_address`).
+_PAGE_SCHEMES = frozenset({"http", "https", "ftp", "file"})
+
+
 def _page_address(arg: str) -> str | None:
     """The web address an argument asks an app to open, or ``None``.
 
@@ -1504,6 +1509,14 @@ def _page_address(arg: str) -> str | None:
     handed it opens as ``https://`` - and not a path to something on disk.  A
     bare ``name.ext`` is not taken for a page (it is as likely a file), nor is
     a URI of a scheme with no host (``mailto:``, ``spotify:track:...``).
+
+    chat19 (final test 19 Oct, all-messaging RC2): only the web schemes
+    (:data:`_PAGE_SCHEMES`) are pages. An app's own link of another scheme with
+    an authority part (``discord://-/channels/@me/<id>``, ``slack://channel?..``)
+    is no page: Discord's window then shows ``https://discord.com/...``, which
+    can never equal the link, so the open waited out its whole deadline and,
+    with the old page readable, said "not opened". Such a link is checked by
+    its handler's window only.
     """
     text = (arg or "").strip()
     if not text or any(ch.isspace() for ch in text) or "\\" in text:
@@ -1514,8 +1527,10 @@ def _page_address(arg: str) -> str | None:
         return None
     scheme = parts.scheme.lower()
     if len(scheme) > 1:
-        if parts.netloc or scheme == "file":
-            return text
+        if scheme in _PAGE_SCHEMES:
+            return text if parts.netloc or scheme == "file" else None
+        if parts.netloc or text[len(scheme) + 1:].startswith("//"):
+            return None  # an app's own link (discord://, slack://): its window is the check, never a page
         # "localhost:3000/x" parses as scheme "localhost": a port, not a scheme.
         if not text[len(scheme) + 1 :].split("/", 1)[0].isdigit():
             return None
@@ -3202,11 +3217,18 @@ def launch_app(
             # host): not opened, so a skill goes on to its next rung instead of counting this as acted
             details["reason"] = "page_unchanged"
             details["page_state"] = "same" if still else "other"
-        elif no_protocol and page_wait is not None and page_wait.windows and not page_wait.seen:
+        elif no_protocol and page_wait is not None and (page_wait.windows or already_running):
+            # (reached only when no window shows a main page: _page_miss said "not opened" for any that does)
             # review r1 M1: its windows are up and show no page at all after a start through its alias or
             # ActivateApplication (Windows refused it the address by protocol activation; a cold Arc shows its
             # new-tab view): not opened, so open_url's address bar or the web skill's next rung types it, instead of
-            # an "opened, not known" that the skill counted as acted and handed to the thinker 6 s later
+            # an "opened, not known" that the skill counted as acted and handed to the thinker 6 s later.
+            # chat19 (all-browser R8: a running Arc handed the address by its alias came back "unread", counted as
+            # acted, and the request waited for a page that never came): its watch is already capped at its react
+            # time (``_REFUSED_PAGE_S``, above); when that ends with no main page in any window (a second page beside
+            # none, or none of its windows on screen while it runs: the listing skips minimised ones) it is
+            # "not opened" too, so the address-bar rung runs (it brings the window up) and the ignored hand-off is
+            # noted. Arc's pages read whenever one shows (final test 19 Oct), so no page means none opened.
             details["reason"] = "page_blank"
             details["page_state"] = "blank"
             page_miss = (False, (

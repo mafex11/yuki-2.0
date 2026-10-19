@@ -2259,7 +2259,10 @@ def trace_steps(results: list[StepResult], pid: int | None) -> list[dict[str, An
 # =====================================================================================================================
 
 #: The patterns a ``uia_invoke`` route may call (D0: UI Automation's Invoke, SelectionItem, Value, RangeValue).
-PATTERNS: tuple[str, ...] = ("invoke", "select", "value", "range")
+#: chat19: ``focus`` is the element's own ``SetFocus`` (no pattern, no key, no pointer): the keyboard put in a field the
+#: way a user's Tab would, e.g. an opened chat's composer (``chat._composer_focus``). It takes focus, so the game gate
+#: is asked as for any focus (never ``front_ok``, :func:`press`).
+PATTERNS: tuple[str, ...] = ("invoke", "select", "value", "range", "focus")
 _PATTERN_IDS: dict[str, int] = {"invoke": 10000, "select": 10010, "value": 10002, "range": 10003}
 #: One by-name search's budget on a warm window (its own UIA thread; a provider that blocks costs this, never more).
 FIND_BUDGET_S = 0.6
@@ -2377,8 +2380,15 @@ def find_in(hwnd: int, *, role: str, name: str, container: Any = (), budget_s: f
 
 
 def apply_pattern(element: Any, pattern: str, value: Any = None, module: Any = None) -> bool:
-    """One pattern call on a live element (no focus, no key, no pointer): Invoke, SelectionItem.Select,
-    Value.SetValue(text) or RangeValue.SetValue(number). False when the element doesn't offer it or the call failed."""
+    """One pattern call on a live element (no key, no pointer): Invoke, SelectionItem.Select, Value.SetValue(text) or
+    RangeValue.SetValue(number); ``focus`` (chat19) is the element's own ``SetFocus``, the only one that moves the
+    keyboard. False when the element doesn't offer it or the call failed."""
+    if pattern == "focus":
+        try:
+            element.SetFocus()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
     if pattern not in _PATTERN_IDS:
         return False
     try:
@@ -2420,14 +2430,16 @@ def press(hwnd: int, *, role: str, name: str, pattern: str = "invoke", value: An
           budget_s: float = FIND_BUDGET_S, automation_fn: Any = None, module: Any = None) -> Pressed:
     """Find one control by role and name inside its container, then call ``pattern`` on it, in one UIA job on its own
     thread. Refused (nothing sent) when the window belongs to a game (D17: a pattern call on any other window may run
-    with a game in front). Never two candidates: ``ambiguous`` and nothing pressed."""
+    with a game in front); ``focus`` (chat19: ``SetFocus`` activates the element's window) is refused with a game in
+    front too, as every focus is. Never two candidates: ``ambiguous`` and nothing pressed."""
     from yuki.actions import gate
 
     if pattern not in PATTERNS:
         return Pressed("error", why="pattern")
     if not hwnd:
         return Pressed("no_window")
-    if (why := gate.refuse("uia_pattern", hwnd=int(hwnd), front_ok=True)) is not None:
+    focus = pattern == "focus"
+    if (why := gate.refuse("uia_focus" if focus else "uia_pattern", hwnd=int(hwnd), front_ok=not focus)) is not None:
         return Pressed("refused", why=str(why), kind=gate.kind_of(why))
     t0 = time.perf_counter()
     gone = threading.Event()

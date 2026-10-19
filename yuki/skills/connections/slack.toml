@@ -20,6 +20,9 @@ services = ["app.slack.com", "slack"]
 switcher = ["ctrl", "k"]
 open = ["enter"]
 send = ["enter"]
+# closes the quick switcher (chat19): sent only for a switcher Yuki's own run opened and didn't finish. No composer
+# label here (not read live yet): the message box is the field Slack itself gives the keyboard as the chat opens
+close = ["escape"]
 # select everything in the message box (a draft Yuki typed there itself is typed over, never the user's:
 # yuki/skills/chat.py typed_by_yuki)
 select_all = ["ctrl", "a"]

@@ -140,18 +140,36 @@ def _close_control(automation: Any, element: Any) -> Any:
     (live 2026-09-27 14:18 and 14:19 both closes of a playing YouTube tab were refused as "no single close
     control"): the close control is the one that sits last along the tab, the right-most (measured pixels, never
     its localized name). With several buttons and no positions to tell them apart, nothing is chosen.
+
+    chat19 (final test 19 Oct, all-browser R3: every Chrome tab close, Yuki's and the harness's, was "no single close
+    control"; Chrome's newer tab strip, its names carrying "- Memory usage - N MB", gives a tab a Button that isn't
+    drawn): a Button with an empty box, one UIA reports off-screen, or one whose box lies outside the tab's own box is
+    not on the tab as shown and is left out before choosing (:func:`_button_children`).
     """
     return pick_close_control(_button_children(automation, element))
 
 
+_P_IS_OFFSCREEN = 30022
+
+
 def _button_children(automation: Any, element: Any) -> list[tuple[Any, tuple[int, int, int, int] | None]]:
-    """``(element, (left, top, right, bottom) or None)`` of a TabItem's Button children, in tree order."""
+    """``(element, (left, top, right, bottom) or None)`` of a TabItem's Button children, in tree order. The box is
+    ``None`` when the Button is not drawn on the tab (chat19): an empty box, UIA's ``IsOffscreen``, or a box that
+    doesn't overlap the TabItem's own (when that one is known)."""
     from yuki.perception.tabs import _P_BOUNDING_RECT, _rect
 
     request = automation.CreateCacheRequest()
     request.AddProperty(_P_CONTROL_TYPE)
     request.AddProperty(_P_BOUNDING_RECT)
+    try:
+        request.AddProperty(_P_IS_OFFSCREEN)
+    except Exception:  # noqa: BLE001 - an older UIA without it: the box alone decides
+        pass
     request.TreeScope = _TREE_SCOPE_ELEMENT
+    try:
+        own = _rect(element.CurrentBoundingRectangle)
+    except Exception:  # noqa: BLE001 - the tab's own box unknown: the buttons' boxes alone decide
+        own = None
     try:
         children = element.FindAllBuildCache(_TREE_SCOPE_CHILDREN, automation.ControlViewCondition, request)
         items = [children.GetElement(i) for i in range(children.Length)]
@@ -163,23 +181,41 @@ def _button_children(automation: Any, element: Any) -> list[tuple[Any, tuple[int
                 rect = _rect(c.GetCachedPropertyValue(_P_BOUNDING_RECT))
             except Exception:  # noqa: BLE001 - no position: still a candidate when it is the only one
                 rect = None
-            out.append((c, rect if rect and rect[2] > rect[0] and rect[3] > rect[1] else None))
+            try:
+                offscreen = bool(c.GetCachedPropertyValue(_P_IS_OFFSCREEN))
+            except Exception:  # noqa: BLE001 - not read: the box decides
+                offscreen = False
+            out.append((c, rect if _drawn(rect, own) and not offscreen else None))
         return out
     except Exception:  # noqa: BLE001 - a tab that went away mid-read
         return []
 
 
+def _drawn(rect: tuple[int, int, int, int] | None, own: tuple[int, int, int, int] | None) -> bool:
+    """Whether a box is drawn on the tab: not empty, and overlapping the tab's own box when that is a real one."""
+    if not rect or rect[2] <= rect[0] or rect[3] <= rect[1]:
+        return False
+    if not own or own[2] <= own[0] or own[3] <= own[1]:
+        return True
+    return rect[0] < own[2] and own[0] < rect[2] and rect[1] < own[3] and own[1] < rect[3]
+
+
 def pick_close_control(buttons: list[tuple[Any, Any]]) -> Any:
     """The close control among a tab's buttons: the only one, else the right-most by its on-screen box.
 
-    ``buttons`` are ``(element, (left, top, right, bottom) or None)``. ``None`` when there are none, or several
-    without boxes to tell them apart.
+    ``buttons`` are ``(element, (left, top, right, bottom) or None)``, ``None`` for a Button not drawn on the tab.
+    chat19: those are left out first; one drawn Button is the close control, several the right-most drawn one. With
+    none drawn, a tab's only Button is still the one (no position to judge it by, as before); several with none
+    drawn: ``None`` (nothing is chosen).
     """
+    drawn = [(b, r) for b, r in buttons if r is not None]
+    if len(drawn) == 1:
+        return drawn[0][0]
+    if len(drawn) > 1:
+        return max(drawn, key=lambda br: br[1][2])[0]
     if len(buttons) == 1:
         return buttons[0][0]
-    if len(buttons) < 2 or any(r is None for _b, r in buttons):
-        return None
-    return max(buttons, key=lambda br: br[1][2])[0]
+    return None
 
 
 def _invoke(element: Any, module: Any) -> bool:

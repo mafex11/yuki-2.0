@@ -30,6 +30,9 @@ services = ["discord.com", "discord"]
 switcher = ["ctrl", "k"]
 open = ["enter"]
 send = ["enter"]
+# closes the quick switcher (chat19, final test 19 Oct: a switcher Yuki opened and didn't finish was left holding
+# Discord's keyboard for every later draft): sent only for a switcher Yuki's own run opened and didn't finish
+close = ["escape"]
 # select everything in the message box (a draft Yuki typed there itself is typed over, never the user's:
 # yuki/skills/chat.py typed_by_yuki)
 select_all = ["ctrl", "a"]
@@ -56,6 +59,10 @@ uri = "discord://-/channels/{guild}/{channel}"
 # Discord's UI labels per display language (the button shown in an opened voice channel before joining).
 [chat.labels.en]
 join_voice = ["Button", "Join Voice"]
+# an opened chat's message box (chat19): its role and name, "{chat}" the chat as the quick switcher names it (its
+# kind's filter character and its name: "Message @<name>" in a DM, "Message #<channel>"; live 18 Oct the box read
+# Edit "Message @<name>"). Yuki puts the keyboard there before typing (yuki/skills/chat.py _composer_focus)
+composer = ["Edit", "Message {chat}"]
 # the header Discord shows on a voice channel; memory's capture keeps it before the channel's name in the scope
 voice_channel = ["Voice Channel"]
 
