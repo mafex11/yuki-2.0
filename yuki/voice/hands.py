@@ -6774,6 +6774,10 @@ class Hands:
                 # integration T4: what the keyboard rung put back after its close (logged: booleans only)
                 facts["tab_reselected"] = rung.get("reselected") == "reselected"
                 facts["tab_front_back"] = rung.get("front_back") == "given"
+                # recheck (safety timing 5): the browser's own pick after the close not known (no tab switched), and
+                # the browser the rung raised left in front (its report says so)
+                facts["tab_pick_unknown"] = rung.get("pick") == "unknown"
+                facts["tab_front_left"] = bool(rung.get("front_left"))
             (closed if good else failed).append(title)
             lines.append(str(getattr(result, "summary", "")))
             facts["action_ms"] = round(float(getattr(result, "elapsed_ms", 0.0) or 0.0))

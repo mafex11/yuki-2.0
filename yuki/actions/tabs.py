@@ -24,7 +24,10 @@ and seen there, the key is sent to that window only, and the strip is read again
 the tab the user was on is selected again (UIA, no key) and the window that was in front gets the front back
 (``place.focus_back``, gated and undoable, never to an app whose Act switch is off), only while the strip's selection
 is still the one the rung or the close left and the browser is still in front (``details["keys_rung"]``:
-``reselected``, ``front_back``).
+``reselected``, ``front_back``). Recheck (safety timing 5): when the browser's own pick right after the close is not
+known, no tab is switched; the front goes back only while the strip, read whole, is unchanged since the close was first
+seen, else the browser is left in front, and either way the report says so (``pick``, ``front_left``:
+:func:`_unknown_pick`).
 
 desk20 review: the close key closes every selected tab (a browser's strip is multiselectable), so right before the key
 the tab must be the one and only selected TabItem of the whole strip, read whole (:func:`_only_selected`; a user's
@@ -324,14 +327,22 @@ def _gone(now: list[tuple[Any, Any]], diag: dict[str, Any], whole: bool, tab_id:
     return bool(whole) or (bool(mates) and mates <= ids)
 
 
+def _strip(found: list[tuple[Any, Any]]) -> dict[str, list[str]]:
+    """One read of a strip by identity alone (content-free): its tab ids in order and its selected ids. Pure."""
+    return {"ids": [str(t.tab_id) for t, _e in found if t.tab_id],
+            "selected": sorted(str(t.tab_id) for t, _e in found if t.selected and t.tab_id)}
+
+
 def _watch_gone(automation: Any, hwnd: int, tab_id: str, mates: set[str], out: dict[str, Any]) -> None:
     """desk20 review 2: watch ``hwnd``'s strip for the tab leaving it (re-reads, a condition poll of
     :data:`CLOSE_WATCH_S`), then read it once more for what is there now. ``out`` gets ``seen`` (a read that counts,
     :func:`_gone`, lacks it, and the last read does not hold it), ``read_back`` (some read told: it held the tab, or
     counts as gone), ``after``, ``after_complete`` and ``picked`` (safety WW8, timing 5: the selected tab ids of the
     first read after the key that lacked the tab, when it counted as gone: the browser's own pick; ``None`` when not
-    known so: a read before it already lacked the tab, or only the read after the watch saw it gone). Blocking; never
-    raises for a window that went away."""
+    known so: a read before it already lacked the tab, or only the read after the watch saw it gone), and
+    ``closed_strip`` (recheck: the read that first counted the tab gone, by identity, :func:`_strip`, when it was read
+    whole and the read after the watch, read whole too, showed it unchanged; else ``None``). Blocking; never raises
+    for a window that went away."""
     from yuki.perception.tabs import walk_tabs
 
     def holds(now: list[tuple[Any, Any]]) -> bool:
@@ -342,6 +353,7 @@ def _watch_gone(automation: Any, hwnd: int, tab_id: str, mates: set[str], out: d
 
     seen = read_back = lacked = False
     picked: list[str] | None = None
+    first: dict[str, list[str]] | None = None
     deadline = time.monotonic() + CLOSE_WATCH_S
     while time.monotonic() < deadline:
         diag: dict[str, Any] = {}
@@ -353,6 +365,7 @@ def _watch_gone(automation: Any, hwnd: int, tab_id: str, mates: set[str], out: d
             # safety WW8: the tab the browser showed right after the close (first read gone); safety timing 5: only
             # when no earlier read already lacked the tab (cut short), else this one may hold the user's click: unknown
             picked = None if lacked else chosen(now)
+            first = _strip(now) if whole else None
             break
         read_back = read_back or holds(now)
         lacked = lacked or not holds(now)
@@ -367,7 +380,11 @@ def _watch_gone(automation: Any, hwnd: int, tab_id: str, mates: set[str], out: d
         # safety timing 5: first seen gone only by this read, a whole watch after the key: its selection may be the
         # user's own click by now, not the browser's pick, so no pick is known (nothing is switched back)
         picked = None
-    out.update(seen=seen, read_back=read_back, after=_rows(later), after_complete=bool(whole), picked=picked)
+        first = _strip(later) if whole else None
+    elif first is not None and (not whole or _strip(later) != first):
+        first = None   # recheck: the strip changed (or was not read whole) since the close was first seen
+    out.update(seen=seen, read_back=read_back, after=_rows(later), after_complete=bool(whole), picked=picked,
+               closed_strip=first if seen else None)
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +686,48 @@ def _front_back(hwnd: int, front_before: Any) -> str:
         return "failed"
 
 
+def _unknown_pick(hwnd: int, was_on: list[str], front_before: Any,
+                  closed: dict[str, list[str]] | None) -> dict[str, Any]:
+    """Recheck (safety timing 5, the user doing nothing): the keyboard rung's close was seen, but the browser's own pick
+    right after it is not known (a read cut short came first, or only the read after the watch saw the tab gone). No
+    tab is switched (that would be a guess), and the strip is read once more, whole, by identity (:func:`_strip`):
+    ``reselected`` is ``already`` when the tab they were on is the one selected now, ``none`` when there was no single
+    one, else ``unknown`` (the report says it was not shown again). The window that was in front gets the front back
+    (:func:`_front_back`: the browser still in front, that window still there and none of Yuki's own, its Act switch
+    on, the game gate) only while the strip is unchanged since the read that first saw the tab gone (``closed``, from
+    :func:`_watch_gone`; ``None``: not known so); else nothing is given back and ``front_back`` is ``left`` while the
+    browser is still in front. ``front_left``: the browser the rung raised is left in front (the report says so).
+    ``pick``: ``unknown``. Blocking, bounded; never raises."""
+    from yuki.actions.input import _Pending, _user32
+
+    def job(automation: Any, shared: dict) -> None:
+        _t, _e, found, whole = _find(automation, hwnd, "", KEYS_SELECT_S * 0.4)
+        shared["now"] = _strip(found) if whole and found else None
+
+    try:
+        now = _Pending(job, "yuki-tab-keys-since", KEYS_SELECT_S).wait().get("now")
+    except Exception:  # noqa: BLE001 - not read: unknown
+        now = None
+    out: dict[str, Any] = {"pick": "unknown"}
+    if len(was_on) != 1:
+        out["reselected"] = "none"
+    else:
+        out["reselected"] = "already" if now is not None and now["selected"] == [str(was_on[0])] else "unknown"
+    if not front_before:
+        out["front_back"] = "none"
+        return out
+    same = now is not None and closed is not None and now == closed
+    got = _front_back(hwnd, front_before) if same else "left"
+    try:
+        in_front = int(_user32.GetForegroundWindow() or 0) == int(hwnd)
+    except Exception:  # noqa: BLE001
+        in_front = False
+    out["front_back"] = "moved_on" if got == "left" and not in_front else got
+    if in_front and out["front_back"] not in ("given", "moved_on"):
+        out["front_left"] = True
+    return out
+
+
 def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
     """Select or close the tab of ``hwnd``'s strip whose identity is ``tab_id``, then re-read the strip.
 
@@ -754,6 +813,7 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
         rung = _close_by_keys(int(hwnd), tab_id, keys)
         details["keys_rung"] = {k: v for k, v in rung.items() if k not in ("said", "was_on", "front_before")}
         left: list[str] | None = [tab_id]   # safety F5: the selection the rung's own select left (the tab alone)
+        unknown, closed = False, None   # recheck: closed, the browser's own pick not known (:func:`_unknown_pick`)
         if rung.get("refused"):
             details["refused"] = rung["refused"]
         if rung.get("sent"):
@@ -773,6 +833,7 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
                 shared["after"], shared["after_complete"] = [], False   # no read after the key: never the old one
             if shared["seen"]:
                 left = seen.get("picked")   # safety WW8: the browser's own pick right after the close (None: unknown)
+                unknown, closed = left is None, seen.get("closed_strip")
             elif not (shared["read_back"] and shared["after_complete"]):
                 left = None   # safety F5: not read back whole after the key (a prompt of the browser's may be up): kept
         else:
@@ -783,10 +844,16 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
             # asked): the tab they were on shows again, and the window that was in front gets the front back, only
             # while they have not moved on (the strip's selection is still the one the rung or the close left, and
             # the browser is still in front)
-            put = _reselect(int(hwnd), list(rung.get("was_on") or []), list(left) if left is not None else None)
-            details["keys_rung"]["reselected"] = put
-            details["keys_rung"]["front_back"] = ("moved_on" if put == "moved_on"
-                                                  else _front_back(int(hwnd), rung.get("front_before")))
+            if unknown:
+                # recheck (safety timing 5): closed, but the browser's own pick is not known: no tab is switched, the
+                # front goes back only on measured facts, and what is left is said (never in silence)
+                details["keys_rung"].update(_unknown_pick(int(hwnd), list(rung.get("was_on") or []),
+                                                          rung.get("front_before"), closed))
+            else:
+                put = _reselect(int(hwnd), list(rung.get("was_on") or []), list(left) if left is not None else None)
+                details["keys_rung"]["reselected"] = put
+                details["keys_rung"]["front_back"] = ("moved_on" if put == "moved_on"
+                                                      else _front_back(int(hwnd), rung.get("front_before")))
     tab = shared.get("tab") or {}
     after = list(shared.get("after") or [])
     details.update({"count": shared.get("count"), "nodes": shared.get("nodes"), "tab": tab or None,
@@ -802,9 +869,12 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
         return finish(False, f"window {hwnd} has no tab with id {tab_id} now (closed, or the strip changed); "
                              f"nothing was done; its {len(after)} tabs now are listed below")
     where = f"tab \"{tab['name']}\" [{tab_id}]"
-    # integration T4, safety F5: what the keyboard rung put back, on whatever exit it took
-    back = _KEYS_BACK_SAID.get(str((details.get("keys_rung") or {}).get("reselected") or ""), "") \
-        + _KEYS_FRONT_SAID.get(str((details.get("keys_rung") or {}).get("front_back") or ""), "")
+    # integration T4, safety F5: what the keyboard rung put back, on whatever exit it took; recheck: the browser it left
+    # in front is always said (``front_left``), in the code's own words when it has some
+    put_back = details.get("keys_rung") or {}
+    front_said = _KEYS_FRONT_SAID.get(str(put_back.get("front_back") or ""), "")
+    back = _KEYS_BACK_SAID.get(str(put_back.get("reselected") or ""), "") \
+        + (front_said or (_KEYS_FRONT_SAID["left"] if put_back.get("front_left") else ""))
     if action == "select":
         if not shared.get("seen"):
             how = shared.get("how") or "no way to select it was accepted"
@@ -848,16 +918,21 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
 
 
 #: Integration T4: what the keyboard rung put back after its close, in words for the report (codes from
-#: :func:`_reselect` and :func:`_front_back`; the ones that changed nothing say nothing).
+#: :func:`_reselect`, :func:`_front_back` and :func:`_unknown_pick`; the ones that changed nothing say nothing).
+#: Recheck (safety timing 5): with the browser's own pick after the close not known, the tab they were on is not
+#: shown again (``unknown``) and the browser may be left in front (``left``): both said plainly.
 _KEYS_BACK_SAID: dict[str, str] = {
     "reselected": "; the tab that was showing before is showing again",
     "gone": "; the tab that was showing before is gone, so the browser shows another one",
     "failed": "; the tab that was showing before could not be shown again",
+    "unknown": "; the tab that was showing before was not shown again (which tab the browser picked right after the "
+               "close is not known, so no tab was switched)",
 }
 _KEYS_FRONT_SAID: dict[str, str] = {
     "given": "; the window that was in front before is in front again",
     "act_off": "; the window that was in front before was left behind it (Act is switched off for its app)",
     "failed": "; the window that was in front before could not be brought back to the front",
+    "left": "; the browser was left in front",
 }
 
 #: Why the keyboard rung sent no key, in words for the report (codes from :func:`_close_by_keys`).

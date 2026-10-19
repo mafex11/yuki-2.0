@@ -167,6 +167,11 @@ LINE_TIDY: dict[str, str] = {"place": "I moved {app} to {where}.", "place_here":
 #: The same as a question, when the user's tidy dial says ask first.
 LINE_TIDY_ASK: dict[str, str] = {"place": "Should I move {app} to {where}?", "place_here": "Should I move {app}?",
                                  "focus_back": "Should I put {app} back in front?"}
+#: Safety timing 3 (recheck): code's own step left after their yes, for any reason (measured again it is no longer the
+#: step, their hold, a gate, a refusal), said plainly once, so a yes is never dropped in silence.
+LINE_TIDY_LEFT: dict[str, str] = {"place": "I didn't move {app} to {where} after all.",
+                                  "place_here": "I didn't move {app} after all.",
+                                  "focus_back": "I didn't put {app} back in front after all."}
 #: A tidy-up step's window when Windows names no app for it.
 TIDY_NO_APP = "that window"
 #: Integration review c2desk-2: code's one measured line after the request's own when the after-look shows what they
@@ -567,6 +572,9 @@ class Executor:
         self._after_step: dict[str, Any] | None = None
         self._after_front: int | None = None
         self._after_state: Any = None
+        #: safety timing 3 (recheck): set only while code's asked step is measured again after their yes
+        #: (:meth:`_tidy_still`): Yuki's own windows are measured as if they were not there (:meth:`_own_aside`)
+        self._own_beneath = False
         _warm_desk()
         self._reset_plan()
         self._skill_context()
@@ -848,19 +856,21 @@ class Executor:
         own Act switch, the desk lease,
         the acting marker, and :meth:`_place_act` (``yuki.actions.place``: undoable, journaled in the request's group
         so one "put it back" undoes it, place's own game gate). ``mode`` ``util.TIDY_ASK``: the step in code's words
-        as the yes/no question first (:meth:`_tidy_ask`), run on their yes only, and only while it is still the step
+        as the yes/no question first (:meth:`_tidy_answer`), run on their yes only, and only while it is still the step
         measured again after it (:meth:`_tidy_still`, safety timing 3; rows 1-2 again); ``util.TIDY_OFF``: nothing.
 
         Returns code's words for after the request's line: the step's own (:data:`LINE_TIDY`, from what it read back)
-        when it changed something, the plain line (``diff.LINE_TIDY_FAILED``) when it ran and did not take, else ``""``
-        (not taken: a guard, a refusal, their no, or nothing changed). Logs content-free (``tidy`` with ``by_code``).
-        Never raises."""
+        when it changed something, the plain line (``diff.LINE_TIDY_FAILED``) when it ran and did not take; after their
+        yes, a step left for any reason gets its own plain line (:data:`LINE_TIDY_LEFT`, safety timing 3 recheck: a yes
+        is never dropped in silence); else ``""`` (not taken: a guard, a refusal, their no, or nothing changed). Logs
+        content-free (``tidy`` with ``by_code``). Never raises."""
         step, d = self._after_step, self._after_diff
         self._after_step = None   # once per request, taken or not
         mode = str(mode or util.TIDY_DO)
         if not step or d is None or self.tidy is not None or self._closed or mode == util.TIDY_OFF:
             return ""
-        state, why, said = "left", "", ""
+        state, why, said, yes = "left", "", "", False
+        call: Call | None = None
         started = time.perf_counter()
         action = "place" if step.get("action") == "place" else "focus_back"
 
@@ -907,8 +917,9 @@ class Executor:
                 why = "wrong_thread"
             if not why and not self.lease.take():
                 why = "busy"
-            if not why and mode == util.TIDY_ASK and not self._tidy_ask(call):
-                why = "declined"
+            if not why and mode == util.TIDY_ASK:
+                yes, back = self._tidy_answer(call)
+                why = "" if yes and back else "busy" if yes else "declined"   # a yes with the lease gone: busy
             if not why and mode == util.TIDY_ASK:
                 why = held()   # safety T-2: they took over while the question waited
             if not why and mode == util.TIDY_ASK:
@@ -945,12 +956,20 @@ class Executor:
                     else:
                         why = "unchanged"
                 elif refused:
-                    why = f"refused_{refused}"   # a game or another gate: nothing reached it, nothing is said
+                    # a game or another gate: nothing reached it, nothing is said (after their yes: the line below)
+                    why = f"refused_{refused}"
                 else:
                     state = "failed"
                     said = desk_diff.tidy_line(step, util.app_name(raw) if raw else "", ok=False)
         except Exception as exc:  # noqa: BLE001 - a step that broke is a step not taken; the request's line stands
             why = why or type(exc).__name__
+        if yes and state == "left" and not said and call is not None:
+            # safety timing 3 (recheck): their yes, and code then left the step (measured again it is no longer the
+            # step, their hold, a gate, a refusal): one plain line, so the yes is never dropped in silence
+            try:
+                said = self._tidy_line(call, None, LINE_TIDY_LEFT)
+            except Exception:  # noqa: BLE001 - no words: the request's line stands
+                said = ""
         self._emit_log("tidy", verb="window_action", action=action, state=state, by_code=True, mode=mode,
                        why=why or None, said=bool(said), ms=round((time.perf_counter() - started) * 1000, 1))
         return said
@@ -961,12 +980,19 @@ class Executor:
         :meth:`after_look`), must give the very same step (its action and window; a place: that window still on the
         monitor it was on at the after-look, so "other" is the screen the question meant), and ``diff.tidy_guard`` on
         that fresh measure must pass with a fresh front. A window they moved, raised, covered or uncovered themselves
-        while asked leaves the step. ``""``: still the step; else why not (``stale``, ``unread`` or the guard's word).
-        Never raises (``stale``)."""
+        while asked leaves the step. Recheck: their yes may come typed in Yuki's own bar or chat page, which is then in
+        front, so this measure (the desk and the fresh front) is taken as if Yuki's own windows were not there
+        (:meth:`_own_aside` with :attr:`_own_beneath`: the window right under them stands for them, never the origin):
+        Yuki's own window in front, by itself, never leaves the step. ``""``: still the step; else why not (``stale``,
+        ``unread`` or the guard's word). Never raises (``stale``)."""
         try:
             from yuki.perception import diff as desk_diff
 
-            now = self._desk_now()
+            self._own_beneath = True
+            try:
+                now = self._desk_now()
+            finally:
+                self._own_beneath = False
             if now is None:
                 return "unread"
             named = {a for a in self._desk_asked | self._desk_touched if isinstance(a, str)}
@@ -984,18 +1010,22 @@ class Executor:
 
             if step.get("action") == "place" and monitor(now) != monitor(self._after_state):
                 return "stale"
-            return desk_diff.tidy_guard(again, d, self._front_since(), done.as_hwnd(getattr(now, "foreground", None)),
-                                        self._desk_arranged)
+            return desk_diff.tidy_guard(again, d, self._front_since(now),
+                                        done.as_hwnd(getattr(now, "foreground", None)), self._desk_arranged)
         except Exception:  # noqa: BLE001 - not measured again: left
             return "stale"
 
-    def _front_since(self) -> int | None:
+    def _front_since(self, measured: Any = None) -> int | None:
         """tidy21: the window in front now, as the after-look reads it (:meth:`_own_aside`: Yuki's own window stands for
-        the one the user called it from), for :meth:`take_tidy_step`'s guard; ``None`` when it can't be read."""
+        the one the user called it from), for :meth:`take_tidy_step`'s guard; ``None`` when it can't be read.
+        ``measured``: the desk :meth:`_tidy_still` measured again as if Yuki's own windows were not there (safety timing
+        3 recheck): Yuki's own window in front then stands for that measure's front (the window right under it)."""
         front = _foreground_now()
         if not front:
             return None
         if _is_own_window(front):
+            if measured is not None:
+                return done.as_hwnd(getattr(measured, "foreground", None))
             return done.as_hwnd(getattr(self.host, "origin_hwnd", None))
         return int(front)
 
@@ -1052,13 +1082,25 @@ class Executor:
 
     def _own_aside(self, state: Any) -> Any:
         """Yuki's own windows (the ask bar, the chat page) are never what the user had: in front or with the keyboard,
-        the window the user called Yuki up from (``host.origin_hwnd``, when listed) stands for them."""
+        the window the user called Yuki up from (``host.origin_hwnd``, when listed) stands for them.
+
+        Safety timing 3 (recheck), while :attr:`_own_beneath` (:meth:`_tidy_still`'s measure after their yes, which may
+        have been typed in Yuki's own window, so that window came up over whatever was in front then, not over the
+        origin): the desk is measured as if Yuki's own windows were not there: they leave the read, and in front or
+        with the keyboard the window right under them stands for them (the top of the rest by Z order, not minimised;
+        ``None`` when there is none)."""
         own = {int(w.hwnd) for w in state.windows if _is_own_window(w.hwnd)}
         if not own:
             return state
-        origin = done.as_hwnd(getattr(self.host, "origin_hwnd", None))
-        listed = {int(w.hwnd) for w in state.windows}
-        stand_in = origin if origin is not None and origin in listed and origin not in own else None
+        if getattr(self, "_own_beneath", False):
+            rest = [w for w in state.windows if int(w.hwnd) not in own]
+            under = min((w for w in rest if not w.minimized and w.kind == "window"), key=lambda w: w.z, default=None)
+            stand_in = int(under.hwnd) if under is not None else None
+            state.windows = rest
+        else:
+            origin = done.as_hwnd(getattr(self.host, "origin_hwnd", None))
+            listed = {int(w.hwnd) for w in state.windows}
+            stand_in = origin if origin is not None and origin in listed and origin not in own else None
         if int(state.foreground or 0) in own:
             state.foreground = stand_in
         if int(state.keyboard or 0) in own:
@@ -1192,16 +1234,22 @@ class Executor:
 
     def _tidy_ask(self, call: Call) -> bool:
         """The tidy dial says ask: the step in code's words as a yes/no question (the desk lease freed while it
-        waits)."""
+        waits); ``True`` on their yes with the lease taken back (:meth:`_tidy_answer`)."""
+        yes, back = self._tidy_answer(call)
+        return back and yes
+
+    def _tidy_answer(self, call: Call) -> tuple[bool, bool]:
+        """:meth:`_tidy_ask`'s question, as ``(their yes, the desk lease taken back)``: code's own step tells a yes it
+        then can't act on from a no (safety timing 3 recheck: such a yes gets :data:`LINE_TIDY_LEFT`, never silence)."""
         question = self._tidy_line(call, None, LINE_TIDY_ASK)
         if not question:
-            return False
+            return False, False
         self.lease.release()
         try:
             yes = bool(self.host.ask(question))
         except Exception:  # noqa: BLE001 - no answer is a no
             yes = False
-        return self.lease.take() and yes
+        return yes, bool(self.lease.take())
 
     def _place_act(self, call: Call) -> Any:
         """A place, focus back or put back step (``yuki.actions.place``), as the Dispatcher's outcome shape. The
