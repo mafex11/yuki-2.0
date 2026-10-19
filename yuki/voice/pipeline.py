@@ -473,6 +473,9 @@ class LlmCall:
     one_repeat: bool = False
     #: voice20 review L1: what of this reply was spoken ends a sentence as a question (its own closing mark)
     one_asks: bool = False
+    #: voice22 (review L3): the ids of the tool results its context ends with (:func:`_trailing_tool_ids`): the run a
+    #: tool result started (``Conversation._opened_answer``)
+    after_tools: tuple[str, ...] = ()
 
 
 #: Tools whose spoken acknowledgement travels in the call itself (``say_first``), said as soon as it is written.
@@ -894,6 +897,11 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
 STRETCH_MARKS = ",.?!;:\u0964"
 
 
+#: voice22 fix (review M1): an own name of at least this many letters standing as written in the words measured_near
+#: would name means nothing was misheard there (names21's shortest name, ``names.MIN_LETTERS``).
+LITERAL_MIN_LETTERS = 3
+
+
 def measured_near(items: Any, names: Any, *, skip: Any = ()) -> list[tuple[float, str, str, set[int]]]:
     """voice22 (A4, final-D S18; names21 merge note 3, contract C14): names21's measured match of the user's own apps,
     sites and channels (``names``: :func:`yuki.voice.keyterms.own_names`) on the heard words (``items``: Flux's word
@@ -903,16 +911,22 @@ def measured_near(items: Any, names: Any, *, skip: Any = ()) -> list[tuple[float
     as a name given at its end (``best_match(..., as_name=True, literal_ok=False)``: the stretch whole, or its last
     words, never a part before them; a name standing in it as written is no mishearing and is left out). The heard
     words named are the fewest last words of the stretch that hold the winner's score (``names.score``). A stretch
-    whose named words include a place in ``skip`` (a known name heard as written) is left out. The bar, the margin
-    and the measure are names21's (calibrated on the user's turns); re-measured by voice22 on the user's past spoken
-    turns before shipping (docs/research/final-test-2026-10-19/builds/voice22.md). ``best_match`` and ``score`` are
-    imported inside ``try/except ImportError`` (contract C14): without them, nothing. Never raises."""
+    whose named words include a place in ``skip`` (a known name heard as written) is left out, and so are named words
+    in which any of ``names`` of :data:`LITERAL_MIN_LETTERS` letters or more stands as written (``names.literal``;
+    review M1: "Open Python." with Pythonw on their list is Python said right, never a mishearing of Pythonw). The
+    bar, the margin and the measure are names21's (calibrated on the user's turns); re-measured by voice22 on the
+    user's past spoken turns before shipping (docs/research/final-test-2026-10-19/builds/voice22.md). ``best_match``,
+    ``score`` and ``literal`` are imported inside ``try/except ImportError`` (contract C14 and its merge note):
+    without them, nothing; ``TURN_BAR`` is read with names21's value as the default. Never raises."""
     try:
-        from yuki.skills.names import TURN_BAR, best_match, score
+        from yuki.skills import names as names_mod
+        from yuki.skills.names import best_match, literal, score
     except ImportError:
         return []
     try:
+        turn_bar = float(getattr(names_mod, "TURN_BAR", 0.85) or 0.85)
         pool = [str(n) for n in (names or ()) if str(n or "").strip()]
+        whole = [n for n in pool if sum(ch.isalnum() for ch in n) >= LITERAL_MIN_LETTERS]
         words = [str(w.get("word") or "") for w in (items or ()) if isinstance(w, dict)
                  and str(w.get("word") or "").strip()]
         if not pool or not words:
@@ -943,7 +957,9 @@ def measured_near(items: Any, names: Any, *, skip: Any = ()) -> list[tuple[float
             if skip & set(span):
                 continue
             heard = " ".join(clean[i] for i in span)
-            if top < TURN_BAR and not _tail_shaped(span, clean, name, top, score):
+            if any(literal(heard, n) for n in whole):
+                continue   # review M1: one of their own names was said as written there: nothing was misheard
+            if top < turn_bar and not _tail_shaped(span, clean, name, top, score):
                 continue
             out.append((top, heard, name, set(span)))
         return out
@@ -1495,6 +1511,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             self._yuki_call = call
             # E3a (v3.17): the router decides alongside this call whether the turn needs the thinker (off by default).
             call.user_turn = _last_role(context) == "user"
+            call.after_tools = _trailing_tool_ids(context)
             hook("route_turn", context, call)
             one = hook("one")
             if one is not None:
@@ -3377,6 +3394,31 @@ def _last_role(context: Any) -> str | None:
         if isinstance(message, dict) and message.get("role") in ("user", "assistant", "developer", "tool"):
             return str(message.get("role"))
     return None
+
+
+def _trailing_tool_ids(context: Any) -> tuple[str, ...]:
+    """voice22 (review L3): the ``tool_call_id`` of each tool result the context ends with: the results a mouth run
+    answers. Read back from the newest message: the reply text Pipecat writes at a response's end (an assistant
+    message with no calls) is passed over until a result is met, then the run of calls and their results (Pipecat's
+    in-progress pairs, the parallel calls of one reply) is read; it stops at anything else. ``()`` when the context
+    ends with their words, a thinker or job line (a developer message), or cannot be read. Structure only. Never
+    raises."""
+    try:
+        messages = list(context.get_messages() or [])
+    except Exception:  # noqa: BLE001
+        return ()
+    out: list[str] = []
+    for message in reversed(messages):
+        role = message.get("role") if isinstance(message, dict) else None
+        if role == "tool":
+            if message.get("tool_call_id"):
+                out.append(str(message.get("tool_call_id")))
+        elif role == "assistant" and message.get("tool_calls"):
+            if not out:
+                break   # a call with no result after it yet: not a run a result started
+        elif not (role == "assistant" and not out):
+            break
+    return tuple(out)
 
 
 def _answered_words(context: Any) -> str:
@@ -6220,8 +6262,10 @@ class Conversation:
         #: themselves was used (:meth:`_opened_quiet`): a second quiet is final.
         self._opened_quiet_used = False
         #: voice22 (A9): the observer's number of the user turn whose quiet the bridge refused that way (its answer is
-        #: the next turn: :meth:`_opened_answer`), ``None`` before any.
+        #: a later turn: :meth:`_opened_answer`), ``None`` before any; (review L3) and the refused stay_quiet's tool call
+        #: id, when the bridge passed it: the answer is the run its result started.
         self._opened_refused_n: int | None = None
+        self._opened_refused_id: str | None = None
         #: Review F4: ``(start of speech, named, how)`` of the words being finished now, set by the fast path on each
         #: eager and final transcript (:meth:`_utterance_named`).
         self._utterance: tuple[float, bool, str] | None = None
@@ -9298,14 +9342,21 @@ class Conversation:
     def _opened_answer(self, turn: Any) -> bool:
         """voice22 (A9, the S10 leftover of voice21): ``turn`` is the talker's run that answers the bridge's refusal of
         the first quiet on their opening words (``mouth.OPENED_QUIET``, :meth:`_opened_quiet_result`): the result turn
-        the observer opened right after that user turn. Under "all" only (ONE's refusal is ``OneVoice.control``'s and
-        its round 2 is its own). Such a run that gave them nothing audible, acted on nothing and did not choose quiet
-        again (a second quiet is final) is unanswered once more (:meth:`_unanswered`): the reply watch answers it
-        again once with ``mouth.RERUN_NOTE``, and a silent rerun gets the give-up tone (live final-D q_discord_today:
-        a reply of unmarked text, none of it spoken). Turn numbers only, never the words."""
+        the observer opened right after that user turn, when its call answers that refusal's result (review L3: the
+        refused call's id in its ``LlmCall.after_tools``; a late job's line that opened first ends its context with a
+        developer message and is not it; no id or no call to read: the turn number alone, as before). Under "all" only
+        (ONE's refusal is ``OneVoice.control``'s and its round 2 is its own). Such a run that gave them nothing
+        audible, acted on nothing and did not choose quiet again (a second quiet is final) is unanswered once more
+        (:meth:`_unanswered`): the reply watch answers it again once with ``mouth.RERUN_NOTE``, and a silent rerun gets
+        the give-up tone (live final-D q_discord_today: a reply of unmarked text, none of it spoken). Turn numbers and
+        call ids only, never the words."""
         n = getattr(self, "_opened_refused_n", None)
-        return (n is not None and getattr(self, "one_driver", None) is None
-                and getattr(turn, "trigger", None) == "result" and getattr(turn, "n", None) == n + 1)
+        if (n is None or getattr(self, "one_driver", None) is not None or getattr(turn, "trigger", None) != "result"
+                or getattr(turn, "n", None) != n + 1):
+            return False
+        refused = getattr(self, "_opened_refused_id", None)
+        call = getattr(turn, "llm", None)
+        return not refused or call is None or refused in tuple(getattr(call, "after_tools", ()) or ())
 
     def _opened_marker_quiet(self, turn: Any) -> bool:
         """voice21 (final-D S10): the user turn's silence was a quiet marker with no stay_quiet call, on the first words
@@ -9691,17 +9742,19 @@ class Conversation:
         except Exception:  # noqa: BLE001
             return True
 
-    def _opened_quiet_result(self, spoke: bool = False) -> dict[str, Any] | None:
+    def _opened_quiet_result(self, spoke: bool = False, call_id: Any = None) -> dict[str, Any] | None:
         """voice21 (final-D S10): the bridge's stay_quiet refusal (:meth:`_opened_quiet`, ``via`` bridge) as its tool
         result: ``mouth.OPENED_QUIET``, and in the marker channel the reply format last (as every ONE result carries
-        it: the q_discord_today reply that went quiet had no marker line); ``None``: the quiet stands."""
+        it: the q_discord_today reply that went quiet had no marker line); ``None``: the quiet stands. ``call_id``: the
+        refused stay_quiet's tool call id (voice22 review L3)."""
         if not self._opened_quiet(spoke=bool(spoke), via="bridge"):
             return None
         from yuki.voice.mouth import MARKER_REMINDER
 
-        # voice22 (A9): the talker's run that answers this refusal is the next turn the observer opens (a result run);
-        # a silent one gets the reply watch's rerun (:meth:`_opened_answer`)
+        # voice22 (A9): the talker's run that answers this refusal is the result run its result starts; a silent one
+        # gets the reply watch's rerun (:meth:`_opened_answer`)
         self._opened_refused_n = getattr(self.observer.turn, "n", None)
+        self._opened_refused_id = str(call_id) if call_id else None
         out: dict[str, Any] = {"not_quiet": OPENED_QUIET}
         if getattr(self, "channel", "") == "marker":
             out[ONE_FORMAT_KEY] = MARKER_REMINDER

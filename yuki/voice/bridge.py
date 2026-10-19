@@ -798,8 +798,9 @@ class VoiceBridge(QObject):
         #: (the first words of a conversation they opened themselves, no call, no dictation, nothing heard yet;
         #: ``spoke``: this reply put words out), taken once a conversation (``Conversation._opened_quiet``): the
         #: refusal's tool result (``mouth.OPENED_QUIET``, with the reply format in the marker channel; ``True``: the
-        #: note alone), else ``None``. Set by the conversation.
-        self.opened_quiet: Callable[[bool], Any] | None = None
+        #: note alone), else ``None``. Set by the conversation. voice22 (review L3): called ``(spoke, tool_call_id)``,
+        #: the refused stay_quiet's id (the run its result starts is the refusal's answer).
+        self.opened_quiet: Callable[..., Any] | None = None
         #: Whether the mouth run now answers the first words after the wake word heard the user say the name
         #: (set by the conversation; v3.6): those words were said to Yuki, so staying quiet is refused once.
         self.named_turn: Callable[[], bool] | None = None
@@ -2447,7 +2448,7 @@ class VoiceBridge(QObject):
             # scratch and stay_quiet on a question to Yuki); the talker runs once more. A second quiet is final, and
             # "go away" still ends it (end_conversation). Under one, OneVoice.control decides.
             try:
-                refused = self.opened_quiet(spoke_now)
+                refused = self.opened_quiet(spoke_now, getattr(params, "tool_call_id", None))
             except Exception:  # noqa: BLE001 - no reading: the quiet stands
                 refused = None
             if refused:
