@@ -2041,16 +2041,20 @@ class Hands:
         except Exception:  # noqa: BLE001
             return False
 
-    def verified_this_turn(self, limit: int = 3) -> list[str]:
+    def verified_this_turn(self, limit: int = 3, turn: Any = None) -> list[str]:
         """hands19 (all-questions RC3a): what the talker's own hands and skills did and verified in the user's current
         turn of this conversation, oldest first (at most ``limit``), each as its action-log line's act and the hand's own
         report (code's words, RAM only): done for these very words, so a hand-off of the rest never does them again.
-        ``[]`` when none. Never raises."""
+        ``turn`` (review L1): that ``(conversation, turn)`` instead (the turn a hand-off came in on). ``[]`` when none.
+        Never raises."""
         try:
-            turn = self._call_safely(self.user_turn, None)
+            convo = getattr(self.actions, "convo", 0)
+            if isinstance(turn, (tuple, list)) and len(turn) == 2:
+                convo, turn = turn[0], turn[1]
+            else:
+                turn = self._call_safely(self.user_turn, None)
             if turn is None:
                 return []
-            convo = getattr(self.actions, "convo", 0)
             done = [r for r in self.actions.records() if r.convo == convo and r.turn == turn and r.who == "your hand"
                     and r.ok and r.verified is True]
             out = []
@@ -2184,7 +2188,8 @@ class Hands:
         argument). App keys or names as given; never words."""
         out: list[str] = []
         scope = facts.get("_desk_scope") if isinstance(facts.get("_desk_scope"), dict) else {}
-        found = list(scope.get("apps") or ()) if name == SKILL_HAND else [facts.get("app"), args.get("app")]
+        found = ([*(scope.get("apps") or ()), *(scope.get("touched_apps") or ())] if name == SKILL_HAND
+                 else [facts.get("app"), args.get("app")])
         for app in found:
             if isinstance(app, str) and app.strip() and app.strip() not in out:
                 out.append(app.strip())
@@ -2226,7 +2231,10 @@ class Hands:
             apps = [a for a in scope.get("apps") or () if a]
             front = [int(moved_front)] if scope.get("focus") and moved_front else []
             asked = (front or apps) if scope.get("open") or scope.get("left") else []
-            return tuple(asked), tuple(apps + front)
+            # hands19 review H1: the app-typed slots' apps, the measured acted apps and windows: touched only
+            more = [a for a in scope.get("touched_apps") or () if a and a not in apps]
+            more += [int(h) for h in scope.get("touched_windows") or () if isinstance(h, int) and h not in front]
+            return tuple(asked), tuple(apps + more + front)
         ids: list[Any] = [args.get("window"), facts.get("live_hwnd"), *(args.get("_hwnds") or [])]
         ids += [t[3] for t in args.get("_targets") or [] if isinstance(t, (list, tuple)) and len(t) > 3]
         out: list[Any] = []
@@ -4782,27 +4790,35 @@ class Hands:
     @staticmethod
     def _skill_scope(skill_key: str, result: Any) -> dict[str, Any]:
         """P1.2: whose change is whose for a skill run's look after it, from its data (never words): the apps it acts in
-        (its connection's app, and the app value it resolved), whether a rung took focus, and whether bringing that up
-        is the ask itself: a skill of kind ``open``, or a run that left its window to the user (``left``: a skill that
-        can send, its sends data, and these values did not send: a draft typed or a chat opened for them to write in).
-        Else a ``change`` skill's window is a means (Discord for a message sent)."""
+        (its connection's app, and the app value it resolved: ``apps``, which are the ask for the kinds below), whether
+        a rung took focus, and whether bringing that up is the ask itself: a skill of kind ``open``, or a run that left
+        its window to the user (``left``: a skill that can send, its sends data, and these values did not send: a draft
+        typed or a chat opened for them to write in). Else a ``change`` skill's window is a means (Discord for a message
+        sent). hands19: ``touched_apps`` (app-typed slots, measured acted apps) and ``touched_windows`` (the windows the
+        engine measured coming forward) are the run's own, never the ask."""
         skill = _skill_def(skill_key)
         values = getattr(result, "values", None) or {}
         apps = [str(getattr(skill, "app", "") or "")]
-        # hands19 (final-B all-desk RC1(b)): every slot whose schema type is ``app`` (by type, never by name: the volume
-        # skill's ``target``, web.open_page's ``browser``), and the apps the engine measured its rungs acting in
-        # (contract C1), so a run's own app is never "not from your act"
-        apps += Hands._app_values(skill, values) + Hands._acted_apps(result)
         value = values.get("app")
         if isinstance(value, dict):
             value = value.get("key") or value.get("name")
         if isinstance(value, str):
             apps.append(value)
-        kept: list[str] = []
-        for app in (str(x).strip() for x in apps):
-            if app and all(_app_id(app) != _app_id(k) for k in kept):
-                kept.append(app)   # each app once (``Discord.exe`` and ``discord`` are one)
-        apps = kept
+        apps = Hands._each_app(apps)
+        # hands19 (final-B all-desk RC1(b)): every slot whose schema type is ``app`` (by type, never by name: the volume
+        # skill's ``target``, web.open_page's ``browser``) and the apps the engine measured its rungs acting in
+        # (contract C1) are the run's own (``touched``: never "not from your act"), never the ask: review H1, a tab opened in
+        # the video's own Chrome window made every Chrome window "asked" (no tab cover flagged, and a tidy step could
+        # move the user's other browser windows). The windows the engine measured coming forward are touched by id.
+        touched = [a for a in Hands._each_app(Hands._app_values(skill, values) + Hands._acted_apps(result))
+                   if all(_app_id(a) != _app_id(k) for k in apps)]
+        windows: list[int] = []
+        for h in getattr(result, "acted_windows", None) or ():
+            try:
+                if int(h) and int(h) not in windows and not isinstance(h, bool):
+                    windows.append(int(h))
+            except (TypeError, ValueError):
+                continue
         left = False
         if skill is not None and getattr(skill, "sends", False):
             try:
@@ -4811,8 +4827,18 @@ class Hands:
                 left = not sends_with(skill, values)
             except Exception:  # noqa: BLE001 - unknown: a means, as before
                 left = False
-        return {"apps": apps, "focus": bool(getattr(result, "focus_taken", False)),
+        return {"apps": apps, "touched_apps": touched, "touched_windows": windows,
+                "focus": bool(getattr(result, "focus_taken", False)),
                 "open": str(getattr(skill, "kind", "") or "") == "open", "left": left}
+
+    @staticmethod
+    def _each_app(apps: Sequence[Any]) -> list[str]:
+        """hands19: ``apps`` stripped, each app once (``Discord.exe`` and ``discord`` are one), in order."""
+        kept: list[str] = []
+        for app in (str(x).strip() for x in apps or () if isinstance(x, str)):
+            if app and all(_app_id(app) != _app_id(k) for k in kept):
+                kept.append(app)
+        return kept
 
     @staticmethod
     def _app_values(skill: Any, values: Any) -> list[str]:

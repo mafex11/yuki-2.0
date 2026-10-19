@@ -2008,7 +2008,7 @@ class Brain:
         # steer taken into a turn) count as theirs for the consent rule's spans and the commit check
         known = set(getattr(executor, "words", []) or [])
         executor.add_words([w for w in host.user_words if w not in known])
-        self._seed_executor(executor, header)
+        self._seed_executor(executor, header, host)
         executor.begin(header)
         early = None
         for step in source.steps():
@@ -2032,7 +2032,7 @@ class Brain:
                                   acted=any(s.tool and s.verb in ACT_VERBS for s in statuses))
         return self._exec_result(got, host)
 
-    def _seed_executor(self, executor: Any, header: Plan) -> None:
+    def _seed_executor(self, executor: Any, header: Plan, host: Any = None) -> None:
         """The hand-off seed the executor holds for this plan (x10). Its done-check reads the seed's fixed check for a
         seeded plan whose own ``done`` took it (``seed_check``: the planner wrote none) and for a skill route, as
         before; a seeded plan by steps that picked a probe of its own (or sends, or joins) is decided by that probe or
@@ -2042,9 +2042,16 @@ class Brain:
             return
         seed = self._req.seed if self._req is not None else None
         if hasattr(executor, "seed_also"):
-            # hands19 (Plan.seed_also): the hand-off's own check, read at that plan's finish beside the plan's probe
+            # hands19 (Plan.seed_also): the hand-off's own check, read at that plan's finish beside the plan's probe.
+            # Review L3: only while the request is still the seed's: once the user added words (a steer, "not that,
+            # the other one", or an answer), the seed's check and done words are of what they asked before
+            added = host is not None and self._req is not None and (
+                len(getattr(host, "user_words", None) or ()) > len(self._req.words) or bool(self._peek_steers()))
+            also = bool(seed and getattr(header, "seed_also", False))
             executor.seed_also = ({k: seed.get(k) for k in ("done", "done_words", "baseline") if k in seed}
-                                  if seed and getattr(header, "seed_also", False) else None)
+                                  if also and not added else None)
+            if also and added:
+                self.logger.log("done_seed_also", skipped="words_added")
         if not seed:
             executor.seed = None
         elif header.seed_check or header.skill:
@@ -3180,19 +3187,26 @@ def answer_due(plan: Plan | None, result: ExecResult, status: str) -> bool:
 
 
 def question_due(plan: Plan | None, result: ExecResult, status: str, req: Any, host: Any) -> bool:
-    """hands19 (final-B all-questions RC3a(ii)): a spoken request (voice channel) whose words ask something
-    (:func:`yuki.brain.plan.goal_is_question`: the recognizer's or the talker's question mark) ended an act plan (done,
-    not confirmed, drafted) that read nothing (no memory read, no fetch came back): nothing answers the question then.
-    Never on a send or a join (consent's own line stands alone). Code facts only (the plan's kind, its status, the reads
-    that came back, the request's channel and punctuation)."""
-    if plan is None or plan.kind != "act" or status not in ("done", "unconfirmed", "drafted") or result.reads:
+    """hands19 (final-B all-questions RC3a(ii)): a spoken request (voice channel) of several parts whose words ask
+    something ended an act plan (done or not confirmed) that read nothing (no memory read, no fetch came back): nothing
+    answers the question then. Several parts by structure (review M1), never by the mark alone: the voice's own hands
+    did a part of these words this turn (:func:`yuki.brain.plan.done_here_given`: the two-part case "pause the song,
+    also when's my meeting"), or the talker's reading holds two or more parts (:func:`yuki.brain.plan.several_parts`);
+    and the ask by the recognizer's or the talker's question mark (:func:`yuki.brain.plan.goal_is_question`). Never on a
+    draft, a plan that types a message, or one that may commit (a send, a join: consent's own line stands alone, and a
+    question in a message is for its reader). Code facts only (the plan's kind, consent and status, the reads that came
+    back, the request's channel, context label, understanding's parts and punctuation)."""
+    if plan is None or plan.kind != "act" or status not in ("done", "unconfirmed") or result.reads:
         return False
-    if plan.consent.commit in ("send", "join") or str(getattr(req, "channel", "") or "") != "voice":
+    if plan.consent.may_commit or plan.consent.text or str(getattr(req, "channel", "") or "") != "voice":
         return False
-    from yuki.brain.plan import goal_is_question
+    from yuki.brain.plan import done_here_given, goal_is_question, several_parts
 
+    understanding = getattr(req, "understanding", None)
+    if not (done_here_given(getattr(req, "context", "")) or several_parts(understanding)):
+        return False
     words = list(getattr(host, "user_words", None) or getattr(req, "words", None) or [])
-    return goal_is_question(words, getattr(req, "understanding", None))
+    return goal_is_question(words, understanding)
 
 
 def question_part_report(plan: Plan | None, line: str) -> str:

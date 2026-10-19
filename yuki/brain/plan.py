@@ -976,6 +976,25 @@ DONE_STRENGTH: dict[str, int] = {"verified": 3, "likely": 2, "unverified": 1, "f
 QUESTION_MARKS: tuple[str, ...] = ("?", "\uff1f", "\u061f")
 
 
+#: hands19 review M1: the lead of the voice's note that parts of these very words were done and verified already in
+#: this turn by its own hands (``voice.bridge.DONE_HERE_CONTEXT`` starts with it): code's own words, never the user's,
+#: so the brain reads from its request's context that the voice began a request of several parts.
+DONE_HERE_LEAD = "Done already for these very words in this turn by Yuki's voice"
+
+
+def done_here_given(context: Any) -> bool:
+    """hands19 review M1: whether a request's labelled context carries the voice's note that parts of its words were
+    done already this turn (:data:`DONE_HERE_LEAD`, code's own words). String identity on code's label only."""
+    return DONE_HERE_LEAD in str(context or "")
+
+
+def several_parts(understanding: Mapping[str, Any] | None) -> bool:
+    """hands19 review M1: whether the talker's reading of the words (contract C3) holds two or more parts. Its own
+    tool's structure, never a reading of the words."""
+    parts = understanding.get("parts") if isinstance(understanding, Mapping) else None
+    return isinstance(parts, (list, tuple)) and sum(1 for p in parts if isinstance(p, Mapping)) >= 2
+
+
 def goal_is_question(words: Sequence[str], understanding: Mapping[str, Any] | None = None) -> bool:
     """hands19 (final-B all-questions RC3: "pause the song, also when's my meeting tomorrow" ended on the pause's line
     and the question was never answered): whether a handed-over request asks something, by the marks it came with: the
@@ -1451,5 +1470,5 @@ __all__ = [
     "probe_args_text", "probe_errors", "error_code", "error_codes", "SEED_RERUN_OK", "skill_family", "seed_skill",
     "spent_skills", "unescape", "seed_sends",
     "person_open", "handoff_person_open", "SEED_ALSO_PROBE", "DONE_STRENGTH", "stronger_done", "QUESTION_MARKS",
-    "goal_is_question",
+    "goal_is_question", "DONE_HERE_LEAD", "done_here_given", "several_parts",
 ]
