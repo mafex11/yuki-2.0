@@ -4192,6 +4192,7 @@ class MemoryClient:
             return None
         d = describe_thread(self.store, t)
         secs = _links.seconds_of(self.store, d["links"])
+        own = _links.own_lasts(self.store, d["links"])   # S19 (mem22): dated by the user's own visits
         return {
             **self._thread_dict(t),
             **self._thread_extras([t]).get(int(t.id), {}),
@@ -4203,7 +4204,8 @@ class MemoryClient:
             "calls": [{"ref": f"call:{c.id}", "app": c.app, "start": _iso(c.recording_started_at or c.detected_at),
                        "end": _iso(c.ended_at)} for c in d["calls"]],
             "chats": [{"start": _iso(s.started_at), "end": _iso(s.ended_at), "text": s.text} for s in d["chats"]],
-            "links": [{"url": link.url, "title": link.title, "line": _links.describe(link, secs.get(link.id))}
+            "links": [{"url": link.url, "title": link.title,
+                       "line": _links.describe(link, secs.get(link.id), own_last=own.get(int(link.id)))}
                       for link in d["links"]],
         }
 
@@ -4262,21 +4264,30 @@ class MemoryClient:
               limit: int = 10, embed_wait_s: float | None = None) -> list[dict]:
         """Links seen - pages the user had in front and links shared with them in conversations - best first
         (by meaning with ``query``, else most recently seen). Each: ``{"ref": "link:N", "url", "title", "host",
-        "app", "how", "sender", "where", "first_seen", "last_seen", "seconds", "visits", "thread", "by_yuki",
-        "line"}``. Never raises."""
+        "app", "how", "sender", "where", "first_seen", "last_seen", "own_last_seen", "seconds", "visits", "thread",
+        "by_yuki", "line"}``; ``own_last_seen`` (S19): the end of the user's own last visit of a viewed page, never a
+        sighting of a page Yuki opened or a live test's (``None`` when there is none). Never raises."""
         from yuki.memory import links as _links
 
         try:
             found = _links.search(self.store, (lambda texts: self.embedder.embed(texts, embed_wait_s)),
                                   query, since=_time_arg(since), until=_time_arg(until), how=how, limit=limit)
             secs = _links.seconds_of(self.store, found)
+            # S19 (mem22): how far the user themselves got on each page (never a sighting of Yuki's or a test's)
+            own = _links.own_lasts(self.store, found)
         except Exception:
             return []
+
+        def own_last(link: Any) -> float | None:
+            return own.get(int(link.id))
+
         return [{"ref": f"link:{link.id}", "url": link.url, "title": link.title, "host": link.host, "app": link.app,
                  "how": link.how, "sender": link.sender, "where": link.where, "first_seen": _iso(link.first_seen),
-                 "last_seen": _iso(link.last_seen), "seconds": round(secs.get(link.id, 0.0), 1), "visits": link.visits,
+                 "last_seen": _iso(link.last_seen), "own_last_seen": _iso(own_last(link)) if own_last(link) else None,
+                 "seconds": round(secs.get(link.id, 0.0), 1), "visits": link.visits,
                  "thread": f"thread:{link.work_thread_id}" if link.work_thread_id else None, "by_yuki": link.by_yuki,
-                 "score": link.score, "line": _links.describe(link, secs.get(link.id))} for link in found]
+                 "score": link.score, "line": _links.describe(link, secs.get(link.id), own_last=own_last(link))}
+                for link in found]
 
     # ======================================================================================================
     # People and routes (revamp Phase B, migration 28, yuki.memory.contacts): who the user talks to and where,

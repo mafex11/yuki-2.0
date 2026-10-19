@@ -10877,15 +10877,19 @@ class Store:
 
     def url_threads_since(self, after: float, *, limit: int = 500) -> list[dict[str, Any]]:
         """Capture threads with a web address seen after ``after`` (the links sync): ``{"id", "app", "url",
-        "title", "host", "first_seen", "last_seen", "kind", "front"}``, oldest first. ``front``: some capture of
-        it was taken with the window in front (not only beside it, migration 24)."""
+        "title", "host", "first_seen", "last_seen", "kind", "front", "by_yuki"}``, oldest first. ``front``: some capture
+        of it was taken with the window in front (not only beside it, migration 24). ``by_yuki`` (mem22): every capture
+        of it kept was taken while Yuki acted (none of the user's)."""
         rows = self._query(
             "SELECT t.*, EXISTS(SELECT 1 FROM captures c WHERE c.thread_id = t.id AND c.trigger != 'popup'"
-            " AND c.trigger NOT LIKE 'visible:%') AS front FROM threads t WHERE t.url_ciphertext IS NOT NULL"
+            " AND c.trigger NOT LIKE 'visible:%') AS front, (EXISTS(SELECT 1 FROM captures c WHERE c.thread_id = t.id)"
+            " AND NOT EXISTS(SELECT 1 FROM captures c WHERE c.thread_id = t.id AND c.by_yuki = 0)) AS yukis"
+            " FROM threads t WHERE t.url_ciphertext IS NOT NULL"
             " AND t.last_seen > ? ORDER BY t.last_seen LIMIT ?", (float(after), int(limit)))
         return [{"id": r["id"], "app": _shown(r["app"], r["process"]), "url": self._dec(r["url_ciphertext"]),
                  "title": self._dec(r["title_ciphertext"]), "host": r["host"], "first_seen": r["first_seen"],
-                 "last_seen": r["last_seen"], "kind": r["kind"], "front": bool(r["front"])} for r in rows]
+                 "last_seen": r["last_seen"], "kind": r["kind"], "front": bool(r["front"]),
+                 "by_yuki": bool(r["yukis"])} for r in rows]
 
     def message_captures_after(self, after_id: int, *, limit: int = 200) -> list[dict[str, Any]]:
         """Conversation and mail captures with ``id > after_id`` (the links sync reads the links in them),

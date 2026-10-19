@@ -30,9 +30,10 @@ reason from, not a catalog, in this order (the situation on the screens stays se
    first); Spotify playlists with what the user calls them; the voice channels and servers of the apps that join calls
    (``yuki.skills.discord_route.voice_channels``), most days used first with the count ("4 of the last 14 days":
    final-B, a recent-first list read as the usual); the things inside their own ways' apps (their projects); usual means
-   (``prefs``); **Where they left off** (planner only) - on the :data:`LEFT_OFF_N` sites they come back to most (never
-   a work site), the last page they had in front in one of their browsers (an app's own embedded page is no page to
-   open), with its title and address (``Store.links``);
+   (``prefs``); **Where they left off** (planner only) - on the :data:`LEFT_OFF_N` sites they came back to latest (never
+   a work site), the last page they themselves had in front in one of their browsers (an app's own embedded page is
+   no page to open), with its title and address (``Store.links``), dated by their own visit
+   (``yuki.memory.links.own_lasts``: never a page Yuki opened, nor a live test's), newest first (S19);
 4. **People** (planner and judge; the talker's profile layer has the directory at 900) - the people block
    (``yuki.memory.contacts.directory`` without its header: the whole :data:`PEOPLE_CHARS` is the people's, closest
    first), then **Who** - the portrait's work and interests, first sentence each.
@@ -125,7 +126,10 @@ LATELY_CHARS = 130
 #: an app's own embedded page (its local bundle) is no page to open; a page whose address is longer than
 #: LEFT_OFF_URL_CHARS, or has a query longer than LEFT_OFF_QUERY_CHARS (a token, a tracking string, a search), is
 #: passed over for that site's last one that can be given whole: a cut address opens the wrong page, and a title alone
-#: is no way back. Each page's title at most LEFT_OFF_TITLE_CHARS (its address names the site).
+#: is no way back. Each page's title at most LEFT_OFF_TITLE_CHARS (its address names the site). S19 (mem22, the user's
+#: decision D3): the pages and the days are the user's own (their timeline rows: never a page Yuki opened, nor one in a
+#: live test's span), and the sites are listed by their newest own visit (the newest page of a thing, whatever site it
+#: is on, comes first), no longer by the most days.
 LEFT_OFF_N = 3
 LEFT_OFF_MIN_N = 2
 LEFT_OFF_DAYS = 14.0
@@ -445,9 +449,13 @@ def _portrait_routine(store: Any, cap: int, priority: int = 2) -> list[list[Any]
 def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: int,
               names: dict[str, str]) -> list[list[Any]]:
     """fBrain (k_resume_anime: the planner clicked through "continue watching" instead of opening the episode): on the
-    ``n`` sites the user comes back to most (their pages seen on the most days, at least :data:`LEFT_OFF_MIN_DAYS`),
-    the last page past the site's root they had in front there in one of their browsers (never one only on screen
-    beside it), with its title and address. Their browsers are learned, not measured here: the programs their own
+    ``n`` sites the user came back to latest (their own pages there on at least :data:`LEFT_OFF_MIN_DAYS` days), the
+    last page past the site's root they themselves had in front there in one of their browsers (never one only on
+    screen beside it), with its title, address and the day of that visit, newest first. S19 (mem22): a page's own
+    visits are the user's timeline rows, or for a page with no timeline key their own captures of it
+    (``links.own_lasts`` / ``own_days``: never a page Yuki opened, nor a live test's), so a test's open of an older
+    episode never reads as where they are. Their browsers are learned, not
+    measured here: the programs their own
     visits to their sites used (the ``browser`` means on their values, what the sites line names; an app drawing its
     own embedded pages, e.g. a game store's local bundle, is none). Only an http(s) address; never a site of their work
     (:meth:`contacts.WorkMarks.page`, their own verdicts: picking up where they left off is for their own time).
@@ -466,8 +474,9 @@ def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: 
                     browsers |= {str(key).casefold(), name.casefold(), str(shown(name) or "").casefold()}
     if not browsers:
         return []
+    since = now - LEFT_OFF_DAYS * 86400.0
     try:
-        links = store.links(how="viewed", since=now - LEFT_OFF_DAYS * 86400.0, limit=LEFT_OFF_LINKS)
+        links = store.links(how="viewed", since=since, limit=LEFT_OFF_LINKS)
     except Exception:  # noqa: BLE001
         return []
     try:
@@ -478,24 +487,23 @@ def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: 
         work = None
     from urllib.parse import urlsplit
 
-    days: dict[str, set[Any]] = {}
-    last: dict[str, Any] = {}
-    for link in links:   # most recently seen first
+    from yuki.memory.links import own_days, own_lasts
+
+    pages: list[tuple[Any, str, str]] = []
+    for link in links:
         host = str(getattr(link, "host", "") or "").casefold()
         if not host or getattr(link, "attention", None) == "visible":
-            continue
+            continue   # only on screen beside the window in front: never a page of theirs to pick up
+        if not getattr(link, "page_key", None) and getattr(link, "capture_thread_id", None) is None:
+            continue   # neither a timeline stretch nor a capture of its own: no visit of theirs to measure
+        if getattr(link, "by_yuki", False):
+            continue   # a page Yuki opened: never their progress
         if str(getattr(link, "app", "") or "").casefold() not in browsers:
             continue   # an app's own page (its embedded UI), not one a browser can open
         if work is not None and work.page(host):
             continue   # their work: never offered to pick up
-        seen = days.setdefault(host, set())
-        for at in (getattr(link, "first_seen", None), getattr(link, "last_seen", None)):
-            try:
-                seen.add(datetime.fromtimestamp(float(at)).date())
-            except Exception:  # noqa: BLE001
-                pass
         title = " ".join(str(getattr(link, "title", "") or "").split())
-        if host in last or not title:
+        if not title:
             continue
         try:
             parts = urlsplit(str(link.url or ""))
@@ -505,19 +513,34 @@ def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: 
             continue   # not a web address, or a site's root: no place to pick up from
         if len(str(link.url or "")) > LEFT_OFF_URL_CHARS or len(parts.query) > LEFT_OFF_QUERY_CHARS:
             continue   # an address that can't be given whole (a cut one opens the wrong page): no way back to it
-        last[host] = (link, parts, title)
-    picks = [(link, parts, title, host) for host, (link, parts, title) in last.items()
-             if len(days.get(host) or ()) >= LEFT_OFF_MIN_DAYS]
-    picks.sort(key=lambda x: (-len(days.get(x[3]) or ()), -float(x[0].last_seen or 0.0)))
+        pages.append((link, host, title))
+    # S19 (mem22, the user's decision D3): how far they got is their own visits, read from the timeline (a page with
+    # no timeline key: their own captures of it, e.g. an episode the player moved to in full screen) - a page's
+    # last_seen also moves when Yuki or a live test has it up (k_resume_anime: a test's 06:17 open of an older episode
+    # read as theirs) - and the sites they come back to count their own days
+    own = own_lasts(store, [link for link, _h, _t in pages], since=since, now=now)
+    days = own_days(store, sorted({h for _l, h, _t in pages}), since=since, now=now)
+    last: dict[str, tuple[Any, str, float]] = {}
+    for link, host, title in pages:
+        at = own.get(int(link.id))
+        if at is not None and (host not in last or at > last[host][2]):
+            last[host] = (link, title, at)
+    picks = [(link, title, at) for host, (link, title, at) in last.items() if days.get(host, 0) >= LEFT_OFF_MIN_DAYS]
+    picks.sort(key=lambda x: -x[2])   # the newest of their own visits first: a newer page carries an older one on
     today = datetime.fromtimestamp(now).date()
     bits = []
-    for link, _parts, title, _host in picks[:n]:
-        day = datetime.fromtimestamp(float(link.last_seen)).date()
+    for link, title, at in picks[:n]:
+        day = datetime.fromtimestamp(at).date()
         gap = (today - day).days
         when = "today" if gap <= 0 else "yesterday" if gap == 1 else f"{day:%d %b}"
         bits.append(f'"{_clip(title, LEFT_OFF_TITLE_CHARS)}" ({link.url}), {when}')
-    return _list(1, "Where they left off (the last page on the sites they return to most; open its address to pick "
-                    "up): ", ((b, PLAIN) for b in bits), sep="; ", min_n=min(len(bits), LEFT_OFF_MIN_N))
+    # the header says what the planner's rule says (mem22 merge notes 1-2, desk22 / one22: "their own thing again"),
+    # no longer than before: the card is full, and a longer head costs the line a page (measured 19 Oct)
+    return _list(1, "Where they left off (their own last page per site, newest first; the newest dated page of a thing "
+                    "wins on any site; when a tab of theirs may hold it, look at their tabs first and show that tab, "
+                    "else open that page's own address): ",
+                 ((b, PLAIN) for b in bits), sep="; ",
+                 min_n=min(len(bits), LEFT_OFF_MIN_N))
 
 
 def _skill_name(store: Any, key: str) -> str:
