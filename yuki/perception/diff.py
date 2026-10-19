@@ -33,6 +33,9 @@ front, held the keyboard, or had a session playing in them:
   act turned toward sound (unmuted it, or raised its level) is still silent after it: its level is 0, it is still
   muted, or (an app's mixer row) the master above it is at 0 or muted. Read only from the parts both snapshots
   carried (the master; the mixer rows of the apps a caller asked :func:`~yuki.perception.situation.snapshot` for).
+  An app's row counts only when that app is one of the act's (``acted`` or ``touched``, matched as the mixer matches
+  an app: :func:`~yuki.perception.situation.mixer_rows`): another app's own level drifting while the master is
+  silent is not the act's to finish (desk19 review L1).
 
 A **tab cover** (final-B: "open GitHub" while a video played opened a tab in the video's own window; same window,
 same share, so nothing changed for a window-level diff) is a covered entry of kind ``tab``: a window that showed a
@@ -69,6 +72,7 @@ from yuki.perception.situation import (
     _squash,
     _title,
     coverer,
+    mixer_rows,
     name_of,
 )
 
@@ -164,7 +168,7 @@ def _moved(a: Window, b: Window) -> bool:
 def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
             touched: Iterable[Any] = ()) -> DeskDiff:
     """What changed from ``before`` to ``after`` (two :func:`~yuki.perception.situation.snapshot` reads around one
-    act), with the three flags (module docstring). ``acted``: what the request was about; ``touched``: the windows the
+    act), with the four flags (module docstring). ``acted``: what the request was about; ``touched``: the windows the
     act itself brought up or focused (ids or app names). Pure: no OS call. Never raises on odd input."""
     diff = DeskDiff()
     acted_hwnds, acted_apps = _acted_sets(acted)
@@ -356,10 +360,14 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
             if abs(a.level - b.level) >= LEVEL_EPS or a.muted != b.muted:
                 diff.volume_changes.append({"app": a.app, "kind": "app", "level_from": b.level, "level_to": a.level,
                                             "muted_from": b.muted, "muted_to": a.muted})
-    # left silent (module docstring): a control turned toward sound whose sound is still off after the act
+    # left silent (module docstring): a control turned toward sound whose sound is still off after the act; an app's
+    # mixer row only when that app is the act's (the master as before: one control, whoever's act it was)
     over = after.master if "master" not in after.errors and after.master else None
+    act_apps = acted_apps | touched_apps
     for v in diff.volume_changes:
         if not ((v["muted_from"] and not v["muted_to"]) or v["level_to"] - v["level_from"] >= LEVEL_EPS):
+            continue
+        if v["kind"] == "app" and not mixer_rows([{"app": v["app"]}], act_apps):
             continue
         why = [w for w, off in (("level", float(v["level_to"]) < LEVEL_EPS), ("muted", bool(v["muted_to"]))) if off]
         if v["kind"] == "app" and over is not None and (bool(over.get("muted"))

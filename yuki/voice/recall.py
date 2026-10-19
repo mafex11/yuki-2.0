@@ -197,6 +197,10 @@ FOUND_NOTE = ("For you, not to read out: answer what they asked from it in a few
               "they mean, say where you looked ({where}) and offer to dig further, which is a hand-over.")
 NOTHING_NOTE = ("Nothing found in {where}. Say that plainly, naming where you looked, and offer to dig further "
                 "(a hand-over); never that they did not tell you.")
+#: desk19 review L3: a search with no hit, with their routine (memory's portrait) beside it as context.
+ROUTINE_ONLY_NOTE = ("Nothing found in {where}; their routine, as memory's portrait writes it, is beside it. When it "
+                     "answers what they asked, answer from it in a few words, saying it is their usual; else say "
+                     "plainly nothing was found, naming where you looked, and offer to dig further (a hand-over).")
 WHOSE_NOTE = ("A hit marked as another AI tool's text, or whose from line says someone else said it, is never theirs: "
               "never give it as their own words or plans. When none is theirs, say what you found and whose it is "
               "(\"someone on your Discord call said that, not you\"), and offer to dig further.")
@@ -1039,14 +1043,19 @@ class QuickMemory:
                      "how_to_handle_it": NOTHING_NOTE.format(where="memory")}, {"ok": False})
         lines = _search_lines(list(hits or []))
         routine = self._routine()
+        if not lines:
+            # desk19 review L3: no hit is still "nothing found"; their routine rides beside it as context only
+            out = {"found": "", "how_to_handle_it": NOTHING_NOTE.format(where="a memory search")}
+            if routine:
+                out = {"found": "", "their_routine": routine,
+                       "how_to_handle_it": ROUTINE_ONLY_NOTE.format(where="a memory search")}
+            return out, {"ok": True, "items": 0, "routine": bool(routine)}
+        items = len(lines)   # the hits (the routine line is counted by its own fact)
         if routine:
             lines.append(routine)
-        if not lines:
-            return {"found": "", "how_to_handle_it": NOTHING_NOTE.format(where="a memory search")}, {"ok": True,
-                                                                                                    "items": 0}
         return ({"found": "\n".join(lines),
                  "how_to_handle_it": FOUND_NOTE.format(where="a memory search") + " " + WHOSE_NOTE},
-                {"ok": True, "items": len(lines), "routine": bool(routine)})
+                {"ok": True, "items": items, "routine": bool(routine)})
 
     def _routine(self) -> str:
         """Their routine as one search line (:func:`routine_line`), ``""`` without (no portrait, memory slow)."""

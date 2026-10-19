@@ -21,8 +21,8 @@ reason from, not a catalog, in this order (the situation on the screens stays se
    from them by name), their other things at this hour (``yuki.skills.learn.values`` hour histograms: seen on
    :data:`HOUR_MIN_DAYS` days or more: "a couple of times" never leads the card); their weekly routines with days and
    times (every active one, whatever the day: "what time's my meeting tomorrow"); their routine as the nightly
-   portrait writes it (final-B: sleep, work hours, the usual meeting; the brief leaves it to the card); their own ways
-   (contract C4: run only when asked, never offered);
+   portrait writes it (final-B: sleep, work hours, the usual meeting; the brief leaves it to the card; the planner's
+   in the first priority, :data:`ROUTINE_PRIORITY`); their own ways (contract C4: run only when asked, never offered);
 3. **Their things, each with what it means to them** (``yuki.memory.meanings.meaning_of``, contract M1: "mafex (the
    MacBook's projects)", next to the thing) - sites with their usual browser (the preference's own answer:
    ``values.known`` reads it from ``yuki.skills.prefs``, one truth with what Yuki opens them in) and a work mark, weak
@@ -37,11 +37,12 @@ reason from, not a catalog, in this order (the situation on the screens stays se
    (``yuki.memory.contacts.directory`` without its header: the whole :data:`PEOPLE_CHARS` is the people's, closest
    first), then **Who** - the portrait's work and interests, first sentence each.
 
-Every line says how sure it is ("often", "some days", "n of m", "you said", "dated"). Sizes: talker at most
-:data:`TALKER_CHARS`, planner and judge at most :data:`WIDE_CHARS`. When a card is over (:func:`_fit`), by priority from
-the least: the lists give their tails first (a weak item first, one with a meaning last, never below a few), then whole
-lines go; a priority gives its tails only once the lines two or more priorities below it are gone (the first priority:
-Open, Lately, the desk, Usually now, Left off, People), and the live lines never go. The slow part (everything but the
+Every line says how sure it is ("often", "some days", "n of m", "you said", "dated"). Sizes: talker under
+:data:`TALKER_CHARS` (one less: the mouth's cut), planner and judge at most :data:`WIDE_CHARS`. When a card is over
+(:func:`_fit`), by priority from the least: the lists give their tails first (a weak item first, one with a meaning
+last, never below a few), then whole lines go; a priority gives its tails only once the lines two or more priorities
+below it are gone (the first priority: Open, Lately, the desk, Usually now, Left off, People, the planner's routine),
+and the live lines never go. The slow part (everything but the
 live lines) is cached in RAM per database and purpose for :data:`CACHE_S` and rebuilt sooner when the learned rows,
 routines, tastes, prefs, contacts, portrait, day digests, meanings or desk habits change (one stamp query, and the
 meanings' own); the live lines are read fresh on every call (the you-now record is in RAM). Never written to disk,
@@ -65,7 +66,9 @@ from typing import Any
 
 PURPOSES: tuple[str, ...] = ("talker", "planner", "judge")
 #: The voice talker reads the card cut at a line boundary to 2,200 chars (kMind: ``mouth.fetch_you_card``): the card
-#: fits it whole, the lines that decide most first: nothing is cut there.
+#: fits it whole, the lines that decide most first: nothing is cut there. That cut counts a newline after every line,
+#: the last one too, so the talker's card is fitted to one character less (desk19 review M2: a card of exactly 2,200
+#: lost its last line there).
 TALKER_CHARS = 2_200
 WIDE_CHARS = 3_000
 CACHE_S = 60.0
@@ -106,6 +109,11 @@ USE_DAYS = 14.0
 #: leaves it out of the talker's slice because the card carries it, and the routines table holds only the skills'
 #: clock routines (a skill's step at a time of day), not what they are for (the meeting that step is for).
 ROUTINE_CHARS = (300, 400)
+#: The routine line's priority per card (:func:`_fit`). The planner reads the brief only when there is no card
+#: (``brain.context.read_context``) and its memory reads never carry the routine, so the card is its one way to it:
+#: first priority there (desk19 review M1: at the second it always gave way on the full planner card). The talker's
+#: memory search carries it too (``voice.recall.routine_line``) and the judge's card holds it at the second.
+ROUTINE_PRIORITY = {"talker": 2, "planner": 1, "judge": 2}
 #: "Lately": each day digest's first sentence at most.
 LATELY_CHARS = 130
 #: "Where they left off" (planner): the LEFT_OFF_N sites they come back to most (the most days; never fewer than
@@ -403,14 +411,14 @@ def _sentences(text: str) -> list[str]:
     return out + ([rest] if rest else [])
 
 
-def _portrait_routine(store: Any, cap: int) -> list[list[Any]]:
+def _portrait_routine(store: Any, cap: int, priority: int = 2) -> list[list[Any]]:
     """final-B (19 Oct, "when's my meeting tomorrow": the talker searched memory and found no time): their routine as
     memory's nightly portrait writes it (the brief's ``routine`` field, else the portrait's Routines section: when
     they sleep, work, eat and play, their usual meeting), dated by the portrait, whole sentences up to ``cap``. The
     brief keeps it out of the talker's slice because the card carries it (``brief.slice_for``), and the routines
-    table's line names only what a skill does at a time. One plain line: a full card drops it whole, after its lists
-    are cut to their best few, rather than keep a fragment (its sentences carry no weight a cut could go by). ``[]``
-    without a portrait."""
+    table's line names only what a skill does at a time. One plain line of ``priority``
+    (:data:`ROUTINE_PRIORITY`): a full card drops it whole, after the lists of its priority are cut to their best
+    few, rather than keep a fragment (its sentences carry no weight a cut could go by). ``[]`` without a portrait."""
     try:
         portrait = store.latest_portrait()
     except Exception:  # noqa: BLE001
@@ -429,7 +437,7 @@ def _portrait_routine(store: Any, cap: int) -> list[list[Any]]:
     if not kept:
         return []
     when = f", portrait of {datetime.fromtimestamp(float(portrait.at)):%d %b}" if portrait.at else ""
-    return [_line(2, f"Their routine (memory{when}): {' '.join(kept)}")]
+    return [_line(priority, f"Their routine (memory{when}): {' '.join(kept)}")]
 
 
 def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: int,
@@ -636,7 +644,7 @@ def _habits(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, purpo
     out = _desk(store, purpose, wide)
     out += _usually_now(store, vals, now, wide)
     out += _routines_week(store, ROUTINES_N[i])
-    out += _portrait_routine(store, ROUTINE_CHARS[i])
+    out += _portrait_routine(store, ROUTINE_CHARS[i], ROUTINE_PRIORITY.get(purpose, 2))
     out += _list(3, "Their own ways (learned from them; run only when they ask, never offered): ",
                  ((x, PLAIN) for x in _ways(ways, WAYS_N[i])), sep="; ")
     return out
@@ -1121,7 +1129,8 @@ def build_you_card(store: Any, *, purpose: str = "talker", now: float | None = N
     if purpose not in PURPOSES:
         raise ValueError(f"purpose must be one of {', '.join(PURPOSES)}, not {purpose!r}")
     now = time.time() if now is None else float(now)
-    cap = TALKER_CHARS if purpose == "talker" else WIDE_CHARS
+    # the talker's: one less than the mouth's cut, which counts a newline after the last line too (TALKER_CHARS)
+    cap = TALKER_CHARS - 1 if purpose == "talker" else WIDE_CHARS
     key = (str(getattr(store, "path", "")), purpose)
     stamp = _stamp(store)
     with _lock:
