@@ -1153,17 +1153,26 @@ def _tidy_switch(call: RouteCall, hands: Any, data: Mapping[str, Any], run: dict
     game stopped it (the gate would refuse the key anyway). With no text field seen taking the keyboard (``opened``
     None), the key goes only when the focus read shows something else holding the keyboard than before the shortcut
     (measured; a switcher whose own window, not a field, has the keyboard), or can't be read: never into an app where
-    nothing changed. ``run["switcher_closed"]``: ``yes`` / ``no`` (still held by what the shortcut opened) /
-    ``unknown`` (the focus can't be read) / ``unchanged`` (nothing opened) / ``theirs`` / ``no_key`` / ``not_sent``."""
+    nothing changed. With the switcher's field seen (``opened``), the key goes only while the focus read shows that
+    field, or something new that takes no text (the switcher's own window), still holding the keyboard, or can't be
+    read (review L2): a switcher that already closed itself gave the keyboard back to where it was, or to another
+    text field (the opened chat's composer, a message being edited), and a close key there would land in the app's
+    own field. ``run["switcher_closed"]``: ``yes`` / ``no`` (still held by what the shortcut opened) / ``unknown``
+    (the focus can't be read) / ``unchanged`` (nothing opened) / ``already`` (it closed itself: nothing pressed) /
+    ``theirs`` / ``no_key`` / ``not_sent``."""
     if run.get("took_over_at"):
         run["switcher_closed"] = "theirs"
         return
     if _refused("keys"):
         run["switcher_closed"] = "not_sent"
         return
-    now = _ident(_holder(hands))
+    snap = _holder(hands)
+    now = _ident(snap)
     if opened is None and before is not None and now is not None and now == before:
         run["switcher_closed"] = "unchanged"
+        return
+    if opened is not None and now is not None and now != tuple(opened) and (now == before or _is_field(snap)):
+        run["switcher_closed"] = "already"
         return
     held_by = opened if opened is not None else now
     sent = _close_own(call, hands, data, apps=apps, key=key)
@@ -1641,7 +1650,7 @@ def _composer_focus(call: RouteCall, app: str, data: Mapping[str, Any], route: C
     labels = composer_labels(data, route)
     shapes = composer_shapes(data)
     snap = _holder(hands)
-    if _in_composer(snap, hwnd, labels, own_field):
+    if _in_composer(snap, hwnd, labels, own_field, shapes):
         return _Keyboard(True, "in_composer", snap)
     image = str((data.get("images") or [""])[0])
     off = _act_off(hands, image)
@@ -2035,8 +2044,12 @@ def probe_message_done(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, 
         ram = {}
     if send and text:
         if ram and not live and not ram.get("pressed"):
-            if ram.get("chat") is False or ram.get("typed") is False:
+            if ram.get("chat") is False:
                 return False, {"status": "not_sent"}
+            if ram.get("typed") is False:
+                # chat19 review M1: nothing typed and no key pressed (C3) is no failed send ("the PC shows it didn't go
+                # through"), and no failed rung: unverified in the check's own word, so the route's own line is said
+                return None, {"status": "not_typed"}
             return None, {"status": "not_pressed"}
         thread_ids = list(ram.get("thread_ids") or [])
         if not thread_ids:

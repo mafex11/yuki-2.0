@@ -143,20 +143,49 @@ def _close_control(automation: Any, element: Any) -> Any:
 
     chat19 (final test 19 Oct, all-browser R3: every Chrome tab close, Yuki's and the harness's, was "no single close
     control"; Chrome's newer tab strip, its names carrying "- Memory usage - N MB", gives a tab a Button that isn't
-    drawn): a Button with an empty box, one UIA reports off-screen, or one whose box lies outside the tab's own box is
-    not on the tab as shown and is left out before choosing (:func:`_button_children`).
+    drawn): a Button whose box was read and is empty or lies outside the tab's own box is not on the tab as shown and
+    is left out before choosing, when it comes before the chosen one in tree order (:func:`_button_children`,
+    :func:`pick_close_control`). A Button whose box couldn't be read, one UIA reports off-screen at the tab's trailing
+    edge beside a drawn one, or an undrawn one after the chosen one is never passed over for the drawn one (review
+    L4: it may be the close control, and the drawn one the sound indicator: nothing is chosen).
     """
     return pick_close_control(_button_children(automation, element))
 
 
 _P_IS_OFFSCREEN = 30022
+#: Where a tab's Button is (:func:`_button_children`): drawn on the tab, reported off-screen by UIA with a real box on
+#: the tab (every Button of a minimised window), or not on the tab as shown (an empty box, or one outside the tab's
+#: own box).
+ON_TAB, OFFSCREEN, OFF_TAB = "tab", "offscreen", "off_tab"
 
 
-def _button_children(automation: Any, element: Any) -> list[tuple[Any, tuple[int, int, int, int] | None]]:
-    """``(element, (left, top, right, bottom) or None)`` of a TabItem's Button children, in tree order. The box is
-    ``None`` when the Button is not drawn on the tab (chat19): an empty box, UIA's ``IsOffscreen``, or a box that
-    doesn't overlap the TabItem's own (when that one is known)."""
-    from yuki.perception.tabs import _P_BOUNDING_RECT, _rect
+def _box(value: Any) -> tuple[int, int, int, int] | None:
+    """A cached BoundingRectangle as ``(left, top, right, bottom)`` (the RECT form or the 4-array form); no box given
+    (an empty value or array) is the empty box; ``None`` when it can't be read as either (never taken for an empty
+    box)."""
+    if value is None:
+        return (0, 0, 0, 0)
+    try:
+        return (int(value.left), int(value.top), int(value.right), int(value.bottom))
+    except Exception:  # noqa: BLE001
+        try:
+            parts = [int(v) for v in value]
+        except Exception:  # noqa: BLE001
+            return None
+        if not parts:
+            return (0, 0, 0, 0)
+        if len(parts) != 4:
+            return None
+        left, top, width, height = parts
+        return (left, top, left + width, top + height)
+
+
+def _button_children(automation: Any, element: Any) -> list[tuple[Any, tuple[int, int, int, int] | None, str]]:
+    """``(element, (left, top, right, bottom) or None, where)`` of a TabItem's Button children, in tree order. The box
+    is ``None`` only when it couldn't be read. ``where`` (chat19): :data:`ON_TAB` (drawn on the tab),
+    :data:`OFFSCREEN` (UIA's ``IsOffscreen`` with a real box on the tab) or :data:`OFF_TAB` (an empty box, or one that
+    doesn't overlap the TabItem's own when that one is known)."""
+    from yuki.perception.tabs import _P_BOUNDING_RECT
 
     request = automation.CreateCacheRequest()
     request.AddProperty(_P_CONTROL_TYPE)
@@ -167,55 +196,73 @@ def _button_children(automation: Any, element: Any) -> list[tuple[Any, tuple[int
         pass
     request.TreeScope = _TREE_SCOPE_ELEMENT
     try:
-        own = _rect(element.CurrentBoundingRectangle)
+        own = _box(element.CurrentBoundingRectangle)
     except Exception:  # noqa: BLE001 - the tab's own box unknown: the buttons' boxes alone decide
         own = None
     try:
         children = element.FindAllBuildCache(_TREE_SCOPE_CHILDREN, automation.ControlViewCondition, request)
         items = [children.GetElement(i) for i in range(children.Length)]
-        out: list[tuple[Any, tuple[int, int, int, int] | None]] = []
+        out: list[tuple[Any, tuple[int, int, int, int] | None, str]] = []
         for c in items:
             if int(c.GetCachedPropertyValue(_P_CONTROL_TYPE) or 0) != _BUTTON:
                 continue
             try:
-                rect = _rect(c.GetCachedPropertyValue(_P_BOUNDING_RECT))
+                rect = _box(c.GetCachedPropertyValue(_P_BOUNDING_RECT))
             except Exception:  # noqa: BLE001 - no position: still a candidate when it is the only one
                 rect = None
             try:
                 offscreen = bool(c.GetCachedPropertyValue(_P_IS_OFFSCREEN))
             except Exception:  # noqa: BLE001 - not read: the box decides
                 offscreen = False
-            out.append((c, rect if _drawn(rect, own) and not offscreen else None))
+            out.append((c, rect, _where(rect, own, offscreen)))
         return out
     except Exception:  # noqa: BLE001 - a tab that went away mid-read
         return []
 
 
-def _drawn(rect: tuple[int, int, int, int] | None, own: tuple[int, int, int, int] | None) -> bool:
-    """Whether a box is drawn on the tab: not empty, and overlapping the tab's own box when that is a real one."""
-    if not rect or rect[2] <= rect[0] or rect[3] <= rect[1]:
-        return False
-    if not own or own[2] <= own[0] or own[3] <= own[1]:
-        return True
-    return rect[0] < own[2] and own[0] < rect[2] and rect[1] < own[3] and own[1] < rect[3]
+def _real(rect: tuple[int, int, int, int] | None) -> bool:
+    return bool(rect) and rect[2] > rect[0] and rect[3] > rect[1]
 
 
-def pick_close_control(buttons: list[tuple[Any, Any]]) -> Any:
+def _where(rect: tuple[int, int, int, int] | None, own: tuple[int, int, int, int] | None, offscreen: bool) -> str:
+    """Where a read box is (:data:`ON_TAB`, :data:`OFFSCREEN`, :data:`OFF_TAB`): not empty, overlapping the tab's own
+    box when that is a real one, and not reported off-screen. A box that couldn't be read is :data:`ON_TAB` here (its
+    ``None`` box says so to :func:`pick_close_control`)."""
+    if rect is None:
+        return ON_TAB
+    if not _real(rect):
+        return OFF_TAB
+    if _real(own) and not (rect[0] < own[2] and own[0] < rect[2] and rect[1] < own[3] and own[1] < rect[3]):
+        return OFF_TAB
+    return OFFSCREEN if offscreen else ON_TAB
+
+
+def pick_close_control(buttons: list[tuple[Any, ...]]) -> Any:
     """The close control among a tab's buttons: the only one, else the right-most by its on-screen box.
 
-    ``buttons`` are ``(element, (left, top, right, bottom) or None)``, ``None`` for a Button not drawn on the tab.
-    chat19: those are left out first; one drawn Button is the close control, several the right-most drawn one. With
-    none drawn, a tab's only Button is still the one (no position to judge it by, as before); several with none
-    drawn: ``None`` (nothing is chosen).
+    ``buttons`` are ``(element, (left, top, right, bottom) or None)``, or ``(element, box, where)`` from
+    :func:`_button_children`; a ``None`` box is one that couldn't be read. ``None`` when there are none, or several
+    and one of them has no box to tell them apart by (it may be the close control). chat19: Buttons not on the tab as
+    shown (``where`` :data:`OFF_TAB`, or an empty box) are left out first; of the rest the right-most is the close
+    control when it is drawn, or when none is drawn (a minimised window: UIA reports every Button off-screen). It is
+    ``None`` instead when the right-most is reported off-screen beside a drawn one, or when a Button not drawn comes
+    after it in tree order (the tab's own order along it: an undrawn Button has no position but that). Either may be
+    a narrow tab's hidden close control, the drawn one its sound indicator: a close never mutes the tab.
     """
-    drawn = [(b, r) for b, r in buttons if r is not None]
-    if len(drawn) == 1:
-        return drawn[0][0]
-    if len(drawn) > 1:
-        return max(drawn, key=lambda br: br[1][2])[0]
-    if len(buttons) == 1:
-        return buttons[0][0]
-    return None
+    rows = [(b[0], b[1], b[2] if len(b) > 2 else ON_TAB) for b in buttons]
+    if len(rows) == 1:
+        return rows[0][0]
+    if len(rows) < 2 or any(r is None for _b, r, _w in rows):
+        return None
+    kept = [(i, r, w) for i, (_b, r, w) in enumerate(rows) if w != OFF_TAB and _real(r)]
+    if not kept:
+        return None
+    at, _r, where = max(kept, key=lambda irw: irw[1][2])
+    if where != ON_TAB and not all(w == OFFSCREEN for _i, _r, w in kept):
+        return None
+    if any(w == OFF_TAB or not _real(r) for _b, r, w in rows[at + 1:]):
+        return None
+    return rows[at][0]
 
 
 def _invoke(element: Any, module: Any) -> bool:
