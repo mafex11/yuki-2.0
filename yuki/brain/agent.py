@@ -115,6 +115,14 @@ CANCELLED, WITHDRAWN, PARKED = "cancelled", "withdrawn", "parked"
 PAUSE_STOP_LINE = "Stopped. Nothing else was done."
 #: After a resume (or an answer, or a tap on the countdown), the takeover watch starts again this late (s).
 RESUME_GRACE_S = 1.5
+#: hands19 (final-B all-messaging RC3, contract C4): the voice's marks on an open send countdown, through the
+#: countdown's chip channel (``Brain.send_choice``; ``ui.runtime.Runtime.send_choice`` reaches the running agent): the
+#: user started speaking (the count pauses), or the voice saw their turn end without their words stopping or changing
+#: the send (it counts on for the time it had left). Not chips: nothing of them is the user's choice of person or place.
+SEND_HOLD, SEND_GO_ON = "hold", "go_on"
+#: A countdown the user's speech paused that nothing ends (their words, a stop, the voice's go-on) within this long
+#: ends stopped: nothing sent (``yuki.one.countdown.PAUSE_MAX_S``, the same bound under brain one).
+SEND_PAUSE_MAX_S = 20.0
 
 #: The outcome levels' words (``finish.LEVEL_LABELS``'s values: the done card and the island repeat them).
 LEVEL_LABELS: dict[str, str] = {"verified": "Checked on screen", "likely": "Likely done",
@@ -215,6 +223,11 @@ TEXT_BACK_CALLS = 2
 #: ANSWER_PART_CALLS to the act budget (code's question).
 ANSWER_PARTS_MAX = 1
 ANSWER_PART_CALLS = 1
+#: hands19 (final-B all-questions RC3, k_two_asks_pause_and_meeting: four act plans re-did the pause, none read memory,
+#: and "Spotify is paused; I couldn't check the rest." hid the question): a spoken request that asks something
+#: (``plan.goal_is_question``) whose act plan ended having read nothing gets the same one answer turn (it counts as
+#: that turn: ANSWER_PARTS_MAX bounds both), with room for one read before the answer: QUESTION_PART_CALLS more calls.
+QUESTION_PART_CALLS = 2
 #: P1.3 (18 Oct free-thinker plan): a done act request whose acts took something the user had (the executor's
 #: after-look) gets one tidy-up turn after its line is said (one per request: the turn's own acts are never looked at
 #: again). The turn is exactly one model call (whatever comes back ends it); it adds TIDY_CALLS to the act budget
@@ -331,6 +344,9 @@ class _State:
     #: (:func:`answer_due`), and the held ending that turn put up (:attr:`held` while no other ending replaced it).
     answer_parts: int = 0
     answer_held: tuple[str, dict[str, Any]] | None = None
+    #: hands19: of those, the turns given because their words asked something and the plan read nothing
+    #: (:func:`question_due`).
+    question_parts: int = 0
     #: P1.3: the tidy-up turn was given (once per request), the ending it holds (its line, already said), and the
     #: executor's list of what its steps did (their words, said after that line).
     tidied: bool = False
@@ -674,6 +690,9 @@ class Brain:
         self._send_open: dict[str, Any] | None = None
         self._send_choice: tuple[str, str] | None = None
         self._send_stopped: bool | None = None
+        #: hands19 (C4): the voice's last mark on the open countdown (:data:`SEND_HOLD` / :data:`SEND_GO_ON`), taken by
+        #: the countdown's loop.
+        self._send_mark: str | None = None
         #: appTakeover (as ``loop.Agent``): the watch factory, the surfaces' callback, whether a pause may start now.
         self.takeover: Any = None
         self.on_pause: Any = None
@@ -792,6 +811,7 @@ class Brain:
         if text:
             with self._steer_lock:
                 self._steers.append(text)
+            self._send_wake.set()   # hands19 (C4): an open countdown sees their words now (they stop the send)
 
     def _peek_steers(self) -> list[str]:
         with self._steer_lock:
@@ -840,7 +860,17 @@ class Brain:
         return self._awaiting_answer
 
     def send_choice(self, kind: str, value: str) -> bool:
-        """A chip tapped on the send countdown (``who`` / ``where``, one of the alternatives shown)."""
+        """A chip tapped on the send countdown (``who`` / ``where``, one of the alternatives shown). hands19 (contract
+        C4): also the voice's marks on it (:data:`SEND_HOLD`: the user started speaking, so it pauses;
+        :data:`SEND_GO_ON`: their turn ended and their words neither stopped nor changed the send, so it counts on for
+        the time it had left). ``False`` when no countdown is open (or the value was not offered)."""
+        if kind in (SEND_HOLD, SEND_GO_ON):
+            with self._send_lock:
+                if self._send_open is None:
+                    return False
+                self._send_mark = kind
+            self._send_wake.set()
+            return True
         with self._send_lock:
             open_ = self._send_open
             if open_ is None or kind not in ("who", "where"):
@@ -1190,7 +1220,7 @@ class Brain:
         if seconds <= 0:
             return "going"
         with self._send_lock:
-            self._send_open, self._send_choice = info, None
+            self._send_open, self._send_choice, self._send_mark = info, None, None
         self._send_wake.clear()
         self.logger.log("send_countdown", state="counting", seconds=seconds, chars=len(text),
                         who_alts=len(who_alts), where_alts=len(where_alts), typed=typed)
@@ -1200,23 +1230,12 @@ class Brain:
         started = time.monotonic()
         deadline = started + seconds
         choice: tuple[str, str] | None = None
-        while True:
-            if self._cancelled.is_set():
-                state = "stopped"
-                break
+        state, why = self._count_down(info, seconds, started, deadline)
+        if state == "swapped":
             with self._send_lock:
                 choice, self._send_choice = self._send_choice, None
-            if choice is not None:
-                state = "swapped"
-                break
-            left = deadline - time.monotonic()
-            if left <= 0:
-                state = "going"
-                break
-            self._send_wake.wait(left)
-            self._send_wake.clear()
         with self._send_lock:
-            self._send_open = None
+            self._send_open, self._send_mark = None, None
         self._pause_quiet_until = time.monotonic() + RESUME_GRACE_S
         self._waited_s += time.monotonic() - started
         event = dict(info)
@@ -1238,11 +1257,63 @@ class Brain:
                             after_ms=round((time.monotonic() - started) * 1000))
             self._push(SendPending("swapped", seconds=seconds, **event))
             return "swapped"
+        if state == "swapped":
+            # hands19 (C4): their own words reached it while it counted or was paused: nothing sent, the island's card
+            # closes, and the executor gives their words to the planner (it sends again through a new countdown,
+            # changes it, or drops it)
+            self.logger.log("send_countdown", state="swapped", why=why or None,
+                            after_ms=round((time.monotonic() - started) * 1000))
+            self._push(SendPending("stopped", seconds=seconds, **event))
+            return "swapped"
         if state == "stopped":
             self._send_stopped = bool(typed)
-        self.logger.log("send_countdown", state=state, after_ms=round((time.monotonic() - started) * 1000))
+        self.logger.log("send_countdown", state=state, why=why or None,
+                        after_ms=round((time.monotonic() - started) * 1000))
         self._push(SendPending(state, seconds=seconds, **event))
         return state
+
+    def _count_down(self, info: dict[str, Any], seconds: float, started: float, deadline: float) -> tuple[str, str]:
+        """hands19 (final-B all-messaging RC3, contract C4): the countdown's wait, ``(state, why)``: ``stopped`` (a
+        cancel; or a pause nothing ended within :data:`SEND_PAUSE_MAX_S`: nothing sent), ``swapped`` (a chip, or the
+        user's own words reached this request while it counted or was paused: the executor gives them to the planner,
+        nothing sent), or ``going`` (the time ran out). The voice's :data:`SEND_HOLD` (the user started speaking: their
+        words decide) pauses it at once with the time it had left (the island card closes, ``SendPending("paused")``);
+        :data:`SEND_GO_ON` (their turn ended and nothing of it stopped or changed the send) counts on for that time
+        (``SendPending("counting")`` again), as brain one's countdown does. Waits on the wake event (a cancel, a chip,
+        a mark or their words set it), at most a quarter second at a time while paused. Code facts only."""
+        words_at = len(self._peek_steers())   # words already waiting were the executor's at its step boundary
+        held_at: float | None = None
+        left = seconds
+        while True:
+            self._send_wake.clear()
+            if self._cancelled.is_set():
+                return "stopped", "cancel"
+            with self._send_lock:
+                chip = self._send_choice is not None
+                mark, self._send_mark = self._send_mark, None
+            if chip:
+                return "swapped", "chip"
+            if len(self._peek_steers()) > words_at:
+                return "swapped", "words"   # their words reached it: the planner decides from them, nothing sent
+            now = time.monotonic()
+            if mark == SEND_HOLD and held_at is None:
+                held_at, left = now, max(0.0, deadline - now)
+                self.logger.log("send_countdown", state="paused", left_ms=round(left * 1000),
+                                after_ms=round((now - started) * 1000))
+                self._push(SendPending("paused", seconds=seconds, **info))
+            elif mark == SEND_GO_ON and held_at is not None:
+                held_at, deadline = None, now + left
+                self.logger.log("send_countdown", state="resumed", left_ms=round(left * 1000))
+                self._push(SendPending("counting", seconds=left, **info))
+            if held_at is not None:
+                if now - held_at >= SEND_PAUSE_MAX_S:
+                    return "stopped", "pause_timeout"
+                wait = min(0.25, SEND_PAUSE_MAX_S - (now - held_at))
+            else:
+                wait = deadline - now
+                if wait <= 0:
+                    return "going", "ran_out"
+            self._send_wake.wait(wait)
 
     # -- the launch watch (copied from loop.Agent) --------------------------------------------------------------------
 
@@ -1723,6 +1794,7 @@ class Brain:
         if state.kind == "act":
             return state.calls < (bs.act_calls + state.part_rests * PART_REST_CALLS
                                   + state.text_backs * TEXT_BACK_CALLS + state.answer_parts * ANSWER_PART_CALLS
+                                  + state.question_parts * QUESTION_PART_CALLS
                                   + int(state.tidied) * TIDY_CALLS)
         work_s = time.monotonic() - req.started - self._waited_s
         return state.calls < bs.answer_calls and work_s < bs.answer_s
@@ -1969,6 +2041,10 @@ class Brain:
         if not hasattr(executor, "seed"):
             return
         seed = self._req.seed if self._req is not None else None
+        if hasattr(executor, "seed_also"):
+            # hands19 (Plan.seed_also): the hand-off's own check, read at that plan's finish beside the plan's probe
+            executor.seed_also = ({k: seed.get(k) for k in ("done", "done_words", "baseline") if k in seed}
+                                  if seed and getattr(header, "seed_also", False) else None)
         if not seed:
             executor.seed = None
         elif header.seed_check or header.skill:
@@ -2274,6 +2350,18 @@ class Brain:
                 conv.add_user([tool_result(tool_id, answer_part_report(result, plan, line)), *extra,
                                *self._steer_turn(host)])
                 return False
+            if (state.answer_parts < ANSWER_PARTS_MAX and not self._cancelled.is_set()
+                    and question_due(plan, result, status, self._req, host)):
+                # hands19 (all-questions RC3a(ii)): their spoken words asked something and this act plan read nothing,
+                # so nothing would ever answer it: its line is held and the planner gets the answer turn, with room
+                # for one read first (the turn's own report says so); code says its line, then that answer
+                state.answer_parts += 1
+                state.question_parts += 1
+                state.held = state.answer_held = (line, outcome)
+                self.logger.log("brain_answer_part", n=state.answer_parts, reads=0, status=status, question=True)
+                conv.add_user([tool_result(tool_id, question_part_report(plan, line)), *extra,
+                               *self._steer_turn(host)])
+                return False
             if status != "declined" and self._tidy_turn(result, plan, line, outcome, state, bs, conv, extra, host,
                                                         tool_id):
                 return False
@@ -2553,6 +2641,8 @@ class Brain:
             plan = state.current if state is not None else None
             if plan is not None and plan.seed_check:
                 return
+            if getattr(getattr(self, "_executor", None), "seed_read", False):
+                return   # hands19: the executor read it at the finish (Plan.seed_also), its verdict weighed there
             self._seed_observed = True
             from yuki.brain import done as _done
 
@@ -3089,6 +3179,36 @@ def answer_due(plan: Plan | None, result: ExecResult, status: str) -> bool:
     return any(s.verb in ANSWER_READ_VERBS for s in plan.steps) and any(s.verb in ACT_VERBS for s in plan.steps)
 
 
+def question_due(plan: Plan | None, result: ExecResult, status: str, req: Any, host: Any) -> bool:
+    """hands19 (final-B all-questions RC3a(ii)): a spoken request (voice channel) whose words ask something
+    (:func:`yuki.brain.plan.goal_is_question`: the recognizer's or the talker's question mark) ended an act plan (done,
+    not confirmed, drafted) that read nothing (no memory read, no fetch came back): nothing answers the question then.
+    Never on a send or a join (consent's own line stands alone). Code facts only (the plan's kind, its status, the reads
+    that came back, the request's channel and punctuation)."""
+    if plan is None or plan.kind != "act" or status not in ("done", "unconfirmed", "drafted") or result.reads:
+        return False
+    if plan.consent.commit in ("send", "join") or str(getattr(req, "channel", "") or "") != "voice":
+        return False
+    from yuki.brain.plan import goal_is_question
+
+    words = list(getattr(host, "user_words", None) or getattr(req, "words", None) or [])
+    return goal_is_question(words, getattr(req, "understanding", None))
+
+
+def question_part_report(plan: Plan | None, line: str) -> str:
+    """hands19: :func:`question_due`'s answer turn (as ``context.answer_part_report`` after a read, with no reads to
+    give back): code's line for the act is held, and the planner answers what their words asked, after one read if it
+    needs one (a memory or look call), in plain text. Code then says its line and the answer after it. Code-written."""
+    pid = plan.id if plan else ""
+    return "\n".join([
+        f"{CHECK_LABEL} Plan {pid} ended. Yuki's line for what it did, not said yet: {one_line(line, 200)}",
+        "That plan read nothing, and their words above also asked something.",
+        f"Answer it now: read what the answer needs first (one memory or look call) if you have not, then reply in "
+        f"plain text with only the answer (one or two short sentences, in their terms; if nothing you read holds it, "
+        f"say so): code says its own line first, so never repeat or claim what was done. If they asked nothing more, "
+        f"reply with the one word {REST_DONE_WORD}."])
+
+
 def look_only(plan: Plan | None, result: ExecResult) -> bool:
     """An act plan whose every step only reads (look, memory, fetch, wait), so nothing of it acted (sBrainFix, F9): its
     check reading nothing is not the end of the request. Code facts only (the closed verb lists, the step states)."""
@@ -3156,4 +3276,6 @@ def _as_result(got: Any) -> ExecResult:
 __all__ = ["Brain", "Host", "CANCELLED", "WITHDRAWN", "PARKED", "PAUSE_STOP_LINE", "LEVEL_LABELS", "OUTCOME_KEYS",
            "STEP_WORDS", "REASON_WORDS", "plain_reason", "typed_draft", "with_watch_steps", "look_only",
            "LOOK_BACKS_MAX", "OBSERVE_LEVELS", "OBSERVE_ACTED_LEVELS", "PART_RESTS_MAX", "PART_REST_CALLS",
-           "rest_done_reply", "LINE_REST_UNDONE", "answer_due", "ANSWER_PARTS_MAX", "ANSWER_PART_CALLS"]
+           "rest_done_reply", "LINE_REST_UNDONE", "answer_due", "ANSWER_PARTS_MAX", "ANSWER_PART_CALLS",
+           "question_due", "question_part_report", "QUESTION_PART_CALLS", "SEND_HOLD", "SEND_GO_ON",
+           "SEND_PAUSE_MAX_S"]

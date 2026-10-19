@@ -383,7 +383,9 @@ class Plan:
     """One validated plan. ``id`` is code's (``p1``, ``p2`` ...). ``seeded``: made in a request a skill handed over
     (rung C). ``done_by_skill``: a skill route checks itself (the engine's own done-check and line). ``seed_check``: the
     hand-off's own fixed check decides this plan (the planner wrote ``none`` for it, or the seed's probe itself); a
-    seeded plan by steps that wrote a probe of its own is decided by that probe (x10)."""
+    seeded plan by steps that wrote a probe of its own is decided by that probe (x10). ``seed_also`` (hands19): that
+    plan's hand-off check is a skill driver's own check of no send or join, so it is read too at the finish, before
+    the line is worded, and the stronger verdict is kept (verified beats likely: :func:`stronger_done`)."""
 
     id: str
     goal: str
@@ -398,6 +400,7 @@ class Plan:
     seeded: bool = False
     done_by_skill: bool = False
     seed_check: bool = False
+    seed_also: bool = False
 
     @property
     def skill(self) -> str | None:
@@ -419,7 +422,8 @@ class Plan:
         return {"plan": self.id, "kind": self.kind, "route": "skill" if self.skill else STEPS_ROUTE,
                 "commit": self.consent.commit, "probe": self.done.name, "steps": len(self.steps),
                 "verbs": [s.verb for s in self.steps], "revises": bool(self.revises), "seeded": self.seeded,
-                "seed_check": self.seed_check, "goal_chars": len(self.goal), "target": sorted(self.target.fields())}
+                "seed_check": self.seed_check, "seed_also": self.seed_also, "goal_chars": len(self.goal),
+                "target": sorted(self.target.fields())}
 
 
 class PlanError(Exception):
@@ -915,7 +919,10 @@ def _check_done(plan: Plan, checks: Checks) -> Plan:
     * a seeded plan by steps: its own probe from the closed list decides it; ``none`` (or the hand-off's own probe
       written out) takes the seed's fixed check (``seed_check``), except a send's or a join's check in a plan that
       declares neither, a sending skill's own check among them (that would read the user's own doing, as
-      :func:`yuki.brain.done.pick_done` refuses it): ``none``;
+      :func:`yuki.brain.done.pick_done` refuses it): ``none``. hands19 (final-B all-spotify RC3: the playlist hand-off's
+      plan picked ``media_session``, which read "likely", while the skill's own ``playing_here`` saw it playing): when
+      the seed's check is a driver's own check of no send or join, the plan's probe still decides, and the seed's check
+      is read too at the finish (``seed_also``): the stronger verdict is kept;
     * any other act plan: the planner's pick.
 
     Raises :class:`PlanError` only for a probe a plan may not pick: one only a skill reads, or a send's or a join's
@@ -949,7 +956,50 @@ def _check_done(plan: Plan, checks: Checks) -> Plan:
         raise PlanError(["message_sent checks a send: declare consent.commit send, or pick another probe"])
     if done.name == "mic_held":
         raise PlanError(["mic_held checks a join: declare consent.commit join, or pick another probe"])
+    if seed is not None and seed.name == SEED_ALSO_PROBE and not _commit_probe(seed) and not seed_sends(checks.seed):
+        # hands19: the skill driver's own check reads what its rung was for (the row playing here), which the plan's
+        # own probe may read only as likely: read at the finish too, the stronger verdict kept
+        return replace(plan, seed_also=True)
     return plan
+
+
+#: hands19: the hand-off check read beside a seeded plan's own probe at its finish (:attr:`Plan.seed_also`): a skill
+#: driver module's own check (``done.observe_seed`` read it only after the line, as an observer whose verdict was
+#: ignored).
+SEED_ALSO_PROBE = "driver"
+#: The verdict levels by strength (``yuki.brain.util``'s words): a stronger one read at the finish replaces a weaker.
+DONE_STRENGTH: dict[str, int] = {"verified": 3, "likely": 2, "unverified": 1, "failed": 0}
+
+
+#: hands19: the mark a sentence asking something ends with, in the forms the recognizer and the talker write it (ASCII,
+#: full-width, Arabic): punctuation, never a word.
+QUESTION_MARKS: tuple[str, ...] = ("?", "\uff1f", "\u061f")
+
+
+def goal_is_question(words: Sequence[str], understanding: Mapping[str, Any] | None = None) -> bool:
+    """hands19 (final-B all-questions RC3: "pause the song, also when's my meeting tomorrow" ended on the pause's line
+    and the question was never answered): whether a handed-over request asks something, by the marks it came with: the
+    talker's reading of it (its ``understanding`` goal or a part's ``what``) or one of the user's own sentences as the
+    speech recognizer punctuated it ends with a question mark. Punctuation the recognizer and the talker wrote, never a
+    reading of the words."""
+    texts: list[str] = [str(w) for w in words or () if str(w or "").strip()]
+    if isinstance(understanding, Mapping):
+        texts.append(str(understanding.get("goal") or ""))
+        texts += [str(p.get("what") or "") for p in understanding.get("parts") or () if isinstance(p, Mapping)]
+    return any(mark in text for text in texts for mark in QUESTION_MARKS)
+
+
+def stronger_done(own: Any, seed: Any) -> bool:
+    """hands19 (:attr:`Plan.seed_also`): whether the hand-off check's result ``seed`` (a ``done.DoneResult``) should
+    replace the plan's own ``own`` at the finish: only a seed check that read it done (verdict ``True``) at a stronger
+    level than the plan's own, never over the plan's own "not so" (``False``: it decides, and its replan stands), never
+    weaker. Code facts (the two verdicts and levels) only."""
+    if seed is None or own is None or getattr(seed, "verdict", None) is not True:
+        return False
+    if getattr(own, "verdict", None) is False:
+        return False
+    return DONE_STRENGTH.get(str(getattr(seed, "level", "") or ""), -1) > DONE_STRENGTH.get(
+        str(getattr(own, "level", "") or ""), -1)
 
 
 def _commit_probe(probe: Probe) -> bool:
@@ -1400,5 +1450,6 @@ __all__ = [
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",
     "probe_args_text", "probe_errors", "error_code", "error_codes", "SEED_RERUN_OK", "skill_family", "seed_skill",
     "spent_skills", "unescape", "seed_sends",
-    "person_open", "handoff_person_open",
+    "person_open", "handoff_person_open", "SEED_ALSO_PROBE", "DONE_STRENGTH", "stronger_done", "QUESTION_MARKS",
+    "goal_is_question",
 ]
