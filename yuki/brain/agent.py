@@ -344,6 +344,9 @@ class _State:
     #: (:func:`answer_due`), and the held ending that turn put up (:attr:`held` while no other ending replaced it).
     answer_parts: int = 0
     answer_held: tuple[str, dict[str, Any]] | None = None
+    #: kw2 review M1: the act plan whose line the answer turn holds and what it reported (its after-look,
+    #: ``result.after``), so the tidy step (tidy21, the user's decision 1) still follows that line after the answer
+    answer_act: tuple[ExecResult, Plan | None] | None = None
     #: hands19: of those, the turns given because their words asked something and the plan read nothing
     #: (:func:`question_due`).
     question_parts: int = 0
@@ -1347,10 +1350,11 @@ class Brain:
 
     def _ask(self, question: str) -> str | None:
         """One question round trip through the generator (it yields :class:`AskUser`). Blocks the worker on an event
-        until the caller answered or the request ended."""
+        until the caller answered or the request ended. kw2 review M2: the planner's mark (``context.AWAITS_MARK``) is
+        taken off first (an ask plan's question, or ``ask_user``'s, is said as written; it waits inside the request)."""
         if self._cancelled.is_set():
             return None
-        item = _Ask(" ".join(str(question or "").split()))
+        item = _Ask(" ".join(take_awaits(str(question or ""))[0].split()))
         self._ask_open = item
         self._push(item)
         item.done.wait()
@@ -2322,6 +2326,7 @@ class Brain:
                 # (or the one word that nothing more was asked); code says its line, then that answer
                 state.answer_parts += 1
                 state.held = state.answer_held = (line, outcome)
+                state.answer_act = (result, plan)   # kw2 review M1: its tidy step follows the answer
                 self.logger.log("brain_answer_part", n=state.answer_parts, reads=len(result.reads), status=status)
                 conv.add_user([tool_result(tool_id, answer_part_report(result, plan, line)), *extra,
                                *self._steer_turn(host)])
@@ -2336,6 +2341,7 @@ class Brain:
                 state.answer_parts += 1
                 state.question_parts += 1
                 state.held = state.answer_held = (line, outcome)
+                state.answer_act = (result, plan)   # kw2 review M1: its tidy step follows the answer
                 self.logger.log("brain_answer_part", n=state.answer_parts, reads=0, status=status, question=True)
                 conv.add_user([tool_result(tool_id, question_part_report(plan, line)), *extra,
                                *self._steer_turn(host)])
@@ -2445,12 +2451,13 @@ class Brain:
 
     def _tidy_turn(self, result: ExecResult, plan: Plan | None, line: str, outcome: dict[str, Any], state: _State,
                    bs: BrainSettings, conv: Conversation, extra: list[dict[str, Any]], host: Host,
-                   tool_id: str) -> bool:
+                   tool_id: str | None) -> bool:
         """One tidy-up turn when the executor's after-look flagged what the request's acts did (``result.after``) and
         the user's tidy dial is not off. The request's line goes out first (review H1: a :class:`Say`, at once: the
         voice says it, the strip shows it; nothing waits on the turn), then the planner gets the "After:" block and
         the principle (:func:`tidy_report`) for exactly one call, and the executor takes only undoable window steps on
-        what the request's own acts changed. ``True`` when the turn was given."""
+        what the request's own acts changed. ``True`` when the turn was given. ``tool_id`` ``None`` (kw2 review M1):
+        the turn follows a plain-text reply (the answer turn after a held act line), so the report is a text block."""
         executor = getattr(self, "_executor", None)
         if (not result.after or state.tidied or executor is None or not hasattr(executor, "tidy_up")
                 or self._cancelled.is_set()):
@@ -2475,7 +2482,8 @@ class Brain:
         # tidy21: only a flag with no legal step comes here (code takes a measured one itself, :meth:`_tidy_by_code`)
         report = tidy_report(plan, line, result.after, nonce=str(getattr(host, "nonce", "") or ""),
                              ask=mode == TIDY_ASK, steps=TIDY_STEPS)
-        conv.add_user([tool_result(tool_id, report), *extra, *self._steer_turn(host)])
+        block = tool_result(tool_id, report) if tool_id is not None else {"type": "text", "text": report}
+        conv.add_user([block, *extra, *self._steer_turn(host)])
         return True
 
     def _after_tidy(self, call: ModelCall, resp: CallResult, result: ExecResult | None, state: _State,
@@ -2714,8 +2722,19 @@ class Brain:
             answer = "" if rest_done_reply(text) else " ".join(text.split())
             line = f"{held_line.rstrip()} {answer}".strip() if answer else held_line
             # kw2 (K1): the answer is said last, so its own mark decides; with none, the held line's own stands
-            self._final(line, _awaiting({**dict(held_outcome or {}), "line": line}, marked) if answer
-                        else dict(held_outcome or {}))
+            outcome = (_awaiting({**dict(held_outcome or {}), "line": line}, marked) if answer
+                       else dict(held_outcome or {}))
+            # kw2 review M1 (tidy21, the user's decision 1): the held act's own after-look still decides the tidy
+            # step, as when no answer turn is given: code takes the measured step (or says its flag line) after the
+            # line and the answer, else the planner's one tidy-up turn. Code facts only (the act's report)
+            act, act_plan = state.answer_act or (None, None)
+            state.answer_act = None
+            if act is not None and act.status != "declined":
+                if self._tidy_by_code(act, line, outcome, state):
+                    return True
+                if self._tidy_turn(act, act_plan, line, outcome, state, bs, conv, [], host, None):
+                    return False
+            self._final(line, outcome)
             return True
         if state.held is not None:
             if state.held is state.rest_held and not rest_done_reply(text):
@@ -2765,6 +2784,12 @@ class Brain:
                                          "open": max(1, int(dict(held_outcome or {}).get("open") or 0))}, False))
             return
         if state.held is not None:
+            # kw2 review M1: an answer turn that ended with no reply (a cut-off, the budget, replans spent) still gets
+            # the held act's measured tidy step by code after its line (no planner call)
+            act = state.answer_act[0] if state.answer_act is not None and state.held is state.answer_held else None
+            state.answer_act = None
+            if act is not None and act.status != "declined" and self._tidy_by_code(act, *state.held, state):
+                return
             self._final(*state.held)
             return
         if state.kind != "act" and not state.acted:

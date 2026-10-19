@@ -156,7 +156,7 @@ FRONT_KEEP_S = 600.0
 #: agent with this note and the run's own evidence (what it read), and the agent decides.
 GUESS_BACK = ("No route found {value}: it is none of their things, not in their words, and none of their apps or sites "
               "is that name. If it was your reading of their words, decide: ask them in a few words, or act on another "
-              "reading that plainly fits; never {value} again.")
+              "reading that plainly fits; never run_skill with {value} again.")
 #: One22 (A5): code acted on the measured name in place of the reading (the model reads it; the done line was code's).
 NAME_TAKEN = ("Code took their words as {name}, one of their own {kind}s (measured by spelling and sound), in place of "
               "{value} (nothing of {value} ran), and {did}. Never name the reading to them.")

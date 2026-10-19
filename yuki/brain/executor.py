@@ -4178,12 +4178,13 @@ class Executor:
 
         kw2 (B6): never an app value (a browser, an app; slot type ``app``). A span cannot see "not" ("open YouTube in
         Arc, not in Chrome" let a planner's Chrome through on the span "Chrome"), so an app the planner gives stands as
-        its own reading of what they meant, as an undoable app slot takes the caller's value (``skills.resolve``), and
-        no earlier turn, nor memory's turn log of the conversation (bRound2's ``said_before`` read, gone), is searched
-        for it.
+        its own reading of what they meant, as an undoable app slot takes the caller's value (``skills.resolve``): no
+        earlier turn's span of it joins ``words`` (what the engine fills from and reads the exchange's own names in),
+        and memory's turn log of the conversation (bRound2's ``said_before`` read) is gone. The resolver still
+        validates every given value, an app's too, against ``earlier`` below (validate-only, never a fill).
 
-        ``earlier``: every earlier request's turns, oldest first, for the resolver's validate-only ``earlier=`` once
-        the Dispatcher passes ``skill_context["earlier"]`` through. Whole words in order, never meaning."""
+        ``earlier``: every earlier request's turns, oldest first, for the resolver's validate-only ``earlier=`` (the
+        engine forwards ``skill_context["earlier"]``). Whole words in order, never meaning."""
         older = self._earlier_requests()
         spans: list[str] = []
         for value, kind in self._given_typed(call):

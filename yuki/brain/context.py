@@ -133,8 +133,8 @@ CHANNEL_LINES = {
 #: :data:`REST_DONE_WORD`), the model's own judgement of its reply, never a reading of the reply's words. Asked of the
 #: ``all`` planner on voice only (:func:`request_turn` ``awaits_mark``).
 AWAITS_MARK = "<awaits/>"
-AWAITS_LINE = (f"[A spoken reply of yours that offers them something or asks them something they answer next ends "
-               f"with {AWAITS_MARK} (code takes it off, never said)]")
+AWAITS_LINE = (f"[A plain-text spoken reply of yours (never a plan's question) that offers them something or asks "
+               f"them something they answer next ends with {AWAITS_MARK} (code takes it off, never said)]")
 #: Most people named that get a card (routes and last messages) in the request turn.
 PEOPLE_MAX = 2
 #: Most of the user's own last messages shown per request turn (design 2.3: the last 3 or fewer, dated).
