@@ -365,11 +365,6 @@ class Turn:
         #: turn before (voice, :meth:`carry`): a pick re-run by code is a correction (``corrects``) of that run.
         self.skills_done: dict[str, str] = {}
         self.skills_before: dict[str, str] = {}
-        #: one22 (decision D5): the slots each of those runs was given, when it ran and the place it was given
-        #: (key -> (slots, wall time, place)), this turn's and the turn before's: a re-ask of the same skill's slot is
-        #: read against them (:meth:`previous_run`).
-        self.skills_given: dict[str, tuple[dict[str, Any], float, str]] = {}
-        self.skills_given_before: dict[str, tuple[dict[str, Any], float, str]] = {}
         #: one22 (A13, contract C13): the acting steps this turn's calls ran, in order (content-free but for the
         #: controls' own role and name; never typed text), and the turns' before it (review L1: carried across turns
         #: for :data:`STEPS_KEEP_S`, at most :data:`STEPS_KEEP`): "remember how I do this" keeps a way from them
@@ -379,10 +374,6 @@ class Turn:
         #: one22 (A21): the agent's own typing the gate allowed, not marked as Yuki's unsent text until it landed
         #: (:meth:`stage_typed`, :meth:`land_typed`): thread id -> {hwnd: the text to mark}.
         self._staged: dict[int, dict[int, str]] = {}
-        #: One20 (final-D S12): the guessed readings this turn asked about (skill, slot, value folded), and those the
-        #: turn before asked (its answer is in these words: never asked twice).
-        self.guesses_asked: set[tuple[str, str, str]] = set()
-        self.guesses_before: set[tuple[str, str, str]] = set()
         #: Safety timing 4: the user's next turn began (they began speaking again, or their next words opened a turn of
         #: their own: the voice driver sets it): code's tidy step of a late act of this turn is left (never after they
         #: moved on; ``Runner._tidy_by_code``).
@@ -466,8 +457,6 @@ class Turn:
                 fresh = {k: v for k, v in previous.asks.items() if k not in previous._carried_asks}
                 sent = set(previous.sent)
                 done = dict(getattr(previous, "skills_done", {}) or {})
-                given = dict(getattr(previous, "skills_given", {}) or {})
-                guessed = set(getattr(previous, "guesses_asked", set()) or set())
                 # one22 review L1: the steps of the turns before it too (a way shown over several turns), while fresh
                 steps = [*(getattr(previous, "steps_before", []) or []), *(getattr(previous, "steps", []) or [])]
             now = time.time()
@@ -480,12 +469,10 @@ class Turn:
                         self._carried_asks.add(k)
                 self.sent_before |= sent
                 self.skills_before.update(done)
-                self.skills_given_before.update(given)
-                self.guesses_before |= guessed
                 self.steps_before = steps
         return self
 
-    # -- one20: the turn's own windows, chats, skill runs and guesses (the runner's code facts) --------------------
+    # -- one20: the turn's own windows, chats and skill runs (the runner's code facts) ----------------------------
 
     def note_acted(self, hwnds: Any) -> None:
         """Windows this turn's own acts acted in or brought up (ids; anything else is skipped)."""
@@ -501,34 +488,12 @@ class Turn:
             with self._lock:
                 self.chats_opened.add(key)
 
-    def note_skill_done(self, skill: str, value: str = "", given: Mapping[str, Any] | None = None,
-                        at: float | None = None, place: str = "") -> None:
-        """A skill ran verified this turn (``value``: its pick slot's value, as shown; ``""``: none; one22 D5:
-        ``given``, the slots the call gave it, ``at``, when, wall clock, and ``place``, the place it was given)."""
+    def note_skill_done(self, skill: str, value: str = "") -> None:
+        """A skill ran verified this turn (``value``: its pick slot's value, as shown; ``""``: none). (kw2/integ23: the
+        slots it was given, when and where, are no longer kept: nothing reads a re-ask by them.)"""
         if skill:
             with self._lock:
                 self.skills_done[str(skill)] = " ".join(str(value or "").split())
-                if given is not None:
-                    self.skills_given[str(skill)] = (dict(given), float(time.time() if at is None else at),
-                                                     " ".join(str(place or "").split()))
-
-    def previous_run(self, skill: str, *, within_s: float, now: float | None = None) -> dict[str, Any] | None:
-        """One22 (decision D5): the same skill's verified run of this turn or the turn before, within ``within_s`` of
-        ``now`` (wall clock): ``{"value": its pick slot's value as shown ("" none), "given": the slots it was given,
-        "at": when, "place": the place it was given ("" none)}``; ``None``: none (or too long ago)."""
-        now = time.time() if now is None else float(now)
-        with self._lock:
-            if skill in self.skills_given:
-                given, at, place = (*self.skills_given[skill], "")[:3]
-                value = self.skills_done.get(skill, "")
-            elif skill in self.skills_given_before:
-                given, at, place = (*self.skills_given_before[skill], "")[:3]
-                value = self.skills_before.get(skill, "")
-            else:
-                return None
-        if now - at > within_s:
-            return None
-        return {"value": value, "given": dict(given), "at": at, "place": place}
 
     def note_step(self, step: Mapping[str, Any]) -> None:
         """One22 (A13): an acting step this turn's call ran (``Runner._step_record``: content-free but for a control's
@@ -568,15 +533,6 @@ class Turn:
             if skill in self.skills_done:
                 return self.skills_done[skill]
             return self.skills_before.get(skill)
-
-    def guess_asked(self, key: tuple[str, str, str]) -> bool:
-        """Whether this guessed reading was asked about this turn or the turn before (never asked twice)."""
-        with self._lock:
-            return key in self.guesses_asked or key in self.guesses_before
-
-    def note_guess_asked(self, key: tuple[str, str, str]) -> None:
-        with self._lock:
-            self.guesses_asked.add(key)
 
     def closing_hold(self) -> str | None:
         """Contract C9 (one20; final-D S5), narrowed by C12 (tidy21): why a closing reply (a quiet, or words with no

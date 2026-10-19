@@ -450,7 +450,9 @@ class VoiceSession(QObject):
                          daemon=True).start()
 
     def _dismiss_cue(self) -> None:
-        """The user dismissed Yuki on the fast path: the soft end tone now (the user's End tone choice), off the loop."""
+        """The conversation ended with no goodbye (the router's end, or the talker's wordless ``end_conversation``;
+        the word-list fast path is gone, keyword audit A1): the soft end tone now (the user's End tone choice), off the
+        loop."""
         def run() -> None:
             try:
                 on = self.end_tone

@@ -63,6 +63,7 @@ from yuki.agent.memory import (
 from yuki.agent.prompt import profile_text, rules_text, system_blocks
 from yuki.agent.tools import (
     ABOUT_FIELD,
+    AWAITS_FIELD,
     CLAIMS_FIELD,
     STATES_FIELD,
     ALL_TOOL_NAMES,
@@ -220,6 +221,10 @@ NOW_CHARS = 140
 #: appPT (review F7): how alike (difflib's ratio, casefolded, whitespace squashed) a send's text and the user's answer
 #: to a question must be for that answer to count as their go-ahead on the text (a fixed spelling or full stop aside).
 ANSWERED_TEXT_SIMILAR = 0.85
+#: Keyword audit D1 (kw4 review R2, integ23): the referent sources (``frame.Candidate.source``) a send countdown may
+#: offer as another "who" chip: measured places only (their chat in front or recently, a call going on), never a name
+#: found in the user's or Yuki's words (``said_user`` / ``said_yuki``).
+MEASURED_REFERENTS: frozenset[str] = frozenset({"front", "recent", "call"})
 
 
 def _now_line(value: Any) -> str:
@@ -468,6 +473,9 @@ class _Turn:
     #: fix6: what the ``done`` of this response claims, as the brain classes it (``claims``: checked, done, tried,
     #: answer; ``None``: none given).
     done_claims: str | None = None
+    #: Keyword audit B7 / K1 (integ23): the ``done`` of this response marked its message as waiting for their answer
+    #: (its own ``awaits`` field, never a "?" read off the words).
+    done_awaits: bool = False
     #: The user answered a question in this response (``ask_user`` or a risk confirmation).
     asked: bool = False
     #: ``(tool, why)`` of actions this response ran whose own report shows the effect did not happen (revamp D, S2):
@@ -2520,6 +2528,8 @@ class Agent:
                 )
                 if turn.finished:
                     verdict = self._outcome_verdict()
+                    if verdict is not None and turn.done_awaits and not self._finished_by_action:
+                        verdict["awaits"] = True   # K1 (integ23): the done's own mark; absent, the exchange closes
                     if self._finished_by_action:
                         self._done_claims = None   # its line is written by code from the verified report
                     final = self._with_list_left(self._honest_final(turn.finished[0], verdict))
@@ -3557,6 +3567,7 @@ class Agent:
             states = tool_input.get(STATES_FIELD)
             turn.done_states = [s for s in states if isinstance(s, dict)][:8] if isinstance(states, list) else []
             turn.done_claims = finish_gate.claim(tool_input.get(CLAIMS_FIELD))
+            turn.done_awaits = tool_input.get(AWAITS_FIELD) is True
             learned = " ".join(str(tool_input.get("learned") or "").split())
             if learned and hasattr(self, "_learning"):
                 self._learning["note"] = learned
@@ -4779,9 +4790,10 @@ class Agent:
 
     def _pending_send(self, name: str, tool_input: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
         """appPT: what the send countdown shows for a send about to run: who (the person this request's situation check
-        was about, else the task frame's person), where (their route in the target's app, else the app), the exact
-        text (the call's own, else what Yuki typed into that window and has not sent), and the alternatives the
-        resolver had (the frame's other people; the person's other routes). Facts of the request only; never raises."""
+        was about; "from memory" only when that is a frame person by identity, keyword audit D1; none: the window's
+        own title shows the chat), where (their route in the target's app, else the app), the exact text (the call's
+        own, else what Yuki typed into that window and has not sent), and the alternatives (the other people the
+        situation checks named; the person's other routes). Facts of the request only; never raises."""
         hwnd = target.get("hwnd")
         text, typed = self._send_text(name, tool_input, target)
         # review F1: the chat the target window itself shows (its title, as the app writes it, read again now), so a
@@ -4792,12 +4804,14 @@ class Agent:
         try:
             checks = [c for c in getattr(self, "_situation_checks", None) or [] if c.about]
             same = [c for c in checks if hwnd is not None and c.hwnd == hwnd] or checks
-            who = " ".join(str(same[-1].about).split()) if same else ""
+            said = " ".join(str(same[-1].about).split()) if same else ""
+            who = said
             frame = getattr(self, "_frame", None)
-            persons = [p for p in (getattr(frame, "persons", None) or []) if isinstance(p, dict) and p.get("name")]
-            person = next((p for p in persons if who and str(p["name"]).casefold() == who.casefold()), None)
-            if person is None and not who and persons:
-                person = persons[0]
+            # keyword audit D1 (kw4 review R2, integ23): "who" comes only from the model's own situation check, and a
+            # frame person counts only when that check named them, by identity (name, known_as, contact or route id:
+            # frame.persons_named); never the frame's first person, who may be a name found in the request's words
+            named = task_frame.persons_named(frame, [said]) if said else []
+            person = named[0] if named else None
             if person is not None:
                 who = str(person["name"])
             info["who"] = who
@@ -4810,9 +4824,14 @@ class Agent:
                                                      and str(r["label"]) != info["where"]))[:2]
             # each route's own app, so a "where" swap names the app it switches to (review F6)
             info["route_apps"] = {str(r["label"]): _app_display(r.get("app")) or str(r["label"]) for r in routes}
-            others = [str(p["name"]) for p in persons if p is not person]
-            others += [str(getattr(c, "label", "") or "") for c in (getattr(frame, "people", None) or [])]
-            info["who_alts"] = tuple(dict.fromkeys(o for o in others if o and o.casefold() != who.casefold()))[:2]
+            # the other people the model's own situation checks named, then referents by measured place only (their
+            # chat in front or recently, a call going on: MEASURED_REFERENTS); never frame.persons, nor a name found
+            # in their words or Yuki's (said_user / said_yuki)
+            skip = {said.casefold(), who.casefold()}
+            others = [" ".join(str(c.about).split()) for c in checks]
+            others += [str(getattr(c, "label", "") or "") for c in (getattr(frame, "people", None) or [])
+                       if getattr(c, "source", "") in MEASURED_REFERENTS]
+            info["who_alts"] = tuple(dict.fromkeys(o for o in others if o and o.casefold() not in skip))[:2]
         except Exception as exc:  # noqa: BLE001 - the countdown still shows the text and the app
             self.logger.log("send_countdown_info_failed", error=f"{type(exc).__name__}: {exc}")
         return info

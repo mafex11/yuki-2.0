@@ -1057,6 +1057,17 @@ CLAIMS_SCHEMA: dict[str, Any] = {
 TOOLS_BY_NAME["done"]["input_schema"]["properties"][CLAIMS_FIELD] = CLAIMS_SCHEMA
 TOOLS_BY_NAME["done"]["input_schema"]["required"] = ["message", ABOUT_FIELD, ACHIEVED_FIELD, STATES_FIELD,
                                                      CLAIMS_FIELD]
+#: Keyword audit B7 / contract K1 (20 Oct, integ23): the brain's own mark that its done message waits for their answer
+#: (it asks them something or offers something they answer next), carried on the outcome verdict as ``awaits`` so the
+#: voice keeps the exchange open (``VoiceBridge._closes_exchange``). Optional; left out or false: the exchange closes.
+#: The model's judgement of its own message, never a "?" read off it.
+AWAITS_FIELD = "awaits"
+AWAITS_SCHEMA: dict[str, Any] = {
+    "type": "boolean",
+    "description": "True only when your message asks them something or offers something they answer next (\"I can "
+                   "try your liked songs instead\"), so their next words are its answer. Leave out otherwise.",
+}
+TOOLS_BY_NAME["done"]["input_schema"]["properties"][AWAITS_FIELD] = AWAITS_SCHEMA
 
 #: Tools the agent loop runs itself (not the dispatcher, not memory): the helper team.
 AGENT_TOOLS: frozenset[str] = frozenset({"spawn_helpers"})
