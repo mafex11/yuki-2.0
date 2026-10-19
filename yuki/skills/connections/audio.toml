@@ -24,17 +24,18 @@ state_reader = "spotify_route"
 [capability.volume]
 end = "volume_change"
 kind = "change"
-menu = "volume of an app, the PC (system) or Yuki's voice (own_voice)"
+menu = "what plays; or a named app, PC (system), Yuki's voice (own_voice)"
 done_line = "Volume set."
 offer_class = "everyday"
 handoff = true
 serves = [{ end = "volume_change", target = "level" }]
 bind = { target = "app", level = "value", control = "means" }
 
-# Whose volume: the app the user names (its key), else the one app playing (two playing: asked), else the whole PC.
-# A call live and no app named: asked (never the call's own app by guess). The names each option goes by in the user's
-# words, as an app's names are its identity (skill20, final-D P2): an option counts as their word only when their words
-# hold one of its names; given otherwise, it is the caller's reading, and the one app playing (live) fills the slot.
+# Whose volume: the caller's target, given only when the user means an app (its key), the whole PC (system) or Yuki's
+# own voice (own_voice): the menu line says so, so the model leaves it out for a bare "bit louder" (kw3 C3, 20 Oct:
+# the model's reading of intent, never a list of words for "system"; the given target stands). Left out: the one app
+# playing (two playing: asked), else the whole PC. A call live and no app given: asked (never the call's own app by
+# guess).
 [[capability.volume.slot]]
 name = "target"
 type = "app"
@@ -44,11 +45,6 @@ live = "playing"
 ask_in_call = true
 default = "system"
 ask = "Whose volume: an app's or the whole PC's?"
-
-# skill22 (A17): "everything" and "speakers" name the whole PC too ("turn everything down", "louder on the speakers").
-[capability.volume.slot.option_names]
-system = ["system", "PC", "computer", "laptop", "master", "everything", "speakers"]
-own_voice = ["own voice", "your voice", "Yuki's voice"]
 
 [[capability.volume.slot]]
 name = "change"

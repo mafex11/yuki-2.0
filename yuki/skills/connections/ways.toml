@@ -26,7 +26,8 @@ handoff = true
 sends_when = { slot = "send", in = ["send"] }
 
 # Which way: its key or its name as a menu line or the you-card shows it. Left out (or a value the resolver does not
-# keep): the only way, or the one whose app or name the user's words hold (yuki/skills/uia_route.py choose_way).
+# keep): the only way; with several, the route asks which (kw3: never the one whose app or name the words hold;
+# yuki/skills/uia_route.py choose_way).
 [[capability."app.way".slot]]
 name = "way"
 type = "entity"

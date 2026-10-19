@@ -127,8 +127,9 @@ SEEN_MAX = 40
 #: After a request named a playlist no row is called (or Spotify had no usable window and nothing played): for this long
 #: (the exchange's span, fix-plan IF-words) the playlist the hand-off job then puts on, seen playing on this PC by its
 #: finish gate or by a rung's own check of the job's press, is what those words meant, kept through
-#: ``taste.note(said_as=...)`` so the same words play it at rung A next time. At most one watch at a time; nothing
-#: polls. Also how long after a play through such a pairing another row played drops it (:func:`_said_doubt`).
+#: ``taste.note(said_as=...)`` as a hint for the next judgement of the same words (kw3 C9: "last time these words
+#: played X", never a lookup). At most one watch at a time; nothing polls. Also how long after a play through such a
+#: pairing another row played drops it (:func:`_said_doubt`).
 PAIR_WATCH_S = 120.0
 #: Session states with nothing playing: a row the hand-off job's finish gate then sees playing is the job's pick (the
 #: paused playlist resumed included). Any other state with no row read as playing (playing something the read
@@ -1118,18 +1119,20 @@ def _other_device(facts: dict[str, Any], *, volume: bool = False) -> Any:
 #     keep a name), so the menu and the resolver can offer them;
 # (2) a read with no row of that name hands over with ``facts["missing"]`` and the names read (``facts_ram["seen"]``),
 #     so the thinker picks the row from the screen and memory and clicks it by steps;
-# (3) the playlist that hand-off job then puts on is kept as what the words meant (``taste.note(said_as=...)``), so
-#     the same words play it here at rung A next time (:func:`_said_name`). Only that job teaches it: its finish gate
+# (3) the playlist that hand-off job then puts on is kept as what the words meant (``taste.note(said_as=...)``): kw3
+#     (C9, 20 Oct) a hint the next judgement of the same words reads ("last time these words played X",
+#     :func:`_meant_row`), never a lookup that plays it by the words alone. Only that job teaches it: its finish gate
 #     (:func:`_handoff_verdict`), or a rung's own check when the job runs the skill again with the row it picked
 #     (:func:`_pair_request`, :func:`_played`). A play outside the job (the user's own pick after giving up may be
 #     anything) is never kept, and only a row D1 lets keep a name is (review r1 M2, L1);
 # (4) what the user says wins over what was learned: when a row reached through a pairing played and another row plays
 #     within the exchange's span (their correction, whatever its words), the pairing is dropped (``taste.unsay``), so
 #     the words hand over once more and learn again (:func:`_said_doubt`).
-# (5) lSkills (live 17 Oct): words that name no row and no pairing (``anime``, ``something chill``) are judged against
-#     memory's own description of the user's playlists before the hand-off (:func:`_meant_row`: taste.described +
-#     taste.judge, a small model; a mood takes the hour's usual), and a row this rung plays for them is watched like a
-#     hand-off's, so its own check keeps the words as another name of it: learned after one go, by identity next time.
+# (5) lSkills (live 17 Oct): a name no row is called is first resolved by measured name distance to the rows read
+#     (kw3 C9: ``taste.heard_as`` on the caller's own name, "Lumin" -> lumen), then judged against memory's own
+#     description of the user's playlists before the hand-off (:func:`_meant_row`: taste.described + taste.judge, a
+#     small model, with the pairing of (3) as a hint; a mood takes the hour's usual), and a row this rung plays for
+#     them is watched like a hand-off's, so its own check keeps the words as another name of it: a hint next time.
 # No mapping is written here, and nothing polls: the watch is a note in RAM that those checks read.
 
 #: Names already kept as taste by this process, per taste kind (folded; RAM): a read with nothing new writes nothing.
@@ -1159,25 +1162,6 @@ def _taste_kind(call: Any) -> str:
         return str(slot_kind(skill, slot) or "")
     except Exception:  # noqa: BLE001
         return ""
-
-
-def _said_name(call: Any, want: str) -> str | None:
-    """The playlist these exact words were paired with (they named no row, and it then played: :func:`_pair_settle`),
-    when that is another name; None without one or without memory. One bounded memory read."""
-    memory = getattr(call.ctx, "memory", None)
-    kind = _taste_kind(call)
-    if memory is None or not kind or not want:
-        return None
-    from yuki.skills import engine
-
-    def read(client: Any) -> Any:
-        from yuki.skills.taste import said_target
-
-        return said_target(engine._store_of(client), kind, want)
-
-    got = engine._mem(memory, "spotify_said", read, timeout_s=0.3)
-    name = " ".join(str(got or "").split())
-    return name if name and _fold(name) != _fold(want) else None
 
 
 def _feed_seen(call: Any, look: Look) -> None:
@@ -1433,13 +1417,10 @@ def _own(look: Look) -> bool:
 
 
 def _said_from(call: Any, look: Look) -> str | None:
-    """The words of this request that reached ``look``'s row through a pairing (:func:`_pair_settle`), or None. The
-    driver's own paired-row read (``details["said_as"]``: :func:`_look_named`, :func:`link_for`): the name asked is
-    those words. Else, when the row's own name isn't in the user's words, the paired words of that row that are (the
-    resolver's ``taste.find`` already put the row's name in the value: "play my Japanese playlist" arrives as
-    "ネオン"). Identity of the user's own words, never meaning; one bounded memory read, only in that case."""
-    if look.details.get("said_as"):
-        return _playlist_name(call.values) or None
+    """The words of this request that are paired with ``look``'s row (:func:`_pair_settle`), or None: when the row's
+    own name isn't in the user's words (the caller gave the row's name for their words: "play my Japanese playlist"
+    arrives as "ネオン"), the paired words of that row that are. Bookkeeping for :func:`_said_doubt` only (a later
+    correction drops the pairing); it never picks a row. One bounded memory read, only in that case."""
     words = getattr(call.ctx, "words", None)
     memory = getattr(call.ctx, "memory", None)
     kind = _taste_kind(call)
@@ -1526,26 +1507,26 @@ def _ask_two(look: Look) -> Any:
 
 
 def _after_look(call: Any, look: Look, status: str, app_id: str, facts: dict[str, Any]) -> Any:
-    """What a row (or page button) read means, after any press made on it (see :func:`_after_row`). A row reached
-    through a pairing (``details["said_as"]``) carries its own name for the checks (``facts_ram["row"]``); any other row
-    is checked by the name asked, which also finds the row a two-rows answer names (review r1 M1: that row's bare name
-    fits both rows). A row that plays (pressed, resumed, or already playing) tells the watch (:func:`_pair_request`: a
-    same-exchange press carries the watch's generation in ``facts_ram["pair"]`` for the rung's own check to settle on,
-    :func:`_played`) and the pairing doubt (:func:`_said_doubt`); one reached through a pairing is remembered
-    (:func:`_said_note`). Rows read with none of that name hand over with what was seen (:func:`_missing`)."""
+    """What a row (or page button) read means, after any press made on it (see :func:`_after_row`). A row reached by
+    what the words mean (``details["meant"]``: :func:`_look_named`) carries its own name for the checks
+    (``facts_ram["row"]``); any other row is checked by the name asked, which also finds the row a two-rows answer
+    names (review r1 M1: that row's bare name fits both rows). A row that plays (pressed, resumed, or already
+    playing) tells the watch (:func:`_pair_request`: a same-exchange press carries the watch's generation in
+    ``facts_ram["pair"]`` for the rung's own check to settle on, :func:`_played`) and the pairing doubt
+    (:func:`_said_doubt`); one whose words this request paired with it is remembered (:func:`_said_note`). Rows read
+    with none of that name hand over with what was seen (:func:`_missing`)."""
     got = _after_row(call, look, status, app_id, facts)
     if look.status != "ok" or (got.ran is False and not got.already):
         return got
-    if look.details.get("said_as"):
-        got.facts_ram["row"] = look.name      # the driver's own paired-row read: the value is still the words
     meant = str(look.details.get("meant") or "")
     if meant:
-        # lSkills: the row memory related the words to (_meant_row): checked by its own name, the value still the
-        # words; a play this rung made is watched like a hand-off's, so once its check sees it play the words are kept
-        # as another name of it (taste.note said_as: the next "anime playlist" plays it by identity, no judgement).
-        # A mood is never kept: the hour decides it each time
+        # lSkills: the row the caller's name was resolved to (by measured name distance, or by what memory relates
+        # the words to: _meant_row): checked by its own name, the value still the words; a play this rung made is
+        # watched like a hand-off's, so once its check sees it play the words are kept as another name of it
+        # (taste.note said_as: kw3 C9, a hint the next judgement of "anime playlist" reads, never a lookup). A mood is
+        # never kept: the hour decides it each time
         got.facts_ram["row"] = look.name
-        got.facts["how"] = str(look.details.get("meant_why") or "")    # name / called / content / mood
+        got.facts["how"] = str(look.details.get("meant_why") or "")    # heard / name / called / content / mood
         learns = _learns(call)
         if learns is None:
             return got
@@ -1771,22 +1752,27 @@ def _press_taken(facts: Mapping[str, Any], ram: Mapping[str, Any] | None) -> str
 
 
 def _look_named(call: Any, hwnd: int, want: str, *, learned: Mapping[str, str] | None, press: bool = False) -> Look:
-    """:func:`_look` for the name asked; when no row has it (``not_in_view``), once more for the row these exact
-    words were paired with (:func:`_said_name`: they named no row before and that playlist then played), marked
-    ``details["said_as"]``; with no pairing, once more for the row memory relates the words to (:func:`_meant_row`,
-    lSkills: "anime playlist" -> ネオン; "something chill" -> the hour's usual), marked ``details["meant"]`` (the words)
-    and ``details["meant_why"]`` (a code word). The first read is kept when that row isn't in view either (its names
-    go to the hand-off). A press happens only on the read that found its row (decide and press on one read)."""
+    """:func:`_look` for the name asked; when no row has it (``not_in_view``), kw3 (C9, 20 Oct): once more for the one
+    row read whose name the name asked measures as (:func:`yuki.skills.taste.heard_as`, its closed-set tier: the
+    caller's own name resolved by sound and spelling distance to the user's playlists, "Lumin" -> lumen; ``meant_why``
+    ``heard``), else for the row memory relates the words to (:func:`_meant_row`, lSkills: "anime playlist" ->
+    ネオン; "something chill" -> the hour's usual; the words' last pairing rides as a hint, never as a lookup), each
+    marked ``details["meant"]`` (the words) and ``details["meant_why"]`` (a code word). The first read is kept when
+    that row isn't in view either (its names go to the hand-off). A press happens only on the read that found its row
+    (decide and press on one read)."""
     look = _look(DESK, hwnd, want, learned=learned, press=press)
     if look.status != "not_in_view":
         return look
-    other = _said_name(call, want)
-    if other:
-        again = _look(DESK, hwnd, other, learned=learned, press=press)
+    from yuki.skills import taste
+
+    near = taste.heard_as([n for n in look.names if n], want, loose=True)
+    if near:
+        again = _look(DESK, hwnd, near, learned=learned, press=press)
         if again.status in ("ok", "ambiguous", "no_wording"):
-            again.details["said_as"] = True
+            again.details["meant"] = want
+            again.details["meant_why"] = "heard"
+            _logger(call)("spotify_meaning", why="heard", items=len(look.names), picked=True)
             return again
-        return look
     meant = _meant_row(call, want, look.names)
     if meant is None:
         return look
@@ -1807,7 +1793,9 @@ MEANING_MIN_LEFT_S = 1.2
 def _meant_row(call: Any, want: str, seen: Any = ()) -> tuple[str, str] | None:
     """lSkills (live 17 Oct: "anime playlist" asked which playlist although "Japanese" was paired with ネオン a minute
     before; "something chill" took 15-29 s through the thinker): the playlist the words ``want`` mean when no row is
-    called that and no pairing holds them, ``(name, why)``, else None.
+    called that, ``(name, why)``, else None. kw3 (C9): the row these same words played last time
+    (:func:`yuki.skills.taste.said_target`, read in the same memory call) is described too and handed to the judgement
+    as a hint ("last time"), never played by the words alone: a newer playlist may fit them better.
 
     Memory describes the user's own playlists (:func:`yuki.skills.taste.described`: what they called each before, when
     they play it, how much, what played while it ran), with the rows this read saw (``seen``), and a small model judges
@@ -1827,14 +1815,23 @@ def _meant_row(call: Any, want: str, seen: Any = ()) -> tuple[str, str] | None:
     from yuki.skills import engine, taste
 
     names = [str(n) for n in (seen or ()) if n][:SEEN_MAX]
-    items = engine._mem(memory, "spotify_meaning_data",
-                        lambda c: taste.described(engine._store_of(c), kind, names=names), timeout_s=0.5)
+
+    def read(client: Any) -> tuple[list[dict[str, Any]], str]:
+        store = engine._store_of(client)
+        last = " ".join(str(taste.said_target(store, kind, want) or "").split())
+        items = list(taste.described(store, kind, names=[last, *names] if last else names) or [])
+        if last and not any(_fold(i.get("name")) == _fold(last) for i in items):
+            items.append({"name": last})    # the hinted row is always one the judgement may answer
+        return items, last
+
+    got = engine._mem(memory, "spotify_meaning_data", read, timeout_s=0.5)
+    items, hint = got if isinstance(got, tuple) and len(got) == 2 else ([], "")
     log = _logger(call)
     if not items:
         log("spotify_meaning", why="no_data", items=0)
         return None
     meant = taste.judge(want, getattr(call.ctx, "words", None) or [want], list(items), kind=kind,
-                        wait_s=min(taste.MEANING_WAIT_S, max(1.0, left - 1.0)))
+                        wait_s=min(taste.MEANING_WAIT_S, max(1.0, left - 1.0)), hint=hint or None)
     if meant.name and meant.why in ("name", "called", "content"):
         log("spotify_meaning", why=meant.why, ms=meant.ms, items=len(items), picked=True)
         return meant.name, meant.why
@@ -1849,12 +1846,11 @@ def _meant_row(call: Any, want: str, seen: Any = ()) -> tuple[str, str] | None:
 
 
 def _check_name(look: Look, want: str) -> str:
-    """The name a row is read again by (the flip wait, the restore): the paired row's own name when the read reached it
-    through a pairing (``details["said_as"]``), else the name asked. The name asked, not the row's bare name, so the
-    row a two-rows answer names ("Lantern Rain by Odile Fenn") stays the one row it fits (review r1 M1); names are
-    matched with case and spacing folded, so Spotify's spelling needs nothing. lSkills: a row reached by what the
-    words mean (``details["meant"]``) is read again by its own name too."""
-    return look.name if (look.details.get("said_as") or look.details.get("meant")) and look.name else want
+    """The name a row is read again by (the flip wait, the restore): the row's own name when the read reached it by
+    what the words mean (``details["meant"]``: a measured name or the judgement), else the name asked. The name asked,
+    not the row's bare name, so the row a two-rows answer names ("Lantern Rain by Odile Fenn") stays the one row it
+    fits (review r1 M1); names are matched with case and spacing folded, so Spotify's spelling needs nothing."""
+    return look.name if look.details.get("meant") and look.name else want
 
 
 #: Reads that saw no row at all (nothing to say "missing" about): a watch may still learn what the words meant.
@@ -1869,10 +1865,10 @@ NEVER_READ = ("not_built", "timeout", "error")
 
 
 def play_library(call: Any) -> Any:
-    """Rung A, no focus: the row of DataGrid "Your Library" named as asked (or the row these words were paired with);
-    its "Play {name}" button by Invoke. Not while Spotify plays on another device; a cold window is warmed within the
-    request's time. The rows read are kept as the user's own names (:func:`_feed_seen`); none with that name hands
-    over with them (:func:`_missing`)."""
+    """Rung A, no focus: the row of DataGrid "Your Library" named as asked (or the row that name measures as, or that
+    the words are judged to mean: :func:`_look_named`); its "Play {name}" button by Invoke. Not while Spotify plays
+    on another device; a cold window is warmed within the request's time. The rows read are kept as the user's own
+    names (:func:`_feed_seen`); none with that name hands over with them (:func:`_missing`)."""
     want = _playlist_name(call.values)
     if not want:
         return _rr(ran=False, outcome="no_name")
@@ -1952,7 +1948,7 @@ def play_restored(call: Any) -> Any:
         return _ask_two(first)
     if first.status == "ok" and first.state == "pause":
         return _after_look(call, first, status, app_id, facts)
-    # the row these words were paired with when the minimised window's read found that one, else the name asked (which
+    # the row the words were resolved to when the minimised window's read found that one, else the name asked (which
     # also finds the row a two-rows answer names: review r1 M1)
     name = _check_name(first, want) if first.status == "ok" else want
     prev = DESK.foreground()
@@ -1966,8 +1962,6 @@ def play_restored(call: Any) -> Any:
         if not _ensure_warm(DESK, win, call, facts, force=True):
             return _rr(ran=False, outcome=_cold(facts), facts=facts)
         look = _look_named(call, win.hwnd, name, learned=learned, press=True)
-        if first.details.get("said_as"):
-            look.details["said_as"] = True
         if first.details.get("meant"):
             look.details["meant"] = first.details["meant"]
             look.details["meant_why"] = first.details.get("meant_why")
@@ -1983,7 +1977,8 @@ def play_restored(call: Any) -> Any:
 def link_for(call: Any, want: str) -> tuple[str | None, str]:
     """The learned ``spotify:playlist:{id}`` for this name and Spotify's own spelling of the name: the slot's taste
     link when it has one, else the links the memory side learned from links Spotify showed (identity of names).
-    ``(None, want)`` when none (or two different links for one name: never a guess)."""
+    ``(None, want)`` when none (or two different links for one name: never a guess). kw3 (C9): never the link of a row
+    the words were once paired with (that pairing is a hint for the judgement only)."""
     sd = _sd()
     value = call.values.get("playlist")
     if isinstance(value, Mapping) and sd.playlist_uri_ok(value.get("ref")):
@@ -2002,10 +1997,6 @@ def link_for(call: Any, want: str) -> tuple[str | None, str]:
         return None, name
 
     uri, name = hit(want)
-    if uri is None and links:
-        other = _said_name(call, want)      # the playlist these words were paired with (a result seen before)
-        if other:
-            uri, name = hit(other)
     return (uri, name) if uri else (None, want)
 
 
@@ -2066,8 +2057,6 @@ def play_link(call: Any) -> Any:
     _log_read(call, "link", "front", facts, look)
     if look.status not in ("ok", "ambiguous"):
         return _rr(ran=False, outcome="page_" + look.status, facts=facts)
-    if _fold(name) != _fold(want):
-        look.details["said_as"] = True      # the link of the playlist these words were paired with
     status, app_id = DESK.spotify_status(win.pid)
     return _after_look(call, look, status, app_id, facts)
 

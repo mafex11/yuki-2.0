@@ -12,9 +12,10 @@
 # 2), Yuki plays its own pick from their taste (yuki/skills/taste.py choose, through yuki/skills/engine.py), names it
 # and why, and "another one" takes the next. Never with a game in front or in a call (said so instead).
 #
-# The browser is a means, with no ranked rule shipped (design §5, critique M8): the one the user named (anywhere in
-# the request's exchange: it beats every other rule), else their usual (preference web.open_page:browser@<site>, or the
-# learned skill's fill policy), else the browser they use most, else Windows' default handler. "A browser" is measured,
+# The browser is a means, with no ranked rule shipped (design §5, critique M8): the browser the caller gave (the
+# model's reading of the whole exchange; kw3, 20 Oct: a browser name found in the turns never overrides it and is never
+# asked about), else their usual (preference web.open_page:browser@<site>, or the learned skill's fill policy), else the
+# browser they use most, else Windows' default handler. "A browser" is measured,
 # never a list: a program whose timeline rows carried pages of at least 3 hosts (yuki/skills/web_route.py). Never with
 # a game in front ("after the round?").
 #

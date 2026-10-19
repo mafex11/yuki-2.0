@@ -30,22 +30,23 @@ said: identity of names, never meaning). Then:
 **web.open_page / web.open_video** (:func:`route_open_page`, :func:`route_open_video`). The address comes from the
 site files (``yuki/connect/sites/*.toml``: a site's front page, or a page kind's template with the item's value) or,
 for a host-scope page, is the registrable domain's front page. The browser (:func:`choose_browser`; design §5, critique
-M8: no ranked rule is shipped ahead of the user's own): the one the user named (it stands in their words); else the
-slot's value the resolver filled (their usual, from preferences); else the fill policy a learned skill carries
-(``means_policy`` in its route arguments: :data:`BROWSER_POLICIES`, chosen nightly by the learner on that skill's own
-occasions); else the browser they use most; else Windows' default handler. "A browser" is measured, never a list: a
+M8: no ranked rule is shipped ahead of the user's own): the slot's value the caller gave (the model's own reading of
+the request); else the one the resolver filled (their usual, from preferences); else the fill policy a learned skill
+carries (``means_policy`` in its route arguments: :data:`BROWSER_POLICIES`, chosen nightly by the learner on that
+skill's own occasions); else the browser they use most; else Windows' default handler. "A browser" is measured, never a list: a
 program whose own timeline rows (not Yuki's) of the last 14 days showed pages of at least 3 hosts, or a page of the
 site itself (a chat app that draws its one site in its own window shows one or two). The address is a launch argument
 (``launch.open_url``: nothing typed). A page opens and nothing else: nothing plays until the user picks. A picked video
 (theirs, or Yuki's pick when they asked it to choose: ``yuki.skills.taste.choose``) opens its own link and is checked by
-the page in front showing that video and the browser's media session playing. A
-browser the user didn't name is named in the done line, so one word corrects it.
+the page in front showing that video and the browser's media session playing. A browser nobody chose for the run is
+named in the done line, so one word corrects it.
 
 x8WebArc (10 Oct: "open YouTube in Arc" opened nothing new in Arc five times, and once "verified" an old tab):
 
-* **A browser named anywhere in the exchange wins** (:func:`choose_browser`): their words are the request's whole
-  exchange, and a measured browser whose name stands in them beats their usual and any learned fill policy. Two
-  different browsers named and the slot naming neither: Yuki asks which, never guesses.
+* kw3 (C1, 20 Oct; supersedes x8WebArc's "a browser named anywhere in the exchange wins"): **the caller's browser
+  stands** (:func:`choose_browser`). The model reads the whole exchange and gives the browser it means; a browser name
+  found in the turns never overrides it and is never asked about ("Chrome keeps crashing, open YouTube" is no request
+  for Chrome).
 * **The ladder is protocol, then the address bar, then the hand-off.** Rung A hands the address over as a launch
   argument (``launch.open_url``: a packaged browser by protocol activation, how a running browser takes a link), within
   the request's deadline. A browser that kept the page it had (``page_unchanged``), or one whose protocol activation
@@ -123,8 +124,6 @@ LINE_CHAT_WEB = "Your chat with {name} is open in {browser}."
 LINE_PAGE_ALREADY = "{site} is already up."
 LINE_VIDEO_ALREADY = "It's already playing."
 LINE_CHAT_WEB_ALREADY = "Your chat with {name} is already open in {browser}."
-#: x8WebArc: two different browsers named in the exchange and the slot naming neither (``{choices}``: "Arc or Chrome").
-ASK_BROWSER = "Which browser, {choices}?"
 ORDINALS = ("the first", "the second", "the third", "the fourth")
 #: The candidates tried in identity order when one won't select (D8: each checked, the next one after a miss).
 TAB_TRIES = 2
@@ -744,8 +743,8 @@ def route_site_tab(call: RouteCall) -> RouteResult:
 
 def route_told_link(call: RouteCall) -> RouteResult:
     """browser.site_tab's second rung A: no tab of the site open and a link the user told once -> that link opened in
-    the means browser (the slot's value: said, or the user's usual; else the browser memory saw the site's tab in;
-    else :func:`choose_browser`'s fill), as a launch argument (nothing typed)."""
+    the means browser (the slot's value: the caller's, or the user's usual; else the browser memory saw the site's tab
+    in; else :func:`choose_browser`'s fill), as a launch argument (nothing typed)."""
     link = str(call.values.get("link") or "").strip()
     if "://" not in link or " " in link:
         return RouteResult(ran=False, outcome="no_link")
@@ -754,25 +753,12 @@ def route_told_link(call: RouteCall) -> RouteResult:
     service = service_of(store, said) if store is not None else said
     ident = _identities(store, service) if store is not None and service else {}
     key = _app_key(call.values.get("browser")) or _app_key(ident.get("process"))
-    measured = measured_browsers(store) if store is not None else []
-    said_key, choices, suspect = _said_browser(call, store, measured)
-    if choices:
-        return _ask_browser(choices)
-    if said_key:
-        # x8WebArc: a browser named in the exchange beats the slot's usual and memory's sighting
-        key = said_key
-        name, source = _browser_title(key), "words"
-    elif key:
+    if key:
+        # kw3 (C1): the slot's value (the caller's, or their usual) stands, else memory's sighting of the site's tab;
+        # a browser name found in the turns decides nothing
         name, source = _browser_title(key), "slot" if call.values.get("browser") else "identity"
-        # review r2 H1: the one browser their words name is one Yuki just acted in: the usual or memory's sighting
-        # doesn't decide it either (asked)
-        ask = _suspect_ask(key, source, suspect, measured)
-        if ask:
-            return _ask_browser(ask)
     else:
         name, key, source = choose_browser(call)
-        if source == "ask":
-            return _ask_browser(name)
     if kind := _refused("open_url"):
         return RouteResult(ran=False, held=kind, outcome="refused")
     if source == "default" and not key:
@@ -1052,10 +1038,11 @@ def band_browser(store: Any, keys: Sequence[str], *, now: float | None = None, h
 def browser_rule(*, named: str | None, said: bool, front: str | None, recent: str | None, pref: str | None,
                  measured: Sequence[Mapping[str, Any]], site_first: bool = False, policy: str = "most",
                  band: str | None = None) -> tuple[str, str]:
-    """``(browser app key, where it came from)`` (design §5): ``words`` (named and in their words) > ``pref`` (the
-    slot's value the resolver filled: their usual) > the fill ``policy`` (:data:`BROWSER_POLICIES`; a learned skill's,
-    else ``most``): ``front`` / ``recent`` for ``front_or_recent``, ``band``, ``site`` (the browser the site was last
-    shown in) > ``most`` (the browser they use most) > ``default`` (``""``: Windows' handler). Pure: a replay on a
+    """``(browser app key, where it came from)`` (design §5): ``words`` (``named`` and ``said``: kw3, the slot's value
+    the caller gave, :func:`choose_browser`) > ``pref`` (the slot's value the resolver filled: their usual) > the fill
+    ``policy`` (:data:`BROWSER_POLICIES`; a learned skill's, else ``most``): ``front`` / ``recent`` for
+    ``front_or_recent``, ``band``, ``site`` (the browser the site was last shown in) > ``most`` (the browser they use
+    most) > ``default`` (``""``: Windows' handler). Pure: a replay on a
     database copy runs it too (``scripts/browser_rule_replay.py``; ``site_first`` is that script's old knob, kept as
     an alias of the ``site`` policy).
 
@@ -1129,35 +1116,6 @@ def _policy(call: RouteCall, slot: str = "browser", default: str = "most") -> st
     return got if got in BROWSER_POLICIES else default
 
 
-def _browser_names(m: Mapping[str, Any]) -> set[str]:
-    """The names one measured browser goes by: its display name as Windows shows it, its app key as people say it
-    ("Arc", "Chrome"), and each word of the display name that its app key holds (review r2 L4: "Microsoft Edge" with
-    the key ``msedge`` is also "Edge"; "Google Chrome" with ``chrome``, "Chrome"). Data only (the name and the key)."""
-    key = str(m.get("key") or "")
-    display = str(m.get("name") or "")
-    names = {display, _browser_title(key)}
-    folded = key.casefold()
-    for word in display.split():
-        w = "".join(ch for ch in word if ch.isalnum())
-        if len(w) >= 3 and w.casefold() in folded:
-            names.add(w)
-    return {n for n in names if n}
-
-
-def browsers_said(measured: Sequence[Mapping[str, Any]], words: Sequence[str]) -> list[str]:
-    """The app keys of the measured browsers whose name stands, whole words in order, in the user's ``words``
-    (:func:`_browser_names`): identity of names, never meaning. In the order measured, each once."""
-    from yuki.skills.uia_route import said as is_said
-
-    sources = [str(w) for w in words if w]
-    out: list[str] = []
-    for m in measured:
-        key = str(m.get("key") or "")
-        if key and key not in out and any(is_said(n, sources) for n in _browser_names(m)):
-            out.append(key)
-    return out
-
-
 def _skill_family(call: RouteCall) -> tuple[str, ...]:
     """The keys whose runs count as "this skill's" in the ledger: the skill's own, its capability's and the learned
     skills of that capability the catalog holds (Item 6's ``family``: a volume change on Arc's sound doesn't count
@@ -1199,13 +1157,12 @@ def _request_began(call: RouteCall, store: Any, now: float, keys: Sequence[str])
 
 def _just_acted(call: RouteCall, store: Any) -> set[str]:
     """Review r2 H1: the app keys of the programs Yuki itself acted in within :data:`JUST_ACTED_S` before this request
-    began (:func:`_request_began`): the same data and window as Item 6's ``resolve.just_acted`` (the timeline's
-    stretches begun while Yuki acted, ``by_yuki``, and the apps the ledger says runs of this skill's family drove,
-    ``skill_runs.app``), called through it when it is there. A turn that names one of them may be the user talking
-    about what Yuki just did ("Dude, you open YouTube and Chrome again."), so that name decides nothing here: never
-    the meaning of the words, only what Yuki did. Left out: a browser the user named for one of those runs (the
-    ledger's ``filled`` says ``words`` for its browser), since Yuki acted there on their word. Never raises (an
-    empty set)."""
+    began (:func:`_request_began`): the same data and window as ``resolve.just_acted`` (the timeline's stretches begun
+    while Yuki acted, ``by_yuki``, and the apps the ledger says runs of this skill's family drove, ``skill_runs.app``),
+    called through it when it is there. kw3 (C1): read only by the ``front_or_recent`` fill policy (a browser Yuki
+    brought to the front is no sign of the user's own browsing; :func:`choose_browser`), never against the words.
+    Left out: a browser the user's own value chose for one of those runs (the ledger's ``filled`` says ``words`` for
+    its browser), since Yuki acted there on their word. Never raises (an empty set)."""
     if store is None:
         return set()
     skills = _skill_family(call)
@@ -1257,172 +1214,68 @@ def _just_acted(call: RouteCall, store: Any) -> set[str]:
     return acted - asked
 
 
-def _said_browser(call: RouteCall, store: Any, measured: Sequence[Mapping[str, Any]] | None = None,
-                  acted: Callable[[], set[str]] | None = None) -> tuple[str, str, tuple[str, ...]]:
-    """``(app key, "", ())`` of the browser the user named (the slot's value when it stands in their words, else the
-    one measured browser whose name does); ``("", "Arc or Chrome", ())`` when two different ones are named and the
-    slot names neither (or is only their usual); ``("", "", ())`` when none is. ``measured``:
-    :func:`measured_browsers` already read (else read here); ``acted``: :func:`_just_acted`'s reader (else read here;
-    read only when the words name a browser).
-
-    Review r2 H1: when the one browser the words name is one Yuki itself just acted in, and the slot doesn't hold it
-    from their words, it decides nothing (Item 6's guard: the turn may name it to complain, "Dude, you open YouTube
-    and Chrome again."), nor does the slot's usual or a fill: ``("", "", (that browser,))``, the third part the
-    browsers named that way, and the caller asks (:func:`_suspect_ask`). A slot value is never swapped for it, and a
-    slot value the resolver took from the words (``_slot_source`` ``words``: the talker read "open it in ARC" there)
-    stands as it is. Two browsers named are never told apart by which one Yuki acted in: that record is partial (10
-    Oct 21:05:05, "open YouTube in arc not in Chrome": the timeline held Yuki's act in Arc, not its YouTube in Chrome,
-    which opened behind), so leaving the acted one out would have picked Chrome; they are asked, as before."""
-    words = [str(w) for w in call.ctx.words if w]
-    named = call.values.get("browser")
-    if measured is None:
-        measured = measured_browsers(store) if store is not None else []
-    hits = browsers_said(measured, words)
-    from yuki.skills.uia_route import said as is_said
-
-    named_said = bool(named) and is_said(str(named), words)
-    if not hits and not named_said:
-        return "", "", ()
-
-    def done_by_yuki() -> set[str]:
-        return acted() if acted is not None else _just_acted(call, store)
-
-    if named_said:
-        key = _app_key(named)
-        others = [k for k in hits if k != key]
-        if not others:
-            # their words name only this one: it stands, unless Yuki just acted in it and the value is only their
-            # usual (then it decides nothing)
-            if key in done_by_yuki() and _slot_source(call, "browser") != "words":
-                return "", "", (key,)
-            return key, "", ()
-        # the words name others too: the talker gave it from their words (it resolved "Arc, not Chrome"), it stands;
-        # the value is only their usual, asked, never assumed
-        if _slot_source(call, "browser") in ("words", ""):
-            return key, "", ()
-        return "", " or ".join(_browser_title(k) for k in ([key] + others)[:3]), ()
-    if len(hits) > 1:
-        return "", " or ".join(_browser_title(k) for k in hits[:3]), ()
-    if hits[0] in done_by_yuki():
-        return "", "", (hits[0],)
-    return hits[0], "", ()
+#: kw3 (C1): the resolver's fill sources (``RouteCall.fill_sources``, ``Plan.filled``) that mean the browser slot's
+#: value is a fill (the user's usual, a learned skill's bound value, ...), not a value the caller gave: such a value is
+#: the usual (``pref``); any other source is the caller's own value (``words`` when it stood in the user's words,
+#: ``given`` otherwise: its reading, named by the resolver's done line as a guess).
+FILL_SOURCES: tuple[str, ...] = ("again", "told", "live", "pref", "taste", "default")
 
 
-def _suspect_ask(key: str, source: str, suspect: Sequence[str], measured: Sequence[Mapping[str, Any]]) -> str:
-    """Review r2 H1: the choices to ask (``"Chrome or Arc"``) when the one browser the user's words name is one Yuki
-    itself just acted in (:func:`_said_browser`'s third part) and the browser picked (``key``) wasn't taken from
-    their words (their usual, a fill policy, memory's sighting). Such a turn may be a complaint about what Yuki did
-    ("Dude, you open YouTube and Chrome again.") or a request for that browser ("put something on YouTube and ARC
-    browser." with Arc just used): the words alone can't tell which, so any fill is a guess either way. On the 10 Oct
-    copy both "most used" and the learned skill's ``site`` policy gave Chrome for the first, and ``site`` gave Chrome
-    for the second at 21:10:30. Never that browser by guess, never another one by guess: asked, the named one and the
-    pick (else the user's next browser) as the choices. ``""`` when there's nothing to ask (the words decided, or no
-    other browser is measured)."""
-    if not suspect or source in ("words", "words_again", "ask"):
+def _browser_given(call: RouteCall) -> str:
+    """kw3 (C1): where the browser slot's value came from when the caller gave it (``words`` / ``given``), else ``""``
+    (a fill, or no source known: an older caller). Code words only."""
+    sources = getattr(call, "fill_sources", None)
+    src = str(sources.get("browser") or "") if isinstance(sources, Mapping) else ""
+    if not src or src in FILL_SOURCES:
         return ""
-    first = str(suspect[0])
-    other = key if key and key not in suspect else next(
-        (str(m["key"]) for m in measured if m.get("key") and str(m["key"]) not in suspect), "")
-    return f"{_browser_title(first)} or {_browser_title(other)}" if other else ""
-
-
-def _slot_source(call: RouteCall, slot: str) -> str:
-    """Where the resolver took ``slot``'s value from for this run (``words``: the caller gave it and it stands in
-    their words; ``pref``, ``taste``, ``default``, ``again``...): the run's own ledger row, which the engine wrote before
-    the first rung (``skill_runs.filled``, code words only). ``""`` when it can't be read (no memory)."""
-    memory = getattr(call.ctx, "memory", None)
-    if memory is None:
-        return ""
-    from yuki.skills.engine import _mem, _store_of
-
-    rid = getattr(call.ctx, "request_id", None)
-    keys = tuple(dict.fromkeys(k for k in (call.skill.key, getattr(call.skill, "capability", "")) if k))
-
-    def go(client: Any) -> str:
-        rows = _store_of(client)._query(
-            f"SELECT filled FROM skill_runs WHERE skill IN ({','.join('?' * len(keys))}) AND outcome = 'running' "
-            "AND t0 >= ?" + (" AND request_id = ?" if rid else "") + " ORDER BY t0 DESC LIMIT 1",
-            (*keys, time.time() - 120.0, *((rid,) if rid else ())))
-        if not rows or not rows[0][0]:
-            return ""
-        import json
-
-        got = json.loads(rows[0][0])
-        return str(got.get(slot) or "") if isinstance(got, dict) else ""
-
-    try:
-        return str(_mem(memory, "skill_slot_source", go, timeout_s=0.5) or "")
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-def _ask_browser(choices: str) -> RouteResult:
-    """Two browsers named and none picked: asked, never guessed (the engine's settled "asked" path)."""
-    return RouteResult(ran=False, ask=ASK_BROWSER.format(choices=choices), options=choices.split(" or "),
-                       outcome="ask_browser")
+    return "words" if src == "words" else "given"
 
 
 def choose_browser(call: RouteCall, *, hosts: Sequence[str] = (), policy: str | None = None) -> tuple[str, str, str]:
     """``(name to launch it by, app key, where it came from)`` for a browser route (see :func:`browser_rule`).
     ``hosts``: the site's own hosts (a program that showed it counts as a browser; the ``site`` policy).
 
-    x8WebArc: what the user said wins. The slot's value stands when it is in their words (the request's whole exchange,
-    ``ctx.words``); otherwise a measured browser whose name is in those words beats their usual and any learned fill
-    policy (10 Oct: the learned "Open YouTube home" was called with no browser while "in Arc" stood two turns back).
-    Two different browsers named there and the slot naming neither (``"open it in Arc, not Chrome"``): ``source`` is
-    ``"ask"`` and ``name`` the choices (``"Arc or Chrome"``), for :func:`_ask_browser`: never a guess.
+    kw3 (C1, 20 Oct: the user's direction, intent over words): the browser slot's value stands. A value the caller
+    gave (the model's own reading of the request; :func:`_browser_given`) is ``words`` (or ``given`` when the user's
+    words don't hold it), resolved to a measured browser's own name when it is one (a name the model chose, resolved by
+    data), else launched by its own name as before; a value the resolver filled is the user's usual (``pref``). With
+    none: the fill policy (:data:`BROWSER_POLICIES`), then the browser used most, then Windows' default handler. A
+    browser name found anywhere in the turns never overrides the value and is never asked about ("Chrome keeps
+    crashing, open YouTube" is no request for Chrome).
 
-    Review r2 H1: a browser Yuki itself just acted in (:func:`_just_acted`) decides nothing by being the one browser
-    named (:func:`_said_browser`), nor by being in front for the ``front_or_recent`` policy (Yuki brought it there;
-    the user's own last browser, ``recent``, still counts); then no fill decides either, it asks
-    (:func:`_suspect_ask`). A browser said that Yuki also just acted in, kept because the resolver took it from the
-    words, is ``source`` ``words_again``: the done line names it (:func:`_browser_line`)."""
+    Review r2 H1: a browser Yuki itself just acted in (:func:`_just_acted`) decides nothing by being in front for the
+    ``front_or_recent`` policy (Yuki brought it there; the user's own last browser, ``recent``, still counts)."""
     named = call.values.get("browser")
     named = str(named) if named else None
     store = _store(call.ctx)
     measured = measured_browsers(store, site_hosts=list(hosts)) if store is not None else []
     keys = [m["key"] for m in measured]
-    seen: list[set[str]] = []
-
-    def acted() -> set[str]:
-        if not seen:
-            seen.append(_just_acted(call, store))
-        return seen[0]
-
-    said_key, choices, suspect = _said_browser(call, store, measured, acted)
-    if choices:
-        return choices, "", "ask"
-    said = bool(said_key)
-    if said:
-        named = said_key
+    given = _browser_given(call) if named else ""
     policy = policy or _policy(call)
     front = recent = band = None
     if store is not None and not named and policy == "front_or_recent":
         _hwnd, image = _front()
         front = _app_key(image) or None
-        if front and front in acted():
+        if front and front in _just_acted(call, store):
             front = None
         recent = last_in_front(store, keys)
     if store is not None and not named and policy == "band":
         band = band_browser(store, fresh_keys(measured) or keys)     # lSkills: among the browsers still in use
-    key, source = browser_rule(named=named, said=said, front=front, recent=recent,
-                               pref=named if not said else None, measured=measured, policy=policy, band=band)
-    ask = _suspect_ask(key, source, suspect, measured)
-    if ask:
-        return ask, "", "ask"
-    if source == "words" and key in acted():
-        source = "words_again"
+    key, source = browser_rule(named=named, said=bool(given), front=front, recent=recent,
+                               pref=named if not given else None, measured=measured, policy=policy, band=band)
+    if source == "words":
+        source = given
     name = next((m["name"] for m in measured if m["key"] == key), "") or _browser_title(key) or key
     return name, key, source
 
 
 def _browser_line(base: str, name: str, source: str) -> str:
-    """The done line: the browser named when the user didn't name it (one word corrects it), and when they named one
-    Yuki had just acted in (``words_again``, review r2 H1: after "you opened it in Chrome. I asked for Arc", the line
-    says which browser it is now). A slot value the resolver filled (``pref``) is named by the resolver's own done
-    line when it was a guess (its slot's ``say``; a confirmed usual is not), so it isn't named here a second time
-    (review r2 sim: "Youtube is up in Google Chrome in chrome.")."""
-    if source in ("words", "default", "pref") or not name:
+    """The done line: the browser named when nobody chose it for this run (a fill policy, the one used most: one word
+    corrects it). A value the caller gave (``words``, or ``given``: its reading, which the resolver's own done line
+    names as a guess) and a slot value the resolver filled (``pref``: named by the resolver's own done line when it was
+    a guess, its slot's ``say``; a confirmed usual is not) aren't named here a second time (review r2 sim: "Youtube is
+    up in Google Chrome in chrome.")."""
+    if source in ("words", "given", "default", "pref") or not name:
         return base
     return f"{base.rstrip('.')} in {_browser_title(name) if name.islower() else name}."
 
@@ -1436,8 +1289,6 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
     route whose next rung is the address bar; review r1 L1): a browser that ignored the last hand-offs
     (:func:`_ignores_handoff`) is not handed this one, so that rung runs at once."""
     name, key, source = choose_browser(call, hosts=hosts, policy=policy)
-    if source == "ask":
-        return _ask_browser(name), name, key, source, {}
     if kind := _refused("open_url"):
         return RouteResult(ran=False, held=kind, outcome="refused"), name, key, source, {}
     if source == "default" and not key:
@@ -1578,36 +1429,24 @@ def site_file(site_word: Any) -> str:
     return ""
 
 
-def _said_in(text: str, words: Sequence[str]) -> bool:
-    """Whether ``text`` stands in ``words`` as whole words (:func:`yuki.skills.uia_route.said`). Never raises."""
-    if not text:
-        return False
-    try:
-        from yuki.skills.uia_route import said
-
-        return bool(said(text, [str(w) for w in words if w]))
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words: Sequence[str], *,
-              now: float | None = None, heard: Sequence[str] | None = None) -> tuple[str | None, str | None, str]:
+              now: float | None = None) -> tuple[str | None, str | None, str]:
     """fSkills (live 18 Oct: the talker gave ``page = "Deji"`` for "Deezy's YouTube channel" and ``page = "MBL
     channel"`` for the user's NDL; both pages were dropped and YouTube's front page opened, or nothing): a site page's
     kind and value as the site's data and the user's own names read them: ``(page kind, item, how)``.
 
     * the item given (or a value given as the page that is no page kind) that one of the user's own names of the
       site's speakable page kind (``taste.site_kinds``: YouTube's ``handle``; ``taste.candidates``) holds as written
-      (``listed``), or by sound, the value itself or a run of its words (``heard``, ``taste.heard_as``'s closed-set
-      tier: "MBL" for NDL, only among their own names), is that page of that name, whatever page kind came with it
-      (review L4: "channel" + "MBL" is their channel NDL's handle page, never a channel id no link gives);
+      (``listed``), or by sound, the value itself (``heard``, ``taste.heard_as``'s closed-set tier: "MBL" for NDL,
+      only among their own names, and only when the user's words hold that name by sound too), is that page of that
+      name, whatever page kind came with it (review L4: "channel" + "MBL" is their channel NDL's handle page, never a
+      channel id no link gives);
     * else a page that is one of the site file's page kinds stays (``kind``: data, like an option of an enum), unless
       its address takes a value and no item came (review L4: ``page = handle`` alone is no page to open);
-    * skill19 (R7): the item given that the user's words don't hold (the caller's own rewrite, "MrBeastGaming" for the
-      heard "MBL"): the user's own words (``heard``: the exchange's turns, else ``words``) matched against their own
-      names of the page kind by sound or spelling (:func:`yuki.skills.taste.heard_in`) -> that page of that name
-      (``heard_words``: Yuki's guess, the done line names it);
     * otherwise ``(None, None, "")``: nothing changed.
+
+    kw3 (C4, 20 Oct): the caller's own value is what is resolved; a name of theirs found elsewhere in the turn (the
+    old ``taste.heard_in``, or a raw substring of a turn) never replaces it.
 
     Never raises."""
     try:
@@ -1622,26 +1461,16 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
         item = _words(item_word if not isinstance(item_word, Mapping) else item_word.get("name"))
         said = item or ("" if page in pages else _words(page_word))
         kinds = [(kind, str(pk)) for kind, site, pk, _var in taste.site_kinds() if site == name] if said else []
-        named: list[tuple[str, list[str]]] = []
         for kind, pk in kinds:
             names = [n for n in taste.candidates(store, kind, now=now) if n]
-            named.append((pk, names))
             exact = next((n for n in names if _words(n).casefold() == said.casefold()), None)
             if exact is not None:
                 return pk, exact, "listed"
+            # the caller's value heard as one of their names (its sound, never a span of the turn); the user's words
+            # holding that name by sound too keeps a model's rewrite from being swapped for one of theirs
             alike = taste.heard_as(names, said, loose=True)
-            if alike and any(taste.heard_as([alike], str(w), loose=True)
-                             or _words(alike).casefold() in str(w).casefold() for w in words if w):
+            if alike and any(taste.heard_as([alike], str(w), loose=True) for w in words if w):
                 return pk, alike, "heard"
-        if named and not _said_in(said, heard if heard is not None else words):
-            # skill19 (live 19 Oct, all-browser R7: "NDL" heard as "MBL", the talker passed its own "MrBeastGaming"
-            # and @MrBeastGaming opened): the caller's value isn't in the user's words, so before it is taken as the
-            # caller's reading, the user's own words are matched against their own names of this page kind by sound
-            # or spelling (taste.heard_in: "MBL" -> NDL); a hit is Yuki's guess, named in the done line
-            for pk, names in named:
-                hit = taste.heard_in(names, heard if heard is not None else words)
-                if hit:
-                    return pk, hit, "heard_words"
         if page not in pages or (not item and "{" in pages[page]):
             # no page kind, or one whose address needs a value none came with: nothing changed (the resolver checks
             # the page as given, and drops it unless the words hold it: the site's front page)
@@ -1741,11 +1570,10 @@ def measured_site(call: RouteCall, said: str) -> str:
     """names21 (final-D S18): the user's own site (its host, :func:`yuki.skills.names.own_site_entries`) a site value
     with no address is a mishearing of: the value measured as a name given to the act
     (:func:`yuki.skills.names.best_match` ``as_name``: "Porbex Kaladra" -> excalidraw.com); one clear winner, else
-    ``""``. Integration F1: the value only, never the rest of the turn. Every web.open_page run went through the
-    resolver, which already read the newest turn for a value the words don't hold (with what Yuki just opened left
-    out) and deliberately not for a value the words hold (names21 review F1: "You opened kit hub again, I said my
-    drawing site" must never open github.com again). Logged content-free (``names_match``: where the words came from,
-    the name's source, the score and the margin). Never raises."""
+    ``""``. Integration F1 and kw3 (C5): the value only, never the rest of the turn (the resolver reads no turn for a
+    name either: "You opened kit hub again, I said my drawing site" must never open github.com again). Logged
+    content-free (``names_match``: where the words came from, the name's source, the score and the margin). Never
+    raises."""
     try:
         from yuki.skills import names as N
 
@@ -1786,10 +1614,12 @@ def search_link(title: Any) -> dict[str, Any] | None:
     """skill22 (A8; final-D multi_arc_newtab_youtube and k_video_another_one under ONE: a video title handed to
     web.open_video had no link of its own, so every rung said no_route): the title as the video site's own search for
     it (the ``search`` address of the site whose watch pages the picks build, :func:`_video_kinds`), for the video
-    slot: ``{"name": the title, "ref": the search address, "search": True}``. A title of fewer than
-    :data:`TITLE_MIN_WORDS` distinct words, or no such address: ``None``. Pure apart from the site files."""
+    slot: ``{"name": the title, "ref": the search address, "search": True}``. kw3 (C11, 20 Oct: "Play Despacito on
+    YouTube" built no search): any title the caller gave, however few its words (a search is undoable and its results
+    are said as such, never "playing"); no title, or no such address: ``None``. :data:`TITLE_MIN_WORDS` stays only for
+    the measured fit of a title against a page's links (:func:`best_title_link`). Pure apart from the site files."""
     words = _words(title)
-    if not words or len(set(_title_words(words))) < TITLE_MIN_WORDS:
+    if not words or not _title_words(words):
         return None
     try:
         from yuki.connect.templates import fill
@@ -1858,7 +1688,8 @@ def _searched(result: RouteResult, expect: Mapping[str, Any]) -> RouteResult:
 
 #: A title is taken for one video's link only when that link's words hold at least this share of the title's words
 #: (a string measure, never a meaning), the next other video's at most :data:`TITLE_GAP` less, and the title has at
-#: least :data:`TITLE_MIN_WORDS` distinct words (a one-word name fits too many links to say which).
+#: least :data:`TITLE_MIN_WORDS` distinct words (a one-word name fits too many links to say which; the measure of
+#: :func:`best_title_link` only: kw3 C11, a search for the title, :func:`search_link`, needs no count).
 TITLE_FIT = 0.8
 TITLE_GAP = 0.15
 TITLE_MIN_WORDS = 3
@@ -2486,8 +2317,6 @@ def route_address_bar(call: RouteCall) -> RouteResult:
     if not new_tab:
         return RouteResult(ran=False, outcome="no_keys")
     name, key, source = choose_browser(call, hosts=_hosts_of(expect))
-    if source == "ask":
-        return _ask_browser(name)
     if source == "default" and not key:
         key = _handler_key(url)
     facts: dict[str, Any] = {"browser_from": source, "via": "address_bar"}
@@ -2878,7 +2707,7 @@ PROBES: dict[str, Callable[..., tuple[bool | None, dict[str, Any]]]] = {
 }
 
 __all__ = ["ROUTES", "PROBES", "route_site_tab", "route_told_link", "route_open_page", "route_open_video",
-           "route_chat_web_link", "route_address_bar", "frame_field", "browsers_said", "ASK_BROWSER",
+           "route_chat_web_link", "route_address_bar", "frame_field",
            "probe_site_tab_shown", "probe_site_front", "probe_browser_front",
            "probe_page_shown", "probe_page_seen", "probe_video_shown", "probe_video_playing", "probe_chat_page_shown",
            "browser_rule", "choose_browser", "measured_browsers", "last_in_front", "band_browser", "site_hosts",
