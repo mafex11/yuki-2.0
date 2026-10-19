@@ -205,8 +205,9 @@ class Plan:
     #: words only.
     sources: dict[str, str] = field(default_factory=dict)
     #: names21 (final-D S18): each slot whose value the names measure took (a misheard name of the user's own app or
-    #: site, :mod:`yuki.skills.names`) -> ``{"how": value | turn, "kind": app | site, "score", "margin"}``: code words
-    #: and numbers only, for the engine's content-free ``skill_resolve`` line.
+    #: site, :mod:`yuki.skills.names`), or whose given pick the user's newest turn agreed with -> ``{"how": value | turn
+    #: | agree, "kind": app | site, "score", "margin"}`` (:data:`HOW_VALUE`, :data:`HOW_TURN`, :data:`HOW_AGREE`): code
+    #: words and numbers only, for the engine's content-free ``skill_resolve`` line.
     measured: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
@@ -1586,14 +1587,14 @@ def _reading(slot: Slot, value: Any, *, store: Any, until: float | None) -> Any:
 
 
 def _own_sites(store: Any) -> list[str]:
-    """The user's own sites, most visited first (their hosts: :func:`yuki.skills.names.own_entries`, read with no desk
-    read). ``[]`` with no store. Never raises."""
+    """The user's own sites, most visited first (their hosts: :func:`yuki.skills.names.own_site_entries`, their own
+    list, never cut to make room for apps; no desk read). ``[]`` with no store. Never raises."""
     if store is None:
         return []
     try:
         from yuki.skills import names as N
 
-        return [e.name for e in N.own_entries(store, running=(), start=()) if e.kind == N.SITE]
+        return [e.name for e in N.own_site_entries(store)]
     except Exception:  # noqa: BLE001
         return []
 
@@ -1626,9 +1627,15 @@ def _act_off(app: Any) -> bool:
         return False
 
 
+#: names21: where a measured name's words came from (:attr:`Plan.measured` ``how``, code words): the value given,
+#: measured as a name (with the word heard just before it, the tail shape); the user's newest turn alone (the value
+#: named nothing: a description or a word for no program); the caller's own pick that the newest turn agrees with.
+HOW_VALUE, HOW_TURN, HOW_AGREE = "value", "turn", "agree"
+
+
 def _measure_facts(got: tuple[str, float, float], how: str, kind: str) -> dict[str, Any]:
-    """A measure's content-free facts (:attr:`Plan.measured`): where the words came from, the name's kind, its score
-    and margin."""
+    """A measure's content-free facts (:attr:`Plan.measured`): where the words came from (:data:`HOW_VALUE`,
+    :data:`HOW_TURN`, :data:`HOW_AGREE`), the name's kind, its score and margin."""
     return {"how": how, "kind": kind, "score": float(got[1]), "margin": float(got[2])}
 
 
@@ -1636,15 +1643,62 @@ def _newest_turn(heard: Sequence[str]) -> str:
     return next((str(t) for t in reversed(list(heard or ())) if _words(t)), "")
 
 
-def _measured_site(value: Any, heard: Sequence[str], *, store: Any,
-                   reading: bool) -> tuple[str, dict[str, Any]] | None:
-    """The user's own site a site value is a mishearing of (:mod:`yuki.skills.names`), or ``None`` (as before). A
-    value that names no address (:func:`_addressable`: "Porbex Kaladra", or the caller's description, "drawing site")
-    is measured as a name given to the act, else the user's newest turn whole (the turn bar). ``reading`` (the
-    caller's own value, the words not holding it) that names an address is measured only against the newest turn (the
-    value itself is the caller's, no evidence): the turn's clear winner replaces it when the value holds less of the
-    turn ("its own pick is weaker"), and when the turn's best of their sites is the value (at the name bar: the pick
-    is a second signal) the value stays, heard, not a guess. ``(the value to run, its facts)``. Never raises."""
+def _turn_parts(heard: Sequence[str], skip: Sequence[str]) -> list[str]:
+    """The user's newest turn as the measure may read it: outside every given free text value (``skip``: what to
+    write, a link; :func:`_outside`, as :func:`named_app` reads it): a name inside the message is its content, never
+    its channel ("tell Hemanth to discard the old build" names no app). ``[]`` for no turn."""
+    turn = _newest_turn(heard)
+    if not turn:
+        return []
+    skip = [str(v) for v in skip or () if _words(v)]
+    return [p for p in _outside(turn, skip) if p] if skip else [turn]
+
+
+def _with_word_before(text: str, heard: Sequence[str]) -> str:
+    """A value the newest turn holds as whole words, with the word heard just before it ("scored" in "Bring up the
+    scored" -> "the scored": the tail shape, a name's first sound gone into the word before). ``""`` when the turn
+    doesn't hold it or nothing stands before it. Never raises."""
+    try:
+        from yuki.memory.contacts import tokens
+
+        words, n = tokens(_newest_turn(heard)), tokens(text)
+        if not n:
+            return ""
+        for i in range(len(words) - len(n), 0, -1):
+            if words[i:i + len(n)] == n:
+                return " ".join(words[i - 1:i + len(n)])
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _as_name(text: str, pool: Sequence[str], heard: Sequence[str]) -> tuple[str, float, float] | None:
+    """A value measured as a name given to the act (:func:`yuki.skills.names.best_match` ``as_name``), else with the
+    word the newest turn has just before it (:func:`_with_word_before`); ``None`` for none."""
+    from yuki.skills import names as N
+
+    got = N.best_match(text, pool, as_name=True)
+    if got is None:
+        wide = _with_word_before(text, heard)
+        if wide:
+            got = N.best_match(wide, pool, as_name=True)
+    return got
+
+
+def _measured_site(value: Any, heard: Sequence[str], *, store: Any, reading: bool, known: bool = False,
+                   whole_turn: bool = True, skip: Sequence[str] = ()) -> tuple[str, dict[str, Any]] | None:
+    """The user's own site a site value is a mishearing of (:mod:`yuki.skills.names`), or ``None`` (as before).
+
+    * A value that names no address and no known site of theirs (:func:`_addressable`: "Porbex Kaladra", or the
+      caller's description, "drawing site"): the value measured as a name given to the act (:func:`_as_name`), else,
+      with ``whole_turn`` (a value the words don't hold), the user's newest turn outside the given free text
+      (:func:`_turn_parts`) at the turn bar, mishearings only: a site the turn names as written is the user's own word
+      for another site, never a mishearing of this one ("close youtube and open my drawing site" is no youtube.com).
+    * ``reading`` (the caller's own pick, the words not holding it) that names an address, or ``known`` (one of their
+      known sites, contract C5): never replaced. The newest turn only agrees: when its best of their sites (at the
+      name bar: the pick is a second signal) is the pick, the pick stays, heard, not a guess (names21 review F1).
+
+    ``(the value to run, its facts)``. Never raises."""
     try:
         from yuki.skills import names as N
 
@@ -1652,36 +1706,41 @@ def _measured_site(value: Any, heard: Sequence[str], *, store: Any,
         sites = _own_sites(store)
         if not text or not sites:
             return None
-        turn = _newest_turn(heard)
-        if not _addressable(text):
-            got, how = N.best_match(text, sites, as_name=True), "value"
-            if got is None and turn:
-                got, how = N.best_match(turn, sites), "turn"
+        parts = _turn_parts(heard, skip)
+        if not known and not _addressable(text):
+            got, how = _as_name(text, sites, heard), HOW_VALUE
+            if got is None and whole_turn and parts:
+                got, how = N.best_match(parts, sites, literal_ok=False), HOW_TURN
             return (got[0], _measure_facts(got, how, N.SITE)) if got is not None else None
-        if not reading or not turn:
+        if not reading or not parts:
             return None
-        # a site the turn names as written is no mishearing: the caller's reading stands over it (Phase 2.1)
-        got = N.best_match(turn, sites, literal_ok=False)
-        if got is not None and not N.same_group(got[0], text):
-            return (got[0], _measure_facts(got, "turn", N.SITE)) if N.score(turn, text) < got[1] else None
-        agree = got or N.best_match(turn, [text, *sites], bar=N.BAR)
+        agree = N.best_match(parts, [text, *sites], bar=N.BAR)
         if agree is not None and N.same_group(agree[0], text):
-            return text, _measure_facts(agree, "turn", N.SITE)
+            return text, _measure_facts(agree, HOW_AGREE, N.SITE)
         return None
     except Exception:  # noqa: BLE001
         return None
 
 
 def _measured_app(skill: Skill, slot: Slot, value: Any, reading: Any, heard: Sequence[str], *, store: Any,
-                  live: "Live", until: float | None, now: float | None) -> tuple[str, dict[str, Any]] | None:
+                  live: "Live", until: float | None, now: float | None, whole_turn: bool = True,
+                  skip: Sequence[str] = (), avoid: Collection[str] = ()) -> tuple[str, dict[str, Any]] | None:
     """The app of an app slot's own candidates (:func:`_app_candidates`: its options, the apps its routes drive, the
-    measured browsers, the apps that play sound) the caller's value is a mishearing of (:mod:`yuki.skills.names`). A
-    value the PC knows no program by (``reading`` ``None``): the value measured as a name given to the act, else the
-    user's newest turn whole (the turn bar). A reading the PC knows (the caller's pick) is measured only against the
-    newest turn: the turn's clear winner replaces it when the pick holds less of the turn ("its own pick is weaker"),
-    and when the turn's best of the slot's apps is the pick (at the name bar: the pick is a second signal) the pick
-    stays, heard, not a guess. An app whose Act switch is off is never taken in place of the value (:func:`_act_off`).
-    ``(app key, its facts)`` or ``None`` (as before). Never raises."""
+    measured browsers, the apps that play sound) the caller's value is a mishearing of (:mod:`yuki.skills.names`).
+
+    * A value the PC knows no program by (``reading`` ``None``): the value measured as a name given to the act
+      (:func:`_as_name`), else, with ``whole_turn`` (a value the words don't hold), the user's newest turn at the turn
+      bar, read as :func:`named_app` reads it: outside the given free text (``skip``), and never an app of ``avoid``
+      (what Yuki just acted in, a live call's own app: a turn may name it to complain), which still counts against
+      the others; a turn that names one of the slot's apps as written is :func:`named_app`'s (whole words), never
+      measured.
+    * A reading the PC knows (the caller's pick) is never replaced (names21 review F1: plain words such as "the
+      score" or "setting it up" measure as close to Discord or Settings as a real mishearing does). The newest turn
+      only agrees: when its best of the slot's apps (at the name bar: the pick is a second signal) is the pick, the
+      pick stays, heard, not a guess; never for a pick of ``avoid``.
+
+    An app whose Act switch is off is never taken in place of the value (:func:`_act_off`). ``(app key, its facts)``
+    or ``None`` (as before). Never raises."""
     try:
         from yuki.skills import names as N
 
@@ -1692,35 +1751,38 @@ def _measured_app(skill: Skill, slot: Slot, value: Any, reading: Any, heard: Seq
                     keys.setdefault(_words(n), key)
         if not keys:
             return None
-        turn = _newest_turn(heard)
+        avoid = set(avoid or ())
+
+        def avoided(key: Any) -> bool:
+            return bool(avoid) and bool(({str(key), app_name(key)} | _app_forms(key, store=store, until=until))
+                                        & avoid)
+
+        parts = _turn_parts(heard, skip)
         if reading is None:
             text = _words(value.get("name") if isinstance(value, Mapping) else value)
-            got, how = (N.best_match(text, list(keys), as_name=True), "value") if text else (None, "value")
-            if got is None and turn:
-                # an app the turn names as written is :func:`named_app`'s (with its just-acted and call rules)
-                got, how = N.best_match(turn, list(keys), literal_ok=False), "turn"
+            got, how = (_as_name(text, list(keys), heard), HOW_VALUE) if text else (None, HOW_VALUE)
+            if got is None and whole_turn and parts:
+                if any(N.literal(parts, n) for n in keys):
+                    return None
+                got, how = N.best_match(parts, list(keys), literal_ok=False), HOW_TURN
+                if got is not None and avoided(keys[got[0]]):
+                    return None
             if got is None or _act_off(keys[got[0]]):
                 return None
             return keys[got[0]], _measure_facts(got, how, N.APP)
-        if not turn:
+        if not parts or avoided(reading):
             return None
         pick = {app_name(reading)} | _app_forms(reading, store=store, until=until)
 
         def same(key: str) -> bool:
             return bool(({key, app_name(key)} | _app_forms(key, store=store, until=until)) & pick)
 
-        theirs = [n for n in app_identity(reading, store=store, until=until)[1] if _words(n)] or [str(reading)]
-        # an app the turn names as written is no mishearing: the caller's reading stands over it (Phase 2.1)
-        got = N.best_match(turn, list(keys), literal_ok=False)
-        if got is not None and not same(keys[got[0]]):
-            if max((N.score(turn, n) for n in theirs), default=0.0) < got[1] and not _act_off(keys[got[0]]):
-                return keys[got[0]], _measure_facts(got, "turn", N.APP)
-            return None
-        for n in theirs:
-            keys.setdefault(_words(n), str(reading))
-        agree = got or N.best_match(turn, list(keys), bar=N.BAR)
+        for n in app_identity(reading, store=store, until=until)[1] or [str(reading)]:
+            if _words(n):
+                keys.setdefault(_words(n), str(reading))
+        agree = N.best_match(parts, list(keys), bar=N.BAR)
         if agree is not None and same(keys[agree[0]]):
-            return reading, _measure_facts(agree, "turn", N.APP)
+            return reading, _measure_facts(agree, HOW_AGREE, N.APP)
         return None
     except Exception:  # noqa: BLE001
         return None
@@ -1730,19 +1792,21 @@ def _measured_said(skill: Skill, slot: Slot, given: Any, value: Any, heard: Sequ
                    live: "Live", cap: str, until: float | None,
                    now: float | None) -> tuple[Any, str, dict[str, Any]] | None:
     """Step 1's value the user's words hold as written that names nothing the PC can open: a site value with no
-    address that is no known site of theirs, or an app value no program of the PC goes by ("the scored"). Its
-    measure (:func:`_measured_site` / :func:`_measured_app`): ``(value, where from, facts)``, where from
-    :data:`FROM_WORDS` when the name stands there as written (an identity: "Excalidraw" for excalidraw.com), else
-    :data:`FROM_HEARD`; ``None`` (as before). Never raises."""
+    address that is no known site of theirs, or an app value no program of the PC goes by ("the scored"). Measured as
+    a name given to the act, with the word heard just before it (:func:`_measured_site` / :func:`_measured_app`, never
+    the rest of the turn: the words hold the value, so that is where the name was said): ``(value, where from,
+    facts)``, where from :data:`FROM_WORDS` when the name stands there as written (an identity: "Excalidraw" for
+    excalidraw.com), else :data:`FROM_HEARD`; ``None`` (as before). Never raises."""
     try:
         if skill.bind.get(slot.name) == SITE_BIND and slot.type == "text":
             if _addressable(value) or _known_site(store, cap, slot.name, value, now=float(now or time.time())):
                 return None
-            took = _measured_site(value, heard, store=store, reading=False)
+            took = _measured_site(value, heard, store=store, reading=False, whole_turn=False)
         elif slot.type == "app" and not slot.told:
             if _known_app(slot, _words(given), store=store, until=until):
                 return None
-            took = _measured_app(skill, slot, given, None, heard, store=store, live=live, until=until, now=now)
+            took = _measured_app(skill, slot, given, None, heard, store=store, live=live, until=until, now=now,
+                                 whole_turn=False)
         else:
             return None
         if took is None:
@@ -1852,6 +1916,16 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
 
     def app_names(value: str) -> tuple[str, list[str]]:
         return app_identity(value, store=store, until=until)
+
+    def app_avoid(slot: Slot) -> set[str]:
+        """The app identities an app slot is never filled with from the words (:func:`named_app`'s ``avoid``): what
+        Yuki just acted in, and for a slot that asks in a call with a call live, the call's own app. names21 review
+        F1: the names measure's turn reading leaves them out as :func:`named_app` does."""
+        nonlocal acted
+        if acted is None:
+            acted = just_acted(store, now=now, until=until, skills=family)
+        in_call = bool(slot.ask_in_call and live.in_call)
+        return set(acted) | (call_apps(store, now=now, until=until) if in_call else set())
 
     values: dict[str, Any] = {}
     filled: dict[str, str] = {}
@@ -2051,21 +2125,25 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             reading = _reading(slot, given[slot.name], store=store, until=until) if undoable else None
             heard_app = None
             if undoable and slot.type == "app" and not slot.told:
-                # names21 (final-D S18; the user's decision 3): the caller's app (or none the PC knows) against the
-                # slot's own apps measured in the value and the user's newest turn: a clear winner the caller's pick
-                # holds less of the turn than is that app, heard; agreeing with the pick, the pick stays, heard
+                # names21 (final-D S18; the user's decision 3; review F1): a value no program of the PC goes by is
+                # measured as a name, else in the user's newest turn (outside the message's own text, never an app
+                # Yuki just acted in or the call's own): a clear winner is that app, heard. The caller's known pick is
+                # never replaced; the newest turn agreeing with it keeps it, heard, not a guess
                 heard_app = _measured_app(skill, slot, given[slot.name], reading, heard, store=store, live=live,
-                                          until=until, now=now)
+                                          until=until, now=now, skip=free_text, avoid=app_avoid(slot))
                 if heard_app is not None:
                     reading, measured[slot.name] = heard_app
+            # an app from the newest turn alone (the value named nothing) is a reading the words don't hold as written:
+            # the live-playing rule below judges it as it judges any reading (names21 review F1)
+            by_turn = heard_app is not None and heard_app[1].get("how") == HOW_TURN
             if reading is not None and slot.type == "app" and slot.ask_in_call and live.in_call and \
                     (_app_forms(reading, store=store, until=until) & call_apps(store, now=now, until=until)):
                 # with a call live, a slot that asks in a call never takes the call's own app unasked (audio.toml:
                 # "turn it down" on a call asks whose volume)
                 reading, heard_app = None, None
                 measured.pop(slot.name, None)
-            if reading is not None and slot.type == "app" and slot.live == "playing" and heard_app is None and \
-                    not (slot.ask_in_call and live.in_call):
+            if reading is not None and slot.type == "app" and slot.live == "playing" and \
+                    (heard_app is None or by_turn) and not (slot.ask_in_call and live.in_call):
                 playing = list(dict.fromkeys(live.playing))
                 if len(playing) == 1 and _live_beats(reading, slot, live, store=store, until=until):
                     # skill20 (final-D P2: "Bit louder bro." with a playlist playing, the talker's ``target: system``
@@ -2075,6 +2153,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                     # Another option (Yuki's own voice) or an app the measure can't see (a game) stands as a named
                     # guess, and with none or two playing, or a call live, every reading stands as before
                     values[slot.name], filled[slot.name] = playing[0], "live"     # a fill: never in ``origin``
+                    measured.pop(slot.name, None)
                     continue
             if reading is not None:
                 src = _given_source(given_from, slot.name)
@@ -2085,10 +2164,12 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                     # fBrain merge note (contract C5): one of the user's own known sites ("my anime" -> JustAnime,
                     # from the card), kept as that known value (the form its runs used)
                     site = _known_site(store, cap, slot.name, reading, now=now)
-                    # names21 (final-D S18; decision 3): measured against their own sites (the value as a name when it
-                    # names no address, else their newest turn): a clear winner the caller's pick holds less of the
-                    # turn than is that site, heard; agreeing with the pick, the pick stays, heard (no hedge)
-                    took = _measured_site(reading if site is None else site, heard, store=store, reading=True)
+                    # names21 (final-D S18; decision 3; review F1/F2): a value that names no address and no known site
+                    # of theirs is measured as a name, else in their newest turn (mishearings only: a site the turn
+                    # names as written is no mishearing of this one): a clear winner is that site, heard. An address
+                    # or a known site is never replaced; the newest turn agreeing with it keeps it, heard (no hedge)
+                    took = _measured_site(reading if site is None else site, heard, store=store, reading=True,
+                                          known=site is not None, skip=free_text)
                     if took is not None:
                         (reading, measured[slot.name]), theirs, src = took, True, FROM_HEARD
                     elif site is not None:

@@ -1682,16 +1682,18 @@ def _target(call: RouteCall, opens: str) -> tuple[str | None, dict[str, Any], st
 
 
 def measured_site(call: RouteCall, said: str) -> str:
-    """names21 (final-D S18): the user's own site (its host, :func:`yuki.skills.names.own_entries`) a site value with
-    no address is a mishearing of: the value measured as a name given to the act (:func:`yuki.skills.names.best_match`
-    ``as_name``: "Porbex Kaladra" -> excalidraw.com), else the user's newest turn measured whole (the stricter turn
-    bar: a value that is the model's description, "drawing site", for "Open Porbex Kaladra"); one clear winner, else
+    """names21 (final-D S18): the user's own site (its host, :func:`yuki.skills.names.own_site_entries`) a site value
+    with no address is a mishearing of: the value measured as a name given to the act
+    (:func:`yuki.skills.names.best_match` ``as_name``: "Porbex Kaladra" -> excalidraw.com), else the user's newest turn
+    measured whole (the stricter turn bar: a value that is the model's description, "drawing site", for "Open Porbex
+    Kaladra"; mishearings only: a site the turn names as written is the user's own word for another site, never this
+    one, so "close youtube and open my drawing site" is no youtube.com, names21 review F2); one clear winner, else
     ``""``. Logged content-free (``names_match``: where the words came from, the name's source, the score and the
     margin). Never raises."""
     try:
         from yuki.skills import names as N
 
-        entries = [e for e in N.own_entries(_store(call.ctx), running=(), start=()) if e.kind == N.SITE]
+        entries = N.own_site_entries(_store(call.ctx))
         sites = [e.name for e in entries]
         if not sites:
             return ""
@@ -1699,7 +1701,7 @@ def measured_site(call: RouteCall, said: str) -> str:
         if got is None:
             turns = [str(w) for w in getattr(call.ctx, "words", None) or () if str(w or "").strip()]
             if turns:
-                got, how = N.best_match(turns[-1], sites), "turn"
+                got, how = N.best_match(turns[-1], sites, literal_ok=False), "turn"
         if got is None:
             return ""
         name, score, margin = got

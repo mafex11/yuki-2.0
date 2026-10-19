@@ -312,6 +312,19 @@ def _heard(text: str) -> _Heard:
     return _Heard(tuple(runs), tuple(tails))
 
 
+def _heard_of(heard: Any) -> _Heard | None:
+    """The heard words as the measure reads them (:class:`_Heard`), or ``None`` for none. ``heard``: a text, or a list
+    or tuple of texts, the parts of one turn (a caller's cut: resolve's ``_outside``, the turn outside the message's
+    own text): each part read alone, so a run never spans two parts. A part's runs end at that part's own last word."""
+    if isinstance(heard, (list, tuple)):
+        parts = [_heard(t) for t in (" ".join(str(p or "").split()) for p in heard if isinstance(p, str)) if t]
+        if not parts:
+            return None
+        return _Heard(tuple(r for h in parts for r in h.runs), tuple(t for h in parts for t in h.tails))
+    text = " ".join(str(heard or "").split())
+    return _heard(text) if text else None
+
+
 def _head_taken(before: str, before_form: _Form, head: str) -> bool:
     """Whether the word heard before a name's tail took the name's head: it ends in the head as written ("porb|ex"),
     or it is the head heard as another short word ("the" for "di": the same consonant sounds, at most one letter
@@ -362,13 +375,13 @@ def _measure(heard: _Heard, name: str, as_name: bool = False) -> tuple[float, in
 def score(heard: Any, name: Any, *, as_name: bool = False) -> float:
     """How closely the heard words hold one name (0..1; 1.0 when a form of it stands there as written): the measure
     :func:`best_match` ranks by, for a caller comparing a name it was given (a model's pick) with the winner.
-    ``as_name`` as for :func:`best_match`. Never raises (0.0)."""
+    ``heard`` and ``as_name`` as for :func:`best_match`. Never raises (0.0)."""
     try:
-        text = " ".join(str(heard or "").split())
+        got = _heard_of(heard)
         name = " ".join(str(name or "").split())
-        if not text or not name:
+        if got is None or not name:
             return 0.0
-        return round(_measure(_heard(text), name, as_name)[0], 3)
+        return round(_measure(got, name, as_name)[0], 3)
     except Exception:  # noqa: BLE001
         return 0.0
 
@@ -386,9 +399,12 @@ def same_group(a: Any, b: Any) -> bool:
 
 def literal(heard: Any, name: Any) -> bool:
     """Whether a spoken form of ``name`` stands in the heard words as written (a run of them, spaces aside): the name
-    was heard right, nothing was misheard. Never raises."""
+    was heard right, nothing was misheard. ``heard`` as for :func:`best_match`. Never raises."""
     try:
-        runs = {r.letters for r, _n, _e, _w in _heard(" ".join(str(heard or "").split())).runs}
+        got = _heard_of(heard)
+        if got is None:
+            return False
+        runs = {r.letters for r, _n, _e, _w in got.runs}
         return any(f.letters in runs for f in _name_forms(" ".join(str(name or "").split())))
     except Exception:  # noqa: BLE001
         return False
@@ -400,16 +416,15 @@ def best_match(heard: Any, names: Iterable[Any], *, literal_ok: bool = True, as_
     (see the module docstring): ``(name, score, margin)`` when it scores at least the bar and beats the best name of
     every other group by :data:`MARGIN`; else ``None``. ``heard``: a whole turn ("Bring up the scored.", bar
     :data:`TURN_BAR`) or, with ``as_name``, a name given to an act ("Porbex Kaladra", "the scored": measured whole, or
-    by its last words, never by a part before them; bar :data:`BAR`). ``literal_ok=False``: a name whose form stands
-    in the words as written is left out (a caller that wants only mishearings: a name heard right needs no help).
-    ``bar``: another bar (a caller with a second signal: a model's own pick that the turn's winner agrees with is
-    confirmed at :data:`BAR`). Pure; never raises (``None``)."""
+    by its last words, never by a part before them; bar :data:`BAR`). ``heard`` may also be a list or tuple of texts,
+    the parts of one turn a caller cut (resolve: the turn outside the message's own text): a run never spans two
+    parts. ``literal_ok=False``: a name whose form stands in the words as written is left out (a caller that wants
+    only mishearings: a name heard right needs no help). ``bar``: another bar (a caller with a second signal: a
+    model's own pick that the turn's winner agrees with is confirmed at :data:`BAR`). Pure; never raises
+    (``None``)."""
     try:
-        text = " ".join(str(heard or "").split())
-        if not text:
-            return None
-        got = _heard(text)
-        if not got.runs:
+        got = _heard_of(heard)
+        if got is None or not got.runs:
             return None
         pool = list(dict.fromkeys(" ".join(str(n or "").split()) for n in names or () if str(n or "").strip()))
         scored: list[tuple[float, int, int, str]] = []
@@ -593,9 +608,10 @@ def own_entries(store: Any = None, *, running: Sequence[str] | None = None,
     """The user's own apps and sites (:class:`Own`), in use first: the programs with a window now (``running``, else a
     read of the window list), the apps their timeline shows (most used first), the sites they visit (most visited
     first), then the Start menu's entries (``start``: ``[{"name", "appid"}]`` or names, else the list this process last
-    read); each name once (letters and digits compared), at most :data:`OWN_MAX`. ``store``: the memory to read (else
-    this process's own memory when it is open; else no timeline and no sites). A running program is named as the
-    timeline names it when it knows it. Never raises."""
+    read); each name once (letters and digits compared), at most :data:`OWN_MAX`. Each kind keeps at least half of
+    that when both have more (in use first; a kind with fewer leaves its room to the other), so a growing timeline
+    never cuts the sites. ``store``: the memory to read (else this process's own memory when it is open; else no
+    timeline and no sites). A running program is named as the timeline names it when it knows it. Never raises."""
     try:
         memory = _memory_entries(store) if store is not None else _default_entries()
         shown: dict[str, str] = {}
@@ -607,14 +623,14 @@ def own_entries(store: Any = None, *, running: Sequence[str] | None = None,
             from yuki.skills.resolve import app_name
         except Exception:  # noqa: BLE001
             app_name = str.casefold
-        out: list[Own] = []
+        listed: list[Own] = []
         seen: set[str] = set()
 
         def add(entry: Own) -> None:
             key = _squash(entry.name)
-            if len(key) >= MIN_LETTERS and key not in seen and len(out) < OWN_MAX:
+            if len(key) >= MIN_LETTERS and key not in seen:
                 seen.add(key)
-                out.append(entry)
+                listed.append(entry)
 
         for image in (running if running is not None else _running_now()):
             text = " ".join(str(image or "").split())
@@ -627,7 +643,30 @@ def own_entries(store: Any = None, *, running: Sequence[str] | None = None,
                 add(e)
         for n in (start_names(start) if start is not None else _start_now()):
             add(Own(n, APP, START))
+        # names21 review F5: each kind capped on its own within OWN_MAX, in the listed order (in use first)
+        sites = sum(1 for e in listed if e.kind == SITE)
+        keep_sites = min(sites, max(OWN_MAX // 2, OWN_MAX - (len(listed) - sites)))
+        keep_apps = OWN_MAX - keep_sites
+        out: list[Own] = []
+        for e in listed:
+            if e.kind == SITE and keep_sites > 0:
+                keep_sites -= 1
+                out.append(e)
+            elif e.kind != SITE and keep_apps > 0:
+                keep_apps -= 1
+                out.append(e)
         return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def own_site_entries(store: Any = None) -> list[Own]:
+    """The user's own sites (:class:`Own`, kind :data:`SITE`), most visited first, at most :data:`OWN_MAX`: the site
+    measures' own list (resolve's site slots, web_route's open), never cut to make room for apps. ``store`` as for
+    :func:`own_entries`; no desk read. Never raises (``[]``)."""
+    try:
+        memory = _memory_entries(store) if store is not None else _default_entries()
+        return [e for e in memory if e.kind == SITE][:OWN_MAX]
     except Exception:  # noqa: BLE001
         return []
 
@@ -682,6 +721,7 @@ def site_browser(host: Any, store: Any = None) -> str:
 __all__ = ["APP", "BAR", "TURN_BAR", "BROWSER_MIN_SITES", "LENGTH_RATIO", "LINKS", "MARGIN", "MAX_WORDS", "MIN_LETTERS",
            "NEAR_MIN_LETTERS", "OWN_MAX", "Own", "RUNNING",
            "SITE", "SITE_MIN_VISITS", "START", "TAIL_HEAD", "TAIL_MIN_LETTERS", "TIMELINE", "best_match", "is_site",
-           "literal", "own_entries", "own_names", "same_group", "score", "site_browser", "site_url", "sites_of",
+           "literal", "own_entries", "own_names", "own_site_entries", "same_group", "score", "site_browser", "site_url",
+           "sites_of",
            "sound_code",
            "start_names"]

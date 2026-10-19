@@ -2802,11 +2802,11 @@ def _launch_verdict(ok: bool, details: dict) -> bool | None:
     return True
 
 
-#: names21: how a launch's summary names what a heard name was taken as (the model reads it, and says what opened).
-MEASURED_APP_LINE = ("Took {query!r} as {name}: no app goes by that name, and {name} is the closest of the user's own "
-                     "apps and sites by spelling and sound ({score:.2f}). ")
-MEASURED_SITE_LINE = ("Took {query!r} as the user's site {name}: no app goes by that name, and {name} is the closest "
-                      "of the user's own apps and sites by spelling and sound ({score:.2f}); opened it. ")
+#: names21: how a launch's summary names what a heard name was taken as, a plain fact (the model reads it and says what
+#: opened: "Opening Discord."). The user's decision 3: named, never a warning, so no doubt and no score here (the
+#: score is in ``details["names_match"]``). The first when the launch went through, the second when it didn't.
+MEASURED_OPENED_LINE = "Opened {name} (heard as {query!r}). "
+MEASURED_TAKEN_LINE = "Took {query!r} as {name}. "
 
 
 def _measured_name(query: str, apps: list[dict[str, str]], *, sites: bool) -> dict | None:
@@ -2815,10 +2815,10 @@ def _measured_name(query: str, apps: list[dict[str, str]], *, sites: bool) -> di
     site excalidraw.com, "the scored" for Discord). Measured among the user's own names and every Start entry
     (:func:`yuki.skills.names.best_match` in name mode: one clear winner by spelling and sound, else none); a site only
     when ``sites`` (a launch handed no arguments). ``{"kind": "app" | "site", "name", "entry" (an app's Start entry),
-    "url" and "app" (a site's front page and the program memory saw it in most), "line" (the summary's words),
-    "log" (content-free: kind, how, score, margin, source)}``, or ``None``: as before. An app the measure names that no
-    Start entry goes by (a program the Start menu lists under another name) is ``None`` too. A path, an address or a
-    command is no name. Never raises."""
+    "url" and "app" (a site's front page and the program memory saw it in most), "query" (the name as given, for the
+    summary's words: :data:`MEASURED_OPENED_LINE`), "log" (content-free: kind, how, score, margin, source)}``, or
+    ``None``: as before. An app the measure names that no Start entry goes by (a program the Start menu lists under
+    another name) is ``None`` too. A path, an address or a command is no name. Never raises."""
     text = " ".join(str(query or "").split())
     if not text or any(ch in text for ch in "\\/:"):
         return None
@@ -2842,12 +2842,11 @@ def _measured_name(query: str, apps: list[dict[str, str]], *, sites: bool) -> di
             if not url:
                 return None
             return {"kind": kind, "name": name, "url": url, "app": entry.app if entry is not None else "", "log": log,
-                    "line": MEASURED_SITE_LINE.format(query=text, name=name, score=score)}
+                    "query": text}
         chosen, _candidates = _match_apps(name, apps)
         if chosen is None:
             return None
-        return {"kind": kind, "name": chosen["name"], "entry": chosen, "log": log,
-                "line": MEASURED_APP_LINE.format(query=text, name=chosen["name"], score=score)}
+        return {"kind": kind, "name": chosen["name"], "entry": chosen, "log": log, "query": text}
     except Exception:  # noqa: BLE001 - no measure: as before
         return None
 
@@ -2912,8 +2911,9 @@ def launch_app(
             scored" for Discord, "Porbex Kaladra" for their excalidraw.com) is
             that one - an app launched as by its own name, a site's front page
             opened in the browser they open it in - and the summary starts by
-            saying what it was taken as (``details["names_match"]``: kind,
-            score, margin, source); with no clear winner, as before.
+            naming it as a plain fact ("Opened Discord (heard as 'the
+            scored')."; ``details["names_match"]``: kind, how, score, margin,
+            source); with no clear winner, as before.
         args: command-line arguments for the app (a URL, a file, a folder).  The
             app is resolved exactly as without them and then started so that it
             receives them - see the module docstring for how.  An app that
@@ -2992,8 +2992,9 @@ def launch_app(
         if "verified" not in details:
             details["verified"] = _launch_verdict(ok, details)
         if measured:
-            details["names_match"] = dict(measured["log"])   # content-free: kind, score, margin, source
-            summary = measured["line"] + summary
+            details["names_match"] = dict(measured["log"])   # content-free: kind, how, score, margin, source
+            line = MEASURED_OPENED_LINE if ok else MEASURED_TAKEN_LINE
+            summary = line.format(name=measured["name"], query=measured["query"]) + summary
         return ActionResult(
             ok=ok,
             summary=summary,
