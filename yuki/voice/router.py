@@ -20,7 +20,7 @@ judges the intent from the words, the earlier turns and the screen summary, so a
 pipeline acts on it only when nothing waits for the user's words or runs for them (a task's question, a held call, a
 hand at work), and only while the talker has not begun its own reply to the same words. While a send of theirs counts
 down, ``end`` also means they call it off: the send is stopped at once, nothing sent, even when the talker answered
-first (a wrong stop never sends).
+first or they spoke again since (a wrong stop never sends); a held countdown waits for that verdict (integ23 S1, S2).
 
 No keywords anywhere: the decision is the router model's, from principles and worked examples; the code reads only its
 tool call's own JSON (a fixed format).
@@ -57,7 +57,8 @@ the skill that plays it: the talker runs it with Yuki choosing (code picks from 
 - a message to someone (the message skill: it opens their chat and types their words);
 - a short question about their day, what they did, who they talked to or what they usually pick (the talker reads its \
 day block and one quick memory look);
-- quiet time for a while or for a call, and a goodbye said with anything else.
+- quiet time: asking her to stop listening for a while or, on a call, for the rest of it (only the talker can turn \
+her name off), and a goodbye said with anything else.
 
 The thinker is needed (to = thinker) for everything else: their files, plans, calls and meetings in detail, memory \
 beyond a short day question; anything of several steps inside an app; anything inside a window that no items line \
@@ -71,7 +72,8 @@ more now. Judge what they mean, never single words: what answers a question Yuki
 talker), and stop, pause or off said about something playing or running is about that (a hand: talker). While a \
 message of theirs counts down to send, words that call it off (they do not want it sent) are an end too: nothing \
 is sent; words that change it (another person, more text) are the talker's. On a call, when words that would end \
-the conversation could be for Yuki, end: a wrong end costs them only her name, while staying listens in on the call.
+the conversation could be for Yuki, end: a wrong end costs them only her name, while staying listens in on the call. \
+Quiet time is never an end, on a call too: an end leaves her name on.
 
 Good: "what did I do today?" -> talker. "summarise my meetings this week" -> thinker. "pause the music" -> talker. "open Chrome" -> talker. "thanks, perfect" -> \
 talker. "click the mix" and the mix is on the items line -> talker; it is not -> thinker, screen true. "open Spotify \
@@ -101,6 +103,9 @@ ROUTES = ("thinker", "talker", "end")
 #: Inputs are cut to these sizes (characters): the earlier turns, and the screen summary.
 HISTORY_CHARS = 700
 DESK_CHARS = 2400
+
+#: How long :func:`decide` waits for the decision (s); the pipeline bounds a held send's wait for it by this.
+DECIDE_TIMEOUT_S = 3.0
 
 
 @dataclass
@@ -203,7 +208,7 @@ def _field(partial: str, name: str) -> Any:
     return None
 
 
-async def decide(client: Any, request: dict[str, Any], *, timeout_s: float = 3.0) -> Route:
+async def decide(client: Any, request: dict[str, Any], *, timeout_s: float = DECIDE_TIMEOUT_S) -> Route:
     """Stream the router's call and return as soon as its decision is complete (``to``, and ``screen`` when it is the
     thinker). Never raises: a failure or a timeout gives ``Route(to=None)`` (the talker's own hand-off then starts the
     thinker, as without a router, and the talker's own end_conversation ends the conversation)."""
@@ -243,5 +248,5 @@ async def decide(client: Any, request: dict[str, Any], *, timeout_s: float = 3.0
     return route
 
 
-__all__ = ["NAMED_LINE", "ROUTER_PROMPT", "ROUTES", "ROUTE_TOOL", "Route", "SENDING_LINE", "decide", "ends_on",
-           "router_request", "skills_line"]
+__all__ = ["DECIDE_TIMEOUT_S", "NAMED_LINE", "ROUTER_PROMPT", "ROUTES", "ROUTE_TOOL", "Route", "SENDING_LINE", "decide",
+           "ends_on", "router_request", "skills_line"]

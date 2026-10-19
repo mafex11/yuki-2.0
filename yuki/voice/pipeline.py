@@ -1472,6 +1472,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             elif isinstance(frame, (EagerEndOfTurnCancelFrame, InterruptionFrame)):
                 self._yuki_early_pending = None
                 self._yuki_words = None  # a cut reply's held words are never said
+                if isinstance(frame, EagerEndOfTurnCancelFrame):
+                    hook("words_withdrawn")  # integ23 S2 (c): a router decision on these partial words goes whole
                 hook("early_withdrawn")  # a hand-off whose call never completed: its early start is void
             held = self._yuki_held_calls
             if held is None:
@@ -3164,9 +3166,16 @@ class _Hooks:
             return None
 
     def early_withdrawn(self) -> None:
-        """The reply was cut (a barge-in, a withdrawn speculation): an early start whose call never ran is void."""
-        self.c._cancel_route()
+        """The reply was cut (a barge-in, a withdrawn speculation): an early start whose call never ran is void.
+        integ23 S2: the router's decision on a send's stop keeps that part (newer speech never voids a stop; a
+        withdrawn speculation's own decision went whole just before, :meth:`words_withdrawn`)."""
+        self.c._cancel_route(keep_stop=True)
         self.c.bridge.drop_early()
+
+    def words_withdrawn(self) -> None:
+        """integ23 S2 (c): an eager end of turn was withdrawn (the same turn went on): the router's decision on those
+        partial words is void whole, its stop part too (the turn's final words get a decision of their own)."""
+        self.c._cancel_route()
 
     def calls_made(self, ids: set[str]) -> None:
         """The reply's calls are complete: an early start for a call that is not among them is void."""
@@ -7258,6 +7267,7 @@ class Conversation:
                 you_cache.attach(self, False)
             self._scroll_hold(False)
             self._cancel_route()
+            self._cancel_stops()
             if getattr(self, "one_driver", None) is not None:
                 self.one_driver.close()   # oVoice: the hard stop's timer, an open countdown (nothing sent)
             self._unboost()
@@ -7857,7 +7867,7 @@ class Conversation:
             if awaited != "countdown":
                 return
             handoff = False
-        self._cancel_route()
+        self._cancel_route(keep_stop=True)   # integ23 S2: newer words never void an earlier decision's stop of a send
         pending = getattr(self.bridge, "routed_job", None)
         if callable(pending) and pending() is not None:
             # an earlier start the talker never took (this is a new run for the turn): withdrawn before a new one
@@ -7893,16 +7903,34 @@ class Conversation:
         s = self.settings
         # sVoice r2 L2 (sWire): the router knows the talker's skills, so "play my focus playlist" stays the talker's
         menu = getattr(getattr(self, "mouth_memory", None), "skills", None) if self._skill_keys() else None
+        sending = awaited == "countdown"
         request = router_request(heard[-1], history=history, desk=getattr(snap, "text", None) or None,
                                  call=self.call_app,
                                  model=str(getattr(s, "voice_router_model", "") or s.voice_mouth_model),
-                                 skills=menu, named=named, sending=awaited == "countdown")
+                                 skills=menu, named=named, sending=sending)
         turn = self.observer.user_turns
-        # what this decision may still do: the talker's reply ending first voids its hand-off (:meth:`_reply_done`)
-        state = {"handoff": handoff, "ends": ends,
+        # what this decision may still do: the talker's reply ending first voids its hand-off (:meth:`_reply_done`);
+        # integ23 S2: asked while an "all" send counts down, it has a stop part newer words never void (``stop``), for
+        # the sends open now only (``sends``: never one opened since); under one their final words end its countdown
+        state = {"handoff": handoff, "ends": ends, "stop": False, "to": None, "sends": None,
                  "start": float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)}
+        counting = getattr(self.bridge, "counting_sends", None)
+        if sending and callable(counting) and getattr(self, "one_driver", None) is None:
+            state["sends"] = counting()
+            state["stop"] = bool(state["sends"])
         self._route_state = state
-        self._router_task = asyncio.ensure_future(self._route(request, heard, context, call, turn, state))
+        task = asyncio.ensure_future(self._route(request, heard, context, call, turn, state))
+        self._router_task = task
+        out = getattr(self.bridge, "router_sends", None)
+        if state["stop"] and isinstance(out, dict):
+            # integ23 S1: a held countdown's watch never counts on while this verdict is out (VoiceBridge.
+            # _held_send_watch), bounded by decide's timeout and the end's wait; cleared when the decision is done,
+            # cancelled or failed (a done callback runs for a task cancelled before it started too)
+            from yuki.voice.router import DECIDE_TIMEOUT_S
+
+            key = id(state)
+            out[key] = time.monotonic() + DECIDE_TIMEOUT_S + self.ROUTE_END_WAIT_S
+            task.add_done_callback(lambda _t, k=key, d=out: d.pop(k, None))
 
     async def _route(self, request: dict[str, Any], heard: list[str], context: Any, call: Any, turn: int,
                      state: dict[str, Any] | None = None) -> None:
@@ -7911,12 +7939,13 @@ class Conversation:
 
         state = state if state is not None else {"handoff": True, "ends": False, "start": 0.0}
         route = await decide(self._client, request)
+        state["to"] = route.to
         call.route, call.route_ms = route.to, route.ms
         self.log.event("router", op="decided", to=route.to, screen=route.screen, ms=route.ms, error=route.error,
                        **({} if state["handoff"] else {"handoff": False}))
         if route.to == "end":
-            if state["ends"]:
-                await self._route_end(float(state["start"]))
+            if state["ends"] or state.get("stop"):
+                await self._route_end(float(state["start"]), state)
             return
         if route.to != "thinker" or not state["handoff"]:
             return
@@ -7982,20 +8011,28 @@ class Conversation:
                 self.log.event("router", op="cancelled", why="reply_first")
 
     #: D1: the router's end waits at most this long for Flux's eager end of turn to be confirmed by the final words (s);
-    #: a speculation withdrawn (they went on talking) cancels the decision with the talker's call (``early_withdrawn``).
+    #: a speculation withdrawn (they went on talking) cancels the decision with the talker's call (``words_withdrawn``).
     ROUTE_END_WAIT_S = 3.0
 
-    async def _route_end(self, start: float) -> None:
+    async def _route_end(self, start: float, state: dict[str, Any] | None = None) -> None:
         """D1 (20 Oct, keyword audit A1): the router's model judged that the user's words end the conversation (they
         send Yuki away or sign off) or, while a send of theirs counts down, call it off. Once a speculative talker call
         on the same words was confirmed (bounded): a send counting down is stopped at once, nothing sent, even when the
         talker answered first (:meth:`_stop_sends`: a wrong stop never sends); then the conversation ends with no
         goodbye, the end cue only, unless :meth:`_route_end_block` says why not (then the talker's own judgement
-        stands: its end_conversation ends it). ``start``: the start of speech of the words judged. Measured states
-        only, never the words; logged content-free."""
+        stands: its end_conversation ends it). ``start``: the start of speech of the words judged. ``state``: the
+        decision's own (:meth:`_route_turn`). integ23 S2: a decision asked while an "all" send counted down (``stop``)
+        stops that send even when they spoke again since (logged ``late``; only the sends open when it was asked,
+        ``sends``; under one their final words end the countdown themselves), and when newer words voided its end
+        part (:meth:`_cancel_route`), the stop is all it does. Measured states only, never the words; logged
+        content-free."""
+        sends = state.get("sends") if state else None
+        stop_part = bool(state and state.get("stop") and sends)
         llm = getattr(self, "_llm", None)
         waited = 0.0
         while llm is not None and getattr(getattr(llm, "_speculation_gate", None), "is_speculating", False):
+            if state is not None and not state.get("ends"):
+                break   # newer words voided its end: these were final (a withdrawn eager turn cancels it whole)
             if waited >= self.ROUTE_END_WAIT_S:
                 self.log.event("router", op="end_skipped", session=self.session, why="unconfirmed")
                 return
@@ -8003,9 +8040,11 @@ class Conversation:
             waited += 0.02
         obs = self.observer
         sending = self._words_awaited() == "countdown"
-        if sending and not self._stop.is_set() \
-                and float(getattr(obs, "_user_started_at", 0.0) or 0.0) == float(start):
-            self._stop_sends()
+        same = float(getattr(obs, "_user_started_at", 0.0) or 0.0) == float(start)
+        if sending and not self._stop.is_set() and (same or stop_part):
+            self._stop_sends(late=not same, only=None if same else sends)
+        if state is not None and not state.get("ends"):
+            return   # integ23 S2: its end part was voided by newer words; the stop was its part
         why = self._route_end_block(start, sending=sending)
         if why:
             self.log.event("router", op="end_skipped", session=self.session, why=why)
@@ -8111,22 +8150,23 @@ class Conversation:
         heard = list(getattr(self.observer, "recent_heard", ()) or ())
         return not any(at < float(when) < start for when, _words in heard)
 
-    def _stop_sends(self) -> None:
+    def _stop_sends(self, late: bool = False, only: frozenset[int] | None = None) -> None:
         """D1: the router judged that the user's words call off a send counting down (or send Yuki away while one
         does): it is stopped at once, nothing sent. Under one the driver's countdown is cancelled (``OneVoice.
-        stop_send``); under all the bridge stops the job whose countdown is open (``VoiceBridge.stop_sends``). Logged
-        content-free. Never raises."""
+        stop_send``); under all the bridge stops the job whose countdown is open (``VoiceBridge.stop_sends``).
+        ``late`` (integ23 S2): they spoke again before the verdict came (a stop never sends, so it still applies), and
+        ``only`` the sends open when the words were judged are stopped. Logged content-free. Never raises."""
         one = getattr(self, "one_driver", None)
         try:
             if one is not None:
                 stopped = int(bool(one.stop_send()))
             else:
                 stop = getattr(self.bridge, "stop_sends", None)
-                stopped = int(stop() or 0) if callable(stop) else 0
+                stopped = (int(stop(only=only) or 0) if only is not None else int(stop() or 0)) if callable(stop) else 0
         except Exception as exc:  # noqa: BLE001 - the held countdown never counts on past the end either way
             self.log.event("router", op="send_stop_error", session=self.session, error=type(exc).__name__)
             return
-        self.log.event("router", op="send_stopped", session=self.session, n=stopped)
+        self.log.event("router", op="send_stopped", session=self.session, n=stopped, **({"late": True} if late else {}))
 
     def _end_cue_now(self) -> None:
         """The end cue for an end with no goodbye said (``on_dismissed``: the session's soft end tone, the user's End
@@ -8165,14 +8205,35 @@ class Conversation:
             _OLD_REFLEXES["done"] = False
             log.event("reflex", op="drop_error", error=type(exc).__name__)
 
-    def _cancel_route(self) -> None:
-        self._route_state = None
+    def _cancel_route(self, keep_stop: bool = False) -> None:
+        """The router's decision still out is void, and its hand-off timer. integ23 S2: ``keep_stop`` (newer words: a
+        new talker call on a user turn, a new turn's interruption): a decision asked while a send counted down
+        (``stop``) that has not decided otherwise keeps its stop part: its end and hand-off are void, and it runs on
+        alone (kept in ``_stop_tasks``) so a late "end" still stops the send but never ends the conversation (a stop
+        never sends). State only."""
+        state, self._route_state = getattr(self, "_route_state", None), None
         task, self._router_task = getattr(self, "_router_task", None), None
         if task is not None and not task.done():
-            task.cancel()
+            if keep_stop and isinstance(state, dict) and state.get("stop") and state.get("to") in (None, "end"):
+                state["ends"] = state["handoff"] = False
+                kept = getattr(self, "_stop_tasks", None)
+                if kept is None:
+                    kept = self._stop_tasks = set()
+                kept.add(task)
+                task.add_done_callback(kept.discard)
+                self.log.event("router", op="stop_kept", session=self.session)
+            else:
+                task.cancel()
         timer, self._route_timer = getattr(self, "_route_timer", None), None
         if timer is not None:
             timer.cancel()
+
+    def _cancel_stops(self) -> None:
+        """integ23 S2: the conversation is over: the decisions kept for their stop part only are cancelled too (past
+        its end :meth:`_route_end` stops nothing, and a held countdown never counts on past it). State only."""
+        for task in list(getattr(self, "_stop_tasks", None) or ()):
+            if not task.done():
+                task.cancel()
 
     def _note_reply(self, calls: list[tuple[str, str, Any]]) -> None:
         """vRound2: the reply-level rule (:func:`reply_skips`) over a reply of several calls, before Pipecat runs them

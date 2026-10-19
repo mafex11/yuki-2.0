@@ -877,6 +877,10 @@ class VoiceBridge(QObject):
         #: submitted, steered or refused), and when each hand-off call came in (monotonic, the last few): a held
         #: countdown's words the talker routed itself are never steered in by code as well.
         self._routing: dict[int, float] = {}
+        #: integ23 S1: the router's verdicts still out on the user's words while a send counted down (the pipeline's
+        #: ``_route_turn`` puts each decision's deadline here and its task's end takes it out, monotonic): a held
+        #: countdown never counts on before they are in (:meth:`_held_send_watch`).
+        self.router_sends: dict[int, float] = {}
         self._handovers_at: deque[float] = deque(maxlen=8)
         #: IF-words (Item 2a): when each of the user's final turns was heard, and when the last spoken request ended
         #: the exchange (monotonic): the exchange a hand-off carries starts after it (:meth:`exchange_floor`).
@@ -1285,19 +1289,37 @@ class VoiceBridge(QObject):
         except Exception:  # noqa: BLE001
             return "task"
 
-    def stop_sends(self) -> int:
+    def _open_sends(self) -> list[Job]:
+        """The voice jobs whose send countdown is open now and has not sent (:meth:`stop_sends`). Call under the
+        lock."""
+        return [j for j in self._jobs.values() if j.source == "voice" and j.state == RUNNING and j.sending
+                and not j.sent and not j.cancel_requested and not j.superseded and j.job_id is not None]
+
+    def counting_sends(self) -> frozenset[int]:
+        """integ23 S2: the job ids :meth:`stop_sends` would stop now (none under brain one). The router's decision
+        keeps them, so a stop it makes after they spoke again stops only those, never a send opened since. State only;
+        never raises."""
+        try:
+            if getattr(self, "one", False):
+                return frozenset()
+            with self._lock:
+                return frozenset(int(j.job_id) for j in self._open_sends())
+        except Exception:  # noqa: BLE001
+            return frozenset()
+
+    def stop_sends(self, only: frozenset[int] | None = None) -> int:
         """D1 (20 Oct): stop at once every send of this conversation's spoken requests that is counting down now (an
         "all" voice job's open countdown, :attr:`Job.sending`, counting or held): the router's model judged that the
         user's words call it off, or send Yuki away while it counts. The job stops as the voice's own stop
         (:meth:`_cancel`, on the GUI thread): nothing is sent. A send that went already is never touched. Under brain
-        one: ``0`` (its own countdown is cancelled by the pipeline's driver). Returns how many were stopped. State only;
-        never raises."""
+        one: ``0`` (its own countdown is cancelled by the pipeline's driver). ``only`` (integ23 S2): just these job
+        ids (:meth:`counting_sends` when the words were judged). Returns how many were stopped. State only; never
+        raises."""
         try:
             if getattr(self, "one", False):
                 return 0
             with self._lock:
-                live = [j for j in self._jobs.values() if j.source == "voice" and j.state == RUNNING and j.sending
-                        and not j.sent and not j.cancel_requested and not j.superseded and j.job_id is not None]
+                live = [j for j in self._open_sends() if only is None or int(j.job_id) in only]
             for job in live:
                 job.cancel_requested = True
                 job.cancel_had_send = True
@@ -4640,11 +4662,22 @@ class VoiceBridge(QObject):
                     and not j.cancel_requested and j.convo == convo]
         return max(jobs, key=lambda j: j.started_at) if jobs else None
 
+    def _router_judging(self, now: float) -> bool:
+        """integ23 S1: whether a router verdict on the user's words while a send counted down is still out (its
+        deadline in :attr:`router_sends` not passed: decide's timeout plus the end's wait, about 6 s, inside the
+        brain's pause limit). Times only; ``False`` when it can't be read."""
+        try:
+            return any(until > now for until in tuple((getattr(self, "router_sends", None) or {}).values()))
+        except Exception:  # noqa: BLE001
+            return False
+
     async def _held_send_watch(self, job: Job, since: float | None, held_at: float, gen: int) -> None:
         """hands19 (C4): a countdown paused on the user's speech, until its pause is decided. It ends when the countdown
         did (``job.sending`` cleared: a cancel, a replacement, their words routed to it, the time ran out) or a newer
         pause of it took over (``gen``). Else it waits while the talker is on their turn (they speak or their voice is
-        heard, it writes or owes a reply, a tool or a hand-off of its is deciding), then:
+        heard, it writes or owes a reply, a tool or a hand-off of its is deciding) and, integ23 S1, while the router's
+        verdict on their words is still out (:meth:`_router_judging`: its stop only works while the job still counts
+        down), then:
 
         * words came (a final turn heard after ``since``), :data:`SEND_SETTLE_S` after the talker settled and at least
           ANSWER_HOLD_MIN_S after the last of them: review M2, when the talker routed none of the words it was given
@@ -4669,7 +4702,7 @@ class VoiceBridge(QObject):
                 newest = self.heard_log.newest() if self.heard_log is not None else None
                 words = newest is not None and (since is None or newest > since)
                 busy = self._talker_busy()
-                if busy or self._user_speaking() or self._routing:
+                if busy or self._user_speaking() or self._routing or self._router_judging(now):
                     settled_at = None
                     continue
                 settled_at = settled_at if settled_at is not None else now

@@ -166,12 +166,12 @@ _INSTANT_VOLUME = "window, tab, click, type, scroll, slider and media_key"
 
 #: The Skills paragraph (the lean talker's, in its words).
 SKILLS_PARAGRAPH = """\
-The Skills list below is what Yuki can do, each checked by the PC; a line shows their usual values. An ask a skill \
+The Skills list below is what Yuki can do, each checked by the PC; its line shows their usuals. An ask a skill \
 covers: run_skill, slots from their words (your reading of a misheard name) or a value its line lists, the rest left \
-out (code fills them from their usuals and names its guess). Of its last run: again true when they want it once \
-more ("a bit more", "from the top"); corrects true when they reject it or want another ("not that one"): the same \
-skill, never the value it ran, say_first neutral ("Switching."); neither for a new ask. Their answer to "Keep this \
-as your usual?" is keep_usual (typed: remember usual)."""
+out (code fills them from their usuals, names its guess). Of its last run: again true to repeat its change ("a \
+bit more"), never to restart what plays (the player's steps); corrects true when they reject it or want another \
+("not that one"): the same skill, never the value it ran, say_first neutral ("Switching."); neither for a new ask. \
+Their answer to "Keep this as your usual?" is keep_usual (typed: remember usual)."""
 
 MESSAGE_SENTENCE = (
     " Every message is run_skill message: person as heard (it resolves and asks), app only when they named one or the "
