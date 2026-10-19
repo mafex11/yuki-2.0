@@ -9,10 +9,12 @@ apps' mixer rows).
 
 Two sets say whose change is whose. ``acted``: what the request itself was about (a change to it is the ask, never
 flagged). ``touched``: the windows the act itself brought up or focused (the route's window, the launched app). The
-act's windows are the new ones, the touched ones and the asked ones; a change made by any other window (the user
-alt-tabbing during a countdown) is the user's own: it raises nothing, and :func:`render` marks it
-:data:`NOT_YOURS` so a look after acting never undoes it. Both take window ids (``int``) and/or app names
-(``"Discord"``, ``"Discord.exe"``). Each covered entry says ``by_act`` (the act's windows did it),
+act's windows are the touched ones, the asked ones, and the windows new since the before that are measurably the act's
+(safety T-1): of a touched or asked app, of a program in ``fresh`` (a launch's measured process, a skill run's measured
+apps), or owned by one of the act's windows. A change made by any other window (the user alt-tabbing during a
+countdown, or opening a window of their own while the act ran) is the user's own: it raises nothing, and
+:func:`render` marks it :data:`NOT_YOURS` so a look after acting never undoes it. All three take window ids (``int``)
+and/or app names (``"Discord"``, ``"Discord.exe"``). Each covered entry says ``by_act`` (the act's windows did it),
 ``side_effect`` (more than the ask itself) and ``by_mine`` (the covering window itself is one of the act's: the only
 cover whose window a tidy step may move; integration T1).
 
@@ -25,12 +27,13 @@ front, held the keyboard, or had a session playing in them:
   the window over it (for a minimised one: the new front) is one of the act's windows, or the act touched that window
   itself (unless it stayed where it was and a measured window none of the act's lies over it: the user's own cover,
   integration T1). When that window, or the new front, is the asked one, a merely-front window going under it is the ask
-  ("open Notepad" covers what was in front): it counts only when it was playing, or sits on another monitor than the
-  asked window.
+  ("open Notepad" covers what was in front; "show the GitHub tab" raising the asked Chrome window over another window
+  of Chrome the act touched by app: safety WW2): it counts only when it was playing, or sits on another monitor than
+  the asked window.
 * ``focus_taken``: the window in front before is still there and was not the ask, but the front (or the keyboard)
-  moved to a new or touched window the request was not about.
-* ``new_popup``: a window that did not exist before and that the request was not about is now in front or holds the
-  keyboard.
+  moved to one of the act's windows (new and the act's, or touched) the request was not about.
+* ``new_popup``: a window that did not exist before, is the act's and that the request was not about is now in front
+  or holds the keyboard.
 * ``left_silent`` (final-B, 19 Oct: "unmute it" at master 0 was a verified done, and silent): a sound control the
   act turned toward sound (unmuted it, or raised its level) is still silent after it: its level is 0, it is still
   muted, or (an app's mixer row) the master above it is at 0 or muted. Read only from the parts both snapshots
@@ -65,7 +68,7 @@ yes/no question; "off" does nothing.
 
 Public API::
 
-    compare(before, after, *, acted=(), touched=()) -> DeskDiff
+    compare(before, after, *, acted=(), touched=(), fresh=()) -> DeskDiff
     render(diff, max_chars=500) -> str      # plain words for the decider (no header: the caller titles it "After:")
     DeskDiff.facts() -> dict                # content-free, for log lines
     tidy_step(d, acts, front, monitors) -> dict | None   # the one legal undoable window step (C7)
@@ -137,6 +140,9 @@ class DeskDiff(_Rec):
     names: dict[int, str] = field(default_factory=dict)
     #: The monitors after the act (index -> "main" or ""), for the words.
     monitors: dict[int, str] = field(default_factory=dict)
+    #: Safety WW5: the monitor each window shows on after the act (``{hwnd: monitor index}``; only windows on a monitor,
+    #: not minimised, with at least ``situation.HIDDEN`` of them seen), for :func:`tidy_step`'s destination check.
+    seen_on: dict[int, int] = field(default_factory=dict)
 
     def facts(self) -> dict[str, Any]:
         """Content-free, for log lines: counts and flags only."""
@@ -187,17 +193,22 @@ def _moved(a: Window, b: Window) -> bool:
 
 
 def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
-            touched: Iterable[Any] = (), sound_apps: Iterable[Any] | None = None) -> DeskDiff:
+            touched: Iterable[Any] = (), sound_apps: Iterable[Any] | None = None,
+            fresh: Iterable[Any] = ()) -> DeskDiff:
     """What changed from ``before`` to ``after`` (two :func:`~yuki.perception.situation.snapshot` reads around one
     act), with the four flags (module docstring). ``acted``: what the request was about; ``touched``: the windows the
     act itself brought up or focused (ids or app names). ``sound_apps`` (integration review c2desk-1): when given, the
     apps whose mixer rows are the act's for ``left_silent`` alone (an app whose volume the act set touched none of its
-    windows); ``None``: those of ``acted`` and ``touched``, as before. Pure: no OS call. Never raises on odd input."""
+    windows); ``None``: those of ``acted`` and ``touched``, as before. ``fresh`` (safety T-1): the programs (or ids)
+    whose windows new since the before are the act's though no other window of theirs is (a launch's measured process,
+    a skill run's measured apps). Pure: no OS call. Never raises on odd input."""
     diff = DeskDiff()
     acted_hwnds, acted_apps = _acted_sets(acted)
     touched_hwnds, touched_apps = _acted_sets(touched)
+    fresh_hwnds, fresh_apps = _acted_sets(fresh)
     old = {w.hwnd: w for w in before.windows}
     new = {w.hwnd: w for w in after.windows}
+    act_ids = acted_hwnds | touched_hwnds
 
     def asked(w: Window | None) -> bool:
         return w is not None and (w.hwnd in acted_hwnds or (bool(acted_apps) and _key(w.app) in acted_apps))
@@ -206,8 +217,18 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
         return w is not None and (w.hwnd in touched_hwnds or (bool(touched_apps) and _key(w.app) in touched_apps))
 
     def of_act(w: Window | None) -> bool:
-        """One of the act's windows: new, touched, or the ask. Any other window that changed, the user changed."""
-        return w is not None and (w.hwnd not in old or touched_it(w) or asked(w))
+        """One of the act's windows: touched, the ask, or new since the before and measurably the act's (safety T-1:
+        one of ``fresh``'s programs or ids, or owned by one of the act's windows). Any other window that changed or
+        appeared, the user changed or opened."""
+        if w is None:
+            return False
+        if touched_it(w) or asked(w):
+            return True
+        if w.hwnd in old:
+            return False
+        owner = int(getattr(w, "owner", 0) or 0)
+        return w.hwnd in fresh_hwnds or (bool(fresh_apps) and _key(w.app) in fresh_apps) or (
+            bool(owner) and owner in act_ids)
 
     def remember(*ws: Window | None) -> None:
         for w in ws:
@@ -244,8 +265,9 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
             if (by is not None and not of_act(by) and not b.minimized and a.monitor == b.monitor
                     and not _moved(a, b)):
                 return False, False
-            return True, True
-        if not of_act(by):
+            # safety WW2: a touched window (another window of the act's app, touched by name) under the asked one
+            # takes the same ask rule as any other window below (the ask's own cover), never a side effect at once
+        elif not of_act(by):
             return False, False
         ask = by if asked(by) else (front_after if asked(front_after) else None)
         if ask is None:
@@ -255,12 +277,16 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
                                            and a.monitor != ask.monitor)
 
     if windows_read:
+        diff.seen_on = {int(w.hwnd): int(w.monitor) for w in after.windows
+                        if w.monitor is not None and not w.minimized and float(w.visible) >= HIDDEN}
         for hwnd, w in new.items():
             if hwnd not in old:
                 remember(w)
+                # ``by_act`` (safety T-1): the new window is measurably the act's; else the user opened it meanwhile
                 diff.new_windows.append({"hwnd": hwnd, "app": w.app, "kind": w.kind, "monitor": w.monitor,
                                          "state": _state_word(w), "foreground": w.foreground,
-                                         "keyboard": w.keyboard, "asked": asked(w), "visible": w.visible})
+                                         "keyboard": w.keyboard, "asked": asked(w), "visible": w.visible,
+                                         "by_act": of_act(w)})
         for hwnd, w in old.items():
             # a pop-up is only on the desk while in front or holding the keyboard, so its absence is not "closed"
             if hwnd not in new and w.kind != "popup":
@@ -338,7 +364,8 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
             front_before is not None and still is not None and not asked(still)
             and any(t is not None and t.hwnd != front_before.hwnd and of_act(t) and not asked(t) for t in moved_to)
             and not (still.foreground or still.keyboard))
-        diff.flags["new_popup"] = any((n["foreground"] or n["keyboard"]) and not n["asked"] for n in diff.new_windows)
+        diff.flags["new_popup"] = any((n["foreground"] or n["keyboard"]) and not n["asked"] and n["by_act"]
+                                      for n in diff.new_windows)
 
     # media: by session, a status or a track change. An app with one session on both sides is keyed by its app id (so
     # a new track is a track change); an app with several (browser tabs) by app id and title.
@@ -471,7 +498,8 @@ def render(diff: DeskDiff, max_chars: int = 500) -> str:
         bits = [b for b in ("in front" if n["foreground"] else "", "has the keyboard" if n["keyboard"] else "",
                             n["state"] if n["state"] not in ("normal",) else "") if b]
         kind = "pop-up" if n["kind"] == "popup" else "window"
-        lines.append(f"New {kind}: {name(n['hwnd'])} on {where}{', ' + ', '.join(bits) if bits else ''}.")
+        mine = "" if n.get("by_act", True) else f" {NOT_YOURS}"
+        lines.append(f"New {kind}: {name(n['hwnd'])} on {where}{', ' + ', '.join(bits) if bits else ''}{mine}.")
     for m in diff.moved:
         bits = []
         if m["from_monitor"] != m["to_monitor"]:
@@ -556,8 +584,9 @@ def tidy_step(d: Any, acts: Iterable[Any], front: Any, monitors: Any = None) -> 
     1. the front was taken and every window of theirs the act covered is that same window (or none was): give the
        front back to it (``focus_back``: raising it uncovers it too);
     2. a window of theirs (playing first, then the one in front) lies under one of the act's own windows, not
-       minimised, and there is another monitor: move that window of the act's to the other monitor (``place``: it
-       stays in view, theirs is uncovered);
+       minimised, and there is another monitor that shows none of their attention windows (safety WW5: the move
+       would cover their front or work window there): move that window of the act's to the other monitor
+       (``place``: it stays in view, theirs is uncovered);
     3. the front was taken: give it back (what is covered under something not the act's stays).
 
     ``{"action": "focus_back" | "place", "hwnd": int, "flag": "focus_taken" | "covered_attention", "covered": the
@@ -587,12 +616,20 @@ def tidy_step(d: Any, acts: Iterable[Any], front: Any, monitors: Any = None) -> 
                             f"undoes it"}
         if count > 1:
             ranked = sorted(covered, key=lambda c: (not c.get("playing"), not c.get("was_front")))
+            seen_on = getattr(d, "seen_on", None) or {}
             for c in ranked:
                 by = _hwnd(c.get("by"))
                 # integration T1: the covering window itself must be the act's (``by_mine``), whatever ``acts`` holds
                 if not by or by not in mine or c.get("minimised") or not c.get("by_act") or not c.get("by_mine"):
                     continue
                 theirs = _hwnd(c.get("hwnd"))
+                # safety WW5: "other" is a monitor this diff did not measure as free: the move is no step when any
+                # other monitor shows one of their attention windows (their front or work window would go under it,
+                # a maximised window kept maximised); the front given back (rule 3) is the step then, if it was taken
+                src = seen_on.get(by)
+                if src is None or any(seen_on.get(_hwnd(h)) not in (None, src)
+                                      for h in getattr(d, "attention", None) or ()):
+                    continue
                 tag = " (playing)" if c.get("playing") else ""
                 taken = f"; it also took the front from {name(taken_from)}" if taken_from else ""
                 return {"action": "place", "hwnd": by, "monitor": "other", "flag": "covered_attention",
@@ -644,8 +681,10 @@ TIDY_NO_APP = "that window"
 #: ONE agent's ``window``: move, maximize, fullscreen, restore; the planner's ``window_action``: place, maximize,
 #: fullscreen, restore; a ``place:other:left`` value reads as ``place``). The window such an act aimed at is where the
 #: user asked for it: code's own tidy step never moves it away again (:func:`tidy_guard`'s ``asked_place``), even when
-#: it now covers what played. Our own verb names, never the user's words.
-ARRANGE_ACTIONS: frozenset[str] = frozenset({"move", "place", "maximize", "fullscreen", "restore"})
+#: it now covers what played. Safety WW6: ``focus`` too (the window hand's, ONE's and ``window_action``'s: "switch to
+#: Discord" brings that window up where it is, as asked; the planner's ``focus_window`` is the executor's own). Our own
+#: verb names, never the user's words (``focus_back``, code's own tidy verb, is none of them).
+ARRANGE_ACTIONS: frozenset[str] = frozenset({"move", "place", "maximize", "fullscreen", "restore", "focus"})
 
 
 def arranges(action: Any) -> bool:
@@ -691,8 +730,8 @@ def tidy_guard(step: Any, d: Any, front_now: Any, front_after: Any, arranged: It
       after-read saw (the user brought another forward since, or another app took it): their desk is theirs;
     * ``asked_place`` (review F1): a move of a window whose own place or state the request asked for: ``arranged``,
       the windows the caller's acts of this turn or request aimed a window-arranging verb at (:func:`arranges`: "move
-      Discord to my other screen", "maximize Spotify", a skill run given a place). Over what played or not, it is
-      where they asked for it;
+      Discord to my other screen", "maximize Spotify", "switch to Discord", a skill run given a place). Over what
+      played or not, it is where they asked for it;
     * ``theirs``: a move of a window that held their attention before the act (in front, the keyboard, or playing:
       where they were working or watching). Code moves only a window the act brought up, never one of their own;
     * ``already``: the front to give back is already in front;

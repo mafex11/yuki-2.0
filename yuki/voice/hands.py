@@ -273,8 +273,9 @@ def arranged_windows(name: str, args: Any, facts: Any, before: Any = None, after
     """tidy21 review F1: the windows whose own place or state this act was asked for, from its own facts (ids, never
     words), so code's tidy step never moves one away again (``diff.tidy_guard``'s ``asked_place``): the window hand's
     (and the ONE ``window`` tool's) target windows for an arranging action (``diff.arranges``: move, maximize,
-    fullscreen, restore), as :meth:`Hands._scope` reads them; a skill run given a place (its ``place`` field) its
-    measured windows and the window it brought to the front. Empty for anything else. Pure; never raises."""
+    fullscreen, restore, and a focus: safety WW6), as :meth:`Hands._scope` reads them; a skill run given a place (its
+    ``place`` field) its measured windows and the window it brought to the front. Empty for anything else. Pure; never
+    raises."""
     out: set[int] = set()
     try:
         from yuki.perception import diff as desk_diff
@@ -2318,11 +2319,13 @@ class Hands:
                ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         """``(acted, touched)`` for :func:`yuki.perception.diff.compare`: whose change is whose, from the act's own
         facts (ids and app names, never words). A hand acts on what their words named: its window(s) and whatever its
-        step brought to the front (an opening's window, a link's page), by id, so another window of the same app (the
-        browser window playing their video) is never the ask; its app too only when it targeted every window of it
-        (minimize or close by app: ``_hwnds``). Its app is touched either way. A skill run (``facts["_desk_scope"]``)
-        touches its apps and, when a rung took focus, the window now in front when it is measurably the run's (one of
-        its measured windows, a new one, or one of its apps': integration T2); that window is the ask itself (by id;
+        step brought to the front (an opening's window, a link's page), by id, when that front is measurably its own
+        (safety WW1: a new window of its app, or any of its app's when it named no window; never one the user switched
+        to meanwhile), so another window of the same app (the browser window playing their video) is never the ask; its
+        app too only when it targeted every window of it (minimize or close by app: ``_hwnds``). Its app is touched
+        either way. A skill run (``facts["_desk_scope"]``) touches its apps and, when a rung took focus, the window now
+        in front when it is measurably the run's (one of its measured windows, or one of its apps': integration T2,
+        safety T-1); that window is the ask itself (by id;
         its apps when no window came forward) for a skill of kind ``open``, or a run that left its window to the user
         (a draft or an opened chat, never sent: the skill's own sends data); else a side effect (a message sent through
         Discord)."""
@@ -2341,8 +2344,8 @@ class Hands:
                             if isinstance(a, str) and a.strip()}
                 ids = {int(h) for h in scope.get("touched_windows") or ()
                        if isinstance(h, int) and not isinstance(h, bool)}
-                fresh = callable(getattr(before, "window", None)) and before.window(moved_front) is None
-                if not (int(moved_front) in ids or fresh or (win is not None and _app_id(win.app) in own_apps)):
+                # safety T-1: a window merely new since the before is no evidence (the user may have opened it)
+                if not (int(moved_front) in ids or (win is not None and _app_id(win.app) in own_apps)):
                     moved_front = None
             front = [int(moved_front)] if scope.get("focus") and moved_front else []
             asked = (front or apps) if scope.get("open") or scope.get("left") else []
@@ -2359,18 +2362,26 @@ class Hands:
                     out.append(int(h))
             except (TypeError, ValueError):
                 continue
-        if moved_front:
-            out.append(int(moved_front))
         app = facts["app"].strip() if isinstance(facts.get("app"), str) else ""
+        if moved_front and int(moved_front) not in out:
+            # safety WW1 / T-1 (integration T2's rule for a hand too): the window in front after the act is the act's
+            # only when it is measurably so: one of the hand's own windows (above), or a window of its app (its
+            # launched process) that is new since the before, or any of its app's when the hand named no window of
+            # its own; a window the user switched to or opened while the hand ran is never the act's
+            win = after.window(moved_front) if callable(getattr(after, "window", None)) else None
+            fresh = callable(getattr(before, "window", None)) and before.window(moved_front) is None
+            if win is not None and app and _app_id(win.app) == _app_id(app) and (fresh or not out):
+                out.append(int(moved_front))
         every = [app] if app and args.get("_hwnds") else []
         return tuple(out + every), tuple(out + ([app] if app else []))
 
     @staticmethod
     def _act_windows(after: Any, d: Any, acted: tuple[Any, ...], touched: tuple[Any, ...]) -> set[int]:
-        """The act's own windows after it (P1.3: the only ones a tidy move may move): the new ones, the ones it touched
-        or was asked about by id, and every window of an app only when the ask was the whole app (a touched app names
-        no window of its own: the browser window playing their video is theirs, never the act's to move)."""
-        ids = {int(n["hwnd"]) for n in getattr(d, "new_windows", None) or [] if n.get("hwnd")}
+        """The act's own windows after it (P1.3: the only ones a tidy move may move): the new ones that are measurably
+        the act's (``by_act``, safety T-1: never a window the user opened while it ran), the ones it touched or was
+        asked about by id, and every window of an app only when the ask was the whole app (a touched app names no
+        window of its own: the browser window playing their video is theirs, never the act's to move)."""
+        ids = {int(n["hwnd"]) for n in getattr(d, "new_windows", None) or [] if n.get("hwnd") and n.get("by_act")}
         named = {_app_id(a) for a in acted if isinstance(a, str) and a.strip()}
         ids |= {int(a) for a in (*acted, *touched) if isinstance(a, int) and not isinstance(a, bool)}
         ids |= {int(w.hwnd) for w in getattr(after, "windows", None) or [] if _app_id(w.app) in named}
@@ -2539,7 +2550,8 @@ class Hands:
         * guards first (``diff.tidy_guard``): the window in front is still the one the after-read saw (never over a
           window they or another app brought forward since), a move never takes a window of theirs (one that held their
           attention before the act) nor one whose own place or state the turn's acts were asked for (``arranged``:
-          :func:`arranged_windows`, review F1), and the Act switch of the step's window (:meth:`act_off`);
+          :func:`arranged_windows`, review F1), never the front given to one of Yuki's own windows (:meth:`_own_window`,
+          safety WW7), and the Act switch of the step's window (:meth:`act_off`);
         * then :meth:`_place_run` with the look itself: its own bounds (one step per look, only the act's windows move,
           the front only back to the window the act took it from), the desk guard, the acting marker, the undo journal
           group of the turn ("put it back" undoes it) and place's own game gate;
@@ -2560,6 +2572,8 @@ class Hands:
         try:
             front = await asyncio.to_thread(self._front_now)
             why = desk_diff.tidy_guard(step, d, front, getattr(after, "foreground", None), arranged)
+            if not why and op == "focus_back" and await asyncio.to_thread(self._own_window, step.get("hwnd")):
+                why = "own_window"   # safety WW7 (as ONE's review F5): Yuki's own chat or bar is never their front
             raw = desk_diff.step_app(step, after) or str(self._app_at(step.get("hwnd")) or "")
             if not why and self.act_off(raw):
                 why = "act_off"

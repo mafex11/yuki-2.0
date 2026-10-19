@@ -1231,6 +1231,13 @@ class Runner:
             if scope is not None:
                 scoped["_desk_scope"] = dict(scope)
             acted, touched = self.verbs.scope(name, resolved, scoped, ctx.before, after)
+            open_tidy = getattr(turn, "tidy", None)
+            if open_tidy is not None and open_tidy.open and open_tidy.before is not None:
+                # safety WW4: a later act of the turn joins the open tidy-up's scope (as the hands' ``_turn_before``
+                # keeps every act of the turn since), so the tidy debt never reads the windows it opened as asked as
+                # the flagged act's side effects (a new flagged diff below opens a tidy-up of its own, as before)
+                open_tidy.acted = tuple(dict.fromkeys([*(open_tidy.acted or ()), *acted]))
+                open_tidy.touched = tuple(dict.fromkeys([*(open_tidy.touched or ()), *touched]))
             d = desk_diff.compare(ctx.before, after, acted=acted, touched=touched)
             state.arranged |= self._arranged(name, resolved, scoped, ctx.before, after)
             own = {int(h) for h in self.verbs.act_windows(after, d, acted, touched) if h}
@@ -1494,7 +1501,8 @@ class Runner:
         """Final-B (one-desk D3/F6): a reply code would settle while the turn's tidy-up is still open with no tidy step
         taken (an earlier act of the turn was flagged; the act that finished their request was clean against its own
         before, which already held the cover). The desk is read once and compared with the flagged act's own before,
-        with that act's scope: still flagged, the net ``after`` and its ``flags`` (the agent gets one round with them);
+        with the scope of that act and of every act of the turn since (safety WW4, :meth:`_diff`): still flagged, the
+        net ``after`` and its ``flags`` (the agent gets one round with them);
         the cover gone, ``None`` (code settles as before). Once a turn (``Tidy.given``), so never a loop. Blocking
         (one desk read, a few ms). Never raises."""
         tidy = getattr(turn, "tidy", None)

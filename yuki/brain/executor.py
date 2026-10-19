@@ -537,6 +537,10 @@ class Executor:
         #: integration T3: the program keys (``situation._key``) this request's launches measured (the launch's process,
         #: its identity's image names): a new window of one of them in front after the acts is the ask, by id
         self._desk_launched: set[str] = set()
+        #: safety WW3 / T-1: the program keys a skill run's rungs were measured acting in (its ``acted_apps``): with
+        #: :attr:`_desk_launched`, the programs whose windows new since the first act are the acts' (``diff.compare``'s
+        #: ``fresh``); any other new window the user opened while the plan ran, and stays theirs
+        self._desk_programs: set[str] = set()
         #: tidy21 review F1: the windows whose own place or state this request's acts were asked for (a window_action
         #: place / maximize / fullscreen / restore, a skill run given a place: ``diff.arranges``): code's tidy step
         #: never moves one away again (``diff.tidy_guard``'s ``asked_place``)
@@ -775,8 +779,11 @@ class Executor:
                 return "", {}
             self._launched_front(after)
             named = {a for a in self._desk_asked | self._desk_touched if isinstance(a, str)}
+            # safety WW3 / T-1: a window new since the first act is the acts' only with evidence (a step's own report
+            # by id, a launched or acted-in program, an owner among the acts' windows); else the user opened it
             d = desk_diff.compare(self._desk_first, after, acted=tuple(self._desk_asked),
-                                  touched=tuple(self._desk_touched), sound_apps=tuple(self._desk_sound | named))
+                                  touched=tuple(self._desk_touched), sound_apps=tuple(self._desk_sound | named),
+                                  fresh=tuple(self._desk_launched | self._desk_programs))
             facts = d.facts()
             self._emit_log("after_look", ms=round(float(getattr(after, "ms", 0.0) or 0.0), 1), **facts)
             if not d.any_flag:
@@ -836,7 +843,9 @@ class Executor:
         request, inside the tidy turn's own bounds: :meth:`_tidy_mine` (only what this request's acts changed),
         ``diff.tidy_guard`` (the window in front is still the one the after-look saw; a move never takes a window of
         theirs, nor one whose own place or state a step of this request was asked for: review F1, ``_desk_arranged``),
-        rows 1-2 (a game in front, the "just suggest" kinds) and the window's own Act switch, the desk lease,
+        the user's hold on the run (safety T-2: a stop, the takeover pause or their added words waiting, as every act
+        step's checkpoint; again after an ask), rows 1-2 (a game in front, the "just suggest" kinds) and the window's
+        own Act switch, the desk lease,
         the acting marker, and :meth:`_place_act` (``yuki.actions.place``: undoable, journaled in the request's group
         so one "put it back" undoes it, place's own game gate). ``mode`` ``util.TIDY_ASK``: the step in code's words
         as the yes/no question first (:meth:`_tidy_ask`), run on their yes only; ``util.TIDY_OFF``: nothing.
@@ -853,6 +862,25 @@ class Executor:
         state, why, said = "left", "", ""
         started = time.perf_counter()
         action = "place" if step.get("action") == "place" else "focus_back"
+
+        def held() -> str:
+            # safety T-2: the user's own hold on the run, as every act step's checkpoint reads it (a stop, the takeover
+            # pause, their added words waiting): code's step never starts over it. Peeks only (the steer stays queued)
+            host = self.host
+            for code, name in (("cancelled", "cancelled"), ("paused", "paused")):
+                test = getattr(host, name, None)
+                try:
+                    if test() if callable(test) else bool(test):
+                        return code
+                except Exception:  # noqa: BLE001 - unreadable: the other checks stand
+                    continue
+            try:
+                peek = getattr(host, "steer_pending", None)
+                steer = peek() if callable(peek) else None
+            except Exception:  # noqa: BLE001
+                steer = None
+            return "steer" if any(str(w).strip() for w in steer or ()) else ""
+
         try:
             from yuki.perception import diff as desk_diff
 
@@ -864,6 +892,8 @@ class Executor:
             why = desk_diff.tidy_guard(step, d, self._front_since(), self._after_front, self._desk_arranged)
             if not why and not self._tidy_mine(action, hwnd):
                 why = "not_ours"
+            if not why:
+                why = held()
             if not why:
                 gate = consent.screen_gate(call, self._live(call))   # rows 1-2: a game in front, "just suggest"
                 why = str(gate.why or "refused") if gate is not None else ""
@@ -878,6 +908,8 @@ class Executor:
                 why = "busy"
             if not why and mode == util.TIDY_ASK and not self._tidy_ask(call):
                 why = "declined"
+            if not why and mode == util.TIDY_ASK:
+                why = held()   # safety T-2: they took over while the question waited
             if not why:
                 if not self.acting:
                     try:
@@ -1014,6 +1046,11 @@ class Executor:
                 measured = {h for h in (done.as_hwnd(w) for w in payload.get("acted_windows") or ()) if h}
                 self._desk_touched |= measured
                 self._desk_sound |= {words(a) for a in payload.get("acted_apps") or () if words(a)}
+                from yuki.perception.situation import _key
+
+                # safety WW3 / T-1: a new window of a program its rungs acted in is the run's (``diff`` ``fresh``)
+                self._desk_programs |= {_key(a) for a in payload.get("acted_apps") or ()
+                                        if isinstance(a, str) and _key(a)}
                 if not hwnds:
                     self._desk_touched |= set(self._skill_programs(payload, key, slots))
             elif call.tool == "app_volume" and words(call.input.get("app")):
@@ -1040,6 +1077,9 @@ class Executor:
 
                 if arranges(call.input.get("action")):
                     self._desk_arranged |= {int(h) for h in hwnds}
+            elif call.tool == "focus_window":
+                # safety WW6: the window they asked to come up is where they asked for it (as a window focus)
+                self._desk_arranged |= {int(h) for h in hwnds}
             elif call.tool == "run_skill" and words(call.input.get("place")):
                 self._desk_arranged |= {int(h) for h in hwnds}
                 self._desk_arranged |= {h for h in (done.as_hwnd(w) for w in payload.get("acted_windows") or ()) if h}
@@ -1078,9 +1118,10 @@ class Executor:
 
     def _tidy_ours(self, d: Any) -> set[int]:
         """The windows a tidy-up's place may move (:meth:`_tidy_mine`): the ones this request's acts brought up (a
-        step's window or its report's), new windows, the act's window over one of theirs, the front its acts took."""
+        step's window or its report's), new windows measurably the acts' (``by_act``, safety WW3: never one the user
+        opened while the plan ran), the act's window over one of theirs, the front its acts took."""
         ours = {h for h in self._desk_touched if isinstance(h, int) and not isinstance(h, bool)}
-        ours |= {done.as_hwnd(n.get("hwnd")) for n in d.new_windows}
+        ours |= {done.as_hwnd(n.get("hwnd")) for n in d.new_windows if n.get("by_act")}
         # integration T1: only a covering window that is itself the act's (new, touched or asked: ``by_mine``); a
         # window the user brought over a window a step touched stays theirs
         ours |= {done.as_hwnd(c.get("by")) for c in d.covered if c.get("by_mine")}

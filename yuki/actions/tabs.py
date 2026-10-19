@@ -330,7 +330,11 @@ def _watch_gone(automation: Any, hwnd: int, tab_id: str, mates: set[str], out: d
     def holds(now: list[tuple[Any, Any]]) -> bool:
         return any(t.tab_id == tab_id for t, _e in now)
 
+    def chosen(now: list[tuple[Any, Any]]) -> list[str]:
+        return [str(t.tab_id) for t, _e in now if t.selected and t.tab_id]
+
     seen = read_back = False
+    picked: list[str] | None = None
     deadline = time.monotonic() + CLOSE_WATCH_S
     while time.monotonic() < deadline:
         diag: dict[str, Any] = {}
@@ -339,6 +343,7 @@ def _watch_gone(automation: Any, hwnd: int, tab_id: str, mates: set[str], out: d
             break   # the window can't be read (gone): not seen, said as it is
         if _gone(now, diag, whole, tab_id, mates):
             seen = read_back = True
+            picked = chosen(now)   # safety WW8: the tab the browser showed right after the close (first read gone)
             break
         read_back = read_back or holds(now)
         time.sleep(POLL_S)
@@ -349,7 +354,8 @@ def _watch_gone(automation: Any, hwnd: int, tab_id: str, mates: set[str], out: d
         seen, read_back = False, True   # the last read holds it: it is still there, whatever an earlier read showed
     elif not seen and _gone(later, diag, whole, tab_id, mates):
         seen = read_back = True
-    out.update(seen=seen, read_back=read_back, after=_rows(later), after_complete=bool(whole))
+        picked = chosen(later)
+    out.update(seen=seen, read_back=read_back, after=_rows(later), after_complete=bool(whole), picked=picked)
 
 
 # ---------------------------------------------------------------------------
@@ -555,24 +561,31 @@ def _close_by_keys(hwnd: int, tab_id: str, keys: tuple[str, ...]) -> dict[str, A
     return out
 
 
-def _reselect(hwnd: int, was_on: list[str]) -> str:
+def _reselect(hwnd: int, was_on: list[str], picked: list[str] | None = None) -> str:
     """Integration T4: after the keyboard rung closed its tab, the tab the user was on before its select (the strip's
     one other selected tab, by RuntimeId) is selected again through UI Automation (SelectionItem.Select, no key), so the
-    browser shows what it showed before. A code word: ``reselected``, ``already`` (it is the selected one),
-    ``gone`` (no longer in the strip), ``none`` (no single tab to go back to: the closed tab was the one showing, or
-    several were selected), ``failed``. Blocking, bounded; never raises."""
+    browser shows what it showed before, only while the selection is still the one the browser itself made right after
+    the close (``picked``: the selected tab ids of the gone-watch's first read without the tab; safety WW8). A code
+    word: ``reselected``, ``already`` (it is the selected one), ``moved_on`` (another tab is selected now than the
+    browser's own pick, the user's click, or that pick is not known: never switched away), ``gone`` (no longer in the
+    strip), ``none`` (no single tab to go back to: the closed tab was the one showing, or several were selected),
+    ``failed``. Blocking, bounded; never raises."""
     if len(was_on) != 1:
         return "none"
     from yuki.actions.input import _Pending
     from yuki.perception.tree import _uia_core
 
     def job(automation: Any, shared: dict) -> None:
-        tab, element, _found, _whole = _find(automation, hwnd, was_on[0], KEYS_SELECT_S * 0.4)
+        tab, element, found, _whole = _find(automation, hwnd, was_on[0], KEYS_SELECT_S * 0.4)
         if tab is None:
             shared["got"] = "gone"
             return
         if tab.selected:
             shared["got"] = "already"
+            return
+        now = sorted(str(t.tab_id) for t, _e in found or () if t.selected and t.tab_id)
+        if picked is None or now != sorted(str(p) for p in picked):
+            shared["got"] = "moved_on"
             return
         shared["got"] = "reselected" if _select(element, _uia_core()) else "failed"
 
@@ -715,11 +728,13 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
                 shared["after"], shared["after_complete"] = seen["after"], seen.get("after_complete", True)
             else:
                 shared["after"], shared["after_complete"] = [], False   # no read after the key: never the old one
+            picked = seen.get("picked")   # safety WW8: the browser's own pick right after the close (None: unknown)
             if shared["seen"]:
                 # integration T4: the rung undoes its own side effects (the brains' tidy steps can't: a tab switch is
                 # no window step, and the raised window counts as asked): the tab they were on shows again, and the
                 # window that was in front gets the front back
-                details["keys_rung"]["reselected"] = _reselect(int(hwnd), list(rung.get("was_on") or []))
+                details["keys_rung"]["reselected"] = _reselect(int(hwnd), list(rung.get("was_on") or []),
+                                                               list(picked) if picked is not None else None)
                 details["keys_rung"]["front_back"] = _front_back(int(hwnd), rung.get("front_before"))
         else:
             shared["keys_why"], shared["keys_said"] = rung.get("why"), rung.get("said")
