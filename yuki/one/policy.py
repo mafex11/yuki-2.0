@@ -96,10 +96,6 @@ LINE_TIDY_STEPS = "Not done: that change got its tidy-up already; nothing more w
 #: message skill of this turn opened: text for a person goes through the message skill (it settles whom).
 LINE_CHAT_TYPE = ("Not typed: this window is a chat's; text for a person goes only through run_skill message (it "
                   "opens their chat, asks Who to? when it can't tell, and leaves a draft). Nothing was typed.")
-#: One20 (final-D S1 fallback, contract C9): a closing reply while the turn's flagged diff has its one legal undoable
-#: step untaken (code's fact; the agent takes it, never code).
-LINE_HOLD_TIDY = ("Not done yet: After shows a side effect of your act on their screen, and one undoable step undoes "
-                  "it: {step}. Take it unless their words asked for what it undoes, then say so in a few words.")
 #: The tidy dial says ask: the step in code's words (``executor.LINE_TIDY_ASK``).
 LINE_TIDY_ASK: dict[str, str] = {"place": "Should I move {app} to your other screen?",
                                  "focus_back": "Should I put {app} back in front?"}
@@ -282,13 +278,13 @@ class Tidy:
     #: One20 (final-D S2): the window in front before the flagged act, measured (``DeskDiff.focus_from`` when the act
     #: moved the front, ``focus_by_act``): a ``focus_back`` with no window is filled with it (it reaches row 8).
     focus_from: int | None = None
-    #: One20 (final-D S1 fallback, contract C7): the one legal undoable step for the flagged diff
-    #: (``perception.diff.tidy_step``: ``{"action": "focus_back" | "place", "hwnd", ...}``) and its words for the agent
-    #: (``window`` with its arguments); ``None`` / ``""``: none.
+    #: One20 (contract C7): the one legal undoable step for the flagged diff (``perception.diff.tidy_step``:
+    #: ``{"action": "focus_back" | "place", "hwnd", ...}``) and its words (``window`` with its arguments); ``None`` /
+    #: ``""``: none. tidy21: under the tidy dial "do" code takes it itself (``Runner._tidy_by_code``); kept as a fact
+    #: (no closing hold reads it any more: contract C12).
     step: dict[str, Any] | None = None
     step_words: str = ""
-    #: The budget's act count when this diff was flagged: the closing hold for its step holds only while no other act
-    #: came after it (a later act's own diff, or the tidy debt's fresh measure, speaks for the desk then).
+    #: The budget's act count when this diff was flagged.
     acts_at: int = 0
 
 
@@ -493,30 +489,21 @@ class Turn:
             self.guesses_asked.add(key)
 
     def closing_hold(self) -> str | None:
-        """Contract C9 (one20; final-D S5 and the S1 fallback): why a closing reply (a quiet, or words with no call)
-        should be held once, else ``None``. The budget's (:meth:`yuki.one.budget.TurnBudget.closing_hold`: the turn's
-        one miss, no act after it, the retry window open), else the turn's flagged diff whose one legal undoable step
-        (:attr:`Tidy.step_words`) nobody took (no tidy step, no tidy question asked, the dial not off). Code facts only;
-        pure (the voice driver holds once, through ``getattr``). Never raises."""
+        """Contract C9 (one20; final-D S5), narrowed by C12 (tidy21): why a closing reply (a quiet, or words with no
+        call) should be held once, else ``None``: the budget's miss only
+        (:meth:`yuki.one.budget.TurnBudget.closing_hold`: the turn's one miss, no act after it, the retry window
+        open). tidy21 (the user's decision 1): a flagged diff's one legal tidy step is no longer a reason: under the
+        tidy dial "do" code takes it itself (``Runner._tidy_by_code``), and at "ask" it is the user's yes/no, never a
+        hold. Code facts only; pure (the voice driver holds once, through ``getattr``). Never raises."""
         try:
             budget = self.budget
-            if budget is not None:
-                if getattr(budget, "closed", False):
-                    return None
-                hold = getattr(budget, "closing_hold", None)
-                why = hold() if callable(hold) else None
-                if why:
-                    return str(why)
-            tidy = self.tidy
-            with self._lock:
-                asked_tidy = any(row == 8 for _q, row in self.asks.values())
-            fresh = budget is None or int(getattr(budget, "acts", 0) or 0) == tidy.acts_at
-            if tidy.open and not tidy.acts and tidy.step_words and fresh and not asked_tidy \
-                    and util.tidy_mode(self.policy) != util.TIDY_OFF:
-                return LINE_HOLD_TIDY.format(step=tidy.step_words)
+            if budget is None or getattr(budget, "closed", False):
+                return None
+            hold = getattr(budget, "closing_hold", None)
+            why = hold() if callable(hold) else None
+            return str(why) if why else None
         except Exception:  # noqa: BLE001 - no hold
             return None
-        return None
 
     # -- the runner's facts -------------------------------------------------------------------------------------------
 
@@ -1168,7 +1155,7 @@ def _emit(turn: Turn, event: str, **fields: Any) -> None:
 
 
 __all__ = ["ALLOW", "ASK", "Decision", "ENTER_KEYS", "ESCAPE_KEYS", "KINDS", "LINE_ALREADY_SENT", "LINE_CHANNEL",
-           "LINE_CHAT_SEND", "LINE_CHAT_TYPE", "LINE_ERROR", "LINE_GAME", "LINE_HOLD_TIDY", "LINE_M9_ASK",
+           "LINE_CHAT_SEND", "LINE_CHAT_TYPE", "LINE_ERROR", "LINE_GAME", "LINE_M9_ASK",
            "LINE_SEND_BY_CODE", "LINE_SENT_AGAIN", "LINE_SHELL_LONG",
            "LINE_TIDY_ASK", "LINE_TIDY_OFF", "LINE_TIDY_STEPS", "LINE_UNKNOWN", "ONE_LINES", "PRIVATE_VERBS", "REFUSE",
            "TIDY_STEPS", "TYPED_WAIT_S", "Tidy", "Turn",

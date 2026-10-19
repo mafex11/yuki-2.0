@@ -64,7 +64,9 @@ request's own acts changed (:meth:`Executor._tidy_mine`: place a window its acts
 the window that was in front or held their attention), through the same consent rule, asked first when the user's tidy
 dial says ask; never bracketed again (one look per request); no done-check: the steps' own read-back decides, and
 code's words for each step that changed something (:data:`LINE_TIDY`, from what the step's report read back, never the
-model's) are said after the request's line.
+model's) are said after the request's line. **tidy21** (the user's decision 1, 19 Oct): when the after-look holds the
+one legal step (``diff.tidy_step``), code takes it itself with no planner call (:meth:`Executor.take_tidy_step`; the
+dial at ask: code's yes/no question first); the planner's tidy-up turn is left only for a flag with no such step.
 
 **Run rows** (D18): ``MemoryAccess.record_run`` in the shape the old loop writes, each step in its ``_trace_step``
 shape with ``tool`` the Dispatcher name that ran, the run's verdict from the done-check.
@@ -383,9 +385,6 @@ class RunResult:
     #: tidy-up turn (``""``: nothing flagged, no turn); ``after_facts``: the diff's content-free facts.
     after: str = ""
     after_facts: dict[str, Any] = field(default_factory=dict)
-    #: desk20 (final-D S1 fallback): with ``after``, the one legal tidy step in the plan's own terms (code's words, no
-    #: window text: ``"window_action, window 123, value focus_back"``), ``""`` when no single step undoes it.
-    after_step: str = ""
 
     def statuses_text(self) -> str:
         """The step statuses in one block, for the replan message."""
@@ -552,8 +551,11 @@ class Executor:
         #: words (:meth:`_stop_words`: the step and its app, the plan's act steps after it), kept across a later plan
         #: that ran no act (an invalid one) and let go once a later act step takes: ``{"what", "rest"}`` or ``None``
         self._stuck_said: dict[str, str] | None = None
-        #: desk20 (final-D S1 fallback): the after-look's one legal tidy step (``diff.tidy_step``) and its words
+        #: desk20 / tidy21: the after-look's one legal tidy step (``diff.tidy_step``), which code takes itself under the
+        #: tidy dial "do" (:meth:`take_tidy_step`), and the window the after-look saw in front (the step's guard)
         self._after_step: dict[str, Any] | None = None
+        self._after_front: int | None = None
+        self._after_state: Any = None
         _warm_desk()
         self._reset_plan()
         self._skill_context()
@@ -698,7 +700,6 @@ class Executor:
         result = self._done_check()
         if result.status == "done":
             result.after, result.after_facts = self.after_look()
-            result.after_step = self._tidy_step_words(self._after_step) if result.after else ""
             sent = isinstance(result.outcome, Mapping) and bool(result.outcome.get("send"))
             if self._purpose_line and result.line and not sent:
                 # integration review c2desk-2: said after the request's own line (never on a send's, consent's own)
@@ -755,7 +756,7 @@ class Executor:
         """What this request's acts did to the desk (module docstring): ``(the "After:" block, the diff's facts)``;
         the block is ``""`` when no flag is up (no turn, no cost). Logged content-free. Never raises."""
         self._purpose_line = ""   # integration review c2desk-2: this look's own, never an earlier plan's
-        self._after_step = None
+        self._after_step = self._after_state = self._after_front = None
         if self.tidy is not None or self._desk_first is None:
             return "", {}
         try:
@@ -782,30 +783,117 @@ class Executor:
             self._after_diff = d
             text = desk_diff.render(d, max_chars=AFTER_DIFF_CHARS)
             desk = situation.render(after, purpose="planner", max_chars=AFTER_DESK_CHARS)
-            # desk20 (final-D S1 fallback): code's classification and the one legal step (diff.tidy_step), from the same
-            # windows the tidy gate allows (:meth:`_tidy_ours`) and the front the acts took
+            # desk20: the one legal step (diff.tidy_step), from the same windows the tidy gate allows
+            # (:meth:`_tidy_ours`) and the front the acts took; tidy21 (decision 1): code takes it itself
+            # (:meth:`take_tidy_step`, the Brain's code tidy-up), so the planner's tidy turn is only for no step
             front = d.focus_from if (d.flags or {}).get("focus_taken") else None
             step = desk_diff.tidy_step(d, self._tidy_ours(d), front, len(getattr(after, "monitors", None) or ()))
             self._after_step = step
+            self._after_state, self._after_front = after, done.as_hwnd(getattr(after, "foreground", None))
             self._emit_log("after_step", action=(step or {}).get("action"), flag=(step or {}).get("flag"))
-            says = f"\n\nSide effect, by code's measure: {step['says']}." if step else ""
-            return f"After:\n{text}{says}\n\nThe desk now:\n{desk}", facts
+            return f"After:\n{text}\n\nThe desk now:\n{desk}", facts
         except Exception as exc:  # noqa: BLE001 - no look: the request ends as before
             self._emit_log("after_look", error=type(exc).__name__)
             return "", {}
 
-    @staticmethod
-    def _tidy_step_words(step: Mapping[str, Any] | None) -> str:
-        """desk20: ``diff.tidy_step``'s step as one plan step in the plan's own terms (code's words and the window's id
-        only, never a title): ``window_action, window 123, value focus_back`` (or ``value place:other``); ``""`` for
-        none."""
-        if not step:
+    def has_tidy_step(self) -> bool:
+        """tidy21: whether the latest after-look holds one legal tidy step for code to take (:meth:`take_tidy_step`)."""
+        return bool(self._after_step) and self._after_diff is not None and self.tidy is None
+
+    def take_tidy_step(self, mode: str) -> str:
+        """tidy21 (the user's decision 1, 19 Oct; final-D S1: the planner's tidy turns took 0 of 3 steps): the Brain's
+        tidy-up by code. The after-look's one legal step (``diff.tidy_step``: the front given back to the window the
+        acts took it from, or the acts' covering window moved to the other monitor) runs with no planner call, once per
+        request, inside the tidy turn's own bounds: :meth:`_tidy_mine` (only what this request's acts changed),
+        ``diff.tidy_guard`` (the window in front is still the one the after-look saw; a move never takes a window of
+        theirs), rows 1-2 (a game in front, the "just suggest" kinds) and the window's own Act switch, the desk lease,
+        the acting marker, and :meth:`_place_act` (``yuki.actions.place``: undoable, journaled in the request's group
+        so one "put it back" undoes it, place's own game gate). ``mode`` ``util.TIDY_ASK``: the step in code's words
+        as the yes/no question first (:meth:`_tidy_ask`), run on their yes only; ``util.TIDY_OFF``: nothing.
+
+        Returns code's words for after the request's line: the step's own (:data:`LINE_TIDY`, from what it read back)
+        when it changed something, the plain line (``diff.LINE_TIDY_FAILED``) when it ran and did not take, else ``""``
+        (not taken: a guard, a refusal, their no, or nothing changed). Logs content-free (``tidy`` with ``by_code``).
+        Never raises."""
+        step, d = self._after_step, self._after_diff
+        self._after_step = None   # once per request, taken or not
+        mode = str(mode or util.TIDY_DO)
+        if not step or d is None or self.tidy is not None or self._closed or mode == util.TIDY_OFF:
             return ""
+        state, why, said = "left", "", ""
+        started = time.perf_counter()
+        action = "place" if step.get("action") == "place" else "focus_back"
         try:
-            value = "place:other" if step.get("action") == "place" else "focus_back"
-            return f"window_action, window {int(step['hwnd'])}, value {value}"
-        except (KeyError, TypeError, ValueError):
-            return ""
+            from yuki.perception import diff as desk_diff
+
+            hwnd = int(step["hwnd"])
+            raw = desk_diff.step_app(step, self._after_state)
+            call = Call("window_action", {"action": action, **({"monitor": "other", "how": "keep"}
+                                                                  if action == "place" else {})},
+                        index=0, hwnd=hwnd, app=raw)
+            why = desk_diff.tidy_guard(step, d, self._front_since(), self._after_front)
+            if not why and not self._tidy_mine(action, hwnd):
+                why = "not_ours"
+            if not why:
+                gate = consent.screen_gate(call, self._live(call))   # rows 1-2: a game in front, "just suggest"
+                why = str(gate.why or "refused") if gate is not None else ""
+            if not why and raw:
+                try:
+                    why = "act_off" if util._shared_reader().app_off(raw) else ""
+                except Exception:  # noqa: BLE001 - an unreadable policy never blocks (rows 1-2's own rule)
+                    why = ""
+            if not why and self.lease.held and self.lease.owner != threading.get_ident():
+                why = "wrong_thread"
+            if not why and not self.lease.take():
+                why = "busy"
+            if not why and mode == util.TIDY_ASK and not self._tidy_ask(call):
+                why = "declined"
+            if not why:
+                if not self.acting:
+                    try:
+                        self.host.acting_begin()
+                        self.acting = True
+                    except Exception:  # noqa: BLE001 - the marker never breaks a run
+                        pass
+                self._emit(ToolCall(call.tool, {**call.input, "_about": self._about(call)}))
+                t0, wall = time.perf_counter(), time.time()
+                with self._dispatch_lock:
+                    outcome = self._place_act(call)
+                ms = round((time.perf_counter() - t0) * 1000, 1)
+                self._emit(ToolResult(call.tool, bool(outcome.ok), str(outcome.summary or "")[:300],
+                                      payload=outcome.payload, about=self._about(call)))
+                payload = outcome.payload if isinstance(outcome.payload, dict) else {}
+                details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+                self._trace_step(call, outcome, ok=bool(outcome.ok), verdict=bool(outcome.ok), why="tidy_by_code",
+                                 ms=ms, started=wall)
+                refused = _refused_kind(payload)
+                if outcome.ok:
+                    state = "taken"
+                    if details.get("changed"):   # review L1: words only for what its own read-back saw change
+                        self._tidy_changed += 1
+                        said = self._tidy_line(call, details, LINE_TIDY)
+                    else:
+                        why = "unchanged"
+                elif refused:
+                    why = f"refused_{refused}"   # a game or another gate: nothing reached it, nothing is said
+                else:
+                    state = "failed"
+                    said = desk_diff.tidy_line(step, util.app_name(raw) if raw else "", ok=False)
+        except Exception as exc:  # noqa: BLE001 - a step that broke is a step not taken; the request's line stands
+            why = why or type(exc).__name__
+        self._emit_log("tidy", verb="window_action", action=action, state=state, by_code=True, mode=mode,
+                       why=why or None, said=bool(said), ms=round((time.perf_counter() - started) * 1000, 1))
+        return said
+
+    def _front_since(self) -> int | None:
+        """tidy21: the window in front now, as the after-look reads it (:meth:`_own_aside`: Yuki's own window stands for
+        the one the user called it from), for :meth:`take_tidy_step`'s guard; ``None`` when it can't be read."""
+        front = _foreground_now()
+        if not front:
+            return None
+        if _is_own_window(front):
+            return done.as_hwnd(getattr(self.host, "origin_hwnd", None))
+        return int(front)
 
     @staticmethod
     def _purpose_words(d: Any) -> str:

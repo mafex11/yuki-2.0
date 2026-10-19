@@ -77,7 +77,9 @@ line, with the "After:" lines and one principle: keep their screen theirs (:data
 dial, ``ui.policy`` kind ``tidy``, can make it ask first or turn it off). Nothing flagged: the done line ends the call
 as before (``run_llm=False``), no model call. At most one look per user turn; its tidy-ups (the window hand's
 ``move``, ``focus_back``, ``undo``: :mod:`yuki.actions.place`, all undoable, never judged, gated for games) are never
-looked after again.
+looked after again. tidy21 (the user's decision 1, 19 Oct): with the dial at "do", the look's one measured step
+(``diff.tidy_step``) is taken by code itself (:meth:`Hands._tidy_by_code`) and said in code's own line; the talker is
+only told (and run only for a sound left silent). "ask" keeps the question; "off" does nothing.
 """
 
 from __future__ import annotations
@@ -222,17 +224,22 @@ _AFTER_ASK_NOTE = (
     "theirs: what they asked for stays; when your own act left a side effect worth undoing, ask in a few words whether "
     "to (the question alone, no call; their yes is the ask); otherwise stay quiet."
 )
-#: desk20 (final-D S1 fallback, desk-tidy RC-A: 0 of 14 window-flagged looks under "all" got their step; the one look
-#: that named its step, left_silent's, got it in both brains): with a window flag up and the one legal step measured
-#: (``diff.tidy_step``), the result carries code's classification (``side_effect``) and that step in the window hand's
-#: terms (``one_step``), and the principle has no "otherwise stay quiet" default.
-_AFTER_STEP_NOTE = (
-    "Done and verified; said is what was heard already. After is what your act did to their screen, and side_effect is "
-    "code's measure of the part that is yours, not what they asked for. Undo it now: call the window hand exactly as "
-    "one_step gives it, alone, with say_when_done a few words of what you put back. Stay quiet instead only when their "
-    "words asked for that very change."
+#: tidy21 (the user's decision 1, 19 Oct; final-D desk-tidy RC-A: 0 of 14 window-flagged looks under "all" got their
+#: step from the talker): under the tidy dial "do" code takes the look's one measured step itself
+#: (:meth:`Hands._tidy_by_code`: ``diff.tidy_step`` through :meth:`Hands._place_run` with the look's own guards) and
+#: says its own line; the talker is told what code did (``tidied``), never asked to do it, and gets a run only for a
+#: sound left silent (:data:`_AFTER_PURPOSE`). The S1 fallback's note that asked the talker to take the step is gone,
+#: so the step can never happen twice.
+_TIDIED: dict[str, str] = {
+    "taken": "code undid that side effect of your act with its one undoable step and said so (said)",
+    "failed": "code's one undoable step to undo that side effect did not take, and code said so (said)",
+    "left": "code left their windows as they are (their desk changed since, or their settings say no)"}
+_AFTER_TIDIED_NOTE = (
+    "Done and verified; said is what was heard already, code's own tidy-up line too. After is what your act did to "
+    "their screen; tidied is what code did about their windows: no window hand for it."
 )
-#: ... and with the tidy dial at "ask": the same, a question instead of the step.
+#: With the tidy dial at "ask" and the one legal step measured (``diff.tidy_step``): code's classification
+#: (``side_effect``) and the step in the window hand's terms (``one_step``), asked as a question, never taken.
 _AFTER_STEP_ASK_NOTE = (
     "Done and verified; said is what was heard already. After is what your act did to their screen, and side_effect is "
     "code's measure of the part that is yours, not what they asked for. Ask in a few words whether to undo it as "
@@ -624,13 +631,13 @@ _AFTER_REST = {"act": (" After is what that run did to their screen: what they a
                        "is undone with one undoable step (window move, focus_back) once the rest is done."),
                "ask": (" After is what that run did to their screen: what they asked for stays; once the rest is done, "
                        "ask in a few words whether to undo your own side effect."),
-               # desk20 (S1 fallback): with code's classification (side_effect) and the one legal step (one_step)
-               "act_step": (" After is what that run did to their screen; side_effect is code's measure of the part "
-                            "that is yours: once the rest is done, undo it with the window hand exactly as one_step "
-                            "gives it, unless their words asked for that very change."),
+               # desk20: with the tidy dial at "ask", code's classification (side_effect) and the one legal step
                "ask_step": (" After is what that run did to their screen; side_effect is code's measure of the part "
                             "that is yours: once the rest is done, ask in a few words whether to undo it as one_step "
-                            "would.")}
+                            "would."),
+               # tidy21 (decision 1): under "do" code took (or left) that one step itself and said so
+               "tidied": (" After is what that run did to their screen; tidied is what code did about their windows: "
+                          "no window hand for it.")}
 #: Phase 2 (2.3): a non-success outcome of a hand or a skill run (not confirmed, failed, held, blocked, stopped, timed
 #: out) is said by the talker in its own words from the evidence (the report), never a code template; code's own line
 #: waits in the owed ledger and is said only when the talker's run is not heard in time (``VoiceBridge.owe_line``).
@@ -2349,10 +2356,15 @@ class Hands:
         is kept for focus_back. Logs content-free. Never raises.
 
         desk20 (final-D): the look is given for a window flag (dial not off) or a sound left silent; with a window flag
-        the result also carries ``flags``, and when ``diff.tidy_step`` finds the one legal step, ``side_effect`` (code's
-        classification) and ``one_step`` (the window hand's arguments), with :data:`_AFTER_STEP_NOTE` (no "otherwise
-        stay quiet"). A tab of the act's over what played is said by code at once (``diff.cover_line``) and comes back
-        as ``"_cover"`` (the callers add it to ``said``); with nothing else to look at, ``{"_cover": line}`` alone."""
+        the result also carries ``flags``. A tab of the act's over what played is said by code at once
+        (``diff.cover_line``) and comes back as ``"_cover"`` (the callers add it to ``said``); with nothing else to look
+        at, ``{"_cover": line}`` alone.
+
+        tidy21 (the user's decision 1): when ``diff.tidy_step`` finds the one legal step, under the dial "do" code takes
+        it itself (:meth:`_tidy_by_code`), says its line (added to ``"_cover"``) and the result says what code did
+        (``tidied``); with nothing else for the talker (no sound left silent) it comes back ``"_quiet"`` (the callers
+        settle the call with no talker run). Under "ask" the result carries ``side_effect`` and ``one_step`` with
+        :data:`_AFTER_STEP_ASK_NOTE` (the question, never the step). No step: as before."""
         if before is None:
             return None
         try:
@@ -2399,8 +2411,8 @@ class Hands:
             taken = bool(d.flags.get("focus_taken")) and d.focus_from
             acts_now = set() if off else self._act_windows(after, d, acted, touched)
             front = int(d.focus_from) if taken and not off else None
-            # desk20 (final-D S1 fallback): code's own classification of the flag and the one legal step (measured:
-            # the act's windows, the front it took, the monitors), so the decider is never left to judge it unaided
+            # desk20 / tidy21: code's own classification of the flag and the one legal step (measured: the act's
+            # windows, the front it took, the monitors): code takes it under "do", the talker asks it under "ask"
             step = (desk_diff.tidy_step(d, acts_now, front, len(getattr(after, "monitors", None) or ()))
                     if look and windowed and not off else None)
             if self.log is not None:
@@ -2423,12 +2435,22 @@ class Hands:
                           "rest": bool(rest), "silent": bool(d.flags.get("left_silent")), "ask": level == "ask",
                           "off": off, "purpose": purpose, "step": step}
             out: dict[str, Any] = {"after": text, "flags": [k for k, v in d.flags.items() if v]}
-            if step is not None:
-                # desk20: the step in the window hand's own terms, and the note without "otherwise stay quiet"
+            if step is not None and level == "do":
+                # tidy21 (decision 1, S1): code takes the one measured step itself, through the look's own guards, and
+                # says its line; the talker is told what code did, never asked to do it (and so never twice)
+                taken = await self._tidy_by_code(params, step, d, after, turn)
+                out["tidied"] = _TIDIED.get(taken.get("state", "left"), _TIDIED["left"])
+                if taken.get("said"):
+                    cover = " ".join(x for x in (cover, taken["said"]) if x)
+                note = _AFTER_TIDIED_NOTE + (_AFTER_PURPOSE + " Otherwise stay quiet." if purpose
+                                             else " Say nothing now.")
+                if not purpose:
+                    out["_quiet"] = True   # nothing left for the talker: the call settles on code's own lines
+            elif step is not None:
+                # desk20: with the dial at "ask", the step in the window hand's own terms, asked as a question
                 out["side_effect"] = step["says"]
                 out["one_step"] = _one_step_call(step)
-                note = (_AFTER_STEP_ASK_NOTE if level == "ask" else _AFTER_STEP_NOTE) + (
-                    _AFTER_PURPOSE if purpose else "")
+                note = _AFTER_STEP_ASK_NOTE + (_AFTER_PURPOSE if purpose else "")
             else:
                 note = _AFTER_PURPOSE_NOTE if off else (_AFTER_ASK_NOTE if level == "ask" else _AFTER_NOTE) + (
                     _AFTER_PURPOSE if purpose else "")
@@ -2451,6 +2473,103 @@ class Hands:
             return cover
         except Exception:  # noqa: BLE001 - not said: the look (if any) still shows it in After
             return ""
+
+    async def _tidy_by_code(self, params: Any, step: dict[str, Any], d: Any, after: Any, turn: Any) -> dict[str, str]:
+        """tidy21 (the user's decision 1, final-D S1): under the tidy dial "do", code takes the look's one measured
+        step (``diff.tidy_step``: the front given back to the window the act took it from, or the act's covering window
+        moved to the other monitor) itself, once, right after the look's done line:
+
+        * guards first (``diff.tidy_guard``): the window in front is still the one the after-read saw (never over a
+          window they or another app brought forward since), a move never takes a window of theirs (one that held their
+          attention before the act), and the Act switch of the step's window (:meth:`act_off`);
+        * then :meth:`_place_run` with the look itself: its own bounds (one step per look, only the act's windows move,
+          the front only back to the window the act took it from), the desk guard, the acting marker, the undo journal
+          group of the turn ("put it back" undoes it) and place's own game gate;
+        * the step's record on the action log, then code's own line (``diff.tidy_line``): what it did, or plainly that
+          it did not take (said once). Left (a guard, a refusal, a game): nothing is said.
+
+        The look's one step is used either way (a talker call after it is refused as a second tidy step). Returns
+        ``{"state": "taken" | "failed" | "left", "said": the line said ("" none)}``. Logs content-free. Never raises."""
+        from yuki.perception import diff as desk_diff
+
+        look = self._look
+        args = _one_step_call(step)
+        op = str(args.get("action") or "")
+        started = time.monotonic()
+        state, said, why = "left", "", ""
+        ok, facts = False, {}
+        try:
+            front = await asyncio.to_thread(self._front_now)
+            why = desk_diff.tidy_guard(step, d, front, getattr(after, "foreground", None))
+            raw = desk_diff.step_app(step, after) or str(self._app_at(step.get("hwnd")) or "")
+            if not why and self.act_off(raw):
+                why = "act_off"
+            if why:
+                if look is not None:
+                    look["used"] = True   # the look's one step was code's to take; left, it is no talker's either
+            else:
+                # the step's windows are measured (the after-read), not named by a model: made actable by id, as the
+                # ONE runner does for an act's after (``Verbs.learn``), so a window the act just opened can be moved
+                Verbs(self).learn(after)
+                if self.bridge is not None:
+                    self.bridge.busy_tools += 1
+                try:
+                    ok, report, facts = await asyncio.to_thread(self._place_run, op, args, turn, look)
+                finally:
+                    if self.bridge is not None:
+                        self.bridge.busy_tools = max(0, self.bridge.busy_tools - 1)
+                        if self.bridge.gate is not None:
+                            self.bridge.gate.poke()
+                ran = facts.get("sent_at") is not None
+                if ok:
+                    state = "taken"
+                elif ran and not facts.get("refused"):
+                    state = "failed"
+                else:
+                    why = str(facts.get("refused_why") or facts.get("refused") or "refused")
+                if ran:
+                    if self.on_action is not None:
+                        self.on_action(facts["sent_at"])
+                    if not facts.get("halted"):
+                        self._keep_record(params, "window", args, report, ok=ok, verified=facts.get("verified"),
+                                          turn=turn, hwnd=facts.get("live_hwnd"))
+                    if self.on_step is not None:
+                        try:
+                            self.on_step("window", hand_words("window", args, facts.get("app")), bool(ok),
+                                         report[:400], round((time.monotonic() - started) * 1000))
+                        except Exception:  # noqa: BLE001 - the screen never breaks a hand
+                            pass
+                if state != "left":
+                    from yuki.brain.util import app_name
+
+                    line = desk_diff.tidy_line(step, app_name(raw) if raw else "", ok=ok)
+                    if line:
+                        from pipecat.frames.frames import TTSSpeakFrame
+
+                        await params.llm.push_frame(TTSSpeakFrame(text=line))
+                        said = line
+        except Exception as exc:  # noqa: BLE001 - a step that broke is a step not taken; nothing more is done
+            why = why or type(exc).__name__
+        finally:
+            if look is not None:
+                look["by_code"] = True
+        if self.log is not None:
+            self.log.event("hands", op="window", action=op, tidy=True, by_code=True, state=state, why=why or None,
+                           ok=ok, said=bool(said), ms=round((time.monotonic() - started) * 1000),
+                           call=getattr(params, "tool_call_id", None))
+        return {"state": state, "said": said}
+
+    def _front_now(self) -> int | None:
+        """tidy21: the window in front now, for the code tidy step's guard (blocking): one read-only Win32 call on the
+        real desktop, a stand-in desk's own overview otherwise (rule 7); ``None`` when it can't be read."""
+        if _is_real_backend(self.backend):
+            try:
+                import ctypes
+
+                return int(ctypes.windll.user32.GetForegroundWindow() or 0) or None
+            except Exception:  # noqa: BLE001
+                return None
+        return self._foreground()
 
     def _place_verbs(self) -> Any:
         """Where the placement verbs run: the backend's own (a stand-in desk's ``place_window`` / ``focus_back`` /
@@ -2908,12 +3027,14 @@ class Hands:
             in_look = look is not None and arrived >= float(look.get("at") or 0.0) and not look.get("rest")
             placing = name == "window" and str(args.get("action") or "") in PLACE_OPS
             # integration review c2desk-2: a look whose After shows the sound still silent lets one volume step through
-            # (its one step, as a placement's is); everything else stays held
-            sound_step = bool(in_look and look.get("silent") and not look.get("used") and (
+            # (its one step, as a placement's is); everything else stays held. tidy21: a window step code took itself
+            # (``by_code``) leaves that one volume step to the talker still
+            sound_step = bool(in_look and look.get("silent") and not look.get("sound_used")
+                              and (not look.get("used") or look.get("by_code")) and (
                 name == "app_volume" or (name == "media_key" and str(args.get("key") or "") in _VOLUME_KEYS)
                 or (name == SKILL_HAND and str(args.get("skill") or "").strip() == VOLUME_SKILL)))
             if sound_step:
-                look["used"] = True
+                look["used"] = look["sound_used"] = True
             if (gate is not None and gate.get("passed") and not spared) or (
                     in_look and not placing and not spared and not sound_step):
                 from pipecat.frames.frames import FunctionCallResultProperties
@@ -3238,12 +3359,14 @@ class Hands:
             # P1.3: the done line is queued; only an act that took something the user had gets one more run
             look = await self._look_after(params, name, args, facts, desk_before)
             cover = str((look or {}).pop("_cover", "") or "")   # desk20 (S3): said by code after the done line
+            quiet = bool((look or {}).pop("_quiet", False))   # tidy21: code took the tidy step; nothing for the talker
             said = " ".join(x for x in (line if speak else "", cover) if x)
-            if look:
+            if look and not quiet:
                 await params.result_callback({"done": report[:700], "said": said, **look})
                 return
-            await params.result_callback({"done": report[:700], "said": said,
-                                          "how_to_handle_it": _SAID_NOTE if said else _SILENT_NOTE},
+            await params.result_callback({"done": report[:700], "said": said, **(look or {}),
+                                          "how_to_handle_it": (look or {}).get("how_to_handle_it")
+                                          or (_SAID_NOTE if said else _SILENT_NOTE)},
                                          properties=FunctionCallResultProperties(run_llm=False))
             return
         if facts.get("held"):
@@ -4483,16 +4606,22 @@ class Hands:
                 # calls stay open: the look is marked as one with a rest)
                 look = await self._look_after(params, name, args, facts, before, rest=True)
                 cover = str((look or {}).pop("_cover", "") or "")   # desk20 (S3): said by code after the line
+                (look or {}).pop("_quiet", None)   # tidy21: the rest is the talker's anyway
                 said = " ".join(x for x in (line, cover) if x)
                 if look:
                     kept = self._look or {}
                     extra = {"after": look.get("after"), "flags": look.get("flags") or []}
-                    if look.get("one_step"):
-                        # desk20 (S1 fallback): code's classification and the one legal step ride with the rest
-                        extra.update(side_effect=look.get("side_effect"), one_step=look.get("one_step"))
-                    if not kept.get("off"):
-                        note += _AFTER_REST[("ask" if kept.get("ask") else "act")
-                                            + ("_step" if look.get("one_step") else "")]
+                    if look.get("tidied"):
+                        # tidy21 (decision 1): code took (or left) the one tidy step itself and said so
+                        extra["tidied"] = look["tidied"]
+                        note += _AFTER_REST["tidied"]
+                    else:
+                        if look.get("one_step"):
+                            # desk20: with the dial at "ask", code's classification and the step ride with the rest
+                            extra.update(side_effect=look.get("side_effect"), one_step=look.get("one_step"))
+                        if not kept.get("off"):
+                            note += _AFTER_REST[("ask" if kept.get("ask") else "act")
+                                                + ("_step" if look.get("one_step") else "")]
                     if kept.get("purpose"):
                         note += _AFTER_PURPOSE   # integration review c2desk-2
             if self.log is not None:
@@ -4515,12 +4644,14 @@ class Hands:
             if verified and not facts.get("keep_question"):
                 look = await self._look_after(params, name, args, facts, before)
             cover = str((look or {}).pop("_cover", "") or "")   # desk20 (S3): said by code after the done line
+            quiet = bool((look or {}).pop("_quiet", False))   # tidy21: code took the tidy step; nothing for the talker
             said = " ".join(x for x in (line, cover) if x)
-            if look:
+            if look and not quiet:
                 await params.result_callback({"done": report[:700], "said": said, **look})
                 return
-            await params.result_callback({"done" if verified else "result": report[:700], "said": said,
-                                          "how_to_handle_it": self._SKILL_SAID_NOTE.format(line=said)},
+            await params.result_callback({"done" if verified else "result": report[:700], "said": said, **(look or {}),
+                                          "how_to_handle_it": (look or {}).get("how_to_handle_it")
+                                          or self._SKILL_SAID_NOTE.format(line=said)},
                                          properties=FunctionCallResultProperties(run_llm=False))
             return
         if facts.get("unsure_focus"):
@@ -7689,6 +7820,11 @@ class Verbs:
 
     def foreground(self) -> int | None:
         return self.hands._foreground()
+
+    def front_now(self) -> int | None:
+        """tidy21: the window in front now in one read-only call (:meth:`Hands._front_now`), for the code tidy step's
+        guard; ``None`` when it can't be read."""
+        return self.hands._front_now()
 
     # -- the verbs (blocking, on the worker thread, inside the runner's ``one_call``) -----------------------------
 
