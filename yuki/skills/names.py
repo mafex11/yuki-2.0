@@ -34,20 +34,25 @@ name's first sound can go into the word heard before it ("the|scored" for "dis|c
 letters put back when the word before ends in them as written, or is them heard as another short word ("the" for
 "di").
 
-Two modes. A whole turn (the default, contract C11's use): every run, bar :data:`TURN_BAR`. A name given to an act
-(``as_name``: a launch's app name, a site value, an app slot's value): the name whole, or the runs that end at its last
-word (never a part before them: "microsoft edge" is no teams.microsoft.com), bar :data:`BAR`.
+One mode (kw3, 20 Oct, contract K2; the user's direction: intent, never words, drives Yuki): a name given to an act
+(``as_name``: a launch's app name, a site value, an app slot's value: a name the model already chose), measured whole
+or by the runs that end at its last word (never a part before them: "microsoft edge" is no teams.microsoft.com), bar
+:data:`BAR`. The whole-turn mode (every run of a user's turn, bar :data:`TURN_BAR`) is gone: no caller fills an app or a
+site from any one-to-three-word run of what the user said ("Turn the game down so I can hear the score" measured "the
+score" as Discord); a misheard name is understood by the model, and only the name it chose is resolved here.
+:data:`TURN_BAR` stays as a strength bar for a reader that keeps only the clearest winners (the voice's near reading of
+a heard stretch, ``yuki.voice.pipeline.measured_near``: a hint to the model, never an act).
 
 skill22 (A14: "this card", "chat BP", "InstaCol" and "Ark" scored under the bar). A possessive's "'s" is no word
 ("Deezy's" is "Deezy": a format rule), and the sound code says "j" as the voiced "ch" (:func:`sound_code`). A name
-given to an act, and only that, is also measured three more ways, each a fixed rule over letters and sounds: a short
-name (three or four letters) by the very same sounds (:data:`SHORT_BAR`: "Ark" for Arc, "Deezy" for Deji); a vowel
-heard as another class costing half an edit (:data:`NAME_VOWEL_COST`: "this card" for Discord); a one-word name of
-theirs said by its first letters as written, when the given name is one written word (:data:`CLIP_SHARE`: "insta" for
-instagram.com; a word the recognizer wrote as two joined ones, "InstaCol", by its first part). The short rule and the
-clip score under :data:`TURN_BAR` (:data:`NAME_RULE_MAX`), so only the name bar takes a name by them. A whole turn is
-measured exactly as before. "chat BP" stays under the bar (0.69: one letter of "GPT" dropped and one changed is two edits of
-seven; no fixed rule raises it without raising plain words).
+given to an act is also measured three more ways, each a fixed rule over letters and sounds: a short name (three or
+four letters) by the very same sounds (:data:`SHORT_BAR`: "Ark" for Arc, "Deezy" for Deji); a vowel heard as another
+class costing half an edit (:data:`NAME_VOWEL_COST`: "this card" for Discord); a one-word name of theirs said by its
+first letters as written, when the given name is one written word (:data:`CLIP_SHARE`: "insta" for instagram.com; a
+word the recognizer wrote as two joined ones, "InstaCol", by its first part). The short rule and the clip score under
+:data:`TURN_BAR` (:data:`NAME_RULE_MAX`), so a reader at that bar never takes a name by them. "chat BP" stays under
+the bar (0.69: one letter of "GPT" dropped and one changed is two edits of seven; no fixed rule raises it without
+raising plain words).
 
 **The winner** must reach the bar and beat the best name of every other group by :data:`MARGIN`. Names one of which
 holds the other ("Chrome" in "Google Chrome") or with the same spoken form (the Claude app and claude.ai) are one
@@ -57,7 +62,8 @@ before a site of the same name wins a tie). Otherwise ``None``: today's behaviou
 Calibrated on 19 Oct on the DB copy (200 own names: 123 apps, 77 sites), the clips' transcripts of final-B/final-D and
 the user's 1008 turns; the numbers are at each constant and in docs/research/final-test-2026-10-19/builds/names21.md.
 
-Contract C11 (voice21): :func:`own_names` and :func:`best_match`, both pure apart from the store read, never raising.
+Contract C11 (voice21): :func:`own_names` and :func:`best_match` (name mode only, contract K2), both pure apart from
+the store read, never raising.
 Nothing here is logged: the callers log content-free facts (the score, the margin, the kind and source of the name),
 never the name or the words.
 """
@@ -109,23 +115,22 @@ TAIL_MIN_LETTERS = 5
 #: 120 names a model might give that no Start entry has ("browser", "microsoft edge", "game"), 5 took one, each the
 #: right one ("aniwave" aniwaves.ru 0.88, "settings app" Settings 0.78, "paint 3d" Paint 0.92)...
 BAR = 0.75
-#: ...a whole turn (the default): this. On the user's 1008 turns the non-literal winners between 0.75 and 0.85 were
-#: plain words ("click" ~ Clock 0.78, "not in" ~ notion.com 0.83, "open a" ~ openai.com 0.83, "What's up" ~ WhatsApp
-#: 0.85-, 13 turns); at 0.85, 6 winners (8 with names heard right left out), each a real mishearing ("spot if"
-#: Spotify 0.93, "dev mefex" devmafex.com 0.88, "discard call" Discord 0.86). "Open Porbex Kaladra." (0.80) and "GIF
-#: hub cold bro." (0.82) fall under it as whole turns; their names given to an act take the name bar.
+#: ...a reader that keeps only the clearest winners (the voice's near reading of a heard stretch, a hint to the model:
+#: ``yuki.voice.pipeline.measured_near``): this. Calibrated when whole turns were measured (kw3: that mode is gone): on
+#: the user's 1008 turns the non-literal winners between 0.75 and 0.85 were plain words ("click" ~ Clock 0.78, "not in"
+#: ~ notion.com 0.83, "open a" ~ openai.com 0.83, "What's up" ~ WhatsApp 0.85-, 13 turns); at 0.85, 6 winners, each a
+#: real mishearing ("spot if" Spotify 0.93, "dev mefex" devmafex.com 0.88, "discard call" Discord 0.86).
 TURN_BAR = 0.85
 #: ...and beat the best name of every other group by at least this much (else two names are close: none is taken). The
 #: clips' true winners led by 0.26-0.60; of the user's 200 names, 2 score 0.75 or more against another group's.
 MARGIN = 0.1
 #: skill22 (A14), a name given to an act only. A name of :data:`MIN_LETTERS` to ``NEAR_MIN_LETTERS - 1`` letters and a
 #: run of as few say the very same sounds (one sound code, one onset): they score the mean of their spelling and 1.0,
-#: at most :data:`NAME_RULE_MAX` ("Ark" / "arc" 0.83; "Deezy" / "deji" 0.75: "z" and "j" in one class, "ee" and "i" one vowel). A whole turn never
-#: takes a short name by its sound (one letter off a four-letter name is a plain word there: :data:`NEAR_MIN_LETTERS`).
+#: at most :data:`NAME_RULE_MAX` ("Ark" / "arc" 0.83; "Deezy" / "deji" 0.75: "z" and "j" in one class, "ee" and "i"
+#: one vowel).
 SHORT_BAR = 1.0
 #: ...a vowel heard as one of another class (:data:`_VOWEL_CLASS`) costs this much of an edit in the sound distance:
-#: "this card" / Discord (a / o) 0.74 -> 0.78. A whole turn keeps the whole cost ("What's up" / WhatsApp would cross
-#: the turn bar).
+#: "this card" / Discord (a / o) 0.74 -> 0.78.
 NAME_VOWEL_COST = 0.5
 #: ...a name said by its first letters (a clip: "insta" for instagram.com): the given name's first word, when the name
 #: was written as one word (its parts split where the recognizer joined two: "InstaCol" -> "Insta"), is a form's first
@@ -136,9 +141,9 @@ CLIP_SHARE = 0.5
 #: most this many letters after the joint (measured: "PowerPoint" read as "Power" + "Point" took PowerToys, 0.78).
 FUSED_MAX_LETTERS = 3
 #: ...the short rule and the clip score at most this, under :data:`TURN_BAR`: they serve a name given to an act (bar
-#: :data:`BAR`) and never a reader that keeps only winners of a whole turn's strength (skill22 fix M3: voice22's
-#: near reading, ``as_name`` at :data:`TURN_BAR`, took the plain word "life" for teams.live.com at 0.875 by the short
-#: rule; "photo" for Photos scored 0.917 by the clip).
+#: :data:`BAR`) and never a reader that keeps only the clearest winners (skill22 fix M3: voice22's near reading,
+#: ``as_name`` at :data:`TURN_BAR`, took the plain word "life" for teams.live.com at 0.875 by the short rule; "photo"
+#: for Photos scored 0.917 by the clip).
 NAME_RULE_MAX = round(TURN_BAR - 0.01, 2)
 #: skill22 (A6, contract C14): at most this many of the user's own channels (:data:`CHANNEL`), their room kept inside
 #: :data:`OWN_MAX` when they are listed with the apps and sites (skill22 fix L2).
@@ -270,7 +275,7 @@ def _distance(a: str, b: str) -> float:
 
 def _code_distance(a: str, b: str, vowel_cost: float) -> float:
     """:func:`_distance` of two sound codes where a vowel class put for another costs ``vowel_cost`` of an edit
-    (skill22, a name given to an act: :data:`NAME_VOWEL_COST`); with 1.0 it is :func:`_distance`. Pure."""
+    (skill22: :data:`NAME_VOWEL_COST`); with 1.0 it is :func:`_distance`. Pure."""
     if vowel_cost >= 1.0 or a == b:
         return _distance(a, b)
     if not a or not b:
@@ -285,15 +290,15 @@ def _code_distance(a: str, b: str, vowel_cost: float) -> float:
     return prev[-1] / max(len(a), len(b))
 
 
-def _pair(run: _Form, form: _Form, as_name: bool = False) -> float:
-    """How alike a run of heard words and a name's form are (0..1): the mean of the spelling and the sound
-    similarities, 0 when they open with another sound, are too short or too unlike in length. skill22, ``as_name`` (a
-    name given to an act): a short pair (:data:`SHORT_BAR`) is measured by the very same sounds, and a vowel of
-    another class costs :data:`NAME_VOWEL_COST` of an edit in the sound distance."""
+def _pair(run: _Form, form: _Form) -> float:
+    """How alike a run of a name given to an act and a name's form are (0..1): the mean of the spelling and the sound
+    similarities, 0 when they open with another sound, are too short or too unlike in length. skill22: a short pair
+    (:data:`SHORT_BAR`) is measured by the very same sounds, and a vowel of another class costs
+    :data:`NAME_VOWEL_COST` of an edit in the sound distance."""
     la, lb = len(run.letters), len(form.letters)
     if run.onset != form.onset:
         return 0.0
-    if as_name and MIN_LETTERS <= min(la, lb) and max(la, lb) < NEAR_MIN_LETTERS:
+    if MIN_LETTERS <= min(la, lb) and max(la, lb) < NEAR_MIN_LETTERS:
         if not run.code or run.code != form.code:
             return 0.0
         return min((1.0 - _distance(run.letters, form.letters) + SHORT_BAR) / 2.0, NAME_RULE_MAX)
@@ -301,7 +306,7 @@ def _pair(run: _Form, form: _Form, as_name: bool = False) -> float:
         return 0.0
     spell = 1.0 - _distance(run.letters, form.letters)
     if run.code and form.code:
-        sound = 1.0 - _code_distance(run.code, form.code, NAME_VOWEL_COST if as_name else 1.0)
+        sound = 1.0 - _code_distance(run.code, form.code, NAME_VOWEL_COST)
     else:
         sound = spell
     return (spell + sound) / 2.0
@@ -464,16 +469,12 @@ def _heard(text: str) -> _Heard:
 
 
 def _heard_of(heard: Any) -> _Heard | None:
-    """The heard words as the measure reads them (:class:`_Heard`), or ``None`` for none. ``heard``: a text, or a list
-    or tuple of texts, the parts of one turn (a caller's cut: resolve's ``_outside``, the turn outside the message's
-    own text): each part read alone, so a run never spans two parts. A part's runs end at that part's own last word.
-    Parts have no ``head`` (a clip is a name given to an act, never a turn's)."""
-    if isinstance(heard, (list, tuple)):
-        parts = [_heard(t) for t in (" ".join(str(p or "").split()) for p in heard if isinstance(p, str)) if t]
-        if not parts:
-            return None
-        return _Heard(tuple(r for h in parts for r in h.runs), tuple(t for h in parts for t in h.tails))
-    text = " ".join(str(heard or "").split())
+    """The heard words as the measure reads them (:class:`_Heard`), or ``None`` for none. ``heard``: one text (a name
+    given to an act, or a stretch a reader checks as written). kw3: no longer a list of a turn's parts (that served the
+    whole-turn mode, gone)."""
+    if not isinstance(heard, str):
+        return None
+    text = " ".join(heard.split())
     return _heard(text) if text else None
 
 
@@ -497,52 +498,55 @@ def _no_head(heard: _Heard) -> _Heard:
     return _Heard(heard.runs, heard.tails, None) if heard.head is not None else heard
 
 
-def _measure(heard: _Heard, name: str, as_name: bool = False) -> tuple[float, int]:
-    """``(score, letters of the heard run it came from)`` of one name against the heard words (0 when nothing
-    compares). ``as_name``: the heard words are a name given to an act ("Porbex Kaladra", "the scored"): a form counts
-    as written only for all of them (a part of "microsoft edge" is no name of theirs), and only runs that end at the
-    last word are measured (a word put before the name, "the", "my", stays out of it)."""
+def _measure(heard: _Heard, name: str) -> tuple[float, int]:
+    """``(score, letters of the heard run it came from)`` of one name against a name given to an act ("Porbex
+    Kaladra", "the scored"; 0 when nothing compares): a form counts as written only for all of its words (a part of
+    "microsoft edge" is no name of theirs), and only runs that end at the last word are measured (a word put before
+    the name, "the", "my", stays out of it)."""
     best = (0.0, 0)
     for form in _name_forms(name):
         for run, size, at_end, every in heard.runs:
-            if as_name and not at_end:
+            if not at_end:
                 continue
             if run.letters == form.letters:
-                got = (1.0 if (every or not as_name) else 0.0, size)
+                got = (1.0 if every else 0.0, size)
             else:
-                got = (_pair(run, form, as_name), size)
+                got = (_pair(run, form), size)
             if got > best:
                 best = got
         if best[0] >= 1.0:
             continue
-        if as_name and heard.head is not None and form in _clip_forms(name):
+        if heard.head is not None and form in _clip_forms(name):
             got = (_clip(heard.head, form), len(heard.head.letters))
             if got > best:
                 best = got
         for before, word, before_form, at_end in heard.tails:
-            if as_name and not at_end:
+            if not at_end:
                 continue
             for j in range(1, TAIL_HEAD + 1):
                 head = form.letters[:j]
                 if len(form.letters) - j < TAIL_MIN_LETTERS - 1 or len(before) < j or \
                         not _head_taken(before, before_form, head):
                     continue
-                got = (_pair(_form(head + word), form, as_name), len(word))
+                got = (_pair(_form(head + word), form), len(word))
                 if got > best:
                     best = got
     return best
 
 
 def score(heard: Any, name: Any, *, as_name: bool = False) -> float:
-    """How closely the heard words hold one name (0..1; 1.0 when a form of it stands there as written): the measure
-    :func:`best_match` ranks by, for a caller comparing a name it was given (a model's pick) with the winner.
-    ``heard`` and ``as_name`` as for :func:`best_match`. Never raises (0.0)."""
+    """How closely a name given to an act holds one name (0..1; 1.0 when a form of it stands there as written): the
+    measure :func:`best_match` ranks by, for a caller comparing a name it was given (a model's pick) with the winner.
+    ``heard`` and ``as_name`` as for :func:`best_match` (kw3, contract K2: without ``as_name``, no whole-turn measure:
+    0.0). Never raises (0.0)."""
     try:
+        if not as_name:
+            return 0.0
         got = _heard_of(heard)
         name = " ".join(str(name or "").split())
         if got is None or not name:
             return 0.0
-        return round(_measure(got, name, as_name)[0], 3)
+        return round(_measure(got, name)[0], 3)
     except Exception:  # noqa: BLE001
         return 0.0
 
@@ -559,8 +563,8 @@ def same_group(a: Any, b: Any) -> bool:
 
 
 def literal(heard: Any, name: Any) -> bool:
-    """Whether a spoken form of ``name`` stands in the heard words as written (a run of them, spaces aside): the name
-    was heard right, nothing was misheard. ``heard`` as for :func:`best_match`. Never raises."""
+    """Whether a spoken form of ``name`` stands in the heard words (one text) as written (a run of them, spaces aside):
+    the name was heard right, nothing was misheard. Never raises."""
     try:
         got = _heard_of(heard)
         if got is None:
@@ -573,19 +577,20 @@ def literal(heard: Any, name: Any) -> bool:
 
 def best_match(heard: Any, names: Iterable[Any], *, literal_ok: bool = True, as_name: bool = False,
                bar: float | None = None, clip: bool = True) -> tuple[str, float, float] | None:
-    """The one of ``names`` (the user's own: :func:`own_names`, or a caller's subset) the heard words name, measured
-    (see the module docstring): ``(name, score, margin)`` when it scores at least the bar and beats the best name of
-    every other group by :data:`MARGIN`; else ``None``. ``heard``: a whole turn ("Bring up the scored.", bar
-    :data:`TURN_BAR`) or, with ``as_name``, a name given to an act ("Porbex Kaladra", "the scored": measured whole, or
-    by its last words, never by a part before them; bar :data:`BAR`). ``heard`` may also be a list or tuple of texts,
-    the parts of one turn a caller cut (resolve: the turn outside the message's own text): a run never spans two
-    parts. ``literal_ok=False``: a name whose form stands in the words as written is left out (a caller that wants
-    only mishearings: a name heard right needs no help). ``bar``: another bar for a caller that has one (resolve's
-    agreement with a model's own pick reads a turn at :data:`TURN_BAR` too: integration F3). skill22: ``clip=False``
-    leaves the clip out (:func:`_clip`; :func:`own_url`: a channel's own short name is often another channel's
-    whole one, "Sidemen" and "SidemenReacts"). Pure; never raises
-    (``None``)."""
+    """The one of ``names`` (the user's own: :func:`own_names`, or a caller's subset) a name given to an act names,
+    measured (see the module docstring): ``(name, score, margin)`` when it scores at least the bar and beats the best
+    name of every other group by :data:`MARGIN`; else ``None``. ``heard``, with ``as_name``: the name the caller was
+    given ("Porbex Kaladra", "the scored": a model's own pick, measured whole, or by its last words, never by a part
+    before them; bar :data:`BAR`). kw3 (C5, contract K2, 20 Oct): the whole-turn mode is gone; a call without
+    ``as_name`` measures nothing (``None``), so no caller can fill an app or a site from a run of a user's turn.
+    ``literal_ok=False``: a name whose form stands in the words as written is left out (a caller that wants only
+    mishearings: a name heard right needs no help). ``bar``: another bar for a caller that has one (the voice's near
+    reading keeps only winners at :data:`TURN_BAR`). skill22: ``clip=False`` leaves the clip out (:func:`_clip`;
+    :func:`own_url`: a channel's own short name is often another channel's whole one, "Sidemen" and
+    "SidemenReacts"). Pure; never raises (``None``)."""
     try:
+        if not as_name:
+            return None
         got = _heard_of(heard)
         if got is None or not got.runs:
             return None
@@ -595,14 +600,14 @@ def best_match(heard: Any, names: Iterable[Any], *, literal_ok: bool = True, as_
         for i, name in enumerate(pool):
             if not literal_ok and any(f.letters in runs for f in _name_forms(name)):
                 continue
-            value, size = _measure(got if clip else _no_head(got), name, as_name)
+            value, size = _measure(got if clip else _no_head(got), name)
             if value > 0.0:
                 scored.append((value, size, i, name))
         if not scored:
             return None
         scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
         top = scored[0]
-        if top[0] < (bar if bar is not None else BAR if as_name else TURN_BAR):
+        if top[0] < (bar if bar is not None else BAR):
             return None
         rival = next((t for t in scored[1:] if not same_group(top[3], t[3])), None)
         margin = top[0] - (rival[0] if rival is not None else 0.0)

@@ -48,10 +48,10 @@ picked names and :func:`find` finds them, so the menu and the resolver can offer
 when they say "my Japanese playlist"). **What the user called it**: when a request's words named an entity no row was
 called and the hand-off job that followed was seen putting one on (the driver decides when), :func:`note` with
 ``said_as`` keeps those words as another name of that row (a row of kind ``<kind>@said``: the words encrypted, their
-keyed digest the key, the row's name encrypted as its target), so :func:`find` maps the same words to it next time. An
-identity of the user's own words, learned from a seen result, never a list of meanings written here; the newest pairing
-of the same words wins, and :func:`unsay` drops one the user's later choice contradicts (what they say wins over what
-was learned).
+keyed digest the key, the row's name encrypted as its target). kw3 (C9, 20 Oct): that pairing is a hint the meaning
+judgement reads (:func:`said_target`, :func:`described`'s ``called``, :func:`judge`'s ``hint``: "last time these words
+played X"), never a lookup that plays X by the words alone; the newest pairing of the same words wins, and
+:func:`unsay` drops one the user's later choice contradicts (what they say wins over what was learned).
 
 **By sound and by meaning** (lSkills, live 17 Oct: "Lumin" for lumen asked "say it again"; "anime playlist" asked which
 playlist a minute after "Japanese" was paired with ネオン; "something chill" took 15-29 s through the thinker):
@@ -62,10 +62,11 @@ playlist a minute after "Japanese" was paired with ネオン; "something chill" 
   own entities (what they called each before, when they pick it, how much, what played while it ran) and the voice's
   small model judges which one the words name or describe, or that they only ask for a mood (then the hour's usual,
   :func:`top`, plays), or none. One forced tool call with the names as an enum, bounded (:data:`MEANING_WAIT_S`), its
-  answer kept for the same words and descriptions (:data:`MEANING_TTL_S`); a ``name`` verdict stands only when the words
-  say that name by identity or sound. The Spotify driver asks it after its Library read and, once its own check sees
-  the row play, keeps those words as another name of the row (:func:`note` ``said_as``): the next time is by identity,
-  with no judgement. Content goes to the model only, never to a log.
+  answer kept for the same words and descriptions (:data:`MEANING_TTL_S`); kw3 (C8): its verdict stands, a ``name``
+  the words don't hold as written being Yuki's guess, named in the done line. The Spotify driver asks it after its
+  Library read and, once its own check sees the row play, keeps those words as another name of the row (:func:`note`
+  ``said_as``): the next judgement of the same words gets it as a hint. Content goes to the model only, never to a
+  log.
 
 **Time, not clicks** (kTaste, 17 Oct audit; research 4.3: YouTube says a click misleads): a pick weighs the units of
 what then played (:func:`yuki.skills.youtube_feed.units`, five minutes = one): a watched video its page's media seconds,
@@ -109,7 +110,7 @@ OPTIONS_N = 8
 SEEN_SOURCE = "seen"
 #: Seen rows kept per kind at most (the oldest go first).
 SEEN_MAX = 200
-#: The kind suffix of the rows that keep what the user called an entity (:func:`note` ``said_as``; :func:`find`).
+#: The kind suffix of the rows that keep what the user called an entity (:func:`note` ``said_as``; :func:`said_target`).
 SAID_SUFFIX = "@said"
 
 LogFn = Callable[..., None]
@@ -241,7 +242,8 @@ def said_kind(kind: str) -> str:
 def said_target(store: Any, kind: str, words: Any) -> str | None:
     """The name of the entity of ``kind`` the user's words ``words`` were last paired with (:func:`note` ``said_as``:
     they named no row, and that entity then played), or None. Identity of the words (case and spacing folded), by
-    their keyed digest. Never raises."""
+    their keyed digest. kw3 (C9): a read-only hint for the meaning judgement (:func:`judge` ``hint``) and a fenced
+    memory line for the brain, never a lookup that plays it by the words alone. Never raises."""
     folded = _norm(words)
     if not folded or not str(kind or "").strip():
         return None
@@ -279,26 +281,17 @@ def said_words(store: Any, kind: str, target: Any) -> list[str]:
 
 
 def find(store: Any, kind: str, name: str) -> Taste | None:
-    """The taste row whose name equals ``name`` (case and spacing folded: identity, never meaning), the names the
-    user's own app showed included (:func:`saw`); else the row the same words were paired with when they named no row
-    and that entity then played (:func:`said_target`). None when neither. Never raises."""
+    """The taste row whose name equals ``name`` (case and spacing folded: identity of a name, never meaning), the names
+    the user's own app showed included (:func:`saw`); None when there is none. kw3 (C9): words the user once said for
+    a row (:func:`said_target`) are never looked up here: they are a hint for the meaning judgement only. Never
+    raises."""
     want = _norm(name)
     if not want:
         return None
-    rows = top(store, kind, n=10_000, seen=True)
-    for t in rows:
+    for t in top(store, kind, n=10_000, seen=True):
         if _norm(t.name) == want:
             return t
-    target = said_target(store, kind, want)
-    if not target:
-        return None
-    for t in rows:
-        if _norm(t.name) == _norm(target):
-            return t
-    try:
-        return Taste(entity_key(store, kind, target), target, "", 0.0, 0.0)
-    except Exception:  # noqa: BLE001
-        return None
+    return None
 
 
 def offered(store: Any, *, now: float | None = None) -> list[Taste]:
@@ -391,30 +384,6 @@ def heard_as(names: Any, said: Any, *, loose: bool = False) -> str | None:
     if hits:
         return next(iter(hits.values())) if len(hits) == 1 else None
     return _closest_heard(pool, text) if loose else None
-
-
-def heard_in(names: Any, turns: Any) -> str | None:
-    """skill19 (live 19 Oct, all-browser R7: "NDL" heard as "MBL", the talker rewrote it to "MrBeastGaming" and that
-    reading ran): the one of the user's own ``names`` (a closed set: their channels, their playlists) that the user's
-    own words hold by sound or spelling distance (:func:`heard_as`, its closed-set tier included), in their newest turn
-    only (review L1: the request's own words; an earlier request of the exchange that named another of their names is
-    never taken for this one). A turn that holds two decides nothing. ``None`` when none does. The caller names it as
-    a guess ("I took that as NDL"). Never raises."""
-    pool = [" ".join(str(n or "").split()) for n in names or [] if str(n or "").strip()]
-    if not pool:
-        return None
-    seq = [turns] if isinstance(turns, str) else [str(t) for t in turns or [] if str(t or "").strip()]
-    if not seq:
-        return None
-    turn = seq[-1]
-    try:
-        padded = f" {_norm(turn)} "
-        literal = {_norm(n): n for n in pool if _norm(n) and f" {_norm(n)} " in padded}
-        if literal:
-            return next(iter(literal.values())) if len(literal) == 1 else None
-        return heard_as(pool, turn, loose=True) or None
-    except Exception:  # noqa: BLE001 - a turn that can't be read by sound
-        return None
 
 
 #: fSkills (live 18 Oct: "MBL's YouTube channel" heard for the user's channel NDL): how each Latin letter is said when
@@ -683,7 +652,9 @@ Answer only with the pick tool:
   for a long drive", "something for cooking"), and no item's name or "called" words say it: pick nothing (their usual
   for the hour will play). A feel or an activity is never content.
 - none: the words name one of their {things} by a word none of these goes by ("my party playlist" with no item called
-  that), or two items fit equally: pick nothing."""
+  that), or two items fit equally: pick nothing.
+"last time", when given, is the item these same words played last time: a strong clue for called, never a rule (a
+newer item may fit them better, and words that ask for a mood stay mood)."""
 
 
 _meaning_cache: dict[tuple[str, str, str], tuple[float, Meant]] = {}
@@ -724,23 +695,12 @@ def prewarm() -> None:
     threading.Thread(target=make, name="yuki-taste-judge-warm", daemon=True).start()
 
 
-def _name_said(said: str, name: str) -> bool:
-    """Whether ``said`` says ``name`` itself: its letters and digits in a row ("the 3 AM one" holds "3AM"), or a run of
-    it sounds like the name (:func:`heard_as`: "Lumin" for lumen). Identity and sound, never meaning: the check behind a
-    judgement that the words name an item (a model once called "workout" a mishearing of lumen)."""
-    def squash(text: str) -> str:
-        return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
-
-    if squash(name) and squash(name) in squash(said):
-        return True
-    return heard_as([name], said) is not None
-
-
 def _settle(response: Any, names: list[str], text: str, ms: float,
             items: list[dict[str, Any]] | None = None) -> Meant:
     """A judgement's answer as a :class:`Meant`: the name only when it is one described (the tool's enum holds that
-    already) and the code word allows one; a ``name`` verdict only when the words say that name by identity or sound
-    (:func:`_name_said`), else ``none``."""
+    already) and the code word allows one. kw3 (C8): the model's verdict stands (a ``name`` the words don't hold as
+    written is a mishearing the model heard: it plays as Yuki's guess, named in the done line), never vetoed by a
+    check of the words."""
     call = next((b for b in getattr(response, "content", []) or [] if getattr(b, "type", None) == "tool_use"), None)
     args = dict(getattr(call, "input", {}) or {}) if call is not None else {}
     why = str(args.get("why") or "")
@@ -750,8 +710,8 @@ def _settle(response: Any, names: list[str], text: str, ms: float,
         why = "none"
     if why in ("mood", "none"):
         name = None
-    elif name is None or (why == "name" and not _name_said(text, name)):
-        why, name = "none", None
+    elif name is None:
+        why = "none"
     elif why == "called" and items is not None and not any(
             _norm(i.get("name")) == _norm(name) and i.get("called") for i in items):
         why = "content"     # nothing was ever called that: it can only be what the item holds
@@ -760,15 +720,17 @@ def _settle(response: Any, names: list[str], text: str, ms: float,
 
 def judge(said: str, words: Any, items: list[dict[str, Any]], *, kind: str = "spotify_playlist",
           client: Any = None, model: str | None = None, settings: Any = None,
-          wait_s: float = MEANING_WAIT_S) -> Meant:
+          wait_s: float = MEANING_WAIT_S, hint: str | None = None) -> Meant:
     """lSkills (live 17 Oct: "anime playlist" asked which playlist twice although "Japanese" had just been paired with
     ネオン; "something chill" took 15-29 s): which of the user's own entities ``said`` means, judged by a small model
     (the voice's mouth model) on memory's own descriptions of them (:func:`described`), never by a word list. One
     forced tool call whose name field is an enum of the names described (it can only answer one of them, or none),
     bounded by ``wait_s`` on its own thread; ``Meant(None, "unknown")`` when there is nothing to judge, no client, or no
     answer in time (an answer that comes late is still kept for the same words and the same descriptions, so the next
-    ask within :data:`MEANING_TTL_S` has it at once). A ``name`` verdict stands only when the words say that name by
-    identity or sound (:func:`_name_said`). Content (names, titles, words) goes to the model only, never to a log."""
+    ask within :data:`MEANING_TTL_S` has it at once). kw3: the verdict stands as the model gave it (C8, no check of the
+    words vetoes it); ``hint`` (C9), the item these same words played last time (:func:`said_target`), rides with the
+    words as "last time" when it is one of the items, a clue the model weighs, never a lookup. Content (names, titles,
+    words) goes to the model only, never to a log."""
     started = time.perf_counter()
     # each name once (review r1 L6: a duplicate value in the tool's enum may get the request refused)
     names = list(dict.fromkeys(str(i.get("name") or "") for i in items if i.get("name")))
@@ -781,8 +743,9 @@ def judge(said: str, words: Any, items: list[dict[str, Any]], *, kind: str = "sp
     # 0.21 s into another exchange's "Play the Japanese playlist" and played the wrong row): the user's turns sent with
     # the request are part of the key, so an answer is reused only for the same request (a retry, the hand-off's own
     # run)
+    last = next((n for n in names if hint and _norm(n) == _norm(hint)), "")
     key = (str(kind), _norm(text), json.dumps(items, ensure_ascii=False, sort_keys=True),
-           json.dumps([_norm(t) for t in turns[-3:]], ensure_ascii=False))
+           json.dumps([_norm(t) for t in turns[-3:]], ensure_ascii=False), _norm(last))
     now_m = time.monotonic()
     with _meaning_lock:
         got = _meaning_cache.get(key)
@@ -806,7 +769,8 @@ def judge(said: str, words: Any, items: list[dict[str, Any]], *, kind: str = "sp
                "system": MEANING_SYSTEM.replace("{things}", things),
                "tools": [tool], "tool_choice": {"type": "tool", "name": "pick"},
                "messages": [{"role": "user", "content": json.dumps(
-                   {"said": text, "their words": turns[-3:], "items": items}, ensure_ascii=False)}]}
+                   {"said": text, "their words": turns[-3:], **({"last time": last} if last else {}), "items": items},
+                   ensure_ascii=False)}]}
     box: dict[str, Any] = {}
     box_lock = threading.Lock()
 
@@ -2264,7 +2228,7 @@ def now_picks(store: Any, *, now: float | None = None, n: int = NOW_N) -> dict[s
 __all__ = ["SIGMA_MIN", "FALLBACK_MASS", "MENU_CANDIDATES", "OPTIONS_N", "SEEN_SOURCE", "SEEN_MAX", "SAID_SUFFIX",
            "Taste", "hour_score", "score_at", "top", "candidates", "seen_names", "options", "said_kind", "said_target",
            "said_words", "find", "offered", "find_offered", "takes_offers", "MEANING_WAIT_S", "MEANING_TTL_S",
-           "MEANING_ITEMS", "MEANING_TITLES", "MEANING_DAYS", "MEANING_WHYS", "Meant", "heard_as", "heard_in",
+           "MEANING_ITEMS", "MEANING_TITLES", "MEANING_DAYS", "MEANING_WHYS", "Meant", "heard_as",
            "described", "judge",
            "prewarm",
            "SEED_DAYS", "HALF_LIFE_DAYS",

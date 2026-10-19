@@ -2324,13 +2324,13 @@ def _slot_flags(names: Any) -> dict[str, bool] | None:
 
 def _measured_fields(measured: Any) -> dict[str, Any]:
     """names21 (merge note 1): the plan's names measure (:attr:`yuki.skills.resolve.Plan.measured`) for the content-free
-    ``skill_resolve`` line: the slots it took (``names_slots``, schema names only), how many by where the words came
-    from (``names_by_value``, ``names_by_turn``, ``names_agreed``: an agreed slot is ``heard`` in ``source`` too), how
-    many are sites (``names_sites``), the lowest score and margin (``names_score``, ``names_margin``). Never a value or
-    a name. ``{}`` when nothing was measured; never raises."""
+    ``skill_resolve`` line: the slots it took (``names_slots``, schema names only), how many by the value given
+    (``names_by_value``; kw3 C5: the only way left, the whole-turn and agreement readings are gone), how many are sites
+    (``names_sites``), the lowest score and margin (``names_score``, ``names_margin``). Never a value or a name. ``{}``
+    when nothing was measured; never raises."""
     try:
         from yuki.skills.names import SITE
-        from yuki.skills.resolve import HOW_AGREE, HOW_TURN, HOW_VALUE
+        from yuki.skills.resolve import HOW_VALUE
 
         got = {k: v for k, v in dict(measured or {}).items() if isinstance(v, Mapping)}
         if not got:
@@ -2339,7 +2339,6 @@ def _measured_fields(measured: Any) -> dict[str, Any]:
         scores = [float(v["score"]) for v in got.values() if isinstance(v.get("score"), (int, float))]
         margins = [float(v["margin"]) for v in got.values() if isinstance(v.get("margin"), (int, float))]
         return {"names_slots": _slot_flags(list(got)), "names_by_value": hows.count(HOW_VALUE) or None,
-                "names_by_turn": hows.count(HOW_TURN) or None, "names_agreed": hows.count(HOW_AGREE) or None,
                 "names_sites": sum(1 for v in got.values() if v.get("kind") == SITE) or None,
                 "names_score": round(min(scores), 3) if scores else None,
                 "names_margin": round(min(margins), 3) if margins else None}
@@ -2723,12 +2722,15 @@ def _choice_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunCon
     (:func:`yuki.skills.taste.choose`) and the run plays its pick: a video (``web.open_video``; ``web.open_page`` on
     YouTube's front page asked to choose becomes it: "put something on YouTube" plays), a channel's page
     (``web.open_page`` on a channel page kind), a playlist of the user's own (``spotify.playlist``). A video or playlist
-    text given with it counts when it IS one of their channels or playlists (``taste._same_name``) and stands in their
-    words, or, asked to choose, when they never said it (the card's pick for now: Yuki's own, ``taste.FROM_CARD``, a
-    guess; phase 2.2); asked to choose, any other text given is their words for the judgement and the pick is free
-    (review M1); not asked, it goes the normal way (review H2: "the Sidemen video about the island" is a search, never
-    Sidemen's newest). With a game in front nothing is put on; with a call live nothing Yuki chose is put on (a channel
-    they named plays, review L4): the result says so and keeps the pick for later (:func:`taste.held_line`,
+    text given with it counts when it IS one of their channels or playlists (``taste._same_name``): kw3 (C7, 20 Oct:
+    "Put on the new Marques Brownlee video" with the caller's ``MKBHD`` was dropped) the caller's name goes on whether
+    or not the user's words hold it as written (the model read their words; the user's own names resolve it), and,
+    asked to choose, a name they never said is tagged the card's pick for now (Yuki's own, ``taste.FROM_CARD``, a
+    guess, so it never feeds their taste; phase 2.2); asked to choose, any other text given is their words for the
+    judgement and the pick is free (review M1); not asked, a text that is none of their channels goes the normal way
+    (review H2: "the Sidemen video about the island" is a search, never Sidemen's newest). With a game in front
+    nothing is put on; with a call live nothing Yuki chose is put on (a channel they named plays, review L4): the
+    result says so and keeps the pick for later (:func:`taste.held_line`,
     :func:`taste.keep_for_later`). ``None``: not such a request, no pick (nothing of theirs to pick from, memory too
     slow), or a concrete value they gave (an offered option, a link: theirs wins); the request then runs the normal way
     with the choice slots taken out."""
@@ -2774,13 +2776,12 @@ def _choice_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunCon
         if name:
             from yuki.skills.uia_route import said
 
-            if not said(name, ctx.words):
-                if asked:
-                    source = taste.FROM_CARD   # choose + a name they never said: the card's pick for now, Yuki's own
-                else:
-                    name = ""      # not asked: the normal way as given (2.1's reading path, e.g. "soccer" -> lumen)
+            if asked and not said(name, ctx.words):
+                # choose + a name they never said: the card's pick for now, Yuki's own (a provenance tag only: the
+                # name still goes on, and a guess never feeds their taste)
+                source = taste.FROM_CARD
             elif cap == "web.open_video" and _offered_pick(ctx, name):
-                return None        # an offered upload they picked ("the Deji one"): the offer's own path
+                return None        # an offered upload the caller named ("the Deji one"): the offer's own path
         if name and (asked or cap == "web.open_video"):
             only = name            # a channel or playlist of theirs if it IS one (asked: else a hint; not: else normal)
         if not asked and not only:
@@ -2853,7 +2854,7 @@ def _title_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunCont
         if got is None:
             # skill22 (A8): no clear fit: the video site's own search for the title (``youtube.toml [urls] search``),
             # opened and named as a search, never as "playing" (web_route._searched); the caller takes it on from the
-            # results. A title too short to search (a name) goes on as before
+            # results (kw3 C11: any title the caller gave, however few its words)
             search = web_route.search_link(title)
             _emit(ctx, "skill_resolve", skill=skill.key, result="title_link",
                   reason="search" if search is not None else "no_fit", origin=ctx.origin)

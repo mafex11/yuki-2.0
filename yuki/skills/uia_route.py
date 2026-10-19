@@ -2519,21 +2519,19 @@ def _name_parts(name: Any) -> list[str]:
     return _parts(_words(name))
 
 
-def choose_way(ways: list[dict[str, Any]], given: Any, words: list[str]) -> dict[str, Any] | None:
-    """The way a run means: the one ``given`` names (its key, or its name as the menu shows it); with nothing given,
-    the only live one, else the one whose app or name stands in the user's words. ``None`` when that leaves none or
-    several, or when a way was given that is none of these (review L1: never another way in its place)."""
+def choose_way(ways: list[dict[str, Any]], given: Any) -> dict[str, Any] | None:
+    """The way a run means: the one ``given`` names (its key, or its name as the menu shows it: the caller's own
+    pick from the menu's way lines); with nothing given, the only live one. ``None`` when that leaves none or several
+    (the route asks "Which of your ways?" with their names, so the caller names one), or when a way was given that is
+    none of these (review L1: never another way in its place). kw3 (C6, 20 Oct: "Add 'ask Claude about the build' to my
+    to-do list" ran the Claude way): an app or a way's name found in the user's words never picks a way."""
     if isinstance(given, Mapping):
         given = given.get("key") or given.get("name")
     key = _words(given)
     if key:
         hits = [w for w in ways if w.get("key") == key or (w.get("name") and _folded(w["name"]) == _folded(key))]
         return hits[0] if hits else None
-    if len(ways) == 1:
-        return ways[0]
-    named = [w for w in ways if (w.get("name") and said(w["name"], words))
-             or said(app_words(str(w.get("app") or "")), words)]
-    return named[0] if len(named) == 1 else None
+    return ways[0] if len(ways) == 1 else None
 
 
 def way_steps_for(way: Mapping[str, Any], *, item: str, text: str, send: bool
@@ -2671,7 +2669,7 @@ def route_way(call: Any) -> Any:
     values = call.values if isinstance(call.values, Mapping) else {}
     words = [str(w) for w in ctx.words or [] if str(w).strip()]
     live = _way_store(ctx.memory, learned.live_ways) or []
-    way = choose_way(list(live), values.get("way"), words)
+    way = choose_way(list(live), values.get("way"))
     if way is None:
         return RouteResult(ran=False, outcome="no_way" if not live else "which_way",
                            ask=None if not live else "Which of your ways?",
