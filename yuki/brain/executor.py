@@ -1278,6 +1278,9 @@ class Executor:
         stop = self._checkpoint()
         if stop is not None:
             return stop
+        if self.tidy is None:
+            # desk20 (S20): what a stuck ending names is the latest act step only (kept across a plan that ran none)
+            self._stuck_said = None
         if call is None:
             call, why = self._resolve(index, step)
             if call is None:

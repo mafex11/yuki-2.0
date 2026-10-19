@@ -140,7 +140,7 @@ _TITLE_WAIT_S = 6.0
 #: strip can never end): the open_url hand's launch answers by this deadline (s), as the web skill's rungs answer by
 #: theirs; the title wait then gets what is left of it, at least _TITLE_FLOOR_S, at most _TITLE_WAIT_S. A browser with no
 #: tab strip is read by its main page, each read within _MAIN_PAGE_READ_S.
-_OPEN_URL_S = 10.0
+_OPEN_URL_S = 15.0
 _TITLE_FLOOR_S = 2.0
 _MAIN_PAGE_READ_S = 0.8
 #: The foreground window's tabs are read within this when the summary needs them now.
