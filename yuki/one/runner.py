@@ -204,10 +204,15 @@ def _step_call(step: Any) -> dict[str, Any] | None:
 
 def _step_words(step: Any, d: Any = None) -> str:
     """One20 (C7): a legal tidy step as the agent's own ``window`` call (its arguments, :func:`_step_call`), with the
-    window's name from the diff; ``""``: not such a step."""
+    window's name from the diff; ``""``: not such a step. Safety timing 3: a place names the measured target monitor
+    (``step["to"]``), so the agent's call on their yes (a later turn) moves the window to the screen asked about, never
+    "other" from wherever they put it meanwhile (code's own step, :meth:`Runner._tidy_by_code`, runs at once)."""
     call = _step_call(step)
     if call is None:
         return ""
+    to = step.get("to") if call.get("action") == "move" else None
+    if isinstance(to, int) and not isinstance(to, bool):
+        call["monitor"] = str(to)
     names = getattr(d, "names", None)
     name = _words(names.get(call["window"])) if isinstance(names, Mapping) else ""
     return f"window {json.dumps(call)}" + (f" ({name})" if name else "")
@@ -1374,7 +1379,9 @@ class Runner:
         given back to the window the act took it from, or the act's covering window moved to the other monitor)
         itself, at most once a turn (:attr:`RunState.tidied`):
 
-        * guards first: ``diff.tidy_guard`` (the window in front is still the one the after-read saw: never over a
+        * guards first: never once the user's next turn began (safety timing 4, ``Turn.moved_on``: a late act of an
+          earlier turn, or their speech begun again while it ran); ``diff.tidy_guard`` (the window in front is still
+          the one the after-read saw: never over a
           window they or another app brought forward since; a move never takes a window of theirs, nor one whose own
           place or state the turn's acts were asked for: :attr:`RunState.arranged`, review F1), never the front given
           to one of Yuki's own windows (review F5: ONE's desk reads keep them; the planner stands the origin in), and
@@ -1405,6 +1412,8 @@ class Runner:
 
             if call is None:
                 why = "no_step"
+            elif getattr(turn, "moved_on", False):
+                why = "moved_on"   # safety timing 4: their next turn began while this act ran: never a step after it
             else:
                 reader = getattr(self.verbs, "front_now", None) or getattr(self.verbs, "foreground", None)
                 front = reader() if callable(reader) else None

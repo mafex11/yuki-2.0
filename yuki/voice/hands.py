@@ -261,11 +261,16 @@ _AFTER_PURPOSE_NOTE = (
 )
 
 
-def _one_step_call(step: dict[str, Any]) -> dict[str, Any]:
+def _one_step_call(step: dict[str, Any], *, asked: bool = False) -> dict[str, Any]:
     """desk20: ``diff.tidy_step``'s step as the window hand's own arguments (what the look's tidy check allows: a move
-    of one of the act's windows, or the front given back to the window the act took it from)."""
+    of one of the act's windows, or the front given back to the window the act took it from). ``asked`` (safety timing
+    3): the step a question asks about carries the measured target monitor (``step["to"]``), so their yes, a later
+    turn's call, moves the window to the screen asked about, never "other" from wherever they put it meanwhile."""
     if step.get("action") == "place":
-        return {"action": "move", "window": int(step["hwnd"]), "monitor": str(step.get("monitor") or "other")}
+        to = step.get("to") if asked else None
+        measured = isinstance(to, int) and not isinstance(to, bool)
+        monitor = str(int(to)) if measured else str(step.get("monitor") or "other")
+        return {"action": "move", "window": int(step["hwnd"]), "monitor": monitor}
     return {"action": "focus_back", "window": int(step["hwnd"])}
 
 
@@ -1283,6 +1288,25 @@ def _game_trouble(facts: dict[str, Any]) -> bool:
     front): the code signal for the talker's game note (x4TalkerPrompt merge note), never the focus state alone."""
     return facts.get("held") == "game" or facts.get("refused") == "game" or bool(facts.get("game_front"))
 
+
+def _moved_on(hands: Any, facts: dict[str, Any]) -> bool:
+    """Safety timing 4: whether the user's next turn began while this act ran: the user turn now is not the one the act
+    began in, or their speech began after it (``facts["_desk_turn"]``: ``(turn, when)`` from the act's own before read,
+    :meth:`Hands._run`; :attr:`Hands.user_began`). Then the act gets no look (code takes no step, files no look) and its
+    before is no turn's: the new turn's one look stays its own. ``False`` when not known. Never raises."""
+    try:
+        began = facts.get("_desk_turn") if isinstance(facts, dict) else None
+        if not isinstance(began, tuple) or len(began) != 2:
+            return False
+        turn, at = began
+        if turn != hands._turn_now():
+            return True
+        spoke = getattr(hands, "user_began", None)
+        return bool(callable(spoke) and float(spoke() or 0.0) > float(at))
+    except Exception:  # noqa: BLE001 - not known: the look as before
+        return False
+
+
 class Hands:
     """The mouth's desktop tools over a backend (the brain's), with the summary they act on.
 
@@ -1401,6 +1425,9 @@ class Hands:
         self.turn_key: Any = None
         self.shown: Any = None
         self.user_turn: Any = None
+        #: safety timing 4: ``() -> float``, when the user's latest speech began (monotonic; the conversation's
+        #: observer), so an act's look knows their next turn began while it ran (:func:`_moved_on`); ``None``: unknown.
+        self.user_began: Any = None
         #: ``() -> bool``: recognition was unsure of the user's latest words (a Speech line), set by the conversation:
         #: a volume skill run then takes no focus (review r2 L3: it is never held on unsure words, as the old sound
         #: hands were not, so its focus rungs and a hand-off are left out on that run).
@@ -2268,8 +2295,9 @@ class Hands:
     def _keep_before(self, name: str, args: dict[str, Any], facts: dict[str, Any], before: Any) -> None:
         """hands19 (final-B all-desk): one bracketed act's before kept for its user turn (:attr:`_turn_before`): the
         turn's first before stays the one a look compares from; each act adds its scope facts (the act's own ids and
-        app names, never words) and the apps whose sound the after read reads. Never raises."""
-        if before is None:
+        app names, never words) and the apps whose sound the after read reads. Safety timing 4: an act whose user's
+        next turn began while it ran (:func:`_moved_on`) keeps nothing (its before is no later turn's). Never raises."""
+        if before is None or _moved_on(self, facts):
             return
         try:
             key = self._turn_now()
@@ -2424,8 +2452,16 @@ class Hands:
         it itself (:meth:`_tidy_by_code`), says its line (added to ``"_cover"``) and the result says what code did
         (``tidied``); with nothing else for the talker (no sound left silent) it comes back ``"_quiet"`` (the callers
         settle the call with no talker run). Under "ask" the result carries ``side_effect`` and ``one_step`` with
-        :data:`_AFTER_STEP_ASK_NOTE` (the question, never the step). No step: as before."""
+        :data:`_AFTER_STEP_ASK_NOTE` (the question, never the step). No step: as before.
+
+        Safety timing 4: an act whose user's next turn began while it ran (:func:`_moved_on`: the turn changed, or they
+        began speaking) gets no look at all: code takes no step for it and files no look (the new turn's one look and
+        its before stay the new turn's own)."""
         if before is None:
+            return None
+        if _moved_on(self, facts):
+            if self.log is not None:
+                self.log.event("hands", op=name, after_look=False, moved_on=True, call=params.tool_call_id)
             return None
         try:
             # hands19 (final-B all-desk): the turn's earliest before no look used yet, with every act of the turn since
@@ -2516,7 +2552,7 @@ class Hands:
             elif step is not None:
                 # desk20: with the dial at "ask", the step in the window hand's own terms, asked as a question
                 out["side_effect"] = step["says"]
-                out["one_step"] = _one_step_call(step)
+                out["one_step"] = _one_step_call(step, asked=True)   # safety timing 3: the measured target screen
                 note = _AFTER_STEP_ASK_NOTE + (_AFTER_PURPOSE if purpose else "")
             else:
                 note = _AFTER_PURPOSE_NOTE if off else (_AFTER_ASK_NOTE if level == "ask" else _AFTER_NOTE) + (
@@ -5085,6 +5121,7 @@ class Hands:
             # hands19 (all-desk RC1(a)): the desk right before the run, whatever its rungs declare (on_focus keeps only
             # the acting marker); the sound of the apps it names is read with it (contract C2)
             desk["before"] = self._desk_read(self._skill_apps(skill_key, slots))
+            desk["turn"] = (self._turn_now(), time.monotonic())   # safety timing 4: the turn the run began in
         try:
             result = engine.resolve_and_run(skill_key, slots, words, ctx, again=bool(args.get("again")),
                                             settings=self.skill_settings, corrects=bool(args.get("corrects")),
@@ -5102,6 +5139,7 @@ class Hands:
         facts["focus_declared"] = bool(getattr(result, "focus_declared", False))   # integration review F1
         if desk.get("before") is not None:
             facts["_desk_before"] = desk["before"]
+            facts["_desk_turn"] = desk.get("turn")
             facts["_desk_scope"] = self._skill_scope(skill_key, result)
         facts["sent_at"] = state.get("sent_at")
         # x3 (3c): what the fallback needs to know (RAM only, never logged): whether a rung may have acted (a verb ran,
@@ -5671,9 +5709,11 @@ class Hands:
             # P1.2: the desk right before the act itself (after every check), for the look after it
             before = self._desk_read(self._desk_apps(name, args, facts)) \
                 if bracket and self._brackets(name, args) else None
+            began = (self._turn_now(), time.monotonic())   # safety timing 4: the user turn the act began in, and when
             ok, report, facts = self._act(name, args, facts)
             if before is not None:
                 facts["_desk_before"] = before
+                facts["_desk_turn"] = began
             if not (ok and facts.get("verified") is True) and not facts.get("settled") and one is None:
                 self._halt_now(name, args, report)   # phase 4: under a ONE call its turn budget keeps the misses
             elif ok and facts.get("verified") is True and name in STEP_FIRST_OPS \

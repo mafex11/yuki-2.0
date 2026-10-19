@@ -848,7 +848,8 @@ class Executor:
         own Act switch, the desk lease,
         the acting marker, and :meth:`_place_act` (``yuki.actions.place``: undoable, journaled in the request's group
         so one "put it back" undoes it, place's own game gate). ``mode`` ``util.TIDY_ASK``: the step in code's words
-        as the yes/no question first (:meth:`_tidy_ask`), run on their yes only; ``util.TIDY_OFF``: nothing.
+        as the yes/no question first (:meth:`_tidy_ask`), run on their yes only, and only while it is still the step
+        measured again after it (:meth:`_tidy_still`, safety timing 3; rows 1-2 again); ``util.TIDY_OFF``: nothing.
 
         Returns code's words for after the request's line: the step's own (:data:`LINE_TIDY`, from what it read back)
         when it changed something, the plain line (``diff.LINE_TIDY_FAILED``) when it ran and did not take, else ``""``
@@ -910,6 +911,13 @@ class Executor:
                 why = "declined"
             if not why and mode == util.TIDY_ASK:
                 why = held()   # safety T-2: they took over while the question waited
+            if not why and mode == util.TIDY_ASK:
+                # safety timing 3: the step measured again after their yes, as the consent question's own re-look (the
+                # desk read again; rows 1-2 again): one no longer valid is left
+                why = self._tidy_still(step)
+                if not why:
+                    gate = consent.screen_gate(call, self._live(call))
+                    why = str(gate.why or "refused") if gate is not None else ""
             if not why:
                 if not self.acting:
                     try:
@@ -946,6 +954,40 @@ class Executor:
         self._emit_log("tidy", verb="window_action", action=action, state=state, by_code=True, mode=mode,
                        why=why or None, said=bool(said), ms=round((time.perf_counter() - started) * 1000, 1))
         return said
+
+    def _tidy_still(self, step: Mapping[str, Any]) -> str:
+        """Safety timing 3: after their yes to code's tidy question, the step measured again before it runs: the desk
+        read again (:meth:`_desk_now`) and compared with the request's first before, with the acts' same scope (as
+        :meth:`after_look`), must give the very same step (its action and window; a place: that window still on the
+        monitor it was on at the after-look, so "other" is the screen the question meant), and ``diff.tidy_guard`` on
+        that fresh measure must pass with a fresh front. A window they moved, raised, covered or uncovered themselves
+        while asked leaves the step. ``""``: still the step; else why not (``stale``, ``unread`` or the guard's word).
+        Never raises (``stale``)."""
+        try:
+            from yuki.perception import diff as desk_diff
+
+            now = self._desk_now()
+            if now is None:
+                return "unread"
+            named = {a for a in self._desk_asked | self._desk_touched if isinstance(a, str)}
+            d = desk_diff.compare(self._desk_first, now, acted=tuple(self._desk_asked),
+                                  touched=tuple(self._desk_touched), sound_apps=tuple(self._desk_sound | named),
+                                  fresh=tuple(self._desk_launched | self._desk_programs))
+            front = d.focus_from if (d.flags or {}).get("focus_taken") else None
+            again = desk_diff.tidy_step(d, self._tidy_ours(d), front, len(getattr(now, "monitors", None) or ()))
+            hwnd = done.as_hwnd(step.get("hwnd"))
+            if not again or again.get("action") != step.get("action") or done.as_hwnd(again.get("hwnd")) != hwnd:
+                return "stale"
+
+            def monitor(state: Any) -> Any:
+                return next((w.monitor for w in getattr(state, "windows", None) or () if int(w.hwnd) == hwnd), None)
+
+            if step.get("action") == "place" and monitor(now) != monitor(self._after_state):
+                return "stale"
+            return desk_diff.tidy_guard(again, d, self._front_since(), done.as_hwnd(getattr(now, "foreground", None)),
+                                        self._desk_arranged)
+        except Exception:  # noqa: BLE001 - not measured again: left
+            return "stale"
 
     def _front_since(self) -> int | None:
         """tidy21: the window in front now, as the after-look reads it (:meth:`_own_aside`: Yuki's own window stands for

@@ -2709,7 +2709,8 @@ def _page_before_keys(details: dict) -> tuple[int, dict | None, bool]:
     return hwnd, page, known
 
 
-def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
+def hotkey(*keys: str, expect_hwnd: int | None = None,
+           before_send: Callable[[], str] | None = None) -> ActionResult:
     """Press a key combination, e.g. ``("ctrl","t")``, ``("volume_mute",)``.
 
     Modifiers are held in order and released in reverse, exactly like a human
@@ -2728,6 +2729,12 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
     foreground window shows (before -> after, watched for up to
     :data:`_PAGE_WATCH_S`; ``page_before``/``page_after``/``page_changed`` in
     ``details``), so a key that navigates says where it went.
+
+    ``before_send`` (safety F1): the caller's own last check, run after every
+    wait above and right before the keys go out (only the front is read after
+    it): a non-empty reason it returns (or raises) sends nothing, and the
+    result says so (``details["withheld"]``). Safety F2: the window in front is
+    read again right before ``SendInput``, after the focus and state reads.
     """
     started = time.perf_counter()
     details: dict = {"keys": list(keys), "expect_hwnd": expect_hwnd}
@@ -2763,6 +2770,17 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
         return _result(False, refusal, details, started)
     before = _focus_state()
     shown_hwnd, shown_before = _window_state_before(expect_hwnd, before)
+    if before_send is not None:
+        try:
+            stop = str(before_send() or "").strip()
+        except Exception as exc:  # noqa: BLE001 - the caller's check could not run: nothing is sent
+            stop = f"its last check could not run ({type(exc).__name__})"
+        if stop:
+            details["withheld"] = stop
+            return _result(False, f"{'+'.join(resolved)} was not pressed: {stop}", details, started)
+    refusal = _foreground_mismatch(expect_hwnd)  # safety F2: right before SendInput (the reads above take time)
+    if refusal:
+        return _result(False, refusal, details, started)
     why: list[str] = []
     _send_chord(*resolved, why=why)
     if why:
@@ -2823,6 +2841,9 @@ def press(
         return _result(False, refusal, details, started)
     before = _focus_state()
     shown_hwnd, shown_before = _window_state_before(expect_hwnd, before)
+    refusal = _foreground_mismatch(expect_hwnd)  # safety F2: right before SendInput (the reads above take time)
+    if refusal:
+        return _result(False, refusal, details, started)
     why: list[str] = []
     _send_presses(normalized, times, why=why)
     if why:

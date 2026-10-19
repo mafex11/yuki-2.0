@@ -4412,6 +4412,8 @@ class OneVoice:
         from yuki.one import budget as one_budget
         from yuki.one import policy
 
+        if self.turn is not None:
+            self.turn.moved_on = True   # safety timing 4: a late act of the last turn takes no tidy step of code's now
         if self.turn is not None and not self.over:
             self.turn_over("next")   # they spoke on: the last turn ends here (its thinking blocks go, its timer stops)
         else:
@@ -5764,9 +5766,13 @@ class OneVoice:
         return bool(countdown is not None and countdown.swap(kind, value))
 
     def user_started(self) -> None:
-        """Flux's start of turn: an open countdown pauses at once (their words then decide, through the agent)."""
+        """Flux's start of turn: an open countdown pauses at once (their words then decide, through the agent). Safety
+        timing 4: their next turn began while a runner call of the current one runs, so that late act takes no tidy
+        step of code's."""
         self._spoke_at = time.monotonic()
         self._words_since = False
+        if self.turn is not None and self._running > 0:
+            self.turn.moved_on = True
         countdown = self._countdown
         if countdown is None or not countdown.counting:
             return
@@ -7539,6 +7545,8 @@ class Conversation:
             hands.exchange = self._exchange_words
             hands.turn_key = self.observer.turn_id
             hands.user_turn = lambda: self.observer.user_turns
+            # safety timing 4: when their latest speech began, so an act's look knows their next turn began meanwhile
+            hands.user_began = lambda: float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)
             # Phase S: the skill path (its keys fixed with this conversation's tools), the engine's memory and settings
             hands.skill_keys = tuple(self._skill_keys())
             # review r2 L3: the volume skill runs unheld on unsure words, so then it takes no focus (the same state

@@ -359,6 +359,10 @@ class Turn:
         #: turn before asked (its answer is in these words: never asked twice).
         self.guesses_asked: set[tuple[str, str, str]] = set()
         self.guesses_before: set[tuple[str, str, str]] = set()
+        #: Safety timing 4: the user's next turn began (they began speaking again, or their next words opened a turn of
+        #: their own: the voice driver sets it): code's tidy step of a late act of this turn is left (never after they
+        #: moved on; ``Runner._tidy_by_code``).
+        self.moved_on = False
         self._lock = threading.Lock()
         self._join: tuple[int, str, str] | None = None
         self._send: dict[str, Any] | None = None

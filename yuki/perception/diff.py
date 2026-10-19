@@ -590,8 +590,10 @@ def tidy_step(d: Any, acts: Iterable[Any], front: Any, monitors: Any = None) -> 
     3. the front was taken: give it back (what is covered under something not the act's stays).
 
     ``{"action": "focus_back" | "place", "hwnd": int, "flag": "focus_taken" | "covered_attention", "covered": the
-    window of theirs it uncovers or gives back (int), "monitor": "other" (place only), "says": code's classification
-    in plain words (window names: content, RAM only, never logged)}``. Pure: no OS call. Never raises (``None``)."""
+    window of theirs it uncovers or gives back (int), "monitor": "other" (place only), "to": that other monitor's
+    measured index (place only; ``None`` unknown: the step asked as a question carries it, safety timing 3), "says":
+    code's classification in plain words (window names: content, RAM only, never logged)}``. Pure: no OS call. Never
+    raises (``None``)."""
     try:
         if d is None or not window_flag(d):
             return None
@@ -632,7 +634,12 @@ def tidy_step(d: Any, acts: Iterable[Any], front: Any, monitors: Any = None) -> 
                     continue
                 tag = " (playing)" if c.get("playing") else ""
                 taken = f"; it also took the front from {name(taken_from)}" if taken_from else ""
-                return {"action": "place", "hwnd": by, "monitor": "other", "flag": "covered_attention",
+                # safety timing 3: the measured index of that other monitor (place's "other" from where it is now),
+                # for an asked step: their later yes moves it to the screen asked about, never "other" from wherever
+                # they put it meanwhile
+                indexes = sorted(int(i) for i in (getattr(d, "monitors", None) or {}))
+                to = indexes[(indexes.index(src) + 1) % len(indexes)] if src in indexes and len(indexes) > 1 else None
+                return {"action": "place", "hwnd": by, "monitor": "other", "to": to, "flag": "covered_attention",
                         "covered": theirs,
                         "says": f"your act's window {name(by)} covers {name(theirs)}{tag}{taken}; moving "
                                 f"{name(by)} to the other monitor keeps it in view and uncovers theirs"}
