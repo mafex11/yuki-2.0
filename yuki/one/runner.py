@@ -37,8 +37,11 @@ code's one line. Otherwise the agent gets its next round with every result.
 **tidy21** (the user's decision 1, 19 Oct): under the tidy dial "do", code takes the flagged diff's one legal undoable
 step (``perception.diff.tidy_step``, contract C7) itself (:meth:`Runner._tidy_by_code`: ``verbs.run("window", ...)``
 through the gate's row 8, once a turn) and says its line; the result tells the agent what code did (``tidied``) and
-keeps no window flag for it. At "ask" the result carries the step for the question only (``side_effect``); "off":
-nothing. A ``focus_back`` with no window goes to the measured front before the act
+keeps no window flag for it, in ``flags`` too (review F2: so voice ONE settles by code). Never a move of a window the
+turn's own acts placed or sized as asked (review F1: ``RunState.arranged``), never the front given to Yuki's own window
+(F5), and a later flagged act of the turn settles by code too (F4: one tidy decision a turn, as under ``all``). At
+"ask" the result carries the step for the question only (``side_effect``); "off": nothing. A ``focus_back`` with no
+window goes to the measured front before the act
 (S2); a skill run that handed back gets the second way the planner gave it under ``all``, once, in code (S5: a rung
 that never read runs once more; a pick-kind value no route found runs as Yuki's pick with it as context), or one short
 question when its value was only the agent's reading of their words (S12); the hand-off text is written for ONE.
@@ -122,7 +125,7 @@ TIDY_ASK_NOTE = ("the flags are a side effect of your act on their screen; one u
 TIDIED: dict[str, str] = {
     "taken": "code undid that side effect with its one undoable step and said so (said)",
     "failed": "code's one undoable step to undo that side effect did not take, and code said so (said)",
-    "left": "code left their windows as they are (their desk changed since, or their settings say no)"}
+    "left": "code left their windows as they are, on purpose"}
 #: The name of code's own tidy step's call context: no ONE tool, so the gate judges it as an inner step (never counted
 #: on the agent's budget or refusals), at row 8 like any tidy step.
 CODE_TIDY = "tidy_by_code"
@@ -437,6 +440,10 @@ class RunState:
     #: said (voice) or shown (typed) like the rest of code's lines.
     tidied: bool = False
     speaker: Any = None
+    #: tidy21 review F1: the windows whose own place or state this turn's acts were asked for
+    #: (``hands.arranged_windows``: a ``window`` move / maximize / fullscreen / restore, a skill run given a place):
+    #: code's tidy step never moves one away again (``diff.tidy_guard``'s ``asked_place``).
+    arranged: set[int] = field(default_factory=set)
 
 
 def state_of(turn: Any) -> RunState:
@@ -1213,6 +1220,7 @@ class Runner:
                 scoped["_desk_scope"] = dict(scope)
             acted, touched = self.verbs.scope(name, resolved, scoped, ctx.before, after)
             d = desk_diff.compare(ctx.before, after, acted=acted, touched=touched)
+            state.arranged |= self._arranged(name, resolved, scoped, ctx.before, after)
             own = {int(h) for h in self.verbs.act_windows(after, d, acted, touched) if h}
             state.own |= own
             result.flags = {k: bool(v) for k, v in dict(d.flags).items()}
@@ -1225,6 +1233,7 @@ class Runner:
             elif self._front_kept is not None and self._front_kept[2] is not state:
                 self._front_kept = None   # an act of a later turn that moved no front lets an older one go (as all)
             pending: dict[str, Any] | None = None
+            settled = False
             if result.flagged and not result.tidy:
                 # a new flagged diff opens a tidy-up on its windows; a tidy step's own flagged diff never renews it
                 # (its two steps per flagged diff stay counted)
@@ -1235,13 +1244,23 @@ class Runner:
                 step, words = self._legal_step(d, own, after, turn)
                 turn.flag(own=sorted(own), attention=attention, before=ctx.before, acted=acted, touched=touched,
                           sound_app=ctx.sound_app, focus_from=moved, step=step, step_words=words)
-                if step is not None and util.tidy_mode(getattr(turn, "policy", None)) == util.TIDY_DO:
+                do = util.tidy_mode(getattr(turn, "policy", None)) == util.TIDY_DO
+                # review F1: a move of a window the turn's acts placed or sized as asked is no side effect: code
+                # leaves it (its guard's ``asked_place``), at "ask" too (no question about it, as the planner)
+                as_asked = step is not None and step.get("action") == "place" and step.get("hwnd") in state.arranged
+                if do and state.tidied:
+                    # review F4: code already decided this turn's one tidy step (taken or left): a later flagged act
+                    # settles by code too, as under "all" (one look a turn), never handed to the agent
+                    settled = True
+                elif step is not None and (do or as_asked):
                     pending = step
                 else:
                     result.tidy_step = words
             self._cover(d, result, turn, state, say)
             if pending is not None:
                 self._tidy_result(pending, d, after, result, turn, state, say)
+            elif settled:
+                self._tidy_settled(result, "", turn)
             self._emit("one_diff", tool=name, **d.facts(), legal_step=bool(pending or result.tidy_step) or None)
         except Exception as exc:  # noqa: BLE001 - no diff: the result stands
             self._emit("one_diff_error", tool=name, error=type(exc).__name__)
@@ -1280,20 +1299,47 @@ class Runner:
                      state: RunState, say: Any) -> None:
         """tidy21: code's own tidy step for a flagged act result (:meth:`_tidy_by_code`), and the result the agent
         reads: code's line added to ``said`` (heard), ``tidied`` (what code did), and no window flag left for the
-        agent (code took the one legal step, or left the desk on purpose): the result is flagged only for a sound left
-        silent (a volume step is the agent's). Never raises."""
+        agent (code took the one legal step, or left the desk on purpose; :meth:`_tidy_settled`): the result is flagged
+        only for a sound left silent (a volume step is the agent's). Never raises."""
         try:
             done, said = self._tidy_by_code(step, d, after, turn, state, say)
         except Exception as exc:  # noqa: BLE001 - nothing was done: the result stands as measured
             self._emit("one_tidy_code", error=type(exc).__name__)
             return
-        if not done:
-            return
         if said:
             result.said = f"{result.said} {said}".strip()
             result.heard = True
-        result.tidied, result.tidy_state = TIDIED.get(done, TIDIED["left"]), done
-        result.flagged = bool(result.flags.get("left_silent"))
+        self._tidy_settled(result, done, turn)
+
+    @staticmethod
+    def _tidy_settled(result: OneResult, done: str, turn: policy.Turn) -> None:
+        """tidy21: a flagged act result whose window tidy-up code decided (``done``: ``taken`` / ``failed`` /
+        ``left``; ``""``: code's one step was decided earlier this turn, review F4) settles by code: ``tidied`` says
+        what code did, and the window flags are cleared from ``flags`` as well as ``flagged`` (review F2: the voice
+        driver reads any truthy flag as flagged, ``pipeline._one_flagged``), so no agent round comes for them; only a
+        sound left silent stays (a volume step is the agent's). The measured flags stay in the ``one_diff`` log line.
+        The flagged diff's tidy debt is code's too (``Tidy.given``). Never raises."""
+        try:
+            result.tidied, result.tidy_state = TIDIED.get(done, TIDIED["left"]), done or "once"
+            silent = bool(dict(result.flags or {}).get("left_silent"))
+            result.flags = {k: (bool(v) if k == "left_silent" else False) for k, v in dict(result.flags or {}).items()}
+            result.flagged = silent
+            tidy = getattr(turn, "tidy", None)
+            if tidy is not None:
+                tidy.given = True
+        except Exception:  # noqa: BLE001 - the result stands as measured
+            pass
+
+    def _arranged(self, name: str, args: Mapping[str, Any], facts: Mapping[str, Any], before: Any,
+                  after: Any) -> set[int]:
+        """tidy21 review F1: the windows whose own place or state this act was asked for
+        (``hands.arranged_windows``, from the act's own facts); empty when unknown. Never raises."""
+        try:
+            from yuki.voice.hands import arranged_windows
+
+            return arranged_windows(name, dict(args or {}), dict(facts or {}), before, after)
+        except Exception:  # noqa: BLE001
+            return set()
 
     def _tidy_by_code(self, step: Mapping[str, Any], d: Any, after: Any, turn: policy.Turn, state: RunState,
                       say: Any) -> tuple[str, str]:
@@ -1303,8 +1349,10 @@ class Runner:
         itself, at most once a turn (:attr:`RunState.tidied`):
 
         * guards first: ``diff.tidy_guard`` (the window in front is still the one the after-read saw: never over a
-          window they or another app brought forward since; a move never takes a window of theirs) and the Act switch
-          of the step's window (:meth:`CallContext.act_off`);
+          window they or another app brought forward since; a move never takes a window of theirs, nor one whose own
+          place or state the turn's acts were asked for: :attr:`RunState.arranged`, review F1), never the front given
+          to one of Yuki's own windows (review F5: ONE's desk reads keep them; the planner stands the origin in), and
+          the Act switch of the step's window (:meth:`CallContext.act_off`);
         * then ``verbs.run("window", step)`` in the desk lease, under a call context of code's own (:data:`CODE_TIDY`):
           the gate judges it as an inner step at its rows (a game in front: row 1; the tidy dial and the flagged
           diff's own windows: row 8, counted as one of its tidy steps), never on the agent's budget or refusals; the
@@ -1334,7 +1382,10 @@ class Runner:
             else:
                 reader = getattr(self.verbs, "front_now", None) or getattr(self.verbs, "foreground", None)
                 front = reader() if callable(reader) else None
-                why = desk_diff.tidy_guard(dict(step), d, front, getattr(after, "foreground", None))
+                why = desk_diff.tidy_guard(dict(step), d, front, getattr(after, "foreground", None), state.arranged)
+                own = getattr(self.verbs, "own_window", None)
+                if not why and call["action"] == "focus_back" and callable(own) and own(call["window"]):
+                    why = "own_window"   # review F5: Yuki's own chat or bar is never "their" front to give back
             raw = desk_diff.step_app(dict(step), after)
             ctx = self._ctx(turn, CODE_TIDY, call or {}, bracket=False)
             if not why and raw and ctx.act_off(raw):
@@ -1446,14 +1497,17 @@ class Runner:
             step, words = self._legal_step(d, own, now, turn)
             if words:
                 tidy.step, tidy.step_words = step, words
-                if util.tidy_mode(getattr(turn, "policy", None)) == util.TIDY_DO:
-                    # tidy21 (decision 1): code takes it itself (once a turn) and says so: nothing left for the agent
-                    # unless a sound is left silent
-                    state = state_of(turn)
-                    done, _said = self._tidy_by_code(step, d, now, turn, state, state.speaker or self.speak)
-                    if done and not dict(d.flags).get("left_silent"):
-                        return None
-                    return debt if not done else {**debt, "after": f"{after}\n{TIDIED.get(done, '')}".strip()}
+            state = state_of(turn)
+            as_asked = bool(words) and step.get("action") == "place" and step.get("hwnd") in state.arranged
+            if (util.tidy_mode(getattr(turn, "policy", None)) == util.TIDY_DO and (words or state.tidied)) or as_asked:
+                # tidy21 (decision 1): code takes it itself (once a turn) and says so; review F4: once code decided
+                # this turn's one step, the debt is code's too; review F1: a move of a window placed as asked is
+                # code's to leave, at "ask" too. Nothing left for the agent unless a sound is silent
+                done = self._tidy_by_code(step, d, now, turn, state, state.speaker or self.speak)[0] if words else ""
+                if not dict(d.flags).get("left_silent"):
+                    return None
+                return {"after": f"{after}\n{TIDIED.get(done, TIDIED['left'])}".strip(), "flags": ["left_silent"]}
+            if words:
                 # the dial at "ask": the step for the question only (the voice driver copies ``after`` and ``flags``)
                 debt["after"] = f"{after}\n{TIDY_ASK_NOTE.format(step=words)}".strip()
             return debt

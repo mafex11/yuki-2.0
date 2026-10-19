@@ -534,6 +534,10 @@ class Executor:
         self._desk_first: Any = None
         self._desk_asked: set[Any] = set()
         self._desk_touched: set[Any] = set()
+        #: tidy21 review F1: the windows whose own place or state this request's acts were asked for (a window_action
+        #: place / maximize / fullscreen / restore, a skill run given a place: ``diff.arranges``): code's tidy step
+        #: never moves one away again (``diff.tidy_guard``'s ``asked_place``)
+        self._desk_arranged: set[int] = set()
         #: integration review c2desk-1: the apps whose mixer rows this request's acts set (an app_volume step's app, a
         #: skill run's measured apps): the after-look's ``left_silent`` scope only, never its window scope
         self._desk_sound: set[Any] = set()
@@ -806,7 +810,8 @@ class Executor:
         acts took it from, or the acts' covering window moved to the other monitor) runs with no planner call, once per
         request, inside the tidy turn's own bounds: :meth:`_tidy_mine` (only what this request's acts changed),
         ``diff.tidy_guard`` (the window in front is still the one the after-look saw; a move never takes a window of
-        theirs), rows 1-2 (a game in front, the "just suggest" kinds) and the window's own Act switch, the desk lease,
+        theirs, nor one whose own place or state a step of this request was asked for: review F1, ``_desk_arranged``),
+        rows 1-2 (a game in front, the "just suggest" kinds) and the window's own Act switch, the desk lease,
         the acting marker, and :meth:`_place_act` (``yuki.actions.place``: undoable, journaled in the request's group
         so one "put it back" undoes it, place's own game gate). ``mode`` ``util.TIDY_ASK``: the step in code's words
         as the yes/no question first (:meth:`_tidy_ask`), run on their yes only; ``util.TIDY_OFF``: nothing.
@@ -831,7 +836,7 @@ class Executor:
             call = Call("window_action", {"action": action, **({"monitor": "other", "how": "keep"}
                                                                   if action == "place" else {})},
                         index=0, hwnd=hwnd, app=raw)
-            why = desk_diff.tidy_guard(step, d, self._front_since(), self._after_front)
+            why = desk_diff.tidy_guard(step, d, self._front_since(), self._after_front, self._desk_arranged)
             if not why and not self._tidy_mine(action, hwnd):
                 why = "not_ours"
             if not why:
@@ -994,6 +999,15 @@ class Executor:
                 self._desk_asked |= hwnds
                 if call.tool == "launch_app" and not hwnds and words(call.input.get("query")):
                     self._desk_asked.add(words(call.input.get("query")))
+            # tidy21 review F1: a step whose ask is its window's own place or state (by our verb names, never words)
+            if call.tool == "window_action":
+                from yuki.perception.diff import arranges
+
+                if arranges(call.input.get("action")):
+                    self._desk_arranged |= {int(h) for h in hwnds}
+            elif call.tool == "run_skill" and words(call.input.get("place")):
+                self._desk_arranged |= {int(h) for h in hwnds}
+                self._desk_arranged |= {h for h in (done.as_hwnd(w) for w in payload.get("acted_windows") or ()) if h}
         except Exception:  # noqa: BLE001 - bookkeeping only
             pass
 

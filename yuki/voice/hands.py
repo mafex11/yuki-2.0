@@ -79,7 +79,8 @@ as before (``run_llm=False``), no model call. At most one look per user turn; it
 ``move``, ``focus_back``, ``undo``: :mod:`yuki.actions.place`, all undoable, never judged, gated for games) are never
 looked after again. tidy21 (the user's decision 1, 19 Oct): with the dial at "do", the look's one measured step
 (``diff.tidy_step``) is taken by code itself (:meth:`Hands._tidy_by_code`) and said in code's own line; the talker is
-only told (and run only for a sound left silent). "ask" keeps the question; "off" does nothing.
+only told (and run only for a sound left silent). "ask" keeps the question; "off" does nothing. Code never moves a
+window whose own place or state the turn's acts were asked for (review F1: :func:`arranged_windows`).
 """
 
 from __future__ import annotations
@@ -233,7 +234,7 @@ _AFTER_ASK_NOTE = (
 _TIDIED: dict[str, str] = {
     "taken": "code undid that side effect of your act with its one undoable step and said so (said)",
     "failed": "code's one undoable step to undo that side effect did not take, and code said so (said)",
-    "left": "code left their windows as they are (their desk changed since, or their settings say no)"}
+    "left": "code left their windows as they are, on purpose"}
 _AFTER_TIDIED_NOTE = (
     "Done and verified; said is what was heard already, code's own tidy-up line too. After is what your act did to "
     "their screen; tidied is what code did about their windows: no window hand for it."
@@ -266,6 +267,41 @@ def _one_step_call(step: dict[str, Any]) -> dict[str, Any]:
     if step.get("action") == "place":
         return {"action": "move", "window": int(step["hwnd"]), "monitor": str(step.get("monitor") or "other")}
     return {"action": "focus_back", "window": int(step["hwnd"])}
+
+
+def arranged_windows(name: str, args: Any, facts: Any, before: Any = None, after: Any = None) -> set[int]:
+    """tidy21 review F1: the windows whose own place or state this act was asked for, from its own facts (ids, never
+    words), so code's tidy step never moves one away again (``diff.tidy_guard``'s ``asked_place``): the window hand's
+    (and the ONE ``window`` tool's) target windows for an arranging action (``diff.arranges``: move, maximize,
+    fullscreen, restore), as :meth:`Hands._scope` reads them; a skill run given a place (its ``place`` field) its
+    measured windows and the window it brought to the front. Empty for anything else. Pure; never raises."""
+    out: set[int] = set()
+    try:
+        from yuki.perception import diff as desk_diff
+
+        args = args if isinstance(args, dict) else {}
+        facts = facts if isinstance(facts, dict) else {}
+        ids: list[Any] = []
+        if name == "window" and desk_diff.arranges(args.get("action")):
+            ids = [args.get("window"), facts.get("live_hwnd"), *(args.get("_hwnds") or [])]
+            ids += [t[3] for t in args.get("_targets") or [] if isinstance(t, (list, tuple)) and len(t) > 3]
+        elif name == SKILL_HAND and " ".join(str(args.get("place") or "").split()):
+            scope = facts.get("_desk_scope") if isinstance(facts.get("_desk_scope"), dict) else {}
+            ids = list(scope.get("touched_windows") or ())
+            fg_before, fg_after = getattr(before, "foreground", None), getattr(after, "foreground", None)
+            if scope.get("focus") and fg_after and fg_after != fg_before:
+                ids.append(fg_after)
+        for h in ids:
+            if isinstance(h, bool) or h is None:
+                continue
+            try:
+                if int(h):
+                    out.add(int(h))
+            except (TypeError, ValueError):
+                continue
+    except Exception:  # noqa: BLE001 - nothing known: code's other guards stand
+        return out
+    return out
 #: A placement verb that did not take effect: said plainly, no other hand (never a loop of tidy-ups).
 _PLACE_FAILED_NOTE = (
     "It did not take effect, as the report says. Say so in a few words if they asked for it; if it was your own "
@@ -2435,10 +2471,17 @@ class Hands:
                           "rest": bool(rest), "silent": bool(d.flags.get("left_silent")), "ask": level == "ask",
                           "off": off, "purpose": purpose, "step": step}
             out: dict[str, Any] = {"after": text, "flags": [k for k, v in d.flags.items() if v]}
-            if step is not None and level == "do":
+            # tidy21 review F1: the windows whose own place or state an act of this turn was asked for; a move of one
+            # is no side effect to undo: code leaves it (``diff.tidy_guard``'s ``asked_place``), at "ask" too (no
+            # question about it: as the planner, whose guard runs before its question)
+            arranged: set[int] = set()
+            for act_name, act_args, act_facts in acts if step is not None else ():
+                arranged |= arranged_windows(act_name, act_args, act_facts, before, after)
+            as_asked = step is not None and step.get("action") == "place" and step.get("hwnd") in arranged
+            if step is not None and (level == "do" or as_asked):
                 # tidy21 (decision 1, S1): code takes the one measured step itself, through the look's own guards, and
                 # says its line; the talker is told what code did, never asked to do it (and so never twice)
-                taken = await self._tidy_by_code(params, step, d, after, turn)
+                taken = await self._tidy_by_code(params, step, d, after, turn, arranged)
                 out["tidied"] = _TIDIED.get(taken.get("state", "left"), _TIDIED["left"])
                 if taken.get("said"):
                     cover = " ".join(x for x in (cover, taken["said"]) if x)
@@ -2474,22 +2517,25 @@ class Hands:
         except Exception:  # noqa: BLE001 - not said: the look (if any) still shows it in After
             return ""
 
-    async def _tidy_by_code(self, params: Any, step: dict[str, Any], d: Any, after: Any, turn: Any) -> dict[str, str]:
+    async def _tidy_by_code(self, params: Any, step: dict[str, Any], d: Any, after: Any, turn: Any,
+                            arranged: Any = ()) -> dict[str, str]:
         """tidy21 (the user's decision 1, final-D S1): under the tidy dial "do", code takes the look's one measured
         step (``diff.tidy_step``: the front given back to the window the act took it from, or the act's covering window
         moved to the other monitor) itself, once, right after the look's done line:
 
         * guards first (``diff.tidy_guard``): the window in front is still the one the after-read saw (never over a
           window they or another app brought forward since), a move never takes a window of theirs (one that held their
-          attention before the act), and the Act switch of the step's window (:meth:`act_off`);
+          attention before the act) nor one whose own place or state the turn's acts were asked for (``arranged``:
+          :func:`arranged_windows`, review F1), and the Act switch of the step's window (:meth:`act_off`);
         * then :meth:`_place_run` with the look itself: its own bounds (one step per look, only the act's windows move,
           the front only back to the window the act took it from), the desk guard, the acting marker, the undo journal
           group of the turn ("put it back" undoes it) and place's own game gate;
         * the step's record on the action log, then code's own line (``diff.tidy_line``): what it did, or plainly that
           it did not take (said once). Left (a guard, a refusal, a game): nothing is said.
 
-        The look's one step is used either way (a talker call after it is refused as a second tidy step). Returns
-        ``{"state": "taken" | "failed" | "left", "said": the line said ("" none)}``. Logs content-free. Never raises."""
+        The look's one step is used either way, an exception too (review F3: a talker call after it is refused as a
+        second tidy step). Returns ``{"state": "taken" | "failed" | "left", "said": the line said ("" none)}``. Logs
+        content-free. Never raises."""
         from yuki.perception import diff as desk_diff
 
         look = self._look
@@ -2500,7 +2546,7 @@ class Hands:
         ok, facts = False, {}
         try:
             front = await asyncio.to_thread(self._front_now)
-            why = desk_diff.tidy_guard(step, d, front, getattr(after, "foreground", None))
+            why = desk_diff.tidy_guard(step, d, front, getattr(after, "foreground", None), arranged)
             raw = desk_diff.step_app(step, after) or str(self._app_at(step.get("hwnd")) or "")
             if not why and self.act_off(raw):
                 why = "act_off"
@@ -2552,7 +2598,7 @@ class Hands:
             why = why or type(exc).__name__
         finally:
             if look is not None:
-                look["by_code"] = True
+                look["by_code"] = look["used"] = True   # review F3: even when it broke, the look's step was code's
         if self.log is not None:
             self.log.event("hands", op="window", action=op, tidy=True, by_code=True, state=state, why=why or None,
                            ok=ok, said=bool(said), ms=round((time.monotonic() - started) * 1000),
@@ -2570,6 +2616,18 @@ class Hands:
             except Exception:  # noqa: BLE001
                 return None
         return self._foreground()
+
+    def _own_window(self, hwnd: Any) -> bool:
+        """tidy21 review F5: whether ``hwnd`` is one of Yuki's own windows (its chat, its bar), by the window's process
+        (``agent.tools._is_own_window``: read-only) on the real desktop; a stand-in desk has none. Never raises."""
+        if not _is_real_backend(self.backend):
+            return False
+        try:
+            from yuki.agent.tools import _is_own_window
+
+            return bool(_is_own_window(int(hwnd or 0)))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _place_verbs(self) -> Any:
         """Where the placement verbs run: the backend's own (a stand-in desk's ``place_window`` / ``focus_back`` /
@@ -7825,6 +7883,11 @@ class Verbs:
         """tidy21: the window in front now in one read-only call (:meth:`Hands._front_now`), for the code tidy step's
         guard; ``None`` when it can't be read."""
         return self.hands._front_now()
+
+    def own_window(self, hwnd: Any) -> bool:
+        """tidy21 review F5: whether ``hwnd`` is one of Yuki's own windows (:meth:`Hands._own_window`), so code's tidy
+        step never gives the front to Yuki's own chat (the planner stands the origin window in for it)."""
+        return self.hands._own_window(hwnd)
 
     # -- the verbs (blocking, on the worker thread, inside the runner's ``one_call``) -----------------------------
 
