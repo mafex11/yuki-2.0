@@ -218,6 +218,10 @@ class SpeechGuard:
         #: the pieces before it, a dropped one marked as such.
         self._written: deque[tuple[float, str]] = deque(maxlen=8)
         self._tasks: set[asyncio.Task] = set()
+        #: voice20 (final-D S22h): a claim-gate wait of the reply being said ran out (no verdict in time, or the check
+        #: failed): its later lines do not wait again (one wait per reply); a new reply or their words reset it.
+        self._reply_waited_out = False
+        self._claim_futs: set[Any] = set()   # the claim-gate checks not decided yet (done or not)
         self.stats: dict[str, Any] = {"checked": 0, "free": 0, "caught": 0, "repeats": 0, "timeouts": 0, "errors": 0,
                                       "shadow_caught": 0, "input_tokens": 0, "output_tokens": 0, "ms": []}
 
@@ -236,6 +240,8 @@ class SpeechGuard:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Verdict] = loop.create_future()
         now = time.monotonic()
+        if first:
+            self._reply_waited_out = False   # voice20 (S22h): a new reply gets its own one wait
         norm = _norm(text)
         if not norm:
             fut.set_result(Verdict(True, by="free"))
@@ -261,6 +267,9 @@ class SpeechGuard:
                 self._pending.add(norm)
                 self._waits.add(fut)
                 fut.add_done_callback(self._waits.discard)
+                if len(self._claim_futs) > 64:
+                    self._claim_futs.clear()   # never decided (a reply cut short): bounded
+                self._claim_futs.add(fut)
                 task = loop.create_task(self._check(text, said, fut, written, first, claim=True))
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
@@ -386,14 +395,27 @@ class SpeechGuard:
         A kept line is remembered for the repeat check; a dropped one is logged and reported (``on_drop``).
         """
         wait = self.timeout_s if wait_s is None else max(0.0, wait_s)
+        # voice20 (final-D S22h): one claim-gate wait per reply. Live final-D (block one, a Bedrock outage) each line of
+        # a failure reply waited out its own 2.5 s (four lines: 10 s). Once one line's claim check ran out in this
+        # reply, the reply's later lines take their verdict as it stands now (none: the same timeout verdict as after a
+        # wait, so what is said is unchanged), with no new wait. A check that is done is read as before.
+        claim = fut in self._claim_futs
+        self._claim_futs.discard(fut)
+        shared = claim and self._reply_waited_out and not fut.done()
+        if shared:
+            wait = 0.0
         try:
             verdict = await asyncio.wait_for(asyncio.shield(fut), timeout=wait) if not fut.done() else fut.result()
         except asyncio.TimeoutError:
             # Fails closed for anything but a short plain line (v3.13): an unchecked long line is never heard.
             self.stats["timeouts"] += 1
+            if claim:
+                self._reply_waited_out = True
             self._log(op="timeout", chars=len(text), waited_ms=round(wait * 1000), said=self.short(text) or self.shadow,
-                      **({"shadow": True} if self.shadow else {}))
+                      **({"shadow": True} if self.shadow else {}), **({"shared": True} if shared else {}))
             verdict = Verdict(self.short(text) or self.shadow, "unchecked", by="timeout")
+        if claim and verdict.by == "error":
+            self._reply_waited_out = True   # the check is failing now: the reply's later lines don't wait for it
         self._pending.discard(_norm(text))
         if verdict.ok:
             if verdict.by != "free":
@@ -484,6 +506,12 @@ class SpeechGuard:
         self._turn.clear()
         self._turn_lines = []
         self._written.clear()
+        self._reply_waited_out = False
+
+    def new_reply(self) -> None:
+        """voice20 (final-D S22h): a new reply of the talker begins (its stream's start, for the voices that check a
+        line before sending it): its lines get their own one claim-gate wait."""
+        self._reply_waited_out = False
 
     # -- bookkeeping -------------------------------------------------------------------------------------
 

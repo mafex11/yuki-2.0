@@ -470,6 +470,8 @@ class LlmCall:
     one_unmarked: bool = False
     one_marker: str | None = None
     one_repeat: bool = False
+    #: voice20 review L1: what of this reply was spoken ends a sentence as a question (its own closing mark)
+    one_asks: bool = False
 
 
 #: Tools whose spoken acknowledgement travels in the call itself (``say_first``), said as soon as it is written.
@@ -644,10 +646,14 @@ NEAR_TAIL_HEAD = 2
 #: ... and with part of the name gone, the rest must match closely: measured "scored" against Discord's tail 0.91 (the
 #: final-B clip), "after" against Father's 0.80 (a clear sentence of the v3.5 checks, never named).
 NEAR_TAIL_RATIO = 0.85
+#: voice20 (final-D S12): a running app's name is measured by its tail with exactly this many first letters gone (the
+#: first sound the word before took: "di|scord"). With one letter gone a prefixed brand leaves an everyday word: on the
+#: user's 793 spoken turns (memory copy, every app of the timeline) "the cloud" was named iCloud, once; with two, none.
+APP_TAIL_HEAD = 2
 
 
 def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
-               screen: list[str] | None = None) -> tuple[str | None, int, int]:
+               screen: list[str] | None = None, apps: list[str] | None = None) -> tuple[str | None, int, int]:
     """What speech recognition was unsure of in a final transcript, for the mouth: ``(note, low, near)``.
 
     ``words`` is Flux's TurnInfo word list (``{"word", "confidence"}``); ``keyterms`` the names memory
@@ -667,6 +673,11 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
     Letters said one by one (v3.13: "Open w a r p." heard as five words, answered "Was that Hindi?") are one word
     spelled out: a run of two or more one-letter words is joined (WARP) and named with the keyterm or screen name
     it is, or begins, or is closest to. Measured on the words' own lengths, no word list.
+
+    ``apps`` (voice20, final-D S12): the apps running on the desk (:func:`desk_app_names`). A heard word is named as
+    close to one only by the tail measure (:data:`NEAR_TAIL_RATIO`: the word before took the name's first sound, "the
+    scored" for "discord"), and only when no name above matched it: the looser whole-word measure of apps is what made
+    plain command words brand notes ("you turn" ~ YouTube, lKeys review L1).
     """
     import difflib
 
@@ -709,7 +720,7 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
                    key=lambda t: difflib.SequenceMatcher(None, k, t).ratio(), default=None)
         return best if best and difflib.SequenceMatcher(None, k, best).ratio() >= NEAR_TERM_RATIO else None
 
-    def tail_ratio(k: str, t: str, before: str) -> float:
+    def tail_ratio(k: str, t: str, before: str, heads: Any = None) -> float:
         # Final-B (all-questions RC5): the name's first sound went into the word before ("the|scored" for
         # "dis|cord"): the heard word keeps the start of the name's tail (its first one or two letters dropped,
         # :data:`NEAR_TAIL_HEAD`) and most of its letters, and the two words together span about the name. Review fix
@@ -717,15 +728,22 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
         # "a|..." no). Measures of the strings' letters and lengths only, no word list.
         if len(k) < LOW_WORD_MIN_LETTERS or not before or len(before) + len(k) > len(t) + NEAR_TAIL_HEAD:
             return 0.0
-        tails = [t[j:] for j in range(1, NEAR_TAIL_HEAD + 1)
+        tails = [t[j:] for j in (range(1, NEAR_TAIL_HEAD + 1) if heads is None else heads)
                  if len(t) - j >= LOW_WORD_MIN_LETTERS and len(before) >= j]
         return max((difflib.SequenceMatcher(None, k, tail).ratio() for tail in tails if tail[:1] == k[:1]
                     and k != t), default=0.0)
 
-    def tail_closest(k: str, before: str) -> str | None:
-        best = max(terms, key=lambda t: tail_ratio(k, t, before), default=None)
-        return best if best and tail_ratio(k, best, before) >= NEAR_TAIL_RATIO else None
+    def tail_closest(k: str, before: str, among: Any = None, heads: Any = None) -> str | None:
+        pool = terms if among is None else among
+        best = max(pool, key=lambda t: tail_ratio(k, t, before, heads), default=None)
+        return best if best and tail_ratio(k, best, before, heads) >= NEAR_TAIL_RATIO else None
 
+    # voice20 (final-D S12): the running apps, by the tail measure only, with exactly APP_TAIL_HEAD first letters gone
+    # (a name too short for such a tail of LOW_WORD_MIN_LETTERS letters is never measured); a name already above is
+    # measured as that
+    running = {key(t): t for t in (apps or [])
+               if len(key(t)) - APP_TAIL_HEAD >= LOW_WORD_MIN_LETTERS and key(t) not in terms}
+    named = {**running, **terms}
     # N9 (report 47): single words and pairs are both measured, and every near name is named, closest first:
     # recognition splits a name across two words ("hey meant" for Hemanth), and live a single word of the pair
     # ("niche") was named with another contact whose handle looks like it, which kept the pair from being measured.
@@ -743,8 +761,11 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
                 before = key(spoken[i - 1])
                 best = tail_closest(k, before)
                 ratio = tail_ratio(k, best, before) if best else 0.0
-            if best and all(t != terms[best] for _r, _h, t in scored):
-                scored.append((ratio, " ".join(window), terms[best]))
+                if best is None and running and k not in running:
+                    best = tail_closest(k, before, running, (APP_TAIL_HEAD,))
+                    ratio = tail_ratio(k, best, before, (APP_TAIL_HEAD,)) if best else 0.0
+            if best and all(t != named[best] for _r, _h, t in scored):
+                scored.append((ratio, " ".join(window), named[best]))
     near = [(h, t) for _r, h, t in sorted(scored, key=lambda s: -s[0])]
     spelled: list[tuple[str, str, str | None]] = []
     run: list[str] = []
@@ -774,12 +795,47 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
         parts.append("unsure of " + ", ".join(f"'{w}' ({c:.2f})" for w, c in low[:5]))
     if near:
         parts.append("; ".join(f"'{h}' sounds close to {t}, " + ("a name on the screen" if key(t) in on_screen
+                                                                   else "an app running now" if key(t) in running
                                                                    else "a name you know") for h, t in near[:3]))
     if fused:
         parts.append("; ".join(f"'{h}' may be {t} said together with the next word" for h, t in fused[:2]))
     # A spelled word that is a known name exactly is no doubt (nothing to ask): only the others count.
     unsure_spelled = sum(1 for _h, w, m in spelled if not (m and key(m) == key(w)))
     return ("; ".join(parts) or None), len(low), len(near) + len(fused) + unsure_spelled
+
+
+#: voice20 (final-D S12): at most this many running apps are measured (a busy desk's own list, never cut by name).
+DESK_APPS_MAX = 40
+
+
+def desk_app_names(overview: Any) -> list[str]:
+    """voice20 (final-D S12): the apps running on the desk as the talker's desk block names them, from a desktop read
+    already made (the hands' last ``Snapshot.overview``; no new read): each window's program (its image name without
+    ".exe", as ``situation`` names it) and the apps running with no window (their Start menu names), each once, in that
+    order, at most :data:`DESK_APPS_MAX`. The Speech line's app names (:func:`heard_note` ``apps``). Never raises."""
+    if not hasattr(overview, "get"):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: Any) -> None:
+        text = " ".join(str(name or "").split())
+        if text.casefold().endswith(".exe"):
+            text = text[:-4].strip()
+        if text and text.casefold() not in seen:
+            seen.add(text.casefold())
+            out.append(text)
+
+    try:
+        for w in overview.get("windows") or []:
+            if hasattr(w, "get"):
+                add(w.get("process_name") or w.get("app"))
+        for a in overview.get("background_apps") or []:
+            if hasattr(a, "get"):
+                add(a.get("name"))
+    except Exception:  # noqa: BLE001 - a desk read of another shape: what was named so far
+        pass
+    return out[:DESK_APPS_MAX]
 
 
 #: The result of a call held on unsure words (``Conversation._hold``) when recognition named nothing (as before).
@@ -852,12 +908,21 @@ def near_terms(user_names: Any, keyterms: Any, cap: int, names: Any = ()) -> lis
     return [t for t in near if fold(t) in tagged or fold(t) in own]
 
 
+#: voice20 (final-D S22j): Deepgram's own limit on one keyterm: "Each keyterm must be 100 characters or fewer"; one
+#: longer term makes Flux reject the whole mid-call update (live final-D: 7 + 5 rejected updates; a screen name taken
+#: from a drawn app's recent window titles has no 32-character cap).
+KEYTERM_MAX_CHARS = 100
+
+
 def keyterm_list(base: list[str], extra: list[str], cap: int) -> list[str]:
-    """Speech recognition's keyterms: ``base`` then ``extra``, each once (case-insensitive), at most ``cap``."""
+    """Speech recognition's keyterms: ``base`` then ``extra``, each once (case-insensitive), at most ``cap``; a term
+    longer than :data:`KEYTERM_MAX_CHARS` is skipped (voice20: the recogniser's own limit, a length, never words)."""
     out: list[str] = []
     seen: set[str] = set()
     for term in [*base, *extra]:
         term = " ".join(str(term or "").split())
+        if len(term) > KEYTERM_MAX_CHARS:
+            continue
         if term and term.casefold() not in seen:
             seen.add(term.casefold())
             out.append(term)
@@ -1369,9 +1434,14 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             if target in HANDOFF_TOOLS and not self._yuki_running(target):
                 # final-B (contract C4, all-messaging RC3): no hand-over call is running, but a run_skill of this
                 # turn may have passed its request on to the bridge (that job is invisible to Pipecat's cancel):
-                # the bridge cancels it (``VoiceBridge.cancel_passed_on``, guarded)
-                if hook("cancel_passed_on", default=None):
-                    await original({"cancelled": True, "note": "Stopped: the request it passed on will not go on."},
+                # the bridge cancels it (``VoiceBridge.cancel_passed_on``, guarded). voice20 (final-D S11): it settles
+                # with no talker run either way; when this reply said no words before the call (a stream fact: its
+                # words went to the voice, ``_yuki_spoke``), the bridge says the job's own "not sent" ending by code
+                said = str(getattr(params, "tool_call_id", "") or "") in self._yuki_spoke
+                if hook("cancel_passed_on", said, default=None):
+                    note = ("Stopped: the request it passed on will not go on." if said else
+                            "Stopped: the request it passed on will not go on; Yuki's voice says so by code.")
+                    await original({"cancelled": True, "note": note},
                                    properties=FunctionCallResultProperties(run_llm=False))
                     return
                 if hook("passed_on_sent", default=None):
@@ -1784,6 +1854,11 @@ def _clause_tts(base: type, *, strip_marks: bool = False) -> type:
                 # A new reply: a look flagged after the last reply's end (a speculative reply's held calls run once
                 # the turn is confirmed, after its end has passed) is not this reply's (review fixes).
                 self._yuki_answer_next = False
+                # voice20 (final-D S22h): its lines get their own one claim-gate wait (the voices checking a line
+                # before sending it know a reply's start only here)
+                new_reply = getattr(getattr(self, "_yuki_guard", None), "new_reply", None)
+                if callable(new_reply):
+                    new_reply()
             elif isinstance(frame, FunctionCallsStartedFrame):
                 # leftVoice: Pipecat pauses this service's frames after a reply that had words until they have played
                 # ("to avoid audio overlapping"), and the tool's result waits in that queue: with "Let me look."
@@ -2022,6 +2097,9 @@ class TurnObserver:
         self.guard: Any = None
         #: Names on the screen in front (yuki.voice.screennames, v3.10): a heard word close to one is named too.
         self.screen_terms: list[str] = []
+        #: voice20 (final-D S12): ``() -> [app names]``, the apps running on the desk (``desk_app_names``, from the
+        #: hands' last desktop read; set by the conversation): a heard word is named with one by the tail measure only.
+        self.desk_apps: Callable[[], list[str]] | None = None
         #: The last reply the user spoke over: what they heard and what was not said (v3.12), for the talker.
         self.last_cut: dict[str, Any] | None = None
         #: ``(now, turn)``: words left the speaker (v3.16, the owed-output ledger listens here). Set by the conversation.
@@ -2049,6 +2127,17 @@ class TurnObserver:
         #: ONE send countdown pauses on their speech and their words decide (set by the conversation under one only).
         self.on_user_started: Callable[[], None] | None = None
         self.on_user_words: Callable[[str], None] | None = None
+
+    def _desk_apps(self) -> list[str]:
+        """voice20 (final-D S12): the apps running on the desk for the Speech line (:attr:`desk_apps`), ``[]`` when
+        unknown. Never raises."""
+        fn = self.desk_apps
+        if fn is None:
+            return []
+        try:
+            return [str(a) for a in (fn() or [])]
+        except Exception:  # noqa: BLE001 - the Speech line goes without them
+            return []
 
     def fast_handled(self, kind: str) -> None:
         """vGame: the open user turn was answered by the fast path (``"dismiss"`` or ``"name"``): it was said to Yuki
@@ -2498,7 +2587,8 @@ class TurnObserver:
             # A speculative reply starts from these words: what recognition was unsure of in them (v3.5).
             result = getattr(frame, "result", None)
             note, low, near = heard_note(result.get("words") if isinstance(result, dict) else None, self.keyterms,
-                                         cut_before=self.cut_before(), screen=self.screen_terms)
+                                         cut_before=self.cut_before(), screen=self.screen_terms,
+                                         apps=self._desk_apps())
             self.heard, self.heard_plain = note, bool(note and not (low or near))
             return
         if isinstance(frame, UserStartedSpeakingFrame):
@@ -2543,7 +2633,7 @@ class TurnObserver:
             result = getattr(frame, "result", None)
             self.heard, turn.heard_low, turn.heard_near = heard_note(
                 result.get("words") if isinstance(result, dict) else None, self.keyterms,
-                cut_before=self.cut_before(), screen=self.screen_terms)
+                cut_before=self.cut_before(), screen=self.screen_terms, apps=self._desk_apps())
             self.heard_plain = bool(self.heard and not (turn.heard_low or turn.heard_near))
             self.last_user_text = turn.user_text
             if turn.user_text.strip():
@@ -2983,15 +3073,19 @@ class _Hooks:
         """The conversation's ONE driver (``brain = "one"``), else ``None`` (every other brain: nothing changes)."""
         return getattr(self.c, "one_driver", None)
 
-    def cancel_passed_on(self) -> bool | None:
+    def cancel_passed_on(self, said: bool = True) -> bool | None:
         """Contract C4: the bridge cancels the job a ``run_skill`` of the current turn passed on
         (``VoiceBridge.cancel_passed_on() -> bool``); ``None`` when the bridge has no such call (before hands19's
-        change). Never raises."""
+        change). voice20 (final-D S11): ``said``: the talker's cancelling reply said words before the call; when it
+        did not, the bridge says the job's own ending by code. Never raises."""
         cancel = getattr(self.c.bridge, "cancel_passed_on", None)
         if not callable(cancel):
             return None
         try:
-            return bool(cancel())
+            try:
+                return bool(cancel(said=bool(said)))
+            except TypeError:   # a bridge before voice20: no ``said``
+                return bool(cancel())
         except Exception:  # noqa: BLE001 - Pipecat's own refusal then
             return None
 
@@ -3667,6 +3761,33 @@ ONE_TOOK: frozenset[str] = frozenset({"done", "already", "written", "stopped", "
 #: was heard is refused once with this (code facts: the calls' kinds, what left the speaker).
 ONE_READ_UNANSWERED = ("Not quiet: they asked and have heard nothing yet. Answer them now from what you read, in a few "
                        "words; if it holds nothing for them, say so.")
+#: voice20 (final-D S5, contract C9): a closing reply (a lone stay_quiet, or words with no call) of a ONE turn that
+#: Lane ONE's ``closing_hold()`` says to hold once is answered with that method's own sentence (its code facts: one
+#: miss with nothing else tried, or a legal tidy step untaken), as the stay_quiet's result or as a note of its own
+#: after the closing words. This line is only the fallback, for a reason given as a bare code word.
+ONE_MISS_HOLD = ("Not done yet: one way did not take and nothing else was tried. Try one other way now (an undoable "
+                 "act), then say in a few words what is left.")
+#: voice20 (final-D S22i): the rerun of a ONE result round whose closing words had no marker line (none of them was
+#: spoken) answered with a lone stay_quiet: refused once with this (a stream fact, never the words).
+ONE_UNHEARD_QUIET = ("Not quiet: your last reply had no say line, so nothing of it was spoken and they heard nothing. "
+                     "Say it now, the say line first.")
+
+
+def _code_word(why: str) -> dict[str, Any]:
+    """voice20: a reason another lane's code gave, for the content-free log: the word itself when it is a code word
+    (letters, digits and underscores, at most 40), else only its length."""
+    text = str(why or "")
+    if text and len(text) <= 40 and text.replace("_", "").isalnum() and text.isascii():
+        return {"why": text}
+    return {"why_chars": len(text)}
+
+
+def _hold_text(why: str) -> str:
+    """voice20 review M1 (contract C9): what a held closing reply is answered with: the sentence Lane ONE's
+    ``closing_hold()`` gave (code's own words to the agent, e.g. its miss or its tidy step), else :data:`ONE_MISS_HOLD`
+    (nothing, or a bare code word). A shape test on code's string, never the user's words."""
+    text = " ".join(str(why or "").split())
+    return ONE_MISS_HOLD if not text or "why" in _code_word(text) else text
 
 
 def one_thinking_mode(settings: Any) -> str:
@@ -3902,6 +4023,8 @@ class _OneReply:
     took: list[int] = field(default_factory=list)
     tried: set[str] = field(default_factory=set)
     released: bool = False
+    #: voice20 (final-D S22i): this reply answers the reply watch's rerun of an unheard close (marker loss).
+    rerun: bool = False
 
     def before(self, call_id: str) -> list[str]:
         return self.ids[: self.ids.index(call_id)] if call_id in self.ids else []
@@ -3992,6 +4115,20 @@ class OneVoice:
         self._rerun = ""
         self._rerun_used = False
         self._rerun_at = 0.0
+        #: voice20 (final-D S5, contract C9): a closing reply of words was held once by Lane ONE's ``closing_hold``:
+        #: ``due`` (the reply watch gives the agent its note once it is quiet), ``asked`` (that round is on its way);
+        #: once a turn (``_hold_used``); its why (ONE's sentence, the note's text: :func:`_hold_text`), whose reading
+        #: gave it (``turn``: the gate's turn, e.g. a tidy step; ``budget``: the budget's miss), and whether the held
+        #: words that were spoken end as a question (review L1: they get longer to answer it).
+        self._hold = ""
+        self._hold_used = False
+        self._hold_at = 0.0
+        self._hold_why = ""
+        self._hold_src = ""
+        self._hold_asks = False
+        #: voice20 (final-D S22d): the owed tokens of acts whose announcing words (a say_first, or the reply's words
+        #: before the call) were heard and that did not take: kept owed past a later try, until words are heard.
+        self._claimed: set[int] = set()
 
     # -- plumbing ---------------------------------------------------------------------------------------------------
 
@@ -4209,6 +4346,9 @@ class OneVoice:
         self._drop_owed_asks()
         self._turn_at = time.monotonic()
         self._quiet_refused, self._rerun, self._rerun_used = False, "", False
+        self._hold, self._hold_used, self._hold_why = "", False, ""
+        self._hold_src, self._hold_asks = "", False
+        self._claimed = set()
         self._answer = None
         if turn.asks and self.anchor_text:
             self._read_answer(turn, self.anchor_text)
@@ -4350,7 +4490,8 @@ class OneVoice:
         if self.turn is None:
             self._new_turn(None)
         group = _OneReply(turn=self.turn, ids=[c[0] for c in calls], names={c[0]: c[1] for c in calls},
-                          args={c[0]: dict(c[2]) for c in calls}, spoke=self._reply_spoke())
+                          args={c[0]: dict(c[2]) for c in calls}, spoke=self._reply_spoke(),
+                          rerun=self._rerun == "asked")
         for cid, _name, _args in calls:
             group.done[cid] = asyncio.Event()
             self.replies[cid] = group
@@ -4429,6 +4570,8 @@ class OneVoice:
         if speculating or call is None or not getattr(call, "one_round", 0) or self.turn is None or self.over:
             return
         rerun, self._rerun = self._rerun, ("" if self._rerun == "asked" else self._rerun)
+        if self._hold == "asked":
+            self._hold = ""   # voice20 (S5): the held round's own reply is judged as any other (the hold is once)
         if getattr(call, "tool", False):
             return   # (a rerun answered with calls: a later closing reply of the turn is judged as any other)
         self._committed = True
@@ -4438,6 +4581,18 @@ class OneVoice:
             # same rerun rule the user's own turn has), never a silent end
             self._rerun, self._rerun_at = "due", time.monotonic()
             self._log("unheard_close", round=int(getattr(call, "one_round", 0) or 0))
+            return
+        spoke = getattr(call, "first_text", None) is not None and not getattr(call, "one_unmarked", False)
+        why = self._closing_hold() if spoke else None
+        if why is not None:
+            # voice20 (final-D S5, contract C9): Lane ONE says this closing reply is held once (one miss with nothing
+            # else tried and time left; or a legal tidy step untaken): the turn stays open, and once they have been
+            # quiet a moment (time to answer an offer themselves; longer when the spoken words asked them something,
+            # review L1) the reply watch gives the agent one more round with ONE's own sentence as the note
+            self._hold, self._hold_at, self._hold_used, self._hold_why = "due", time.monotonic(), True, why
+            self._hold_asks = bool(getattr(call, "one_asks", False))
+            self._log("hold", closing="words", round=int(getattr(call, "one_round", 0) or 0), source=self._hold_src,
+                      asks=self._hold_asks, **_code_word(why))
             return
         if rerun == "asked" and self._rerun_silent(call) and not self._owed_pending():
             # the rerun spoke nothing either and nothing is owed: the error tone says so (a non-speech notice)
@@ -4488,6 +4643,115 @@ class OneVoice:
         self._log("unheard_close", expired=True)
         self.turn_over("unheard")
 
+    # -- voice20 (final-D S5, contract C9): a closing reply after one miss is held once -------------------------------
+
+    #: After held closing words, the agent's other way goes once they have been quiet this long (s): long enough to
+    #: answer an offer themselves (their words then start a turn of their own and the hold goes).
+    HOLD_QUIET_S = 1.5
+    #: Review L1: the same wait when the held words that were spoken end a sentence as a question (their own closing
+    #: mark, ``ReplyChannel.spoken_asks``): an answer takes longer to begin than a reaction, and Flux reports its start
+    #: of turn some 0.5-1 s into speech.
+    HOLD_ASK_QUIET_S = 3.0
+
+    def hold_quiet_s(self) -> float:
+        """How long they must have been quiet before the held round goes (:data:`HOLD_ASK_QUIET_S` after a spoken
+        question, else :data:`HOLD_QUIET_S`)."""
+        return self.HOLD_ASK_QUIET_S if self._hold_asks else self.HOLD_QUIET_S
+
+    def _closing_hold(self) -> str | None:
+        """Why this turn's closing reply is held once (Lane ONE's sentence), else ``None``. Contract C9, read through
+        ``getattr`` (a no-op until that lane is merged); review M1: the gate's turn (``policy.Turn.closing_hold``) is
+        asked first, as it holds the budget's reading (one miss, no act after it, the retry window open) and the S1
+        fallback's (a flagged diff's one legal undoable step untaken); the turn's budget
+        (``TurnBudget.closing_hold``) only when the turn has no such reading. The voice's own facts first: once a
+        turn, a turn their words began and no newer words of theirs moved on from, not closed by code, and never after
+        a send or join that missed (it is never tried again in the turn). Sets ``_hold_src``. Never raises."""
+        self._hold_src = ""
+        turn = self.turn
+        if turn is None or self.over or self._hold_used or not self.anchor_text:
+            return None
+        budget = getattr(turn, "budget", None)
+        if budget is None or getattr(budget, "closed", False) is True \
+                or getattr(budget, "lasting_missed", False) is True:
+            return None
+        mark = self._marks.get(turn)
+        if mark is not None and self._heard_n > mark:
+            return None   # their newer words make a turn of their own
+
+        def ask(owner: Any) -> tuple[bool, str]:
+            fn = getattr(owner, "closing_hold", None)
+            if not callable(fn):
+                return False, ""
+            try:
+                got = fn()
+            except Exception as exc:  # noqa: BLE001 - no reading from it
+                self._log("hold", error=type(exc).__name__)
+                return False, ""
+            return True, (" ".join(str(got).split()) if got else "")
+
+        answered, why = ask(turn)
+        source = "turn"
+        if not answered:
+            answered, why = ask(budget)
+            source = "budget"
+        if not why:
+            return None
+        if source == "turn":
+            # content-free provenance for the log: the budget's own sentence (a miss), or the turn's own (a tidy step)
+            own_answered, own = ask(budget)
+            if own_answered and own == why:
+                source = "budget"
+        self._hold_src = source
+        return why
+
+    def _lone_quiet(self, group: _OneReply) -> bool:
+        """The reply is a stay_quiet alone (the whole closing reply) of the current turn."""
+        return group.turn is self.turn and bool(group.names) and all(n == "stay_quiet" for n in group.names.values())
+
+    def _quiet_unheard_rerun(self, group: _OneReply) -> bool:
+        """voice20 (final-D S22i): a lone stay_quiet answering the reply watch's rerun of an unheard close (closing
+        words with no marker line, none of them spoken), that spoke nothing itself, with nothing of Yuki's heard since
+        that close and no quiet refused this turn yet: the agent's words never reached them, so its quiet is refused
+        once (live final-D p1_github: the rerun chose stay_quiet and its 121 characters were never heard). Stream facts
+        only."""
+        if not group.rerun or self._quiet_refused or group.spoke or not self._lone_quiet(group):
+            return False
+        if self.heard_since(self._rerun_at):
+            return False
+        self._quiet_refused = True
+        return True
+
+    def hold_due(self) -> bool:
+        """The reply watch's held round is due (:meth:`reply_end`)."""
+        return self._hold == "due" and not self.over and self.turn is not None and not self.turn.budget.closed
+
+    def hold_note(self) -> str:
+        """The held round's note: Lane ONE's own sentence (:func:`_hold_text`; :data:`ONE_MISS_HOLD` only as the
+        fallback), after the agent's closing words in the bracketed form of the turn's own notes, as a developer-role
+        message (Pipecat's Anthropic adapter sends it as the user's turn, as :meth:`Conversation._announce` does);
+        marker channel: the format last, as every ONE round reads it."""
+        from yuki.voice.mouth import MARKER_REMINDER
+
+        note = f"[{_hold_text(self._hold_why)}]"
+        return f"{note}\n{MARKER_REMINDER}" if getattr(self.c, "channel", "") == "marker" else note
+
+    def hold_go(self) -> str:
+        """The reply watch gives the held turn its round now (once a turn): the note it runs with."""
+        self._hold = "asked"
+        self._log("hold", go=True, round=self.rounds, waited_ms=round((time.monotonic() - self._hold_at) * 1000),
+                  source=self._hold_src, asks=self._hold_asks, **_code_word(self._hold_why))
+        return self.hold_note()
+
+    def hold_stale(self, wait_s: float) -> bool:
+        """The held round has been due this long with no quiet moment to run it in."""
+        return self._hold == "due" and time.monotonic() - self._hold_at >= wait_s
+
+    def hold_expire(self) -> None:
+        """No quiet moment came for the held round: the turn ends as it would have (what it owes falls due)."""
+        self._hold = ""
+        self._log("hold", expired=True)
+        self.turn_over("model")
+
     def _owed_pending(self) -> bool:
         ledger = getattr(self.c, "ledger", None)
         try:
@@ -4507,6 +4771,7 @@ class OneVoice:
             return
         self.over = True
         self._rerun = ""
+        self._hold = ""
         self._cancel_timer()
         # final-B (one-voice RC B/O1c): the turn is over: what it still owes falls due now (said by code at the next
         # quiet moment unless the agent's own words were heard for it)
@@ -4606,26 +4871,27 @@ class OneVoice:
 
     # -- the owed fallback ----------------------------------------------------------------------------------------
 
-    def _owe(self, result: dict[str, Any], outcome: dict[str, Any], *, keep: bool = True) -> None:
+    def _owe(self, result: dict[str, Any], outcome: dict[str, Any], *, keep: bool = True) -> int | None:
         """A non-success act that code said nothing for owes code's fallback (``OwedLedger``): said only if the
         agent's next round is not heard (it chose silence, or never came within ``RUN_WAIT_S``). ``keep``: the token
         is the current turn's (dropped when it settles by code); an earlier turn's late result keeps its own (review
-        fix L1). A held call or a reflex's call still under way owes nothing (``_no_owe``: the agent asks or says it)."""
+        fix L1). A held call or a reflex's call still under way owes nothing (``_no_owe``: the agent asks or says it).
+        Returns the owed token (voice20: :meth:`_owe_group` marks a claimed act's), else ``None``."""
         ledger = getattr(self.c, "ledger", None)
         status = str(result.get("status") or "").strip().lower()
         if ledger is None or outcome.get("kind") != "act" or result.get("said") \
                 or result.get("_no_owe") or status == "changed":
-            return   # a send their words or a chip changed: nothing failed; their words (or the agent) decide
+            return None   # a send their words or a chip changed: nothing failed; their words (or the agent) decide
         if status in ONE_TOOK or result.get("verified") is True:
             # final-B (one-voice RC B/O1a): the act took effect: a ``then`` (parts left), a flag (a tidy-up) or an
             # "already" nobody heard is the agent's next round, never code's failure line
-            return
+            return None
         from yuki.one.budget import LINE_REST_LEFT
 
         question = " ".join(str(result.get("question") or "").split())
         if status in ("ask", "asked"):
             if not question:
-                return   # no structured question to owe: the agent words it from the result
+                return None   # no structured question to owe: the agent words it from the result
             kind, text = "ask", question
         else:
             # the runner's own fallback line (``OneResult.owed``), else rule #149's
@@ -4633,7 +4899,7 @@ class OneVoice:
         token = -next(self._tokens)
         try:
             if ledger.owe(token, kind, text, int(getattr(self.c.observer, "user_turns", 0))) is None:
-                return
+                return None
             if kind == "ask":
                 self._owed_asks.append(token)
                 del self._owed_asks[:-24]
@@ -4644,19 +4910,38 @@ class OneVoice:
                     # due once it is over with nothing heard (:meth:`turn_over`)
                     ledger.hold(token, True)
         except Exception:  # noqa: BLE001 - the agent's round says it anyway
-            pass
+            return None
+        return token
 
     def _owe_group(self, group: _OneReply) -> None:
         """Review fix M1: when the agent gets its next round, every act of the reply that did not verify and that code
         said nothing for owes code's fallback, not only the reply's last call (``[failed act, done act]``,
-        ``[failed act, stay_quiet]``). Each call once."""
+        ``[failed act, stay_quiet]``). Each call once. voice20 (final-D S22d): a failure of a call whose announcing
+        words were heard (:meth:`_claimed_call`) is marked claimed (:meth:`_let_owed_go` keeps it owed)."""
         keep = self._current(group)
         for cid in group.ids:
             outcome, result = group.outcomes.get(cid), group.results.get(cid)
             if outcome is None or result is None or cid in group.owed:
                 continue
             group.owed.add(cid)
-            self._owe(result, outcome, keep=keep)
+            token = self._owe(result, outcome, keep=keep)
+            if token is not None and keep and self._claimed_call(group, cid):
+                self._claimed.add(token)
+                self._log("owed", claimed=True)
+
+    def _claimed_call(self, group: _OneReply, call_id: str) -> bool:
+        """voice20 (final-D S22d): words announcing this act went to the voice before it ran (its say_first, said early
+        or by :meth:`_say_first_if_silent`, or the reply's own words before its calls: the talker service's
+        ``_yuki_spoke``, a stream fact; never the words). Live final-D k_video_another_one under one: "Putting on a
+        MrBeast Gaming video." was heard, the skill handed over, a later open_url was tried (which dropped the owed
+        line) and the turn ended with nothing more said."""
+        if group.turn is not self.turn or call_id not in group.names:
+            return False
+        spoken = getattr(getattr(self.c, "_llm", None), "_yuki_spoke", None)
+        try:
+            return call_id in spoken if spoken is not None else False
+        except TypeError:
+            return False
 
     @staticmethod
     def _heard(group: _OneReply) -> bool:
@@ -4715,7 +5000,12 @@ class OneVoice:
         it took on (:meth:`reply`) are dropped: the agent went on with what it was given, and its new results owe
         their own lines. Nothing of it tried (every call held, late, or a read): they stay owed (held while the turn is
         open).
-        Once per reply. Never raises."""
+        Once per reply. Never raises.
+
+        voice20 (final-D S22d): an owed failure of an act whose announcing words were heard (``_claimed``: "Putting on
+        X." said, then nothing of it happened) is not let go by a later try alone: only by a later act of this reply
+        that took effect and left no parts (no ``then``). Else it stays held, due once the turn is over unless words
+        of Yuki's are heard by then (the ledger's own rule): a claim that never landed always gets a closing line."""
         if group.released or not group.took or any(not e.is_set() for e in group.done.values()):
             return
         group.released = True
@@ -4724,9 +5014,14 @@ class OneVoice:
         if ledger is None:
             return
         tried = bool(group.tried)
+        finished = any(self._finished(group, cid) for cid in group.tried)
+        kept = 0
         for token in took:
             try:
-                if tried:
+                if tried and token in self._claimed and not finished and group.turn is self.turn and not self.over:
+                    self._owed.append(token)   # voice20 (S22d): still held, due once the turn is over
+                    kept += 1
+                elif tried:
                     ledger.drop(token)
                 elif group.turn is self.turn and not self.over:
                     self._owed.append(token)   # still held: due once the turn is over
@@ -4734,7 +5029,18 @@ class OneVoice:
                     ledger.hold(token, False)
             except Exception:  # noqa: BLE001
                 pass
-        self._log("owed", took=len(took), dropped=tried)
+        self._log("owed", took=len(took), dropped=tried, **({"claimed_kept": kept} if kept else {}))
+
+    @staticmethod
+    def _finished(group: _OneReply, call_id: str) -> bool:
+        """voice20 (final-D S22d): a call of the reply that acted and took effect with nothing left (no ``then``): the
+        statuses :func:`OneVoice._owe` counts as taken, or ``verified`` true. Code facts of the result only."""
+        outcome = group.outcomes.get(call_id) or {}
+        result = group.results.get(call_id) or {}
+        if outcome.get("kind") != "act" or outcome.get("then"):
+            return False
+        status = str(result.get("status") or "").strip().lower()
+        return status in ONE_TOOK or result.get("verified") is True
 
     @staticmethod
     def _tried(group: _OneReply, call_id: str, name: str) -> None:
@@ -5189,6 +5495,28 @@ class OneVoice:
                 await params.result_callback(self.with_format({"not_quiet": ONE_READ_UNANSWERED}),
                                              properties=FunctionCallResultProperties(run_llm=True))
                 return
+            if name == "stay_quiet" and self._lone_quiet(group):
+                # voice20 (final-D S22i): the rerun of an unheard close chose quiet while nothing reached them; (S5,
+                # contract C9) Lane ONE holds a closing quiet once (one miss with nothing else tried, or a legal tidy
+                # step untaken), with its own sentence as the refusal (review M1). Each once.
+                why, note = "", ""
+                if self._quiet_unheard_rerun(group):
+                    why, note = "unheard_rerun", ONE_UNHEARD_QUIET
+                else:
+                    held = self._closing_hold()
+                    if held is not None:
+                        self._hold_used, self._hold_why = True, held
+                        why, note = "closing_hold", _hold_text(held)
+                        self._log("hold", closing="quiet", round=self.rounds, source=self._hold_src,
+                                  **_code_word(held))
+                if note:
+                    group.outcomes[call_id] = one_outcome(name, {}, {})
+                    group.verdict = "model"
+                    final["run_llm"] = True
+                    self._log("quiet", refused=why, round=self.rounds)
+                    await params.result_callback(self.with_format({"not_quiet": note}),
+                                                 properties=FunctionCallResultProperties(run_llm=True))
+                    return
             original = params.result_callback
 
             async def settle(result: Any, *, properties: Any = None) -> None:
@@ -5472,6 +5800,8 @@ class Conversation:
         self.observer.keyterms = [t for t in near_terms(settings.user_names, self.keyterms, settings.voice_keyterms_max,
                                                         name_terms())
                                   if t.casefold() != WAKE_NAME.casefold()]
+        # voice20 (final-D S12): the apps running on the desk, measured by the tail shape only (heard_note ``apps``)
+        self.observer.desk_apps = self._desk_app_names
         self.worker: Any = None
         #: The spoken-line check (yuki.voice.speechguard, v3.10), made with the services.
         self.guard: Any = None
@@ -7227,7 +7557,9 @@ class Conversation:
         async_tool_messages._FINAL_DESCRIPTION = FINAL_DESCRIPTION
         # One list for every recogniser (yuki.voice.keyterms.vocabulary): Yuki's name, the user's names, memory's names
         # (a correction's right name first), never a heard form; Flux's keyterms and Parakeet's hotwords alike.
-        terms = vocabulary(s.user_names, self.keyterms, s.voice_keyterms_max)
+        # voice20 review L4 (S22j): the start-of-conversation list keeps the same length cap as the mid-call update
+        # (one over-long term makes Flux reject the whole list)
+        terms = keyterm_list(vocabulary(s.user_names, self.keyterms, s.voice_keyterms_max), [], s.voice_keyterms_max)
         if stt_provider(s) == "local":
             # vLocal: Parakeet on this PC, with its own end of turn (Silero VAD + Smart Turn), shaped like Flux
             from yuki.voice.local_stt import ParakeetSTTService
@@ -7734,6 +8066,14 @@ class Conversation:
                 await asyncio.sleep(self.SCREEN_TERMS_EVERY_S)
         except asyncio.CancelledError:
             return
+
+    def _desk_app_names(self) -> list[str]:
+        """voice20 (final-D S12): the apps running on the desk (:func:`desk_app_names`) from the hands' last desktop
+        read (read while they talk: ``prefetch_desk``), never Yuki's own; no new read. ``[]`` with no hands or no
+        read."""
+        hands = getattr(getattr(self, "bridge", None), "hands", None)
+        snap = getattr(hands, "last", None) if hands is not None else None
+        return [n for n in desk_app_names(getattr(snap, "overview", None)) if n.casefold() != WAKE_NAME.casefold()]
 
     async def _apply_screen_terms(self, names: list[str]) -> None:
         """New names on the screen: the Speech line's near names and recognition's keyterms (memory names first)."""
@@ -8662,6 +9002,21 @@ class Conversation:
                     elif one.rerun_stale(self.RERUN_WAIT_S):
                         one.rerun_expire()
                     continue
+                if one is not None and self.worker is not None and callable(getattr(one, "hold_due", None)) \
+                        and one.hold_due():
+                    # voice20 (final-D S5, contract C9): a ONE turn's closing words were held by Lane ONE: once they
+                    # have been quiet a moment (their own answer to an offer starts a turn of its own; longer after a
+                    # spoken question, review L1), the agent gets one more round with the hold's note after its words
+                    obs = self.observer
+                    if not (obs.bot_speaking or obs.generating or obs.user_speaking or obs.speech_pending
+                            or one._running) and self._quiet_for() >= one.hold_quiet_s():
+                        note = one.hold_go()
+                        self.log.event("reply_watch", op="hold", one=True, round=one.rounds)
+                        if not await self._one_note_run(note):
+                            one.hold_expire()   # its words are not the context's last message: it ends as before
+                    elif one.hold_stale(self.RERUN_WAIT_S):
+                        one.hold_expire()
+                    continue
                 turn = self._unanswered()
                 obs = self.observer
                 if turn is None or self.worker is None:
@@ -9019,6 +9374,7 @@ class Conversation:
                 call.one_unmarked = bool(facts.get("unmarked"))
                 call.one_marker = facts.get("marker")
                 call.one_repeat = bool(facts.get("repeat_dropped"))
+                call.one_asks = bool(getattr(channel, "spoken_asks", False))   # voice20 review L1 (punctuation)
             except Exception:  # noqa: BLE001 - a stand-in call that takes no attribute
                 pass
         if facts.get("marker") is not None or facts.get("scratch_chars"):
@@ -9089,6 +9445,30 @@ class Conversation:
         if text is not None:
             self.mouth_memory.standing = text
         self.log.event("rules_refreshed", changed=changed, chars=len(text or ""))
+
+    async def _one_note_run(self, note: str) -> bool:
+        """voice20 (final-D S5): a ONE turn's next round, with code's note as a developer-role message (Pipecat's
+        Anthropic adapter sends it as the user's turn, as :meth:`_announce`) right after the agent's own closing words,
+        in the bracketed form of the turn's own notes. Only when the context's newest
+        message is those words (an assistant message): never after a tool result (design 3.3.3: harness text there
+        reads as injection). Append-only; the turn's frozen block still rides on their own message. ``False``: not
+        queued (the caller ends the turn as it would have ended)."""
+        from pipecat.frames.frames import LLMMessagesAppendFrame
+
+        context = getattr(self, "_llm_context", None)
+        try:
+            messages = list(context.get_messages() or []) if context is not None else []
+        except Exception:  # noqa: BLE001
+            messages = []
+        last = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("role")), None)
+        if self.worker is None or not str(note or "").strip() or last is None or last.get("role") != "assistant" \
+                or last.get("tool_calls"):
+            self.log.event("reply_watch", op="hold", one=True, queued=False,
+                           last=str(last.get("role")) if isinstance(last, dict) else None)
+            return False
+        await self.worker.queue_frame(LLMMessagesAppendFrame(
+            messages=[{"role": "developer", "content": str(note)}], run_llm=True))
+        return True
 
     async def _announce(self, payload: dict[str, Any], run_llm: bool = True) -> None:
         """An item of a task no tool call carries (a hand's try passed to the thinker by code, or a correction that
