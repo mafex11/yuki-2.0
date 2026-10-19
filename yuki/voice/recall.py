@@ -226,7 +226,7 @@ def day_text(report: dict[str, Any]) -> str:
             summary = _clip(e.get("summary"), DAY_SUMMARY_CHARS)
             lines.append(f"- {datetime.fromtimestamp(e['start']):%H:%M}-{datetime.fromtimestamp(e['end']):%H:%M} "
                          f"{_clip(e['title'], DIGEST_TITLE_CHARS)}" + (f": {summary}" if summary else ""))
-        lines += [f"- {_call_text(c)}" for c in p.get("calls") or []]
+        lines += [f"- {_call_text(c, ref=p.get('start'))}" for c in p.get("calls") or []]
     people = report.get("people") or []
     if people:
         lines.append("Messaged (direct messages): " + "; ".join(
@@ -542,13 +542,28 @@ def _clock(at: float | None) -> str:
     return f"{datetime.fromtimestamp(at):%H:%M}" if at else ""
 
 
-def _call_text(c: dict[str, Any], *, people: int = DIGEST_PEOPLE) -> str:
-    """One call as the digest says it: where (or the app), when, with whom."""
+def _when(at: float, ref: float | None) -> str:
+    """``HH:MM`` on the date of ``ref``, ``Mon HH:MM`` on another date (``None``: always bare), the rule of
+    ``yuki.memory.callspans._when``."""
+    shown = datetime.fromtimestamp(at)
+    if ref is None or shown.date() == datetime.fromtimestamp(ref).date():
+        return f"{shown:%H:%M}"
+    return f"{shown:%a %H:%M}"
+
+
+def _call_text(c: dict[str, Any], *, people: int = DIGEST_PEOPLE, ref: float | None = None) -> str:
+    """One call as the digest says it: where (or the app), when, with whom.
+
+    fe (final-F E2: "voice channel ... 23:50-04:18" read as a call that ran to 04:18 tonight): its start carries its
+    weekday when it is on another date than ``ref`` (the part of the day or the day it is listed under; ``None``: the
+    start's own date), and its end when it is on another date than its start (a call through midnight:
+    "23:50-Mon 04:18"). Dates as the clock gives them, never a reading of words."""
     where = _clip(c.get("place") or c.get("app") or "a call", DIGEST_PLACE_CHARS)
     start, end = c.get("start"), c.get("end")
-    when = f"{_clock(start)}-{_clock(end)}" if start and end else ""
+    first = _when(float(start), float(ref) if ref else None) if start else ""
+    when = f"{first}-{_when(float(end), float(start))}" if start and end else ""
     if c.get("ongoing"):
-        when = f"since {_clock(start)} (still on)" if start else "still on"
+        when = f"since {first} (still on)" if start else "still on"
     who = _who(list(c.get("people") or []), people) if people > 0 else ""
     kind = "game voice chat" if c.get("kind") == "game" else "call"
     return f"{kind} {where} {when}".strip() + (f" with {who}" if who else "")
@@ -577,7 +592,8 @@ def _part_line(p: dict[str, Any], episodes: int, listed: set[tuple[int, str]] | 
     eps = sorted(sorted(p.get("episodes") or [], key=lambda e: -(e["end"] - e["start"]))[:max(0, episodes)],
                  key=lambda e: e["start"])
     bits += [f"{_clip(e['title'], DIGEST_TITLE_CHARS)} {_clock(e['start'])}-{_clock(e['end'])}" for e in eps]
-    bits += [_call_text(c, people=0 if _call_key(c) in listed else 4) for c in p.get("calls") or []]
+    bits += [_call_text(c, people=0 if _call_key(c) in listed else 4, ref=p.get("start"))
+             for c in p.get("calls") or []]
     return f"{head} {'; '.join(bits)}" if bits else ""
 
 
@@ -589,9 +605,10 @@ def _talked_with(data: dict[str, Any]) -> str:
         app = str(p.get("app") or "")
         by_app.setdefault(app.casefold(), {"app": app, "bits": []})["bits"].append(
             f"{p['name']} (DM, {p['mine'] + p['theirs']} msgs both ways, last {_clock(p['last'])})")
+    day = data.get("day_start") or data.get("now")   # E2: a call of their day on another date says its weekday
     for c in data.get("calls_today") or []:
         app = str(c.get("app") or "")
-        by_app.setdefault(app.casefold(), {"app": app, "bits": []})["bits"].append(_call_text(c))
+        by_app.setdefault(app.casefold(), {"app": app, "bits": []})["bits"].append(_call_text(c, ref=day))
     if not by_app:
         return ""
     return "Talked with in their day so far: " + " ".join(
