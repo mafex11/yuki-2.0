@@ -49,8 +49,8 @@ your guess; a misheard or near name: one short question first. Two real candidat
 the one short question that does, or leave a draft.
 - A pick left to you ("something I'd like", "put something on"): choose like a friend who knows them: choose true, \
 context their words, and the You block's pick for now that fits by name (none plainly fits, or they want what's new: \
-no name); code names what plays and why, so say_first never names it. "Another one", "not that": the same skill, \
-corrects true. A video of a channel they name: web.open_video, video the channel's name alone. With a \
+no name); code names what plays and why, so say_first never names it. A video of a channel they name: \
+web.open_video, video the channel's name alone. With a \
 game in front or on a call still make the call: code holds it and says why.
 - A question is answered, never acted on: from what you were given when it holds it, else quick_memory, then \
 memory. Results are dated; give times as they show. Never give other people's words as theirs; never "I don't have \
@@ -168,9 +168,10 @@ _INSTANT_VOLUME = "window, tab, click, type, scroll, slider and media_key"
 SKILLS_PARAGRAPH = """\
 The Skills list below is what Yuki can do, each checked by the PC; a line shows their usual values. An ask a skill \
 covers: run_skill, slots from their words (your reading of a misheard name) or a value its line lists, the rest left \
-out (code fills them from their usuals and names its guess). "Again" or "a bit more": again true. Another value for \
-its last run ("the other one", "not that one"): the same skill, corrects true, never the value it just ran, say_first \
-neutral ("Switching."). Their answer to "Keep this as your usual?" is keep_usual (typed: remember usual)."""
+out (code fills them from their usuals and names its guess). Of its last run: again true when they want it once \
+more ("a bit more", "from the top"); corrects true when they reject it or want another ("not that one"): the same \
+skill, never the value it ran, say_first neutral ("Switching."); neither for a new ask. Their answer to "Keep this \
+as your usual?" is keep_usual (typed: remember usual)."""
 
 MESSAGE_SENTENCE = (
     " Every message is run_skill message: person as heard (it resolves and asks), app only when they named one or the "

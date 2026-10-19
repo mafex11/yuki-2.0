@@ -74,6 +74,7 @@ from yuki.brain.context import (
     step_report,
     steer_blocks,
     swap_blocks,
+    take_awaits,
     text_back_report,
     tidy_report,
     tool_result,
@@ -232,9 +233,10 @@ TEXT_BACK_CALLS = 2
 ANSWER_PARTS_MAX = 1
 ANSWER_PART_CALLS = 1
 #: hands19 (final-B all-questions RC3, k_two_asks_pause_and_meeting: four act plans re-did the pause, none read memory,
-#: and "Spotify is paused; I couldn't check the rest." hid the question): a spoken request that asks something
-#: (``plan.goal_is_question``) whose act plan ended having read nothing gets the same one answer turn (it counts as
-#: that turn: ANSWER_PARTS_MAX bounds both), with room for one read before the answer: QUESTION_PART_CALLS more calls.
+#: and "Spotify is paused; I couldn't check the rest." hid the question): a spoken request of several parts whose act
+#: plan ended having read nothing gets the same one answer turn (it counts as that turn: ANSWER_PARTS_MAX bounds both),
+#: with room for one read before the answer: QUESTION_PART_CALLS more calls. kw2 (B4): whether a part asked something
+#: is the planner's to read in that turn (it answers, or replies with the one done word), never a question mark.
 QUESTION_PART_CALLS = 2
 #: P1.3 (18 Oct free-thinker plan): a done act request whose acts took something the user had (the executor's
 #: after-look) gets one tidy-up turn after its line is said (one per request: the turn's own acts are never looked at
@@ -247,17 +249,6 @@ ANSWER_READ_VERBS: frozenset[str] = frozenset({"memory", "fetch", "keep_way"})
 #: pBrain (B35, bRound2 "Sending to हेमंत"): the bound on the people-index read that gives a spoken line memory's own
 #: name for a send's recipient (:meth:`Brain._said_name`).
 SAID_NAME_TIMEOUT_S = 0.8
-#: bRound2 (B28): the user's own turns of this conversation the executor may find a step's app value in
-#: (:meth:`Host.said_before`): memory's turn log of the last ``SAID_BEFORE_S`` (the 10 Oct YouTube-in-Arc task ran 17
-#: minutes; "in arc not in Chrome" stood 4 minutes before "Open the fucking YouTube tab"), at most
-#: ``SAID_BEFORE_TURNS`` turns, read within ``SAID_BEFORE_WAIT_S``. Only the turns the voice pipeline marked as said
-#: to Yuki (``addressed`` ``yuki``; the 10 Oct copy: 37 such turns that evening, the rest Yuki's own lines with no
-#: words): never a turn said to others in a call, and never a Brain request's own logged row (its text is the request
-#: as it came, which a card may have composed; the Brain's own requests are its earlier words already).
-SAID_BEFORE_S = 600.0
-SAID_BEFORE_TURNS = 16
-SAID_BEFORE_WAIT_S = 0.4
-SAID_BEFORE_TO: tuple[str | None, ...] = ("yuki",)
 
 #: kBrain: the planner's stable layers are kept an hour (``prompt.CACHE_CONTROL``): a warm-up is worth its call only
 #: when no planner call or warm-up ran for this long (s), or none yet in this app run.
@@ -482,48 +473,6 @@ class Host:
         self.origin_hwnd: int | None = req.origin_hwnd
         #: The executor's desk lease (set by the Brain once the executor is made): freed while a question waits.
         self.desk: Any = None
-        #: bRound2: the conversation's turns from memory's turn log, read on first use (:meth:`said_before`).
-        self._said_before: list[str] | None = None
-
-    def said_before(self) -> list[str]:
-        """bRound2 (B28): the user's own turns of this conversation, oldest first: memory's turn log (what the user
-        said to Yuki, exactly as heard, including the turns only the voice talker answered, which never reached this
-        Brain as a request) of the last :data:`SAID_BEFORE_S`, marked as said to Yuki (:data:`SAID_BEFORE_TO`), at most
-        :data:`SAID_BEFORE_TURNS`, each once, none of this request's own. Never a card's text, a model's words or
-        Yuki's replies. Read once per request on first use (the executor asks only for a step's app value no request
-        of the Brain's says); ``[]`` when memory can't say. RAM only; the log has the count."""
-        if self._said_before is not None:
-            return list(self._said_before)
-        got: list[str] = []
-        memory = self.memory
-        call = getattr(memory, "call", None)
-        if callable(call):
-            now = time.time()
-
-            def go(client: Any) -> list[str]:
-                store = getattr(client, "store", client)
-                turns = store.turns_between(now - SAID_BEFORE_S, now + 1.0)
-                return [str(t.user_text or "") for t in turns
-                        if getattr(t, "addressed", None) in SAID_BEFORE_TO and str(t.user_text or "").strip()]
-
-            try:
-                got = list(call("brain_said_before", go, timeout_s=SAID_BEFORE_WAIT_S) or [])
-            except Exception:  # noqa: BLE001 - a help only
-                got = []
-        mine = {" ".join(str(w).split()).casefold() for w in self.user_words}
-        out: list[str] = []
-        seen: set[str] = set()
-        for text in got:
-            key = " ".join(text.split()).casefold()
-            if key and key not in mine and key not in seen:
-                seen.add(key)
-                out.append(" ".join(text.split()))
-        self._said_before = out[-SAID_BEFORE_TURNS:]
-        try:
-            self.log("brain_said_before_read", turns=len(self._said_before), read=len(got))
-        except Exception:  # noqa: BLE001
-            pass
-        return list(self._said_before)
 
     @property
     def model_calls(self) -> int:
@@ -1752,7 +1701,7 @@ class Brain:
         conv = Conversation(request_turn(words=req.words, channel=req.channel, context=req.context,
                                          gathered=gathered, history=list(self._history), seed=req.seed, limits=bs,
                                          nonce=nonce, seed_hint=hint_box[0] if hint_box else None,
-                                         understanding=req.understanding))
+                                         understanding=req.understanding, awaits_mark=True))
         system = system_blocks(gathered.profile, gathered.menu)
         # aBrain (phase 2.5): pinned for the whole request, from its structure (the talker's understanding: its parts
         # and the skills they name; a hand-off), never its words; the rule is a setting so a test can compare
@@ -2148,7 +2097,9 @@ class Brain:
             "line": str(getattr(got, "line", "") or ""), "check_calls": checks,
             "outcome": getattr(got, "outcome", None), "final": bool(getattr(got, "final", False)),
             "parts": [str(p) for p in getattr(got, "parts", None) or [] if str(p or "").strip()],
-            "after": str(getattr(got, "after", "") or "")}
+            "after": str(getattr(got, "after", "") or ""),
+            # kw2 (K1): the executor chose one of its own asking lines (``executor.ASKING_LINES``, a skill's question)
+            "asks": getattr(got, "asks", False) is True}
         status = str(getattr(got, "status", "") or "error")
         if status == "done":
             # "done" only when the check saw it; any other reading is said as not confirmed, with the executor's line
@@ -2302,7 +2253,7 @@ class Brain:
             sent = isinstance(result.outcome, Mapping) and bool(result.outcome.get("send"))
             said = ending_line(line, self._ending_facts()) if (status == "unconfirmed" and not sent
                                                                and not self._consent_lined(plan)) else line
-            outcome = self._result_outcome(result, state, plan, said)
+            outcome = _awaiting(self._result_outcome(result, state, plan, said), result.asks and said == line)
             if said != line:
                 # aBrain (phase 2.3): the generic line gave way to the evidence's; the outcome's code line is the same
                 line = said
@@ -2376,10 +2327,12 @@ class Brain:
                                *self._steer_turn(host)])
                 return False
             if (state.answer_parts < ANSWER_PARTS_MAX and not self._cancelled.is_set()
-                    and question_due(plan, result, status, self._req, host)):
-                # hands19 (all-questions RC3a(ii)): their spoken words asked something and this act plan read nothing,
-                # so nothing would ever answer it: its line is held and the planner gets the answer turn, with room
-                # for one read first (the turn's own report says so); code says its line, then that answer
+                    and question_due(plan, result, status, self._req)):
+                # hands19 (all-questions RC3a(ii)), kw2 (B4): their spoken words held several parts and this act plan
+                # read nothing, so nothing would ever answer a part that asked something: its line is held and the
+                # planner gets the answer turn, with room for one read first (the turn's own report says so); it
+                # answers, or replies with the one done word when nothing was asked; code says its line, then the
+                # answer
                 state.answer_parts += 1
                 state.question_parts += 1
                 state.held = state.answer_held = (line, outcome)
@@ -2398,7 +2351,8 @@ class Brain:
             # the executor ends the run here with its own line (a game in front: "after the round?"; the desk busy):
             # no replan routes around it; the parts already done are said first (review M2)
             line = with_parts(result.parts, result.line)
-            self._final(line, self._with_evidence(line, self._result_outcome(result, state, plan, line)))
+            self._final(line, _awaiting(self._with_evidence(line, self._result_outcome(result, state, plan, line)),
+                                        result.asks))
             return True
         if status == "stopped":
             self._push(self._cancel_event())
@@ -2737,7 +2691,8 @@ class Brain:
                                                     f"plan, if it asks for something to be done)."},
                            *self._steer_turn(host)])
             return False
-        text = (text or "").strip()
+        # kw2 (K1): the planner's own mark that its reply waits for their answer, taken off before anything is said
+        text, marked = take_awaits((text or "").strip())
         last = state.last
         where = text_back(state, self._req.seed if self._req is not None else None, words=len(host.user_words))
         if where is not None and not self._cancelled.is_set():
@@ -2758,7 +2713,9 @@ class Brain:
             held_line, held_outcome = state.held
             answer = "" if rest_done_reply(text) else " ".join(text.split())
             line = f"{held_line.rstrip()} {answer}".strip() if answer else held_line
-            self._final(line, {**dict(held_outcome or {}), "line": line} if answer else dict(held_outcome or {}))
+            # kw2 (K1): the answer is said last, so its own mark decides; with none, the held line's own stands
+            self._final(line, _awaiting({**dict(held_outcome or {}), "line": line}, marked) if answer
+                        else dict(held_outcome or {}))
             return True
         if state.held is not None:
             if state.held is state.rest_held and not rest_done_reply(text):
@@ -2775,8 +2732,8 @@ class Brain:
             # the executor's own line for why it stopped (a refusal's "after the round?") wins over the model's words;
             # the parts already done are said first (review M2)
             line = with_parts(last.parts, last.line)
-            self._final(line, self._outcome(state, level="failed" if state.acted else "answer", line=line,
-                                            partial=bool(last.parts)))
+            self._final(line, _awaiting(self._outcome(state, level="failed" if state.acted else "answer", line=line,
+                                                      partial=bool(last.parts)), last.asks))
             return True
         if state.acted or (state.kind == "act" and last is not None
                            and last.status in ("refused", "mismatch", "error")):
@@ -2785,7 +2742,7 @@ class Brain:
             # "Sent Hemanth a DM asking when he's joining the VC." would have been said. Code says where it stopped.
             self._finish_stuck(state)
             return True
-        self._final(text or LINE_NO_REPLY, self._outcome(state, level="answer"))
+        self._final(text or LINE_NO_REPLY, _awaiting(self._outcome(state, level="answer"), marked and bool(text)))
         return True
 
     def _finish_stuck(self, state: _State, *, budget: bool = False) -> None:
@@ -2803,9 +2760,9 @@ class Brain:
             if base.endswith(tail):
                 base = base[:-len(tail)]
             line = LINE_REST_UNDONE.format(line=base.rstrip(". ") or "I did a part")
-            self._final(line, {**dict(held_outcome or {}), "level": "failed", "label": LEVEL_LABELS["failed"],
-                               "partial": True, "line": line,
-                               "open": max(1, int(dict(held_outcome or {}).get("open") or 0))})
+            self._final(line, _awaiting({**dict(held_outcome or {}), "level": "failed", "label": LEVEL_LABELS["failed"],
+                                         "partial": True, "line": line,
+                                         "open": max(1, int(dict(held_outcome or {}).get("open") or 0))}, False))
             return
         if state.held is not None:
             self._final(*state.held)
@@ -2828,8 +2785,12 @@ class Brain:
             why = plain_reason(last.reason, refused=last.status == "refused")
         stuck_what = " ".join(str(facts.get("stuck_what") or "").split())
         stuck_rest = " ".join(str(facts.get("stuck_rest") or "").split())
+        # kw2 (K1): every stuck line of code's own (LINE_STUCK*) offers another way, so the request waits for their
+        # answer; an executor's own line asks only when it chose one of its asking lines
+        awaits = True
         if last is not None and last.line and last.status in ("mismatch", "refused"):
             line = last.line
+            awaits = last.asks
         elif stuck_what:
             # desk20 (final-D S20, k_t3_draft): the step that did not take, with its app, and what was left after it,
             # from code facts (the executor's, as its input-gate stop line words them); never the plan's free text
@@ -2844,8 +2805,8 @@ class Brain:
             line = LINE_STUCK.format(where=f" {where}" if where else "", why=f": {why}" if why else "")
         # review M2: the parts already done (their own skill's check saw them) are said before where it stopped
         line = with_parts(last.parts if last is not None else (), line)
-        self._final(line, self._with_evidence(line, self._outcome(state, level="failed" if state.acted else "answer",
-                                                                  line=line, partial=state.acted)))
+        self._final(line, _awaiting(self._with_evidence(line, self._outcome(
+            state, level="failed" if state.acted else "answer", line=line, partial=state.acted)), awaits))
 
     def _outcome(self, state: _State, *, level: str, line: str = "", partial: bool = False,
                  seen: str = "", send: str | None = None) -> dict[str, Any]:
@@ -3175,6 +3136,18 @@ def typed_draft(plan: Plan | None, seed: Mapping[str, Any] | None) -> bool:
     return plan.done.name == "field_holds" and bool(" ".join(str(plan.done.args.get("text") or "").split()))
 
 
+def _awaiting(outcome: Mapping[str, Any] | None, awaits: bool) -> dict[str, Any]:
+    """kw2 (contract K1): ``outcome`` with ``awaits`` true when the request ends on a question or an offer the user
+    answers next (the planner's own mark on its reply, code's own stuck line, the executor's own asking line), else
+    without the key (a missing ``awaits`` closes the voice's exchange). Code facts only, never the line's words."""
+    out = dict(outcome or {})
+    if awaits:
+        out["awaits"] = True
+    else:
+        out.pop("awaits", None)
+    return out
+
+
 def rest_done_reply(text: Any) -> bool:
     """The planner's reply after a part was done is the one word code asked for when all is done
     (``context.REST_DONE_WORD``, :func:`yuki.brain.context.part_rest_report`): an exact reply format code set, never a
@@ -3257,41 +3230,39 @@ def answer_due(plan: Plan | None, result: ExecResult, status: str) -> bool:
     return any(s.verb in ANSWER_READ_VERBS for s in plan.steps) and any(s.verb in ACT_VERBS for s in plan.steps)
 
 
-def question_due(plan: Plan | None, result: ExecResult, status: str, req: Any, host: Any) -> bool:
-    """hands19 (final-B all-questions RC3a(ii)): a spoken request (voice channel) of several parts whose words ask
-    something ended an act plan (done or not confirmed) that read nothing (no memory read, no fetch came back): nothing
-    answers the question then. Several parts by structure (review M1), never by the mark alone: the voice's own hands
-    did a part of these words this turn (:func:`yuki.brain.plan.done_here_given`: the two-part case "pause the song,
-    also when's my meeting"), or the talker's reading holds two or more parts (:func:`yuki.brain.plan.several_parts`);
-    and the ask by the recognizer's or the talker's question mark (:func:`yuki.brain.plan.goal_is_question`). Never on a
-    draft, a plan that types a message, or one that may commit (a send, a join: consent's own line stands alone, and a
-    question in a message is for its reader). Code facts only (the plan's kind, consent and status, the reads that came
-    back, the request's channel, context label, understanding's parts and punctuation)."""
+def question_due(plan: Plan | None, result: ExecResult, status: str, req: Any) -> bool:
+    """hands19 (final-B all-questions RC3a(ii)), kw2 (B4): a spoken request (voice channel) of several parts ended an
+    act plan (done or not confirmed) that read nothing (no memory read, no fetch came back): nothing would answer a part
+    that asked something. Several parts by structure (review M1): the voice's own hands did a part of these words this
+    turn (:func:`yuki.brain.plan.done_here_given`: the two-part case "pause the song, also when's my meeting"), or the
+    talker's reading holds two or more parts (:func:`yuki.brain.plan.several_parts`). Whether a part asked something
+    is the planner's to read in its answer turn (it answers, or replies with the one done word), never a question mark
+    the recognizer or the talker wrote (the 18 Oct case's full stop lost the meeting). Never on a draft, a plan that
+    types a message, or one that may commit (a send, a join: consent's own line stands alone, and a question in a
+    message is for its reader). Code facts only (the plan's kind, consent and status, the reads that came back, the
+    request's channel, context label and understanding's parts)."""
     if plan is None or plan.kind != "act" or status not in ("done", "unconfirmed") or result.reads:
         return False
     if plan.consent.may_commit or plan.consent.text or str(getattr(req, "channel", "") or "") != "voice":
         return False
-    from yuki.brain.plan import done_here_given, goal_is_question, several_parts
+    from yuki.brain.plan import done_here_given, several_parts
 
-    understanding = getattr(req, "understanding", None)
-    if not (done_here_given(getattr(req, "context", "")) or several_parts(understanding)):
-        return False
-    words = list(getattr(host, "user_words", None) or getattr(req, "words", None) or [])
-    return goal_is_question(words, understanding)
+    return done_here_given(getattr(req, "context", "")) or several_parts(getattr(req, "understanding", None))
 
 
 def question_part_report(plan: Plan | None, line: str) -> str:
-    """hands19: :func:`question_due`'s answer turn (as ``context.answer_part_report`` after a read, with no reads to
-    give back): code's line for the act is held, and the planner answers what their words asked, after one read if it
-    needs one (a memory or look call), in plain text. Code then says its line and the answer after it. Code-written."""
+    """hands19, kw2 (B4): :func:`question_due`'s answer turn (as ``context.answer_part_report`` after a read, with no
+    reads to give back): code's line for the act is held, and the planner reads whether their words also asked
+    something; if so it answers, after one read if it needs one (a memory or look call), in plain text; else the one
+    done word. Code then says its line and the answer after it. Code-written."""
     pid = plan.id if plan else ""
     return "\n".join([
         f"{CHECK_LABEL} Plan {pid} ended. Yuki's line for what it did, not said yet: {one_line(line, 200)}",
-        "That plan read nothing, and their words above also asked something.",
-        f"Answer it now: read what the answer needs first (one memory or look call) if you have not, then reply in "
-        f"plain text with only the answer (one or two short sentences, in their terms; if nothing you read holds it, "
-        f"say so): code says its own line first, so never repeat or claim what was done. If they asked nothing more, "
-        f"reply with the one word {REST_DONE_WORD}."])
+        "That plan read nothing. If their words above also asked something it did not answer, answer it now: read "
+        "what the answer needs first (one memory or look call) if you have not, then reply in plain text with only the "
+        "answer (one or two short sentences, in their terms; if nothing you read holds it, say so): code says its own "
+        "line first, so never repeat or claim what was done.",
+        f"If they asked nothing more, reply with the one word {REST_DONE_WORD}."])
 
 
 def look_only(plan: Plan | None, result: ExecResult) -> bool:
