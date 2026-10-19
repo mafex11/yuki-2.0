@@ -28,7 +28,9 @@ One request:
    allows it once); a skill's own question goes to the model with their answer. The tools the drivers run themselves
    (status ``driver``: ``ask_user``, ``quick_memory``) run here once the gate allowed them. A reply cut at its output
    ceiling is never kept: it is asked again once with more room (``Brain._after_cutoff``'s rule).
-4. **Who ends it.** The model, by replying with no call. Code ends a clean reply as today (addendum decision 2,
+4. **Who ends it.** The model, by replying with no call (one22, A15: held once when the gate's turn says so,
+   :func:`closing_hold`: the turn's one miss, nothing tried after it, time left; the model goes again with the hold's
+   sentence, :data:`HOLD_HELD`). Code ends a clean reply as today (addendum decision 2,
    must-fix 2; ``one_settle = "code"``) by the runner's one settle rule (``yuki.one.runner.settles``: every call took,
    nothing flagged, every ``then`` empty): code's verified line is the reply, no closing call. A settle by the gate or
    the budget (the second refusal, the hard stop, the rounds) ends it with code's line (rule #149).
@@ -92,6 +94,10 @@ LINE_DONE = "Done."
 #: A reply written while the user added words is not their answer: the model goes again with their words.
 REPLY_HELD = (f"{CHECK_LABEL} Your reply above was not sent: the user added this before it went out. Take it into "
               f"account, then reply again (or act).")
+#: One22 (A15, contract C9 on typed): a closing reply of words the gate's turn holds once (``policy.Turn.closing_hold``:
+#: the turn's one miss, nothing tried after it, the time for another way still open): not shown; the model goes again
+#: with the hold's own sentence (``budget.LINE_HOLD_MISS``), as the voice driver's held round does.
+HOLD_HELD = f"{CHECK_LABEL} Your reply above was not shown to them yet. {{why}}"
 #: A call whose input was cut off (the reply hit its output ceiling) is never run on a cut-short value.
 BAD_INPUT_TEXT = "Not run: its input was cut off. Send the call again, shorter."
 #: The rest of a reply after code ended the request (a settle): nothing more of it runs.
@@ -277,6 +283,23 @@ def tidy_debt(runner: Any, turn: Any) -> dict[str, Any] | None:
     except Exception:  # noqa: BLE001 - no measure: code settles as before
         return None
     return dict(got) if isinstance(got, Mapping) and got else None
+
+
+def closing_hold(turn: Any) -> str | None:
+    """One22 (A15, contract C9): why the request's closing reply of words is held once, else ``None``: the gate's turn
+    (``policy.Turn.closing_hold``: the budget's one-miss reading), else the turn's budget's own
+    (``budget.TurnBudget.closing_hold``), read through ``getattr`` as the voice driver does. Pure. Never raises."""
+    for owner in (turn, getattr(turn, "budget", None)):
+        fn = getattr(owner, "closing_hold", None)
+        if not callable(fn):
+            continue
+        try:
+            got = fn()
+        except Exception:  # noqa: BLE001 - no reading: no hold
+            return None
+        text = " ".join(str(got or "").split())
+        return text or None
+    return None
 
 
 def typed_menu(menu_lines: str) -> tuple[str, list[str]]:
@@ -597,6 +620,7 @@ class OneAgent(Brain):
                 turn: P.Turn, runner: Any) -> None:
         shown: list[str] = []   # code's lines already shown as progress (Say)
         cutoffs = 0
+        held = False   # one22 (A15): the closing hold, once a request
         while True:
             if self._cancelled.is_set() or not self._hold_if_paused(turn):
                 self._ended_by = "cancelled"
@@ -635,6 +659,14 @@ class OneAgent(Brain):
                 if self._steer_waiting() and not turn.budget.closed:
                     self.logger.log("steer", held_final="reply")
                     conv.add_user([{"type": "text", "text": REPLY_HELD}, *self._added(host, turn)])
+                    continue
+                why = None if held or turn.budget.closed else closing_hold(turn)
+                if why:
+                    # one22 (A15): the turn's one miss with nothing tried after it and time left: held once, the
+                    # model gets one more round with the hold's sentence (the voice driver's C9 hold, typed)
+                    held = True
+                    self.logger.log("one_hold", closing="words", round=state.calls, why_chars=len(why))
+                    conv.add_user([{"type": "text", "text": HOLD_HELD.format(why=why)}, *self._added(host, turn)])
                     continue
                 self._end_with_text(reply.text, state, shown)
                 return
@@ -1079,6 +1111,6 @@ class OneAgent(Brain):
             self.logger.log("error", where="memory_turn", error=type(exc).__name__)
 
 
-__all__ = ["BAD_INPUT_TEXT", "FIELD_LABELS", "Got", "LINE_DONE", "LINE_NOT_RUN", "LINE_NOT_YES", "NO_SKILLS", "NOT_OK",
-           "OneAgent", "RAN", "REPLY_HELD", "Reply", "TOOK", "Use", "model_text", "read_result", "reply_uses",
-           "runner_settles", "tidy_debt", "typed_menu"]
+__all__ = ["BAD_INPUT_TEXT", "FIELD_LABELS", "Got", "HOLD_HELD", "LINE_DONE", "LINE_NOT_RUN", "LINE_NOT_YES",
+           "NO_SKILLS", "NOT_OK", "OneAgent", "RAN", "REPLY_HELD", "Reply", "TOOK", "Use", "closing_hold", "model_text",
+           "read_result", "reply_uses", "runner_settles", "tidy_debt", "typed_menu"]
