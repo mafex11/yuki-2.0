@@ -50,7 +50,9 @@ prompted with a proper noun; measured).
 thread and a memory call of their own (:func:`refresh_own_names`), through contract C11 (lane names21's
 ``yuki.skills.names.own_names``, imported inside ``try/except ImportError``), each said as a name (a site by its
 registrable name), kept for :func:`own_names`. They never become keyterms here; ``pipeline.heard_note`` measures a heard
-word against them by the tail shape only.
+word against them by the tail shape, and (voice22, A4, contract C14: the reader now also gives the user's own YouTube
+channels) by names21's measured match (``pipeline.measured_near``: ``names.best_match`` with ``as_name`` on each
+stretch of the heard words, re-measured on the user's past spoken turns before it shipped).
 """
 
 from __future__ import annotations
@@ -579,8 +581,9 @@ _OWN_NAMES: list[str] = []
 
 
 def own_names() -> list[str]:
-    """The user's own apps and sites as last read beside the keyterms (contract C11), for the Speech line's near test
-    (``pipeline.heard_note`` ``own``: the tail measure only). ``[]`` until a read, or with the reader missing."""
+    """The user's own apps, sites and channels as last read beside the keyterms (contracts C11 and C14), for the
+    Speech line's near test (``pipeline.heard_note`` ``own``, the tail measure, and ``measured``, names21's measured
+    match). ``[]`` until a read, or with the reader missing."""
     return list(_OWN_NAMES)
 
 
