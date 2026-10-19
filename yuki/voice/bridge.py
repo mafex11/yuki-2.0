@@ -65,7 +65,8 @@ from PySide6.QtCore import QObject, Signal
 
 from yuki.voice.expressive import strip_tags
 from yuki.voice.mouth import (
-    APP_NAMED_NOTE, CODE_SAID_NOTE, CORRECTION_MARK, REMEMBER_NOTE, SAVED_NOTE, SPOKEN_NOTE, WITHDRAWN_NOTE,
+    APP_NAMED_NOTE, CODE_SAID_NOTE, CORRECTION_MARK, HANDOFF_TOOLS, REMEMBER_NOTE, SAVED_NOTE, SPOKEN_NOTE,
+    WITHDRAWN_NOTE,
     brain_request, outcome_fields, result_payload, say_first_words, talker_kind, voice_on_brain, voice_one,
     waiting_payload,
 )
@@ -135,6 +136,28 @@ CLAIM_TURN_S = 20.0
 #: The same turn offered to :meth:`VoiceBridge.answer_waiting` twice this close together (s; a held final transcript
 #: the fast path releases again) is taken once.
 ANSWER_SAME_TURN_S = 2.0
+#: hands19 (final-B all-questions RC3a: "pause the song, also when's my meeting tomorrow": the hand-off started before
+#: the pause's result came back, the planner re-did the pause and toggled the music back on): a hand-off waits for the
+#: other calls of the same reply (Pipecat runs a reply's calls side by side) at most this long (s) ...
+HANDS_FIRST_MAX_S = 12.0
+#: ... and, when those calls can't be read, gives them this long to reach the hands' order gate (s), looking this often.
+HANDS_ARRIVE_S = 0.3
+HANDS_TICK_S = 0.05
+#: What the planner is told the same words already got (code facts: the hands' own verified reports).
+#: Review M1: it starts with the brain's ``plan.DONE_HERE_LEAD`` (the planner's answer turn for a request of several
+#: parts reads it); :func:`_done_here_note` checks that they agree.
+DONE_HERE_CONTEXT = ("Done already for these very words in this turn by Yuki's voice, and verified by the PC's own "
+                     "check (code facts, not their words): {done}. Those parts are done: never do them again; plan "
+                     "only what is left of their words.")
+#: hands19 (final-B all-messaging RC3, contract C4): a send countdown the user's speech paused counts on (their words
+#: neither stopped nor changed it) once the talker settled on their turn this long (s), never sooner than
+#: ANSWER_HOLD_MIN_S after their last words; a pause that brought no words, with nobody speaking, was noise after this
+#: long (s; brain one's ``ONE_NOISE_S``); with no view of the talker's state it counts on after ANSWER_HOLD_S.
+SEND_SETTLE_S = 0.4
+SEND_NOISE_S = 2.0
+SEND_TICK_S = 0.2
+#: The countdown's marks (``yuki.brain.agent.SEND_HOLD`` / ``SEND_GO_ON``), through the runtime's chip channel.
+SEND_HOLD_MARK, SEND_GO_ON_MARK = "hold", "go_on"
 #: Review r2 M1: a context message is one of a claim's turns when the heard log places it this close to them (s; the
 #: same entry gives the same time, this only absorbs a turn noted twice far apart); a later turn is never the claim's.
 CLAIM_HEARD_S = 0.5
@@ -264,6 +287,20 @@ class Job:
     #: appPT: who a send of this job goes to while its send countdown runs (the island's "3 s to stop"), else
     #: ``None``: the talker's thinker line says so, so their "stop" in those seconds is taken for that send.
     sending: str | None = None
+    #: hands19 (C4): its open countdown is paused on the user's speech (``SendPending("paused")``): their words decide.
+    send_held: bool = False
+    #: hands19 (C4): no hand-off call carries it (code passed it on: a hand's or skill's fallback, a held run, a late
+    #: addition), so the talker's cancel tool reaches it only through :meth:`VoiceBridge.cancel_passed_on`; and stopped
+    #: that way (nothing more of it is said, as for a cancelled hand-off call, unless its send went).
+    detached: bool = False
+    talker_cancelled: bool = False
+    #: hands19 review (H2, M2, M3): each pause of its countdown on the user's speech is one hold (its watch ends when a
+    #: newer hold takes over); the final words heard while it is held (RAM only, never logged; keyed by when each turn
+    #: was heard); and when the newest of them was steered into it by code (the talker routed none of them), so the
+    #: talker's own later call for the same words is never a second steer or a second job.
+    send_gen: int = 0
+    held_words: dict[float, str] = field(default_factory=dict)
+    held_steered_at: float | None = None
     #: Item 2 review r1 M2: a send countdown of this job ended ``going`` (the message went out, or may have): kept for
     #: good, so its end closes the exchange whatever its outcome says (the new brain's stuck endings carry no ``send``)
     #: and no later request carries its words again (rule 8: never sent twice).
@@ -291,6 +328,9 @@ class Job:
     #: How many user turns the conversation had when this was handed over (v3.9): a result that arrives
     #: after the user said more is the outcome of an earlier request, never an answer to their newest words.
     user_turn: int = 0
+    #: hands19 (final-B all-browser R2): the conversation it was handed over in (the shared action log's number): that
+    #: turn count restarts at 0 in each conversation, so every comparison of turns is of ``(convo, user_turn)``.
+    convo: int = 0
     #: The conversation's turn it was handed over in (``<session>-<n>``, phase F): its request id in the logs is
     #: ``voice-<turn>-t<token>``, beside that turn's hands (``voice-<turn>-h<n>``), for ``python -m yuki.log.follow``.
     turn_id: str | None = None
@@ -761,8 +801,17 @@ class VoiceBridge(QObject):
         #: the conversation; a stay_quiet on the user's words then is refused once (v3.9, never silent).
         self.in_exchange: Callable[[], bool] | None = None
         self._quiet_refused_turn = -1
-        #: The user turn an acknowledgement was last said for (v3.12: one per request).
-        self._acked_turn = -1
+        #: The user turn an acknowledgement was last said for (v3.12: one per request). hands19: ``(conversation, turn)``
+        #: (or -1), reset as each conversation goes live.
+        self._acked_turn: Any = -1
+        #: hands19 (C4): the watch of a send countdown the user's speech paused (:meth:`_held_send_watch`), kept so it
+        #: is never collected before it ends.
+        self._send_watch: Any = None
+        #: hands19 review (M2): the talker's hand-off calls still deciding where their words go (entered, not yet
+        #: submitted, steered or refused), and when each hand-off call came in (monotonic, the last few): a held
+        #: countdown's words the talker routed itself are never steered in by code as well.
+        self._routing: dict[int, float] = {}
+        self._handovers_at: deque[float] = deque(maxlen=8)
         #: IF-words (Item 2a): when each of the user's final turns was heard, and when the last spoken request ended
         #: the exchange (monotonic): the exchange a hand-off carries starts after it (:meth:`exchange_floor`).
         self.heard_log = HeardLog()
@@ -869,6 +918,9 @@ class VoiceBridge(QObject):
                 hands.new_conversation()   # it starts the shared log's new conversation too
             else:
                 self.actions.new_conversation()
+            # hands19 (all-browser R2, one-voice C): the last conversation's acknowledged turn is not this one's (turn 1
+            # here read as acknowledged, so most turn-1 say_firsts were never said)
+            self._acked_turn = -1
             self._log("bridge", op="new_conversation", convo=getattr(self.actions, "convo", None))
         except Exception:  # noqa: BLE001 - a log that keeps its lines is the old behaviour, never a crash
             pass
@@ -1224,19 +1276,14 @@ class VoiceBridge(QObject):
         words). The job table, the shared action log's records and the clock only."""
         if newest_at is _NEWEST:
             newest_at = self.heard_log.newest() if self.heard_log is not None else None
-        turn: int | None = None
-        if self.user_turns is not None:
-            try:
-                turn = int(self.user_turns())
-            except Exception:  # noqa: BLE001
-                turn = None
+        turn = self._turn_now()   # hands19: ``(conversation, turn)``
         with self._lock:
             # a request to keep counts too (review r1 L2), and one replaced after its send went keeps its words its own
             # (rule 8)
             live = [j for j in list(self._jobs.values()) + list(self._unsubmitted.values())
                     if j.source == "voice" and j.state in OPEN_STATES and (j.sent or not (j.superseded or
                                                                                          j.cancel_requested))
-                    and not j.unadopted and (turn is None or j.user_turn < turn)]
+                    and not j.unadopted and (turn is None or (j.convo, j.user_turn) < turn)]
         marks = [m for m in (self._closed_at, *(j.started_at for j in live)) if m is not None]
         claim = self._claim
         if claim is not None and claim.done and not claim.dropped and claim.heard_at is not None \
@@ -1309,7 +1356,14 @@ class VoiceBridge(QObject):
             if recent:
                 self._escalated_hands.append(last)
 
-    def _new_job(self, request: str, *, source: str = "voice", with_queue: bool = True) -> Job:
+    def _new_job(self, request: str, *, source: str = "voice", with_queue: bool = True,
+                 turn: tuple[int, int] | None = None) -> Job:
+        """A new job of ``request``, stamped with the user's current turn (hands19 review L1: or ``turn``, the
+        ``(conversation, turn)`` its hand-off came in on)."""
+        if turn is not None:
+            job = self._new_job(request, source=source, with_queue=with_queue)
+            job.convo, job.user_turn = int(turn[0]), int(turn[1])
+            return job
         turns = 0
         if self.user_turns is not None:
             try:
@@ -1324,7 +1378,25 @@ class VoiceBridge(QObject):
                 turn_id = None
         return Job(job_id=None, request=request, source=source, token=next(self._tokens),
                    events=asyncio.Queue() if with_queue else None, log=JobLog(request=request), user_turn=turns,
-                   turn_id=turn_id)
+                   turn_id=turn_id, convo=self._convo())
+
+    def _convo(self) -> int:
+        """hands19: this conversation's number (the shared action log's: bumped as each conversation goes live)."""
+        try:
+            return int(getattr(self.actions, "convo", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _turn_now(self) -> tuple[int, int] | None:
+        """hands19 (final-B all-browser R2, one-voice C): the user's current turn as ``(conversation, turn)``, else
+        ``None``: the conversation's own turn count restarts at 0 in each one, so a job or an acknowledgement of an
+        earlier conversation is never taken for this one's (compare these pairs, never the bare counts)."""
+        if self.user_turns is None:
+            return None
+        try:
+            return self._convo(), int(self.user_turns())
+        except Exception:  # noqa: BLE001
+            return None
 
     # -- the mouth's tools (voice thread) ---------------------------------------
 
@@ -1493,18 +1565,17 @@ class VoiceBridge(QObject):
         except Exception:  # noqa: BLE001
             return False
 
-    def _same_turn_job(self) -> Job | None:
-        """An open voice job handed over for the user's current turn (the same request), else ``None``."""
-        if self.user_turns is None:
+    def _same_turn_job(self, turn: tuple[int, int] | None = None) -> Job | None:
+        """An open voice job handed over for the user's current turn (the same request; hands19 review L1: or for
+        ``turn``), else ``None``."""
+        now = turn if turn is not None else self._turn_now()   # hands19: of this conversation only
+        if now is None:
             return None
-        try:
-            turn = int(self.user_turns())
-        except Exception:  # noqa: BLE001
-            return None
+        convo, turn = now
         with self._lock:
             live = [j for j in list(self._jobs.values()) + list(self._unsubmitted.values())
                     if j.source == "voice" and j.state in OPEN_STATES and not j.superseded and not j.remember
-                    and j.user_turn == turn and turn > 0 and not j.unadopted]
+                    and j.convo == convo and j.user_turn == turn and turn > 0 and not j.unadopted]
         return max(live, key=lambda j: j.started_at) if live else None
 
     def turn_handed_over(self) -> bool:
@@ -1548,17 +1619,13 @@ class VoiceBridge(QObject):
         """pVoice review r1 L2: whether a spoken job (open or finished; never one to keep) was made for the user's
         current turn: their request went to the thinker, so a ``then`` the hands still hold for this turn is closed
         (never a second job for the same words). State only."""
-        if self.user_turns is None:
-            return False
-        try:
-            turn = int(self.user_turns())
-        except Exception:  # noqa: BLE001
-            return False
-        if turn <= 0:
+        now = self._turn_now()   # hands19: of this conversation only
+        if now is None or now[1] <= 0:
             return False
         with self._lock:
             jobs = list(self._jobs.values()) + list(self._unsubmitted.values()) + list(self._finished)
-        return any(j.source == "voice" and not j.remember and not j.unadopted and j.user_turn == turn for j in jobs)
+        return any(j.source == "voice" and not j.remember and not j.unadopted and (j.convo, j.user_turn) == now
+                   for j in jobs)
 
     async def note_planned(self, text: str) -> bool:
         """lVoice review r1 L2: a labelled note (code's words: a part of the reply the voice planned and did not run,
@@ -2739,11 +2806,20 @@ class VoiceBridge(QObject):
         if job is None:
             return
         send = send if isinstance(send, dict) else {}
+        # hands19 (C4): a countdown their speech paused (``paused``) is still open: their words now are for it
+        state = send.get("state")
         job.sending = (" ".join(str(send.get("who") or "").split()) or "them") \
-            if send.get("state") == "counting" else None
-        if send.get("state") == "going":
+            if state in ("counting", "paused") else None
+        # review: a "counting" that comes after a newer pause was asked for is still that pause's (its "paused" follows)
+        job.send_held = state == "paused" or (state == "counting" and job.send_held)
+        if state == "going":
             job.sent = True   # Item 2 review r1 M2: it went (or may have): its end closes the exchange (rule 8)
-        self._log("bridge", op="send_countdown", job_id=job_id, state=send.get("state"))
+        self._log("bridge", op="send_countdown", job_id=job_id, state=state)
+        if (state == "counting" and not job.send_held and job.source == "voice" and self.on_brain
+                and not getattr(self, "one", False) and self._loop is not None and self._user_speaking()):
+            # review M3: it opened (or counts on) while they are speaking: it pauses at once, their words decide, as
+            # brain one's countdown does
+            self._hold_send(job, "spoke_first", self.heard_log.newest() if self.heard_log is not None else None)
         self._changed()
 
     def _on_paused_changed(self, lane: str, job_id: int, state: str, why: str) -> None:
@@ -2833,8 +2909,9 @@ class VoiceBridge(QObject):
             hwnd, tab = (getattr(job, "acting_on", None) or (None, "")) if job is not None else (None, "")
             try:
                 try:
+                    own = job is not None and job.convo == self._convo()   # hands19: a turn of this conversation
                     self.actions.add("the thinker", what, summary[:400], ok=bool(ok), verified=None if ok else False,
-                                     turn=job.user_turn if job is not None else None, hwnd=hwnd, tab_id=tab)
+                                     turn=job.user_turn if own else None, hwnd=hwnd, tab_id=tab)
                 except TypeError:   # an older log without the identities
                     self.actions.add("the thinker", what, summary[:400], ok=bool(ok), verified=None if ok else False)
             except Exception as exc:  # noqa: BLE001 - a record never breaks the thinker's step (content-free log)
@@ -3038,8 +3115,10 @@ class VoiceBridge(QObject):
         now = time.monotonic()
         with self._lock:
             others = list(self._jobs.values()) + list(self._unsubmitted.values()) + list(self._finished)
-        return any(o is not job and o.source == "voice" and not o.remember and o.user_turn > job.user_turn
-                   and not o.unadopted
+        # hands19 (all-browser R2): by ``(conversation, turn)``: a job of an earlier conversation's turn 2 is never
+        # newer than this conversation's turn 1 (k_resume_anime's outcome was folded by one two conversations back)
+        return any(o is not job and o.source == "voice" and not o.remember
+                   and (o.convo, o.user_turn) > (job.convo, job.user_turn) and not o.unadopted
                    and (o.state in OPEN_STATES or (o.finished_at and now - o.finished_at < RECENT_S))
                    for o in others)
 
@@ -3058,38 +3137,29 @@ class VoiceBridge(QObject):
 
     def _outcome_said(self, job: Job) -> None:
         """The outcome of what they asked last is being said: no acknowledgement may come after it (v3.13)."""
-        try:
-            turn = int(self.user_turns()) if self.user_turns is not None else -1
-        except Exception:  # noqa: BLE001
-            return
-        if turn >= 0 and job.user_turn == turn:
-            self._acked_turn = turn
+        now = self._turn_now()
+        if now is not None and now[1] >= 0 and (job.convo, job.user_turn) == now:
+            self._acked_turn = now   # hands19: ``(conversation, turn)``
 
     # -- one acknowledgement per request (v3.12) --------------------------------------------------
 
     def may_ack(self) -> bool:
         """Whether an acknowledgement may still be said for the user's current words (one per request: live 13:31:31
         "My bad, opening DevMafex now. Opening it. Let me open that for you." were three for one)."""
-        try:
-            turn = int(self.user_turns()) if self.user_turns is not None else -1
-        except Exception:  # noqa: BLE001
-            turn = -1
-        return turn < 0 or turn != self._acked_turn
+        now = self._turn_now()
+        return now is None or now[1] < 0 or now != self._acked_turn   # hands19: this conversation's turn only
 
     def acked(self) -> None:
         """Something was said for the user's current words (an acknowledgement or the reply's own words)."""
-        try:
-            self._acked_turn = int(self.user_turns()) if self.user_turns is not None else -1
-        except Exception:  # noqa: BLE001
-            pass
+        now = self._turn_now()
+        self._acked_turn = now if now is not None else -1   # hands19: ``(conversation, turn)``
 
     def _moved_on(self, job: Job) -> bool:
         """Whether the user has said more since this job was handed over (its result is then a late one)."""
-        if self.user_turns is None:
-            return False
+        now = self._turn_now()
         try:
-            return int(self.user_turns()) > int(job.user_turn)
-        except Exception:  # noqa: BLE001
+            return now is not None and now > (int(job.convo), int(job.user_turn))   # hands19: a later conversation too
+        except (TypeError, ValueError):
             return False
 
     #: How long after a "still on it" line was handed to the talker its reply may still be on its way (s).
@@ -3274,6 +3344,7 @@ class VoiceBridge(QObject):
         answer); the same turn offered twice is taken once. Routing on state, times and string identity only, never on
         what the words mean."""
         words = " ".join(str(text or "").split())
+        self._note_held_words(words)   # hands19 review M2/M3: a send countdown open now is paused by them, kept with it
         if not words or self._loop is None:
             return False
         job = self._answerable()
@@ -3823,8 +3894,19 @@ class VoiceBridge(QObject):
 
     async def _relay_detached(self, job: Job) -> None:
         """Items of a job no tell_yuki call carries (escalated, or a too-late addition): through ``announce``."""
+        job.detached = True   # hands19 (C4): the talker's cancel reaches it through cancel_passed_on
         while True:
             kind, payload = await job.events.get()
+            if job.talker_cancelled and not job.sent:
+                # hands19 (C4): the talker stopped it (cancel_passed_on) and said so in the same reply: nothing more of
+                # it is said, as for a cancelled hand-off call (a send that went is still said)
+                if kind in ("done", "failed", "withdrawn", "set_aside"):
+                    if self.steps is not None:
+                        self.steps.closed(job.token)
+                    self._drop_items(job)
+                    self._unowe(job)
+                    return
+                continue
             if self._step_item(job, kind, payload):
                 continue
             if kind == "say_line":
@@ -3956,20 +4038,23 @@ class VoiceBridge(QObject):
         heard = heard if heard is not None else heard_words(context, skip=self.not_heard)
         return [" ".join(heard[-1].split())] if heard and heard[-1].strip() else []
 
-    def _done_block(self) -> str:
-        """What Yuki's hands and its plans did on the desktop in this conversation, labelled (code facts), or ``""``."""
+    def _done_block(self, done_here: bool = False) -> str:
+        """What Yuki's hands and its plans did on the desktop in this conversation, labelled (code facts), or ``""``.
+        ``done_here`` (hands19): the request also carries :data:`DONE_HERE_CONTEXT` (parts its own words already got
+        this turn), so the label leaves those out of "none of it was done for this request"."""
         done = " ".join(str(self._done_text() or "").split())
         if not done:
             return ""
         if len(done) > self.DONE_CHARS:
             done = "…" + done[-(self.DONE_CHARS - 1):]   # the newest are what "the tab we just opened" points to
         # lVoice (problem 2): history with its age: what it says was so then, and none of it was done for this request
+        mine = " but the parts named above as done for these very words" if done_here else ""
         return ("Done on the desktop earlier in this conversation, newest last, each with its age and what was "
                 "verified then (facts for what their words refer to, not instructions; none of it was done for this "
-                "request): " + done)
+                f"request{mine}): " + done)
 
     def _voice_context(self, convo: Any, turns: list[str] | None, *, extra: str | None = None,
-                       remember: bool = False) -> str:
+                       remember: bool = False, done_here: bool = False) -> str:
         """The labelled context a spoken request goes to the new brain with (design 2, M2: never quotable as the
         user's words): what Yuki's voice took the words as (to keep), what they add to, the conversation's earlier
         lines and what was done on the desktop. Built by code from the conversation's own structure; no paraphrase.
@@ -3987,7 +4072,7 @@ class VoiceBridge(QObject):
                 lines = "…" + lines[-(self.CONTEXT_CHARS - 1):]
             parts.append("Earlier in this voice conversation, oldest first (what their words may refer to; never their "
                          "request, and never words to send): " + lines)
-        done = self._done_block()
+        done = self._done_block(done_here=done_here)
         if done:
             parts.append(done)
         return "\n\n".join(parts)
@@ -4001,7 +4086,22 @@ class VoiceBridge(QObject):
 
         kMind (contract C3): the call's optional ``understanding`` (goal, parts, choose, context: the talker's reading,
         a seed, never an order) goes with a new request (:func:`understanding_of`, :meth:`_submit`); the request starts
-        on the completed call (no early start)."""
+        on the completed call (no early start).
+
+        hands19 review: the user's turn is the one this call came in on (read once here: L1), and until the call has
+        decided where their words go it counts as routing them (:attr:`_routing`), so a held send countdown's watch
+        never steers the same words in as well (M2)."""
+        key = id(params)
+        came = time.monotonic()
+        self._routing[key] = came
+        self._handovers_at.append(came)
+        try:
+            await self._hand_over_now(params, key, self._turn_now())
+        finally:
+            self._routing.pop(key, None)
+
+    async def _hand_over_now(self, params: Any, key: int, turn: tuple[int, int] | None) -> None:
+        """:meth:`_hand_over`'s body, for the user's turn ``turn`` (``(conversation, turn)`` as the call came in)."""
         from pipecat.frames.frames import FunctionCallResultProperties
 
         args = params.arguments if isinstance(params.arguments, dict) else {}
@@ -4012,6 +4112,15 @@ class VoiceBridge(QObject):
         remember = intent == "remember"
         if await self._claim_decides(params, args, intent, heard, None):
             return   # Item 2(c, e): their answer to the waiting question, routed once
+        steered = self._held_steered_job() if intent in ("new_task", "follow_up") else None
+        if steered is not None:
+            # hands19 review M2: code already gave these very words to the task whose send they paused (the talker
+            # routed none of them in time): never a second steer of them, nor a second job for them
+            await self._ack_if_silent(params, args)
+            self._log("bridge", op="merged_held_steer", job_id=steered.job_id, call=params.tool_call_id, intent=intent)
+            await params.result_callback({"status": "passed on to the running task (added)"},
+                                         properties=FunctionCallResultProperties(run_llm=False))
+            return
         replaced: list[Job] = []
         if intent == "instead":
             replaced = self._replace_targets(args.get("replaces"))
@@ -4030,8 +4139,13 @@ class VoiceBridge(QObject):
         elif intent == "instead":
             self._log("bridge", op="replace", call=params.tool_call_id, withdrawn=[])
             intent = "new_task"
+        # hands19 (final-B all-questions RC3a): the same reply's other calls return first (a hand of theirs that passed
+        # the request on is then this turn's job, below); what this turn's hands verified goes with the request as done.
+        # Review L2: only a new request waits (a follow-up's words, a "don't send" steer among them, go on at once; one
+        # that starts a new request after all waits below)
+        done_here = await self._hands_first(params, turn) if intent == "new_task" else []
         if intent in ("new_task", "follow_up") and not replaced:
-            same = self._same_turn_job()
+            same = self._same_turn_job(turn)
             if same is not None and same.escalated:
                 # code already gave the brain these very words (a hand of the talker's did not take effect, v3.14);
                 # Item 2(e): a follow-up of them too is never steered in a second time (live 10 Oct, job 3)
@@ -4063,7 +4177,9 @@ class VoiceBridge(QObject):
                 extra = (f'These words add to the request just before ("{target.brief()}"), which had just finished'
                          + (f": {condense(prev, max_sentences=2, max_chars=300)[0]}" if prev else ".")
                          + " Take it from what the screen shows now.")
-        job = self._new_job(request)
+        if intent == "follow_up":
+            done_here = await self._hands_first(params, turn)   # review L2: it starts a new request after all
+        job = self._new_job(request, turn=turn)
         job.acked = self._acked(params, args)
         job.remember = remember
         with self._lock:
@@ -4073,22 +4189,30 @@ class VoiceBridge(QObject):
         lane = "worker" if replaced else None
         if lane == "worker" and not remember:
             self._pass_over_questions(lane)
-        context = self._voice_context(params.context, turns, extra=extra, remember=remember)
+        if done_here:
+            note = _done_here_note(done_here)
+            extra = f"{extra}\n\n{note}" if extra else note
+        context = self._voice_context(params.context, turns, extra=extra, remember=remember,
+                                      done_here=bool(done_here))
         query = _memory_words(request, heard)
         understanding = None if remember else understanding_of(args.get("understanding"))
         self._gui(lambda: self._submit(job, request, origin, lane=lane, memory_query=query, user_words=turns,
                                        context=context, understanding=understanding))
         self._log("bridge", op="submit", token=job.token, call=params.tool_call_id, intent=intent, brain=True,
                   words_chars=len(request), turns=len(turns), context_chars=len(context), origin_hwnd=origin,
+                  done_here=len(done_here),
                   replaced=len(replaced), lane=lane, remember=remember,
                   understanding=len((understanding or {}).get("parts") or []) if understanding else None)
         self._changed()
+        self._routing.pop(key, None)   # hands19 review M2: their words have their request now
         self._arm_wait(job)
         try:
             await self._relay(job, params)
         except asyncio.CancelledError:
             if not self.closing:
-                # cancel_hand_over: stop the brain's work too, and say nothing more of it
+                # cancel_hand_over: stop the brain's work too, and say nothing more of it; hands19 (C4): marked at once,
+                # so a countdown their speech paused is never counted on before the GUI thread has the stop
+                job.cancel_requested = True
                 self._gui(lambda: self._cancel(job))
                 if self.gate is not None:
                     for item in self.gate.take(job.token, kinds=tuple(RANKS)):
@@ -4097,6 +4221,301 @@ class VoiceBridge(QObject):
                 self._unowe(job)
                 self._log("bridge", op="cancel", job_id=job.job_id, by="mouth")
             raise
+
+    def _reply_calls(self, params: Any) -> set[Any] | None:
+        """hands19 (all-questions RC3a): the other calls of the reply this call came in that are still running
+        (Pipecat's running calls of the same group: one model reply's calls share it), hand-offs aside (two hand-offs
+        never wait on each other); ``None`` when Pipecat's table can't be read or the call has no group. Plumbing."""
+        llm = getattr(params, "llm", None)
+        table = getattr(llm, "_function_call_tasks", None)
+        if not isinstance(table, dict):
+            return None
+        try:
+            items = list(table.items())
+            mine = next((item for _task, item in items
+                         if getattr(item, "tool_call_id", None) == getattr(params, "tool_call_id", None)), None)
+            group = getattr(mine, "group_id", None) if mine is not None else None
+            if group is None:
+                return None
+            return {task for task, item in items if getattr(item, "group_id", None) == group
+                    and getattr(item, "tool_call_id", None) != params.tool_call_id
+                    and getattr(item, "function_name", "") not in HANDOFF_TOOLS and not task.done()}
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _hands_first(self, params: Any, turn: tuple[int, int] | None = None) -> list[str]:
+        """hands19 (final-B all-questions RC3a): before a hand-off goes, the same reply's hands return (bounded,
+        :data:`HANDS_FIRST_MAX_S`): its other calls, read from Pipecat's running calls; when those can't be read, this
+        turn's hands in the hands' order gate (after :data:`HANDS_ARRIVE_S` for them to reach it). Returns what this
+        turn's hands verified (``Hands.verified_this_turn``: code's words), which the request carries as done
+        (:data:`DONE_HERE_CONTEXT`). Review L1: of ``turn``, the user's turn the hand-off came in on (their newer words
+        during the wait are not its turn). Content-free log. Never raises but for a cancel while waiting."""
+        hands = self.hands
+        if hands is None:
+            return []
+        started = time.monotonic()
+        siblings = self._reply_calls(params)
+        how = "reply"
+        if siblings:
+            await asyncio.wait(siblings, timeout=HANDS_FIRST_MAX_S)
+        elif siblings is None:
+            how = "gate"
+            running = getattr(hands, "turn_hands_running", None)
+            await asyncio.sleep(HANDS_ARRIVE_S)
+            while callable(running) and running() and time.monotonic() - started < HANDS_FIRST_MAX_S:
+                await asyncio.sleep(HANDS_TICK_S)
+        read = getattr(hands, "verified_this_turn", None)
+        try:
+            got = (read(turn=turn) if turn is not None and _takes(read, "turn") else read()) if callable(read) else []
+            done = [str(d) for d in got or [] if str(d).strip()]
+        except Exception:  # noqa: BLE001
+            done = []
+        self._log("bridge", op="hands_first", how=how, calls=len(siblings or ()), done=len(done),
+                  waited_ms=round((time.monotonic() - started) * 1000))
+        return done
+
+    # -- hands19 (contract C4): the user's speech on an "all" send countdown, and a cancel of a passed-on job -------
+
+    def user_speech_started(self) -> bool:
+        """hands19 (final-B all-messaging RC3, contract C4): the user started speaking (the pipeline's VAD start of their
+        speech, called through a ``getattr`` guard while a countdown is open). An open send countdown of the new brain's
+        (a voice job whose countdown counts: :attr:`Job.sending`) pauses at once with the time it had left (the
+        brain's ``SEND_HOLD`` mark), so a spoken "wait, don't send it" is heard before the send can go. Their words then
+        decide: a cancel (``cancel_hand_over``, :meth:`cancel_passed_on`) or a replacement stops it; their words routed
+        to the job end it for the planner to decide (the talker's follow-up, or, review M2, code's own steer of them
+        when the talker routed none of them: brain one's countdown ends on their words too); a pause whose words the
+        talker took elsewhere (a new request, a hand), or that brought no words, counts on for the time it had left
+        (:meth:`_held_send_watch`). Under brain one or the old thinker: ``False`` (brain one's countdown pauses itself).
+        Returns whether a countdown was paused. State only; never raises."""
+        try:
+            if getattr(self, "one", False) or not self.on_brain or self._loop is None:
+                return False
+            with self._lock:
+                live = [j for j in self._jobs.values() if j.source == "voice" and j.state == RUNNING and j.sending
+                        and not j.send_held and not j.superseded and not j.cancel_requested and j.job_id is not None]
+            if not live:
+                return False
+            since = self.heard_log.newest() if self.heard_log is not None else None
+            return self._hold_send(max(live, key=lambda j: j.started_at), "speaking", since)
+        except Exception as exc:  # noqa: BLE001 - the countdown's own time then
+            self._log("bridge_error", error=f"user_speech_started: {type(exc).__name__}")
+            return False
+
+    def _hold_send(self, job: Job, why: str, since: float | None) -> bool:
+        """hands19 (C4; review M3): ``job``'s open countdown pauses now (the brain's ``SEND_HOLD`` mark) and a watch of
+        this pause starts (:meth:`_held_send_watch`; a watch of an earlier pause of it ends). ``since``: when the newest
+        turn heard before the words this pause waits for was heard (``None``: none). ``why``: ``speaking`` (their speech
+        began), ``spoke_first`` (it opened while they spoke), ``words`` (their final words came while it counted). Any
+        thread; state only. Returns ``True``."""
+        job.send_held = True
+        job.send_gen += 1
+        job.held_words = {}
+        gen = job.send_gen
+        self._gui(lambda: self._send_mark(job, SEND_HOLD_MARK))
+        self._log("bridge", op="send_held", job_id=job.job_id, why=why)
+        coro = self._held_send_watch(job, since, time.monotonic(), gen)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._loop:
+            task = asyncio.ensure_future(coro)
+        else:
+            task = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        self._send_watch = task
+        return True
+
+    def _note_held_words(self, text: str) -> None:
+        """hands19 review (M2, M3): a final turn of theirs that reaches the talker (:meth:`answer_waiting`) while an
+        "all" send countdown is open is kept with that job while its countdown is held (RAM only, never logged): the
+        words its watch gives the job when the talker routes none of them. One heard while the countdown still counts
+        (their speech began before it opened, or the final came after the watch counted on) pauses it now, as brain
+        one's countdown does. Never raises."""
+        try:
+            words = " ".join(str(text or "").split())
+            if not words or getattr(self, "one", False) or not self.on_brain or self._loop is None:
+                return
+            with self._lock:
+                live = [j for j in self._jobs.values() if j.source == "voice" and j.state == RUNNING and j.sending
+                        and not j.superseded and not j.cancel_requested and j.job_id is not None]
+            if not live:
+                return
+            job = max(live, key=lambda j: j.started_at)
+            at = self.heard_log.note(words) if self.heard_log is not None else None
+            at = float(at) if at is not None else time.monotonic()
+            if not job.send_held:
+                self._hold_send(job, "words", at - 0.001)
+            job.held_words[at] = words
+            for old in sorted(job.held_words)[:-EXCHANGE_TURNS]:
+                job.held_words.pop(old, None)
+        except Exception as exc:  # noqa: BLE001 - the pause on their speech and the talker's own calls still hold
+            self._log("bridge_error", error=f"note_held_words: {type(exc).__name__}")
+
+    def _send_mark(self, job: Job, mark: str) -> None:
+        """On the GUI thread: the countdown mark for ``job``'s running agent (``Runtime.send_choice``, the countdown's
+        chip channel; any agent but the new brain's says no). A pause the agent did not take ends its watch."""
+        if job.job_id is None:
+            return
+        choose = getattr(self.runtime, "send_choice", None)
+        try:
+            ok = bool(choose(int(job.job_id), mark, "voice")) if callable(choose) else False
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            self._log("bridge_error", error=f"send_mark: {type(exc).__name__}")
+        if not ok and mark == SEND_HOLD_MARK:
+            job.send_held = False   # no countdown took it (it ended meanwhile): nothing is paused
+            job.send_gen += 1
+        self._log("bridge", op="send_mark", job_id=job.job_id, mark=mark, delivered=ok)
+
+    def _user_speaking(self) -> bool:
+        """hands19 review (H2, M3): whether the user is speaking now: the conversation's VAD (``user_speaking``) or
+        the microphone's voiced audio just now (``user_sound``), from the narrator gate's live state; ``False`` when it
+        can't be read. State only."""
+        state = getattr(self.gate, "_state", None) if self.gate is not None else None
+        if not callable(state):
+            return False
+        try:
+            s = state()
+        except Exception:  # noqa: BLE001
+            return False
+        return isinstance(s, dict) and bool(s.get("user_speaking") or s.get("user_sound"))
+
+    def _talker_routed(self, job: Job) -> bool:
+        """hands19 review M2: whether the talker's own calls took the words held for ``job``'s countdown somewhere: a
+        hand-off call came in after the first of them (a new request, a follow-up, a fact to keep, a replacement), or
+        a hand or skill of its ran on their turn. State and times only."""
+        first = min(job.held_words) if job.held_words else None
+        if first is not None and any(at >= first for at in list(self._handovers_at)):
+            return True
+        called = getattr(self.hands, "called_this_turn", None) if self.hands is not None else None
+        try:
+            return bool(callable(called) and called())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _held_steered_job(self) -> Job | None:
+        """hands19 review M2: the open voice job of this conversation that code gave the user's newest heard words to
+        while its countdown was held (:meth:`_held_send_watch`), when no newer turn was heard since; else ``None``. A
+        hand-off of those same words then is neither a second steer nor a second job. Times only."""
+        newest = self.heard_log.newest() if self.heard_log is not None else None
+        if newest is None:
+            return None
+        convo = self._convo()
+        with self._lock:
+            jobs = [j for j in self._jobs.values() if j.source == "voice" and j.held_steered_at is not None
+                    and newest <= j.held_steered_at and j.state in OPEN_STATES and not j.superseded
+                    and not j.cancel_requested and j.convo == convo]
+        return max(jobs, key=lambda j: j.started_at) if jobs else None
+
+    async def _held_send_watch(self, job: Job, since: float | None, held_at: float, gen: int) -> None:
+        """hands19 (C4): a countdown paused on the user's speech, until its pause is decided. It ends when the countdown
+        did (``job.sending`` cleared: a cancel, a replacement, their words routed to it, the time ran out) or a newer
+        pause of it took over (``gen``). Else it waits while the talker is on their turn (they speak or their voice is
+        heard, it writes or owes a reply, a tool or a hand-off of its is deciding), then:
+
+        * words came (a final turn heard after ``since``), :data:`SEND_SETTLE_S` after the talker settled and at least
+          ANSWER_HOLD_MIN_S after the last of them: review M2, when the talker routed none of the words it was given
+          (it answered in words only, or stayed quiet; never in a call, where most words are for the others) they go to
+          the job as their follow-up, which ends the countdown with nothing sent (the planner sends again only through
+          a new countdown); else (it took them elsewhere, or they never reached it) the countdown counts on;
+        * no words: review H2, :data:`SEND_NOISE_S` after their speech ended (the first quiet tick), never timed from
+          its start (the final transcript comes 0.5-1.6 s after the VAD stop, and a reply is owed only then): noise,
+          it counts on;
+        * no view of the talker's state: ANSWER_HOLD_S after the pause or their last words.
+
+        Counting on is the brain's ``SEND_GO_ON`` for the time it had left; the brain's own pause limit (nothing sent)
+        bounds it all. States and times only; never what was said."""
+        settled_at: float | None = None
+        try:
+            while True:
+                await asyncio.sleep(SEND_TICK_S)
+                if (job.send_gen != gen or job.sending is None or job.state not in OPEN_STATES or job.superseded
+                        or job.cancel_requested or job.talker_cancelled):
+                    return
+                now = time.monotonic()
+                newest = self.heard_log.newest() if self.heard_log is not None else None
+                words = newest is not None and (since is None or newest > since)
+                busy = self._talker_busy()
+                if busy or self._user_speaking() or self._routing:
+                    settled_at = None
+                    continue
+                settled_at = settled_at if settled_at is not None else now
+                last = float(newest) if words else held_at
+                if busy is None:
+                    due = now - max(held_at, last) >= ANSWER_HOLD_S
+                elif words:
+                    due = now - settled_at >= SEND_SETTLE_S and now - last >= ANSWER_HOLD_MIN_S
+                else:
+                    due = now - settled_at >= SEND_NOISE_S
+                if not due:
+                    continue
+                in_call = False
+                try:
+                    in_call = bool(self.call_mode()) if self.call_mode is not None else False
+                except Exception:  # noqa: BLE001
+                    in_call = False
+                if words and job.held_words and not in_call and not self._talker_routed(job):
+                    text = " ".join(job.held_words[k] for k in sorted(job.held_words))
+                    at = max(job.held_words)
+                    turns = len(job.held_words)
+                    how = await self._follow_up(job, text)
+                    if how != "restart":
+                        job.held_steered_at = at
+                        self._log("bridge", op="send_words_steered", job_id=job.job_id, how=how, turns=turns,
+                                  held_ms=round((now - held_at) * 1000))
+                        return
+                    # their words could not reach it (it is finishing): never counted on past them; the brain's
+                    # pause limit ends it with nothing sent
+                    self._log("bridge", op="send_words_unsteered", job_id=job.job_id, turns=turns)
+                    return
+                job.send_held = False
+                self._gui(lambda: self._send_mark(job, SEND_GO_ON_MARK))
+                self._log("bridge", op="send_go_on", job_id=job.job_id, words=words, view=busy is not None,
+                          held_ms=round((now - held_at) * 1000))
+                return
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 - the brain's pause limit ends it then (nothing sent)
+            self._log("bridge_error", error=f"held_send_watch: {type(exc).__name__}")
+
+    def cancel_passed_on(self) -> bool:
+        """hands19 (final-B all-messaging RC3, contract C4): the talker's cancel when no hand-off call of its is running
+        (the pipeline's cancel tool, through a ``getattr`` guard): the open voice job code passed on for their words
+        (a ``run_skill`` or hand fallback, a held run, a late addition: :attr:`Job.detached`, no call carries it) is
+        stopped: this user turn's, else the newest of this conversation (p24_countdown_cancel: the send was passed on
+        in turn 1, "wait, no, don't send it" was turn 2, and the cancel tool answered "no hand_over call is running"
+        five times). Nothing more of it is said (the talker says it is stopping in the same reply), unless its send
+        went. ``True`` when one was stopped. Never under brain one. State only; never raises."""
+        try:
+            if getattr(self, "one", False):
+                return False
+            now = self._turn_now()
+            convo = now[0] if now is not None else self._convo()
+            with self._lock:
+                live = [j for j in list(self._jobs.values()) + list(self._unsubmitted.values())
+                        if j.source == "voice" and (j.escalated or j.detached) and j.state in OPEN_STATES
+                        and not j.superseded and not j.cancel_requested and not j.remember and not j.unadopted
+                        and j.convo == convo]
+            if not live:
+                self._log("bridge", op="cancel_passed_on", found=False)
+                return False
+            same = [j for j in live if now is not None and j.user_turn == now[1]]
+            job = max(same or live, key=lambda j: j.started_at)
+            job.talker_cancelled = True
+            job.cancel_requested = True
+            self._gui(lambda: self._cancel(job))
+            if self.gate is not None:
+                for item in self.gate.take(job.token, kinds=tuple(RANKS)):
+                    if item.drop is not None:
+                        item.drop()
+            self._unowe(job)
+            self._log("bridge", op="cancel_passed_on", found=True, job_id=job.job_id, this_turn=bool(same),
+                      sending=job.sending is not None)
+            self._changed()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._log("bridge_error", error=f"cancel_passed_on: {type(exc).__name__}")
+            return False
 
     def _brain_escalate(self, params: Any, name: str, args: dict[str, Any], report: str, heard: list[str], *,
                         acked: bool = False, context: str | None = None, skill: dict[str, Any] | None = None) -> bool:
@@ -4392,6 +4811,17 @@ def conversation_turns(context: Any, *, skip: Callable[[Any], bool] | None = Non
 #: An understanding's parts kept, and the characters of each text field.
 UNDERSTANDING_PARTS = 6
 UNDERSTANDING_CHARS = 300
+
+
+def _done_here_note(done: list[str]) -> str:
+    """hands19: :data:`DONE_HERE_CONTEXT` for ``done`` (code's words), led by the brain's own label for it
+    (``plan.DONE_HERE_LEAD``, review M1) even if the two wordings ever drift apart."""
+    note = DONE_HERE_CONTEXT.format(done="; ".join(done))
+    try:
+        from yuki.brain.plan import DONE_HERE_LEAD
+    except ImportError:   # an older brain: no answer turn reads it
+        return note
+    return note if note.startswith(DONE_HERE_LEAD) else f"{DONE_HERE_LEAD}: {note}"
 
 
 def understanding_of(raw: Any) -> dict[str, Any] | None:

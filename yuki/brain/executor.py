@@ -234,6 +234,11 @@ LINE_HELD_CALL = "You're on a call, so I held off."
 #: this one says only that the step was stopped (``{what}``: the step in words), and the run ends there (a replan would
 #: meet the same gate). ``{what}``: :data:`STOPPED_WHAT`.
 LINE_INPUT_STOPPED = "Something on the PC stopped me {what}, so I left it there."
+#: hands19 (final-B all-messaging RC5, k_t3_draft: "Something on the PC stopped me bringing that window forward, so I
+#: left it there." named neither the app nor what was left undone): the same stop when act steps of the plan were still
+#: to run after it (``{rest}``: those steps in the island's words, at most :data:`STOPPED_REST_MAX`).
+LINE_INPUT_STOPPED_REST = "Something on the PC stopped me {what}, so I didn't do the rest ({rest})."
+STOPPED_REST_MAX = 2
 #: fHands note 2: a ``run_skill`` step the gate stopped for anything but a game (``refused: blocked``) that gave no line
 #: of its own: plain, never the game line.
 LINE_BLOCKED = "Something on the PC stopped me there, so nothing was done."
@@ -258,6 +263,13 @@ STOPPED_WHAT: dict[str, str] = {
     "window_action": "arranging the window", "tab": "switching the tab", "click": "clicking", "type_text": "typing",
     "hotkey": "pressing the shortcut", "press": "pressing the key", "scroll": "scrolling",
     "set_slider": "moving the slider", "write_clipboard": "copying"}
+#: hands19: the same, naming the app the stopped step acts in (``{app}``: its target window's program as people say
+#: it, else the plan's target app), used when that app is known.
+STOPPED_WHAT_APP: dict[str, str] = {
+    "launch_app": "opening {app}", "focus_window": "bringing {app} forward", "open_url": "opening the page in {app}",
+    "window_action": "arranging {app}'s window", "tab": "switching the tab in {app}", "click": "clicking in {app}",
+    "type_text": "typing in {app}", "hotkey": "pressing the shortcut in {app}", "press": "pressing the key in {app}",
+    "scroll": "scrolling in {app}", "set_slider": "moving the slider in {app}"}
 #: fBrain (18 Oct live A, "Pull up ChatGPT and ElevenLabs": two open_url steps whose own reports said "navigation
 #: confirmed", done none, said "I did it, but I couldn't confirm it worked."): the probe whose words say an act verb's
 #: effect, for a plan by steps that wrote done none and whose every act step its own report saw take
@@ -484,6 +496,12 @@ class Executor:
         self._recheck_verdict: dict[str, Any] = {}
         self._result: RunResult | None = None
         self._last_done: done.DoneResult | None = None
+        #: hands19: the hand-off's own check was read at a plan's finish (:meth:`_seed_also`): the brain's observer
+        #: never reads it again for this request.
+        self.seed_read = False
+        #: hands19: the hand-off's own check (``done``, ``done_words``, ``baseline``) held for the current plan when it is
+        #: ``Plan.seed_also`` (the brain sets it with each plan: ``Brain._seed_executor``), else ``None``.
+        self.seed_also: dict[str, Any] | None = None
         self._skill_key: str | None = None
         #: zFinal: the request's desk hands for ``run_skill`` (``None`` until a run_skill needs them; ``False``: they
         #: couldn't be made).
@@ -1486,8 +1504,7 @@ class Executor:
                 # never a replan (it would meet the same gate)
                 status.state, status.why = "refused", "input_gate"
                 self._emit_log("brain_gate_no_game", verb=call.tool, kind=kind)
-                return RunResult("refused", line=LINE_INPUT_STOPPED.format(
-                    what=STOPPED_WHAT.get(call.tool, "there")), final=True)
+                return RunResult("refused", line=self._stopped_line(index, call), final=True)
             return self._mismatch_result(index, why, seen=shown, call=call, seen_fenced=external and bool(body))
         status.state, status.why = "ok", why
         if self.tidy is not None:
@@ -1710,8 +1727,10 @@ class Executor:
             except Exception:  # noqa: BLE001 - no countdown ran: nothing is sent
                 state = "stopped"
             state = state if state in ("going", "stopped", "swapped") else "stopped"
-            if state == "going":
-                # words the user said while it counted (a correction) stop the send for a replan, as a chip would
+            if state in ("going", "swapped"):
+                # words the user said while it counted (a correction) stop the send for a replan, as a chip would;
+                # hands19 (C4): the host's countdown also ends ``swapped`` the moment their words reach it (while it
+                # counted, or paused on their speech): those words are theirs for the consent rule and the planner
                 try:
                     late = [str(w) for w in (self.host.steer_pending() or []) if str(w).strip()]
                 except Exception:  # noqa: BLE001
@@ -2608,6 +2627,8 @@ class Executor:
                                          type_after=deciding.type_after, typed=deciding.typed)
         else:
             result = self._pick_done(env)
+            if field_of(self.head, "seed_also", False) and self.seed_also and result.probe != done.PARTS:
+                result = self._seed_also(result, env)
         if cls in ("skill", "join") and not (deciding is not None and deciding.drafted):
             # kBrain review M2: the request's other parts their own skills saw done (this plan's, and earlier plans' a
             # later part stopped) are said first; a send's or a draft's line stands alone (consent's own words)
@@ -2636,6 +2657,59 @@ class Executor:
         final = done.outcome(result, self.trace, step_words=self._step_words(), refused=self._refused_count())
         return RunResult("done", plan_id=self.plan_id, statuses=list(self.statuses), done=result, line=result.line,
                          final=True, outcome=final, reads=list(self.read_results))
+
+    def _stopped_line(self, index: int, call: Call) -> str:
+        """hands19 (final-B all-messaging RC5): the line for an act step the input gate stopped with no game in front,
+        from code facts: the stopped step's verb and the app it acts in (its target window's program, else the plan's
+        target app; :data:`STOPPED_WHAT_APP`), and that the plan's act steps after it were not done (each in the
+        island's words, :meth:`_step_said`; :data:`LINE_INPUT_STOPPED_REST`). Never the plan's free text. Never
+        raises: the old line when anything is missing."""
+        try:
+            target = field_of(field_of(self.head, "target", None), "app", None) if self.head is not None else None
+            app = util.app_name(call.app) if call.app else (words(target) if target else "")
+            app = "" if app in ("", "It") else app
+            what = (STOPPED_WHAT_APP[call.tool].format(app=app) if app and call.tool in STOPPED_WHAT_APP
+                    else STOPPED_WHAT.get(call.tool, "there"))
+            rest = []
+            for step in list(self.steps)[index + 1:]:
+                if self._verb(step) not in ACT_VERBS:
+                    continue
+                said = _mid(self._step_said(step))
+                if said and said not in rest:
+                    rest.append(said)
+            if not rest:
+                return LINE_INPUT_STOPPED.format(what=what)
+            shown = ", ".join(rest[:STOPPED_REST_MAX]) + (", and more" if len(rest) > STOPPED_REST_MAX else "")
+            return LINE_INPUT_STOPPED_REST.format(what=what, rest=shown)
+        except Exception:  # noqa: BLE001 - the plain line
+            return LINE_INPUT_STOPPED.format(what=STOPPED_WHAT.get(call.tool, "there"))
+
+    def _seed_also(self, own: done.DoneResult, env: done.ProbeEnv) -> done.DoneResult:
+        """hands19 (final-B all-spotify RC3: "Touch grass should be on, but I couldn't confirm it" while the harness saw
+        it playing): a seeded plan by steps whose hand-off check is a skill driver's own (``Plan.seed_also``) has that
+        check read now, at the finish, before its line is worded (``done.seed_done``: the skill's own done words), and
+        the stronger verdict is kept (``plan.stronger_done``: verified beats likely; never over the plan's own "not
+        so"). Only when the plan's own check didn't already read it verified. :attr:`seed_read` marks it read, so the
+        brain's after-the-line observer doesn't read it a second time. Never raises."""
+        held = dict(self.seed_also or {})
+        if own.verdict is False or own.level == util.VERIFIED or not held.get("done") or not words(
+                held.get("done_words")):
+            return own   # a seed with no done words of its own would say "couldn't confirm" at a verified level
+        try:
+            seeded = done.seed_done(held, env)
+        except Exception as exc:  # noqa: BLE001 - the plan's own check stands
+            self._emit_log("done_seed_also", error=type(exc).__name__)
+            return own
+        self.seed_read = True
+        try:
+            from yuki.brain.plan import stronger_done
+
+            better = stronger_done(own, seeded)
+        except ImportError:   # a branch without bCore's plan.py: the same rule
+            better = seeded.verdict is True and seeded.level == util.VERIFIED
+        self._emit_log("done_seed_also", own=own.level, seed=seeded.level, kept="seed" if better else "plan",
+                       check=seeded.probe)
+        return seeded if better else own
 
     def _part(self, run: _SkillRun, *, several: bool = True) -> done.DoneResult:
         """One ``run_skill`` part of this plan, by its own skill's check (``several``: the request has other parts)."""

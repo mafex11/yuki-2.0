@@ -89,7 +89,7 @@ import time
 from collections import deque
 from types import SimpleNamespace
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from yuki.ui.own_window import PAGES as YUKI_PAGES
 
@@ -796,7 +796,8 @@ VOLUME_SKILL = "volume"
 #: volume skill's. The session wording is fWire's (review r2 L4), so the two descriptions agree after the merge.
 MEDIA_KEY_TRANSPORT_DESCRIPTION = (
     "Your hand: a media key (playpause, nexttrack, prevtrack, stop) for the media session that is playing, else the "
-    "current one (through Windows' media controls; never a game's). Volume is run_skill volume. Verified from the "
+    "current one (through Windows' media controls; never a game's). Volume is run_skill volume. Muting or silencing "
+    "one app (its sound off while it plays on) is the volume skill with mute on, never a pause. Verified from the "
     "session's status." + _NOW
 )
 
@@ -1366,6 +1367,11 @@ class Hands:
         #: window in front before, when the act took the focus: focus_back's only target there), ``"used"`` (its one
         #: tidy step was taken)``}``.
         self._look: dict[str, Any] | None = None
+        #: hands19 (final-B all-desk): the desk before this user turn's first bracketed act and each act of the turn
+        #: since (``{"turn": (conversation, turn), "desk", "acts": [(hand, args, scope facts)], "apps"}``, RAM only):
+        #: a look after a later act of the same turn compares from that earliest before, so a change an earlier act made
+        #: (a playlist rung that took the front, then a volume step) is never already in the before it is compared with.
+        self._turn_before: dict[str, Any] | None = None
         #: ``(hwnd, when, turn)``: the window in front before Yuki's last act that moved the focus (focus_back's
         #: default); an act of a later turn that moves no focus lets it go.
         self._front_before: tuple[int, float, Any] | None = None
@@ -1406,6 +1412,21 @@ class Hands:
         self._look = None
         self._front_before = None
         self._undo_stale = None
+        # hands19 (final-B all-questions RC2): every store keyed by the user turn count is let go too: that count
+        # restarts at 0 in each conversation, so turn 1 here read the last conversation's turn-1 calls (the claim gate
+        # opened on every first answer and waited ~1 s for its check)
+        self._turn_calls = None
+        self._step_checked = None
+        self._shape_given = None
+        self._malformed_given = None
+        self._then_looks = None
+        self._turn_before = None
+
+    def _turn_now(self) -> tuple[int, Any] | None:
+        """hands19: the user's current turn as ``(conversation, turn)`` (the action log's conversation number and the
+        conversation's own turn count, which restarts at 0 in each one), else ``None``. Never raises."""
+        turn = self._call_safely(self.user_turn, None)
+        return None if turn is None else (int(getattr(self.actions, "convo", 0) or 0), turn)
 
     def new_user_turn(self) -> None:
         """The user spoke: the talker may use its hands again (after telling them what happened)."""
@@ -2006,6 +2027,44 @@ class Hands:
         except Exception:  # noqa: BLE001
             return False
 
+    def turn_hands_running(self) -> bool:
+        """hands19 (final-B all-questions RC3a): whether a hand or skill of the user's current turn (this conversation)
+        is running or waiting its turn in the order gate (:meth:`_enter_order`: a reply's calls run one after another).
+        The gate's state only. Never raises."""
+        try:
+            gate = self._order
+            key = (getattr(self.actions, "convo", 0), self._call_safely(self.user_turn, None))
+            if gate is None or gate.get("key") != key:
+                return False
+            lock = gate.get("lock")
+            return bool(int(gate.get("waiting") or 0) > 0 or (lock is not None and lock.locked()))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def verified_this_turn(self, limit: int = 3, turn: Any = None) -> list[str]:
+        """hands19 (all-questions RC3a): what the talker's own hands and skills did and verified in the user's current
+        turn of this conversation, oldest first (at most ``limit``), each as its action-log line's act and the hand's own
+        report (code's words, RAM only): done for these very words, so a hand-off of the rest never does them again.
+        ``turn`` (review L1): that ``(conversation, turn)`` instead (the turn a hand-off came in on). ``[]`` when none.
+        Never raises."""
+        try:
+            convo = getattr(self.actions, "convo", 0)
+            if isinstance(turn, (tuple, list)) and len(turn) == 2:
+                convo, turn = turn[0], turn[1]
+            else:
+                turn = self._call_safely(self.user_turn, None)
+            if turn is None:
+                return []
+            done = [r for r in self.actions.records() if r.convo == convo and r.turn == turn and r.who == "your hand"
+                    and r.ok and r.verified is True]
+            out = []
+            for r in done[-max(1, int(limit)):]:
+                report = " ".join(str(r.result or "").split())
+                out.append(f"{r.what}: {report[:200]}" if report else str(r.what))
+            return out
+        except Exception:  # noqa: BLE001
+            return []
+
     def acted_this_turn(self) -> bool:
         """lVoice (problem 2, a hook for the talker's reply path): whether one of the talker's hands or skills did
         something verified in the user's current turn of this conversation. Saying something is done now needs that
@@ -2076,24 +2135,65 @@ class Hands:
 
     # -- P1.2-P1.4: look after acting, and the placement verbs ------------------------------------------------------
 
-    def _desk_read(self) -> Any:
+    def _desk_read(self, apps: Sequence[Any] = ()) -> Any:
         """P1.2: the desk now as a ``situation.DeskState`` for one act's before or after (blocking, a few ms: windows,
-        layout, media; no sound, which no flag reads), or ``None``. The real desktop as the OS has it
-        (``situation.snapshot``: the occlusion grid, the pop-up in front, the keyboard's window); a stand-in desk only
-        through its own overview (``from_overview``), never the real screen (rule 7). Never raises."""
+        layout, media, and the sound), or ``None``. The real desktop as the OS has it (``situation.snapshot``: the
+        occlusion grid, the pop-up in front, the keyboard's window); a stand-in desk only through its own overview
+        (``from_overview``), never the real screen (rule 7). Never raises.
+
+        hands19 (contract C2, final-B all-desk RC2: "unmute" left the PC at 0% and no read saw it): the master level and
+        mute (``master=True``) and the mixer rows of ``apps`` (the acted app's: app keys or names as the act gave them)
+        are read too, so ``diff.compare`` can say an act that left a control it raised or unmuted silent. A stand-in
+        desk gets the same parts from its own backend (its master and mixer reads), filtered to ``apps``."""
+        wanted = [str(a).strip() for a in apps or () if isinstance(a, str) and str(a).strip()]
         try:
             from yuki.perception import situation
 
             if _is_real_backend(self.backend):
-                return situation.snapshot(audio=[], master=False, holds="")
+                return situation.snapshot(audio=wanted, master=True, holds="")
             _text, payload, _ms = self._dispatcher.overview_text()
             try:
                 media = (self._dispatcher.activity_facts() or {}).get("media")
             except Exception:  # noqa: BLE001
                 media = None
-            return situation.from_overview(payload, media=media, audio=[], holds="")
+            keys = {_app_id(a) for a in wanted}
+            rows = [a for a in self._audio_apps() or [] if _app_id(a.get("app")) in keys] if keys else []
+            return situation.from_overview(payload, media=media, audio=rows, master=self._volume(), holds="")
         except Exception:  # noqa: BLE001 - no read: no look after this act
             return None
+
+    def _keep_before(self, name: str, args: dict[str, Any], facts: dict[str, Any], before: Any) -> None:
+        """hands19 (final-B all-desk): one bracketed act's before kept for its user turn (:attr:`_turn_before`): the
+        turn's first before stays the one a look compares from; each act adds its scope facts (the act's own ids and
+        app names, never words) and the apps whose sound the after read reads. Never raises."""
+        if before is None:
+            return
+        try:
+            key = self._turn_now()
+            kept = self._turn_before
+            if kept is None or kept.get("turn") != key or kept.get("looked") or kept.get("desk") is None:
+                kept = self._turn_before = {"turn": key, "desk": before, "acts": [], "apps": []}
+            scope = {k: facts.get(k) for k in ("_desk_scope", "live_hwnd", "app") if facts.get(k) is not None}
+            kept["acts"].append((str(name), dict(args), scope))
+            for app in self._desk_apps(name, args, facts):
+                if app not in kept["apps"]:
+                    kept["apps"].append(app)
+        except Exception:  # noqa: BLE001 - then the act's own before alone, as before
+            pass
+
+    @staticmethod
+    def _desk_apps(name: str, args: dict[str, Any], facts: dict[str, Any]) -> list[str]:
+        """hands19 (contract C2): the apps whose mixer rows an act's desk reads carry: a skill run's scope apps (its
+        connection's app, the measured acted apps, every app-typed slot's value), else the hand's own app (its fact or
+        argument). App keys or names as given; never words."""
+        out: list[str] = []
+        scope = facts.get("_desk_scope") if isinstance(facts.get("_desk_scope"), dict) else {}
+        found = ([*(scope.get("apps") or ()), *(scope.get("touched_apps") or ())] if name == SKILL_HAND
+                 else [facts.get("app"), args.get("app")])
+        for app in found:
+            if isinstance(app, str) and app.strip() and app.strip() not in out:
+                out.append(app.strip())
+        return out
 
     def _look_now(self, turn: Any) -> dict[str, Any] | None:
         """This user turn's look after acting, once given (:attr:`_look`), else ``None``."""
@@ -2131,7 +2231,10 @@ class Hands:
             apps = [a for a in scope.get("apps") or () if a]
             front = [int(moved_front)] if scope.get("focus") and moved_front else []
             asked = (front or apps) if scope.get("open") or scope.get("left") else []
-            return tuple(asked), tuple(apps + front)
+            # hands19 review H1: the app-typed slots' apps, the measured acted apps and windows: touched only
+            more = [a for a in scope.get("touched_apps") or () if a and a not in apps]
+            more += [int(h) for h in scope.get("touched_windows") or () if isinstance(h, int) and h not in front]
+            return tuple(asked), tuple(apps + more + front)
         ids: list[Any] = [args.get("window"), facts.get("live_hwnd"), *(args.get("_hwnds") or [])]
         ids += [t[3] for t in args.get("_targets") or [] if isinstance(t, (list, tuple)) and len(t) > 3]
         out: list[Any] = []
@@ -2187,12 +2290,29 @@ class Hands:
         if before is None:
             return None
         try:
-            after = await asyncio.to_thread(self._desk_read)
+            # hands19 (final-B all-desk): the turn's earliest before no look used yet, with every act of the turn since
+            # (their scopes together), so an earlier act's change is compared too, never already in the before
+            kept = self._turn_before
+            acts: list[tuple[str, dict[str, Any], dict[str, Any]]] = [(name, args, facts)]
+            apps = self._desk_apps(name, args, facts)
+            if (isinstance(kept, dict) and kept.get("turn") == self._turn_now() and not kept.get("looked")
+                    and kept.get("desk") is not None):
+                before = kept["desk"]
+                earlier = list(kept.get("acts") or ())
+                acts = earlier + ([] if any(n == name and a == args for n, a, _f in earlier) else acts)
+                apps = [*apps, *(a for a in kept.get("apps") or () if a not in apps)]
+            after = await asyncio.to_thread(self._desk_read, apps)
             if after is None:
                 return None
             from yuki.perception import diff as desk_diff
 
-            acted, touched = self._scope(name, args, facts, before, after)
+            acted_ids: list[Any] = []
+            touched_ids: list[Any] = []
+            for act_name, act_args, act_facts in acts:
+                one_acted, one_touched = self._scope(act_name, act_args, act_facts, before, after)
+                acted_ids += [a for a in one_acted if a not in acted_ids]
+                touched_ids += [t for t in one_touched if t not in touched_ids]
+            acted, touched = tuple(acted_ids), tuple(touched_ids)
             d = desk_diff.compare(before, after, acted=acted, touched=touched)
             turn = self._call_safely(self.user_turn, None)
             if d.focus_from and d.focus_from != d.focus_to and d.focus_by_act:
@@ -2207,6 +2327,8 @@ class Hands:
                                **{f"after_{k}": v for k, v in d.facts().items()})
             if not text:
                 return None
+            if isinstance(kept, dict) and kept.get("desk") is before:
+                kept["looked"] = True   # its one look was given: a later act of the turn starts a before of its own
             taken = bool(d.flags.get("focus_taken")) and d.focus_from
             # review r1 L3: ``rest``: the look rides with a "still to do" look, so the calls after it are not held to
             # the one tidy step (:meth:`handle`)
@@ -2781,6 +2903,7 @@ class Hands:
                 if self.bridge.gate is not None:
                     self.bridge.gate.poke()
         desk_before = facts.pop("_desk_before", None)   # P1.2: the desk right before the act (RAM only)
+        self._keep_before(name, args, facts, desk_before)   # hands19: the turn's earliest before (its look)
         self._retry_settle(facts)   # review r1 L5: a retry refused before it acted gives the halt back
         ms = round((time.monotonic() - started) * 1000)
         if self.on_action is not None and facts.get("sent_at") is not None:
@@ -3608,7 +3731,7 @@ class Hands:
         """Review r1 L4: one hand's call in this user turn's list (at most :data:`TURN_CALLS_MAX`, RAM only). Never
         raises."""
         try:
-            turn = self._call_safely(self.user_turn, None)
+            turn = self._turn_now()   # hands19: keyed by conversation and turn (the count restarts per conversation)
             if turn is None:
                 return
             got = self._turn_calls
@@ -3619,9 +3742,9 @@ class Hands:
             pass
 
     def _turn_hands(self) -> list[tuple[str, dict[str, Any]]]:
-        """The hands called in this user turn, in order (:meth:`_note_call`), else ``[]``."""
+        """The hands called in this user turn of this conversation, in order (:meth:`_note_call`), else ``[]``."""
         got = self._turn_calls
-        turn = self._call_safely(self.user_turn, None)
+        turn = self._turn_now()
         return list(got[1]) if isinstance(got, tuple) and turn is not None and got[0] == turn else []
 
     def _then_now(self) -> dict[str, Any] | None:
@@ -4081,7 +4204,8 @@ class Hands:
         self._note_values(args, facts.get("_values"))   # lVoice: what it did, for the thinker's steps (RAM only)
         if facts.get("verified") is True and gate is not None:
             gate["done"].add(key)
-        desk_before = facts.pop("_desk_before", None)   # P1.2: the desk before its first focus rung (RAM only)
+        desk_before = facts.pop("_desk_before", None)   # P1.2: the desk right before the run (RAM only)
+        self._keep_before(name, args, facts, desk_before)   # hands19: the turn's earliest before (its look)
         facts.pop("_values", None)
         facts.pop("_tried", None)
         facts.pop("_words", None)
@@ -4498,8 +4622,11 @@ class Hands:
         words: a correction naming another option (:func:`yuki.skills.prefs.note_correction`), the pending "Keep this
         as your usual?", a "still your usual?" card. The acting marker goes up only right before a rung that takes
         focus (D18: sound-only runs publish none). ``(ok, report, facts)`` as :meth:`SkillResult.as_voice` gives.
-        P1.2: with ``bracket`` (not a reflex's run), the desk is read right before the first rung that takes focus, kept
-        as ``facts["_desk_before"]`` with whose change is whose (``facts["_desk_scope"]``) for the look after it."""
+        P1.2: with ``bracket`` (not a reflex's run), the desk is read right before the run, kept as
+        ``facts["_desk_before"]`` with whose change is whose (``facts["_desk_scope"]``) for the look after it.
+        hands19 (final-B all-desk RC1(a)): read before every bracketed run (never a sound-only one), not only before a
+        rung that declares it takes focus: Spotify's declared no-focus rungs took the front on this PC and no before was
+        ever read, so nothing looked after them."""
         facts: dict[str, Any] = {"sent_at": None, "verified": None}
         skill_key = str(args.get("skill") or "").strip()
         slots = dict(args.get("slots")) if isinstance(args.get("slots"), dict) else {}
@@ -4544,8 +4671,6 @@ class Hands:
         desk: dict[str, Any] = {}
 
         def on_focus() -> None:
-            if bracket and not sound_only and "before" not in desk:
-                desk["before"] = self._desk_read()   # P1.2: the desk right before the first rung that takes focus
             if marker["token"] is not None or not callable(begin) or sound_only:
                 return   # sound_only: the focus rung is refused by its verb, nothing takes focus (D18)
             token = f"voice-skill-{id(self)}-{time.monotonic_ns()}"
@@ -4573,6 +4698,10 @@ class Hands:
                                 session_id=getattr(memory, "session_id", None), on_focus=on_focus,
                                 verbs=self._skill_verbs(state), game=self._game_strict, hand_id=hand_id,
                                 **self._skill_place(engine, args, slots, skill_key))
+        if bracket and not sound_only:
+            # hands19 (all-desk RC1(a)): the desk right before the run, whatever its rungs declare (on_focus keeps only
+            # the acting marker); the sound of the apps it names is read with it (contract C2)
+            desk["before"] = self._desk_read(self._skill_apps(skill_key, slots))
         try:
             result = engine.resolve_and_run(skill_key, slots, words, ctx, again=bool(args.get("again")),
                                             settings=self.skill_settings, corrects=bool(args.get("corrects")),
@@ -4593,8 +4722,11 @@ class Hands:
         facts["sent_at"] = state.get("sent_at")
         # x3 (3c): what the fallback needs to know (RAM only, never logged): whether a rung may have acted (a verb ran,
         # or a rung's check contradicted it), the run's values and what it tried (the hand-off seed is built from them)
+        # hands19 (contract C1): the engine's measured ``acted`` adds to these, never takes one away (rule 8: a run that
+        # may have sent is never handed on as not acted)
         facts["acted"] = bool(state.get("sent_at") is not None or result.outcome == "unverified"
-                              or any(t.get("outcome") == "contradicted" for t in result.tried or []))
+                              or any(t.get("outcome") == "contradicted" for t in result.tried or [])
+                              or getattr(result, "acted", None) is True)
         facts["_values"] = dict(result.values or {})
         facts["_tried"] = [dict(t) for t in result.tried or [] if isinstance(t, dict)]
         facts["_words"] = list(words)   # review r1 L1: whether a value the resolver asks about was said word for word
@@ -4658,10 +4790,12 @@ class Hands:
     @staticmethod
     def _skill_scope(skill_key: str, result: Any) -> dict[str, Any]:
         """P1.2: whose change is whose for a skill run's look after it, from its data (never words): the apps it acts in
-        (its connection's app, and the app value it resolved), whether a rung took focus, and whether bringing that up
-        is the ask itself: a skill of kind ``open``, or a run that left its window to the user (``left``: a skill that
-        can send, its sends data, and these values did not send: a draft typed or a chat opened for them to write in).
-        Else a ``change`` skill's window is a means (Discord for a message sent)."""
+        (its connection's app, and the app value it resolved: ``apps``, which are the ask for the kinds below), whether
+        a rung took focus, and whether bringing that up is the ask itself: a skill of kind ``open``, or a run that left
+        its window to the user (``left``: a skill that can send, its sends data, and these values did not send: a draft
+        typed or a chat opened for them to write in). Else a ``change`` skill's window is a means (Discord for a message
+        sent). hands19: ``touched_apps`` (app-typed slots, measured acted apps) and ``touched_windows`` (the windows the
+        engine measured coming forward) are the run's own, never the ask."""
         skill = _skill_def(skill_key)
         values = getattr(result, "values", None) or {}
         apps = [str(getattr(skill, "app", "") or "")]
@@ -4670,6 +4804,21 @@ class Hands:
             value = value.get("key") or value.get("name")
         if isinstance(value, str):
             apps.append(value)
+        apps = Hands._each_app(apps)
+        # hands19 (final-B all-desk RC1(b)): every slot whose schema type is ``app`` (by type, never by name: the volume
+        # skill's ``target``, web.open_page's ``browser``) and the apps the engine measured its rungs acting in
+        # (contract C1) are the run's own (``touched``: never "not from your act"), never the ask: review H1, a tab opened in
+        # the video's own Chrome window made every Chrome window "asked" (no tab cover flagged, and a tidy step could
+        # move the user's other browser windows). The windows the engine measured coming forward are touched by id.
+        touched = [a for a in Hands._each_app(Hands._app_values(skill, values) + Hands._acted_apps(result))
+                   if all(_app_id(a) != _app_id(k) for k in apps)]
+        windows: list[int] = []
+        for h in getattr(result, "acted_windows", None) or ():
+            try:
+                if int(h) and int(h) not in windows and not isinstance(h, bool):
+                    windows.append(int(h))
+            except (TypeError, ValueError):
+                continue
         left = False
         if skill is not None and getattr(skill, "sends", False):
             try:
@@ -4678,8 +4827,61 @@ class Hands:
                 left = not sends_with(skill, values)
             except Exception:  # noqa: BLE001 - unknown: a means, as before
                 left = False
-        return {"apps": [a.strip() for a in apps if a.strip()], "focus": bool(getattr(result, "focus_taken", False)),
+        return {"apps": apps, "touched_apps": touched, "touched_windows": windows,
+                "focus": bool(getattr(result, "focus_taken", False)),
                 "open": str(getattr(skill, "kind", "") or "") == "open", "left": left}
+
+    @staticmethod
+    def _each_app(apps: Sequence[Any]) -> list[str]:
+        """hands19: ``apps`` stripped, each app once (``Discord.exe`` and ``discord`` are one), in order."""
+        kept: list[str] = []
+        for app in (str(x).strip() for x in apps or () if isinstance(x, str)):
+            if app and all(_app_id(app) != _app_id(k) for k in kept):
+                kept.append(app)
+        return kept
+
+    @staticmethod
+    def _app_values(skill: Any, values: Any) -> list[str]:
+        """hands19: the values of a skill's slots whose schema type is ``app`` (``Slot.type``, data), each as the app's
+        key or name (a resolved option's ``key`` / ``name``), from ``values`` (the call's slots or the run's resolved
+        values). Never words, never a slot's name."""
+        out: list[str] = []
+        vals = values if isinstance(values, dict) else {}
+        for slot in getattr(skill, "slots", None) or ():
+            if getattr(slot, "type", "") != "app":
+                continue
+            value = vals.get(getattr(slot, "name", ""))
+            if isinstance(value, dict):
+                value = value.get("key") or value.get("name")
+            if isinstance(value, str) and value.strip():
+                out.append(value.strip())
+        return out
+
+    @staticmethod
+    def _acted_apps(result: Any) -> list[str]:
+        """hands19 (contract C1): the apps the engine measured its rungs acting in: ``SkillResult.acted_apps`` (a list)
+        or ``SkillResult.acted_app`` (one), else each tried rung's ``app`` where that rung is marked as acted. ``[]``
+        when the result names none. Code facts only."""
+        out: list[str] = []
+        for attr in ("acted_apps", "acted_app"):
+            got = getattr(result, attr, None)
+            for app in (got if isinstance(got, (list, tuple, set)) else [got]):
+                if isinstance(app, str) and app.strip():
+                    out.append(app.strip())
+        for row in getattr(result, "tried", None) or ():
+            app = row.get("app") if isinstance(row, dict) and row.get("acted") is True else None
+            if isinstance(app, str) and app.strip():
+                out.append(app.strip())
+        return out
+
+    def _skill_apps(self, skill_key: str, slots: dict[str, Any]) -> list[str]:
+        """hands19 (contract C2): the apps a skill run is about before it runs (its connection's app and its app-typed
+        slots as called), whose mixer rows its before read carries. Never raises."""
+        try:
+            skill = _skill_def(skill_key)
+            return [a for a in [str(getattr(skill, "app", "") or "").strip(), *self._app_values(skill, slots)] if a]
+        except Exception:  # noqa: BLE001
+            return []
 
     def _skill_act_off(self, result: Any, off: str, facts: dict[str, Any], memory: Any) -> str:
         """A run refused in an app whose Settings "Act" switch is off (review r1 M2): the judge's plain line, no
@@ -5083,7 +5285,8 @@ class Hands:
             if name != SKILL_HAND:
                 self._check_hand(name, args)   # v3.18: a close, a tab close, a held kind: Yuki's own check first
             # P1.2: the desk right before the act itself (after every check), for the look after it
-            before = self._desk_read() if bracket and self._brackets(name, args) else None
+            before = self._desk_read(self._desk_apps(name, args, facts)) \
+                if bracket and self._brackets(name, args) else None
             ok, report, facts = self._act(name, args, facts)
             if before is not None:
                 facts["_desk_before"] = before
@@ -7226,9 +7429,11 @@ class Verbs:
             return last
         return h.snapshot()
 
-    def desk_read(self) -> Any:
-        """One act's before or after (``situation.DeskState``; ``None`` when it can't be read)."""
-        return self.hands._desk_read()
+    def desk_read(self, apps: Sequence[Any] = ()) -> Any:
+        """One act's before or after (``situation.DeskState``; ``None`` when it can't be read). hands19 (contract C2):
+        the master level and mute always, and the mixer rows of ``apps`` (the acted app's), as :meth:`Hands._desk_read`
+        reads them."""
+        return self.hands._desk_read(apps)
 
     def learn(self, state: Any) -> int:
         """The windows a desk read shows (an act's after: the window it opened) made actable by id for the agent's
