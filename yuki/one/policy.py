@@ -24,7 +24,9 @@ It is a thin wrapper on the table that already exists: ``brain.consent`` (rows 1
    (a counted send, :meth:`Turn.begin_skill`) may press its own send once, for that very text. The agent's own Enter
    (a key, a combination holding it, typing with Enter or a line break) in a chat's window (``consent.chat_window``;
    a program it can't tell counts as a chat) is a send by code too, whoever's text waits there (addendum: zero
-   tolerance); the skill engine's own steps keep using Enter (a quick switcher), judged as before.
+   tolerance); the skill engine's own steps keep using Enter (a quick switcher), judged as before. One20 (final-D S17):
+   the agent's own typing in a chat's window (the same test) is refused toward ``run_skill message`` unless this
+   turn's message skill opened that chat (:meth:`Turn.note_chat`): nobody settled whom the words are for.
 5. **Skill sends**: no declaration (``consent`` on ``run_skill``): the gate **rewrites the send slot to a draft**
    (``Decision.rewrite``; Yuki's own wording typed after, ``type_after``), never a hand-over. With one: ``check.one``
    with ``consent=``: the send rule unchanged (countdown, the quote in their words, the recipient named, their text,
@@ -35,7 +37,9 @@ It is a thin wrapper on the table that already exists: ``brain.consent`` (rows 1
 7. **Undoable**: allowed.
 8. **Tidy** (a window move or focus_back while the turn holds a flagged act diff, on a window the turn's own acts
    brought up or took the front from): the tidy dial (``util.tidy_mode``): do it / ask once / off; at most two tidy
-   steps per flagged diff.
+   steps per flagged diff. One20: an Escape in a window this turn's own acts acted in (a switcher its hotkey opened)
+   is a tidy step too; a tidy step is never "another way" after a miss (the budget's retry window and same-step bar
+   don't apply to it).
 
 A yes to a question the gate asked is recorded as a code fact (:meth:`Turn.answer`): that very step is allowed once,
 not asked again (rows 1-2 read first; a send keeps its countdown), and the yes is used up (``consent.after_ask``:
@@ -88,6 +92,14 @@ LINE_M9_ASK = "Should I open that address? It may carry what I read of yours."
 LINE_TIDY_OFF = ("Not done: their settings say no tidy-ups; leave the windows as they are and say in a few words what "
                  "changed.")
 LINE_TIDY_STEPS = "Not done: that change got its tidy-up already; nothing more was moved."
+#: One20 (final-D S17): the agent's own typing into a chat's window (the Enter rule's ``chat_window`` test) that no
+#: message skill of this turn opened: text for a person goes through the message skill (it settles whom).
+LINE_CHAT_TYPE = ("Not typed: this window is a chat's; text for a person goes only through run_skill message (it "
+                  "opens their chat, asks Who to? when it can't tell, and leaves a draft). Nothing was typed.")
+#: One20 (final-D S1 fallback, contract C9): a closing reply while the turn's flagged diff has its one legal undoable
+#: step untaken (code's fact; the agent takes it, never code).
+LINE_HOLD_TIDY = ("Not done yet: After shows a side effect of your act on their screen, and one undoable step undoes "
+                  "it: {step}. Take it now, then say so in a few words.")
 #: The tidy dial says ask: the step in code's words (``executor.LINE_TIDY_ASK``).
 LINE_TIDY_ASK: dict[str, str] = {"place": "Should I move {app} to your other screen?",
                                  "focus_back": "Should I put {app} back in front?"}
@@ -112,6 +124,8 @@ TIDY_STEPS = 2
 TYPED_WAIT_S = 600.0
 #: Key names that submit (a fixed key vocabulary, never words).
 ENTER_KEYS = frozenset({"enter", "return"})
+#: One20 (final-D one-core §2b): the key that dismisses what an act of the turn opened (a fixed key vocabulary).
+ESCAPE_KEYS = frozenset({"escape", "esc"})
 #: Reads of the user's private content (M9): after one, an outbound address goes to the commit check.
 PRIVATE_VERBS: dict[str, str] = {"read_file": "file", "read_clipboard": "clipboard", "memory": "memory",
                                  "quick_memory": "memory"}
@@ -265,6 +279,17 @@ class Tidy:
     touched: Any = None
     sound_app: str = ""
     given: bool = False
+    #: One20 (final-D S2): the window in front before the flagged act, measured (``DeskDiff.focus_from`` when the act
+    #: moved the front, ``focus_by_act``): a ``focus_back`` with no window is filled with it (it reaches row 8).
+    focus_from: int | None = None
+    #: One20 (final-D S1 fallback, contract C7): the one legal undoable step for the flagged diff
+    #: (``perception.diff.tidy_step``: ``{"action": "focus_back" | "place", "hwnd", ...}``) and its words for the agent
+    #: (``window`` with its arguments); ``None`` / ``""``: none.
+    step: dict[str, Any] | None = None
+    step_words: str = ""
+    #: The budget's act count when this diff was flagged: the closing hold for its step holds only while no other act
+    #: came after it (a later act's own diff, or the tidy debt's fresh measure, speaks for the desk then).
+    acts_at: int = 0
 
 
 class Turn:
@@ -321,6 +346,20 @@ class Turn:
         self.sent: set[tuple[str, str]] = set()
         #: Sends that went in the turn before (voice, :meth:`carry`): the same message again is asked first.
         self.sent_before: set[tuple[str, str]] = set()
+        #: One20: the windows this turn's own acts acted in or brought up (the runner's, :meth:`note_acted`): an Escape
+        #: there dismisses what an act of the turn opened (a tidy step, never "another way" after a miss).
+        self.own_windows: set[int] = set()
+        #: One20 (final-D S17): the chat windows a message skill of this turn opened (:meth:`note_chat`): the agent's
+        #: own typing there is allowed; in any other chat window it is refused toward run_skill message.
+        self.chats_opened: set[int] = set()
+        #: One20 (final-D S5): the skills run verified this turn (key -> the value of its pick slot), and those of the
+        #: turn before (voice, :meth:`carry`): a pick re-run by code is a correction (``corrects``) of that run.
+        self.skills_done: dict[str, str] = {}
+        self.skills_before: dict[str, str] = {}
+        #: One20 (final-D S12): the guessed readings this turn asked about (skill, slot, value folded), and those the
+        #: turn before asked (its answer is in these words: never asked twice).
+        self.guesses_asked: set[tuple[str, str, str]] = set()
+        self.guesses_before: set[tuple[str, str, str]] = set()
         self._lock = threading.Lock()
         self._join: tuple[int, str, str] | None = None
         self._send: dict[str, Any] | None = None
@@ -399,24 +438,99 @@ class Turn:
             with previous._lock:
                 fresh = {k: v for k, v in previous.asks.items() if k not in previous._carried_asks}
                 sent = set(previous.sent)
+                done = dict(getattr(previous, "skills_done", {}) or {})
+                guessed = set(getattr(previous, "guesses_asked", set()) or set())
             with self._lock:
                 for k, v in fresh.items():
                     if k not in self.asks:
                         self.asks[k] = v
                         self._carried_asks.add(k)
                 self.sent_before |= sent
+                self.skills_before.update(done)
+                self.guesses_before |= guessed
         return self
+
+    # -- one20: the turn's own windows, chats, skill runs and guesses (the runner's code facts) --------------------
+
+    def note_acted(self, hwnds: Any) -> None:
+        """Windows this turn's own acts acted in or brought up (ids; anything else is skipped)."""
+        got = {h for h in map(_hwnd, hwnds if isinstance(hwnds, (list, tuple, set, frozenset)) else [hwnds]) if h}
+        if got:
+            with self._lock:
+                self.own_windows |= got
+
+    def note_chat(self, hwnd: Any) -> None:
+        """A message skill of this turn opened the chat in this window (its verified run, the window in front)."""
+        key = _hwnd(hwnd)
+        if key is not None:
+            with self._lock:
+                self.chats_opened.add(key)
+
+    def note_skill_done(self, skill: str, value: str = "") -> None:
+        """A skill ran verified this turn (``value``: its pick slot's value, as shown; ``""``: none)."""
+        if skill:
+            with self._lock:
+                self.skills_done[str(skill)] = " ".join(str(value or "").split())
+
+    def ran_before(self, skill: str) -> str | None:
+        """The value the same skill ran verified with earlier this turn or in the turn before (``""``: no pick value),
+        else ``None``: a re-run of it now is a correction of that run."""
+        with self._lock:
+            if skill in self.skills_done:
+                return self.skills_done[skill]
+            return self.skills_before.get(skill)
+
+    def guess_asked(self, key: tuple[str, str, str]) -> bool:
+        """Whether this guessed reading was asked about this turn or the turn before (never asked twice)."""
+        with self._lock:
+            return key in self.guesses_asked or key in self.guesses_before
+
+    def note_guess_asked(self, key: tuple[str, str, str]) -> None:
+        with self._lock:
+            self.guesses_asked.add(key)
+
+    def closing_hold(self) -> str | None:
+        """Contract C9 (one20; final-D S5 and the S1 fallback): why a closing reply (a quiet, or words with no call)
+        should be held once, else ``None``. The budget's (:meth:`yuki.one.budget.TurnBudget.closing_hold`: the turn's
+        one miss, no act after it, the retry window open), else the turn's flagged diff whose one legal undoable step
+        (:attr:`Tidy.step_words`) nobody took (no tidy step, no tidy question asked, the dial not off). Code facts only;
+        pure (the voice driver holds once, through ``getattr``). Never raises."""
+        try:
+            budget = self.budget
+            if budget is not None:
+                if getattr(budget, "closed", False):
+                    return None
+                hold = getattr(budget, "closing_hold", None)
+                why = hold() if callable(hold) else None
+                if why:
+                    return str(why)
+            tidy = self.tidy
+            with self._lock:
+                asked_tidy = any(row == 8 for _q, row in self.asks.values())
+            fresh = budget is None or int(getattr(budget, "acts", 0) or 0) == tidy.acts_at
+            if tidy.open and not tidy.acts and tidy.step_words and fresh and not asked_tidy \
+                    and util.tidy_mode(self.policy) != util.TIDY_OFF:
+                return LINE_HOLD_TIDY.format(step=tidy.step_words)
+        except Exception:  # noqa: BLE001 - no hold
+            return None
+        return None
 
     # -- the runner's facts -------------------------------------------------------------------------------------------
 
     def flag(self, *, own: Sequence[Any] = (), attention: Sequence[Any] = (), before: Any = None, acted: Any = None,
-             touched: Any = None, sound_app: str = "") -> None:
+             touched: Any = None, sound_app: str = "", focus_from: Any = None,
+             step: Mapping[str, Any] | None = None, step_words: str = "") -> None:
         """An act's diff came back flagged (it covered what they watched, took the keyboard, left something open):
         a tidy-up may follow, on these windows only. ``before`` and the scope (``acted``, ``touched``, ``sound_app``):
-        that act's own before and whose change was whose, for the turn's tidy debt (``Runner.tidy_debt``)."""
+        that act's own before and whose change was whose, for the turn's tidy debt (``Runner.tidy_debt``).
+        ``focus_from``: the measured front before it (one20 S2, a focus_back's window); ``step`` / ``step_words``: the
+        one legal undoable step (one20, contract C7) and its words for the agent."""
         self.tidy = Tidy(open=True, own={h for h in map(_hwnd, own) if h},
                          attention={h for h in map(_hwnd, attention) if h}, before=before, acted=acted,
-                         touched=touched, sound_app=str(sound_app or ""))
+                         touched=touched, sound_app=str(sound_app or ""), focus_from=_hwnd(focus_from),
+                         step=dict(step) if isinstance(step, Mapping) else None,
+                         step_words=" ".join(str(step_words or "").split()),
+                         acts_at=int(getattr(self.budget, "acts", 0) or 0))
 
     def begin_skill(self, decision: Decision, tool_input: Mapping[str, Any], *, counted: bool = False) -> None:
         """A ``run_skill`` the gate allowed starts on this thread (the runner calls it there, right before the run):
@@ -560,7 +674,10 @@ def _gate(name: str, args: dict[str, Any], facts: dict[str, Any], turn: Turn, in
     # row 0: the budget first, so a call it refuses leaves nothing behind (no ask, no typed mark, no tidy step, no check)
     counted = not inner and budget is not None and spec.kind not in (T.CONTROL, T.WRITE)
     if counted:
-        spend = budget.before_call(name, args, acts=spec.acts)
+        # one20: the budget reads the resolved target (its step identity), and whether this undoes the turn's own side
+        # effect (a tidy step is never "another way" after a miss: no retry window, no same-step bar)
+        spend = budget.before_call(name, args, acts=spec.acts, target=facts,
+                                   tidy=_tidy_like(verb, vinput, facts, turn))
         if not spend.ok:
             return _spent(spend, verb)
     decision = _decide(name, spec, verb, vinput, args, facts, turn, inner)
@@ -624,6 +741,13 @@ def _decide(name: str, spec: T.Spec, verb: str, vinput: dict[str, Any], args: di
     if not inner and verb != "click" and _submits(verb, vinput) \
             and rule.chat_window(_call(verb, vinput, facts), _board_live(board)) is not False:
         return Decision(REFUSE, "send_by_code", line=LINE_CHAT_SEND, row=4, verb=verb)
+    # one20 (final-D S17): the agent's own typing in a chat's window (the same structural test as the Enter rule just
+    # above; a program it can't tell counts as a chat) puts words in front of a person nobody settled: refused toward
+    # run_skill message, unless this turn's message skill opened that very chat. The skill engine's own steps and the
+    # runner's typing of a draft's wording are inner steps (judged as before)
+    if not inner and verb == "type_text" and (hwnd is None or hwnd not in turn.chats_opened) \
+            and rule.chat_window(_call(verb, vinput, facts), _board_live(board)) is not False:
+        return Decision(REFUSE, "chat_type", line=LINE_CHAT_TYPE, row=4, verb=verb)
 
     # row 6 (shell): shown whole to the commit check, or refused plainly
     if verb == "run_powershell":
@@ -657,6 +781,13 @@ def _decide(name: str, spec: T.Spec, verb: str, vinput: dict[str, Any], args: di
         if tidy is not None:   # a tidy-up step counts toward the flagged diff's steps, a yes'd one too
             decision = replace(decision, tidy=True)
             turn.tidy.acts += 1
+        elif not inner and _own_escape(verb, vinput, facts, turn):
+            # one20 (final-D one-core §2b): an Escape dismissing what an act of this turn opened in its window (a
+            # quick switcher the agent's own hotkey opened) is a tidy step, counted with the flagged diff's when one
+            # is open
+            decision = replace(decision, tidy=True)
+            if turn.tidy.open:
+                turn.tidy.acts += 1
         if verb == "type_text" and hwnd:
             if vinput.get("press_enter") is True:
                 clear_typed(hwnd)
@@ -861,6 +992,32 @@ def _carries(url: Any) -> bool:
     return bool(parsed.query or parsed.fragment)
 
 
+def _own_escape(verb: str, vinput: Mapping[str, Any], facts: Mapping[str, Any], turn: Turn) -> bool:
+    """One20: Escape pressed once, alone, in a window this turn's own acts acted in (:attr:`Turn.own_windows`), while
+    the flagged diff (if one is open) has a tidy step left. Key names and the turn's own windows only."""
+    if verb != "press" or _fold(vinput.get("key")) not in ESCAPE_KEYS or vinput.get("times") not in (None, 1):
+        return False
+    hwnd = _hwnd(facts.get("hwnd"))
+    if hwnd is None or hwnd not in turn.own_windows:
+        return False
+    return not turn.tidy.open or turn.tidy.acts < TIDY_STEPS
+
+
+def _tidy_like(verb: str, vinput: Mapping[str, Any], facts: Mapping[str, Any], turn: Turn) -> bool:
+    """One20: whether this call undoes the turn's own side effect, read before the budget (no state changed): a row-8
+    candidate (a move of one of the flagged act's own windows, the front given back to one that had it) with a tidy
+    step left, or :func:`_own_escape`."""
+    if _own_escape(verb, vinput, facts, turn):
+        return True
+    if verb != "window_action" or not turn.tidy.open or turn.tidy.acts >= TIDY_STEPS:
+        return False
+    action = str(vinput.get("action") or "")
+    hwnd = _hwnd(facts.get("hwnd"))
+    if action == "focus_back":
+        return hwnd in turn.tidy.attention
+    return action == "place" and hwnd in turn.tidy.own
+
+
 def _tidy(verb: str, vinput: Mapping[str, Any], facts: Mapping[str, Any], turn: Turn) -> Decision | None:
     """Row 8: a window move or focus_back while a flagged act diff is open, on a window the turn's acts brought up
     (move) or one that had their attention or the front before (focus_back): the tidy dial. ``None``: not a tidy-up
@@ -1008,8 +1165,9 @@ def _emit(turn: Turn, event: str, **fields: Any) -> None:
         pass
 
 
-__all__ = ["ALLOW", "ASK", "Decision", "ENTER_KEYS", "KINDS", "LINE_ALREADY_SENT", "LINE_CHANNEL", "LINE_CHAT_SEND",
-           "LINE_ERROR", "LINE_GAME", "LINE_M9_ASK", "LINE_SEND_BY_CODE", "LINE_SENT_AGAIN", "LINE_SHELL_LONG",
+__all__ = ["ALLOW", "ASK", "Decision", "ENTER_KEYS", "ESCAPE_KEYS", "KINDS", "LINE_ALREADY_SENT", "LINE_CHANNEL",
+           "LINE_CHAT_SEND", "LINE_CHAT_TYPE", "LINE_ERROR", "LINE_GAME", "LINE_HOLD_TIDY", "LINE_M9_ASK",
+           "LINE_SEND_BY_CODE", "LINE_SENT_AGAIN", "LINE_SHELL_LONG",
            "LINE_TIDY_ASK", "LINE_TIDY_OFF", "LINE_TIDY_STEPS", "LINE_UNKNOWN", "ONE_LINES", "PRIVATE_VERBS", "REFUSE",
            "TIDY_STEPS", "TYPED_WAIT_S", "Tidy", "Turn",
            "adopt_typed", "authorize", "clear_typed", "gate", "mark_typed", "read_answer", "recheck_send", "send_key",

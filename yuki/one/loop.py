@@ -111,7 +111,9 @@ TOOK: frozenset[str] = frozenset({"done", "already"})
 #: Statuses sent back as errors (``is_error``): nothing was done for it, or it failed.
 NOT_OK: frozenset[str] = frozenset({"refused", "asked", "failed", "busy", "not_done", "declined", "error"})
 #: The labels of a result's fields the model reads (``OneResult.for_model``; the prompt calls the act's diff "After").
-FIELD_LABELS: dict[str, str] = {"after": "After", "said": "said by code (already shown to them)"}
+FIELD_LABELS: dict[str, str] = {"after": "After", "said": "said by code (already shown to them)",
+                                # one20 (S3): the measured tab-cover sentence code did not show: theirs to hear
+                                "cover": "left behind your act (tell them in a few words)"}
 #: The fewest seconds between two ``Partial`` updates of the same kind (``planner.PARTIAL_GAP_S``).
 PARTIAL_GAP_S = 0.12
 #: The no-menu line of the ONE agent (``brain.prompt.NO_MENU`` speaks of the planner's routes).

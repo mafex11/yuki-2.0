@@ -14,8 +14,15 @@ One :class:`TurnBudget` per user turn (voice) or request (typed). Every number i
 * **Retry window**: after the first act that did not take effect, other undoable tries go for 8 s
   (``voice.hands.RETRY_BUDGET_S``), never after; a lasting act (a send, a join) that missed is never tried again in the
   turn.
-* **Same failing step**: refused at once, keyed by :func:`step_key` (``voice.hands._step_key``'s identity).
+* **Same failing step**: refused at once, keyed by :func:`step_key` (``voice.hands._step_key``'s identity, on the
+  resolved target: the window the gate found, whatever named it; one20, final-D one-core §3.4).
 * **Refusals**: the second refusal in a turn settles it: no model run (``run_llm=False``), code's rule-#149 line.
+* **Tidy steps** (one20): a step that undoes the turn's own side effect (the gate's row 8, an Escape on a window the
+  turn's own act opened something in) is never "another way" after a miss: the retry window and the same-step bar do
+  not apply to it (the gate's two-steps cap does).
+* **The closing hold** (one20, contract C9: :meth:`TurnBudget.closing_hold`): the turn's one miss (an act that did not
+  take, or a skill run that handed back with nothing done, :meth:`TurnBudget.unfinished_run`), no act tried after it,
+  the retry window still open: a closing reply is held once by the voice driver with :data:`LINE_HOLD_MISS`.
 
 Every settle (the hard stop, the rounds, the second refusal) closes the turn: a later call in the same reply, or a
 late result, settles silently, so code's line is said once. The driver calls :meth:`TurnBudget.round` before **every**
@@ -55,6 +62,10 @@ LINE_LASTING_RETRY = ("Not tried: a send or join already did not go through this
                       "never tried again on its own. Say so in one line.")
 #: The turn was closed by code (the hard stop): a late result settles with no words.
 LINE_CLOSED = "The turn is over; nothing was done. Say nothing."
+#: One20 (contract C9, final-D S5): why a closing reply (a quiet, or words with no call) is held once: the turn's one
+#: miss, nothing tried after it, time left for another way. The voice driver returns it to the agent as the refusal.
+LINE_HOLD_MISS = ("Not done yet: one step of their request didn't take and nothing else was tried. Try one other way "
+                  "now with an undoable act (never the same step), then say in a few words what is left.")
 
 
 @dataclass(frozen=True)
@@ -97,14 +108,43 @@ def limits_for(channel: str, settings: Any = None) -> Limits:
     return Limits(**{**base.__dict__, **out}) if out else base
 
 
-def step_key(name: str, args: Mapping[str, Any] | None) -> str:
+def _target_window(args: Mapping[str, Any], target: Mapping[str, Any] | None) -> int | None:
+    """The window a call acts on as resolved: the target the gate was shown (``hwnd``), else the call's own
+    ``window``; ``None``: no window (an address, a skill)."""
+    for raw in ((target or {}).get("hwnd"), args.get("window")):
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            got = int(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+        if got:
+            return got
+    return None
+
+
+def step_key(name: str, args: Mapping[str, Any] | None, target: Mapping[str, Any] | None = None) -> str:
     """What a call acts on, for telling one step from the same step again: its words for the user (``say_first``,
-    ``say_when_done``, ``named``, ``then``) left out, an address and a name tidied (``voice.hands._step_key``)."""
-    keep = {k: v for k, v in dict(args or {}).items() if k not in ("say_first", "say_when_done", "named", "then")}
+    ``say_when_done``, ``named``, ``then``) left out, an address and a name tidied (``voice.hands._step_key``).
+
+    One20 (final-D one-core §3.4: the same tab close came again with ``app`` and ``window`` dropped, not caught):
+    keyed on the resolved target when the gate found a window (``target["hwnd"]``, else the call's ``window``): that
+    window stands for whatever named it (``window``, ``app``). A tab call keeps its ``named`` (folded): the tab is the
+    target inside that window, and a browser's tab names carry live text (a memory figure) that changes between two
+    reads, so the tab's own title is not the key."""
+    raw = dict(args or {})
+    keep = {k: v for k, v in raw.items() if k not in ("say_first", "say_when_done", "named", "then")}
     if isinstance(keep.get("url"), str):
         keep["url"] = keep["url"].strip().rstrip("/").casefold()
     if isinstance(keep.get("name"), str):
         keep["name"] = " ".join(keep["name"].split()).casefold()
+    window = _target_window(raw, target)
+    if window is not None:
+        keep.pop("window", None)
+        keep.pop("app", None)
+        keep["@window"] = window
+        if str(name) == "tab" and isinstance(raw.get("named"), str):
+            keep["named"] = " ".join(raw["named"].split()).casefold()
     return str(name) + json.dumps(keep, sort_keys=True, default=str)
 
 
@@ -147,6 +187,11 @@ class TurnBudget:
         self.first_miss: float | None = None
         self.failed: set[str] = set()
         self.lasting_missed = False
+        #: One20 (C9): skill runs that handed back with nothing on the PC touched (:meth:`unfinished_run`): not a miss
+        #: of the retry window (no verb ran), but a part of their request still open.
+        self.unfinished = 0
+        #: :attr:`acts` when the newest miss (or unfinished run) came back: an act after it raises the count.
+        self._acts_at_miss: int | None = None
         self.closed = False
         self.closed_why = ""
 
@@ -237,9 +282,11 @@ class TurnBudget:
             return OK
 
     def before_call(self, name: str, args: Mapping[str, Any] | None = None, *, acts: bool = True,
-                    lasting: bool = False) -> Spend:
+                    lasting: bool = False, target: Mapping[str, Any] | None = None, tidy: bool = False) -> Spend:
         """Before one tool call (``acts``: it acts on the desktop; ``lasting``: a send or a join). The first call starts
-        the clock when no :meth:`round` did; the hard stop closes the turn. Never raises."""
+        the clock when no :meth:`round` did; the hard stop closes the turn. ``target``: what the gate found it acts on
+        (:func:`step_key`). ``tidy``: a step that undoes the turn's own side effect (the gate's reading, one20): the
+        same-step bar and the retry window don't apply to it. Never raises."""
         self.start()
         with self._lock:
             if self.closed:
@@ -257,7 +304,12 @@ class TurnBudget:
                 return OK
             if now_s >= self.limits.soft_s:
                 return Spend(False, "soft", LINE_SPENT)
-            key = step_key(name, args)
+            if tidy and not lasting:
+                # one20: undoing the turn's own side effect is never "another way" after a miss (the gate holds it to
+                # its own windows and two steps)
+                self.acts += 1
+                return OK
+            key = step_key(name, args, target)
             if key in self.failed:
                 return Spend(False, "same_step", LINE_SAME_STEP)
             if lasting and self.lasting_missed:
@@ -280,17 +332,48 @@ class TurnBudget:
             return OK
 
     def after_call(self, name: str, args: Mapping[str, Any] | None = None, *, acts: bool = True, ok: bool = True,
-                   lasting: bool = False) -> None:
+                   lasting: bool = False, target: Mapping[str, Any] | None = None) -> None:
         """After one acting call: a call that did not take effect opens the retry window (its first miss) and is never
-        tried again this turn; a lasting one that missed stops every later lasting act."""
+        tried again this turn (keyed on ``target`` as :meth:`before_call` read it); a lasting one that missed stops
+        every later lasting act."""
         if not acts or ok:
             return
         with self._lock:
             if self.first_miss is None:
                 self.first_miss = self._elapsed()   # counted seconds since round 1, as before_call reads it
-            self.failed.add(step_key(name, args))
+            self.failed.add(step_key(name, args, target))
+            self._acts_at_miss = self.acts
             if lasting:
                 self.lasting_missed = True
+
+    def unfinished_run(self) -> None:
+        """One20 (C9): a skill run handed back with nothing on the PC touched (no route, a slot no route found, a rung
+        that never read): a part of their request is still open. Not a miss of the retry window (no verb ran, the
+        steps after it have their time), but :meth:`closing_hold` counts it."""
+        with self._lock:
+            self.unfinished += 1
+            self._acts_at_miss = self.acts
+
+    def closing_hold(self) -> str | None:
+        """One20 (contract C9, final-D S5): why a closing reply (a quiet, or words with no call) should be held once:
+        the turn has exactly one miss (an act that did not take, or one :meth:`unfinished_run`), no act was tried
+        after it, it was no lasting act (never tried again), and the time for another way is still open (the retry
+        window after a verb's miss; the soft limit). ``None``: no hold. Pure: reads counts only, changes nothing (the
+        voice driver holds once). Never raises."""
+        try:
+            with self._lock:
+                if self.closed or self.lasting_missed or self._acts_at_miss is None:
+                    return None
+                if len(self.failed) + self.unfinished != 1 or self.acts != self._acts_at_miss:
+                    return None
+                now_s = self._elapsed()
+                if now_s >= self.limits.soft_s or now_s >= self.limits.hard_s:
+                    return None
+                if self.first_miss is not None and now_s - self.first_miss > self.limits.retry_s:
+                    return None
+                return LINE_HOLD_MISS
+        except Exception:  # noqa: BLE001 - no hold
+            return None
 
     def refused(self, final_line: str = "") -> Spend:
         """A call was refused (by the gate or this budget). The second refusal of the turn settles it by code: no model
@@ -312,9 +395,14 @@ class TurnBudget:
         with self._lock:
             return {"channel": self.channel, "rounds": self.rounds, "acts": self.acts, "reads": self.reads,
                     "refusals": self.refusals, "elapsed_s": round(self._elapsed(), 2), "missed": len(self.failed),
-                    "closed": self.closed_why if self.closed else ""}
+                    "unfinished": self.unfinished, "closed": self.closed_why if self.closed else ""}
 
 
-__all__ = ["LINE_CLOSED", "LINE_LASTING_RETRY", "LINE_READS_SPENT", "LINE_REST_LEFT", "LINE_RETRY_SPENT",
-           "LINE_SAME_STEP", "LINE_SPENT", "Limits", "OK", "Spend", "TYPED", "TurnBudget", "VOICE", "limits_for",
-           "step_key"]
+#: Contract C9's name ("budget.py ``Turn.closing_hold()``"): the turn's budget. The gate's ``policy.Turn`` has a
+#: ``closing_hold()`` too (this one's, and a tidy step still open), so a driver may ask either through ``getattr``.
+Turn = TurnBudget
+
+
+__all__ = ["LINE_CLOSED", "LINE_HOLD_MISS", "LINE_LASTING_RETRY", "LINE_READS_SPENT", "LINE_REST_LEFT",
+           "LINE_RETRY_SPENT", "LINE_SAME_STEP", "LINE_SPENT", "Limits", "OK", "Spend", "TYPED", "Turn", "TurnBudget",
+           "VOICE", "limits_for", "step_key"]

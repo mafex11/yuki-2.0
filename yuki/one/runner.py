@@ -33,6 +33,13 @@ lines already said) only when every call of the reply took (verified, already so
 flagged and every ``then`` is empty; a forced settle (the budget's hard stop or rounds, the second refusal) ends it with
 code's one line. Otherwise the agent gets its next round with every result.
 
+**One20 (final-D)**: a flagged result carries the one legal undoable step code measured for it (``side_effect``, from
+``perception.diff.tidy_step``: contract C7; the agent takes it, never code) and code says the measured tab-cover
+sentence (``perception.diff.cover_line``); a ``focus_back`` with no window goes to the measured front before the act
+(S2); a skill run that handed back gets the second way the planner gave it under ``all``, once, in code (S5: a rung
+that never read runs once more; a pick-kind value no route found runs as Yuki's pick with it as context), or one short
+question when its value was only the agent's reading of their words (S12); the hand-off text is written for ONE.
+
 **The turn state** (:class:`RunState` on the gate's ``Turn``): every result, the act's own windows (tidy), the lines
 said; ``private_read`` and the refusal count are the gate's and the budget's (``policy.Turn``, ``budget.TurnBudget``).
 
@@ -43,6 +50,7 @@ budget's counts). Every helper fails closed: an error is a refusal or a failure,
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 import threading
 import time
@@ -101,6 +109,93 @@ LINE_NOT_ONE = "Not done: Yuki's ONE brain is not switched on here, so nothing w
 LINE_CHAT_UNCONFIRMED = "I couldn't confirm the chat is open, so I didn't type anything."
 #: The skill engine's outcomes after which a send did not go (``executor.NOT_SENT_OUTCOMES``).
 NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "held_call", "failed"})
+#: One20 (final-D S1 fallback, contract C7): the flagged result's one legal undoable step, for the agent (code facts:
+#: the diff's flags and :func:`yuki.perception.diff.tidy_step`; the agent takes it, never code).
+TIDY_STEP_NOTE = ("the flags are a side effect of your act on their screen; one undoable step undoes it: {step}. Take "
+                  "it now, then say so in a few words; their request isn't done before it.")
+#: How long the window in front before an act that moved the front is kept for a ``focus_back`` with no window
+#: (``voice.hands._FRONT_KEEP_S``: the same "put it back" reach as under ``all``).
+FRONT_KEEP_S = 600.0
+#: One20 (final-D S12): a run that didn't land on a value that is only the agent's own reading of their words (none of
+#: their things, not in what they said, no route found it), and that would change what plays or take the front.
+LINE_GUESS_ASK = "Did you mean {value}?"
+GUESS_HELD = ("Held as a question: {value} is your own reading of their words (none of their things, not in what they "
+              "said), and no route found it. Ask them; do nothing else for it until they answer.")
+#: One20 (final-D S5): the engine's outcomes after which a run handed back with its request still open.
+OPEN_OUTCOMES = frozenset({"handed_over", "failed"})
+#: The engine's hand-off reasons after which nothing may run again (it may have acted, or a step was the user's):
+#: ``engine.WHY_UNVERIFIED``, ``engine.WHY_ERROR``, ``engine.TO_PLANNER``, ``engine.WHY_DROPPED``.
+NO_SECOND_RUN = frozenset({"unverified", "error", "to_planner", "dropped"})
+#: The pick kinds a second way re-runs with ``choose`` (``taste.CHOOSE_KINDS``' skills whose pick slot is the request's
+#: own subject). ``web.open_page`` is left out: the engine never chooses for it with an item given
+#: (``engine._choice_request``), so its re-run would drop the item and open another page than asked.
+PICK_RERUN_CAPS = frozenset({"web.open_video", "spotify.playlist"})
+#: The fill sources that are only the caller's reading of their words (``resolve.FROM_READING``).
+READING_SOURCES = frozenset({"reading"})
+#: A value counts as read off the screen this turn when this share of its words are words of one read (S12).
+ON_SCREEN_SHARE = 0.8
+
+
+def _tokens(text: Any) -> list[str]:
+    """The words of a text, letters and digits only, folded (a string measure; no meaning read)."""
+    out, word = [], []
+    for ch in str(text or "").casefold():
+        if ch.isalnum():
+            word.append(ch)
+        elif word:
+            out.append("".join(word))
+            word = []
+    if word:
+        out.append("".join(word))
+    return out
+
+
+def _desk_helper(name: str) -> Callable[..., Any] | None:
+    """Contract C7 (lane DESK): ``yuki.perception.diff.tidy_step`` / ``cover_line``, pure; ``None`` until merged."""
+    try:
+        from yuki.perception import diff as desk_diff
+    except ImportError:
+        return None
+    got = getattr(desk_diff, name, None)
+    return got if callable(got) else None
+
+
+def _step_words(step: Any, d: Any = None) -> str:
+    """One20 (C7): a legal tidy step (``{"action": "focus_back" | "place", "hwnd", "monitor"?, "how"?}``) as the
+    agent's own ``window`` call (its arguments), with the window's name from the diff; ``""``: not such a step."""
+    if not isinstance(step, Mapping):
+        return ""
+    action = str(step.get("action") or "")
+    hwnd = step.get("hwnd")
+    if isinstance(hwnd, bool):
+        return ""
+    try:
+        hwnd = int(hwnd)
+    except (TypeError, ValueError):
+        return ""
+    if not hwnd:
+        return ""
+    if action == "focus_back":
+        call: dict[str, Any] = {"action": "focus_back", "window": hwnd}
+    elif action == "place":
+        call = {"action": "move", "window": hwnd, "monitor": _words(step.get("monitor")) or "other"}
+        if step.get("how") in ("keep", "maximize", "left", "right"):
+            call["how"] = step["how"]
+    else:
+        return ""
+    names = getattr(d, "names", None)
+    name = _words(names.get(hwnd)) if isinstance(names, Mapping) else ""
+    return f"window {json.dumps(call)}" + (f" ({name})" if name else "")
+
+
+def _value_text(value: Any) -> str:
+    """A slot value as shown (a canonical entity's ``name`` / ``key`` / ``title``, else the text)."""
+    if isinstance(value, Mapping):
+        for k in ("name", "title", "key"):
+            if _words(value.get(k)):
+                return _words(value.get(k))
+        return ""
+    return "" if isinstance(value, (bool, int, float)) or value is None else _words(value)
 
 
 def _words(value: Any) -> str:
@@ -153,6 +248,12 @@ class OneResult:
     payload: Any = None
     verb: str = ""
     ms: float = 0.0
+    #: One20 (S1 fallback, C7): the flagged diff's one legal undoable step in the agent's words (``""``: none).
+    tidy_step: str = ""
+    #: One20 (S3, C7): the measured tab-cover sentence when code did not say it (a result not done): the agent words it.
+    cover: str = ""
+    #: One20 (S5): what code already did as the second way inside this call (a code word: ``unread``, ``choose``).
+    second: str = ""
 
     @property
     def refused(self) -> bool:
@@ -183,6 +284,10 @@ class OneResult:
             out["after"] = self.after
         if self.flagged:
             out["flags"] = [k for k, v in self.flags.items() if v]
+        if self.tidy_step:
+            out["side_effect"] = TIDY_STEP_NOTE.format(step=self.tidy_step)
+        if self.cover:
+            out["cover"] = self.cover
         if self.evidence:
             out["evidence"] = reads.evidence_text(self.evidence)
         if self.question:
@@ -203,7 +308,8 @@ class OneResult:
                 "row": getattr(decision, "row", None), "flagged": self.flagged,
                 **{f"flag_{k}": bool(v) for k, v in self.flags.items()}, "then": bool(self.then),
                 "said": bool(self.said), "heard": self.heard, "settle": self.settle, "silent": self.silent,
-                "tidy": self.tidy,
+                "tidy": self.tidy, "tidy_step": bool(self.tidy_step), "cover": bool(self.cover),
+                "second": self.second or None,
                 "countdown": self.countdown or None, "result_chars": len(self.result), "after_chars": len(self.after),
                 "evidence": len(self.evidence), "ms": round(self.ms, 1)}
 
@@ -675,6 +781,9 @@ class Runner:
         self.lease_wait_s = float(lease_wait_s)
         self.effect_budget_s = float(effect_budget_s)
         self._desk_shape: str | None = None   # review fix F2: the verbs' desk_read form, read once
+        #: One20 (S2): the window in front before the newest act that moved the front (measured by its diff) and when:
+        #: a ``focus_back`` with no window and no open tidy-up goes there (``Hands._front_before``'s reach).
+        self._front_kept: tuple[int, float, Any] | None = None
 
     @property
     def memory(self) -> Any:
@@ -858,10 +967,31 @@ class Runner:
         return CallContext(self, turn, name, args, settings=self.settings, desk_read=self._desk_read,
                            bracket=bracket)
 
+    def _focus_back_window(self, turn: policy.Turn) -> int | None:
+        """One20 (final-D S2, desk-tidy RC-B): the window a ``focus_back`` with no window gives the front back to: the
+        open tidy-up's measured ``focus_from`` (:attr:`policy.Tidy.focus_from`), else the window in front before the
+        newest act that moved the front, within :data:`FRONT_KEEP_S`. Measured facts only; ``None``: none (the hands
+        refuse it, as before)."""
+        tidy = getattr(turn, "tidy", None)
+        if tidy is not None and getattr(tidy, "open", False) and getattr(tidy, "focus_from", None):
+            return int(tidy.focus_from)
+        kept = self._front_kept
+        if kept is not None and time.monotonic() - kept[1] < FRONT_KEEP_S:
+            return int(kept[0])
+        return None
+
     def _act(self, name: str, args: dict[str, Any], turn: policy.Turn, spec: T.Spec, say: Any,
              state: RunState) -> OneResult:
         from yuki.voice.hands import one_call
 
+        if name == "window" and str(args.get("action") or "") == "focus_back" and args.get("window") is None:
+            # one20 (S2): the hands keep no "front before" for ONE (only their own look sets it), so a focus_back with
+            # no window had no target and was refused before the gate; the measured front fills it and it reaches
+            # row 8 (a tidy step) like a named one
+            target = self._focus_back_window(turn)
+            if target is not None:
+                args = {**args, "window": target}
+                self._emit("one_focus_back", filled=True)
         ctx = self._ctx(turn, name, args, bracket=spec.kind == T.ACT)
         with _Lease(turn, wanted=self.lease and spec.kind == T.ACT, wait_s=self.lease_wait_s) as lease:
             if not lease.got:
@@ -935,14 +1065,26 @@ class Runner:
                 result.status, result.question = ASKED, str(facts.get("question") or "")
         acted = facts.get("sent_at") is not None or status in (DONE, NOT_CONFIRMED, FAILED)
         if ctx.before is not None:
-            self._diff(name, resolved, facts, ctx, result, turn, state, scope=scope)
+            self._diff(name, resolved, facts, ctx, result, turn, state, scope=scope, say=say)
+        if acted or result.status == DONE:
+            # one20: the windows this turn's own acts acted in (an Escape there is a tidy step: the gate's row 8)
+            self._note_acted(turn, ctx, facts, state)
         if acted:
             state.acted = True
             if budget is not None and decision is not None and result.status != ASKED:
                 # an ask (the skill's own question, a hold with a question) is theirs to answer, not a miss: no retry
-                # window opened, the step not barred, a lasting act not stopped for it
+                # window opened, the step not barred, a lasting act not stopped for it; one20: keyed on the target the
+                # gate found (the budget's step identity)
                 budget.after_call(name, ctx.first_args or args, acts=True,
-                                  ok=status in (DONE, ALREADY, NO_CHANGE, STARTING), lasting=lasting)
+                                  ok=status in (DONE, ALREADY, NO_CHANGE, STARTING), lasting=lasting,
+                                  target=ctx.facts)
+        elif name == "run_skill" and budget is not None and decision is not None and result.status == REFUSED \
+                and str(facts.get("outcome") or "") in OPEN_OUTCOMES and not facts.get("refused"):
+            # one20 (C9): a run that handed back with nothing done leaves a part of their request open (no verb ran: no
+            # retry window, but the closing hold counts it)
+            note = getattr(budget, "unfinished_run", None)
+            if callable(note):
+                note()
             try:
                 self.verbs.record(name, resolved, report, ok=bool(ok), verified=verified, facts=facts)
             except Exception:  # noqa: BLE001 - a record never breaks an act
@@ -1014,7 +1156,8 @@ class Runner:
                                   verdict=probe.get("verdict"), evidence=probe.get("evidence"), skill=skill)
 
     def _diff(self, name: str, resolved: dict[str, Any], facts: dict[str, Any], ctx: CallContext,
-              result: OneResult, turn: policy.Turn, state: RunState, *, scope: Mapping[str, Any] | None) -> None:
+              result: OneResult, turn: policy.Turn, state: RunState, *, scope: Mapping[str, Any] | None,
+              say: Any = None) -> None:
         """The act's diff: the desk read again, compared with its before (whose change is whose: ``Hands._scope``),
         the After text and its flags; the act's own windows and the attention windows before it to the turn (a
         tidy-up's only targets); new windows actable by id."""
@@ -1039,15 +1182,92 @@ class Runner:
             result.flagged = bool(d.any_flag)
             if not d.empty:
                 result.after = desk_diff.render(d, max_chars=AFTER_CHARS)
+            moved = self._front_moved(d)
+            if moved is not None:
+                self._front_kept = (moved, time.monotonic(), state)   # one20 (S2): a later focus_back's window
+            elif self._front_kept is not None and self._front_kept[2] is not state:
+                self._front_kept = None   # an act of a later turn that moved no front lets an older one go (as all)
             if result.flagged and not result.tidy:
                 # a new flagged diff opens a tidy-up on its windows; a tidy step's own flagged diff never renews it
                 # (its two steps per flagged diff stay counted)
                 attention = [h for h in [*list(d.attention or []), d.focus_from] if h]
+                # one20 (S1 fallback, C7): the one legal undoable step code measured for this diff, given to the agent
+                # as a fact (the agent takes it; never code), with no quiet default while it is open
+                step, words = self._legal_step(d, own, after, turn)
                 turn.flag(own=sorted(own), attention=attention, before=ctx.before, acted=acted, touched=touched,
-                          sound_app=ctx.sound_app)
-            self._emit("one_diff", tool=name, **d.facts())
+                          sound_app=ctx.sound_app, focus_from=moved, step=step, step_words=words)
+                result.tidy_step = words
+            self._cover(d, result, turn, state, say)
+            self._emit("one_diff", tool=name, **d.facts(), legal_step=bool(result.tidy_step) or None)
         except Exception as exc:  # noqa: BLE001 - no diff: the result stands
             self._emit("one_diff_error", tool=name, error=type(exc).__name__)
+
+    @staticmethod
+    def _front_moved(d: Any) -> int | None:
+        """The window in front before the act when the act itself moved the front (``focus_by_act``), else ``None``."""
+        try:
+            if getattr(d, "focus_by_act", False) and d.focus_from and d.focus_from != d.focus_to:
+                return int(d.focus_from)
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    def _legal_step(self, d: Any, own: set[int], after: Any, turn: policy.Turn) -> tuple[dict[str, Any] | None, str]:
+        """One20 (S1 fallback, contract C7): ``perception.diff.tidy_step(d, acts, front, monitors)`` (lane DESK) for a
+        flagged diff: the act's own windows, the window it took the front from (``focus_taken``, as the hands' look
+        keeps ``look["front"]``) and the monitors after it; the step and its words (a ``window`` call), or
+        ``(None, "")``: none, the tidy dial off, or the helper not merged yet. Never raises."""
+        helper = _desk_helper("tidy_step")
+        if helper is None:
+            return None, ""
+        try:
+            if util.tidy_mode(getattr(turn, "policy", None)) == util.TIDY_OFF:
+                return None, ""
+            moved = self._front_moved(d)
+            front = moved if moved is not None and dict(getattr(d, "flags", {}) or {}).get("focus_taken") else None
+            monitors = list(getattr(after, "monitors", None) or [])
+            step = helper(d, sorted(own), front, monitors)
+        except Exception as exc:  # noqa: BLE001 - no step: the agent reads the After as before
+            self._emit("one_tidy_step", error=type(exc).__name__)
+            return None, ""
+        return (dict(step), _step_words(step, d)) if isinstance(step, Mapping) and _step_words(step, d) else (None, "")
+
+    def _cover(self, d: Any, result: OneResult, turn: policy.Turn, state: RunState, say: Any) -> None:
+        """One20 (S3, contract C7): ``perception.diff.cover_line(d)``, the measured tab-cover sentence ("GitHub is up;
+        X plays on in the other tab"): said by code after a done line it belongs to (the agent never owned it, and an
+        unmarked round lost it in final-D), else on the result for the agent to word. Never raises."""
+        helper = _desk_helper("cover_line")
+        if helper is None:
+            return
+        try:
+            line = _words(helper(d))
+        except Exception as exc:  # noqa: BLE001
+            self._emit("one_cover", error=type(exc).__name__)
+            return
+        if not line:
+            return
+        budget = getattr(turn, "budget", None)
+        late = budget is not None and budget.late()
+        if result.status == DONE and not late:
+            said, _heard = self._speak(line, say, state)
+            if said:
+                result.said = f"{result.said} {said}".strip()
+                result.heard = True
+                return
+        if not late:
+            result.cover = line
+
+    @staticmethod
+    def _note_acted(turn: policy.Turn, ctx: CallContext, facts: Mapping[str, Any], state: RunState) -> None:
+        """One20: the windows this act acted in (its target, its live window) and the turn's own act windows, onto the
+        gate's turn (:meth:`policy.Turn.note_acted`). Never raises."""
+        note = getattr(turn, "note_acted", None)
+        if not callable(note):
+            return
+        try:
+            note([h for h in (ctx.facts.get("hwnd"), facts.get("live_hwnd"), *sorted(state.own)) if h])
+        except Exception:  # noqa: BLE001
+            pass
 
     def tidy_debt(self, turn: policy.Turn) -> dict[str, Any] | None:
         """Final-B (one-desk D3/F6): a reply code would settle while the turn's tidy-up is still open with no tidy step
@@ -1070,8 +1290,20 @@ class Runner:
             self._emit("one_tidy_debt", **d.facts())
             if not d.any_flag:
                 return None
-            return {"after": desk_diff.render(d, max_chars=AFTER_CHARS),
-                    "flags": [k for k, v in dict(d.flags).items() if v]}
+            after = desk_diff.render(d, max_chars=AFTER_CHARS)
+            debt: dict[str, Any] = {"after": after, "flags": [k for k, v in dict(d.flags).items() if v]}
+            # one20 (S1 fallback, C7): the net diff's one legal step, measured again; it rides in the After text too
+            # (the voice driver copies only ``after`` and ``flags`` onto the result)
+            own = set(tidy.own)
+            try:
+                own |= {int(h) for h in self.verbs.act_windows(now, d, tidy.acted, tidy.touched) if h}
+            except Exception:  # noqa: BLE001 - the flagged act's own windows as kept
+                pass
+            step, words = self._legal_step(d, own, now, turn)
+            if words:
+                tidy.step, tidy.step_words = step, words
+                debt["after"] = f"{after}\n{TIDY_STEP_NOTE.format(step=words)}".strip()
+            return debt
         except Exception as exc:  # noqa: BLE001 - no measure: code settles as before
             self._emit("one_tidy_debt_error", error=type(exc).__name__)
             return None
@@ -1194,9 +1426,40 @@ class Runner:
                         ok, report, facts = self.verbs.run("run_skill", run_args)
                 finally:
                     turn.end_skill()
+                second = ""
+                if not desk_path:
+                    # one20 (S5): the code-owned second way, once, inside this call (the planner's rung C under all):
+                    # a rung that never read runs once more; a pick-kind run whose value found no route runs again as
+                    # Yuki's pick with that value as context; each through the gate (an inner step), never a lasting
+                    # skill (those run on the desk path) and never after a run that may have done it already
+                    plan = self._second_way(key, sk, run_args, dict(facts or {}), turn, state)
+                    if plan is not None:
+                        second, again = plan
+                        gated = policy.gate("run_skill", again, {"app": app}, turn, inner=True)
+                        self._emit("one_second_way", skill=key, how=second, allowed=gated.allowed)
+                        if gated.allowed:
+                            turn.begin_skill(gated, again)
+                            try:
+                                ok, report, facts = self.verbs.run("run_skill", again)
+                            finally:
+                                turn.end_skill()
+                            run_args = again
+                        else:
+                            second = ""
                 if drafted and decision.type_after and ok:
                     ok, report, facts = self._type_after(turn, decision, key, app, ok, report, facts)
         facts = dict(facts or {})
+        if second:
+            facts["second_way"] = second
+        guess = None if desk_path else self._guess_question(key, sk, run_args, facts, turn, state)
+        if guess is not None:
+            # one20 (S12): a run that didn't land on a value that is only the agent's reading of their words, that would
+            # change what plays or take the front: one short question back, nothing more done for it
+            facts["_asked"], report = guess
+        elif str(facts.get("outcome") or "") == "handed_over":
+            report = self._one_handoff(report, facts, turn, second)   # one20 (S5): written for ONE
+        if desk_path and can_send and not decision.join and facts.get("verified") is True:
+            self._note_chat(turn, app)   # one20 (S17): the chat this turn's message skill opened
         prefs = facts.pop("_prefs", None)
         if decision.countdown and str(facts.get("outcome") or "") not in NOT_SENT_OUTCOMES:
             turn.mark_sent(args)   # it may have gone: never twice this request, asked first in the next turn
@@ -1232,11 +1495,225 @@ class Runner:
             facts["_asked"] = _words(facts.get("ask"))
         result = self._finish("run_skill", args, turn, ctx, ok, report, facts, say, state, done_line=line,
                               scope=scope, lasting=bool(decision.countdown or decision.join))
+        result.second = second
         if counted:
             result.countdown = "sent"
+        if result.status == DONE and result.verified is True:
+            # one20 (S5): a later pick re-run of this skill (this turn or the next) is a correction of this run
+            note = getattr(turn, "note_skill_done", None)
+            if callable(note):
+                note(key, self._pick_value(sk, facts))
         if prefs is not None:
             self._after_skill(prefs)
         return result
+
+    # -- one20: the second way, the guessed reading, the hand-off for ONE ---------------------------------------------
+
+    @staticmethod
+    def _pick_slot(sk: Any) -> str:
+        """The pick slot of a pick-kind skill (``taste.CHOOSE_SLOTS`` of its ``CHOOSE_KINDS`` kind), else ``""``."""
+        try:
+            from yuki.skills import taste
+
+            cap = str(getattr(sk, "capability", "") or getattr(sk, "key", "") or "")
+            return str(taste.CHOOSE_SLOTS.get(taste.CHOOSE_KINDS.get(cap, ""), "") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _pick_value(self, sk: Any, facts: Mapping[str, Any]) -> str:
+        """The value a verified run played for its pick slot (the run's own values), ``""``: none."""
+        pick = self._pick_slot(sk)
+        values = facts.get("_values") if isinstance(facts.get("_values"), Mapping) else {}
+        return _value_text(values.get(pick)) if pick else ""
+
+    @staticmethod
+    def _sources(facts: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
+        """Slot -> (source, value as shown) of a run's given values: the engine's ``fill_sources`` (contract C10, read
+        with ``.get``), its guesses (``guessed``), the hand-off's pinned slots. Code words only."""
+        out: dict[str, tuple[str, str]] = {}
+        ev = facts.get("evidence") if isinstance(facts.get("evidence"), Mapping) else {}
+        pin = facts.get("handoff_skill") if isinstance(facts.get("handoff_skill"), Mapping) else {}
+        pinned = pin.get("slots") if isinstance(pin.get("slots"), Mapping) else {}
+        for name, slot in pinned.items():
+            if isinstance(slot, Mapping):
+                out[str(name)] = (str(slot.get("from") or ""), _value_text(slot.get("value")))
+        for g in facts.get("guessed") or ():
+            if isinstance(g, Mapping) and g.get("slot"):
+                out[str(g["slot"])] = (str(g.get("from") or ""), _value_text(g.get("value")))
+        fills = ev.get("fill_sources") or facts.get("fill_sources")
+        if isinstance(fills, Mapping):
+            values = facts.get("_values") if isinstance(facts.get("_values"), Mapping) else {}
+            for name, src in fills.items():
+                shown = _value_text(values.get(name)) or out.get(str(name), ("", ""))[1]
+                out[str(name)] = (str(src or ""), shown)
+        return out
+
+    @staticmethod
+    def _on_screen(value: str, state: RunState) -> bool:
+        """Whether ``value`` stands in a read of this turn (a look's text): a reading of the screen, not of their words.
+        A string measure: at least :data:`ON_SCREEN_SHARE` of its words (letters and digits, folded) are words of one
+        read (a title read off a page and its channel's name, joined by the agent, still counts)."""
+        want = _tokens(value)
+        if not want:
+            return False
+        for r in state.results:
+            if r.status != READ or not r.result:
+                continue
+            have = set(_tokens(r.result))
+            if sum(1 for t in want if t in have) >= ON_SCREEN_SHARE * len(want):
+                return True
+        return False
+
+    def _reading_guess(self, facts: Mapping[str, Any], state: RunState) -> tuple[str, str] | None:
+        """The (slot, value) of a run's given value that is only the caller's reading of their words (the resolver's
+        ``reading``: none of their things, not said, not heard by sound or spelling) and not on the screen this turn
+        read; ``None``: none."""
+        for name, (src, value) in self._sources(facts).items():
+            if src in READING_SOURCES and value and not self._on_screen(value, state):
+                return name, value
+        return None
+
+    @staticmethod
+    def _open_run(facts: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any], str] | None:
+        """A run that handed back (or failed) with its request open and nothing that bars a second run: its evidence,
+        its pinned hand-off and the hand-off's reason; ``None``: done, held, refused, or it may have acted already."""
+        outcome = str(facts.get("outcome") or "")
+        if outcome not in OPEN_OUTCOMES or facts.get("verified") is True:
+            return None
+        if facts.get("refused") or facts.get("held") or facts.get("act_off") or facts.get("memory_slow"):
+            return None
+        ev = facts.get("evidence") if isinstance(facts.get("evidence"), Mapping) else {}
+        pin = facts.get("handoff_skill") if isinstance(facts.get("handoff_skill"), Mapping) else {}
+        why = str(pin.get("why") or ev.get("reason") or "")
+        if why in NO_SECOND_RUN:
+            return None
+        tried = [*(facts.get("_tried") or ()), *(ev.get("tried") or ())]
+        if any(isinstance(t, Mapping) and str(t.get("outcome") or "") == "contradicted" for t in tried):
+            return None   # a rung acted and its own check said no: a second run could do it twice (x5Fallback)
+        return ev, pin, why
+
+    def _second_way(self, key: str, sk: Any, run_args: Mapping[str, Any], facts: Mapping[str, Any],
+                    turn: policy.Turn, state: RunState) -> tuple[str, dict[str, Any]] | None:
+        """One20 (final-D S5, one-core §3 fix 1): the second way code takes inside the call, once: ``("unread", the
+        same input)`` when a rung never read (contract C10's ``unread``); ``("choose", the input as Yuki's pick)`` when
+        a pick-kind skill (:data:`PICK_RERUN_CAPS`) found no route for its value or no item for its pick slot: the
+        value goes to ``context``, ``choose`` true, ``corrects`` when the same skill ran verified this turn or the
+        turn before (:meth:`policy.Turn.ran_before`; that value is named in the context as the one not wanted). Never
+        for a value that is only the agent's reading of their words (S12 asks instead). Engine and turn facts only."""
+        if sk is None:
+            return None
+        got = self._open_run(facts)
+        if got is None:
+            return None
+        ev, pin, why = got
+        if ev.get("unread") or facts.get("unread"):
+            return "unread", dict(run_args)
+        cap = str(getattr(sk, "capability", "") or getattr(sk, "key", "") or "")
+        pick = self._pick_slot(sk)
+        if cap not in PICK_RERUN_CAPS or not pick:
+            return None
+        slots = dict(run_args.get("slots") or {}) if isinstance(run_args.get("slots"), Mapping) else {}
+        value = _value_text(slots.get(pick))
+        missing = str(ev.get("missing") or pin.get("missing") or "")
+        if not value or not (why == "no_route" or missing == pick):
+            return None
+        chose = str(slots.get("choose")).strip().casefold() in ("true", "1", "yes")
+        if not chose and self._reading_guess(facts, state) is not None:
+            return None   # S12: their words never held it, none of theirs: a question, never a pick in its place
+        context = _words(slots.get("context"))
+        if value.casefold() not in context.casefold():
+            context = f"{context}; {value}" if context else value
+        again_slots = {k: v for k, v in slots.items() if k not in (pick, "choose", "context")}
+        again: dict[str, Any] = {**dict(run_args), "slots": again_slots}
+        earlier = turn.ran_before(key) if callable(getattr(turn, "ran_before", None)) else None
+        if earlier is not None:
+            again["corrects"] = True
+            if earlier and earlier.casefold() not in context.casefold():
+                context = f"{context}, other than {earlier}"
+        again_slots.update(choose=True, context=context)
+        return "choose", again
+
+    def _guess_question(self, key: str, sk: Any, run_args: Mapping[str, Any], facts: Mapping[str, Any],
+                        turn: policy.Turn, state: RunState) -> tuple[str, str] | None:
+        """One20 (final-D S12, ONE part): ``(question, report)`` when a run did not land, the agent did not ask Yuki to
+        choose, a value it gave is only its own reading of their words (:meth:`_reading_guess`), the skill would
+        change what plays or take the front (a pick kind, a route that takes focus, an ``open`` skill: its data) and
+        that reading was not asked about this turn or the last; ``None`` otherwise. Marks it asked."""
+        if sk is None or self._open_run(facts) is None:
+            return None
+        slots = run_args.get("slots") if isinstance(run_args.get("slots"), Mapping) else {}
+        if str(slots.get("choose")).strip().casefold() in ("true", "1", "yes"):
+            return None
+        guess = self._reading_guess(facts, state)
+        if guess is None:
+            return None
+        try:
+            from yuki.skills import taste
+
+            cap = str(getattr(sk, "capability", "") or getattr(sk, "key", "") or "")
+            moves = cap in taste.CHOOSE_KINDS or str(getattr(sk, "kind", "") or "") == "open" or any(
+                bool(getattr(r, "needs_focus", False)) for r in getattr(sk, "routes", ()) or ())
+        except Exception:  # noqa: BLE001
+            moves = False
+        mark = (str(key), guess[0], guess[1].casefold())
+        asked, note = getattr(turn, "guess_asked", None), getattr(turn, "note_guess_asked", None)
+        if not moves or not callable(asked) or not callable(note) or asked(mark):
+            return None
+        note(mark)
+        self._emit("one_guess", skill=key, asked=True)
+        return LINE_GUESS_ASK.format(value=guess[1]), GUESS_HELD.format(value=guess[1])
+
+    def _one_handoff(self, report: str, facts: Mapping[str, Any], turn: policy.Turn, second: str) -> str:
+        """One20 (final-D S5, one-core §3 fix 3): the engine's hand-off text was written for the planner ("with the
+        skill pinned"); under ONE there is no planner: the head line is code's own, from the run's facts, and the
+        evidence line after it stays. Routes that got nowhere: the verbs this channel has, and "not this skill again"
+        only when its rungs read the app (a rung that never read, contract C10's ``unread``: the skill may run once
+        more). A step that would send or join: the message skill and their click. Any other reason keeps the
+        engine's own words (they name no planner)."""
+        ev = facts.get("evidence") if isinstance(facts.get("evidence"), Mapping) else {}
+        pin = facts.get("handoff_skill") if isinstance(facts.get("handoff_skill"), Mapping) else {}
+        why = str(pin.get("why") or ev.get("reason") or "")
+        if why in ("unverified", "error", "dropped"):
+            return report
+        rest = str(report or "").split("\n", 1)[1] if "\n" in str(report or "") else ""
+        if why == "to_planner":
+            head = ("A step of it would send or join something, so that step was not done: a message goes out only "
+                    "through run_skill message with consent, and joining a call is their click.")
+        else:
+            channel = getattr(turn, "channel", "voice")
+            verbs = ", ".join(n for n, s in T.SPECS.items() if s.kind == T.ACT and channel in s.channels
+                              and n != "open_yuki")   # Yuki's own window never finishes a request of theirs
+            touched = bool(facts.get("acted") or ev.get("acted"))
+            head = "Its own routes didn't get there" + ("" if touched else "; nothing on the PC was touched")
+            if second == "choose":
+                head += "; code already ran it again as your pick from their things"
+            elif second == "unread":
+                head += "; code already ran it once more"
+            head += f". Do it another way now: look, then your verbs ({verbs})"
+            if ev.get("unread") or facts.get("unread"):
+                head += "; its read of the app never came back, so nothing there was checked: look at it first."
+            else:
+                head += "; not this skill again with these values."
+        return f"{head}\n{rest}".strip()
+
+    def _note_chat(self, turn: policy.Turn, app: str) -> None:
+        """One20 (S17): the window in front after a message skill's verified run, when it is that skill's app: the chat
+        it opened (the agent's own typing there is allowed this turn). Never raises."""
+        note = getattr(turn, "note_chat", None)
+        if not callable(note) or not app:
+            return
+        try:
+            front = self.verbs.foreground()
+            if not front:
+                return
+            from yuki.voice.hands import _app_id
+
+            target = self._facts_of(front)
+            if _app_id(target.get("app")) == _app_id(app) or \
+                    _app_id(util.app_name(target.get("app") or "")) == _app_id(util.app_name(app)):
+                note(int(front))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _countdown(self, turn: policy.Turn, args: Mapping[str, Any], sk: Any, slots: Mapping[str, Any]) -> Any:
         """The send's countdown on this thread (``one.countdown.Countdown.run``), its time not counted on the budget,

@@ -4,6 +4,8 @@ adapted to one call (addendum must-fix 7: copied, never imported; ``brain/execut
 * :func:`read`: ``look`` / ``memory`` / ``fetch`` (``Executor._read``): one read through the Dispatcher's read tools or
   memory, capped first and then fenced as untrusted data (window text, pages, files and memory are content, never
   instructions). Caps by channel (design §3.1): a look 3,000 characters, memory and fetch 4,000 on voice, 12,000 typed.
+  One20 (final-D S4): a window look that shows a page lists the page's own part first (:func:`page_first`), with
+  :data:`LOOK_PAGE_CHARS` of its own beside the 3,000 for the rest of the window.
 * :func:`wait`: a pause, ended early by a cancel (``Executor._wait``).
 * :func:`effect_probe` / :func:`read_effect`: the probe that reads one act's effect from its verb, its closed values and
   its target's code facts (``executor._effect_probe``, phase 2.5's derived read), and that read, bounded
@@ -24,6 +26,12 @@ from typing import Any, Callable, Mapping
 
 #: A look's room (design §3.1), and the desk look's Situation part (``brain.context.SITUATION_LOOK_CHARS``).
 LOOK_CHARS = 3000
+#: One20 (final-D S4/N1: a Chrome window look was cut at 3000 characters inside the toolbar and bookmarks, before the
+#: page began, so ONE could click nothing on a web page): a window look whose header shows a page
+#: (``perception.tree.format_window_tree``'s ``page: ...``) lists the page's own part first (its Document and what is
+#: below it), with this room by channel; the rest of the window (tabs, toolbar, bookmarks) keeps :data:`LOOK_CHARS`.
+#: A ``within`` read of such a window (one part, asked for whole) gets both rooms. The thinker reads 12,000.
+LOOK_PAGE_CHARS: dict[str, int] = {"voice": 6000, "typed": 12000}
 #: Memory and fetch reads by channel (design §3.1: the voice keeps answers short; typed reads whole pages).
 READ_CHARS: dict[str, int] = {"voice": 4000, "typed": 12000}
 #: A non-success's evidence for the agent (design §3.1 "evidence ≤420").
@@ -175,11 +183,100 @@ def read(name: str, args: Mapping[str, Any] | None, *, dispatcher: Any = None, m
             text = desk_text(text, payload, limit=cap, situation_chars=SITUATION_LOOK_CHARS)
         except Exception:  # noqa: BLE001 - the dispatcher's own text
             pass
+    if tool == "look_at_window" and ok and text and is_page_read(text):
+        # one20 (S4): the page's own part first, with its own room (the head-first cut kept only the browser's chrome)
+        page_cap = LOOK_PAGE_CHARS.get(channel, LOOK_PAGE_CHARS["typed"])
+        if "within" in tool_input:
+            cap += page_cap                     # one part, asked for whole: both rooms, head first
+        else:
+            text = page_first(text, page_chars=page_cap, rest_chars=cap)
+            cap = len(text)                     # already within both rooms, cut at line ends
     text = (text or str(getattr(outcome, "summary", "") or ""))[:cap]   # capped first, so the fence stays whole
     if ok:
         text = _fence(text, tool=tool, tool_input=tool_input, nonce=nonce, source=source)
     return ReadResult(name, tool, ok, text, payload, round((time.perf_counter() - started) * 1000, 1),
                       private=tool in PRIVATE_TOOLS, input=dict(tool_input))
+
+
+def is_page_read(text: str) -> bool:
+    """Whether a window read shows a page: its header (the first line) leads with the page fact
+    (``perception.tree.format_window_tree``: ``page: "<title>" <url>``; contract C8 keeps that lead and may name the
+    page Document's element id in it). Yuki's own format, read as such."""
+    head = str(text or "").split("\n", 1)[0].lstrip()
+    return head.startswith("page")
+
+
+def _element_line(line: str) -> tuple[int, int, str] | None:
+    """``(indent, element id, role)`` of one element line of a window read (``{indent}[{id}] {Role} ...``), else
+    ``None`` (a folded run, a note). Yuki's own format."""
+    body = line.lstrip(" ")
+    if not body.startswith("["):
+        return None
+    close = body.find("]")
+    if close <= 1 or not body[1:close].isdigit():
+        return None
+    role = body[close + 1:].lstrip(" ").split(" ", 1)[0]
+    return len(line) - len(body), int(body[1:close]), role
+
+
+def _page_document(header: str, body: list[str]) -> int | None:
+    """The index in ``body`` of the shown page's Document line: the one whose id the header names (contract C8), else
+    the one whose address the header's page fact holds, else the first Document with an address; ``None``: none."""
+    docs: list[tuple[int, int, str]] = []
+    for i, line in enumerate(body):
+        got = _element_line(line)
+        if got is not None and got[2] == "Document":
+            docs.append((i, got[1], line))
+    if not docs:
+        return None
+    for i, ident, _line in docs:
+        if f"[{ident}]" in header:
+            return i
+    for i, _ident, line in docs:
+        start = line.find('value="')
+        if start >= 0:
+            value = line[start + 7:].split('"', 1)[0].rstrip("…").strip()
+            if value and value[:80] in header:
+                return i
+    return next((i for i, _ident, line in docs if "://" in line), docs[0][0])
+
+
+def _fit(lines: list[str], room: int) -> str:
+    """Whole lines while they fit ``room`` characters, and a note of how many more were cut ("" for none)."""
+    out: list[str] = []
+    used = 0
+    for n, line in enumerate(lines):
+        if used + len(line) + 1 > room:
+            out.append(f"(cut here: {len(lines) - n} more line(s); look window within=<an [id] above> reads one part "
+                       f"whole)")
+            break
+        out.append(line)
+        used += len(line) + 1
+    return "\n".join(out)
+
+
+def page_first(text: str, *, page_chars: int, rest_chars: int = LOOK_CHARS) -> str:
+    """One20 (final-D S4): a window read that shows a page (:func:`is_page_read`) with the page's own part first: the
+    header line, then the shown page's Document line and every line below it (deeper indented), at most
+    ``page_chars``, then the rest of the window (its tabs, toolbar, bookmarks) at most ``rest_chars`` with the header.
+    Each part is cut at a line end with a note of what was cut. Works on today's order (the page after the browser's
+    own controls) and on contract C8's (the page first). A read with no page Document comes back cut as before."""
+    lines = str(text or "").split("\n")
+    header, body = lines[0], lines[1:]
+    at = _page_document(header, body)
+    if at is None:
+        return str(text or "")[: rest_chars]
+    head = _element_line(body[at])
+    indent = head[0] if head is not None else 0
+    end = at + 1
+    while end < len(body):
+        line = body[end]
+        if line.strip() and len(line) - len(line.lstrip(" ")) <= indent:
+            break
+        end += 1
+    page = _fit(body[at:end], page_chars)
+    rest = _fit(body[:at] + body[end:], max(0, rest_chars - len(header) - 1))
+    return "\n".join(part for part in (header, page, rest) if part)
 
 
 def wait(seconds: Any, cancelled: Callable[[], bool] | None = None) -> float:
@@ -324,6 +421,6 @@ def evidence_text(facts: Mapping[str, str], limit: int = EVIDENCE_CHARS) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-__all__ = ["DERIVED_WINDOW_STATES", "EFFECT_BUDGET_S", "EVIDENCE_CHARS", "LOOK_CHARS", "LOOK_TOOLS", "MEMORY_KINDS",
-           "PRIVATE_TOOLS", "READ_CHARS", "ReadResult", "WAIT_MAX_S", "effect_probe", "ending_facts", "evidence_text",
-           "read", "read_effect", "wait"]
+__all__ = ["DERIVED_WINDOW_STATES", "EFFECT_BUDGET_S", "EVIDENCE_CHARS", "LOOK_CHARS", "LOOK_PAGE_CHARS", "LOOK_TOOLS",
+           "MEMORY_KINDS", "PRIVATE_TOOLS", "READ_CHARS", "ReadResult", "WAIT_MAX_S", "effect_probe", "ending_facts",
+           "evidence_text", "is_page_read", "page_first", "read", "read_effect", "wait"]
