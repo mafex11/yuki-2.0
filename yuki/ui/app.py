@@ -1196,8 +1196,10 @@ class YukiUi(QObject):
             answered(request_id)
 
     def _on_framed(self, _lane: str, request_id: int, frame: dict) -> None:
-        """The request's task frame: the island's "from memory" chip, and (for a request typed in the open ask bar)
-        its resolved chips in the Intent card."""
+        """The person the model's own call named, with their usual route from memory (``runtime.named_view``; sent
+        only once a call names one, keyword audit D1): the island's "from memory" chip, and (for a request typed in
+        the open ask bar) its resolved chips in the Intent card. Nothing here picks a person from the request's
+        words."""
         frame = dict(frame or {})
         self.island.set_frame(int(request_id), frame)
         run = self.island.inputs.run

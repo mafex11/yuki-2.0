@@ -488,6 +488,35 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
     return frame
 
 
+def _folded(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def persons_named(frame: Any, values: Sequence[Any]) -> list[dict[str, Any]]:
+    """The frame's people with routes (``TaskFrame.persons``) that the model's own call names (keyword audit D1, 20 Oct
+    2026): ``values`` are the person values of that call (``about``'s name, the situation check's ``about``, a skill's
+    person slot). A person counts only by identity: their name as memory knows it, a name an app knows them by
+    (``known_as``), their ``contact:<id>`` or one of their route ids, case and spaces aside; never a part of a name and
+    never the request's words. The frame's people block stays the model's context; this only says which of them the
+    model chose, for the UI's "from memory" chip. Never raises."""
+    try:
+        wanted = {_folded(v) for v in values or () if isinstance(v, (str, int)) and _folded(v)}
+        if not wanted:
+            return []
+        out: list[dict[str, Any]] = []
+        for p in list(getattr(frame, "persons", None) or []):
+            if not isinstance(p, dict) or not p.get("name"):
+                continue
+            routes = [r for r in p.get("routes") or [] if isinstance(r, dict)]
+            ids = {_folded(p.get("name")), _folded(f"contact:{p.get('id')}") if p.get("id") is not None else ""}
+            ids |= {_folded(r.get("known_as")) for r in routes} | {_folded(r.get("ref")) for r in routes}
+            if wanted & (ids - {""}):
+                out.append(p)
+        return out
+    except Exception:  # noqa: BLE001 - presentation only: no chip
+        return []
+
+
 def _referent_lines(frame: TaskFrame, routes: dict[Any, Any] | None = None, shown: set[Any] | None = None) -> list[str]:
     lines: list[str] = []
     routes = routes or {}

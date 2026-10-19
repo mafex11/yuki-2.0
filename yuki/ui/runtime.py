@@ -761,14 +761,25 @@ class Lane(QThread):
             elif isinstance(event, ToolCall):
                 if allowed is not None and event.name not in allowed:
                     refused.append(event.name)
-                if not framed:   # the task frame is built before the first model call: the island's chips read it
-                    framed = True
-                    view = frame_view(self.agent)
-                    if view is not None:
-                        runtime.framed.emit(self.name, job.id, view)
                 runtime.tool_called.emit(self.name, job.id, event.name, dict(event.input))
+                if not framed:
+                    # keyword audit D1 (20 Oct): the island's "from memory" chip and the ask bar's "Plan · resolved
+                    # from memory" show a person only once the model's own call names them (a memory read about
+                    # them, or a skill call's person slot), on that call's step (sent after its tool_called), never
+                    # from a name memory found in the request's words before the model planned anything
+                    view = named_view(self.agent, event.name, event.input)
+                    if view is not None:
+                        framed = True
+                        runtime.framed.emit(self.name, job.id, view)
             elif isinstance(event, ToolResult):
                 runtime.tool_finished.emit(self.name, job.id, event.name, event.ok, event.summary)
+                if not framed and event.ok:
+                    # the same chip from the call's result: memory's id for the person an ``about`` call named, when
+                    # the model's short name matched no identity of the frame's person at the call (its own step)
+                    view = result_view(self.agent, event.name, event.payload)
+                    if view is not None:
+                        framed = True
+                        runtime.framed.emit(self.name, job.id, view)
                 if event.ok and event.payload:
                     from yuki.ui.status import describe_result
 
@@ -1019,8 +1030,10 @@ class AgentRuntime(QObject):
     partial = Signal(str, int, str, str)
     notice = Signal(str, str)
     cancelled = Signal(int, str)
-    #: ``(lane, id, frame)``: the request's task frame as plain data (:func:`frame_view`: who it may be about and
-    #: their usual route, the playbooks shown), once, before its first step; the island's "from memory" chip.
+    #: ``(lane, id, frame)``: the request's task frame as plain data (:func:`named_view`: the person the model's own
+    #: call names and their usual route, the playbooks shown), once, right after the ``tool_called`` of the first
+    #: call that names one of the frame's people, or the ``tool_finished`` of an ``about`` call whose result's contact
+    #: id is one of them (:func:`result_view`); the island's "from memory" chip (keyword audit D1, 20 Oct).
     framed = Signal(str, int, dict)
     #: appPT: ``(lane, id, send)``: the send countdown (``yuki.log.events.SendPending`` as a dict: ``state`` counting |
     #: going | stopped | swapped, who, where, app, text, seconds, who_alts, where_alts, typed, from_memory, window).
@@ -1613,17 +1626,94 @@ def takeover_watch(on_takeover: Any, *, grace_s: float = 0.0) -> Any:
     return TakeoverThread(on_takeover, grace_s=grace_s)
 
 
-def frame_view(agent: Any) -> dict[str, Any] | None:
+#: The model's own fields that name a person, by tool (schema facts, never words): memory's people index (``about``)
+#: and the situation check's person or thing (``check_situation``). A ``run_skill`` call names one through its skill's
+#: person slots (:func:`_skill_people`).
+PERSON_FIELDS: dict[str, tuple[str, ...]] = {"about": ("name", "prefer_route"), "check_situation": ("about",)}
+
+
+def called_people(name: str, tool_input: dict[str, Any] | None) -> list[str]:
+    """The person values a model's own call carries (keyword audit D1, 20 Oct): the fields of :data:`PERSON_FIELDS`,
+    and a ``run_skill`` call's person slots by its skill's own slot types (a ``person`` slot, or a text slot its
+    capability binds to a contact), a learned skill's bound value standing for a slot the call left out. Never the
+    request's words. Never raises."""
+    args = tool_input if isinstance(tool_input, dict) else {}
+    try:
+        out = [args.get(k) for k in PERSON_FIELDS.get(str(name or ""), ())]
+        if name == "run_skill":
+            out += _skill_people(args)
+        return [str(v) for v in out if isinstance(v, (str, int)) and str(v).strip()]
+    except Exception:  # noqa: BLE001 - presentation only: no chip
+        return []
+
+
+def _skill_people(args: dict[str, Any]) -> list[Any]:
+    from yuki.skills.catalog import load
+    from yuki.skills.resolve import _person_bound
+
+    skill = load().get(str(args.get("skill") or ""))
+    if skill is None:
+        return []
+    slots = args.get("slots") if isinstance(args.get("slots"), dict) else {}
+    bound = getattr(skill, "bound", None) or {}
+    # the resolver's own test of a person slot (one rule, so the chip and the resolver never drift apart)
+    return [slots.get(s.name, bound.get(s.name)) for s in skill.slots if _person_bound(skill, s)]
+
+
+def named_view(agent: Any, name: str, tool_input: dict[str, Any] | None) -> dict[str, Any] | None:
     """The agent's task frame for the request now running (``yuki.agent.frame.TaskFrame``, read from the agent; a
-    frame from an older agent, or none, gives ``None``), as plain data for the island: the people with routes
-    (name and each route's label, app and how many messages the user sent there), the referent candidates' labels and
-    the playbook ids the frame showed. Read only; never raises."""
+    frame from an older agent, or none, gives ``None``) as plain data for the island, narrowed to the frame's people
+    the model's own call names (:func:`called_people`, matched by identity: ``yuki.agent.frame.persons_named``): each
+    one's name and their routes' label, app and how many messages the user sent there; the referent candidates'
+    labels; where the frame found the person; the playbook ids the frame showed; and ``named_by``, the call's tool
+    name. ``None`` when the call names none of them (no chip yet). Keyword audit D1 (20 Oct): this replaced
+    ``frame_view``, which gave the frame's people as found, a name memory saw in the request's words included ("mark
+    it done" with a contact called Mark). Read only; never raises."""
+    return _named(agent, name, called_people(name, tool_input))
+
+
+def result_people(name: str, payload: Any) -> list[str]:
+    """Memory's identity for the person a model's own call named, from that call's result (keyword audit D1 review,
+    20 Oct): an ``about`` result that found them carries their ``ref`` (``contact:<id>``), so a short name the model
+    used ("Sam" for memory's "Sam Patel", which no app knows them by) still finds the frame's person by identity.
+    Memory's read of the model's own name, never the request's words. Never raises."""
+    try:
+        if str(name or "") != "about" or not isinstance(payload, dict) or not payload.get("found"):
+            return []
+        ref = payload.get("ref")
+        return [ref] if isinstance(ref, str) and ref.strip() else []
+    except Exception:  # noqa: BLE001 - presentation only: no chip
+        return []
+
+
+def result_view(agent: Any, name: str, payload: Any) -> dict[str, Any] | None:
+    """:func:`named_view` for a call's result: the frame narrowed to the person memory found for the model's own
+    ``about`` call (:func:`result_people`); ``None`` otherwise. Read only; never raises."""
+    return _named(agent, name, result_people(name, payload))
+
+
+def _named(agent: Any, name: str, values: list[str]) -> dict[str, Any] | None:
     frame = getattr(agent, "_frame", None)
     if frame is None:
         return None
     try:
+        from yuki.agent.frame import persons_named
+
+        chosen = persons_named(frame, values) if values else []
+        if not chosen:
+            return None
+        view = _view(frame, chosen)
+        if view is not None:
+            view["named_by"] = str(name or "")
+        return view
+    except Exception:
+        return None
+
+
+def _view(frame: Any, chosen: list[Any]) -> dict[str, Any] | None:
+    try:
         persons = []
-        for p in list(getattr(frame, "persons", None) or [])[:2]:
+        for p in chosen[:2]:
             if not isinstance(p, dict):
                 continue
             routes = [{"label": r.get("label"), "app": r.get("app"), "mine": r.get("mine"), "ref": r.get("ref")}

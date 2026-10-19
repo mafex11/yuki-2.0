@@ -403,27 +403,6 @@ def test_switching_names_the_new_app_and_says_typed_text_stays_in_the_first_box(
         isl.stop()
 
 
-def test_the_thinking_line_before_the_first_step_is_what_yuki_worked_out(qapp) -> None:
-    """F4: before the brain's first step, the thinking line shows the resolver's line (who, their usual route) rather
-    than a canned "Thinking…"; the brain's own note replaces it, and the first step starts clean."""
-    from yuki.ui.island import spec_for
-
-    isl = _island()
-    try:
-        isl.strip.start_run(5, line="", request="tell sam omw")
-        frame = {"persons": [{"name": "Sam", "routes": [{"label": "Discord DM", "app": "Discord.exe", "mine": 12}]}]}
-        isl.set_frame(5, frame)
-        assert isl.inputs.run.steps == 0 and isl.state == "thinking"
-        assert isl.inputs.run.thought == "From memory: you message Sam on Discord DM, 12 times"
-        assert spec_for("thinking", isl.inputs).line == "From memory: you message Sam on Discord DM, 12 times"
-        isl.set_thought(5, "Opening Sam's chat to check it first")      # streamed before its step starts
-        assert spec_for("thinking", isl.inputs).line == "Opening Sam's chat to check it first"
-        isl.strip.run_step(5, "Opening Discord", 1)
-        assert isl.inputs.run.thought == ""
-    finally:
-        isl.stop()
-
-
 def test_the_html_window_draws_no_step_total() -> None:
     """F5: the window's face and field draw the steps so far from the shell's real step, never a fixed "2 of 5"."""
     from pathlib import Path
