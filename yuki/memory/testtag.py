@@ -26,10 +26,15 @@ skill19: the preference events those runs and exchanges wrote (an "in Arc" said,
 preference rows restated by what remains) and a false-done mark a test's repeat left on a real run
 (:func:`_purge_run_effects`).
 By the test sessions' own span (the harness drove the desktop while the user was away; these rows carry no tag): the
-know-how, the "said" taste pairings, the misheard-name aliases, the episodes, Yuki's own journal facts, the taste events
-(Yuki's picks, skips and offers) and the videos' watched / offered stamps, the moments
+"said" taste pairings, the misheard-name aliases, the episodes, Yuki's own journal facts, the taste events
+(Yuki's picks, skips and offers, and the outcomes of those offers dated after the span) and the videos' watched /
+offered stamps, the moments
 and occasions (with the preference observations fed from them) learned inside it, and the corrections said in it
-(ended, with the journal and portrait changes their pass made undone). **Except what real use confirmed** (phase 3,
+(ended, with the journal and portrait changes their pass made undone). mem22: by the spans of this purge and of earlier
+ones (:data:`KEPT_SPANS_STATE`), the know-how dated by a test exchange or inside a span at no real exchange's time
+(:func:`_purge_knowhow`; a real row it had superseded current again), the pages a test had in front and nobody saw
+outside its span (:func:`_purge_links`), and the YouTube offers' live switch when the test fed it
+(:func:`_reset_offers_off`, by the feed's own state name). **Except what real use confirmed** (phase 3,
 3.4; dots audit 18 Oct: the purge took "lumen = chill" and the Japanese playlist's meaning, learned in test sessions):
 a "said" taste row (a pairing of the user's words with a playlist, or a pick they named) or a name alias still in
 force is kept when a real exchange (no test session) holds its words - a pairing's words or an alias's heard form said
@@ -38,7 +43,8 @@ request id, else a run within :data:`CONFIRM_RUN_S` after it that no other excha
 Still in force is the "no correction afterwards": a correction drops a pairing (``taste.unsay``) or ends an alias.
 A pick row that a kept pairing (or a pairing outside the span) points at is kept too. Only test-only rows go.
 The standing rules a test session made are conversation facts resting on its exchanges only, so they go with them.
-Kept: what the screen showed in the span (screen journal facts, links seen, the hour counts of "observed" tastes), which may be real incoming content.
+Kept: what the screen showed in the span (screen journal facts, links shared in messages and pages only beside the window
+in front, the hour counts of "observed" tastes), which may be real incoming content.
 
 **Live lookups still see test runs** (review r1 M2): they say how a route or a control behaves on this PC, whoever
 asked, so a test measures the same Yuki the user runs and real evidence (a verified rung B, a false done) is never
@@ -568,6 +574,42 @@ def _refresh_prefs(conn: sqlite3.Connection, gone: Sequence[tuple[int, str]]) ->
     return out
 
 
+def _reset_offers_off(conn: sqlite3.Connection, gone_events: Sequence[tuple[int, str, float]],
+                      known: Sequence[tuple[float, float]]) -> dict[str, int]:
+    """mem22 (A2c, contract C15): the YouTube offers' live switch (``yuki.skills.youtube_feed.OFF_STATE``, by its
+    name: ``off:<epoch>``) is reset when the switch rested on the test: this purge took an offer or an outcome the live
+    check read when it switched them off (within ``youtube_feed.LIVE_DAYS`` before), or it was switched off inside a
+    live test's span (``known``: this purge's spans and the kept ones). The live check then decides again, on the
+    user's own offers only, at its next settle. Its own ``offers_off`` note goes with it. Idempotent: a second purge
+    takes no event and finds the switch on. Content-free counts."""
+    try:
+        import yuki.skills.youtube_feed as feed
+
+        off_state = str(feed.OFF_STATE)   # contract C15: the switch by its own name
+    except Exception:  # noqa: BLE001 - a build without the feed: no switch to reset
+        return {}
+    live_days = float(getattr(feed, "LIVE_DAYS", 30.0))   # the live check's window (the feed's own)
+    raw = _state_value(conn, off_state)
+    if not raw or not str(raw).startswith("off"):
+        return {}
+    try:
+        epoch = float(str(raw).split(":", 1)[1])
+    except (IndexError, ValueError):
+        return {}
+    fed = any(kind in ("offered", "outcome") and epoch - live_days * 86400.0 <= at <= epoch + 1.0
+              for _i, kind, at in gone_events)
+    inside = any(a <= epoch <= b for a, b in known)
+    if not (fed or inside):
+        return {}
+    out = {"offers_off_reset": int(conn.execute("DELETE FROM nudge_state WHERE name = ?", (off_state,)).rowcount or 0)}
+    if _has(conn, "taste_events", "kind"):
+        n = int(conn.execute("DELETE FROM taste_events WHERE kind = 'offers_off' AND at >= ? AND at < ?",
+                             (epoch, epoch + 1.0)).rowcount or 0)
+        if n:
+            out["offers_off_notes"] = n
+    return {k: v for k, v in out.items() if v}
+
+
 def _purge_run_effects(conn: sqlite3.Connection, turn_ids: set[int] | frozenset[int], questions: Sequence[int],
                        spans: Sequence[tuple[float, float]]) -> dict[str, int]:
     """skill19: what the live test's runs and exchanges left that changes later behaviour, by the test's own ids
@@ -646,15 +688,127 @@ def _purge_run_effects(conn: sqlite3.Connection, turn_ids: set[int] | frozenset[
             if between is None:
                 count("false_done_marks_cleared", conn.execute(
                     "UPDATE skill_runs SET recheck = NULL WHERE run_key = ?", (run_key,)).rowcount)
+    gone_events: list[tuple[int, str, float]] = []
     if spans and _has(conn, "taste_events", "at"):
         cond, params = _in_spans("at", spans)
+        gone_events = [(int(r[0]), str(r[1] or ""), float(r[2])) for r in conn.execute(
+            f"SELECT id, kind, at FROM taste_events WHERE {cond}", params).fetchall()]
         count("taste_events", conn.execute(f"DELETE FROM taste_events WHERE {cond}", params).rowcount)
+        # mem22 (A2c): an offer's outcome is dated OUTCOME_S after it, often past the span's end: it goes with its
+        # offer (by the offer's id in its content-free detail)
+        offers = {i for i, kind, _at in gone_events if kind == "offered"}
+        if offers:
+            outcomes = []
+            for r in conn.execute("SELECT id, at, detail FROM taste_events WHERE kind = 'outcome'").fetchall():
+                try:
+                    offer = int((json.loads(r[2]) if r[2] else {}).get("offer") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if offer in offers:
+                    outcomes.append((int(r[0]), float(r[1])))
+            gone_events += [(i, "outcome", at) for i, at in outcomes]
+            count("taste_outcomes_of_test_offers",
+                  _delete_ids(conn, "taste_events", "id", [i for i, _at in outcomes]))
+    for kind, n in _reset_offers_off(conn, gone_events, _union_spans(
+            spans, _kept_spans(_state_value(conn, KEPT_SPANS_STATE)))).items():
+        count(kind, n)
     if spans and _has(conn, "yt_videos", "watched_at"):
         for column in ("watched_at", "offered_at"):
             cond, params = _in_spans(column, spans)
             count(f"yt_videos_{column.split('_')[0]}_reset", conn.execute(
                 f"UPDATE yt_videos SET {column} = NULL WHERE {column} IS NOT NULL AND {cond}", params).rowcount)
     return out
+
+
+def _purge_knowhow(conn: sqlite3.Connection, known: Sequence[tuple[float, float]],
+                   test_ats: set[float] | frozenset[float]) -> dict[str, int]:
+    """mem22 (A2b): the know-how learned from a live test. The table carries no session, but each row is dated by
+    what it was learned from (``valid_from``): conversation memory dates the know-how it draws from exchanges
+    (``conversation`` / ``taught`` / ``failed``) at its newest cited exchange's own time, exactly; Yuki's own
+    ``remember_how`` at the moment it was written, during its run. So a row goes when its date is a test exchange's
+    time (``test_ats``, the turns this purge reads), or lies inside a test's span (``known``: this purge's and the ones
+    earlier purges kept, whose turns are gone) and is no real exchange's time there. The old rule (written inside a
+    span: ``created_at``) took a real session's know-how when the worker drew it while a test ran, and missed the
+    test's own when the worker drew it after the span. A real row a test row had superseded (a restatement: its
+    ``valid_to`` and ``superseded_by``) is current again when no row that stays carries its line on, and so is one
+    whose successor an earlier purge already took (its ``superseded_by`` names no row, or a row that did not start the
+    moment it ended: the id was given again). Idempotent. Content-free counts."""
+    if not (known or test_ats) or not _has(conn, "knowhow", "valid_from"):
+        return {}
+    real_ats: set[float] = set()
+    if known and _has(conn, "conversation_turns", "at"):
+        lo, hi = _session_range()
+        cond, params = _in_spans("at", known)
+        real_ats = {float(r[0]) for r in conn.execute(
+            f"SELECT at FROM conversation_turns WHERE NOT (session_id >= ? AND session_id < ?) AND {cond}",
+            (lo, hi, *params)).fetchall()}
+    chained = _has(conn, "knowhow", "superseded_by")
+    rows = [(int(r[0]), r[1], r[2], int(r[3]) if chained and r[3] is not None else None) for r in conn.execute(
+        f"SELECT id, valid_from, valid_to, {'superseded_by' if chained else 'NULL'} FROM knowhow").fetchall()]
+    gone: set[int] = set()
+    for kid, vfrom, _vto, _sup in rows:
+        if vfrom is None:
+            continue
+        at = float(vfrom)
+        if at in test_ats or (at not in real_ats and any(a <= at <= b for a, b in known)):
+            gone.add(kid)
+    after = {kid: sup for kid, _v, _t, sup in rows}
+    since = {kid: (float(v) if v is not None else None) for kid, v, _t, _s in rows}
+    current = {kid for kid, _v, vto, _s in rows if vto is None}
+    restore: list[tuple[int, int]] = []
+    unlink: list[tuple[int, int]] = []
+    for kid, _v, vto, sup in rows:
+        if kid in gone or sup is None or vto is None:
+            continue
+        if sup in gone:
+            j, last, seen = sup, None, set()
+            while j is not None and j in gone and j not in seen:   # the test's rows after it on its line
+                seen.add(j)
+                last, j = j, after.get(j)
+            if j is None and last in current:   # its line ended in a current test row: nothing of theirs carries it on
+                restore.append((kid, sup))
+            else:   # a row that stays carries it on (or it was ended for good): ended, its pointer to the test's cleared
+                unlink.append((kid, sup))
+        elif sup not in since or since[sup] != float(vto):
+            # its successor is gone: only a purge deletes know-how (an earlier one took a test's restatement and
+            # left this row ended; the id may since be another row's - a successor starts the moment it ended)
+            restore.append((kid, sup))
+    if not gone and not restore:
+        return {}
+    out: dict[str, int] = {}
+    expired = ", expired_at = NULL" if _has(conn, "knowhow", "expired_at") else ""
+    for kid, sup in restore:
+        n = int(conn.execute(f"UPDATE knowhow SET valid_to = NULL{expired}, superseded_by = NULL WHERE id = ? AND"
+                             " superseded_by = ?", (kid, sup)).rowcount or 0)
+        if n:
+            out["knowhow_restored"] = out.get("knowhow_restored", 0) + n
+    for kid, sup in unlink:
+        conn.execute("UPDATE knowhow SET superseded_by = NULL WHERE id = ? AND superseded_by = ?", (kid, sup))
+    _delete_ids(conn, "knowhow_vec", "knowhow_id", gone)
+    n = _delete_ids(conn, "knowhow", "id", gone)
+    if n:
+        out["knowhow"] = n
+    return out
+
+
+def _purge_links(conn: sqlite3.Connection, known: Sequence[tuple[float, float]]) -> dict[str, int]:
+    """mem22 (A2a): the pages a live test had in front, never the user's: a ``viewed`` link row whose every sighting
+    lies inside one test span (``known``: this purge's and the kept ones), opened by Yuki there (``by_yuki``) or in
+    front while the harness had the desktop. A test's episode page then never reads as the user's progress. Kept: a
+    link shared in a message and a page only beside the window in front (both may be real incoming content), and every
+    row also seen outside a span (its later sightings are the user's). Idempotent. Content-free counts."""
+    if not known or not _has(conn, "links_seen", "first_seen"):
+        return {}
+    front = "attention IS NULL" if _has(conn, "links_seen", "attention") else "1"
+    yukis = "by_yuki = 1" if _has(conn, "links_seen", "by_yuki") else "0"
+    whole = " OR ".join("(first_seen >= ? AND last_seen <= ?)" for _ in known)
+    ids = _ids(conn.execute(f"SELECT id FROM links_seen WHERE how = 'viewed' AND ({yukis} OR {front}) AND ({whole})",
+                            [x for s in known for x in s]))
+    if not ids:
+        return {}
+    _delete_ids(conn, "link_vec", "link_id", ids)
+    n = _delete_ids(conn, "links_seen", "id", ids)
+    return {"links_seen": n} if n else {}
 
 
 def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: float) -> dict[str, int]:
@@ -672,9 +826,12 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
     spans = test_spans(conn)
     lo, hi = _session_range()
     turn_ids: set[int] = set()
+    test_ats: set[float] = set()   # the test exchanges' own times (know-how is dated by the exchange it came from)
     if _has(conn, "conversation_turns", "session_id"):
-        turn_ids = set(_ids(conn.execute("SELECT id FROM conversation_turns WHERE session_id >= ? AND session_id < ?",
-                                         (lo, hi))))
+        rows = conn.execute("SELECT id, at FROM conversation_turns WHERE session_id >= ? AND session_id < ?",
+                            (lo, hi)).fetchall()
+        turn_ids = {int(r[0]) for r in rows}
+        test_ats = {float(r[1]) for r in rows if r[1] is not None}
     # journal facts conversation memory drew from test exchanges (their provenance names the exchange), and Yuki's
     # own facts written inside the test's span
     gone_journal: set[int] = set()
@@ -812,13 +969,14 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
                 part).rowcount)
     count("occasions", _delete_ids(conn, "occasions", "id", occ))
     count("moments", _delete_ids(conn, "moments", "id", moment_ids))
+    # mem22 (A2a, A2b): the test's spans with the ones earlier purges kept (their turns are gone, their rows may not be)
+    known = _union_spans(spans, _kept_spans(_state_value(conn, KEPT_SPANS_STATE)))
+    for kind, n in _purge_knowhow(conn, known, test_ats).items():
+        count(kind, n)
+    for kind, n in _purge_links(conn, known).items():
+        count(kind, n)
     if spans:
         # learned inside the test's span; none of these rows carries a session
-        if _has(conn, "knowhow", "created_at"):
-            cond, params = _in_spans("created_at", spans)
-            kh = _ids(conn.execute(f"SELECT id FROM knowhow WHERE {cond}", params))
-            _delete_ids(conn, "knowhow_vec", "knowhow_id", kh)
-            count("knowhow", _delete_ids(conn, "knowhow", "id", kh))
         uses: list[tuple[float, str]] | None = None
         if _has(conn, "tastes", "source"):
             # phase 3 (3.4): a pairing or a named pick the user's real use confirmed is kept; only test-only rows go

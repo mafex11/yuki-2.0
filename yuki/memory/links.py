@@ -23,7 +23,12 @@ Public API::
     embed_call_digests(store, embedder, limit=64) -> int                 # vectors for call digests (whole-memory ranking)
     link_text(link) -> str                                               # what a link is embedded as
     search(store, embed, query=None, *, since=None, until=None, how=None, limit=10) -> list[LinkSeen]
-    describe(link, seconds=None, now=None) -> str
+    describe(link, seconds=None, now=None, own_last=None) -> str
+    own_visits(store, page_keys, *, since=None, now=None) -> {page_key: end}   # the user's own newest stretch (S19)
+    own_days(store, hosts, *, since, now=None) -> {host: days}                 # days they had its pages in front
+
+A page's ``last_seen`` moves with every sighting, a page Yuki opened (or a live test) included; how far the user
+themselves got is read from their own timeline rows (:func:`own_visits`, mem22 S19: "where I left off").
 """
 
 from __future__ import annotations
@@ -159,6 +164,9 @@ def sync(store: Any, *, embedder: Any = None, full: bool = False, now: float | N
                 continue
             items.append({"url": r["url"], "how": "viewed", "title": r["title"], "host": r["host"] or _host(r["url"]),
                           "app": r["app"], "at": r["first_seen"], "until": r["last_seen"], "visit": False,
+                          # mem22 (A2a, S19): a page only ever captured while Yuki acted is Yuki's (its row was
+                          # written as the user's here, so no row ever kept by_yuki: 0 of 1,742 on 19 Oct)
+                          "by_yuki": bool(r.get("by_yuki")),
                           "capture_thread_id": r["id"], "work_thread_id": _work_of(store, r["id"], work_cache),
                           # a page only ever read beside the window in front (migration 24): weaker evidence
                           "attention": None if r.get("front", True) else "visible"})
@@ -283,13 +291,18 @@ def search(store: Any, embed: Callable[[list[str]], Any] | None, query: str | No
     return scored[: max(0, int(limit))]
 
 
-def describe(link: Any, seconds: float | None = None, now: float | None = None) -> str:
-    """One line: ``"Title" - https://... (github.com; viewed in Google Chrome, last Tue 29 Sep 03:40, 4 min in front,
-    3 visits)``, or for a shared link who sent it and where."""
-    now = time.time() if now is None else float(now)
-    last = datetime.fromtimestamp(link.last_seen)
-    when = last.strftime("today %H:%M") if last.date() == datetime.fromtimestamp(now).date() else last.strftime(
+def _when(at: float, now: float) -> str:
+    stamp = datetime.fromtimestamp(float(at))
+    return stamp.strftime("today %H:%M") if stamp.date() == datetime.fromtimestamp(now).date() else stamp.strftime(
         "%a %d %b %H:%M")
+
+
+def describe(link: Any, seconds: float | None = None, now: float | None = None, own_last: float | None = None) -> str:
+    """One line: ``"Title" - https://... (github.com; viewed in Google Chrome, last Tue 29 Sep 03:40, 4 min in front,
+    3 visits)``, or for a shared link who sent it and where. ``own_last`` (S19: :func:`own_visits`): when the user's own
+    last visit ended, said when the page was seen later than that (Yuki or a test had it up again)."""
+    now = time.time() if now is None else float(now)
+    when = _when(link.last_seen, now)
     title = f"\"{' '.join((link.title or '').split())[:120]}\" - " if link.title else ""
     bits = [link.host or ""]
     if link.how == "shared":
@@ -305,9 +318,75 @@ def describe(link: Any, seconds: float | None = None, now: float | None = None) 
             bits.append(f"{minutes} min in front" if minutes else f"{int(seconds)} s in front")
         if link.visits > 1:
             bits.append(f"{link.visits} visits")
+        if own_last is not None and float(link.last_seen) - float(own_last) > 60.0:
+            bits.append(f"their own last visit {_when(own_last, now)} (the later sighting was not theirs)")
     if link.by_yuki:
         bits.append("opened by Yuki at the user's request")
     return f"{title}{link.url} ({'; '.join(b for b in bits if b)})"
+
+
+def _own_rows(store: Any, sql: str, args: Sequence[Any], lo: float, hi: float) -> list[Any]:
+    """A timeline read (alias ``t``; ``{own}`` where the conditions go) of the user's own rows only: ``by_yuki = 0``,
+    never a row inside a page visit memory attributes to Yuki (``yuki.skills.web_route.own_rows_query``: a ``page``
+    moment ``by = 'yuki'``, the visit whose first stretch began while Yuki acted), never one inside a live test's span
+    (``yuki.memory.testtag.store_test_spans``). Raises what the read raises."""
+    cond, cond_args = "1", []
+    try:
+        from yuki.memory.testtag import sql_outside_spans, store_test_spans
+
+        cond, cond_args = sql_outside_spans("t.started_at", [(a, b) for a, b in store_test_spans(store)
+                                                             if b >= lo and a <= hi])
+    except Exception:  # noqa: BLE001 - no spans known: every row counts
+        pass
+    sql = sql.replace("{own}", f" AND t.by_yuki = 0 AND {cond}{{own}}")
+    args = (*args, *cond_args)
+    try:
+        from yuki.skills.web_route import own_rows_query
+    except Exception:  # noqa: BLE001 - a build without the browser drivers: Yuki's own rows by their mark only
+        return store._query(sql.replace("{own}", ""), args)
+    return own_rows_query(store, sql, args, alias="t")
+
+
+def own_visits(store: Any, page_keys: Sequence[str], *, since: float | None = None,
+               now: float | None = None) -> dict[str, float]:
+    """S19 (mem22): ``{page_key: when the user's own newest stretch on that page ended}``, from the timeline's rows with
+    them present (:func:`_own_rows`: never a page Yuki opened, nor a test's), ``since`` on. A page with none is left
+    out. Content-free (the keys are digests). Never raises (``{}``)."""
+    keys = sorted({str(k) for k in page_keys if k})
+    if not keys:
+        return {}
+    now = time.time() if now is None else float(now)
+    lo = float(since) if since is not None else 0.0
+    out: dict[str, float] = {}
+    try:
+        for i in range(0, len(keys), 400):
+            part = keys[i:i + 400]
+            for key, last in _own_rows(
+                    store, f"SELECT t.page_key, max(coalesce(t.ended_at, t.started_at)) FROM timeline t WHERE "
+                    f"t.page_key IN ({','.join('?' * len(part))}) AND t.state = 'present' AND t.started_at >= ? "
+                    "AND t.started_at <= ?{own} GROUP BY t.page_key", (*part, lo, now), lo, now):
+                if key and last is not None:
+                    out[str(key)] = float(last)
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
+def own_days(store: Any, hosts: Sequence[str], *, since: float, now: float | None = None) -> dict[str, int]:
+    """S19 (mem22): ``{host: on how many days since ``since`` the user had its pages in front themselves}``
+    (:func:`_own_rows`; local days). Content-free. Never raises (``{}``)."""
+    wanted = sorted({str(h) for h in hosts if h})
+    if not wanted:
+        return {}
+    now = time.time() if now is None else float(now)
+    try:
+        rows = _own_rows(store, f"SELECT t.host, count(DISTINCT date(t.started_at, 'unixepoch', 'localtime')) FROM "
+                         f"timeline t WHERE t.host IN ({','.join('?' * len(wanted))}) AND t.state = 'present' AND "
+                         "t.started_at >= ? AND t.started_at <= ?{own} GROUP BY t.host", (*wanted, float(since), now),
+                         float(since), now)
+    except Exception:  # noqa: BLE001
+        return {}
+    return {str(h): int(n or 0) for h, n in rows if h}
 
 
 def seconds_of(store: Any, links: Sequence[Any]) -> dict[int, float]:
