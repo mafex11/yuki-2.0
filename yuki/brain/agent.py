@@ -132,6 +132,11 @@ LEVEL_LABELS: dict[str, str] = {"verified": "Checked on screen", "likely": "Like
 LINE_UNCONFIRMED = "I tried, but I couldn't confirm it worked."
 #: ``where``: " " and the step in plain words (" partway" when that step is unknown), or "" when nothing ran.
 LINE_STUCK = "I got stuck{where}{why}. Try another way?"
+#: desk20 (final-D S20, k_t3_draft "I got stuck typing. Try another way?"): a request that ended stuck on an act step
+#: whose own report said it did not take, from the executor's code facts (``ending_facts`` ``stuck_what``: the step
+#: and the app it acts in, "typing in T3 Code"; ``stuck_rest``: the plan's act steps after it, in the island's words).
+LINE_STUCK_WHAT = "I got stuck {what}{why}, so I left it there. Try another way?"
+LINE_STUCK_REST = "I got stuck {what}{why}, so I didn't do the rest ({rest}). Try another way?"
 #: A part's line, held while the planner did the rest of the request, when the budget or the replans ran out before
 #: the planner said it was all done: what the part's check saw, and that the rest isn't.
 LINE_REST_UNDONE = "{line}; I couldn't get the rest done."
@@ -2458,8 +2463,9 @@ class Brain:
         state.held = state.tidy_held = (line, outcome)
         self._push(Say(line))
         self.logger.log("brain_tidy", given=True, mode=mode, status=result.status, said_first=True)
+        # desk20 (final-D S1 fallback): the one legal step the executor measured (``""``: none), in the plan's terms
         report = tidy_report(plan, line, result.after, nonce=str(getattr(host, "nonce", "") or ""),
-                             ask=mode == TIDY_ASK, steps=TIDY_STEPS)
+                             ask=mode == TIDY_ASK, steps=TIDY_STEPS, step=str(getattr(result, "after_step", "") or ""))
         conv.add_user([tool_result(tool_id, report), *extra, *self._steer_turn(host)])
         return True
 
@@ -2765,8 +2771,18 @@ class Brain:
             # x10: a reason is a code word (or an executor's note) for the planner and the log: only the few with
             # plain words of their own are said; any other is left out
             why = plain_reason(last.reason, refused=last.status == "refused")
+        stuck_what = " ".join(str(facts.get("stuck_what") or "").split())
+        stuck_rest = " ".join(str(facts.get("stuck_rest") or "").split())
         if last is not None and last.line and last.status in ("mismatch", "refused"):
             line = last.line
+        elif stuck_what:
+            # desk20 (final-D S20, k_t3_draft): the step that did not take, with its app, and what was left after it,
+            # from code facts (the executor's, as its input-gate stop line words them); never the plan's free text
+            why_part = f": {why}" if why else ""
+            line = (LINE_STUCK_REST.format(what=stuck_what, why=why_part, rest=stuck_rest) if stuck_rest
+                    else LINE_STUCK_WHAT.format(what=stuck_what, why=why_part))
+            if facts.get("did"):
+                line = f"{facts['did'].rstrip('. ')}, then {line}"
         elif facts.get("did") and where and where != "partway":
             line = LINE_STUCK_AFTER.format(did=facts["did"], stuck=where, why=f": {why}" if why else "")
         else:

@@ -3998,6 +3998,46 @@ def _registered_browser_images() -> frozenset[str]:
     return got
 
 
+#: :func:`web_app`'s answers per program image (RAM only, this process).
+_WEB_APPS: dict[str, bool] = {}
+
+
+def web_app(process: str, pid: object = None) -> bool:
+    """Whether a program is a web browser by machine data (kHands r1 M6; moved here from ``yuki.voice.hands`` by
+    desk20 so the tab hand's keyboard rung asks the same): Windows lists it as a desktop browser
+    (:func:`_registered_browser_images`), or (``pid`` of the real desktop given) it is a packaged app whose own manifest
+    declares web addresses (a ``windows.protocol`` for http or https: Arc). Never a list of browsers. Read-only, kept
+    per image; never raises (``False``)."""
+    image = str(process or "").strip().lower()
+    if not image:
+        return False
+    if image in _WEB_APPS:
+        return _WEB_APPS[image]
+    try:
+        if image in _registered_browser_images():
+            _WEB_APPS[image] = True
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+    if pid is None:
+        return False
+    try:
+        from yuki.core.appnames import WindowsProbe
+
+        probe = WindowsProbe()
+        full, _aumid = probe.package_of_process(int(pid))
+        root = probe.package_path(full) if full else ""
+        found = False
+        if root:
+            tree = ElementTree.parse(os.path.join(root, "AppxManifest.xml")).getroot()
+            found = any(str(el.tag).rsplit("}", 1)[-1] == "Protocol"
+                        and str(el.get("Name") or "").lower() in ("http", "https") for el in tree.iter())
+    except Exception:  # noqa: BLE001 - unknown this time: asked again next time
+        return False
+    _WEB_APPS[image] = found
+    return found
+
+
 def _takes_addresses(chosen: dict[str, str], identity: _AppIdentity, target: str, details: dict) -> bool:
     """Whether the app is a web browser by machine data, so its own address bar may take the address: a packaged app
     whose manifest declares the address's scheme (``windows.protocol``: Arc declares http and https), or a desktop
@@ -4102,9 +4142,16 @@ def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: 
                      "via_word": "address_bar", "page_targets": [target], "launched": bool(hd.get("launched")),
                      "handoff": {k: hd.get(k) for k in ("via", "via_word", "reason", "page_state", "launched",
                                                         "protocol_refused") if k in hd}}
+    if isinstance(hd.get("timings_ms"), dict):
+        # desk20 (final-D S21): the hand-off's own stage ends ride along, so a hand that logs them shows where its time
+        # went before the address bar (code words and numbers only)
+        details["timings_ms"] = dict(hd["timings_ms"])
 
     def finish(ok: bool, summary: str, stage: str) -> ActionResult:
         details["bar_stage"] = stage
+        if isinstance(details.get("timings_ms"), dict):
+            # the address bar's own duration (ms from its start, not the hand-off's clock)
+            details["timings_ms"]["bar"] = round((time.perf_counter() - started) * 1000.0, 1)
         details.setdefault("verified", True if ok and details.get("page_verified") else (False if not ok else None))
         return ActionResult(ok=ok, summary=summary, details=details,
                             elapsed_ms=(time.perf_counter() - started) * 1000.0)

@@ -136,6 +136,13 @@ _WATCH_S = 0.8
 _POLL_S = 0.05
 #: How long an opened page may take to get its title (the page is at the address before it has one).
 _TITLE_WAIT_S = 6.0
+#: desk20 (final-D S21, browser B4: deji_arc took 18.5 s through this hand, launch 3.7 s + a 6.1 s title wait Arc's
+#: strip can never end): the open_url hand's launch answers by this deadline (s), as the web skill's rungs answer by
+#: theirs; the title wait then gets what is left of it, at least _TITLE_FLOOR_S, at most _TITLE_WAIT_S. A browser with no
+#: tab strip is read by its main page, each read within _MAIN_PAGE_READ_S.
+_OPEN_URL_S = 10.0
+_TITLE_FLOOR_S = 2.0
+_MAIN_PAGE_READ_S = 0.8
 #: The foreground window's tabs are read within this when the summary needs them now.
 _TABS_BUDGET_S = 0.15
 #: A tab strip read ahead (when the user starts talking) serves a summary for this long, while the
@@ -213,18 +220,43 @@ _AFTER_ASK_NOTE = (
     "theirs: what they asked for stays; when your own act left a side effect worth undoing, ask in a few words whether "
     "to (the question alone, no call; their yes is the ask); otherwise stay quiet."
 )
+#: desk20 (final-D S1 fallback, desk-tidy RC-A: 0 of 14 window-flagged looks under "all" got their step; the one look
+#: that named its step, left_silent's, got it in both brains): with a window flag up and the one legal step measured
+#: (``diff.tidy_step``), the result carries code's classification (``side_effect``) and that step in the window hand's
+#: terms (``one_step``), and the principle has no "otherwise stay quiet" default.
+_AFTER_STEP_NOTE = (
+    "Done and verified; said is what was heard already. After is what your act did to their screen, and side_effect is "
+    "code's measure of the part that is yours, not what they asked for. Undo it now: call the window hand exactly as "
+    "one_step gives it, alone, with say_when_done a few words of what you put back. Stay quiet instead only when their "
+    "words asked for that very change."
+)
+#: ... and with the tidy dial at "ask": the same, a question instead of the step.
+_AFTER_STEP_ASK_NOTE = (
+    "Done and verified; said is what was heard already. After is what your act did to their screen, and side_effect is "
+    "code's measure of the part that is yours, not what they asked for. Ask in a few words whether to undo it as "
+    "one_step would (the question alone, no call; their yes is the ask), unless their words asked for that very change."
+)
 #: Integration review c2desk-2 (desk19 merge note 6, all-desk RC2): with the After lines when the measure shows what
-#: they asked for did not reach its purpose (``left_silent``, a tab of the act's over what played), whatever the tidy
-#: dial says: the look's one step may then be a volume step (:meth:`handle`).
+#: they asked for did not reach its purpose (``left_silent``), whatever the tidy dial says: the look's one step may
+#: then be a volume step (:meth:`handle`). desk20 (S3): a tab of the act's over what played is said by code
+#: (``diff.cover_line``), so it is no longer the talker's to say.
 _AFTER_PURPOSE = (
-    " When After shows what they asked for did not reach its purpose (a sound still silent, or what played now behind "
-    "another tab), finish it with one step (a volume step, for a sound still silent) or say so in a few words."
+    " When After shows what they asked for did not reach its purpose (a sound still silent), finish it with one step "
+    "(a volume step) or say so in a few words."
 )
 #: ... and the look's principle with the tidy dial off: no window tidy-up, only that.
 _AFTER_PURPOSE_NOTE = (
     "Done and verified; said is what was heard already. After is what your act did to their screen; their windows "
     "stay as they are." + _AFTER_PURPOSE + " Otherwise stay quiet."
 )
+
+
+def _one_step_call(step: dict[str, Any]) -> dict[str, Any]:
+    """desk20: ``diff.tidy_step``'s step as the window hand's own arguments (what the look's tidy check allows: a move
+    of one of the act's windows, or the front given back to the window the act took it from)."""
+    if step.get("action") == "place":
+        return {"action": "move", "window": int(step["hwnd"]), "monitor": str(step.get("monitor") or "other")}
+    return {"action": "focus_back", "window": int(step["hwnd"])}
 #: A placement verb that did not take effect: said plainly, no other hand (never a loop of tidy-ups).
 _PLACE_FAILED_NOTE = (
     "It did not take effect, as the report says. Say so in a few words if they asked for it; if it was your own "
@@ -279,6 +311,14 @@ _NOOP_NOTE = (
     "Nothing changed: it was already there, as the report says. Say that in a few words, never that you turned it up "
     "or down, and offer the volume that may be the low one (the app's own player volume or the system volume, as the "
     "report names them). No other hand and no hand-off unless they say which."
+)
+#: desk20 (final-D S22b, multi_open_then_close all t2: "tab show" of the tab Yuki had just opened, already in front, was
+#: said as "YouTube's up front in Chrome."): a step whose own read says it changed nothing (its window was in front and
+#: the tab already the one showing) is never said as done.
+_UNCHANGED_NOTE = (
+    "Nothing changed: it was already in front and showing before this step, as the report says. Never say it as done "
+    "or as something you did. If their newest words asked for something else, do that now with one call; else say in a "
+    "few words that it was already up."
 )
 #: What the talker reads when an app was handed to its launcher and its own window is not up yet (appOpen, 5 Oct).
 _STARTING_NOTE = (
@@ -581,7 +621,14 @@ _REST_LEFT_NOTE = ("Not all done: the rest of their request could not go on, and
 _AFTER_REST = {"act": (" After is what that run did to their screen: what they asked for stays; your own side effect "
                        "is undone with one undoable step (window move, focus_back) once the rest is done."),
                "ask": (" After is what that run did to their screen: what they asked for stays; once the rest is done, "
-                       "ask in a few words whether to undo your own side effect.")}
+                       "ask in a few words whether to undo your own side effect."),
+               # desk20 (S1 fallback): with code's classification (side_effect) and the one legal step (one_step)
+               "act_step": (" After is what that run did to their screen; side_effect is code's measure of the part "
+                            "that is yours: once the rest is done, undo it with the window hand exactly as one_step "
+                            "gives it, unless their words asked for that very change."),
+               "ask_step": (" After is what that run did to their screen; side_effect is code's measure of the part "
+                            "that is yours: once the rest is done, ask in a few words whether to undo it as one_step "
+                            "would.")}
 #: Phase 2 (2.3): a non-success outcome of a hand or a skill run (not confirmed, failed, held, blocked, stopped, timed
 #: out) is said by the talker in its own words from the evidence (the report), never a code template; code's own line
 #: waits in the owed ledger and is said only when the talker's run is not heard in time (``VoiceBridge.owe_line``).
@@ -2297,7 +2344,13 @@ class Hands:
         run: ``{"after": the diff in plain words, "how_to_handle_it": the principle}``; else ``None`` (the done line ends the call, as before: no run, no cost). At most one look per user
         turn (never a loop), kept with the act's own windows and, when the act took the focus, the window that was in
         front (what a tidy step may touch, :meth:`_look_check`); the window in front before an act that moved the focus
-        is kept for focus_back. Logs content-free. Never raises."""
+        is kept for focus_back. Logs content-free. Never raises.
+
+        desk20 (final-D): the look is given for a window flag (dial not off) or a sound left silent; with a window flag
+        the result also carries ``flags``, and when ``diff.tidy_step`` finds the one legal step, ``side_effect`` (code's
+        classification) and ``one_step`` (the window hand's arguments), with :data:`_AFTER_STEP_NOTE` (no "otherwise
+        stay quiet"). A tab of the act's over what played is said by code at once (``diff.cover_line``) and comes back
+        as ``"_cover"`` (the callers add it to ``said``); with nothing else to look at, ``{"_cover": line}`` alone."""
         if before is None:
             return None
         try:
@@ -2332,37 +2385,70 @@ class Hands:
                 self._front_before = None   # an act of a later turn that moved no focus: an older front is let go
             level = self._tidy_level() if d.any_flag else ""
             # integration review c2desk-2: what they asked for that did not reach its purpose (measured: the sound left
-            # silent, a tab of the act's over what played) is theirs to hear whatever the dial says; the dial gates
-            # only the window tidy-up
-            purpose = bool(d.flags.get("left_silent")) or any(c.get("kind") == "tab" and c.get("side_effect")
-                                                              for c in d.covered)
-            look = bool(d.any_flag and (purpose or level != "off") and self._look_now(turn) is None)
+            # silent) is theirs to hear whatever the dial says; the dial gates only the window tidy-up. desk20 (final-D
+            # S3): a tab of the act's over what played is said by code right after the done line (``diff.cover_line``,
+            # the measured sentence: no window step can touch a tab), never left to a model round
+            purpose = bool(d.flags.get("left_silent"))
+            cover = desk_diff.cover_line(d) if self._look_now(turn) is None else ""
+            windowed = desk_diff.window_flag(d)
+            look = bool(d.any_flag and (purpose or (windowed and level != "off")) and self._look_now(turn) is None)
             text = desk_diff.render(d, max_chars=AFTER_CHARS) if look else ""
+            off = level == "off"
+            taken = bool(d.flags.get("focus_taken")) and d.focus_from
+            acts_now = set() if off else self._act_windows(after, d, acted, touched)
+            front = int(d.focus_from) if taken and not off else None
+            # desk20 (final-D S1 fallback): code's own classification of the flag and the one legal step (measured:
+            # the act's windows, the front it took, the monitors), so the decider is never left to judge it unaided
+            step = (desk_diff.tidy_step(d, acts_now, front, len(getattr(after, "monitors", None) or ()))
+                    if look and windowed and not off else None)
             if self.log is not None:
                 self.log.event("hands", op=name, after_look=bool(text), tidy=level or None, call=params.tool_call_id,
+                               tidy_step=(step or {}).get("action"), cover_said=bool(cover),
                                **{f"after_{k}": v for k, v in d.facts().items()})
+            if cover:
+                cover = await self._say_cover(params, cover)
             if not text:
-                return None
+                if cover and isinstance(kept, dict) and kept.get("desk") is before:
+                    kept["looked"] = True   # said once: a later act of the turn never says the same cover again
+                return {"_cover": cover} if cover else None
             if isinstance(kept, dict) and kept.get("desk") is before:
                 kept["looked"] = True   # its one look was given: a later act of the turn starts a before of its own
-            taken = bool(d.flags.get("focus_taken")) and d.focus_from
             # review r1 L3: ``rest``: the look rides with a "still to do" look, so the calls after it are not held to
             # the one tidy step (:meth:`handle`)
             # integration review c2desk-2: with the dial off no window step is the look's (no act windows, no front);
             # ``silent`` lets its one step be a volume step (:meth:`handle`)
-            off = level == "off"
-            self._look = {"turn": turn, "at": time.monotonic(),
-                          "acts": set() if off else self._act_windows(after, d, acted, touched),
-                          "front": int(d.focus_from) if taken and not off else None, "used": False,
+            self._look = {"turn": turn, "at": time.monotonic(), "acts": acts_now, "front": front, "used": False,
                           "rest": bool(rest), "silent": bool(d.flags.get("left_silent")), "ask": level == "ask",
-                          "off": off, "purpose": purpose}
-            note = _AFTER_PURPOSE_NOTE if off else (_AFTER_ASK_NOTE if level == "ask" else _AFTER_NOTE) + (
-                _AFTER_PURPOSE if purpose else "")
-            return {"after": text, "how_to_handle_it": note}
+                          "off": off, "purpose": purpose, "step": step}
+            out: dict[str, Any] = {"after": text, "flags": [k for k, v in d.flags.items() if v]}
+            if step is not None:
+                # desk20: the step in the window hand's own terms, and the note without "otherwise stay quiet"
+                out["side_effect"] = step["says"]
+                out["one_step"] = _one_step_call(step)
+                note = (_AFTER_STEP_ASK_NOTE if level == "ask" else _AFTER_STEP_NOTE) + (
+                    _AFTER_PURPOSE if purpose else "")
+            else:
+                note = _AFTER_PURPOSE_NOTE if off else (_AFTER_ASK_NOTE if level == "ask" else _AFTER_NOTE) + (
+                    _AFTER_PURPOSE if purpose else "")
+            out["how_to_handle_it"] = note
+            if cover:
+                out["_cover"] = cover
+            return out
         except Exception as exc:  # noqa: BLE001 - no look: the done line ends the call as before
             if self.log is not None:
                 self.log.event("hands", op=name, after_error=type(exc).__name__)
             return None
+
+    async def _say_cover(self, params: Any, cover: str) -> str:
+        """desk20 (final-D S3): code says the measured tab-cover sentence (``diff.cover_line``) right after the act's
+        done line, in the same voice; ``cover`` when it went out, ``""`` when it could not be queued. Never raises."""
+        try:
+            from pipecat.frames.frames import TTSSpeakFrame
+
+            await params.llm.push_frame(TTSSpeakFrame(text=cover))
+            return cover
+        except Exception:  # noqa: BLE001 - not said: the look (if any) still shows it in After
+            return ""
 
     def _place_verbs(self) -> Any:
         """Where the placement verbs run: the backend's own (a stand-in desk's ``place_window`` / ``focus_back`` /
@@ -2995,6 +3081,11 @@ class Hands:
                           and queued)
         if first_step:
             line, coded = "", True
+        # desk20 (final-D S22b): a step its own read says changed nothing (the window in front, the tab already the one
+        # showing) is never said as done; the talker hears that nothing changed (below)
+        unchanged = bool(confirmed and facts.get("unchanged") and not rest and not queued)
+        if unchanged:
+            line, coded = "", False
         speak = bool(line) and confirmed and not rest
         said_key = ""
         if speak:
@@ -3030,6 +3121,8 @@ class Hands:
             self.log.event("hands", op=name, ok=ok, ms=ms, report_chars=len(report), call=params.tool_call_id,
                            done_line=speak, request_id=hand_id, refused_why=why,
                            refused_at=facts.get("refused_at"), action=(op or None),
+                           # desk20 (S21): a launch's stage ends (code words and numbers only)
+                           **({"stage_ms": facts["stage_ms"]} if isinstance(facts.get("stage_ms"), dict) else {}),
                            **{k: v for k, v in facts.items()
                               if (isinstance(v, (int, float, bool)) or v is None)
                               and k not in ("question", "request_id", "refused_why", "refused_at")})
@@ -3048,6 +3141,9 @@ class Hands:
             return
         if facts.get("halted"):
             await self._halted_result(params, report)   # lVoice (problem 7): not tried, never a failure of its own
+            return
+        if unchanged:
+            await params.result_callback({"no_change": report[:700], "how_to_say_it": _UNCHANGED_NOTE})
             return
         if confirmed and rest and queued:
             # lVoice (problem 3): the reply's next call is already waiting: it runs now for the rest (no settle wait,
@@ -3139,11 +3235,13 @@ class Hands:
                 await params.llm.push_frame(TTSSpeakFrame(text=line))
             # P1.3: the done line is queued; only an act that took something the user had gets one more run
             look = await self._look_after(params, name, args, facts, desk_before)
-            if look is not None:
-                await params.result_callback({"done": report[:700], "said": line if speak else "", **look})
+            cover = str((look or {}).pop("_cover", "") or "")   # desk20 (S3): said by code after the done line
+            said = " ".join(x for x in (line if speak else "", cover) if x)
+            if look:
+                await params.result_callback({"done": report[:700], "said": said, **look})
                 return
-            await params.result_callback({"done": report[:700], "said": line if speak else "",
-                                          "how_to_handle_it": _SAID_NOTE if speak else _SILENT_NOTE},
+            await params.result_callback({"done": report[:700], "said": said,
+                                          "how_to_handle_it": _SAID_NOTE if said else _SILENT_NOTE},
                                          properties=FunctionCallResultProperties(run_llm=False))
             return
         if facts.get("held"):
@@ -4377,21 +4475,28 @@ class Hands:
                                        "report": report[:REST_REPORT_CHARS]}
             note = self._note(_STEP_THEN_NOTE, _PART_THEN_NOTE_LEAN).format(rest=rest[:200])
             extra: dict[str, Any] = {}
+            said = line
             if not facts.get("keep_question"):
                 # review r1 L3: the run's after-look rides with this look when it flags (one talker run; the rest's
                 # calls stay open: the look is marked as one with a rest)
                 look = await self._look_after(params, name, args, facts, before, rest=True)
-                if look is not None:
+                cover = str((look or {}).pop("_cover", "") or "")   # desk20 (S3): said by code after the line
+                said = " ".join(x for x in (line, cover) if x)
+                if look:
                     kept = self._look or {}
-                    extra = {"after": look.get("after")}
+                    extra = {"after": look.get("after"), "flags": look.get("flags") or []}
+                    if look.get("one_step"):
+                        # desk20 (S1 fallback): code's classification and the one legal step ride with the rest
+                        extra.update(side_effect=look.get("side_effect"), one_step=look.get("one_step"))
                     if not kept.get("off"):
-                        note += _AFTER_REST["ask" if kept.get("ask") else "act"]
+                        note += _AFTER_REST[("ask" if kept.get("ask") else "act")
+                                            + ("_step" if look.get("one_step") else "")]
                     if kept.get("purpose"):
                         note += _AFTER_PURPOSE   # integration review c2desk-2
             if self.log is not None:
                 self.log.event("hands", op=name, then_open=True, steps=1, sent_turn=sent, after_look=bool(extra),
                                call=params.tool_call_id)
-            await params.result_callback({"done": report[:700], "said": line, "then": rest[:200], **extra,
+            await params.result_callback({"done": report[:700], "said": said, "then": rest[:200], **extra,
                                           "how_to_handle_it": note})
             return
         if line and talk and self._owe_fallback(line):
@@ -4407,11 +4512,13 @@ class Hands:
             look = None
             if verified and not facts.get("keep_question"):
                 look = await self._look_after(params, name, args, facts, before)
-            if look is not None:
-                await params.result_callback({"done": report[:700], "said": line, **look})
+            cover = str((look or {}).pop("_cover", "") or "")   # desk20 (S3): said by code after the done line
+            said = " ".join(x for x in (line, cover) if x)
+            if look:
+                await params.result_callback({"done": report[:700], "said": said, **look})
                 return
-            await params.result_callback({"done" if verified else "result": report[:700], "said": line,
-                                          "how_to_handle_it": self._SKILL_SAID_NOTE.format(line=line)},
+            await params.result_callback({"done" if verified else "result": report[:700], "said": said,
+                                          "how_to_handle_it": self._SKILL_SAID_NOTE.format(line=said)},
                                          properties=FunctionCallResultProperties(run_llm=False))
             return
         if facts.get("unsure_focus"):
@@ -6033,6 +6140,11 @@ class Hands:
             result = select(hwnd, index, expect_name=title)
         ok, report, facts = self._report(result, lead, facts)
         facts["verified"] = bool(_detail(result, "verified")) if ok else False
+        if ok and not lead and _detail(result, "how") == "already showing":
+            # desk20 (final-D S22b, multi_open_then_close all t2: "tab show" on the tab already in front was spoken as
+            # "YouTube's up front in Chrome."): its window was in front and the tab already the selected one, read by
+            # the hand itself, so this step changed nothing and is never said as done (:data:`_UNCHANGED_NOTE`)
+            facts["unchanged"] = True
         return ok, report, facts
 
     # -- kHands: a tab found by what it is, in any window of the browser they named --------------------------------
@@ -6426,11 +6538,21 @@ class Hands:
             raise _Refused("no address given")
         app = str(args.get("app") or "").strip() or None
         facts["sent_at"] = time.monotonic()
-        result = self.backend.open_url(url, app=app) if app else self.backend.open_url(url)
+        # desk20 (final-D S21, browser B4: Arc through this hand took ~18 s, always unverified): the launch answers by a
+        # deadline, as the web skill's rungs do (a backend that takes one: probed, never assumed)
+        end = time.monotonic() + _OPEN_URL_S
+        opener = self.backend.open_url
+        kw: dict[str, Any] = {"app": app} if app else {}
+        if _takes_kw(opener, "deadline"):
+            kw["deadline"] = end
+        result = opener(url, **kw)
         ok, report, facts = self._report(result, "", facts)
         details = getattr(result, "details", None) or {}
         page = details.get("page") if isinstance(details.get("page"), dict) else {}
         hwnd = details.get("hwnd")
+        stages = _stage_ms(details.get("timings_ms"))
+        if stages:
+            facts["stage_ms"] = stages   # desk20 (S21): where the launch's time went (code words and numbers only)
         if hwnd:
             facts["live_hwnd"] = hwnd   # lVoice: the action log's line holds while this window (and tab, below) does
         if ok and not details.get("page_targets") and "page_verified" not in details:
@@ -6447,12 +6569,26 @@ class Hands:
         title = str(page.get("title") or "")
         titled = bool(title) and title != str(page.get("url") or "")
         waited = time.monotonic()
-        deadline = waited + _TITLE_WAIT_S
+        # desk20 (S21): the title wait answers by the hand's deadline too (at least _TITLE_FLOOR_S of it)
+        wait_s = min(_TITLE_WAIT_S, max(_TITLE_FLOOR_S, end - waited))
+        deadline = waited + wait_s
         can_read = callable(getattr(self.backend, "read_tabs", None))
+        stripless = False
+        tab = None
         while True:
-            tab = self._selected_tab(hwnd)
+            if not stripless:
+                tab = self._selected_tab(hwnd)
+                # desk20 (S21): a browser that draws no tab strip (Arc: "shows no tabs") is read by its main page
+                # instead (the page-only reader the rungs use), never waited on for a tab title it can't show
+                stripless = tab is None and can_read and self._no_strip(hwnd)
+                if stripless:
+                    facts["by_page"] = True
             if not titled and tab is not None and tab[1] and not _is_address(tab[1]):
                 titled, title = True, tab[1]
+            if not titled and stripless:
+                shown = self._main_page_title(hwnd, str(page.get("url") or url), deadline)
+                if shown:
+                    titled, title = True, shown
             if titled or not can_read or time.monotonic() >= deadline:
                 break
             time.sleep(_POLL_S * 2)
@@ -6463,10 +6599,53 @@ class Hands:
         # The verified facts first (they are what the action log and the thinker need), then the
         # opening's own report.
         where = f"it is tab {tab[0]} of {tab[2]} in window {hwnd}, \"{tab[1]}\", now showing; " if tab else ""
+        if not tab and stripless:
+            where = f"window {hwnd} (no tab strip: read by its page) shows it; "
         # (tab[3]: its identity, for the action log only)
         state = (f"the page has its title (\"{title}\"): loaded" if titled
-                 else f"after {_TITLE_WAIT_S:g} s the page still has no title: not loaded yet")
+                 else f"after {wait_s:g} s the page still has no title: not loaded yet")
         return ok, f"opened {url}: {where}{state}. ({report})", facts
+
+    def _no_strip(self, hwnd: Any) -> bool:
+        """desk20 (S21): whether ``hwnd``'s strip was read and holds no tab at all (a browser that draws none: Arc), as
+        opposed to a strip that could not be read or has no tab selected yet. Never raises (``False``)."""
+        read = getattr(self.backend, "read_tabs", None)
+        if not callable(read) or not hwnd:
+            return False
+        try:
+            strip = read(int(hwnd), budget_s=0.3)
+        except Exception:  # noqa: BLE001
+            return False
+        return (not getattr(strip, "tabs", None) and not getattr(strip, "error", None)
+                and bool(getattr(strip, "complete", True)))
+
+    def _main_page_title(self, hwnd: Any, want: str, deadline: float) -> str:
+        """desk20 (S21): the title of the main page ``hwnd`` shows (the page-only reader, ``tree.wait_for_page``: the
+        window's main page, never a background tab's), when that page is at the address opened (same host) and has a
+        title that is not its address; ``""`` otherwise. Only on the real desktop (a stand-in desk has no page
+        reader). One short read, within ``deadline``. Never raises."""
+        if not _is_real_backend(self.backend) or not hwnd:
+            return ""
+        try:
+            from urllib.parse import urlsplit
+
+            from yuki.perception.tree import wait_for_page
+
+            def host(address: str) -> str:
+                net = urlsplit(str(address or "")).netloc.casefold()
+                return net[4:] if net.startswith("www.") else net
+
+            wanted = host(want)
+            budget = max(0.2, min(_MAIN_PAGE_READ_S, deadline - time.monotonic()))
+            got = wait_for_page(lambda: [int(hwnd)], lambda _address: True, timeout_s=budget)
+            main = next((p for p in got.seen if int(p.hwnd) == int(hwnd) and p.main), None)
+            if main is None or not main.title or main.title == main.url or _is_address(main.title):
+                return ""
+            if wanted and host(main.url) != wanted:
+                return ""
+            return str(main.title)
+        except Exception:  # noqa: BLE001 - no read: the wait goes on to its deadline
+            return ""
 
     def _keep_record(self, params: Any, name: str, args: dict[str, Any], report: str, **fields: Any) -> Any:
         """The hand's line on the action log (``fields``: ok, verified, turn, and where its effect sits), or ``None``.
@@ -6860,48 +7039,15 @@ def _squash(text: Any) -> str:
     return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
 
 
-#: :func:`web_app`'s answers per program image (RAM only, this process).
-_WEB_APPS: dict[str, bool] = {}
-
-
 def web_app(process: str, pid: Any = None) -> bool:
-    """Whether a program is a web browser by machine data (kHands r1 M6): Windows lists it as a desktop browser
-    (``Clients\\StartMenuInternet``: :func:`yuki.actions.launch._registered_browser_images`), or (``pid`` of the real
-    desktop given) it is a packaged app whose own manifest declares web addresses (a ``windows.protocol`` for http or
-    https: Arc). Never a list of browsers. Read-only, kept per image; never raises (``False``)."""
-    image = str(process or "").strip().lower()
-    if not image:
-        return False
-    if image in _WEB_APPS:
-        return _WEB_APPS[image]
+    """Whether a program is a web browser by machine data (kHands r1 M6): :func:`yuki.actions.launch.web_app` (desk20
+    moved it there, so the tab hand's keyboard rung asks the same). Never raises (``False``)."""
     try:
-        from yuki.actions.launch import _registered_browser_images
+        from yuki.actions.launch import web_app as _web_app
 
-        if image in _registered_browser_images():
-            _WEB_APPS[image] = True
-            return True
+        return bool(_web_app(process, pid))
     except Exception:  # noqa: BLE001
         return False
-    if pid is None:
-        return False
-    try:
-        import os
-        from xml.etree import ElementTree
-
-        from yuki.core.appnames import WindowsProbe
-
-        probe = WindowsProbe()
-        full, _aumid = probe.package_of_process(int(pid))
-        root = probe.package_path(full) if full else ""
-        found = False
-        if root:
-            tree = ElementTree.parse(os.path.join(root, "AppxManifest.xml")).getroot()
-            found = any(str(el.tag).rsplit("}", 1)[-1] == "Protocol"
-                        and str(el.get("Name") or "").lower() in ("http", "https") for el in tree.iter())
-    except Exception:  # noqa: BLE001 - unknown this time: asked again next time
-        return False
-    _WEB_APPS[image] = found
-    return found
 
 
 def app_forms(process: str) -> tuple[set[str], set[str]]:
@@ -7061,6 +7207,18 @@ def _app_id(app: Any) -> str:
     (stripped, casefolded, no ``.exe``: ``Discord.exe`` and ``discord`` are one app); ``""`` for none."""
     key = str(app or "").strip().casefold()
     return key[:-4].rstrip() if key.endswith(".exe") else key
+
+
+def _stage_ms(timings: Any) -> dict[str, int]:
+    """desk20 (S21): a launch's ``timings_ms`` (stage -> ms since the call began) as ``{stage: ms}`` numbers (code-word
+    stages, at most 16), or ``{}``: kept a mapping of numbers, which the content-free log keeps."""
+    if not isinstance(timings, dict):
+        return {}
+    out: dict[str, int] = {}
+    for stage, ms in timings.items():
+        if isinstance(ms, (int, float)) and not isinstance(ms, bool) and len(out) < 16:
+            out[str(stage)[:24]] = int(round(float(ms)))
+    return out
 
 
 def _takes_kw(fn: Any, name: str) -> bool:

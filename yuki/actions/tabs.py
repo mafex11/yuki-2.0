@@ -11,10 +11,20 @@ name at that place is not the one it expected) is refused, never guessed at.
 :func:`tab_action` is the brain's hand (the agent's ``tab`` tool): a tab found by its
 identity (its UIA RuntimeId, :attr:`yuki.perception.tabs.Tab.tab_id`), selected or closed,
 and the strip read again afterwards so what is said about it rests on that read.
+
+**The keyboard rung of a close** (desk20, final-D S9): a read-only dump of Chrome's strip on 19 Oct (vertical tabs)
+showed its TabItems have no child at all, Button or other, so no close control can ever be chosen there. A close
+with no single close control then goes by the browser's own close-tab key, from the browser connection data
+(``connections/browser_tabs.toml`` ``[tab_keys] close``), only in a browser's window (machine data,
+:func:`yuki.actions.launch.web_app`): the tab is found by its RuntimeId in the strip (never inside a web page's
+Document: the strip walk never enters one, and the tab's own ancestors are checked again before any key), the Act
+switch and the game gate are asked first, the tab is selected and seen selected, the window is brought to the front
+and seen there, the key is sent to that window only, and the strip is read again to see the tab gone.
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -281,6 +291,179 @@ def _rows(found: list[tuple[Any, Any]]) -> list[dict[str, Any]]:
             for t, _e in found]
 
 
+# ---------------------------------------------------------------------------
+# desk20 (final-D S9): the keyboard rung of a tab close
+# ---------------------------------------------------------------------------
+
+#: The browser connection file holding the close-tab key (``[tab_keys] close``), and its table and key.
+KEYS_FILE = "browser_tabs.toml"
+KEYS_TABLE = "tab_keys"
+_DOCUMENT = 50030
+#: How many parents of the tab are walked up to look for a page's Document (the strip sits a few levels down).
+_ANCESTOR_LEVELS = 24
+#: Bounds of the rung's own UIA reads (select and watch, the check right before the key).
+KEYS_SELECT_S = 1.5
+KEYS_CHECK_S = 1.0
+_keys_cache: dict[str, Any] = {}
+_keys_lock = threading.Lock()
+_policy: list[Any] = []
+
+
+def close_keys() -> tuple[str, ...]:
+    """The browser's own close-tab key from the connection data (``[tab_keys] close`` of :data:`KEYS_FILE`, cached
+    until the file changes); ``()`` when the file or the entry is missing (then no keyboard rung). Never raises."""
+    try:
+        import tomllib
+
+        from yuki.skills.connection import CONNECTIONS_DIR
+
+        path = CONNECTIONS_DIR / KEYS_FILE
+        st = path.stat()
+        stamp = (str(path), st.st_mtime, st.st_size)
+        with _keys_lock:
+            if _keys_cache.get("stamp") == stamp:
+                return tuple(_keys_cache.get("close") or ())
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        table = data.get(KEYS_TABLE) if isinstance(data.get(KEYS_TABLE), dict) else {}
+        raw = table.get("close")
+        keys = tuple(str(k).strip() for k in raw if str(k).strip()) if isinstance(raw, list) else ()
+        with _keys_lock:
+            _keys_cache.update(stamp=stamp, close=keys)
+        return keys
+    except Exception:  # noqa: BLE001 - no data: no keyboard rung
+        return ()
+
+
+def _act_off(process: str) -> str | None:
+    """The name Settings switched "Act" off for when ``process`` is that app (no click, type or key there), else
+    ``None``; an unreadable policy is ``None`` (the judge's reader, as the hands read it)."""
+    try:
+        from yuki.agent.judge import PolicyReader
+
+        if not _policy:
+            _policy.append(PolicyReader())
+        return _policy[0].app_off(process) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _inside_document(automation: Any, element: Any) -> bool:
+    """Whether a page's Document holds ``element`` (one of its ancestors is a Document): a web page's own tab widget,
+    never the browser's strip. Unreadable counts as inside (no key is sent on a guess)."""
+    try:
+        walker = automation.ControlViewWalker
+        node = element
+        for _ in range(_ANCESTOR_LEVELS):
+            node = walker.GetParentElement(node)
+            if not node:
+                return False
+            if int(node.CurrentControlType or 0) == _DOCUMENT:
+                return True
+        return True
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _find(automation: Any, hwnd: int, tab_id: str, budget_s: float) -> tuple[Any, Any, list[tuple[Any, Any]]]:
+    """``(tab, element, every tab found)`` for the tab whose RuntimeId is ``tab_id`` in ``hwnd``'s strip (every group;
+    the walk never enters a Document); ``(None, None, found)`` when it is not there."""
+    from yuki.perception.tabs import walk_tabs
+
+    found, _nodes, _complete = walk_tabs(automation, int(hwnd), time.monotonic() + budget_s, all_groups=True)
+    match = next(((t, e) for t, e in found if t.tab_id and t.tab_id == tab_id), None)
+    return (match[0], match[1], found) if match else (None, None, found)
+
+
+def _close_by_keys(hwnd: int, tab_id: str, keys: tuple[str, ...]) -> dict[str, Any]:
+    """The keyboard rung (module docstring), blocking: ``{"how", "sent", "why", "refused", "focus_ms", ...}``. Every
+    check comes before the key; the key goes only to ``hwnd`` in front with that tab selected. The caller watches the
+    strip afterwards."""
+    from yuki.actions import gate as _gate
+    from yuki.actions.input import _Pending, _user32, hotkey
+    from yuki.actions.launch import focus_window, web_app
+    from yuki.perception.tree import _uia_core
+    from yuki.perception.windows import window_info
+
+    out: dict[str, Any] = {"how": "", "sent": False, "keys": "+".join(keys)}
+    info = window_info(int(hwnd))
+    if info is None:
+        out["why"] = "gone"
+        return out
+    if not web_app(info.process_name, info.pid):
+        out["why"] = "not_browser"   # the close key is a browser's; another app's tabs are never closed by it
+        return out
+    off = _act_off(info.process_name)
+    if off:
+        out.update(why="act_off", act_off=off)
+        return out
+    if (refused := _gate.refuse("keys", hwnd=int(hwnd))) is not None:
+        out.update(why="game" if _gate.kind_of(refused) == _gate.GAME else "blocked", refused=_gate.kind_of(refused),
+                   said=str(refused))
+        return out
+
+    def select(automation: Any, shared: dict) -> None:
+        tab, element, _found = _find(automation, hwnd, tab_id, KEYS_SELECT_S * 0.5)
+        if tab is None:
+            shared["why"] = "gone"
+            return
+        if _inside_document(automation, element):
+            shared["why"] = "in_page"   # a page's own tab widget: never a key
+            return
+        if not tab.selected:
+            shared["select"] = _select(element, _uia_core())
+            deadline = time.monotonic() + WATCH_S
+            while shared["select"] and time.monotonic() < deadline:
+                try:
+                    if bool(element.GetCurrentPropertyValue(_P_SELECTION_ITEM_IS_SELECTED)):
+                        break
+                except Exception:  # noqa: BLE001
+                    break
+                time.sleep(POLL_S)
+        try:
+            shared["selected"] = bool(element.GetCurrentPropertyValue(_P_SELECTION_ITEM_IS_SELECTED))
+        except Exception:  # noqa: BLE001
+            shared["selected"] = False
+
+    picked = _Pending(select, "yuki-tab-keys", KEYS_SELECT_S).wait()
+    if picked.get("why") or not picked.get("selected"):
+        out["why"] = picked.get("why") or "not_selected"
+        return out
+    started = time.monotonic()
+    if int(_user32.GetForegroundWindow() or 0) != int(hwnd):
+        focused = focus_window(int(hwnd))
+        details = getattr(focused, "details", None) or {}
+        if not focused.ok:
+            out.update(why="focus", refused=_gate.carried(details), said=str(focused.summary)[:200])
+            return out
+    out["focus_ms"] = round((time.monotonic() - started) * 1000)
+
+    def check(automation: Any, shared: dict) -> None:
+        tab, element, _found = _find(automation, hwnd, tab_id, KEYS_CHECK_S * 0.6)
+        if tab is None or _inside_document(automation, element):
+            shared["ok"] = False
+            return
+        try:
+            shared["ok"] = bool(element.GetCurrentPropertyValue(_P_SELECTION_ITEM_IS_SELECTED))
+        except Exception:  # noqa: BLE001
+            shared["ok"] = False
+
+    # right before the key: the tab is still the selected one, and its window is the one in front
+    if not _Pending(check, "yuki-tab-keys-check", KEYS_CHECK_S).wait().get("ok"):
+        out["why"] = "not_selected"
+        return out
+    if int(_user32.GetForegroundWindow() or 0) != int(hwnd):
+        out["why"] = "not_front"
+        return out
+    pressed = hotkey(*keys, expect_hwnd=int(hwnd))   # sent only while hwnd is in front; the game gate again inside
+    details = getattr(pressed, "details", None) or {}
+    out["sent"] = bool(pressed.ok)
+    if not pressed.ok:
+        out.update(why="key", refused=_gate.carried(details), said=str(pressed.summary)[:200])
+        return out
+    out["how"] = f"the browser's close-tab key ({out['keys']})"
+    return out
+
+
 def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
     """Select or close the tab of ``hwnd``'s strip whose identity is ``tab_id``, then re-read the strip.
 
@@ -289,10 +472,13 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
     found by it, whatever its title or place now, and
     one that is no longer there is reported, never replaced by another. ``select`` asks it
     to show (as :func:`select_tab`) and watches it report itself selected; ``close`` invokes
-    its own close control (its single Button child; with none or several nothing is done)
-    and watches it leave the strip. Either way the strip is read again at the end and
+    its own close control (its single Button child) and watches it leave the strip; with none
+    or several chosen, a browser's tab goes by the keyboard rung (desk20 S9, module docstring:
+    selected, its window in front, the close-tab key from the connection data, Act switch and
+    game gate first). Either way the strip is read again at the end and
     ``details["tabs_after"]`` lists what is there now, so what is said about it rests on
-    that read. ``ok`` only when the effect was seen. Cursor and keyboard are untouched.
+    that read. ``ok`` only when the effect was seen. Cursor untouched; the keyboard only in the
+    keyboard rung (``details["keys_rung"]``).
     """
     from yuki.actions.input import _Pending
     from yuki.perception.tabs import walk_tabs
@@ -316,7 +502,7 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
         # a tab id from any group of the strip (PLAN.md D8: a pinned or Essentials tab sits in a smaller group)
         found, nodes, _complete = walk_tabs(automation, int(hwnd), time.monotonic() + ACTION_BUDGET_S * 0.25,
                                             all_groups=True)
-        shared["count"], shared["nodes"] = len(found), nodes
+        shared["count"], shared["nodes"], shared["before"] = len(found), nodes, _rows(found)
         match = next(((t, e) for t, e in found if t.tab_id and t.tab_id == tab_id), None)
         if match is None:
             shared["after"] = _rows(found)
@@ -357,6 +543,42 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
 
     pending = _Pending(job, "yuki-tab-action", ACTION_BUDGET_S)
     shared = pending.wait()
+    keys = close_keys() if action == "close" and shared.get("no_control") and shared.get("tab") else ()
+    if keys and int(shared.get("count") or 0) <= 1:
+        # the window's only tab: its close key closes the window itself, which is more than a tab (never by a key)
+        keys, shared["keys_why"] = (), "only_tab"
+    if keys and not pending.timed_out and not shared.get("error"):
+        # desk20 (S9): no single close control was chosen (Chrome's TabItems have no child at all): the browser's own
+        # close-tab key on that very tab, every check first (:func:`_close_by_keys`), then the strip watched
+        rung = _close_by_keys(int(hwnd), tab_id, keys)
+        details["keys_rung"] = {k: v for k, v in rung.items() if k not in ("said",)}
+        if rung.get("refused"):
+            details["refused"] = rung["refused"]
+        if rung.get("sent"):
+            shared["no_control"], shared["how"] = False, rung["how"]
+
+            def watch(automation: Any, out: dict) -> None:
+                deadline = time.monotonic() + CLOSE_WATCH_S
+                while time.monotonic() < deadline:
+                    diag: dict[str, Any] = {}
+                    now, _n, _c = walk_tabs(automation, int(hwnd), time.monotonic() + 0.3, all_groups=True,
+                                            diagnostics=diag)
+                    if diag.get("reason") == "error":
+                        break   # the window can't be read (gone): not seen, said as it is
+                    if not any(t.tab_id == tab_id for t, _e in now):
+                        out["seen"] = True
+                        break
+                    time.sleep(POLL_S)
+                later, _n, complete = walk_tabs(automation, int(hwnd), time.monotonic() + ACTION_BUDGET_S * 0.2,
+                                                all_groups=True, diagnostics={})
+                out["after"], out["after_complete"] = _rows(later), complete
+
+            seen = _Pending(watch, "yuki-tab-keys-watch", CLOSE_WATCH_S + ACTION_BUDGET_S * 0.25).wait()
+            shared["seen"] = bool(seen.get("seen"))
+            if "after" in seen:
+                shared["after"], shared["after_complete"] = seen["after"], seen.get("after_complete", True)
+        else:
+            shared["keys_why"], shared["keys_said"] = rung.get("why"), rung.get("said")
     tab = shared.get("tab") or {}
     after = list(shared.get("after") or [])
     details.update({"count": shared.get("count"), "nodes": shared.get("nodes"), "tab": tab or None,
@@ -382,9 +604,37 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
         return finish(True, f"{where} is {'already' if already else 'now'} the one showing "
                             f"(window title now \"{details['title']}\")")
     if shared.get("no_control"):
+        why = shared.get("keys_why")
+        if why:
+            # desk20 (S9): the keyboard rung was tried and stopped before any key, or its key was not sent
+            said = str(shared.get("keys_said") or "").strip()
+            return finish(False, f"{where} has no single close control of its own, and its browser's close-tab key "
+                                 f"was not sent: {_KEYS_WHY.get(str(why), str(why))}{'; ' + said if said else ''}; "
+                                 f"nothing was closed")
         return finish(False, f"{where} has no single close control of its own; nothing was closed")
     if not shared.get("how"):
         return finish(False, f"{where}: its close control did not accept the request; nothing was closed")
     if not shared.get("seen"):
-        return finish(False, f"asked {where} to close, but it is still in the strip after {CLOSE_WATCH_S:g} s")
-    return finish(True, f"closed {where}; the strip, read again, has {len(after)} tabs")
+        lost = [r for r in shared.get("before") or () if r.get("id") and r["id"] not in {a.get("id") for a in after}]
+        if lost:
+            details["closed_other"] = len(lost)
+        return finish(False, f"asked {where} to close ({shared.get('how')}), but it is still in the strip after "
+                             f"{CLOSE_WATCH_S:g} s" + (f"; {len(lost)} other tab(s) left the strip meanwhile"
+                                                       if lost else ""))
+    return finish(True, f"closed {where} ({shared.get('how')}); the strip, read again, has {len(after)} tabs")
+
+
+#: Why the keyboard rung sent no key, in words for the report (codes from :func:`_close_by_keys`).
+_KEYS_WHY: dict[str, str] = {
+    "gone": "the tab or its window is gone",
+    "only_tab": "it is the window's only tab, and its close key would close the whole window",
+    "not_browser": "the window is not a browser's, and the close key is a browser's",
+    "act_off": "Act is switched off for that app in Yuki's settings, so Yuki does not press keys there",
+    "game": "a game is in front",
+    "blocked": "something on the PC stopped it",
+    "in_page": "that tab is a web page's own widget, not the browser's tab",
+    "not_selected": "the tab could not be made the selected one",
+    "focus": "its window could not be brought to the front",
+    "not_front": "its window was not in front right before the key",
+    "key": "the key was refused",
+}

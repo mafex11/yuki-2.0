@@ -5969,7 +5969,11 @@ def format_window_tree(tree: WindowTree, *, within: int | None = None,
     The header is one line.  When the window shows a page (a Document whose
     Value is an address, see :func:`page_identity`) it starts with
     ``page: "<title>" <url>`` and, when there is one outside the page, the
-    selected tab (``selected tab: "..."``); then the window, the element count,
+    selected tab (``selected tab: "..."``) and (desk20, contract C8: the whole
+    window read, not a ``within`` one) ``page element [<id>], listed first``: that
+    page's Document and everything below it are listed before the rest of the
+    window (its toolbar, tab strip, bookmarks), so a reader cut from the head gets
+    the page; then the window, the element count,
     how long the read took, and - when there are any - how the tree was built,
     its status, that it is partial, what was left off screen, and the note.
 
@@ -6023,6 +6027,13 @@ def format_window_tree(tree: WindowTree, *, within: int | None = None,
         )
         if page.selected_tab:
             facts.append(f'selected tab: "{_one_line(page.selected_tab, _FORMAT_NAME_CHARS)}"')
+    # desk20 (final-D S4, contract C8): a window showing a page lists that page's Document subtree first and names its
+    # element id here, so a reader cut from the head (ONE's look) gets the page before the browser's own frame (its
+    # toolbar, extensions and bookmarks came first and filled a 3000-character look), and can read it whole by that id
+    page_first = within is None and page is not None and page.element_id >= 0 and any(
+        element.id == page.element_id for element in tree.elements)
+    if page_first:
+        facts.append(f"page element [{page.element_id}], listed first")
     # The window's own tabs, counted: tab controls inside a page (a site's
     # "Browse | Chat" switch) are not among them, and a long list is easy to miscount.
     by_id = {element.id: element for element in tree.elements}
@@ -6070,7 +6081,12 @@ def format_window_tree(tree: WindowTree, *, within: int | None = None,
             return lines[0] + f"\n(this read has no element [{within}]; read the whole window)"
         listed = [element for element in listed if element.id in part]
         lines[0] += f" | only [{within}] and what is below it"
-    parents = _parents(listed, tree.elements)
+    reordered = (_ordered_page_first(listed, tree.elements, page.element_id)
+                 if page_first and page is not None else None)
+    if reordered is not None:
+        listed, parents = reordered
+    else:
+        parents = _parents(listed, tree.elements)
     has_child = [False] * len(listed)
     for parent in parents:
         if parent >= 0:
@@ -6245,6 +6261,24 @@ def format_window_tree(tree: WindowTree, *, within: int | None = None,
     if not listed and status != "busy":  # a busy window's note already says why
         lines.append("(no named or interactive elements - UIA exposes nothing usable here)")
     return "\n".join(lines)
+
+
+def _ordered_page_first(listed: list[UIElement], everything: list[UIElement],
+                        page_id: int) -> tuple[list[UIElement], list[int]] | None:
+    """desk20 (S4, C8): ``listed`` reordered with the page Document's subtree first (tree order kept inside each part),
+    and each element's nearest listed ancestor as an index into the new order (:func:`_parents`, computed per part so a
+    parent always comes before its children: the Document heads its part at the top level). ``None`` when the page
+    part or the rest is empty (nothing to reorder). Structure only."""
+    part = _subtree_ids(everything, page_id)
+    if not part:
+        return None
+    first = [element for element in listed if element.id in part]
+    rest = [element for element in listed if element.id not in part]
+    if not first or not rest:
+        return None
+    head = _parents(first, everything)
+    tail = [p + len(first) if p >= 0 else -1 for p in _parents(rest, everything)]
+    return first + rest, head + tail
 
 
 def _subtree_ids(elements: list[UIElement], root: int) -> set[int]:

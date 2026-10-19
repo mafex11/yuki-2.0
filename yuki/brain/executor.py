@@ -383,6 +383,9 @@ class RunResult:
     #: tidy-up turn (``""``: nothing flagged, no turn); ``after_facts``: the diff's content-free facts.
     after: str = ""
     after_facts: dict[str, Any] = field(default_factory=dict)
+    #: desk20 (final-D S1 fallback): with ``after``, the one legal tidy step in the plan's own terms (code's words, no
+    #: window text: ``"window_action, window 123, value focus_back"``), ``""`` when no single step undoes it.
+    after_step: str = ""
 
     def statuses_text(self) -> str:
         """The step statuses in one block, for the replan message."""
@@ -545,6 +548,12 @@ class Executor:
         self._slow_said: set[str] = set()
         #: P1.3: the tidy-up turn, while it runs (:meth:`tidy_up`): ``{"mode", "acts", "words"}``; ``None`` otherwise
         self.tidy: dict[str, Any] | None = None
+        #: desk20 (final-D S20): the last act step of this request whose own report said it did not take, in code's
+        #: words (:meth:`_stop_words`: the step and its app, the plan's act steps after it), kept across a later plan
+        #: that ran no act (an invalid one) and let go once a later act step takes: ``{"what", "rest"}`` or ``None``
+        self._stuck_said: dict[str, str] | None = None
+        #: desk20 (final-D S1 fallback): the after-look's one legal tidy step (``diff.tidy_step``) and its words
+        self._after_step: dict[str, Any] | None = None
         _warm_desk()
         self._reset_plan()
         self._skill_context()
@@ -689,6 +698,7 @@ class Executor:
         result = self._done_check()
         if result.status == "done":
             result.after, result.after_facts = self.after_look()
+            result.after_step = self._tidy_step_words(self._after_step) if result.after else ""
             sent = isinstance(result.outcome, Mapping) and bool(result.outcome.get("send"))
             if self._purpose_line and result.line and not sent:
                 # integration review c2desk-2: said after the request's own line (never on a send's, consent's own)
@@ -745,6 +755,7 @@ class Executor:
         """What this request's acts did to the desk (module docstring): ``(the "After:" block, the diff's facts)``;
         the block is ``""`` when no flag is up (no turn, no cost). Logged content-free. Never raises."""
         self._purpose_line = ""   # integration review c2desk-2: this look's own, never an earlier plan's
+        self._after_step = None
         if self.tidy is not None or self._desk_first is None:
             return "", {}
         try:
@@ -771,10 +782,30 @@ class Executor:
             self._after_diff = d
             text = desk_diff.render(d, max_chars=AFTER_DIFF_CHARS)
             desk = situation.render(after, purpose="planner", max_chars=AFTER_DESK_CHARS)
-            return f"After:\n{text}\n\nThe desk now:\n{desk}", facts
+            # desk20 (final-D S1 fallback): code's classification and the one legal step (diff.tidy_step), from the same
+            # windows the tidy gate allows (:meth:`_tidy_ours`) and the front the acts took
+            front = d.focus_from if (d.flags or {}).get("focus_taken") else None
+            step = desk_diff.tidy_step(d, self._tidy_ours(d), front, len(getattr(after, "monitors", None) or ()))
+            self._after_step = step
+            self._emit_log("after_step", action=(step or {}).get("action"), flag=(step or {}).get("flag"))
+            says = f"\n\nSide effect, by code's measure: {step['says']}." if step else ""
+            return f"After:\n{text}{says}\n\nThe desk now:\n{desk}", facts
         except Exception as exc:  # noqa: BLE001 - no look: the request ends as before
             self._emit_log("after_look", error=type(exc).__name__)
             return "", {}
+
+    @staticmethod
+    def _tidy_step_words(step: Mapping[str, Any] | None) -> str:
+        """desk20: ``diff.tidy_step``'s step as one plan step in the plan's own terms (code's words and the window's id
+        only, never a title): ``window_action, window 123, value focus_back`` (or ``value place:other``); ``""`` for
+        none."""
+        if not step:
+            return ""
+        try:
+            value = "place:other" if step.get("action") == "place" else "focus_back"
+            return f"window_action, window {int(step['hwnd'])}, value {value}"
+        except (KeyError, TypeError, ValueError):
+            return ""
 
     @staticmethod
     def _purpose_words(d: Any) -> str:
@@ -796,7 +827,11 @@ class Executor:
                         level=round(float(v.get("master_level") or 0.0))))
                 break
             if any(c.get("kind") == "tab" and c.get("side_effect") for c in getattr(d, "covered", None) or ()):
-                out.append(LINE_BEHIND_TAB)
+                # desk20 (final-D S3): the measured sentence (what plays on, by its title), shared with the voice's
+                # hands and ONE (``diff.cover_line``); the plain line when it can't be built
+                from yuki.perception.diff import cover_line
+
+                out.append(cover_line(d) or LINE_BEHIND_TAB)
             return " ".join(out)
         except Exception:  # noqa: BLE001 - no words: the request's line stands
             return ""
@@ -902,12 +937,18 @@ class Executor:
             return False
         if action == "focus_back":
             return target == done.as_hwnd(d.focus_from) or target in {done.as_hwnd(h) for h in d.attention}
+        return target in self._tidy_ours(d)
+
+    def _tidy_ours(self, d: Any) -> set[int]:
+        """The windows a tidy-up's place may move (:meth:`_tidy_mine`): the ones this request's acts brought up (a
+        step's window or its report's), new windows, the act's window over one of theirs, the front its acts took."""
         ours = {h for h in self._desk_touched if isinstance(h, int) and not isinstance(h, bool)}
         ours |= {done.as_hwnd(n.get("hwnd")) for n in d.new_windows}
         ours |= {done.as_hwnd(c.get("by")) for c in d.covered if c.get("by_act")}
         if d.focus_by_act:
             ours.add(done.as_hwnd(d.focus_to))
-        return target in ours
+        ours.discard(None)
+        return ours
 
     @staticmethod
     def _tidy_line(call: Call, details: Mapping[str, Any] | None, table: Mapping[str, str]) -> str:
@@ -1565,6 +1606,8 @@ class Executor:
             return self._skill_result(index, step, call, outcome)
         if not outcome.ok or verdict is False:
             status.state, status.why = "failed", why
+            if self.tidy is None:
+                self._note_stuck(index, call)   # desk20 (S20): the ending names its app and what was left
             payload = outcome.payload if isinstance(outcome.payload, dict) else {}
             kind = _refused_kind(payload)
             if kind == "game" and self._game_seen(call):
@@ -1578,6 +1621,8 @@ class Executor:
                 return RunResult("refused", line=self._stopped_line(index, call), final=True)
             return self._mismatch_result(index, why, seen=shown, call=call, seen_fenced=external and bool(body))
         status.state, status.why = "ok", why
+        if self.tidy is None and call.tool in ACT_VERBS:
+            self._stuck_said = None   # desk20 (S20): a later act took: an earlier stuck step is no longer the ending
         if self.tidy is not None:
             self.tidy["acts"] = int(self.tidy.get("acts", 0)) + 1
             payload = outcome.payload if isinstance(outcome.payload, dict) else {}
@@ -1634,6 +1679,8 @@ class Executor:
             return self._mismatch_result(index, state or "failed", seen=str(outcome.summary or ""), call=call,
                                          line=_engine_said(outcome) or LINE_SKILL_FAILED)
         status.state, status.why = "ok", state
+        if self.tidy is None:
+            self._stuck_said = None   # desk20 (S20): a later act took: an earlier stuck step is no longer the ending
         return None
 
     def _who_result(self, index: int, call: Call, outcome: Any, state: str,
@@ -2736,24 +2783,44 @@ class Executor:
         island's words, :meth:`_step_said`; :data:`LINE_INPUT_STOPPED_REST`). Never the plan's free text. Never
         raises: the old line when anything is missing."""
         try:
-            target = field_of(field_of(self.head, "target", None), "app", None) if self.head is not None else None
-            app = util.app_name(call.app) if call.app else (words(target) if target else "")
-            app = "" if app in ("", "It") else app
-            what = (STOPPED_WHAT_APP[call.tool].format(app=app) if app and call.tool in STOPPED_WHAT_APP
-                    else STOPPED_WHAT.get(call.tool, "there"))
-            rest = []
-            for step in list(self.steps)[index + 1:]:
-                if self._verb(step) not in ACT_VERBS:
-                    continue
-                said = _mid(self._step_said(step))
-                if said and said not in rest:
-                    rest.append(said)
-            if not rest:
+            what, shown = self._stop_words(index, call)
+            if not shown:
                 return LINE_INPUT_STOPPED.format(what=what)
-            shown = ", ".join(rest[:STOPPED_REST_MAX]) + (", and more" if len(rest) > STOPPED_REST_MAX else "")
             return LINE_INPUT_STOPPED_REST.format(what=what, rest=shown)
         except Exception:  # noqa: BLE001 - the plain line
             return LINE_INPUT_STOPPED.format(what=STOPPED_WHAT.get(call.tool, "there"))
+
+    def _stop_words(self, index: int, call: Call) -> tuple[str, str]:
+        """``(what, rest)``: a step that did not go, in code's words (shared by :meth:`_stopped_line` and, desk20 S20,
+        the stuck ending): the step's verb and the app it acts in (its target window's program, else the plan's target
+        app; :data:`STOPPED_WHAT_APP`), and the plan's act steps after it that were not done (each in the island's
+        words, :meth:`_step_said`, at most :data:`STOPPED_REST_MAX`; ``""`` none). Never the plan's free text. May
+        raise (callers keep their own plain line)."""
+        target = field_of(field_of(self.head, "target", None), "app", None) if self.head is not None else None
+        app = util.app_name(call.app) if call.app else (words(target) if target else "")
+        app = "" if app in ("", "It") else app
+        what = (STOPPED_WHAT_APP[call.tool].format(app=app) if app and call.tool in STOPPED_WHAT_APP
+                else STOPPED_WHAT.get(call.tool, "there"))
+        rest: list[str] = []
+        for step in list(self.steps)[index + 1:]:
+            if self._verb(step) not in ACT_VERBS:
+                continue
+            said = _mid(self._step_said(step))
+            if said and said not in rest:
+                rest.append(said)
+        shown = ", ".join(rest[:STOPPED_REST_MAX]) + (", and more" if len(rest) > STOPPED_REST_MAX else "") \
+            if rest else ""
+        return what, shown
+
+    def _note_stuck(self, index: int, call: Call) -> None:
+        """desk20 (final-D S20, k_t3_draft: "I got stuck typing. Try another way?" named neither T3 Code nor what was
+        left): an act step whose own report said it did not take is kept in code's words (:meth:`_stop_words`), so a
+        request that ends stuck on it names its app and what was left undone (:meth:`ending_facts`). Never raises."""
+        try:
+            what, rest = self._stop_words(index, call)
+            self._stuck_said = {"what": what, "rest": rest} if what and what != "there" else None
+        except Exception:  # noqa: BLE001 - the plain stuck line then
+            self._stuck_said = None
 
     def _seed_also(self, own: done.DoneResult, env: done.ProbeEnv) -> done.DoneResult:
         """hands19 (final-B all-spotify RC3: "Touch grass should be on, but I couldn't confirm it" while the harness saw
@@ -2901,7 +2968,9 @@ class Executor:
         line and the voice's talker (content: never logged). ``did``: the last act step that ran, as done ("Opened a
         page in Arc"); ``stuck``: the step that failed or was refused, as it runs ("clicking Continue"), and ``why``
         when its reason is plain words (a code word is left out); ``claim``: what the done-check looked for ("Excalidraw
-        is open in Arc") and ``seen``: what it saw, when it didn't read it done. Only the current plan's steps."""
+        is open in Arc") and ``seen``: what it saw, when it didn't read it done. Only the current plan's steps, except
+        desk20's ``stuck_what`` / ``stuck_rest`` (:meth:`_note_stuck`): the request's last act step that did not take,
+        with its app ("typing in T3 Code"), and the act steps after it in its plan ("" none)."""
         out: dict[str, str] = {}
         try:
             ran = [i for i, st in enumerate(self.statuses) if st.state == "ok" and i < len(self.steps)
@@ -2927,6 +2996,11 @@ class Executor:
             elif result is not None and result.uncovered:
                 # a done that read only part of the target ("Arc is in front; I couldn't check the rest.")
                 out["unchecked"] = ", ".join(UNCHECKED_WORDS.get(f, f) for f in result.uncovered)
+            if self._stuck_said:
+                # desk20 (S20): this request's last act step that did not take, naming its app, and the act steps
+                # after it in that plan (any plan of the request, not only the current one)
+                out["stuck_what"] = self._stuck_said.get("what", "")
+                out["stuck_rest"] = self._stuck_said.get("rest", "")
         except Exception:  # noqa: BLE001 - no facts: the line stands as it was
             return {k: v for k, v in out.items() if v}
         return {k: v for k, v in out.items() if v}

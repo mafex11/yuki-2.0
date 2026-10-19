@@ -96,3 +96,9 @@ args = { service = "{service}" }
 # done only when memory saw the site itself in front in that browser (review r1 L2), not just the browser in front
 done = { probe = "driver", driver = "web_route", call = "site_front", service = "{service}", within_s = 6 }
 recheck = { probe = "driver", driver = "web_route", call = "browser_front", after_s = 3 }
+
+# desk20 (final-D S9): the key every desktop browser closes its selected tab with (as web.toml's new_tab is the key it
+# opens one with). The tab hand (yuki/actions/tabs.py) sends it only when the tab's strip gives it no single close
+# control, to a browser's window in front with that very tab selected (never a page's own tab), then reads the strip.
+[tab_keys]
+close = ["ctrl", "w"]

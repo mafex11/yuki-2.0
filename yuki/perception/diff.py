@@ -49,11 +49,20 @@ The thresholds are measured shares (the 16 px occlusion grid) and text the OS an
 (the window title holding the session's title: ``situation.map_media``'s own test), never a guess at meaning. Media and
 volume changes are only read when both snapshots read that part (``DeskState.errors``).
 
+**The one legal tidy step** (desk20, final-D S1 fallback; contract C7 with the ONE brain): :func:`tidy_step` says, from
+the diff and the caller's measured facts alone (the act's own windows, the window the act took the front from, how
+many monitors there are), the one undoable window step that undoes a flagged side effect, or ``None`` when no single
+step does. Its ``says`` is code's classification of the flag in plain words for a decider; :func:`cover_line` is the
+measured sentence for a tab the act put over what played (no window step touches a tab: it is said, never undone).
+
 Public API::
 
     compare(before, after, *, acted=(), touched=()) -> DeskDiff
     render(diff, max_chars=500) -> str      # plain words for the decider (no header: the caller titles it "After:")
     DeskDiff.facts() -> dict                # content-free, for log lines
+    tidy_step(d, acts, front, monitors) -> dict | None   # the one legal undoable window step (C7)
+    cover_line(d) -> str                    # the measured tab-cover sentence, or "" (C7)
+    window_flag(d) -> bool                  # a flag a window step could undo is up (not a tab cover, not a sound)
 """
 
 from __future__ import annotations
@@ -475,4 +484,133 @@ def render(diff: DeskDiff, max_chars: int = 500) -> str:
     return text
 
 
-__all__ = ["COVER_KEEP", "COVER_MIN_LOSS", "DeskDiff", "MOSTLY", "NOT_YOURS", "compare", "render"]
+def _cover_of_window(c: dict[str, Any]) -> bool:
+    """A covered entry that counts for ``covered_attention`` and is a window's (not a tab's): an attention window the
+    request was not about, covered as a side effect of the act."""
+    return bool(c.get("kind") != "tab" and c.get("attention") and not c.get("asked") and c.get("side_effect"))
+
+
+def window_flag(d: Any) -> bool:
+    """desk20: whether a flag is up that an undoable window step could undo: the front (or keyboard) taken, a pop-up
+    left in front, or a window of theirs covered by the act (a tab over what played and a sound left silent are not:
+    no window step touches either). Pure; never raises (``False``)."""
+    try:
+        flags = getattr(d, "flags", None) or {}
+        if flags.get("focus_taken") or flags.get("new_popup"):
+            return True
+        return any(_cover_of_window(c) for c in getattr(d, "covered", None) or ())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _hwnd(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number or None
+
+
+def _monitor_count(monitors: Any) -> int:
+    """How many monitors: an ``int``, or the length of a mapping or sequence of them (``DeskDiff.monitors``,
+    ``DeskState.monitors``); 0 when unknown."""
+    if isinstance(monitors, bool):
+        return 0
+    if isinstance(monitors, int):
+        return max(0, monitors)
+    try:
+        return len(monitors)
+    except TypeError:
+        return 0
+
+
+def tidy_step(d: Any, acts: Iterable[Any], front: Any, monitors: Any = None) -> dict[str, Any] | None:
+    """desk20 (final-D S1 fallback; contract C7): the one legal undoable window step for a flagged diff, from measured
+    facts only, or ``None`` when no single step undoes it (a tab over what played, a sound left silent, nothing
+    flagged, a cover by a window not the act's, one monitor and nothing taken).
+
+    ``acts``: the act's own windows (ids: the only windows a move may move, as the caller's tidy check holds it);
+    ``front``: the window the act took the front from (the measured ``focus_from`` when ``focus_taken``; ``None``:
+    the act took no front, e.g. the front went to the asked window); ``monitors``: how many monitors there are (an
+    ``int``, or the monitors themselves; ``None``: the diff's own). In order:
+
+    1. the front was taken and every window of theirs the act covered is that same window (or none was): give the
+       front back to it (``focus_back``: raising it uncovers it too);
+    2. a window of theirs (playing first, then the one in front) lies under one of the act's own windows, not
+       minimised, and there is another monitor: move that window of the act's to the other monitor (``place``: it
+       stays in view, theirs is uncovered);
+    3. the front was taken: give it back (what is covered under something not the act's stays).
+
+    ``{"action": "focus_back" | "place", "hwnd": int, "flag": "focus_taken" | "covered_attention", "covered": the
+    window of theirs it uncovers or gives back (int), "monitor": "other" (place only), "says": code's classification
+    in plain words (window names: content, RAM only, never logged)}``. Pure: no OS call. Never raises (``None``)."""
+    try:
+        if d is None or not window_flag(d):
+            return None
+        flags = getattr(d, "flags", None) or {}
+        names = getattr(d, "names", None) or {}
+        mine: set[int] = set()
+        for a in acts or ():
+            h = _hwnd(a)
+            if h:
+                mine.add(h)
+        taken_from = _hwnd(front) if flags.get("focus_taken") else None
+        covered = [c for c in getattr(d, "covered", None) or () if _cover_of_window(c)]
+        count = _monitor_count(getattr(d, "monitors", None) if monitors is None else monitors)
+
+        def name(h: int | None) -> str:
+            return str(names.get(h) or f"[{h}]") if h else "a window"
+
+        if taken_from and all(_hwnd(c.get("hwnd")) == taken_from for c in covered):
+            hid = " and covered it" if covered else ""
+            return {"action": "focus_back", "hwnd": taken_from, "flag": "focus_taken", "covered": taken_from,
+                    "says": f"your act took the front from {name(taken_from)}{hid}; giving the front back to it "
+                            f"undoes it"}
+        if count > 1:
+            ranked = sorted(covered, key=lambda c: (not c.get("playing"), not c.get("was_front")))
+            for c in ranked:
+                by = _hwnd(c.get("by"))
+                if not by or by not in mine or c.get("minimised") or not c.get("by_act"):
+                    continue
+                theirs = _hwnd(c.get("hwnd"))
+                tag = " (playing)" if c.get("playing") else ""
+                taken = f"; it also took the front from {name(taken_from)}" if taken_from else ""
+                return {"action": "place", "hwnd": by, "monitor": "other", "flag": "covered_attention",
+                        "covered": theirs,
+                        "says": f"your act's window {name(by)} covers {name(theirs)}{tag}{taken}; moving "
+                                f"{name(by)} to the other monitor keeps it in view and uncovers theirs"}
+        if taken_from:
+            return {"action": "focus_back", "hwnd": taken_from, "flag": "focus_taken", "covered": taken_from,
+                    "says": f"your act took the front from {name(taken_from)}; giving the front back to it undoes "
+                            f"that"}
+        return None
+    except Exception:  # noqa: BLE001 - no step: the decider reads After alone, as before
+        return None
+
+
+#: :func:`cover_line`'s words: what played, said by its own title when the session gave one (``{title}``), else plainly.
+LINE_TAB_COVER = "\"{title}\" is still playing in the other tab."
+LINE_TAB_COVER_PLAIN = "What was playing is still playing in the other tab."
+
+
+def cover_line(d: Any) -> str:
+    """desk20 (final-D S3; contract C7): the measured sentence for a tab the act put over what played (a covered
+    entry of kind ``tab`` that is the act's: ``side_effect``), said after the act's own line ("GitHub is up." then
+    ``"BETA SQUAD UNO" is still playing in the other tab.``); ``""`` when there is none, or the cover is the user's own
+    (not from the act). No window step can touch a tab, so this is said, never undone. The session's title is content
+    (RAM only, never logged). Pure; never raises."""
+    try:
+        for c in getattr(d, "covered", None) or ():
+            if c.get("kind") != "tab" or not c.get("side_effect"):
+                continue
+            title = _title(c.get("media") or "", 40) if c.get("media") else ""
+            return LINE_TAB_COVER.format(title=title) if title else LINE_TAB_COVER_PLAIN
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+__all__ = ["COVER_KEEP", "COVER_MIN_LOSS", "DeskDiff", "LINE_TAB_COVER", "LINE_TAB_COVER_PLAIN", "MOSTLY", "NOT_YOURS",
+           "compare", "cover_line", "render", "tidy_step", "window_flag"]
