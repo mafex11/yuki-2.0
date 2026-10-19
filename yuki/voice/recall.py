@@ -791,6 +791,31 @@ def _search_lines(hits: list[dict[str, Any]]) -> list[str]:
     return out
 
 
+#: final-B (19 Oct, "when's my meeting tomorrow": the search found only a call's passing mention, no time, while the
+#: portrait's routine had the meeting's usual time): the journal search never reads the portrait, so a search's
+#: report also carries their routine as memory's nightly portrait writes it (the brief's ``routine`` field, else the
+#: portrait's Routines section), dated by the portrait, cut to this (whole words).
+ROUTINE_CHARS = 400
+#: Bound on that read (one row of the store, decrypted: milliseconds).
+ROUTINE_TIMEOUT_S = 1.0
+
+
+def routine_line(client: Any) -> str:
+    """Their routine as a search line, ``- (routine, portrait of Mon 19 Oct 07:11) ...`` (the brief's ``routine``,
+    else the portrait's Routines section), from ``client`` (a memory client, or the store itself); ``""`` without a
+    portrait or with neither. Content: RAM only."""
+    store = getattr(client, "store", client)
+    portrait = store.latest_portrait()
+    if portrait is None:
+        return ""
+    text = (portrait.brief or {}).get("routine") or (portrait.sections or {}).get("routines") or ""
+    text = _clip(text, ROUTINE_CHARS)
+    if not text:
+        return ""
+    when = f"portrait of {datetime.fromtimestamp(float(portrait.at)):%a %d %b %H:%M}" if portrait.at else "portrait"
+    return f"- (routine, {when}) {text}"
+
+
 def added_line(report: dict[str, Any]) -> str | None:
     """The words that confirm an add by code, or ``None`` when the talker should say it (leftVoice).
 
@@ -1013,12 +1038,25 @@ class QuickMemory:
             return ({"failed": f"memory could not be searched ({type(exc).__name__})",
                      "how_to_handle_it": NOTHING_NOTE.format(where="memory")}, {"ok": False})
         lines = _search_lines(list(hits or []))
+        routine = self._routine()
+        if routine:
+            lines.append(routine)
         if not lines:
             return {"found": "", "how_to_handle_it": NOTHING_NOTE.format(where="a memory search")}, {"ok": True,
                                                                                                     "items": 0}
         return ({"found": "\n".join(lines),
                  "how_to_handle_it": FOUND_NOTE.format(where="a memory search") + " " + WHOSE_NOTE},
-                {"ok": True, "items": len(lines)})
+                {"ok": True, "items": len(lines), "routine": bool(routine)})
+
+    def _routine(self) -> str:
+        """Their routine as one search line (:func:`routine_line`), ``""`` without (no portrait, memory slow)."""
+        call = getattr(self.memory, "call", None)
+        if not callable(call):
+            return ""
+        try:
+            return str(call("routine", routine_line, timeout_s=ROUTINE_TIMEOUT_S) or "")
+        except Exception:  # noqa: BLE001 - the search's own hits stand
+            return ""
 
 
 __all__ = ["DIGEST_LABEL", "QUICK_MEMORY", "QuickMemory", "RECENT_LABEL", "day_text", "digest_view", "fetch_digest",

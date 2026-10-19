@@ -3,8 +3,9 @@
 Every act (a hand, a skill run, a brain step) is bracketed by two :func:`yuki.perception.situation.snapshot` reads;
 :func:`compare` says what changed between them, in code, from measured numbers only: new windows (a pop-up, a
 picture-in-picture, an app that opened), windows gone, windows moved or resized (and their monitor), windows covered
-or uncovered (their visible share before and after, and what covers them now), where the focus went, media that
-started, stopped or changed track, and volume and mute changes (master and per app).
+or uncovered (their visible share before and after, and what covers them now), a tab put over what played (below),
+where the focus went, media that started, stopped or changed track, and volume and mute changes (the master and the
+apps' mixer rows).
 
 Two sets say whose change is whose. ``acted``: what the request itself was about (a change to it is the ask, never
 flagged). ``touched``: the windows the act itself brought up or focused (the route's window, the launched app). The
@@ -14,9 +15,9 @@ alt-tabbing during a countdown) is the user's own: it raises nothing, and :func:
 (``"Discord"``, ``"Discord.exe"``). Each covered entry says ``by_act`` (the act's windows did it) and
 ``side_effect`` (more than the ask itself).
 
-Three flags say when the act took something the user had, which is what earns the decider one look after acting
-(P1.3). "Attention" windows are the ones that, before the act, were in front, held the keyboard, or had a session
-playing in them:
+Four flags earn the decider one look after acting (P1.3): three say when the act took something the user had, the
+fourth when a sound the act turned on is still off. "Attention" windows are the ones that, before the act, were in
+front, held the keyboard, or had a session playing in them:
 
 * ``covered_attention``: an attention window the request was not about lost most of its visible share (under
   :data:`COVER_KEEP` of what it had left, losing at least :data:`COVER_MIN_LOSS`), or got minimised, and the act did it:
@@ -28,9 +29,22 @@ playing in them:
   moved to a new or touched window the request was not about.
 * ``new_popup``: a window that did not exist before and that the request was not about is now in front or holds the
   keyboard.
+* ``left_silent`` (final-B, 19 Oct: "unmute it" at master 0 was a verified done, and silent): a sound control the
+  act turned toward sound (unmuted it, or raised its level) is still silent after it: its level is 0, it is still
+  muted, or (an app's mixer row) the master above it is at 0 or muted. Read only from the parts both snapshots
+  carried (the master; the mixer rows of the apps a caller asked :func:`~yuki.perception.situation.snapshot` for).
 
-The thresholds are measured shares (the 16 px occlusion grid), never a guess at meaning. Media and volume changes are
-only read when both snapshots read that part (``DeskState.errors``).
+A **tab cover** (final-B: "open GitHub" while a video played opened a tab in the video's own window; same window,
+same share, so nothing changed for a window-level diff) is a covered entry of kind ``tab``: a window that showed a
+playing session's title before the act (the session tied to it, its title inside the window's) shows another title
+after it, while that same session (app id and title) plays on and is tied to no other window. It is judged by the
+session: the playing tab was not what was asked (the new tab was), so it counts for ``covered_attention`` even when
+the window is the ask's (a kind ``open`` skill marks the browser asked); it is the act's when the window is one of the
+act's (touched or asked), else the user's own (``(not from your act)``).
+
+The thresholds are measured shares (the 16 px occlusion grid) and text the OS and the apps wrote, compared as text
+(the window title holding the session's title: ``situation.map_media``'s own test), never a guess at meaning. Media and
+volume changes are only read when both snapshots read that part (``DeskState.errors``).
 
 Public API::
 
@@ -46,11 +60,13 @@ from typing import Any, Iterable
 
 from yuki.perception.situation import (
     HIDDEN,
+    MEDIA_TITLE_MIN,
     DeskState,
     Window,
     _key,
     _percent,
     _Rec,
+    _squash,
     _title,
     coverer,
     name_of,
@@ -88,7 +104,7 @@ class DeskDiff(_Rec):
     media_changes: list[dict[str, Any]] = field(default_factory=list)
     volume_changes: list[dict[str, Any]] = field(default_factory=list)
     flags: dict[str, bool] = field(default_factory=lambda: {"covered_attention": False, "focus_taken": False,
-                                                            "new_popup": False})
+                                                            "new_popup": False, "left_silent": False})
     any_flag: bool = False
     #: The attention windows before the act (ids): in front, keyboard, or playing.
     attention: list[int] = field(default_factory=list)
@@ -100,7 +116,8 @@ class DeskDiff(_Rec):
     def facts(self) -> dict[str, Any]:
         """Content-free, for log lines: counts and flags only."""
         return {"new": len(self.new_windows), "gone": len(self.gone_windows), "moved": len(self.moved),
-                "covered": len(self.covered), "uncovered": len(self.uncovered),
+                "covered": len(self.covered), "tabs": sum(1 for c in self.covered if c.get("kind") == "tab"),
+                "uncovered": len(self.uncovered),
                 "focus_moved": self.focus_from != self.focus_to, "media": len(self.media_changes),
                 "volume": len(self.volume_changes), **{k: bool(v) for k, v in self.flags.items()},
                 "any_flag": self.any_flag}
@@ -237,7 +254,8 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
                     by = coverer(after, b)
                 remember(b, by)
                 did, side = act_took(a, b, by)
-                diff.covered.append({"hwnd": hwnd, "app": b.app, "before": round(was, 3), "after": round(now, 3),
+                diff.covered.append({"hwnd": hwnd, "app": b.app, "kind": "window", "before": round(was, 3),
+                                     "after": round(now, 3),
                                      "by": by.hwnd if by is not None else None,
                                      "by_app": by.app if by is not None else None, "minimised": minimised,
                                      "attention": hwnd in diff.attention, "playing": hwnd in playing,
@@ -247,6 +265,32 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
                 remember(b)
                 diff.uncovered.append({"hwnd": hwnd, "app": b.app, "before": round(float(a.visible), 3),
                                        "after": round(float(b.visible), 3), "asked": asked(b)})
+
+        # a tab over what played (module docstring): the window that showed the playing session's title now shows
+        # another one, and the same session plays on, in no other window; judged by the session, never "asked"
+        if "media" not in before.errors and "media" not in after.errors:
+            for m in before.media:
+                a = old.get(m.hwnd or 0) if m.playing else None
+                b = new.get(a.hwnd) if a is not None else None
+                title = _squash(m.title)
+                if a is None or b is None or b.minimized or len(title) < MEDIA_TITLE_MIN:
+                    continue
+                if title not in _squash(a.title) or title in _squash(b.title):
+                    continue
+                sid = m.app_id or m.app
+                on = next((x for x in after.media if x.playing and (x.app_id or x.app) == sid
+                           and _squash(x.title) == title), None)
+                if on is None or (on.hwnd and on.hwnd != b.hwnd):
+                    continue
+                if any(c["hwnd"] == b.hwnd and c.get("kind") == "tab" for c in diff.covered):
+                    continue
+                remember(b)
+                mine = of_act(b)
+                diff.covered.append({"hwnd": b.hwnd, "app": b.app, "kind": "tab", "before": round(float(a.visible), 3),
+                                     "after": round(float(b.visible), 3), "by": None, "by_app": None,
+                                     "minimised": False, "attention": b.hwnd in diff.attention, "playing": True,
+                                     "was_front": a.foreground, "asked": False, "by_act": mine, "side_effect": mine,
+                                     "media": m.title})
 
         diff.focus_from, diff.focus_to = before.foreground, after.foreground
         diff.focus_by_act = bool(diff.focus_from != diff.focus_to and of_act(front_after))
@@ -294,13 +338,15 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
                 diff.media_changes.append({"app": ref.app, "title": ref.title, "from": was, "to": now,
                                            "track": bool(track), "hwnd": ref.hwnd})
 
-    # volumes: the master, then each app's own level and mute
-    if "master" not in before.errors and "master" not in after.errors and before.master and after.master:
+    # volumes: the master, then each app's own (mixer) level and mute
+    master_read = "master" not in before.errors and "master" not in after.errors and bool(before.master) \
+        and bool(after.master)
+    if master_read:
         lb, la = float(before.master.get("level") or 0.0), float(after.master.get("level") or 0.0)
         mb_, ma_ = bool(before.master.get("muted")), bool(after.master.get("muted"))
         if abs(la - lb) >= LEVEL_EPS or mb_ != ma_:
-            diff.volume_changes.append({"app": "master", "level_from": lb, "level_to": la, "muted_from": mb_,
-                                        "muted_to": ma_})
+            diff.volume_changes.append({"app": "master", "kind": "master", "level_from": lb, "level_to": la,
+                                        "muted_from": mb_, "muted_to": ma_})
     if "audio" not in before.errors and "audio" not in after.errors:
         ab = {_key(a.app): a for a in before.audio}
         for a in after.audio:
@@ -308,8 +354,21 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
             if b is None:
                 continue
             if abs(a.level - b.level) >= LEVEL_EPS or a.muted != b.muted:
-                diff.volume_changes.append({"app": a.app, "level_from": b.level, "level_to": a.level,
+                diff.volume_changes.append({"app": a.app, "kind": "app", "level_from": b.level, "level_to": a.level,
                                             "muted_from": b.muted, "muted_to": a.muted})
+    # left silent (module docstring): a control turned toward sound whose sound is still off after the act
+    over = after.master if "master" not in after.errors and after.master else None
+    for v in diff.volume_changes:
+        if not ((v["muted_from"] and not v["muted_to"]) or v["level_to"] - v["level_from"] >= LEVEL_EPS):
+            continue
+        why = [w for w, off in (("level", float(v["level_to"]) < LEVEL_EPS), ("muted", bool(v["muted_to"]))) if off]
+        if v["kind"] == "app" and over is not None and (bool(over.get("muted"))
+                                                        or float(over.get("level") or 0.0) < LEVEL_EPS):
+            why.append("master")
+            v["master_level"], v["master_muted"] = float(over.get("level") or 0.0), bool(over.get("muted"))
+        if why:
+            v["silent"] = why
+    diff.flags["left_silent"] = any(v.get("silent") for v in diff.volume_changes)
 
     diff.any_flag = any(diff.flags.values())
     return diff
@@ -322,10 +381,31 @@ def _mon(diff: DeskDiff, index: Any) -> str:
     return f"monitor {index}" + (f" ({tag})" if tag else "")
 
 
+def _volume_line(v: dict[str, Any]) -> str:
+    """One volume change in words: the master as ``Volume: master ...``, an app's row as the mixer's
+    (``Volume (mixer): Spotify 50% -> 40%.``: never an app's own slider), and why a control turned toward sound is
+    still silent: ``Volume: master unmuted, level 0% (still silent).``"""
+    bits = []
+    moved = abs(v["level_to"] - v["level_from"]) >= LEVEL_EPS
+    if moved:
+        bits.append(f"{v['level_from']:g}% -> {v['level_to']:g}%")
+    if v["muted_from"] != v["muted_to"]:
+        bits.append("muted" if v["muted_to"] else "unmuted")
+    why = v.get("silent") or ()
+    if "level" in why and not moved:
+        bits.append(f"level {v['level_to']:g}%")
+    if "muted" in why and v["muted_from"] == v["muted_to"]:
+        bits.append("still muted")
+    if "master" in why:
+        bits.append(f"the master at {v.get('master_level', 0.0):g}%{' and muted' if v.get('master_muted') else ''}")
+    head = "Volume (mixer):" if v.get("kind") == "app" else "Volume:"
+    return f"{head} {v['app']} {', '.join(bits)}{' (still silent)' if why else ''}."
+
+
 def render(diff: DeskDiff, max_chars: int = 500) -> str:
     """The diff in plain words for a decider (content: RAM only, never a log line), most telling first: what got
-    covered, the focus, new windows, moves, media, volumes. ``""`` when nothing changed. No header: the caller titles
-    it (the voice's "After:" block)."""
+    covered (a window, or a tab over what played), a sound left silent, the focus, new windows, moves, media, the
+    other volumes. ``""`` when nothing changed. No header: the caller titles it (the voice's "After:" block)."""
     name = diff.names.get
     lines: list[str] = []
     for c in diff.covered:
@@ -333,11 +413,19 @@ def render(diff: DeskDiff, max_chars: int = 500) -> str:
         tags = [t for t in ("was in front" if c["was_front"] else "", "playing" if c["playing"] else "") if t]
         head = f"{what}{' (' + ', '.join(tags) + ')' if tags else ''}"
         mine = "" if c.get("by_act", True) else f" {NOT_YOURS}"
+        if c.get("kind") == "tab":
+            # the window's own title is the new tab's now: said by id and app, with what plays on behind it
+            playing = f'"{_title(c["media"], 40)}"' if c.get("media") else "what was playing"
+            lines.append(f"[{c['hwnd']}] {c['app']} (playing): now shows another tab, {playing} plays on behind it"
+                         f"{mine}.")
+            continue
         if c["minimised"]:
             lines.append(f"{head} got minimised{mine}.")
         else:
             by = f", under [{c['by']}] {c['by_app']}" if c.get("by") else ""
             lines.append(f"{head}: visible {_percent(c['before'])}% -> {_percent(c['after'])}%{by}{mine}.")
+    silent = [v for v in diff.volume_changes if v.get("silent")]
+    lines += [_volume_line(v) for v in silent]   # a flag: said before the rest, never the first to give way
     if diff.focus_from != diff.focus_to:
         mine = "" if diff.focus_by_act else f" {NOT_YOURS}"
         lines.append(f"Focus: {name(diff.focus_from or 0) or 'nothing'} -> {name(diff.focus_to or 0) or 'nothing'}"
@@ -365,13 +453,7 @@ def render(diff: DeskDiff, max_chars: int = 500) -> str:
         title = f' "{_title(m["title"], 40)}"' if m.get("title") else ""
         change = "new track" if m["track"] and m["from"] == m["to"] else f"{m['from']} -> {m['to']}"
         lines.append(f"Media: {m['app']}{title} {change}.")
-    for v in diff.volume_changes:
-        bits = []
-        if abs(v["level_to"] - v["level_from"]) >= LEVEL_EPS:
-            bits.append(f"{v['level_from']:g}% -> {v['level_to']:g}%")
-        if v["muted_from"] != v["muted_to"]:
-            bits.append("muted" if v["muted_to"] else "unmuted")
-        lines.append(f"Volume: {v['app']} {', '.join(bits)}.")
+    lines += [_volume_line(v) for v in diff.volume_changes if not v.get("silent")]
     text = ""
     for line in lines:
         candidate = f"{text}\n{line}" if text else line

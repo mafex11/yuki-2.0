@@ -20,14 +20,16 @@ reason from, not a catalog, in this order (the situation on the screens stays se
    now (phase 2.2: ``yuki.skills.taste.now_picks``, each with a code-made why; the talker and the planner may choose
    from them by name), their other things at this hour (``yuki.skills.learn.values`` hour histograms: seen on
    :data:`HOUR_MIN_DAYS` days or more: "a couple of times" never leads the card); their weekly routines with days and
-   times (every active one, whatever the day: "what time's my meeting tomorrow"); their own ways (contract C4: run
-   only when asked, never offered);
+   times (every active one, whatever the day: "what time's my meeting tomorrow"); their routine as the nightly
+   portrait writes it (final-B: sleep, work hours, the usual meeting; the brief leaves it to the card); their own ways
+   (contract C4: run only when asked, never offered);
 3. **Their things, each with what it means to them** (``yuki.memory.meanings.meaning_of``, contract M1: "mafex (the
    MacBook's projects)", next to the thing) - sites with their usual browser (the preference's own answer:
    ``values.known`` reads it from ``yuki.skills.prefs``, one truth with what Yuki opens them in) and a work mark, weak
    ones last; their browsers when one means something; meeting tabs; YouTube channels (by display name, most watched
    first); Spotify playlists with what the user calls them; the voice channels and servers of the apps that join calls
-   (``yuki.skills.discord_route.voice_channels``); the things inside their own ways' apps (their projects); usual means
+   (``yuki.skills.discord_route.voice_channels``), most days used first with the count ("4 of the last 14 days":
+   final-B, a recent-first list read as the usual); the things inside their own ways' apps (their projects); usual means
    (``prefs``); **Where they left off** (planner only) - on the :data:`LEFT_OFF_N` sites they come back to most (never
    a work site), the last page they had in front in one of their browsers (an app's own embedded page is no page to
    open), with its title and address (``Store.links``);
@@ -96,6 +98,14 @@ MEANING_CHARS = 60
 DESK_CHARS = (300, 360)
 #: The weekly routines line names at most this many (talker, wide).
 ROUTINES_N = (4, 6)
+#: final-B (19 Oct): the "usual" lists that were recent first (voice channels, servers) rank by use over the last this
+#: many days (a channel's days with a call there, a server's days with a capture in its chats), the count said next
+#: to each, "n of the last 14 days", as the routines' "11 of 13 weekdays".
+USE_DAYS = 14.0
+#: The portrait's routine (the brief's ``routine`` field, else its Routines section) on the card at most: brief.py
+#: leaves it out of the talker's slice because the card carries it, and the routines table holds only the skills'
+#: clock routines (a skill's step at a time of day), not what they are for (the meeting that step is for).
+ROUTINE_CHARS = (300, 400)
 #: "Lately": each day digest's first sentence at most.
 LATELY_CHARS = 130
 #: "Where they left off" (planner): the LEFT_OFF_N sites they come back to most (the most days; never fewer than
@@ -379,6 +389,49 @@ def _routines_week(store: Any, n: int) -> list[list[Any]]:
     return _list(2, "Weekly routines: ", ((line, PLAIN) for _at, line in out[:n]), sep="; ")
 
 
+def _sentences(text: str) -> list[str]:
+    """``text`` cut after each sentence's stop (". ", "! ", "? "): plain punctuation, never a reading of words."""
+    out: list[str] = []
+    start = 0
+    for i, ch in enumerate(text):
+        if ch in ".!?" and (i + 1 == len(text) or text[i + 1] == " "):
+            part = text[start:i + 1].strip()
+            if part:
+                out.append(part)
+            start = i + 1
+    rest = text[start:].strip()
+    return out + ([rest] if rest else [])
+
+
+def _portrait_routine(store: Any, cap: int) -> list[list[Any]]:
+    """final-B (19 Oct, "when's my meeting tomorrow": the talker searched memory and found no time): their routine as
+    memory's nightly portrait writes it (the brief's ``routine`` field, else the portrait's Routines section: when
+    they sleep, work, eat and play, their usual meeting), dated by the portrait, whole sentences up to ``cap``. The
+    brief keeps it out of the talker's slice because the card carries it (``brief.slice_for``), and the routines
+    table's line names only what a skill does at a time. One plain line: a full card drops it whole, after its lists
+    are cut to their best few, rather than keep a fragment (its sentences carry no weight a cut could go by). ``[]``
+    without a portrait."""
+    try:
+        portrait = store.latest_portrait()
+    except Exception:  # noqa: BLE001
+        return []
+    if portrait is None:
+        return []
+    text = " ".join(str((portrait.brief or {}).get("routine") or (portrait.sections or {}).get("routines")
+                        or "").split())
+    kept: list[str] = []
+    for sentence in _sentences(text):
+        if len(" ".join([*kept, sentence])) > cap:
+            if not kept:
+                kept.append(_clip(sentence, cap))
+            break
+        kept.append(sentence)
+    if not kept:
+        return []
+    when = f", portrait of {datetime.fromtimestamp(float(portrait.at)):%d %b}" if portrait.at else ""
+    return [_line(2, f"Their routine (memory{when}): {' '.join(kept)}")]
+
+
 def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: int,
               names: dict[str, str]) -> list[list[Any]]:
     """fBrain (k_resume_anime: the planner clicked through "continue watching" instead of opening the episode): on the
@@ -583,6 +636,7 @@ def _habits(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, purpo
     out = _desk(store, purpose, wide)
     out += _usually_now(store, vals, now, wide)
     out += _routines_week(store, ROUTINES_N[i])
+    out += _portrait_routine(store, ROUTINE_CHARS[i])
     out += _list(3, "Their own ways (learned from them; run only when they ask, never offered): ",
                  ((x, PLAIN) for x in _ways(ways, WAYS_N[i])), sep="; ")
     return out
@@ -693,13 +747,10 @@ def _channels(store: Any, now: float, n: int) -> list[tuple[str, float]]:
 def _places(store: Any, now: float, n_voice: int, n_servers: int) -> list[list[Any]]:
     """Per app that joins calls (catalog data: ``end = "call_join"``): the voice channels they join (tastes
     ``<app>_voice``) and the ones memory saw them in (``yuki.skills.discord_route.voice_channels``, kHands merge note
-    5: newest first) with each one's server, then the servers they chat in (the part before ": " of their chats'
-    scopes: the capture's own "<server>: <channel>" form, as ``yuki.brain.context.read_places``), recent first, each
-    with what it means to them (contract M1). RAM only."""
+    5) with each one's server, most days on a call there first (:data:`USE_DAYS`, the count said), then the servers
+    they chat in (:func:`_servers`), each with what it means to them (contract M1). RAM only."""
     try:
-        from yuki.memory.store import app_key
         from yuki.skills.catalog import capabilities
-        from yuki.skills.chat import app_data
         from yuki.skills.menu import voice_channels
 
         apps = sorted({str(s.app) for s in capabilities().skills if str(getattr(s, "end", "")) == "call_join" and
@@ -709,58 +760,118 @@ def _places(store: Any, now: float, n_voice: int, n_servers: int) -> list[list[A
     out: list[list[Any]] = []
     for app in apps:
         title = app.capitalize()
-        voice: list[tuple[str, float]] = []
-        named: set[str] = set()
+        # final-B (19 Oct, "which VC do I usually hop in at night"): the list was recent first with no counts, and
+        # the newest channel read as the usual. Every channel memory knows (the ones they asked Yuki to join, the
+        # ones it saw them in) is now ranked by its days with a call there over the last USE_DAYS, with that count
+        # next to it; one with no call there in that window follows, in the old order, weak.
+        names: dict[str, tuple[str, str]] = {}
         try:
             from yuki.skills import taste
 
-            for x in taste.candidates(store, f"{app}_voice", now=now, by="n_obs", limit=n_voice):
+            for x in taste.candidates(store, f"{app}_voice", now=now, by="n_obs", limit=max(n_voice, 12)):
                 if str(x or "").strip():
-                    meaning = _meaning(store, "voice_channel", x)
-                    voice.append((_with(_clip(x, 30), meaning), MEANT if meaning else PLAIN))
-                    named.add(_clip(x, 30))
+                    names.setdefault(_squash_name(x), (" ".join(str(x).split()), ""))
         except Exception:  # noqa: BLE001
             pass
         seen = voice_channels(store, app)
         for vc in seen:
-            if len(voice) >= n_voice:
-                break
-            if not vc.name or _clip(vc.name, 30) in named:
-                continue
-            meaning = _meaning(store, "voice_channel", vc.name)
-            voice.append((_with(_clip(vc.name, 30), meaning, f"in {_clip(vc.place, 30)}" if vc.place else ""),
-                          MEANT if meaning else PLAIN))
-            named.add(_clip(vc.name, 30))
-        out += _list(2, f"{title} voice channels they join (recent first): ", voice, min_n=2)
-        servers: list[str] = []
+            if vc.name:
+                key = _squash_name(vc.name)
+                got = names.get(key)
+                names[key] = (got[0], got[1] or vc.place or "") if got else (" ".join(vc.name.split()),
+                                                                               vc.place or "")
+        use = _channel_use(store, now, [n for n, _p in names.values()], title)
+        ranked = sorted(enumerate(names.items()), key=lambda e: (
+            -int((use.get(e[1][0]) or {}).get("days") or 0), -int((use.get(e[1][0]) or {}).get("nights") or 0),
+            -float((use.get(e[1][0]) or {}).get("last") or 0.0), e[0]))
+        voice: list[tuple[str, float]] = []
+        for _i, (key, (name, place)) in ranked[:n_voice]:
+            u = use.get(key) or {}
+            days = int(u.get("days") or 0)
+            meaning = _meaning(store, "voice_channel", name)
+            count = (f"{days} of {int(USE_DAYS)} days" + (f", {int(u['nights'])} at night" if u.get("nights")
+                                                            else "")) if days else ""
+            voice.append((_with(_clip(name, 30), meaning, f"in {_clip(place, 30)}" if place else "", count),
+                          MEANT if meaning else PLAIN if days else WEAK))
+        counted = any((use.get(k) or {}).get("days") for _i, (k, _v) in ranked[:n_voice])
+        out += _list(2, f"{title} voice channels they join "
+                        f"({'most used first' if counted else 'recent first'}): ", voice, min_n=2)
         try:
-            keys = sorted({app_key(str(p)) or "" for p in app_data(app).get("processes") or []} - {""})
-            rows = store._query(f"SELECT scope_ciphertext FROM threads WHERE process IN ({','.join('?' * len(keys))})"
-                                " AND merged_into IS NULL AND kind = 'conversation' AND scope_ciphertext IS NOT NULL"
-                                " ORDER BY last_seen DESC LIMIT 200", keys) if keys else []
-        except Exception:  # noqa: BLE001
-            rows = []
-        for (ct,) in rows:
-            try:
-                scope = " ".join(str(store._dec(ct) or "").split())
-            except Exception:  # noqa: BLE001
-                continue
-            head, sep, _rest = scope.partition(": ")
-            if sep and head and head not in servers:
-                servers.append(head)
-            if len(servers) >= n_servers:
-                break
-        for vc in seen:
-            if len(servers) >= n_servers:
-                break
-            if vc.place and vc.place not in servers:
-                servers.append(vc.place)
-        bits = []
-        for x in servers:
-            meaning = _meaning(store, "server", x)
-            bits.append((_with(_clip(x, 30), meaning), MEANT if meaning else PLAIN))
-        out += _list(3, f"{title} servers they're in (recent first): ", bits, min_n=2)
+            out += _servers(store, app, title, seen, now, n_servers)
+        except Exception:  # noqa: BLE001 - the voice channels stand alone
+            pass
     return out
+
+
+def _squash_name(name: Any) -> str:
+    return " ".join(str(name or "").split()).casefold()
+
+
+def _channel_use(store: Any, now: float, names: list[str], app: str) -> dict[str, dict[str, Any]]:
+    """Each of ``names``' (voice channels') days with a call there over the last :data:`USE_DAYS`
+    (``talker_digest.channel_use``: their days, how many at night), keyed by :func:`_squash_name`. ``{}`` without."""
+    if not names:
+        return {}
+    try:
+        from yuki.memory.talker_digest import channel_use
+
+        got = channel_use(store, now, names, app=app, days=USE_DAYS)
+    except Exception:  # noqa: BLE001
+        return {}
+    return {_squash_name(v.get("name")): v for v in got.values()}
+
+
+def _servers(store: Any, app: str, title: str, seen: Sequence[Any], now: float, n: int) -> list[list[Any]]:
+    """The servers they chat in on one call-joining app (the part before ": " of their chats' scopes: the capture's
+    own "<server>: <channel>" form, as ``yuki.brain.context.read_places``), then the servers of the voice channels
+    memory saw them in; ranked by their days with a capture in that server's chats over the last :data:`USE_DAYS`
+    (final-B: the list was recent first), each with that count and what it means to them (contract M1). RAM only."""
+    from yuki.memory.checkins import user_day
+    from yuki.memory.store import app_key
+    from yuki.skills.chat import app_data
+
+    try:
+        keys = sorted({app_key(str(p)) or "" for p in app_data(app).get("processes") or []} - {""})
+        rows = store._query(f"SELECT id, scope_ciphertext FROM threads WHERE process IN ({','.join('?' * len(keys))})"
+                            " AND merged_into IS NULL AND kind = 'conversation' AND scope_ciphertext IS NOT NULL"
+                            " ORDER BY last_seen DESC LIMIT 200", keys) if keys else []
+    except Exception:  # noqa: BLE001
+        rows = []
+    servers: list[str] = []
+    threads: dict[int, str] = {}
+    for tid, ct in rows:
+        try:
+            scope = " ".join(str(store._dec(ct) or "").split())
+        except Exception:  # noqa: BLE001
+            continue
+        head, sep, _rest = scope.partition(": ")
+        if sep and head:
+            threads[int(tid)] = head
+            if head not in servers:
+                servers.append(head)
+    for vc in seen:
+        if vc.place and vc.place not in servers:
+            servers.append(vc.place)
+    days: dict[str, set[str]] = {}
+    if threads:
+        try:
+            got = store._query(f"SELECT thread_id, at FROM captures WHERE thread_id IN ({','.join('?' * len(threads))})"
+                               " AND at >= ?", (*threads, now - USE_DAYS * 86400.0))
+        except Exception:  # noqa: BLE001
+            got = []
+        for tid, at in got:
+            if int(tid) in threads and at:
+                days.setdefault(threads[int(tid)], set()).add(user_day(float(at)))
+    ranked = sorted(enumerate(servers), key=lambda e: (-len(days.get(e[1], ())), e[0]))[:n]
+    bits = []
+    for _i, x in ranked:
+        k = len(days.get(x, ()))
+        meaning = _meaning(store, "server", x)
+        bits.append((_with(_clip(x, 30), meaning, f"{k} of {int(USE_DAYS)} days" if k else ""),
+                     MEANT if meaning else PLAIN if k else WEAK))
+    counted = any(days.get(x) for _i, x in ranked)
+    return _list(3, f"{title} servers they're in ({'most used first' if counted else 'recent first'}): ",
+                 bits, min_n=2)
 
 
 def _live_ways(store: Any) -> list[dict[str, Any]]:
