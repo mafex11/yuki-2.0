@@ -62,7 +62,9 @@ x8WebArc (10 Oct: "open YouTube in Arc" opened nothing new in Arc five times, an
   newly at the address (review r1 H1); a window that already showed the very page asked for, and still does, is
   "already" (review r1 M1), said only once the done-check sees it, never a fresh "done".
 * **A browser that ignored the last two hand-offs** (kept the very page it had) is not handed the next one for a while
-  (RAM, this process; review r1 L1): its address-bar rung runs at once.
+  (RAM, this process; review r1 L1): its address-bar rung runs at once. skill22 (A16): the launch's persisted note
+  (:func:`persisted_note`) says so across restarts too, learns from this skill's own hand-offs, and an expired one
+  (``recheck``) gets one hand-off with its page wait capped (:data:`IGNORED_WAIT_S`).
 
 lSkills (live 17 Oct: every Arc open failed with protocol activation's ``0x80270254``, then the address-bar rung said
 "no window" in 96 ms with Arc up, and Yuki opened Excalidraw in Chrome):
@@ -112,6 +114,8 @@ LINE_TAB_UP = "{service} is up in {browser}."
 #: A web page (``{site}``: the site file's name or the domain as the user hears it).
 LINE_PAGE_UP = "{site} is up."
 LINE_VIDEO_UP = "Playing it."
+#: skill22 (A8): a title with no link of its own opened as the site's search for it (never "playing").
+LINE_VIDEO_SEARCH = "I couldn't find that video's own link, so its search results are up."
 LINE_CHAT_WEB = "Your chat with {name} is open in {browser}."
 #: Review r1 M1: the browser window already showed the very page asked for (and still does): said as "already", and
 #: only once the engine's done-check saw it (never a fresh "done"; a video only once it plays).
@@ -455,8 +459,11 @@ def _noted_window(call: RouteCall, key: str) -> int:
 _ignored: dict[str, tuple[int, float]] = {}
 
 
-def _note_ignored(key: str, ignored: bool) -> None:
-    """One more hand-off ``key`` ignored (``ignored``), or one it opened newly (the count is cleared)."""
+def _note_ignored(key: str, ignored: bool, name: str = "") -> None:
+    """One more hand-off ``key`` ignored (``ignored``), or one it opened newly (the count is cleared). skill22 (A16):
+    the launch's persisted note learns it too (:data:`PERSISTED_WRITE`, by the browser's ``name`` as the Start menu
+    has it, else its key): the launch's own open_url notes only the hands' path, since this skill asks it for the
+    hand-off alone."""
     key = _app_key(key)
     if not key:
         return
@@ -465,14 +472,54 @@ def _note_ignored(key: str, ignored: bool) -> None:
             _ignored[key] = (_ignored.get(key, (0, 0.0))[0] + 1, time.monotonic())
         else:
             _ignored.pop(key, None)
+    try:
+        from yuki.actions import launch
+
+        fn = getattr(launch, PERSISTED_WRITE, None)
+        if callable(fn):
+            fn(_words(name) or key, bool(ignored))
+    except Exception:  # noqa: BLE001
+        pass
 
 
-def _ignores_handoff(key: str) -> bool:
+def _ignores_handoff(key: str, name: str = "", note: str | None = None) -> bool:
     """Whether browser ``key`` ignored the last :data:`IGNORED_AFTER` hand-offs, the latest within
-    :data:`IGNORED_KEEP_S`."""
+    :data:`IGNORED_KEEP_S`; skill22 (A16): or the launch's persisted note says it ignores them
+    (:func:`persisted_note` ``ignores``; ``note``: that note already read), so the first open after each start no
+    longer pays a hand-off the browser always ignores (final-D: Arc's skill path spent 3.4 s of its 7.6 s on it)."""
     with _noted_lock:
         got = _ignored.get(_app_key(key))
-    return bool(got) and got[0] >= IGNORED_AFTER and time.monotonic() - got[1] < IGNORED_KEEP_S
+    if bool(got) and got[0] >= IGNORED_AFTER and time.monotonic() - got[1] < IGNORED_KEEP_S:
+        return True
+    return (persisted_note(key, name) if note is None else note) == "ignores"
+
+
+#: skill22 (A16): the launch's persisted per-browser note (desk22, ``yuki/actions/launch.py``):
+#: ``handoff_note(app) -> "ignores" | "recheck" | ""`` (it ignores hand-offs; it did, but the note has expired: hand it
+#: over once more with the page wait capped and measure it again; nothing known) and its writer
+#: ``note_handoff(app, ignored)``, both by the browser's Start menu name. Read through ``getattr``: a launch without
+#: them reads ``""`` (this process's own note only, as before).
+PERSISTED_NOTE = "handoff_note"
+PERSISTED_WRITE = "note_handoff"
+#: ...with that note, the longest a hand-off's page wait may take: a ``recheck``, or an ``ignores`` on a route whose
+#: next rung is not the address bar (the hand-off is the one way left there).
+IGNORED_WAIT_S = 1.5
+
+
+def persisted_note(key: str, name: str = "") -> str:
+    """:data:`PERSISTED_NOTE` for the browser ``name`` (else its ``key``): ``"ignores"``, ``"recheck"`` or ``""``.
+    Never raises."""
+    app = _words(name) or _app_key(key)
+    if not app:
+        return ""
+    try:
+        from yuki.actions import launch
+
+        fn = getattr(launch, PERSISTED_NOTE, None)
+        got = str(fn(app) or "") if callable(fn) else ""
+        return got if got in ("ignores", "recheck") else ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _is_window(hwnd: int) -> bool:
@@ -742,14 +789,14 @@ def route_told_link(call: RouteCall) -> RouteResult:
             # x8WebArc: the browser kept the page it had: not opened (page_blank, review r1 M1: a protocol-refused
             # browser came up showing no page at all: not opened either)
             if source != "default" and seen["state"] == "same":
-                _note_ignored(key, True)
+                _note_ignored(key, True, name)
             _log_open(call, "protocol", seen, seen["reason"])
             return RouteResult(ran=False, outcome=seen["reason"],
                                facts={"browser_from": source, "via": seen["via"], "state": seen["state"]})
         if not (isinstance(details, Mapping) and (details.get("launched") or details.get("hwnd"))):
             return RouteResult(ran=False, outcome="not_opened", facts={"browser_from": source, "via": seen["via"]})
     if seen["verified"] and source != "default":
-        _note_ignored(key, False)
+        _note_ignored(key, False, name)
     _log_open(call, "protocol", seen, "already" if seen["already"] else "page" if seen["verified"] else "unread")
     words = {"service": service or said or "It", "browser": _browser_title(key) or name or "the browser"}
     return RouteResult(ran=True, outcome="opened", app=key or None, say=LINE_TAB_UP.format(**words),
@@ -1397,13 +1444,21 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
     if source == "default" and not key:
         key = _handler_key(url)
     named = source != "default"
-    if bar_next and named and _ignores_handoff(key):
+    note = persisted_note(key, name) if named else ""
+    ignores = named and _ignores_handoff(key, name, note)
+    if bar_next and ignores:
         _log_open(call, "protocol", {}, "skipped_ignored")
         return RouteResult(ran=False, outcome="handoff_ignored", facts={"browser_from": source}), \
             name, key, source, {}
     _claim_app(call, key)
     tabs_before = _tabs_before(key, url) if key else {}
-    result = _open_url(url, name if named else None, _launch_deadline(call))
+    deadline = _launch_deadline(call)
+    if ignores or note == "recheck":
+        # skill22 (A16): a browser the kept note says ignores hand-offs, on a route with no address-bar rung next (the
+        # hand-off is the one way left), or one whose note has expired (handed over once more, measured again): its
+        # page wait is capped (the launch's own wait would run its whole floor on a page that never comes)
+        deadline = min(deadline, time.monotonic() + IGNORED_WAIT_S)
+    result = _open_url(url, name if named else None, deadline)
     if kind := _held_by_game(result):
         return RouteResult(ran=False, held=kind, outcome="refused"), name, key, source, {}
     seen = _launch_seen(result)
@@ -1419,7 +1474,7 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
             if named and seen["state"] in ("same", "blank"):
                 # fSkills (live 18 Oct: Arc refused the address and came up blank, 3.4 s, before the address bar):
                 # a blank window is the address ignored too, so after IGNORED_AFTER of them the bar runs at once
-                _note_ignored(key, True)
+                _note_ignored(key, True, name)
             _log_open(call, "protocol", seen, seen["reason"])
             return RouteResult(ran=False, outcome=seen["reason"], facts={**facts, "state": seen["state"]}), \
                 name, key, source, seen
@@ -1430,7 +1485,7 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
         return (None if launched else RouteResult(ran=False, outcome="not_opened", facts=facts)), \
             name, key, source, seen
     if seen["verified"] and named:
-        _note_ignored(key, False)
+        _note_ignored(key, False, name)
     _log_open(call, "protocol", seen, "already" if seen["already"] else "page" if seen["verified"] else "unread")
     return None, name, key, source, seen
 
@@ -1612,6 +1667,9 @@ def page_matches(url: Any, expect: Mapping[str, Any]) -> bool:
 
     if not url or not expect:
         return False
+    if expect.get("search"):
+        # skill22 (A8): a site's search results for the words asked: that very address (its query included)
+        return _page_key(str(url)) == _page_key(str(expect["search"]))
     if expect.get("host"):
         host = (url_host(str(url)) or "").casefold()
         domain = str(expect["host"]).casefold()
@@ -1661,6 +1719,10 @@ def _target(call: RouteCall, opens: str) -> tuple[str | None, dict[str, Any], st
     ``(None, {"why": code}, "", "")`` when no address can be built from data."""
     if opens == "video":
         video = call.values.get("video")
+        found = search_page(video.get("ref")) if isinstance(video, Mapping) and video.get("search") else None
+        if found is not None:
+            # skill22 (A8): a title with no link of its own: the site's search for it (named so, never "playing")
+            return found[0], found[1], LINE_VIDEO_SEARCH, LINE_VIDEO_SEARCH
         got = video_page(video.get("ref") if isinstance(video, Mapping) else None)
         if got is None:
             return None, {"why": "no_link"}, "", ""
@@ -1723,6 +1785,52 @@ def video_page(ref: Any) -> tuple[str, dict[str, Any]] | None:
     return ref, {"site": m.site, "kind": m.kind, "entity": str(m.entity)}
 
 
+#: skill22 (A8): the site file's ``[urls]`` template of its own search results page (``yuki/connect/sites``; data).
+SEARCH_URL = "search"
+
+
+def search_link(title: Any) -> dict[str, Any] | None:
+    """skill22 (A8; final-D multi_arc_newtab_youtube and k_video_another_one under ONE: a video title handed to
+    web.open_video had no link of its own, so every rung said no_route): the title as the video site's own search for
+    it (the ``search`` address of the site whose watch pages the picks build, :func:`_video_kinds`), for the video
+    slot: ``{"name": the title, "ref": the search address, "search": True}``. A title of fewer than
+    :data:`TITLE_MIN_WORDS` distinct words, or no such address: ``None``. Pure apart from the site files."""
+    words = _words(title)
+    if not words or len(set(_title_words(words))) < TITLE_MIN_WORDS:
+        return None
+    try:
+        from yuki.connect.templates import fill
+
+        for site_name, _kind in sorted(_video_kinds()):
+            url = fill(site_name, SEARCH_URL, query=words)
+            if url and url.startswith("https://"):
+                return {"name": words, "ref": url, "search": True}
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def search_page(ref: Any) -> tuple[str, dict[str, Any]] | None:
+    """``(the address, what the page in front must be)`` of a search address :func:`search_link` built: one of the
+    video sites' own search template (its host and path; the query is the words), as it stands. ``None``: not one."""
+    from urllib.parse import urlsplit
+
+    ref = str(ref or "").strip()
+    if not ref.startswith("https://") or " " in ref:
+        return None
+    try:
+        from yuki.connect.templates import site as site_data
+
+        got = urlsplit(ref)
+        for site_name, _kind in sorted(_video_kinds()):
+            template = str(((site_data(site_name) or {}).get("urls") or {}).get(SEARCH_URL) or "")
+            if template and _same_page(ref, template) and got.query:
+                return ref, {"site": site_name, "search": ref}
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def route_open_video(call: RouteCall) -> RouteResult:
     """web.open_video's rung A: the picked video's own page in the chosen browser (its link from the offered options)."""
     url, expect, base, already = _target(call, "video")
@@ -1731,8 +1839,24 @@ def route_open_video(call: RouteCall) -> RouteResult:
     failed, name, key, source, seen = _open_in_browser(call, url, hosts=_hosts_of(expect), bar_next=True)
     if failed is not None:
         return failed
-    return _opened_result(_browser_line(base, name, source), key, source, seen, {"expect": expect, "address": url},
-                          already_line=_browser_line(already, name, source))
+    got = _opened_result(_browser_line(base, name, source), key, source, seen, {"expect": expect, "address": url},
+                         already_line=_browser_line(already, name, source))
+    return _searched(got, expect)
+
+
+def _searched(result: RouteResult, expect: Mapping[str, Any]) -> RouteResult:
+    """skill22 (A8): a rung that opened a site's search for a title (no link of its own) never says "Playing it": its
+    check can't confirm a video plays (:func:`probe_video_shown`), so the run is unconfirmed, handed to the caller
+    with the results page up, and its own line says what is there (``unverified_line``). ``facts["search"]``: a code
+    flag. Any other result as it is."""
+    if not expect.get("search"):
+        return result
+    result.unverified_line = result.say
+    result.facts = {**dict(result.facts or {}), "search": True}
+    if result.already:
+        # the very search page was already showing: still nothing playing, so never the engine's "already" path
+        result.already, result.ran, result.outcome = False, True, "opened"
+    return result
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2182,7 +2306,12 @@ def probe_video_shown(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, d
     expect = _ram(ctx).get("expect")
     if not isinstance(expect, Mapping) or not expect:
         return None, {"status": "no_route"}
-    return _shown_page(ctx, lambda url: page_matches(url, expect))
+    verdict, ev = _shown_page(ctx, lambda url: page_matches(url, expect))
+    if expect.get("search") and verdict is True:
+        # skill22 (A8): the search results for the title are up, which is no video playing: never a done (None, so
+        # the run goes to the caller unconfirmed with the results in front, never the next rung typing it again)
+        return None, {**ev, "status": "search_shown"}
+    return verdict, ev
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2409,9 +2538,11 @@ def route_address_bar(call: RouteCall) -> RouteResult:
         # once the engine's done-check sees it (else the next rung runs: ran is False)
         seen["state"] = "already"
         _log_open(call, "address_bar", seen, "already")
-        return RouteResult(ran=False, already=True, outcome="already", app=key,
-                           say=_browser_line(already_base, name, source), facts={**facts, "status": "already"},
-                           facts_ram={**ram, "hwnd": hwnd, "before": before_url, "already": True, "arrived": False})
+        return _searched(RouteResult(ran=False, already=True, outcome="already", app=key,
+                                     say=_browser_line(already_base, name, source),
+                                     facts={**facts, "status": "already"},
+                                     facts_ram={**ram, "hwnd": hwnd, "before": before_url, "already": True,
+                                                "arrived": False}), expect)
     keys = _keys()
     opened = keys.hotkey(*new_tab, expect_hwnd=hwnd)
     if kind := _held_by_game(opened):
@@ -2481,25 +2612,129 @@ def route_address_bar(call: RouteCall) -> RouteResult:
     _log_open(call, "address_bar", seen, facts["status"])
     # verified only on a page seen newly arriving (RAM ``arrived``); otherwise the done-check decides, and an unchanged
     # page there is False (the hand-off runs), never a "done"
-    return RouteResult(ran=True, verified=True if page is not None else None, outcome="typed", app=key,
-                       say=_browser_line(base, name, source), facts=facts,
-                       facts_ram={**ram, "hwnd": at, "before": befores.get(at, ""), "arrived": page is not None})
+    return _searched(RouteResult(ran=True, verified=True if page is not None else None, outcome="typed", app=key,
+                                 say=_browser_line(base, name, source), facts=facts,
+                                 facts_ram={**ram, "hwnd": at, "before": befores.get(at, ""),
+                                            "arrived": page is not None}), expect)
 
 
 def probe_video_playing(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
     """web.open_video's playing check (part of its done-check, review r1 M2, and its re-check): the browser's own
     media session says playing. The browser is the one the route opened the page in; after a hand-off (no route
-    result) the program of the window in front (the page the done-check's other part reads is in it)."""
+    result) the program of the window in front (the page the done-check's other part reads is in it).
+
+    skill22 (A7; final-B R11 and final-D youtube_newest_sidemen, k_resume_anime: the video opened paused, the check
+    waited out its 6 s on "paused" and only a later rung touching the window started it): while the route's own check
+    waits, a session still paused :data:`PLAY_AFTER_S` after the check first saw it paused gets **one** play through
+    the media session (:func:`_play_once`: no key, no click, no focus), only when the page shown is that very video and
+    the session is that page's (its title stands in that window's title), never with a game in front or with Act
+    switched off for the browser, never after the done verdict (the re-check: a pause then is the user's), never after
+    a hand-off. A search page (A8) is no video: ``None``."""
     from yuki.skills.donecheck import probe_media_session
 
     result = getattr(ctx, "result", None)
-    browser = str(_ram(ctx).get("browser") or getattr(result, "app", "") or "")
+    ram = _ram(ctx)
+    expect = ram.get("expect")
+    if isinstance(expect, Mapping) and expect.get("search"):
+        return None, {"status": "search"}
+    browser = str(ram.get("browser") or getattr(result, "app", "") or "")
     if not browser:
         _hwnd, image = _front()
         browser = _app_key(image)
     if not browser:
         return None, {"status": "no_browser"}
-    return probe_media_session(ctx, {"app": browser, "status": "playing"})
+    verdict, ev = probe_media_session(ctx, {"app": browser, "status": "playing"})
+    if verdict is False and ev.get("status") == "paused":
+        played = _play_once(ctx, browser)
+        if played:
+            ev = {**ev, "play": played}
+    return verdict, ev
+
+
+#: skill22 (A7): how long a just-opened video's session may read paused (the page's own autoplay starting) before the
+#: one play by the media session (:func:`_play_once`), and how long that command may take.
+PLAY_AFTER_S = 1.0
+PLAY_TIMEOUT_S = 0.8
+#: The route's RAM keys of that play: when the check first read paused, the play's outcome (once per run) and how many
+#: times that very video's page was up with another page's session, at most :data:`PLAY_LOOKS_MAX`.
+PAUSED_SEEN, PLAY_SENT, PLAY_LOOKS = "paused_seen", "play_sent", "play_looks"
+PLAY_LOOKS_MAX = 3
+
+
+def _session_title(browser: str) -> str:
+    """The title of ``browser``'s media session the playing check reads (its first: ``donecheck.probe_media_session``'s
+    own choice); ``""`` when none. RAM only."""
+    try:
+        from yuki.actions.media import session_matches
+        from yuki.skills.donecheck import _sessions
+
+        mine = [s for s in (_sessions() or []) if session_matches(str(s.get("app_id") or ""), browser)]
+        return " ".join(str((mine[0] if mine else {}).get("title") or "").split())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _window_title(hwnd: int) -> str:
+    try:
+        import win32gui
+
+        return " ".join(str(win32gui.GetWindowText(int(hwnd)) or "").split())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _act_off(app: str) -> bool:
+    """Whether the user switched Act off for ``app`` (Settings, App access: the brain's own policy reader, as the
+    launch's measured names read it). Unreadable: not off. Never raises."""
+    try:
+        from yuki.brain.util import _shared_reader
+
+        return bool(_shared_reader().app_off(app))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _play_once(ctx: Any, browser: str) -> str:
+    """skill22 (A7): the one play of :func:`probe_video_playing`, as a code word for the check's evidence: ``""``
+    nothing yet (no route facts, after the done verdict, paused for less than :data:`PLAY_AFTER_S`, already sent);
+    not sent this read: ``not_shown`` (the page isn't that very video's yet), ``other_session`` (the session's title
+    isn't that window's page); not sent this run: ``held_game``, ``act_off``, ``not_matched`` (:data:`PLAY_LOOKS_MAX`
+    looks and never matched); else the media command's outcome (``sent``, ``pending``, ``already``, ``refused``,
+    ``no_session``...). The route's own RAM facts (the result's ``facts_ram``) keep when it first read paused and that
+    the play went, so it goes once per run. Never raises."""
+    try:
+        live = getattr(getattr(ctx, "result", None), "facts_ram", None)
+        if not isinstance(live, dict) or not live.get("expect") or live.get(DONE_AT) or live.get(PLAY_SENT):
+            return ""
+        clock = getattr(ctx, "clock", time.monotonic)
+        now = float(clock())
+        first = live.setdefault(PAUSED_SEEN, now)
+        if now - float(first) < PLAY_AFTER_S:
+            return ""
+        if _refused("media_play"):
+            live[PLAY_SENT] = "held_game"
+            return "held_game"
+        if _act_off(browser):
+            live[PLAY_SENT] = "act_off"
+            return "act_off"
+        shown, _ev = probe_video_shown(ctx, {})
+        if shown is not True:
+            return "not_shown"           # not that very video's page (yet): no play, read again (the check's own time)
+        hwnd, _how = _page_window(ctx)
+        title = _session_title(browser)
+        if not title or not hwnd or title.casefold() not in _window_title(hwnd).casefold():
+            live[PLAY_LOOKS] = int(live.get(PLAY_LOOKS) or 0) + 1
+            if live[PLAY_LOOKS] >= PLAY_LOOKS_MAX:
+                live[PLAY_SENT] = "not_matched"
+                return "not_matched"     # never seen as that very video's session: no play this run
+            return "other_session"       # the session is another page's (another tab's video): no play, read again
+        from yuki.actions import media
+
+        got = media.command("play", app=browser, timeout_s=PLAY_TIMEOUT_S)
+        live[PLAY_SENT] = str(got.outcome or "sent")
+        return live[PLAY_SENT]
+    except Exception:  # noqa: BLE001 - no play: the check reads on as before
+        return ""
 
 
 def probe_page_seen(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
@@ -2658,4 +2893,5 @@ __all__ = ["ROUTES", "PROBES", "route_site_tab", "route_told_link", "route_open_
            "known_services", "service_of", "page_address", "page_matches", "video_page", "domain_like",
            "chat_web_address", "read_whole", "BROWSER_MIN_HOSTS", "BROWSER_POLICIES", "LINE_TAB_UNREADABLE",
            "LINE_TAB_PARTIAL", "LINE_TAB_NONE", "LINE_TAB_UNKNOWN", "LINE_BROWSER_CLOSED", "LINE_TAB_NO_ID",
-           "ASK_TAB_WHICH", "LINE_TAB_UP", "site_browser", "SITE_SHARE", "SITE_MIN_VISITS"]
+           "ASK_TAB_WHICH", "LINE_TAB_UP", "site_browser", "SITE_SHARE", "SITE_MIN_VISITS", "LINE_VIDEO_SEARCH",
+           "search_link", "search_page", "persisted_note", "PLAY_AFTER_S"]

@@ -15,7 +15,9 @@ be replaced through ``ProbeContext.probes`` (tests, replays, a driver):
 
 * ``read_back``: the route's own measured read-back (a slider's or a mixer level's ``verified``);
 * ``uia_name``: an element with this role and name exists inside its container (``"Pause {name}"`` in a grid);
-* ``media_session``: one app's media session has ``status`` (``playing`` / ``paused``) or its track changed since t0;
+* ``media_session``: one app's media session has ``status`` (``playing`` / ``paused``) or its track changed since t0
+  (a read only; skill22, A7: web.open_video's own playing check gives a video it just opened that stays paused one
+  play through the media session, :func:`yuki.skills.web_route.probe_video_playing`);
 * ``audio_active``: the app's process has an active render session on this PC (Core Audio);
 * ``level``: a mixer or the endpoint level is ``value`` (within 2 points);
 * ``page_at``: the browser window shows a page of ``site`` / ``kind`` (``yuki/connect/sites`` templates; ``site`` a

@@ -837,10 +837,122 @@ def _import_evidence(store: Any, *, now: float) -> bool:
         return False
 
 
+#: skill22 (contract C13): the act steps :func:`spec_from_steps` reads, by their ``do`` (the hands' and the desk's own
+#: step words): a click on a control or a row, typing into a field, keys pressed.
+TOLD_CLICKS = frozenset({"click", "dclick", "select", "invoke", "pick", "press_button", "toggle", "expand"})
+TOLD_TEXT = frozenset({"type", "paste", "set_text", "set_value", "write"})
+TOLD_KEYS = frozenset({"keys", "press", "press_keys", "hotkey", "key"})
+#: The roles a told control may have (a command's own control, as :func:`_labels` reads them): anything else clicked
+#: before the typing (a message, a line of text) is content, never a step of a way.
+TOLD_CONTROL_ROLES = frozenset({"Button", "MenuItem", "ComboBox", "Tab", "TabItem", "SplitButton", "Hyperlink"})
+
+
+def _step_role(step: Mapping[str, Any]) -> str:
+    return " ".join(str(step.get("role") or step.get("control_type") or "").split())
+
+
+def _step_name(step: Mapping[str, Any]) -> str:
+    return " ".join(str(step.get("name") or step.get("label") or "").split())
+
+
+def spec_from_steps(app: str, steps: Sequence[Mapping[str, Any]], end: Mapping[str, Any] | None = None
+                    ) -> dict[str, Any] | None:
+    """skill22 (contract C13; "learn after one go"): the spec of a way the user tells Yuki to keep ("remember how I do
+    this"), built from the steps an act just ran, in the shape :func:`keep_told` takes (:func:`template`'s). Pure.
+
+    ``steps``, in the order they ran, each a mapping with ``do`` and the UI facts of what it acted on (never its
+    text): a click (:data:`TOLD_CLICKS`) on a control (``role``, its own ``name``, ``aid`` its AutomationId, ``parent``
+    its parent's role) or on a row of a list (``item`` true, or an ``index``: which row differs from one go to the
+    next, so it becomes the way's item slot); typing (:data:`TOLD_TEXT`) into a field (``role``, its own ``name``,
+    ``parent``; the typed text is never read: it is the way's text slot); keys (:data:`TOLD_KEYS`, ``keys``: the chord).
+    Only the steps before the first typing are the way's place, as in :func:`template`: its first row picked (the item
+    slot) and at most :data:`MAX_CONTROLS` command controls (:data:`TOLD_CONTROL_ROLES`, a name of one part: a row's
+    composite name is never a control's). The field is the one the last typing went into; the end is the keys
+    pressed after it (``end``: ``{"kind", "keys"}`` given by the caller wins), else none (a draft way).
+
+    ``None`` when nothing of it can be kept: no app, no typing into a field (a way ends in a field), or no place step
+    (only typing into one field: the hands do that without a way, :func:`find`'s own rule). The field's own name is
+    kept in RAM only until :func:`keep_told` turns it into the trace's keyed digest."""
+    try:
+        from yuki.memory.store import app_key
+
+        app_k = app_key(str(app or "")) or " ".join(str(app or "").split()).casefold()
+        if not app_k:
+            return None
+        rows = [s for s in steps or () if isinstance(s, Mapping)]
+        typed_at = next((i for i, s in enumerate(rows) if str(s.get("do") or "") in TOLD_TEXT), None)
+        if typed_at is None:
+            return None
+        field_step = [s for s in rows if str(s.get("do") or "") in TOLD_TEXT][-1]
+        field_role, field_name = _step_role(field_step), _step_name(field_step)
+        if not field_role or not field_name:
+            return None
+        out_steps: list[dict[str, Any]] = []
+        item: dict[str, Any] | None = None
+        controls = 0
+        for s in rows[:typed_at]:
+            if str(s.get("do") or "") not in TOLD_CLICKS:
+                continue
+            role, name = _step_role(s), _step_name(s)
+            if role == field_role and name == field_name:
+                continue          # a click into the field itself: the field step below
+            is_row = bool(s.get("item")) or isinstance(s.get("index"), int) and not isinstance(s.get("index"), bool)
+            if is_row:
+                if item is None and role:
+                    item = {"role": role, "parent": " ".join(str(s.get("parent") or "").split()), "things": [],
+                            "demos": 1, "days": 1}
+                    out_steps.append({"do": "item"})
+                continue
+            if (controls < MAX_CONTROLS and role in TOLD_CONTROL_ROLES and name and len(_parts(name)) == 1
+                    and not any(c.get("do") == "control" and c.get("name") == name[:NAME_CHARS] for c in out_steps)):
+                aid = " ".join(str(s.get("aid") or s.get("automation_id") or "").split())
+                out_steps.append({"do": "control", "role": role, "name": name[:NAME_CHARS], "aid": aid,
+                                  "demos": 1, "days": 1})
+                controls += 1
+        if not out_steps:
+            return None
+        out_steps += [{"do": "field"}, {"do": "text"}]
+        keys: list[str] = []
+        if isinstance(end, Mapping) and isinstance(end.get("keys"), (list, tuple)):
+            keys = [str(k).casefold() for k in end["keys"] if str(k).strip()]
+        else:
+            last = typed_at + max(i for i, s in enumerate(rows[typed_at:]) if str(s.get("do") or "") in TOLD_TEXT)
+            after = [s for s in rows[last + 1:] if str(s.get("do") or "") in TOLD_KEYS]
+            if after:
+                raw = after[-1].get("keys") if after[-1].get("keys") is not None else after[-1].get("key")
+                raw = raw if isinstance(raw, (list, tuple)) else str(raw or "").split("+")
+                keys = [str(k).strip().casefold() for k in raw if str(k).strip()]
+        kind = str((end or {}).get("kind") or "field_submitted") if isinstance(end, Mapping) else "field_submitted"
+        field_id = {"role": field_role, "parent": " ".join(str(field_step.get("parent") or "").split()),
+                    "box": " ".join(str(field_step.get("box") or "").split()), "name": field_name}
+        return {"v": SPEC_VERSION, "app": app_k, "end": {"kind": kind, "keys": keys}, "steps": out_steps,
+                "field": [field_id], "item": item,
+                "evidence": {"demos": 1, "days": 1, "typed": 1, "with_item": 1 if item else 0, "told": True}}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _told_fields(store: Any, app: str, spec: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """skill22 (C13): a told spec's field identities as the replay finds them: a field's own name (RAM, from
+    :func:`spec_from_steps`) turned into the trace's keyed digest (:func:`name_digest`), the name itself never kept."""
+    out: list[dict[str, Any]] = []
+    for f in spec.get("field") or []:
+        if not isinstance(f, Mapping):
+            continue
+        g = {k: v for k, v in f.items() if k != "name"}
+        if not g.get("name_digest") and f.get("name"):
+            g["name_digest"] = name_digest(store, app, str(f.get("role") or ""), str(f.get("name") or ""))
+        if g.get("name_digest"):
+            out.append(g)
+    return out
+
+
 def keep_told(store: Any, *, app: str, spec: Mapping[str, Any], name: str, now: float | None = None) -> str | None:
     """The hook for a way the user TELLS Yuki ("learn after one go"): kept at once, no bar, never retired by the
     pass. ``spec`` has this module's shape (:func:`template`); the caller (the brain's "remember how I do this") builds
-    it from the steps it just ran. Returns the way's key, or ``None`` when it could not be kept. Never raises."""
+    it from the steps it just ran (skill22, contract C13: :func:`spec_from_steps`; a field named by its own name there
+    is kept as its keyed digest, never the name). Returns the way's key, or ``None`` when it could not be kept (no field
+    the replay can find). Never raises."""
     now = time.time() if now is None else float(now)
     try:
         from yuki.memory.store import app_key
@@ -849,7 +961,10 @@ def keep_told(store: Any, *, app: str, spec: Mapping[str, Any], name: str, now: 
         key = way_key(app, str((spec.get("end") or {}).get("kind") or "told"), "told:" + " ".join(name.split()))
         prov = json.dumps({"v": SPEC_VERSION, "learned_by": "told", "told": True, "named_by": "user",
                            "everyday": False, "offer": "never"}, separators=(",", ":"))
-        body = dict(spec, v=SPEC_VERSION, app=app)
+        fields = _told_fields(store, app, spec)
+        if not fields:
+            return None
+        body = dict(spec, v=SPEC_VERSION, app=app, field=fields)
         cap_id = capability_id(store)
 
         def op(conn: Any) -> None:
@@ -1001,5 +1116,6 @@ if __name__ == "__main__":
 
 __all__ = ["CAPABILITY", "ORIGIN", "END_FACTS", "MAX_WAYS", "Step", "Demo", "Way", "demonstrations", "group_key",
            "passes", "kept_places", "merge_groups", "things", "template", "way_key", "find", "learn", "keep_told",
+           "spec_from_steps", "TOLD_CLICKS", "TOLD_TEXT", "TOLD_KEYS",
            "live_ways", "menu_lines", "control_labels", "note_use", "name_digest", "container_digest", "covered_apps",
            "capability_id", "app_title", "group_words", "NAMING_V"]

@@ -23,3 +23,6 @@ handle = "https://www.youtube.com/@{handle}"
 channel = "https://www.youtube.com/channel/{id}"
 feed = "https://www.youtube.com/feeds/videos.xml?channel_id={id}"
 oembed = "https://www.youtube.com/oembed?url={url}&format=json"
+# skill22 (A8): the site's own search results page for words (web.open_video's fallback for a title that has no link
+# of its own). An address only, deliberately no [pages] kind: a search is never a taste entity or a moment's value.
+search = "https://www.youtube.com/results?search_query={query}"

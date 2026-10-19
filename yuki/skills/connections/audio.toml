@@ -45,8 +45,9 @@ ask_in_call = true
 default = "system"
 ask = "Whose volume: an app's or the whole PC's?"
 
+# skill22 (A17): "everything" and "speakers" name the whole PC too ("turn everything down", "louder on the speakers").
 [capability.volume.slot.option_names]
-system = ["system", "PC", "computer", "laptop", "master"]
+system = ["system", "PC", "computer", "laptop", "master", "everything", "speakers"]
 own_voice = ["own voice", "your voice", "Yuki's voice"]
 
 [[capability.volume.slot]]
