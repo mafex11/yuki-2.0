@@ -1369,6 +1369,15 @@ class ReplyChannel:
         """The words held back from speech (after a ``more`` line, or past the word cap), or ``""``."""
         return " ".join("".join(self._held).split())
 
+    @property
+    def spoken_asks(self) -> bool:
+        """voice20 review L1: what of this reply was passed on as speech ends a sentence as a question (its own
+        closing mark, ``narrator.asks``; punctuation, never words). Held-back words are not counted (never heard)."""
+        from yuki.voice.expressive import strip_tags
+        from yuki.voice.narrator import asks
+
+        return asks(strip_tags("".join(self._said)))
+
     def feed(self, text: str) -> str:
         out: list[str] = []
         for ch in text or "":

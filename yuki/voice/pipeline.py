@@ -470,6 +470,8 @@ class LlmCall:
     one_unmarked: bool = False
     one_marker: str | None = None
     one_repeat: bool = False
+    #: voice20 review L1: what of this reply was spoken ends a sentence as a question (its own closing mark)
+    one_asks: bool = False
 
 
 #: Tools whose spoken acknowledgement travels in the call itself (``say_first``), said as soon as it is written.
@@ -3759,9 +3761,10 @@ ONE_TOOK: frozenset[str] = frozenset({"done", "already", "written", "stopped", "
 #: was heard is refused once with this (code facts: the calls' kinds, what left the speaker).
 ONE_READ_UNANSWERED = ("Not quiet: they asked and have heard nothing yet. Answer them now from what you read, in a few "
                        "words; if it holds nothing for them, say so.")
-#: voice20 (final-D S5, contract C9): a closing reply (a lone stay_quiet, or words with no call) of a ONE turn that the
-#: budget says to hold once (``closing_hold()``: one miss, no act after it, the retry window open) gets this instead:
-#: as the stay_quiet's result, or after the closing words as a note of its own (code facts, never the words).
+#: voice20 (final-D S5, contract C9): a closing reply (a lone stay_quiet, or words with no call) of a ONE turn that
+#: Lane ONE's ``closing_hold()`` says to hold once is answered with that method's own sentence (its code facts: one
+#: miss with nothing else tried, or a legal tidy step untaken), as the stay_quiet's result or as a note of its own
+#: after the closing words. This line is only the fallback, for a reason given as a bare code word.
 ONE_MISS_HOLD = ("Not done yet: one way did not take and nothing else was tried. Try one other way now (an undoable "
                  "act), then say in a few words what is left.")
 #: voice20 (final-D S22i): the rerun of a ONE result round whose closing words had no marker line (none of them was
@@ -3777,6 +3780,14 @@ def _code_word(why: str) -> dict[str, Any]:
     if text and len(text) <= 40 and text.replace("_", "").isalnum() and text.isascii():
         return {"why": text}
     return {"why_chars": len(text)}
+
+
+def _hold_text(why: str) -> str:
+    """voice20 review M1 (contract C9): what a held closing reply is answered with: the sentence Lane ONE's
+    ``closing_hold()`` gave (code's own words to the agent, e.g. its miss or its tidy step), else :data:`ONE_MISS_HOLD`
+    (nothing, or a bare code word). A shape test on code's string, never the user's words."""
+    text = " ".join(str(why or "").split())
+    return ONE_MISS_HOLD if not text or "why" in _code_word(text) else text
 
 
 def one_thinking_mode(settings: Any) -> str:
@@ -4104,13 +4115,17 @@ class OneVoice:
         self._rerun = ""
         self._rerun_used = False
         self._rerun_at = 0.0
-        #: voice20 (final-D S5, contract C9): a closing reply of words was held once by the budget's ``closing_hold``:
+        #: voice20 (final-D S5, contract C9): a closing reply of words was held once by Lane ONE's ``closing_hold``:
         #: ``due`` (the reply watch gives the agent its note once it is quiet), ``asked`` (that round is on its way);
-        #: once a turn (``_hold_used``), the budget's own why kept for the log (a code word).
+        #: once a turn (``_hold_used``); its why (ONE's sentence, the note's text: :func:`_hold_text`), whose reading
+        #: gave it (``turn``: the gate's turn, e.g. a tidy step; ``budget``: the budget's miss), and whether the held
+        #: words that were spoken end as a question (review L1: they get longer to answer it).
         self._hold = ""
         self._hold_used = False
         self._hold_at = 0.0
         self._hold_why = ""
+        self._hold_src = ""
+        self._hold_asks = False
         #: voice20 (final-D S22d): the owed tokens of acts whose announcing words (a say_first, or the reply's words
         #: before the call) were heard and that did not take: kept owed past a later try, until words are heard.
         self._claimed: set[int] = set()
@@ -4332,6 +4347,7 @@ class OneVoice:
         self._turn_at = time.monotonic()
         self._quiet_refused, self._rerun, self._rerun_used = False, "", False
         self._hold, self._hold_used, self._hold_why = "", False, ""
+        self._hold_src, self._hold_asks = "", False
         self._claimed = set()
         self._answer = None
         if turn.asks and self.anchor_text:
@@ -4569,11 +4585,14 @@ class OneVoice:
         spoke = getattr(call, "first_text", None) is not None and not getattr(call, "one_unmarked", False)
         why = self._closing_hold() if spoke else None
         if why is not None:
-            # voice20 (final-D S5, contract C9): the budget says this closing reply comes after one miss with nothing
-            # else tried and time left for it: the turn stays open, and once they have been quiet a moment (time to
-            # answer an offer themselves) the reply watch gives the agent one more round with ONE_MISS_HOLD
+            # voice20 (final-D S5, contract C9): Lane ONE says this closing reply is held once (one miss with nothing
+            # else tried and time left; or a legal tidy step untaken): the turn stays open, and once they have been
+            # quiet a moment (time to answer an offer themselves; longer when the spoken words asked them something,
+            # review L1) the reply watch gives the agent one more round with ONE's own sentence as the note
             self._hold, self._hold_at, self._hold_used, self._hold_why = "due", time.monotonic(), True, why
-            self._log("hold", closing="words", round=int(getattr(call, "one_round", 0) or 0), **_code_word(why))
+            self._hold_asks = bool(getattr(call, "one_asks", False))
+            self._log("hold", closing="words", round=int(getattr(call, "one_round", 0) or 0), source=self._hold_src,
+                      asks=self._hold_asks, **_code_word(why))
             return
         if rerun == "asked" and self._rerun_silent(call) and not self._owed_pending():
             # the rerun spoke nothing either and nothing is owed: the error tone says so (a non-speech notice)
@@ -4627,15 +4646,27 @@ class OneVoice:
     # -- voice20 (final-D S5, contract C9): a closing reply after one miss is held once -------------------------------
 
     #: After held closing words, the agent's other way goes once they have been quiet this long (s): long enough to
-    #: answer an offer or a question themselves (their words then start a turn of their own and the hold goes).
+    #: answer an offer themselves (their words then start a turn of their own and the hold goes).
     HOLD_QUIET_S = 1.5
+    #: Review L1: the same wait when the held words that were spoken end a sentence as a question (their own closing
+    #: mark, ``ReplyChannel.spoken_asks``): an answer takes longer to begin than a reaction, and Flux reports its start
+    #: of turn some 0.5-1 s into speech.
+    HOLD_ASK_QUIET_S = 3.0
+
+    def hold_quiet_s(self) -> float:
+        """How long they must have been quiet before the held round goes (:data:`HOLD_ASK_QUIET_S` after a spoken
+        question, else :data:`HOLD_QUIET_S`)."""
+        return self.HOLD_ASK_QUIET_S if self._hold_asks else self.HOLD_QUIET_S
 
     def _closing_hold(self) -> str | None:
-        """Why this turn's closing reply is held once, else ``None``: the budget's own reading (Lane ONE's
-        ``closing_hold() -> str | None``: one miss, no act after it, the retry window open), read through ``getattr``
-        on the turn's budget, else on the turn (a no-op until that lane is merged). The voice's own facts first: once
-        a turn, a turn their words began and no newer words of theirs moved on from, not closed by code, and never
-        after a send or join that missed (it is never tried again in the turn). Never raises."""
+        """Why this turn's closing reply is held once (Lane ONE's sentence), else ``None``. Contract C9, read through
+        ``getattr`` (a no-op until that lane is merged); review M1: the gate's turn (``policy.Turn.closing_hold``) is
+        asked first, as it holds the budget's reading (one miss, no act after it, the retry window open) and the S1
+        fallback's (a flagged diff's one legal undoable step untaken); the turn's budget
+        (``TurnBudget.closing_hold``) only when the turn has no such reading. The voice's own facts first: once a
+        turn, a turn their words began and no newer words of theirs moved on from, not closed by code, and never after
+        a send or join that missed (it is never tried again in the turn). Sets ``_hold_src``. Never raises."""
+        self._hold_src = ""
         turn = self.turn
         if turn is None or self.over or self._hold_used or not self.anchor_text:
             return None
@@ -4646,18 +4677,32 @@ class OneVoice:
         mark = self._marks.get(turn)
         if mark is not None and self._heard_n > mark:
             return None   # their newer words make a turn of their own
-        fn = getattr(budget, "closing_hold", None)
-        if not callable(fn):
-            fn = getattr(turn, "closing_hold", None)
-        if not callable(fn):
+
+        def ask(owner: Any) -> tuple[bool, str]:
+            fn = getattr(owner, "closing_hold", None)
+            if not callable(fn):
+                return False, ""
+            try:
+                got = fn()
+            except Exception as exc:  # noqa: BLE001 - no reading from it
+                self._log("hold", error=type(exc).__name__)
+                return False, ""
+            return True, (" ".join(str(got).split()) if got else "")
+
+        answered, why = ask(turn)
+        source = "turn"
+        if not answered:
+            answered, why = ask(budget)
+            source = "budget"
+        if not why:
             return None
-        try:
-            why = fn()
-        except Exception as exc:  # noqa: BLE001 - no reading: the reply closes as before
-            self._log("hold", error=type(exc).__name__)
-            return None
-        why = " ".join(str(why or "").split()) if why else ""
-        return why or None
+        if source == "turn":
+            # content-free provenance for the log: the budget's own sentence (a miss), or the turn's own (a tidy step)
+            own_answered, own = ask(budget)
+            if own_answered and own == why:
+                source = "budget"
+        self._hold_src = source
+        return why
 
     def _lone_quiet(self, group: _OneReply) -> bool:
         """The reply is a stay_quiet alone (the whole closing reply) of the current turn."""
@@ -4681,18 +4726,20 @@ class OneVoice:
         return self._hold == "due" and not self.over and self.turn is not None and not self.turn.budget.closed
 
     def hold_note(self) -> str:
-        """The held round's note (a user-role note after the agent's closing words, in the bracketed form of the turn's
-        own notes; marker channel: the format last, as every ONE round reads it)."""
+        """The held round's note: Lane ONE's own sentence (:func:`_hold_text`; :data:`ONE_MISS_HOLD` only as the
+        fallback), after the agent's closing words in the bracketed form of the turn's own notes, as a developer-role
+        message (Pipecat's Anthropic adapter sends it as the user's turn, as :meth:`Conversation._announce` does);
+        marker channel: the format last, as every ONE round reads it."""
         from yuki.voice.mouth import MARKER_REMINDER
 
-        note = f"[{ONE_MISS_HOLD}]"
+        note = f"[{_hold_text(self._hold_why)}]"
         return f"{note}\n{MARKER_REMINDER}" if getattr(self.c, "channel", "") == "marker" else note
 
     def hold_go(self) -> str:
         """The reply watch gives the held turn its round now (once a turn): the note it runs with."""
         self._hold = "asked"
         self._log("hold", go=True, round=self.rounds, waited_ms=round((time.monotonic() - self._hold_at) * 1000),
-                  **_code_word(self._hold_why))
+                  source=self._hold_src, asks=self._hold_asks, **_code_word(self._hold_why))
         return self.hold_note()
 
     def hold_stale(self, wait_s: float) -> bool:
@@ -5450,7 +5497,8 @@ class OneVoice:
                 return
             if name == "stay_quiet" and self._lone_quiet(group):
                 # voice20 (final-D S22i): the rerun of an unheard close chose quiet while nothing reached them; (S5,
-                # contract C9) the budget holds a closing quiet after one miss with nothing else tried. Each once.
+                # contract C9) Lane ONE holds a closing quiet once (one miss with nothing else tried, or a legal tidy
+                # step untaken), with its own sentence as the refusal (review M1). Each once.
                 why, note = "", ""
                 if self._quiet_unheard_rerun(group):
                     why, note = "unheard_rerun", ONE_UNHEARD_QUIET
@@ -5458,8 +5506,9 @@ class OneVoice:
                     held = self._closing_hold()
                     if held is not None:
                         self._hold_used, self._hold_why = True, held
-                        why, note = "miss_hold", ONE_MISS_HOLD
-                        self._log("hold", closing="quiet", round=self.rounds, **_code_word(held))
+                        why, note = "closing_hold", _hold_text(held)
+                        self._log("hold", closing="quiet", round=self.rounds, source=self._hold_src,
+                                  **_code_word(held))
                 if note:
                     group.outcomes[call_id] = one_outcome(name, {}, {})
                     group.verdict = "model"
@@ -7508,7 +7557,9 @@ class Conversation:
         async_tool_messages._FINAL_DESCRIPTION = FINAL_DESCRIPTION
         # One list for every recogniser (yuki.voice.keyterms.vocabulary): Yuki's name, the user's names, memory's names
         # (a correction's right name first), never a heard form; Flux's keyterms and Parakeet's hotwords alike.
-        terms = vocabulary(s.user_names, self.keyterms, s.voice_keyterms_max)
+        # voice20 review L4 (S22j): the start-of-conversation list keeps the same length cap as the mid-call update
+        # (one over-long term makes Flux reject the whole list)
+        terms = keyterm_list(vocabulary(s.user_names, self.keyterms, s.voice_keyterms_max), [], s.voice_keyterms_max)
         if stt_provider(s) == "local":
             # vLocal: Parakeet on this PC, with its own end of turn (Silero VAD + Smart Turn), shaped like Flux
             from yuki.voice.local_stt import ParakeetSTTService
@@ -8953,12 +9004,12 @@ class Conversation:
                     continue
                 if one is not None and self.worker is not None and callable(getattr(one, "hold_due", None)) \
                         and one.hold_due():
-                    # voice20 (final-D S5, contract C9): a ONE turn's closing words came after one miss with nothing
-                    # else tried: once they have been quiet a moment (their own answer to an offer starts a turn of
-                    # its own), the agent gets one more round with the hold's note after its words
+                    # voice20 (final-D S5, contract C9): a ONE turn's closing words were held by Lane ONE: once they
+                    # have been quiet a moment (their own answer to an offer starts a turn of its own; longer after a
+                    # spoken question, review L1), the agent gets one more round with the hold's note after its words
                     obs = self.observer
                     if not (obs.bot_speaking or obs.generating or obs.user_speaking or obs.speech_pending
-                            or one._running) and self._quiet_for() >= one.HOLD_QUIET_S:
+                            or one._running) and self._quiet_for() >= one.hold_quiet_s():
                         note = one.hold_go()
                         self.log.event("reply_watch", op="hold", one=True, round=one.rounds)
                         if not await self._one_note_run(note):
@@ -9323,6 +9374,7 @@ class Conversation:
                 call.one_unmarked = bool(facts.get("unmarked"))
                 call.one_marker = facts.get("marker")
                 call.one_repeat = bool(facts.get("repeat_dropped"))
+                call.one_asks = bool(getattr(channel, "spoken_asks", False))   # voice20 review L1 (punctuation)
             except Exception:  # noqa: BLE001 - a stand-in call that takes no attribute
                 pass
         if facts.get("marker") is not None or facts.get("scratch_chars"):
@@ -9395,8 +9447,9 @@ class Conversation:
         self.log.event("rules_refreshed", changed=changed, chars=len(text or ""))
 
     async def _one_note_run(self, note: str) -> bool:
-        """voice20 (final-D S5): a ONE turn's next round, with code's note as a user-role message right after the
-        agent's own closing words, in the bracketed form of the turn's own notes. Only when the context's newest
+        """voice20 (final-D S5): a ONE turn's next round, with code's note as a developer-role message (Pipecat's
+        Anthropic adapter sends it as the user's turn, as :meth:`_announce`) right after the agent's own closing words,
+        in the bracketed form of the turn's own notes. Only when the context's newest
         message is those words (an assistant message): never after a tool result (design 3.3.3: harness text there
         reads as injection). Append-only; the turn's frozen block still rides on their own message. ``False``: not
         queued (the caller ends the turn as it would have ended)."""

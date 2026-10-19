@@ -3965,7 +3965,13 @@ class VoiceBridge(QObject):
         job.detached = True   # hands19 (C4): the talker's cancel reaches it through cancel_passed_on
         while True:
             kind, payload = await job.events.get()
-            if job.talker_cancelled and not job.sent:
+            # voice20 review L2: a bare cancel's job that ended done finished before the cancel landed (a stop the
+            # runtime's cancel made ends "failed"), so "stopped" would be untrue: its own final is relayed below as any
+            # detached job's (late: they spoke since), never dropped and never called stopped. The job's record only.
+            finished = kind == "done" and job.talker_cancelled and job.talker_silent and not job.sent
+            if finished:
+                self._log("bridge", op="cancel_said", job_id=job.job_id, said=False, finished=True)
+            if job.talker_cancelled and not job.sent and not finished:
                 # hands19 (C4): the talker stopped it (cancel_passed_on) and said so in the same reply: nothing more of
                 # it is said, as for a cancelled hand-off call (a send that went is still said). voice20 (final-D
                 # S11): a bare cancel call said nothing: its own ending is said by code once it has stopped
