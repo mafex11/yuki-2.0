@@ -248,36 +248,58 @@ _last_steps: dict[str, Any] = {}
 _last_lock = threading.Lock()
 
 
+#: desk22 review H1 (contract C13): our verbs as the step words ``ways.spec_from_steps`` reads (``do``: its
+#: ``TOLD_CLICKS`` / ``TOLD_TEXT`` / ``TOLD_KEYS``); any other verb keeps its own name (no part of a told way's path).
+WAY_DO: dict[str, str] = {"click": "click", "type_text": "type", "hotkey": "keys", "press": "keys"}
+#: The UIA control types of a list's row (machine facts, never words): a click on one is the way's item slot
+#: (C13's ``item``: which row differs from one go to the next).
+WAY_ROW_ROLES: frozenset[str] = frozenset({"ListItem", "DataItem", "TreeItem"})
+
+
 def way_step(verb: Any, *, app: Any = "", role: Any = "", name: Any = "", value: Any = None, submit: bool = False,
              ok: bool = True) -> dict[str, Any] | None:
-    """One step of an act in the shape ``ways.spec_from_steps`` takes (contract C13): ``{"verb", "app", "role",
-    "name", "value", "submit", "ok"}``. ``verb``: our own verb names (:data:`WAY_VERBS`; the talker's hands map to
-    them: :func:`yuki.voice.hands.way_step_of`); ``app``: the program the step acted in (raw, as Windows names it);
-    ``role`` / ``name``: the control as the window's read showed it; ``value``: the step's closed values only (a click's
-    button, a window or tab action, a chord or key, an app's name, a page's address); typed text is never kept (a
-    ``type_text`` step's value is ``None``: the way's text is a slot). ``None`` for any other verb. Pure."""
+    """One step of an act in the shape ``ways.spec_from_steps`` takes (contract C13, skill22's shape): ``{"do",
+    "verb", "app", "role", "name", "value", "submit", "ok"}``, with ``keys`` (the chord, lowercased, split on "+") on a
+    key step and ``item`` (True) on a click on a list's row (:data:`WAY_ROW_ROLES`). ``do``: :data:`WAY_DO` (``click``,
+    ``dclick`` for a double click, ``type``, ``keys``), else the verb itself; ``verb``: our own verb names
+    (:data:`WAY_VERBS`; the talker's hands map to them: :func:`yuki.voice.hands.way_step_of`); ``app``: the program the
+    step acted in (raw, as Windows names it); ``role`` / ``name``: the control as the window's read showed it;
+    ``value``: the step's closed values only (a click's button, a window or tab action, a chord or key, an app's name, a
+    page's address); typed text is never kept (a ``type_text`` step's value is ``None``: the way's text is a slot).
+    ``None`` for any other verb. Pure."""
     verb = str(verb or "")
     if verb not in WAY_VERBS:
         return None
     kept = None if verb == "type_text" or value is None else " ".join(str(value).split())[:300] or None
-    return {"verb": verb, "app": " ".join(str(app or "").split()), "role": " ".join(str(role or "").split())[:60],
-            "name": " ".join(str(name or "").split())[:120], "value": kept, "submit": bool(submit),
-            "ok": bool(ok)}
+    role_w = " ".join(str(role or "").split())[:60]
+    do = WAY_DO.get(verb, verb)
+    if verb == "click" and kept == "double":
+        do = "dclick"
+    step: dict[str, Any] = {"do": do, "verb": verb, "app": " ".join(str(app or "").split()), "role": role_w,
+                            "name": " ".join(str(name or "").split())[:120], "value": kept, "submit": bool(submit),
+                            "ok": bool(ok)}
+    if do == "keys":
+        step["keys"] = [k.strip().casefold() for k in str(kept or "").split("+") if k.strip()]
+    if verb == "click" and role_w in WAY_ROW_ROLES:
+        step["item"] = True
+    return step
 
 
 def way_end(steps: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
-    """The checked end a told way's steps came to, in ways' own terms (``END_FACTS``): text submitted in a field (the
-    last step a ``type_text`` with Enter after, or an Enter right after typing) -> ``{"kind": "field_submitted"}``,
-    else ``None``. Our own verbs and values, never words. Pure."""
+    """The checked end a told way's steps came to, in ways' own terms (``{"kind", "keys"}``, the shape
+    ``spec_from_steps``'s ``end`` takes): the last typing submitted with Enter in the same step (a ``type_text`` with
+    ``submit``: no key step follows it, desk22 review H1) -> ``{"kind": "field_submitted", "keys": ["enter"]}``; else
+    the keys of the last key step after the last typing (as ways reads them itself); else ``None`` (a draft way).
+    Our own verbs and values, never words. Pure."""
     acts = [s for s in steps or () if isinstance(s, Mapping)]
-    if not acts:
+    typed = [i for i, s in enumerate(acts) if s.get("do") == "type"]
+    if not typed:
         return None
-    last = acts[-1]
-    if last.get("verb") == "type_text" and last.get("submit"):
-        return {"kind": "field_submitted"}
-    if (len(acts) > 1 and last.get("verb") == "press" and str(last.get("value") or "").casefold() == "enter"
-            and acts[-2].get("verb") == "type_text"):
-        return {"kind": "field_submitted"}
+    if acts[typed[-1]].get("submit"):
+        return {"kind": "field_submitted", "keys": ["enter"]}
+    after = [s for s in acts[typed[-1] + 1:] if s.get("do") == "keys" and s.get("keys")]
+    if after:
+        return {"kind": "field_submitted", "keys": [str(k) for k in after[-1]["keys"]]}
     return None
 
 
@@ -699,6 +721,9 @@ class Executor:
         self._slow_said: set[str] = set()
         #: P1.3: the tidy-up turn, while it runs (:meth:`tidy_up`): ``{"mode", "acts", "words"}``; ``None`` otherwise
         self.tidy: dict[str, Any] | None = None
+        #: desk22 review L2: where the tidy-up turn's steps begin in :attr:`trace` (:meth:`tidy_up`): those are code's
+        #: or the tidy turn's own, never part of "the steps just done" (:meth:`way_steps`); ``None`` before it
+        self._tidy_from: int | None = None
         #: desk20 (final-D S20): the last act step of this request whose own report said it did not take, in code's
         #: words (:meth:`_stop_words`: the step and its app, the plan's act steps after it), kept across a later plan
         #: that ran no act (an invalid one) and let go once a later act step takes: ``{"what", "rest"}`` or ``None``
@@ -923,6 +948,8 @@ class Executor:
         """The Brain's tidy-up turn begins (the next plan): only undoable window steps (``plan.TIDY_ACTIONS``), at most
         :data:`TIDY_STEPS`, each asked first when ``mode`` is ``util.TIDY_ASK``; their words are the run's line."""
         self.tidy = {"mode": str(mode or util.TIDY_DO), "acts": 0, "words": []}
+        if self._tidy_from is None:
+            self._tidy_from = len(self.trace)   # desk22 review L2: the tidy turn's steps are no part of a told way
 
     def after_look(self) -> tuple[str, dict[str, Any]]:
         """What this request's acts did to the desk (module docstring): ``(the "After:" block, the diff's facts)``;
@@ -1012,10 +1039,11 @@ class Executor:
         step (``diff.flag_line``: "Discord is covering Chrome."); ``""`` otherwise. Taken once per request (the Brain
         says it after the request's line, with no planner turn for it). Never raises."""
         line, self._flag_line = self._flag_line, ""
-        if line:
+        out = line if self.tidy is None and not self._closed else ""
+        if out:   # desk22 review L3: logged only when the line is given (the log never claims a line not said)
             self._emit_log("tidy", verb="window_action", action=None, state="said", by_code=True, why="no_step",
                            said=True)
-        return line if self.tidy is None and not self._closed else ""
+        return out
 
     def take_tidy_step(self, mode: str) -> str:
         """tidy21 (the user's decision 1, 19 Oct; final-D S1: the planner's tidy turns took 0 of 3 steps): the Brain's
@@ -1343,18 +1371,17 @@ class Executor:
                 self._desk_arranged |= {int(h) for h in hwnds}
                 self._desk_arranged |= {h for h in (done.as_hwnd(w) for w in payload.get("acted_windows") or ()) if h}
             # desk22 (A24): the windows a step opened a page in (an open_url, a skill of kind open): the diff's
-            # single-session autoplay tab cover reads only these (a click or the next video never counts)
+            # single-session autoplay tab cover reads only these (a click or the next video never counts). desk22
+            # review L4: by window id when one was measured; the app only when none was (so another window of the same
+            # browser, advancing its own playlist meanwhile, is never read as the act's tab)
             if call.tool == "open_url":
-                self._desk_opened |= hwnds
-                self._desk_opened |= {words(a) for a in (call.app, call.input.get("app")) if words(a)}
+                self._desk_opened |= hwnds or {words(a) for a in (call.app, call.input.get("app")) if words(a)}
             elif call.tool == "run_skill":
                 key = consent.skill_input(call, self.head)[0]
                 sk = util.skill(key) if key else None
                 if sk is not None and str(getattr(sk, "kind", "") or "") == "open":
-                    self._desk_opened |= hwnds
-                    self._desk_opened |= {h for h in (done.as_hwnd(w) for w in payload.get("acted_windows") or ())
-                                          if h}
-                    self._desk_opened |= {words(a) for a in payload.get("acted_apps") or () if words(a)}
+                    ids = hwnds | {h for h in (done.as_hwnd(w) for w in payload.get("acted_windows") or ()) if h}
+                    self._desk_opened |= ids or {words(a) for a in payload.get("acted_apps") or () if words(a)}
         except Exception:  # noqa: BLE001 - bookkeeping only
             pass
 
@@ -3827,10 +3854,12 @@ class Executor:
     def way_steps(self) -> list[dict[str, Any]]:
         """desk22 (A13): this request's act steps that took (their own report or the step check saw them), in
         :func:`way_step`'s shape (contract C13): the verb, the program it acted in, the control's role and name, the
-        closed values only (never typed text). A tidy-up step (code's own) is no part of it. Never raises."""
+        closed values only (never typed text). A tidy-up step (code's own, or any step of the tidy-up turn: desk22
+        review L2, :attr:`_tidy_from`) is no part of it. Never raises."""
         out: list[dict[str, Any]] = []
         try:
-            for s in self.trace:
+            ran = self.trace if self._tidy_from is None else self.trace[:self._tidy_from]
+            for s in ran:
                 if not isinstance(s, Mapping) or s.get("kind") != "action" or s.get("why") == "tidy_by_code":
                     continue
                 if s.get("refused") or s.get("ok") is False or s.get("verdict") is False:

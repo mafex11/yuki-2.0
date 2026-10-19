@@ -2409,6 +2409,23 @@ class Hands:
         except Exception:  # noqa: BLE001 - then the act's own before alone, as before
             pass
 
+    def _keep_placed(self, name: str, args: dict[str, Any], facts: dict[str, Any]) -> None:
+        """desk22 review H2 (tidy21 review F1 at the turn's end, decision D4): an asked placement of this user turn
+        (``_handle_place``: never bracketed, so it joins no act's list) that took is kept with the turn's open before
+        (``placed``: the window ids :func:`arranged_windows` reads from its own facts), so the turn's look, the rest's
+        or the end's (:meth:`_tidy_deferred`), never moves that window away from where they asked for it (``diff``'s
+        ``asked_place``). Ids only, never words. Never raises."""
+        try:
+            kept = self._turn_before
+            if not isinstance(kept, dict) or kept.get("looked") or kept.get("turn") != self._turn_now():
+                return
+            ids = arranged_windows(name, args, facts)
+            if ids:
+                placed = kept.get("placed")
+                kept["placed"] = (placed if isinstance(placed, set) else set()) | ids
+        except Exception:  # noqa: BLE001 - nothing kept: code's other guards stand
+            pass
+
     @staticmethod
     def _desk_apps(name: str, args: dict[str, Any], facts: dict[str, Any]) -> list[str]:
         """hands19 (contract C2): the apps whose mixer rows an act's desk reads carry: a skill run's scope apps (its
@@ -2599,7 +2616,11 @@ class Hands:
                 acted_ids += [a for a in one_acted if a not in acted_ids]
                 touched_ids += [t for t in one_touched if t not in touched_ids]
                 if _opens_page(act_name, act_args, act_facts):
-                    opened_ids += [x for x in (*one_acted, *one_touched) if x not in opened_ids]
+                    # desk22 review L4: the act's windows by id when measured; its app only when none was (another
+                    # window of the same browser is never the act's tab)
+                    found = [x for x in (*one_acted, *one_touched) if isinstance(x, int) and not isinstance(x, bool)]
+                    found = found or [x for x in (*one_acted, *one_touched) if isinstance(x, str) and x.strip()]
+                    opened_ids += [x for x in dict.fromkeys(found) if x not in opened_ids]
             acted, touched = tuple(acted_ids), tuple(touched_ids)
             d = desk_diff.compare(before, after, acted=acted, touched=touched, opened=tuple(opened_ids))
             turn = self._call_safely(self.user_turn, None)
@@ -2671,6 +2692,10 @@ class Hands:
             arranged: set[int] = set()
             for act_name, act_args, act_facts in acts if step is not None else ():
                 arranged |= arranged_windows(act_name, act_args, act_facts, before, after)
+            if step is not None and same_before:
+                # desk22 review H2: the windows an asked placement of this turn put where they asked (never bracketed,
+                # so in no act's list: :meth:`_keep_placed`); the turn's look never moves one away again
+                arranged |= {int(h) for h in kept.get("placed") or ()}
             as_asked = step is not None and step.get("action") == "place" and step.get("hwnd") in arranged
             if step is not None and (level == "do" or as_asked):
                 # tidy21 (decision 1, S1): code takes the one measured step itself, through the look's own guards, and
@@ -2725,7 +2750,7 @@ class Hands:
         got = kept.get("deferred")
         return got if isinstance(got, dict) else None
 
-    async def _tidy_deferred(self, why: str) -> None:
+    async def _tidy_deferred(self, why: str, ordered: bool = False) -> None:
         """desk22 (decision D4): the turn's end for a two-part ask whose part 1 left its look open (``deferred``): the
         turn's look is given now, over every act of the turn, from its earliest before (:meth:`_look_after` with
         ``end``: under "do" code takes the one measured step through the same guards and says its line, or says its
@@ -2734,39 +2759,94 @@ class Hands:
         reaches no talker call (the reply already settled). ``why``: what ended the turn (``settled``: a hand of the
         turn settled with no talker run; ``quiet``: the talker stayed quiet; ``reply_end``: the talker's reply ended
         with no hand of ours in it). Once per turn; safety timing 4 (the user's next words began): nothing. Logs
-        content-free. Never raises."""
-        dfr = self._deferred_now()
-        if dfr is None:
+        content-free. Never raises.
+
+        desk22 review M1: ``ordered`` is the caller's word that it holds the hands' order gate (a hand's own
+        ``settled`` end, inside :meth:`handle`). Any other end (the talker's stay_quiet, its reply's end) runs outside
+        it, beside a reply's other calls (Pipecat runs a reply's calls side by side): while a hand of the turn is still
+        acting or waiting its turn (:meth:`turn_hands_running`, an act in flight, a busy tool), the look is left to
+        that hand's own end (``left_to_hand``: its ``settled`` end, or the talker's next reply's); else this end
+        takes the order gate itself, so a hand that arrives meanwhile waits behind the look, never acts beside it.
+        Review M2: once the turn is with the thinker (:meth:`_turn_handed_over`, or a desk job running) the step is
+        dropped (``handed_over``): the thinker owns the desk and reads it afresh; code never moves a window under it."""
+        if self._deferred_now() is None:
             return
-        kept = self._turn_before
-        kept["deferred"] = None
-        started = time.monotonic()
-        state = "looked"
+        if self._with_thinker():
+            self._drop_deferred("handed_over")
+            return
+        gate = None
+        if not ordered:
+            if self._hands_busy():
+                if self.log is not None:
+                    self.log.event("hands", op="window", tidy=True, by_code=True, deferred=True, end=why,
+                                   state="left_to_hand")
+                return
+            gate = await self._enter_order()
         try:
-            if _moved_on(self, {"_desk_turn": (kept.get("turn"), float(dfr.get("at") or 0.0))}):
-                state = "moved_on"
-            else:
-                name, args, facts = dfr["act"]
-                out = await self._look_after(dfr["params"], name, dict(args), dict(facts), kept["desk"], end=True,
-                                             front_ok=dfr.get("front"))
-                state = "looked" if out else "nothing"
-        except Exception as exc:  # noqa: BLE001 - no end look: their desk stays as it is
-            state = type(exc).__name__
-        if self.log is not None:
-            self.log.event("hands", op="window", tidy=True, by_code=True, deferred=True, end=why, state=state,
-                           ms=round((time.monotonic() - started) * 1000))
+            dfr = self._deferred_now()   # re-checked once in the order: a hand's own end may have taken it
+            if dfr is None:
+                return
+            kept = self._turn_before
+            kept["deferred"] = None
+            started = time.monotonic()
+            state = "looked"
+            try:
+                if _moved_on(self, {"_desk_turn": (kept.get("turn"), float(dfr.get("at") or 0.0))}):
+                    state = "moved_on"
+                elif self._with_thinker():
+                    state = "handed_over"
+                else:
+                    name, args, facts = dfr["act"]
+                    out = await self._look_after(dfr["params"], name, dict(args), dict(facts), kept["desk"],
+                                                 end=True, front_ok=dfr.get("front"))
+                    state = "looked" if out else "nothing"
+            except Exception as exc:  # noqa: BLE001 - no end look: their desk stays as it is
+                state = type(exc).__name__
+            if self.log is not None:
+                self.log.event("hands", op="window", tidy=True, by_code=True, deferred=True, end=why, state=state,
+                               ms=round((time.monotonic() - started) * 1000))
+        finally:
+            self._leave_order(gate)
+
+    def _hands_busy(self) -> bool:
+        """desk22 review M1: whether a hand of this user turn is still acting or waiting its turn (the order gate), an
+        act is in flight, or a tool keeps the bridge busy. State only; unknown is busy (the step is then left to the
+        hand's own end, or dropped at the next turn: never taken beside an act). Never raises."""
+        try:
+            busy = int(getattr(self.bridge, "busy_tools", 0) or 0) if self.bridge is not None else 0
+            return bool(self.turn_hands_running() or self._inflight or busy > 0)
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _with_thinker(self) -> bool:
+        """desk22 review M2: whether this user turn is with the thinker (:meth:`_turn_handed_over`) or a desk job runs
+        (``bridge.desk_job``): the deferred step is then never code's to take. Never raises (unknown: with it)."""
+        try:
+            job = getattr(self.bridge, "desk_job", None) if self.bridge is not None else None
+            return bool(self._turn_handed_over() or (callable(job) and job()))
+        except Exception:  # noqa: BLE001
+            return True
 
     def reply_done(self, calls: Any = ()) -> None:
         """desk22 (decision D4; merge note to voice22): the talker's reply ended (``pipeline``'s
         ``LLMFullResponseEndFrame``), ``calls``: the names of the function calls that reply made. With a two-part ask's
         look left open (:meth:`_deferred_now`) and no call of the talker's hands in that reply (a plain answer, a
-        stay_quiet, a hand_over), the turn has ended: the deferred look is given now (:meth:`_tidy_deferred`). A reply
-        with one of our hands in it leaves it to that hand's own end. Never raises; never blocks the loop."""
+        stay_quiet), the turn has ended: the deferred look is given now (:meth:`_tidy_deferred`). A reply with one of
+        our hands in it leaves it to that hand's own end. desk22 review M2: a reply that hands the rest to the thinker
+        (``mouth.HANDOFF_TOOLS``: tell_yuki, hand_over) has not ended the turn; the thinker has started on the rest (as
+        the reply began: the early hand-off) and reads the desk afresh, so the step is dropped (``handed_over``),
+        never taken under it. Never raises; never blocks the loop."""
         try:
             if self._deferred_now() is None:
                 return
+            from yuki.voice.mouth import HANDOFF_TOOLS
+
+            names = {str(c or "") for c in calls or ()}
+            if names & set(HANDOFF_TOOLS):
+                self._drop_deferred("handed_over")
+                return
             ours = set(HAND_NAMES) | {SKILL_HAND, KEEP_USUAL_HAND, KEEP_WAY_HAND}
-            if any(str(c or "") in ours for c in calls or ()):
+            if names & ours:
                 return
             task = asyncio.ensure_future(self._tidy_deferred("reply_end"))
             self._background.add(task)
@@ -3068,6 +3148,8 @@ class Hands:
         ms = round((time.monotonic() - started) * 1000)
         if ok and gate is not None:
             gate["done"].add(key)
+        if ok and not tidy:
+            self._keep_placed(name, args, facts)   # desk22 review H2: the turn's look never moves it back
         if self.on_action is not None and facts.get("sent_at") is not None:
             self.on_action(facts["sent_at"])
         if not facts.get("halted"):
@@ -3405,8 +3487,9 @@ class Hands:
                 self._let_owed_go(taken, params.tool_call_id)
             if settled is not None and settled.get("quiet") and not self._queued_behind(gate):
                 # desk22 (D4): this hand ended the turn (its call settled with no talker run, nothing queued behind
-                # it): the two-part ask's look left open after part 1 is given now, over the whole turn
-                await self._tidy_deferred("settled")
+                # it): the two-part ask's look left open after part 1 is given now, over the whole turn (inside the
+                # order gate this call holds: review M1)
+                await self._tidy_deferred("settled", ordered=True)
         finally:
             self._leave_order(gate)
 

@@ -53,8 +53,9 @@ act's (touched or asked), else the user's own (``(not from your act)``).
 desk22 (A24, desk19 review nit: "a tab cover missed when Chrome's single session turns into a new video autoplaying in
 the new tab"): a browser that shows one media session only (one session of that app id on both sides) moves it to the
 new tab that plays, so "the same session plays on" can't be read. When the act opened a page in that very window
-(``opened``: the caller's open acts, by id or app) and the window's one session now plays another title that the
-window's own title now holds (the new tab plays), it is a tab cover too, marked ``autoplay``: the new tab started
+(``opened``: the caller's open acts, by id, by app only when no window of the act was measured: review L4) and the
+window's one session now plays another title that the window's own title now holds (the new tab plays), it is a tab
+cover too, marked ``autoplay``: the new tab started
 playing over what was on. Without ``opened`` (a click on another video in the same tab, the next video, a pause) it is
 never one.
 
@@ -215,8 +216,9 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
     apps whose mixer rows are the act's for ``left_silent`` alone (an app whose volume the act set touched none of its
     windows); ``None``: those of ``acted`` and ``touched``, as before. ``fresh`` (safety T-1): the programs (or ids)
     whose windows new since the before are the act's though no other window of theirs is (a launch's measured process,
-    a skill run's measured apps). ``opened`` (desk22, A24): the windows (ids or apps) an act opened a page in (an
-    open_url hand or step, a skill of kind ``open``), for the single-session autoplay tab cover only; ``()``: as before.
+    a skill run's measured apps). ``opened`` (desk22, A24): the windows an act opened a page in (an open_url hand or
+    step, a skill of kind ``open``), by id; an app only for an act whose window was not measured (review L4: every
+    window of that app then counts), for the single-session autoplay tab cover only; ``()``: as before.
     Pure: no OS call. Never raises on odd input."""
     diff = DeskDiff()
     acted_hwnds, acted_apps = _acted_sets(acted)

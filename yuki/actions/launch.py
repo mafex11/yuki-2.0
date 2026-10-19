@@ -4045,14 +4045,16 @@ _BAR_FLOOR_S = 6.0
 #: address, no page). It is capped and expired by measure: at most :data:`_IGNORED_CAP` browsers (the oldest go), each
 #: count capped at :data:`_IGNORED_COUNT_MAX`, cleared the moment a hand-off is seen to open its page, and held only
 #: :data:`_IGNORED_KEEP_S` after the last ignored hand-off measured. Once it has expired the next hand-off is measured
-#: again (an updated browser may take addresses now) with its page wait capped at :data:`_RECHECK_PAGE_S` (as a
-#: refused package's watch): ignored again, the note holds again at once; opened, it is cleared. The web skill's own
-#: hand-off (``address_bar=False``) to a browser the note holds gets the same capped wait.
+#: again with the full page wait (an updated browser may take addresses now; desk22 review L1: a measure, so a slow but
+#: working hand-off is never followed by a typed second tab): ignored again, the note holds again at once; opened, it
+#: is cleared. The web skill's own hand-off (``address_bar=False``) to a browser the note holds gets its page wait
+#: capped at :data:`_NOTED_PAGE_S` (as a refused package's watch: the skill's next rung types it); the skill measures
+#: that hand-off into the note itself (:func:`note_handoff`, review M3: one writer, never counted twice).
 _IGNORED_AFTER = 2
 _IGNORED_KEEP_S = 7 * 86400.0
 _IGNORED_CAP = 16
 _IGNORED_COUNT_MAX = 8
-_RECHECK_PAGE_S = 3.0
+_NOTED_PAGE_S = 3.0
 HANDOFF_FILE_NAME = "browser_handoffs.json"
 #: Where the note is kept: ``None`` = :func:`yuki.core.paths.data_dir`'s :data:`HANDOFF_FILE_NAME` (a checker or a
 #: test sets a path of its own here, or ``YUKI_HANDOFF_FILE``, so the user's file is never touched).
@@ -4155,7 +4157,7 @@ def _note_ignored(appid: str, ignored: bool) -> None:
 def _handoff_state(appid: str) -> str:
     """desk22 (A16): the kept note for ``appid``: ``"ignores"`` (it ignored enough hand-offs in a row, the latest
     within :data:`_IGNORED_KEEP_S`: type the address at once), ``"recheck"`` (it did, but the note has expired: hand
-    it over once more, its page wait capped at :data:`_RECHECK_PAGE_S`, and measure it again), else ``""``."""
+    it over once more with the full page wait, and measure it again), else ``""``."""
     key = str(appid or "").lower()
     if not key:
         return ""
@@ -4190,7 +4192,9 @@ def handoff_note(app: str) -> str:
 
 def note_handoff(app: str, ignored: bool) -> None:
     """desk22 (A16, merge note to skill22): one address hand-off to the browser ``app`` names, measured ignored (it
-    kept the page it had, or showed none) or opened: kept in the same note :func:`open_url` reads. Never raises."""
+    kept the page it had, or showed none) or opened: kept in the same note :func:`open_url` reads. The web skill's own
+    hand-off (``open_url(address_bar=False)``) is noted only through here, by the skill (review M3: one writer per
+    hand-off). Never raises."""
     try:
         _note_ignored(_appid_of(app), bool(ignored))
     except Exception:  # noqa: BLE001
@@ -4515,9 +4519,11 @@ def open_url(
             the answer (never handed over too). desk22 (A16): that note is
             kept across restarts and expires by measure (:data:`_IGNORED_KEEP_S`
             after the last ignored hand-off; then one hand-off is measured
-            again, its page wait capped at :data:`_RECHECK_PAGE_S`). ``False``:
-            the hand-off's own result only (the web skill, whose next rung
-            types it itself); its measure is still kept in the note.
+            again, with the full page wait). ``False``: the hand-off's own
+            result only (the web skill, whose next rung types it itself; its
+            page wait capped at :data:`_NOTED_PAGE_S` while the note holds the
+            browser). The skill measures that hand-off into the note itself
+            (:func:`note_handoff`), so this path writes no note (review M3).
 
     A web address handed to a browser that was already running is checked
     against what its windows showed right before (:func:`_pages_before`): an
@@ -4556,10 +4562,11 @@ def open_url(
         if address:
             appid = _appid_of(app)
             state = _handoff_state(appid) if appid else ""
-            # desk22 (A16): the hand-off's page wait is capped when the kept note says this browser ignores them: an
-            # expired note's hand-off is measured once more ("recheck"), and the web skill (``address_bar=False``)
-            # still hands it over as it asked, its next rung typing it once the short wait shows nothing
-            capped = state == "recheck" or (state == "ignores" and not address_bar)
+            # desk22 (A16): the hand-off's page wait is capped when the kept note says this browser ignores them and
+            # the web skill (``address_bar=False``) still hands it over as it asked: its next rung types it once the
+            # short wait shows nothing. desk22 review L1: an expired note's hand-off ("recheck") gets the full wait (it
+            # is a measure: a slow but working hand-off is never followed by a typed second tab of the same page)
+            capped = state == "ignores" and not address_bar
             if state == "ignores" and address_bar:
                 # it ignored the last hand-offs (kept the very page it had): the address goes into its own address
                 # bar at once, not after the whole page wait (x8WebArc review r1 L1, carried to the hand)
@@ -4572,12 +4579,15 @@ def open_url(
                     typed_first.details["url"] = target
                     typed_first.details["handoff_skipped"] = True
                     return typed_first
-        wait_s = min(float(content_timeout_s), _RECHECK_PAGE_S) if capped else content_timeout_s
+        wait_s = min(float(content_timeout_s), _NOTED_PAGE_S) if capped else content_timeout_s
         launched = launch_app(app, args=[target], content_timeout_s=wait_s, deadline=deadline)
         launched.details["url"] = target
         if capped:
             launched.details["handoff_capped"] = True   # code word only: the kept note capped the page wait
-        if not address:
+        if not address or not address_bar:
+            # desk22 review M3: the web skill's own hand-off (``address_bar=False``) is measured into the note by the
+            # skill itself (``web_route`` calls :func:`note_handoff` with what it saw): one writer per hand-off, so one
+            # ignored hand-off is never counted twice
             return launched
         ld = launched.details
         appid = str(ld.get("appid") or "")
@@ -4596,10 +4606,8 @@ def open_url(
         if same or blank_page:
             # kept the very page it had, or (review r1 M1) a refused package's start showed no page at all: the next
             # address goes straight into its address bar (one such hand-off is enough once protocol was refused).
-            # desk22 (A16): measured on the web skill's hand-off too (``address_bar=False``), and kept across restarts
+            # desk22 (A16): kept across restarts
             _note_ignored(appid, True)
-        if not address_bar:
-            return launched
         page_check = ld.get("page_check") if isinstance(ld.get("page_check"), dict) else {}
         # its windows show no page at all after a packaged app's alias or activation carried the address (percFix: Arc
         # started cold on its own new-tab view); a program started with the address on its command line is left alone
