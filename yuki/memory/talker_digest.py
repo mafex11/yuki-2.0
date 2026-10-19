@@ -44,6 +44,9 @@ VOICE_PLACES = 3
 VOICE_PEOPLE = 5
 #: The night, for "at night": a call that began from this hour on, or before :data:`NIGHT_ENDS`.
 NIGHT_STARTS, NIGHT_ENDS = 21, 5
+#: final-B (19 Oct, "which VC do I usually hop in at night" named the newest): a voice channel's use for a "usual"
+#: list (the you-card's voice channels) is its days with a call there over the last this many days.
+CHANNEL_DAYS = 14.0
 #: People and chats shown for a window, at most.
 PEOPLE_N = 8
 CHATS_N = 4
@@ -112,12 +115,15 @@ def _first_sentence(text: Any, limit: int) -> str:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def sessions(store: Any, since: float, until: float, *, now: float | None = None) -> list[dict[str, Any]]:
+def sessions(store: Any, since: float, until: float, *, now: float | None = None,
+             channels: bool = False) -> list[dict[str, Any]]:
     """The call sessions overlapping ``[since, until)`` (``yuki.memory.callspans.merged_calls``), oldest first:
     ``{"app", "kind" (call | game), "start", "end", "ongoing", "place", "voice", "people"}``. ``place``: where it was
     as the call's digest read the screen ("Discord, #lofi lounge voice"; the older digests' free text as it is), empty
     when that says no more than the app; ``voice``: the digest marked the place a voice channel; ``people``: the names
-    seen on it, strongest first. ``[]`` on any failure."""
+    seen on it, strongest first. ``channels``: each row also says the voice channel it was in (``channel``:
+    :func:`channel_of` over the channels these calls' digests and memory name, ``""`` for none). ``[]`` on any
+    failure."""
     try:
         from yuki.memory.calldigest import merge_people
         from yuki.memory.callspans import merged_calls
@@ -127,6 +133,7 @@ def sessions(store: Any, since: float, until: float, *, now: float | None = None
         digests = store.call_digests(i for sp in spans for i in sp["call_ids"]) if spans else {}
     except Exception:  # noqa: BLE001 - no calls known
         return []
+    pool = _digest_channels(store, spans, digests) if channels else []
     out = []
     for sp in spans:
         contexts = [(digests.get(c) or {}).get("context") or {} for c in sp["call_ids"]]
@@ -138,9 +145,121 @@ def sessions(store: Any, since: float, until: float, *, now: float | None = None
             people = [p["name"] for p in merge_people(*(c.get("people") or [] for c in contexts))]
         except Exception:  # noqa: BLE001
             people = []
-        out.append({"app": app, "kind": str(sp.get("kind") or "call"), "start": float(sp["start"]),
-                    "end": float(sp["end"]), "ongoing": bool(sp.get("ongoing")), "place": place, "voice": voice,
-                    "people": people})
+        row = {"app": app, "kind": str(sp.get("kind") or "call"), "start": float(sp["start"]),
+               "end": float(sp["end"]), "ongoing": bool(sp.get("ongoing")), "place": place, "voice": voice,
+               "people": people}
+        if channels:
+            row["channel"] = channel_of(contexts, pool)
+        out.append(row)
+    return out
+
+
+def _night(at: float) -> bool:
+    hour = datetime.fromtimestamp(at).hour
+    return hour >= NIGHT_STARTS or hour < NIGHT_ENDS
+
+
+def _call_words(contexts: list[dict[str, Any]]) -> tuple[set[str], list[list[str]]]:
+    """What a call's digests say of where it was: the channel names they wrote in their own ``channel`` field
+    (words, joined), and the words of every place text they wrote (the label, the free ``where``, the server)."""
+    from yuki.memory.contacts import tokens
+    from yuki.memory.titles import place_label
+
+    named: set[str] = set()
+    texts: list[list[str]] = []
+    for c in contexts:
+        place = c.get("place") if isinstance(c.get("place"), dict) else {}
+        if place.get("channel"):
+            named.add(" ".join(tokens(str(place["channel"]))))
+        for text in (place_label(c.get("place"), c.get("where") or ""), c.get("where"), place.get("server")):
+            words = tokens(str(text or ""))
+            if words:
+                texts.append(words)
+    return named, texts
+
+
+def channel_of(contexts: list[dict[str, Any]], names: list[str]) -> str:
+    """Which of ``names`` (voice channels) a call was in, by what its digests wrote (final-B, 19 Oct: one channel was
+    written three ways, "Discord, #<name> voice", "Discord, voice channel <name>", "Discord (<name> | <server>)",
+    so counting by label split it and the newest channel read as the usual): a name equal to a digest's own channel
+    field, else the longest name whose words stand whole and in order in a digest's words of the place
+    (``contacts.span_in``: identity of names). ``""`` for none. Pure."""
+    from yuki.memory.contacts import span_in, tokens
+
+    named, texts = _call_words(contexts)
+    best = ""
+    for name in names:
+        words = tokens(name)
+        if not words:
+            continue
+        if " ".join(words) in named:
+            return name
+        if len(words) > len(tokens(best)) and any(span_in(words, t) for t in texts):
+            best = name
+    return best
+
+
+def _digest_channels(store: Any, spans: list[dict[str, Any]], digests: dict[Any, Any]) -> list[str]:
+    """The voice channels a set of calls' digests name in their own ``channel`` field, and the ones memory saw the
+    user in on a call-joining app (``yuki.skills.menu.voice_channels``, when the skills are there), first form kept."""
+    out: dict[str, str] = {}
+    for sp in spans:
+        for i in sp.get("call_ids") or ():
+            place = ((digests.get(i) or {}).get("context") or {}).get("place")
+            if isinstance(place, dict) and str(place.get("channel") or "").strip():
+                name = " ".join(str(place["channel"]).split()).lstrip("#")
+                out.setdefault(name.casefold(), name)
+    try:
+        from yuki.skills.catalog import capabilities
+        from yuki.skills.menu import voice_channels
+
+        apps = sorted({str(s.app) for s in capabilities().skills if str(getattr(s, "end", "")) == "call_join"
+                       and s.app})
+        for app in apps:
+            for vc in voice_channels(store, app):
+                if vc.name:
+                    out.setdefault(" ".join(vc.name.split()).casefold(), " ".join(vc.name.split()))
+    except Exception:  # noqa: BLE001 - the digests' own names only
+        pass
+    return list(out.values())
+
+
+def channel_use(store: Any, now: float, names: list[str] | None = None, *, app: str = "",
+                days: float = CHANNEL_DAYS) -> dict[str, dict[str, Any]]:
+    """How much the user was on calls in each voice channel over the last ``days`` (not a game's own voice chat;
+    ``app``: that app's calls only): ``{name casefolded: {"name", "days", "nights", "calls", "last"}}``. ``days``:
+    their days (memory's 04:00 start) with a call there; ``nights``: of those, the days whose call there began at
+    night (:data:`NIGHT_STARTS` to :data:`NIGHT_ENDS`); ``last``: the newest start. A call counts for the one channel
+    :func:`channel_of` reads from its digests; ``names``: the channels to count (``None``: every one the calls' digests
+    or memory's voice channels name). Counts of stored rows; never raises (``{}``)."""
+    try:
+        from yuki.memory.callspans import merged_calls
+        from yuki.memory.checkins import user_day
+
+        spans = [sp for sp in merged_calls(store, now - days * 86400.0, now, now=now)
+                 if str(sp.get("kind") or "call") != "game"
+                 and (not app or " ".join(str(sp.get("app") or "").split()).casefold() == app.casefold())]
+        digests = store.call_digests(i for sp in spans for i in sp["call_ids"]) if spans else {}
+        pool = [n for n in (names if names is not None else _digest_channels(store, spans, digests))
+                if str(n or "").strip()]
+    except Exception:  # noqa: BLE001 - no calls known
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    marks: dict[str, tuple[set[str], set[str]]] = {}
+    for sp in spans:
+        name = channel_of([(digests.get(c) or {}).get("context") or {} for c in sp["call_ids"]], pool)
+        if not name:
+            continue
+        key = name.casefold()
+        row = out.setdefault(key, {"name": name, "days": 0, "nights": 0, "calls": 0, "last": 0.0})
+        on, nights = marks.setdefault(key, (set(), set()))
+        day = user_day(float(sp["start"]))
+        on.add(day)
+        if _night(float(sp["start"])):
+            nights.add(day)
+        row["calls"] += 1
+        row["last"] = max(row["last"], float(sp["start"]))
+        row["days"], row["nights"] = len(on), len(nights)
     return out
 
 
@@ -148,11 +267,19 @@ def voice_usual(store: Any, now: float, *, days: float = VOICE_DAYS) -> dict[str
     """The places of the user's calls (not a game's own voice chat) over the last ``days``, most calls first:
     ``{"places": [{"place", "n", "night", "hour", "last", "voice"}], "people": [names], "calls": n}``. ``hour``: the
     median start hour; ``night``: how many began at night (:data:`NIGHT_STARTS` to :data:`NIGHT_ENDS`). ``people``:
-    the names seen most on those calls. Counts of stored rows; never raises."""
-    rows = [s for s in sessions(store, now - days * 86400.0, now, now=now) if s["kind"] != "game"]
+    the names seen most on those calls. A call in a voice channel counts for that channel however its digest wrote
+    the place (:func:`channel_of`: final-B, one channel under three labels), said as ``<app>, #<channel> voice``.
+    Counts of stored rows; never raises."""
+    rows = [s for s in sessions(store, now - days * 86400.0, now, now=now, channels=True) if s["kind"] != "game"]
     by_place: dict[str, list[dict[str, Any]]] = {}
     seen: Counter[str] = Counter()
+    try:
+        from yuki.memory.titles import place_label
+    except Exception:  # noqa: BLE001 - by the digests' labels, as written
+        place_label = None
     for s in rows:
+        if s.get("channel") and place_label is not None:
+            s = {**s, "place": place_label({"app": s["app"], "channel": s["channel"], "kind": "voice"}), "voice": True}
         if s["place"]:
             by_place.setdefault(s["place"], []).append(s)
         for name in s["people"]:

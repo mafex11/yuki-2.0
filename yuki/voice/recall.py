@@ -197,6 +197,10 @@ FOUND_NOTE = ("For you, not to read out: answer what they asked from it in a few
               "they mean, say where you looked ({where}) and offer to dig further, which is a hand-over.")
 NOTHING_NOTE = ("Nothing found in {where}. Say that plainly, naming where you looked, and offer to dig further "
                 "(a hand-over); never that they did not tell you.")
+#: desk19 review L3: a search with no hit, with their routine (memory's portrait) beside it as context.
+ROUTINE_ONLY_NOTE = ("Nothing found in {where}; their routine, as memory's portrait writes it, is beside it. When it "
+                     "answers what they asked, answer from it in a few words, saying it is their usual; else say "
+                     "plainly nothing was found, naming where you looked, and offer to dig further (a hand-over).")
 WHOSE_NOTE = ("A hit marked as another AI tool's text, or whose from line says someone else said it, is never theirs: "
               "never give it as their own words or plans. When none is theirs, say what you found and whose it is "
               "(\"someone on your Discord call said that, not you\"), and offer to dig further.")
@@ -791,6 +795,31 @@ def _search_lines(hits: list[dict[str, Any]]) -> list[str]:
     return out
 
 
+#: final-B (19 Oct, "when's my meeting tomorrow": the search found only a call's passing mention, no time, while the
+#: portrait's routine had the meeting's usual time): the journal search never reads the portrait, so a search's
+#: report also carries their routine as memory's nightly portrait writes it (the brief's ``routine`` field, else the
+#: portrait's Routines section), dated by the portrait, cut to this (whole words).
+ROUTINE_CHARS = 400
+#: Bound on that read (one row of the store, decrypted: milliseconds).
+ROUTINE_TIMEOUT_S = 1.0
+
+
+def routine_line(client: Any) -> str:
+    """Their routine as a search line, ``- (routine, portrait of Mon 19 Oct 07:11) ...`` (the brief's ``routine``,
+    else the portrait's Routines section), from ``client`` (a memory client, or the store itself); ``""`` without a
+    portrait or with neither. Content: RAM only."""
+    store = getattr(client, "store", client)
+    portrait = store.latest_portrait()
+    if portrait is None:
+        return ""
+    text = (portrait.brief or {}).get("routine") or (portrait.sections or {}).get("routines") or ""
+    text = _clip(text, ROUTINE_CHARS)
+    if not text:
+        return ""
+    when = f"portrait of {datetime.fromtimestamp(float(portrait.at)):%a %d %b %H:%M}" if portrait.at else "portrait"
+    return f"- (routine, {when}) {text}"
+
+
 def added_line(report: dict[str, Any]) -> str | None:
     """The words that confirm an add by code, or ``None`` when the talker should say it (leftVoice).
 
@@ -1013,12 +1042,30 @@ class QuickMemory:
             return ({"failed": f"memory could not be searched ({type(exc).__name__})",
                      "how_to_handle_it": NOTHING_NOTE.format(where="memory")}, {"ok": False})
         lines = _search_lines(list(hits or []))
+        routine = self._routine()
         if not lines:
-            return {"found": "", "how_to_handle_it": NOTHING_NOTE.format(where="a memory search")}, {"ok": True,
-                                                                                                    "items": 0}
+            # desk19 review L3: no hit is still "nothing found"; their routine rides beside it as context only
+            out = {"found": "", "how_to_handle_it": NOTHING_NOTE.format(where="a memory search")}
+            if routine:
+                out = {"found": "", "their_routine": routine,
+                       "how_to_handle_it": ROUTINE_ONLY_NOTE.format(where="a memory search")}
+            return out, {"ok": True, "items": 0, "routine": bool(routine)}
+        items = len(lines)   # the hits (the routine line is counted by its own fact)
+        if routine:
+            lines.append(routine)
         return ({"found": "\n".join(lines),
                  "how_to_handle_it": FOUND_NOTE.format(where="a memory search") + " " + WHOSE_NOTE},
-                {"ok": True, "items": len(lines)})
+                {"ok": True, "items": items, "routine": bool(routine)})
+
+    def _routine(self) -> str:
+        """Their routine as one search line (:func:`routine_line`), ``""`` without (no portrait, memory slow)."""
+        call = getattr(self.memory, "call", None)
+        if not callable(call):
+            return ""
+        try:
+            return str(call("routine", routine_line, timeout_s=ROUTINE_TIMEOUT_S) or "")
+        except Exception:  # noqa: BLE001 - the search's own hits stand
+            return ""
 
 
 __all__ = ["DIGEST_LABEL", "QUICK_MEMORY", "QuickMemory", "RECENT_LABEL", "day_text", "digest_view", "fetch_digest",

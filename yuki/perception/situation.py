@@ -31,6 +31,8 @@ Public API::
     from_overview(payload, *, shares=None, media=None, audio=None, master=None, holds="", keyboard=None) -> DeskState
     warm() -> None                                 # at start: the first read's COM/WinRT costs, in the background
     render(state, *, purpose="talker" | "planner", max_chars=900, just_asked="", just_did="") -> str
+    sound_line(state) -> str                       # the Sound line alone (the mixer's levels labelled as such)
+    mixer_rows(rows, apps) -> list                 # pure: the mixer rows of the apps named
     monitor_of(rect, monitors) -> int | None       # pure: the monitor holding most of a rectangle
     coverer(state, window) -> Window | None        # pure: the window above that covers most of it
 """
@@ -334,6 +336,29 @@ def _audio_from(raw: Iterable[Any]) -> list[Audio]:
     return out
 
 
+def _mixer_key(name: Any) -> str:
+    """An app as the mixer matches it (``app_volume._key``: casefolded, no ``.exe``, letters and digits only)."""
+    part = str(name or "").casefold().strip()
+    part = part[:-4] if part.endswith(".exe") else part
+    return "".join(ch for ch in part if ch.isalnum())
+
+
+def mixer_rows(rows: Iterable[Any], apps: Iterable[Any]) -> list[Any]:
+    """The mixer rows (``app_volume.audio_apps``' dicts) of the apps named in ``apps``, matched as the volume hand
+    matches an app (``app_volume.matching``: the same process name, else one name holding the other, 3 characters
+    or more). Pure."""
+    rows = [r for r in rows or [] if hasattr(r, "get") and r.get("app")]
+    out: list[Any] = []
+    for want in dict.fromkeys(_mixer_key(a) for a in apps or ()):
+        if not want:
+            continue
+        exact = [r for r in rows if _mixer_key(r.get("app")) == want]
+        got = exact or [r for r in rows if len(_mixer_key(r.get("app"))) >= 3
+                        and (_mixer_key(r.get("app")) in want or want in _mixer_key(r.get("app")))]
+        out.extend(r for r in got if not any(r is x for x in out))
+    return out
+
+
 def _holds_from(you: Any) -> str:
     try:
         from yuki.memory.younow import _focus_phrase, holds_now
@@ -349,9 +374,12 @@ def snapshot(*, media: Iterable[Any] | None = None, audio: Iterable[Any] | None 
     ~9 ms, master ~4 ms). Never raises: a part that fails is left empty and named in ``errors``.
 
     A caller that already read a part passes it and it is not read again: ``media`` (``system.media_sessions``'
-    dicts), ``audio`` (``app_volume.audio_apps``' dicts), ``master`` (``audio.master_volume``'s dict; ``False`` to
-    skip it). ``holds``: the focus words, when the caller has them; else ``you`` (a you-now record) is rendered; else
-    the memory service is asked (bounded :data:`YOU_WAIT_S`); pass ``holds=""`` to skip (a diff needs none)."""
+    dicts), ``audio`` (``app_volume.audio_apps``' dicts; ``[]`` to skip the mixer), ``master``
+    (``audio.master_volume``'s dict; ``False`` to skip it, ``True`` or ``None`` to read it). final-B (19 Oct): a
+    look after acting reads the sound only for what the act was about, so ``audio`` may also name apps (strings): the
+    mixer is read and only those apps' rows are kept (:func:`mixer_rows`; dicts in the same list are kept as given).
+    ``holds``: the focus words, when the caller has them; else ``you`` (a you-now record) is rendered; else the memory
+    service is asked (bounded :data:`YOU_WAIT_S`); pass ``holds=""`` to skip (a diff needs none)."""
     started = time.perf_counter()
     state = DeskState(at=time.time())
     try:
@@ -413,16 +441,22 @@ def snapshot(*, media: Iterable[Any] | None = None, audio: Iterable[Any] | None 
             pass
         map_media(state.media, state.windows, identity)
 
-    if audio is None:
+    named: list[Any] = []
+    if audio is not None:
+        audio = [audio] if isinstance(audio, str) else list(audio)
+        named = [a for a in audio if isinstance(a, str) and a.strip()]
+        audio = [a for a in audio if not isinstance(a, str)]
+    if audio is None or named:
         try:
             from yuki.actions.app_volume import audio_apps
 
-            audio = audio_apps(limit=12)
+            read = audio_apps(limit=12 if audio is None else 32)
         except Exception as exc:  # noqa: BLE001
-            audio = []
+            read = []
             state.errors["audio"] = type(exc).__name__
+        audio = read if audio is None else [*audio, *mixer_rows(read, named)]
     state.audio = _audio_from(audio)
-    if master is None:
+    if master is None or master is True:
         try:
             from yuki.perception.audio import master_volume
 
@@ -471,7 +505,7 @@ def warm() -> None:
 
 def from_overview(payload: dict[str, Any], *, shares: dict[int, float] | None = None,
                   media: Iterable[Any] | None = None, audio: Iterable[Any] | None = None,
-                  master: dict[str, Any] | None = None, holds: str = "", keyboard: int | None = None,
+                  master: dict[str, Any] | None | bool = None, holds: str = "", keyboard: int | None = None,
                   identity: dict[int, str] | None = None) -> DeskState:
     """A :class:`DeskState` from an overview already read (``Dispatcher.overview_text``'s payload: the plain
     ``windows.DesktopOverview``), so a caller that holds one reads no window twice, and a stand-in desk (the live
@@ -532,7 +566,7 @@ def from_overview(payload: dict[str, Any], *, shares: dict[int, float] | None = 
     if audio is None:
         state.errors["audio"] = "unread"
     state.audio = _audio_from(audio or [])
-    if master is None:
+    if master is None or master is True:   # ``True`` (read it) is no read here: this is pure
         state.errors["master"] = "unread"
     state.master = dict(master) if isinstance(master, dict) else None
     state.holds = str(holds or "")
@@ -629,6 +663,26 @@ def _where(state: DeskState, m: Media) -> tuple[str, str]:
     return f"an app (id {m.app})", " (which window is not known)"
 
 
+#: How the Sound line labels the apps' levels: they are the Windows mixer's (``app_volume``), never an app's own
+#: slider (final-B, 19 Oct: the agent read "Spotify 100%" as Spotify's own volume, at 50, and set it to 70 for
+#: "down a bit"). The app names stay bare: the volume hands take an app "as the Sound line names it".
+MIXER_LABEL = "mixer levels (not an app's own slider): "
+
+
+def sound_line(state: DeskState) -> str:
+    """The Sound line (``""`` with nothing read): ``Sound: master 50%; mixer levels (not an app's own slider): Spotify
+    100% sounding; chrome 25% muted.`` The one wording of it, for the render and for a caller that says it outside
+    the render's budget (``Hands._situation_text``)."""
+    parts: list[str] = []
+    if state.master:
+        muted = " muted" if state.master.get("muted") else ""
+        parts.append(f"master {float(state.master.get('level') or 0):g}%{muted}")
+    apps = [f"{a.app} {a.level:g}%{' muted' if a.muted else ''}{' sounding' if a.playing else ''}" for a in state.audio]
+    if apps:
+        parts.append(MIXER_LABEL + "; ".join(apps))
+    return ("Sound: " + "; ".join(parts) + ".") if parts else ""
+
+
 def _items(state: DeskState, *, planner: bool, cap: int, said: int, short: bool, just_asked: str,
            just_did: str) -> list[tuple[int, int, str, str]]:
     """The render's pieces: ``(priority, order, group, text)``; a group joins its pieces on one line. Priority 0 and
@@ -680,14 +734,7 @@ def _items(state: DeskState, *, planner: bool, cap: int, said: int, short: bool,
         add(3, "media", "Paused: " + "; ".join(
             f'{m.app}{" " + chr(34) + _title(m.title, min(40, cap)) + chr(34) if m.title and cap > 0 else ""}'
             for m in paused) + ".")
-    sound: list[str] = []
-    if state.master:
-        muted = " muted" if state.master.get("muted") else ""
-        sound.append(f"master {float(state.master.get('level') or 0):g}%{muted}")
-    for a in state.audio:
-        sound.append(f"{a.app} {a.level:g}%{' muted' if a.muted else ''}{' sounding' if a.playing else ''}")
-    if sound:
-        add(3, "sound", "Sound: " + "; ".join(sound) + ".")
+    add(3, "sound", sound_line(state))
     if state.holds:
         add(0, "holds", f"Holding them: {state.holds}.")
     if just_asked:
@@ -773,5 +820,5 @@ def render(state: DeskState, *, purpose: str = "talker", max_chars: int = 900, j
     return _squeeze(text, max_chars, ("Just asked:", "Just did:", "Holding them:", "("))
 
 
-__all__ = ["SAID_CHARS", "Audio", "DeskState", "Media", "Monitor", "Window", "coverer", "from_overview", "map_media",
-           "monitor_of", "name_of", "render", "snapshot", "warm"]
+__all__ = ["MIXER_LABEL", "SAID_CHARS", "Audio", "DeskState", "Media", "Monitor", "Window", "coverer", "from_overview",
+           "map_media", "mixer_rows", "monitor_of", "name_of", "render", "snapshot", "sound_line", "warm"]
