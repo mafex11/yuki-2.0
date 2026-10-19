@@ -1352,25 +1352,17 @@ KEEP_THEIRS = ("Keep their screen theirs: undo your own side effects with one un
                "otherwise stay quiet.")
 
 
-def tidy_report(plan: Plan | None, line: str, after: str, *, nonce: str, ask: bool = False, steps: int = 2,
-                step: str = "") -> str:
+def tidy_report(plan: Plan | None, line: str, after: str, *, nonce: str, ask: bool = False, steps: int = 2) -> str:
     """P1.3: a done plan's acts took something the user had (the executor's after-look: a window in front, playing or
     with the keyboard covered, the front taken, a pop-up left). Code's line was just said; the planner gets the
     "After:" block (fenced: it holds window titles) and the principle, for one reply: at most ``steps`` undoable window
     steps on its own windows, or the one word that nothing needs undoing. ``ask``: the user's tidy dial asks first.
-    desk20 (final-D S1 fallback): ``step``, the one legal step code measured (``diff.tidy_step`` in the plan's terms;
-    its classification rides inside the fence, after the diff): that step is the reply, with no "otherwise stay quiet"
-    default (the one word only when their words asked for that very change). Code-written."""
+    tidy21 (the user's decision 1): only a flag with no legal step code could measure comes here; a measured step is
+    taken by code itself (``Brain._tidy_by_code``), so desk20's "take that one step" wording is gone. Code-written."""
     pid = plan.id if plan else "null"
     told = "they are asked first, " if ask else ""
     head = [f"{CHECK_LABEL} Plan {pid} is done; Yuki said: {one_line(line, 200)}",
             fence(after, source="the desk before and after your acts", nonce=nonce)]
-    if step:
-        return "\n".join([
-            *head,
-            f"Code measured a side effect of your acts (After) and the one undoable step that undoes it: {step}. One "
-            f"reply: plan kind act with that one step, done none; {told}code says it in a few words. The one word "
-            f"{REST_DONE_WORD} only when their words asked for that very change."])
     return "\n".join([
         *head,
         f"{KEEP_THEIRS} A change marked (not from your act) is theirs. One reply: to undo one of yours, plan kind act, "

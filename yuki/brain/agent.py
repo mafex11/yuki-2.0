@@ -17,7 +17,10 @@ the done card, the island and the ledger read) or :class:`ErrorEvent`:
    tidy-up turn AFTER its line: the line goes out at once (a :class:`Say`), then one planner call with the "After:"
    block and one principle, for at most two undoable window steps on what the request's own acts changed (place it,
    give the front back); the :class:`Final` is the line and what the tidy-up did (``outcome["said_first"]``: the part
-   already said). Nothing flagged, or the user's tidy dial off: no turn, no cost.
+   already said). Nothing flagged, or the user's tidy dial off: no turn, no cost. tidy21 (the user's decision 1, 19
+   Oct): when the after-look measured the one legal step (``diff.tidy_step``), code takes it itself with no planner
+   call (:meth:`Brain._tidy_by_code`: the executor's ``take_tidy_step``; the dial at ask: code's yes/no question
+   first) and the Final is the line then code's tidy words; the planner's turn is only for a flag with no such step.
 
 The executor runs push-style against :class:`yuki.brain.plan.ExecHost` (``emit``, a blocking ``ask``), so the request
 runs on its own worker thread and this generator only relays: events come through one queue (no polling), and an
@@ -2374,6 +2377,8 @@ class Brain:
                 conv.add_user([tool_result(tool_id, question_part_report(plan, line)), *extra,
                                *self._steer_turn(host)])
                 return False
+            if status != "declined" and self._tidy_by_code(result, line, outcome, state):
+                return True   # tidy21 (decision 1): code took (or left) the one measured tidy step; the request ended
             if status != "declined" and self._tidy_turn(result, plan, line, outcome, state, bs, conv, extra, host,
                                                         tool_id):
                 return False
@@ -2434,6 +2439,35 @@ class Brain:
         """The tidy-up turn is running: its held ending is the one up."""
         return state.tidy_held is not None and state.held is state.tidy_held
 
+    def _tidy_by_code(self, result: ExecResult, line: str, outcome: dict[str, Any], state: _State) -> bool:
+        """tidy21 (the user's decision 1, 19 Oct; final-D S1: the planner's tidy turns took 0 of 3 steps): the
+        executor's after-look flagged what the request's acts did (``result.after``) and measured the one legal
+        undoable step (``diff.tidy_step``), and the user's tidy dial is not off: code takes that step itself, with no
+        planner call (``Executor.take_tidy_step``: its guards, the game gate and the Act switch, undoable and journaled;
+        at "ask" code's own yes/no question first). The request's line goes out first (a :class:`Say`, at once, as the
+        tidy-up turn's does); the :class:`Final` is that line and code's tidy words after it (the step it took, or
+        plainly that it did not take; none when it was left), with ``outcome["said_first"]`` the part already said.
+        Once per request (``state.tidied``). ``True`` when the request ended here; ``False``: no such step (the
+        planner's tidy-up turn as before, :meth:`_tidy_turn`)."""
+        executor = getattr(self, "_executor", None)
+        if (not result.after or state.tidied or executor is None or not hasattr(executor, "take_tidy_step")
+                or not executor.has_tidy_step() or self._cancelled.is_set()):
+            return False
+        from yuki.brain.util import TIDY_OFF, tidy_mode
+
+        mode = tidy_mode()
+        if mode == TIDY_OFF:
+            return False
+        state.tidied = True
+        self._push(Say(line))
+        words = " ".join(str(executor.take_tidy_step(mode) or "").split())
+        text = f"{line.rstrip()} {words}".strip() if words else line
+        # review M2 (as the tidy-up turn's ending): the line went out as code said it, so no talker re-words it
+        ended = {**dict(outcome or {}), "said_first": line, "evidence": "", **({"line": text} if words else {})}
+        self.logger.log("brain_tidy", given=False, by_code=True, mode=mode, status=result.status, said=bool(words))
+        self._final(text, ended)
+        return True
+
     def _tidy_turn(self, result: ExecResult, plan: Plan | None, line: str, outcome: dict[str, Any], state: _State,
                    bs: BrainSettings, conv: Conversation, extra: list[dict[str, Any]], host: Host,
                    tool_id: str) -> bool:
@@ -2463,9 +2497,9 @@ class Brain:
         state.held = state.tidy_held = (line, outcome)
         self._push(Say(line))
         self.logger.log("brain_tidy", given=True, mode=mode, status=result.status, said_first=True)
-        # desk20 (final-D S1 fallback): the one legal step the executor measured (``""``: none), in the plan's terms
+        # tidy21: only a flag with no legal step comes here (code takes a measured one itself, :meth:`_tidy_by_code`)
         report = tidy_report(plan, line, result.after, nonce=str(getattr(host, "nonce", "") or ""),
-                             ask=mode == TIDY_ASK, steps=TIDY_STEPS, step=str(getattr(result, "after_step", "") or ""))
+                             ask=mode == TIDY_ASK, steps=TIDY_STEPS)
         conv.add_user([tool_result(tool_id, report), *extra, *self._steer_turn(host)])
         return True
 

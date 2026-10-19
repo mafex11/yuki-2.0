@@ -55,6 +55,12 @@ many monitors there are), the one undoable window step that undoes a flagged sid
 step does. Its ``says`` is code's classification of the flag in plain words for a decider; :func:`cover_line` is the
 measured sentence for a tab the act put over what played (no window step touches a tab: it is said, never undone).
 
+**Code takes that step** (tidy21, the user's decision 1 of 19 Oct): under the tidy dial "do" each brain's code runs
+:func:`tidy_step`'s step itself, through its own guarded, undoable, journaled placement path, once a turn, after
+:func:`tidy_guard` (the front unchanged since the after-read; never a move of a window of theirs, nor of a window
+whose own place or state the request asked for: :data:`ARRANGE_ACTIONS`), and says :func:`tidy_line`. "ask" keeps the
+yes/no question; "off" does nothing.
+
 Public API::
 
     compare(before, after, *, acted=(), touched=()) -> DeskDiff
@@ -63,6 +69,10 @@ Public API::
     tidy_step(d, acts, front, monitors) -> dict | None   # the one legal undoable window step (C7)
     cover_line(d) -> str                    # the measured tab-cover sentence, or "" (C7)
     window_flag(d) -> bool                  # a flag a window step could undo is up (not a tab cover, not a sound)
+    tidy_guard(step, d, front_now, front_after, arranged=()) -> str   # "" when code may take it now, else why not
+    arranges(action) -> bool                # a window verb's action that sets the window's own place or state
+    tidy_line(step, app, ok=True) -> str    # code's line for the step it took (or that did not take) (tidy21)
+    step_app(step, state) -> str            # the raw app of the step's window in a desk read (tidy21)
 """
 
 from __future__ import annotations
@@ -612,5 +622,99 @@ def cover_line(d: Any) -> str:
         return ""
 
 
-__all__ = ["COVER_KEEP", "COVER_MIN_LOSS", "DeskDiff", "LINE_TAB_COVER", "LINE_TAB_COVER_PLAIN", "MOSTLY", "NOT_YOURS",
-           "compare", "cover_line", "render", "tidy_step", "window_flag"]
+#: tidy21 (the user's decision 1, 19 Oct: under the tidy dial "do" code takes the one measured step itself): code's
+#: own short line once the step took (``{app}``: the moved window's app, or the app given the front back, as people
+#: say it), and the plain line when it ran and did not take (said once). The planner's own tidy words
+#: (``brain.executor.LINE_TIDY``) are the same sentences.
+LINE_TIDY_DONE: dict[str, str] = {"place": "I moved {app} to your other screen.",
+                                  "focus_back": "I put {app} back in front."}
+LINE_TIDY_FAILED: dict[str, str] = {"place": "I couldn't move {app} to your other screen.",
+                                    "focus_back": "I couldn't put {app} back in front."}
+#: The step's window when no app name is known for it.
+TIDY_NO_APP = "that window"
+#: tidy21 review F1: the window verbs' actions whose ask is the window's own place or state (the window hand's and the
+#: ONE agent's ``window``: move, maximize, fullscreen, restore; the planner's ``window_action``: place, maximize,
+#: fullscreen, restore; a ``place:other:left`` value reads as ``place``). The window such an act aimed at is where the
+#: user asked for it: code's own tidy step never moves it away again (:func:`tidy_guard`'s ``asked_place``), even when
+#: it now covers what played. Our own verb names, never the user's words.
+ARRANGE_ACTIONS: frozenset[str] = frozenset({"move", "place", "maximize", "fullscreen", "restore"})
+
+
+def arranges(action: Any) -> bool:
+    """tidy21 review F1: whether a window verb's ``action`` (:data:`ARRANGE_ACTIONS`) sets the window's own place or
+    state. Pure; never raises."""
+    try:
+        return str(action or "").strip().split(":", 1)[0] in ARRANGE_ACTIONS
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def tidy_line(step: Any, app: str = "", ok: bool = True) -> str:
+    """tidy21: code's line for :func:`tidy_step`'s step (:data:`LINE_TIDY_DONE`, or :data:`LINE_TIDY_FAILED` when it
+    ran and did not take); ``app`` is the caller's display name of the step's window ("" -> :data:`TIDY_NO_APP`).
+    ``""`` for anything that is no such step. Pure; never raises."""
+    try:
+        action = str((step or {}).get("action") or "") if isinstance(step, dict) else ""
+        table = LINE_TIDY_DONE if ok else LINE_TIDY_FAILED
+        if action not in table:
+            return ""
+        return table[action].format(app=" ".join(str(app or "").split()) or TIDY_NO_APP)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def step_app(step: Any, state: Any) -> str:
+    """tidy21: the raw app (the window's process, as :class:`~yuki.perception.situation.Window` holds it) of the
+    window :func:`tidy_step`'s step acts on, in ``state`` (the after-read); ``""`` when it isn't listed. Pure."""
+    try:
+        hwnd = _hwnd((step or {}).get("hwnd")) if isinstance(step, dict) else None
+        if not hwnd:
+            return ""
+        return next((str(w.app or "") for w in getattr(state, "windows", None) or () if int(w.hwnd) == hwnd), "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def tidy_guard(step: Any, d: Any, front_now: Any, front_after: Any, arranged: Iterable[Any] = ()) -> str:
+    """tidy21 (decision 1): whether code may take :func:`tidy_step`'s step right now, from measured facts only: ``""``
+    when it may, else a code word why not (code then leaves the desk as it is and says nothing):
+
+    * ``front_unread`` / ``front_changed``: the window in front now could not be read, or is no longer the one the
+      after-read saw (the user brought another forward since, or another app took it): their desk is theirs;
+    * ``asked_place`` (review F1): a move of a window whose own place or state the request asked for: ``arranged``,
+      the windows the caller's acts of this turn or request aimed a window-arranging verb at (:func:`arranges`: "move
+      Discord to my other screen", "maximize Spotify", a skill run given a place). Over what played or not, it is
+      where they asked for it;
+    * ``theirs``: a move of a window that held their attention before the act (in front, the keyboard, or playing:
+      where they were working or watching). Code moves only a window the act brought up, never one of their own;
+    * ``already``: the front to give back is already in front;
+    * ``no_step``: nothing to take.
+
+    The step's own bounds (only the act's windows move; the front goes back only to the window the act took it from)
+    are :func:`tidy_step`'s and the caller's tidy check's; the game gate and the Act switch are the caller's. Pure;
+    never raises (``"error"``)."""
+    try:
+        if not isinstance(step, dict) or step.get("action") not in ("place", "focus_back"):
+            return "no_step"
+        hwnd = _hwnd(step.get("hwnd"))
+        if not hwnd:
+            return "no_step"
+        if step["action"] == "place" and hwnd in {_hwnd(h) for h in arranged or ()}:
+            return "asked_place"
+        now, then = _hwnd(front_now), _hwnd(front_after)
+        if now is None or then is None:
+            return "front_unread"
+        if now != then:
+            return "front_changed"
+        if step["action"] == "place" and hwnd in {_hwnd(h) for h in getattr(d, "attention", None) or ()}:
+            return "theirs"
+        if step["action"] == "focus_back" and hwnd == now:
+            return "already"
+        return ""
+    except Exception:  # noqa: BLE001
+        return "error"
+
+
+__all__ = ["ARRANGE_ACTIONS", "COVER_KEEP", "COVER_MIN_LOSS", "DeskDiff", "LINE_TAB_COVER", "LINE_TAB_COVER_PLAIN",
+           "LINE_TIDY_DONE", "LINE_TIDY_FAILED", "MOSTLY", "NOT_YOURS", "TIDY_NO_APP", "arranges", "compare",
+           "cover_line", "render", "step_app", "tidy_guard", "tidy_line", "tidy_step", "window_flag"]
