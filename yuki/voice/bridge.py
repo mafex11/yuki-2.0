@@ -294,6 +294,10 @@ class Job:
     #: that way (nothing more of it is said, as for a cancelled hand-off call, unless its send went).
     detached: bool = False
     talker_cancelled: bool = False
+    #: voice20 (final-D S11): the talker's cancelling reply said no words (a bare cancel call): its own ending is then
+    #: said by code (:meth:`VoiceBridge._say_stopped`); and whether a send of it was counting down when it was stopped.
+    talker_silent: bool = False
+    cancel_had_send: bool = False
     #: hands19 review (H2, M2, M3): each pause of its countdown on the user's speech is one hold (its watch ends when a
     #: newer hold takes over); the final words heard while it is held (RAM only, never logged; keyed by when each turn
     #: was heard); and when the newest of them was steered into it by code (the talker routed none of them), so the
@@ -1760,12 +1764,13 @@ class VoiceBridge(QObject):
                 held = self._held_verdict(job, kind, payload)   # honest (87): below likely, never said as written
                 verified = bool(kind == "done" and job.finished_by_action
                                 and payload.strip() == job.finished_by_action) and held is None
-                head, rest = condense(payload, max_sentences=self._max_sentences, max_chars=self._max_chars)
+                head, rest, by_rule = self._condensed(job, payload)   # voice20 (S22g): an answer is never cut by count
                 job.rest = rest
                 delivered = loop.create_future()
                 nothing = self._nothing_done(job) if kind == "done" else False
                 lines = None if held is not None else self._by_code(job, kind, head, rest, late=late,
-                                                                    verified=verified, nothing_done=nothing)
+                                                                    verified=verified, nothing_done=nothing,
+                                                                    by_rule=by_rule)
                 if held is not None:
                     self._log("bridge", op="outcome_held", job_id=job.job_id, level=held.get("level"),
                               said_by="talker")
@@ -3190,8 +3195,27 @@ class VoiceBridge(QObject):
 
     # -- C1 (v3.17): results by code ----------------------------------------------------------------------------
 
+    def _condensed(self, job: Job, payload: str) -> tuple[str, str, str]:
+        """``(head, rest, by_rule)``: a result's words to say now and what is held back (``condense``), and the rest
+        the sentence rule alone would hold back (:meth:`_by_code` decides who says it from that, as before).
+
+        voice20 (final-D S22g, questions Y2): an answer (the outcome's level ``answer``: the planner answered, it did
+        no act for it) is cut by characters only, never by the sentence count: live final-D k_two_asks under all, a
+        173-character answer of three sentences was cut to its first two and the sentence that answered (the usual
+        meeting) went to "more". The outcome's own level and the text's sentence marks, never the words."""
+        head, rest = condense(payload, max_sentences=self._max_sentences, max_chars=self._max_chars)
+        level = str((job.verdict or {}).get("level") or "") if isinstance(job.verdict, dict) else ""
+        if level != "answer" or not rest:
+            return head, rest, rest
+        whole, left = condense(payload, max_sentences=max(self._max_sentences, len(sentences(payload))),
+                               max_chars=self._max_chars)
+        if left != rest:
+            self._log("bridge", op="answer_whole", job_id=job.job_id, spoken_chars=len(whole), rest_chars=len(left),
+                      by_rule_chars=len(head))
+        return whole, left, rest
+
     def _by_code(self, job: Job, kind: str, head: str, rest: str, *, late: bool, verified: bool,
-                 nothing_done: bool) -> list[str] | None:
+                 nothing_done: bool, by_rule: str | None = None) -> list[str] | None:
         """The sentences of a result to say by code, word for word, with no talker run, or ``None`` (the talker says it).
 
         07 §6 C: a verified ``finishes_with`` result, or a ``done`` that fits the condense rule whole (``voice_result_
@@ -3200,7 +3224,9 @@ class VoiceBridge(QObject):
         a result with more to offer, one that asks them something (its own closing question mark), one with an address
         or a path to describe rather than read, a late one (they said more since: it must be framed as the earlier
         request's), and one for a request that asked for something to be done when nothing was (v3.14b). Facts of the
-        job's record and the text's own punctuation and machine formats, never what the words mean.
+        job's record and the text's own punctuation and machine formats, never what the words mean. voice20:
+        ``by_rule`` (:meth:`_condensed`): what the sentence rule alone holds back, for "fits whole" (an answer's head
+        may be longer now; who says it is decided as before).
         """
         v = job.verdict if isinstance(job.verdict, dict) else {}
         if kind == "done" and job.brain_run and v.get("evidence") and not v.get("send") and not v.get("said_first"):
@@ -3230,7 +3256,7 @@ class VoiceBridge(QObject):
                 return sentences(text) or None
         if not self._results_by_code or kind != "done" or job.remember or job.superseded or late or nothing_done:
             return None
-        if rest and not verified:
+        if (rest if by_rule is None else by_rule) and not verified:
             return None
         text = " ".join((head or "").split())
         if not strip_tags(text).strip() or asks(text) or machine_text(text):
@@ -3895,6 +3921,45 @@ class VoiceBridge(QObject):
         asyncio.ensure_future(self._relay_detached(job))
         return True
 
+    #: voice20 (final-D S11): what code says when the talker's bare cancel stopped a passed-on job: with a send counting
+    #: down when it was stopped, the both brains' words for a stopped send (``executor.LINE_STOPPED_SEND``,
+    #: ``one.runner.LINE_STOPPED_SEND``), else that it stopped. Facts of the job's record, never the words.
+    LINE_STOPPED_SEND = "Stopped. Nothing was sent."
+    LINE_STOPPED = "Okay, stopped."
+
+    def _say_stopped(self, job: Job) -> None:
+        """voice20 (final-D S11): the talker's cancel of a passed-on job came as a bare call (no words), and the job has
+        stopped with nothing sent: its own ending is said by code, through the narrator gate like a code-said final
+        (when Yuki may speak), and goes into the talker's conversation as said (:data:`CODE_SAID_NOTE`), never with a
+        talker run. Never raises."""
+        line = self.LINE_STOPPED_SEND if job.cancel_had_send else self.LINE_STOPPED
+        announce = self.announce
+
+        async def deliver(run_llm: bool, stale: bool) -> None:
+            del run_llm   # it speaks itself: the talker is never run for it
+            if stale or job.sent:
+                self._log("bridge", op="cancel_said", job_id=job.job_id, said=False, stale=bool(stale))
+                return
+            try:
+                await self._say_lines([line], None)
+                if announce is not None:
+                    await announce({"stopped": job.brief(), "said": line, "how_to_handle_it": CODE_SAID_NOTE}, False)
+                self._log("bridge", op="cancel_said", job_id=job.job_id, said=True, send=job.cancel_had_send,
+                          said_by="code")
+            except Exception as exc:  # noqa: BLE001 - a line never breaks the bridge
+                self._log("bridge_error", error=f"cancel_said: {type(exc).__name__}")
+
+        if self.speak_result is None and self.speak is None:
+            self._log("bridge", op="cancel_said", job_id=job.job_id, said=False, voice=False)
+            return
+        try:
+            if self.gate is not None:
+                self.gate.enqueue(Item(job=job.token, kind="final", deliver=deliver, self_spoken=True))
+            else:
+                asyncio.ensure_future(deliver(False, False))
+        except Exception as exc:  # noqa: BLE001
+            self._log("bridge_error", error=f"cancel_said: {type(exc).__name__}")
+
     async def _relay_detached(self, job: Job) -> None:
         """Items of a job no tell_yuki call carries (escalated, or a too-late addition): through ``announce``."""
         job.detached = True   # hands19 (C4): the talker's cancel reaches it through cancel_passed_on
@@ -3902,12 +3967,15 @@ class VoiceBridge(QObject):
             kind, payload = await job.events.get()
             if job.talker_cancelled and not job.sent:
                 # hands19 (C4): the talker stopped it (cancel_passed_on) and said so in the same reply: nothing more of
-                # it is said, as for a cancelled hand-off call (a send that went is still said)
+                # it is said, as for a cancelled hand-off call (a send that went is still said). voice20 (final-D
+                # S11): a bare cancel call said nothing: its own ending is said by code once it has stopped
                 if kind in ("done", "failed", "withdrawn", "set_aside"):
                     if self.steps is not None:
                         self.steps.closed(job.token)
                     self._drop_items(job)
                     self._unowe(job)
+                    if job.talker_silent:
+                        self._say_stopped(job)
                     return
                 continue
             if self._step_item(job, kind, payload):
@@ -3948,11 +4016,12 @@ class VoiceBridge(QObject):
                 held = self._held_verdict(job, kind, payload)   # honest (87): below likely, never said as written
                 verified = bool(kind == "done" and job.finished_by_action
                                 and payload.strip() == job.finished_by_action) and held is None
-                head, rest = condense(payload, max_sentences=self._max_sentences, max_chars=self._max_chars)
+                head, rest, by_rule = self._condensed(job, payload)   # voice20 (S22g): an answer is never cut by count
                 job.rest = rest
                 nothing = self._nothing_done(job) if kind == "done" else False
                 lines = None if held is not None else self._by_code(job, kind, head, rest, late=late,
-                                                                    verified=verified, nothing_done=nothing)
+                                                                    verified=verified, nothing_done=nothing,
+                                                                    by_rule=by_rule)
                 if held is not None:
                     self._log("bridge", op="outcome_held", job_id=job.job_id, level=held.get("level"),
                               said_by="talker")
@@ -4487,7 +4556,7 @@ class VoiceBridge(QObject):
         except Exception as exc:  # noqa: BLE001 - the brain's pause limit ends it then (nothing sent)
             self._log("bridge_error", error=f"held_send_watch: {type(exc).__name__}")
 
-    def cancel_passed_on(self) -> bool:
+    def cancel_passed_on(self, said: bool = True) -> bool:
         """hands19 (final-B all-messaging RC3, contract C4): the talker's cancel when no hand-off call of its is running
         (the pipeline's cancel tool, through a ``getattr`` guard): the open voice job code passed on for their words
         (a ``run_skill`` or hand fallback, a held run, a late addition: :attr:`Job.detached`, no call carries it) is
@@ -4495,7 +4564,11 @@ class VoiceBridge(QObject):
         in turn 1, "wait, no, don't send it" was turn 2, and the cancel tool answered "no hand_over call is running"
         five times). Nothing more of it is said (the talker says it is stopping in the same reply), unless its send
         went. ``True`` when one was stopped. Integration review VC-2: one whose send went already is not stopped
-        (``False``, with :attr:`cancel_found_sent` set). Never under brain one. State only; never raises."""
+        (``False``, with :attr:`cancel_found_sent` set). Never under brain one. State only; never raises.
+
+        voice20 (final-D S11): ``said`` false: the talker's cancelling reply said no words (a bare cancel call; live
+        final-D p24_countdown_cancel under all: the cancel landed and Yuki said nothing). The job's own ending is then
+        said by code once it has stopped (:meth:`_relay_detached`, :meth:`_say_stopped`): never a silent cancel."""
         self.cancel_found_sent = False
         try:
             if getattr(self, "one", False):
@@ -4520,6 +4593,9 @@ class VoiceBridge(QObject):
                 return False
             job.talker_cancelled = True
             job.cancel_requested = True
+            job.talker_silent = not said
+            # a send of it counted down (counting or paused now, or paused on their speech before)
+            job.cancel_had_send = job.sending is not None or job.send_held or job.send_gen > 0
             self._gui(lambda: self._cancel(job))
             if self.gate is not None:
                 for item in self.gate.take(job.token, kinds=tuple(RANKS)):
@@ -4527,7 +4603,7 @@ class VoiceBridge(QObject):
                         item.drop()
             self._unowe(job)
             self._log("bridge", op="cancel_passed_on", found=True, job_id=job.job_id, this_turn=bool(same),
-                      sending=job.sending is not None)
+                      sending=job.sending is not None, said=bool(said))
             self._changed()
             return True
         except Exception as exc:  # noqa: BLE001
