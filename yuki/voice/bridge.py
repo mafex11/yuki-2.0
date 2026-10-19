@@ -73,6 +73,53 @@ from yuki.voice.mouth import (
 from yuki.voice.narrator import RANKS, Item, asks, condense, ends_sentence, machine_text, sentences
 from yuki.voice.progress import JobLog, step_of
 
+#: voice22 (A25, final-D one-core §4: in both brains "Opening Spotify." was said before the game gate held the act):
+#: the calls whose say_first announces an act the game gate decides at its step: an app or a page opened (row 1: it
+#: takes the screen) and a skill run (gated rung by rung, by each rung's own data).
+GAME_GATED_SAYS = frozenset({"open_app", "open_url", "run_skill"})
+
+
+def say_waits_for_game(name: Any, args: Any = None) -> bool:
+    """voice22 (A25): whether a call's say_first must not be said yet, because the game gate holds its act: a game is
+    in front now (the gate's own local read, ``yuki.memory.gamegate.game_in_front``) and the call opens an app or a
+    page (row 1 holds those with a game in front), or runs a skill none of whose rungs may run with one (its data, as
+    the engine's ``_game_blocks`` reads it: a rung that takes no focus whose ``game`` is ``always``, or ``states``
+    with proven states listed; a ``states`` rung with none listed never runs with a game). A skill
+    not named yet (``args`` still streaming), not in the catalog, or unreadable: it waits. The act's own outcome is
+    then what is heard: the game line when it is held, its done line when it went. ``args``: the call's arguments
+    (a mapping), or the skill key. Blocking (a foreground read, the catalog): off the voice loop. Never raises
+    (``False``: no game read, the say goes as before)."""
+    tool = str(name or "")
+    if tool not in GAME_GATED_SAYS:
+        return False
+    try:
+        from yuki.memory.gamegate import game_in_front
+
+        if not game_in_front():
+            return False
+    except Exception:  # noqa: BLE001 - no read: as before
+        return False
+    if tool != "run_skill":
+        return True
+    key = str((args.get("skill") if isinstance(args, dict) else args) or "").strip()
+    if not key:
+        return True
+    try:
+        from yuki.skills.catalog import load
+
+        catalog = load()
+        skill = catalog.get(key) or (catalog.get(key.split("#", 1)[0]) if "#" in key else None)
+        routes = tuple(getattr(skill, "routes", None) or ()) if skill is not None else ()
+    except Exception:  # noqa: BLE001 - unreadable: it waits
+        return True
+    def may_run(route: Any) -> bool:
+        game = str(getattr(route, "game", "never") or "never")
+        return not getattr(route, "needs_focus", True) and (
+            game == "always" or (game == "states" and bool(getattr(route, "game_states", ()))))
+
+    return not any(may_run(r) for r in routes)
+
+
 #: Job states.
 QUEUED, RUNNING, WAITING, DONE, FAILED, CANCELLED = (
     "queued", "running", "waiting_for_answer", "done", "failed", "cancelled")
@@ -1697,6 +1744,17 @@ class VoiceBridge(QObject):
         spoke = self.spoke_in_reply() if self.spoke_in_reply is not None else True
         if spoke or not words:
             return
+        name = str(getattr(params, "function_name", "") or "")
+        if name in GAME_GATED_SAYS:
+            try:
+                waits = await asyncio.to_thread(say_waits_for_game, name, args)
+            except Exception:  # noqa: BLE001 - no read: as before
+                waits = False
+            if waits:
+                # voice22 (A25): a game is in front and the gate holds this act: its game line (or its done line,
+                # when it went after all) is what they hear, never an "Opening it." first
+                self._log("bridge", op="ack_skipped", call=params.tool_call_id, why="game")
+                return
         if not self.may_ack():
             self._log("bridge", op="ack_skipped", call=params.tool_call_id, why="already_acknowledged")
             return

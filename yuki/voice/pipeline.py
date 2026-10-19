@@ -43,7 +43,7 @@ from typing import Any, Callable
 from yuki.config import Settings, thinking_off
 from yuki.voice.expressive import strip_tags
 from yuki.voice.keys import DEEPGRAM, ELEVENLABS, GOOGLE, get_key
-from yuki.voice.keyterms import name_terms, own_names, vocabulary
+from yuki.voice.keyterms import name_terms, own_names, said_site, vocabulary
 from yuki.voice.hands import talker_hand_tools
 from yuki.voice.recall import QUICK_MEMORY
 from yuki.voice.mouth import (
@@ -510,6 +510,29 @@ def early_words(partial_json: str) -> str | None:
     return words or None
 
 
+def early_text(partial_json: str, name: str) -> str | None:
+    """voice22 (A25): a string field of a tool call whose arguments are still streaming, once its value is whole
+    (``None`` until then, or when it is not a string). Parsing the call's own JSON."""
+    import json
+
+    key = str(partial_json or "").find(f'"{name}"')
+    if key < 0:
+        return None
+    colon = partial_json.find(":", key + len(name) + 2)
+    if colon < 0:
+        return None
+    start = colon + 1
+    while start < len(partial_json) and partial_json[start] in " \t\r\n":
+        start += 1
+    if start >= len(partial_json) or partial_json[start] != '"':
+        return None
+    try:
+        value, _end = json.JSONDecoder().raw_decode(partial_json, start)
+    except ValueError:
+        return None
+    return value if isinstance(value, str) else None
+
+
 def early_flag(partial_json: str, name: str) -> bool | None:
     """A boolean field of a tool call whose arguments are still streaming, once its value is written.
 
@@ -653,8 +676,8 @@ NEAR_TAIL_RATIO = 0.85
 APP_TAIL_HEAD = 2
 #: voice21 (final-D decision 3, 19 Oct: "not flag, but it should automatically understand it and work"): what a near
 #: name of the Speech line is, by where it came from (a measured source, never the words).
-NEAR_KINDS = {"screen": "a name on the screen", "running": "an app running now", "own": "one of their apps or sites",
-              "known": "a name you know"}
+NEAR_KINDS = {"screen": "a name on the screen", "running": "an app running now",
+              "own": "one of their apps, sites or channels", "known": "a name you know"}
 #: ... and what the note says of the closest near name of each heard stretch: it is what they most likely said, to be
 #: used and named, never asked about. A farther one for the same heard words is named as less likely.
 #: A person still goes as heard: whom a message goes to is the message skill's to settle (a send is never matched by
@@ -668,7 +691,7 @@ NEAR_ACT = ("for anything undoable, take each most likely name as what they said
 
 def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
                screen: list[str] | None = None, apps: list[str] | None = None,
-               own: list[str] | None = None) -> tuple[str | None, int, int]:
+               own: list[str] | None = None, measured: list[str] | None = None) -> tuple[str | None, int, int]:
     """What speech recognition was unsure of in a final transcript, for the mouth: ``(note, low, near)``.
 
     ``words`` is Flux's TurnInfo word list (``{"word", "confidence"}``); ``keyterms`` the names memory
@@ -700,6 +723,11 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
 
     voice21 (decision 3): the note says each near name as what they most likely said (:data:`NEAR_ACT`: to be used and
     named in the reply, never asked about); for the same heard words, a farther name is named as less likely.
+
+    ``measured`` (voice22, A4 / final-D S18, contract C14): the user's own apps, sites and channels for names21's
+    measured match (:func:`measured_near`: ``names.best_match`` with ``as_name`` on each stretch of the heard words,
+    never a name heard as written), so a garble the tail shape misses ("Porbex Kaladra" for Excalidraw) is named as
+    what they most likely said before the model picks an exact wrong name itself.
     """
     import difflib
 
@@ -800,6 +828,13 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
                     window, span = spoken[i - 1:i + 1], {i - 1, i}
             if best and all(t != named[best] for _r, _h, t, _s in scored):
                 scored.append((ratio, " ".join(window), named[best], span))
+    # voice22 (A4): names21's measured match of the user's own names, on each stretch of the heard words (never words
+    # that are a known name as heard, never a name already named above)
+    measured_names: set[str] = set()
+    for ratio, h, t, span in measured_near(items, measured or (), skip=exact):
+        if all(key(t) != key(x) for _r, _h, x, _s in scored):
+            scored.append((ratio, h, t, span))
+            measured_names.add(key(t))
     # voice21 (decision 3): of the names for the same heard words, the one that accounts for more of them (N9: the pair
     # "hey meant" is Hemanth, though "niche" alone spells closer to another contact), then the closest, is what they
     # most likely said; another for words of the same stretch is less likely
@@ -837,8 +872,8 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
     if near:
         def kind(t: str) -> str:
             k = key(t)
-            return NEAR_KINDS["screen" if k in on_screen else "running" if k in running else "own" if k in owned
-                              else "known"]
+            return NEAR_KINDS["screen" if k in on_screen else "running" if k in running else "own"
+                              if k in owned or k in measured_names else "known"]
 
         parts.append("; ".join(f"'{h}' sounds close to {t}, {kind(t)}"
                                + (f": they most likely said {t}" if first else ", less likely")
@@ -851,6 +886,89 @@ def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
     if near:
         note += ". " + NEAR_ACT[:1].upper() + NEAR_ACT[1:]   # voice21 (decision 3): a near name leads to action
     return (note or None), len(low), len(near) + len(fused) + unsure_spelled
+
+
+#: voice22 (A4): marks recognition writes at a word's end that close a stretch of what was said (its own punctuation:
+#: a clause or a sentence ends there). Each stretch is measured as a name given at its end (``names.best_match``
+#: ``as_name``: the stretch's last words, never a part before them).
+STRETCH_MARKS = ",.?!;:\u0964"
+
+
+def measured_near(items: Any, names: Any, *, skip: Any = ()) -> list[tuple[float, str, str, set[int]]]:
+    """voice22 (A4, final-D S18; names21 merge note 3, contract C14): names21's measured match of the user's own apps,
+    sites and channels (``names``: :func:`yuki.voice.keyterms.own_names`) on the heard words (``items``: Flux's word
+    list, ``{"word", ...}``): ``[(score, heard words, name, word places)]``, at most one a stretch.
+
+    The words are cut into stretches at recognition's own punctuation (:data:`STRETCH_MARKS`); each stretch is measured
+    as a name given at its end (``best_match(..., as_name=True, literal_ok=False)``: the stretch whole, or its last
+    words, never a part before them; a name standing in it as written is no mishearing and is left out). The heard
+    words named are the fewest last words of the stretch that hold the winner's score (``names.score``). A stretch
+    whose named words include a place in ``skip`` (a known name heard as written) is left out. The bar, the margin
+    and the measure are names21's (calibrated on the user's turns); re-measured by voice22 on the user's past spoken
+    turns before shipping (docs/research/final-test-2026-10-19/builds/voice22.md). ``best_match`` and ``score`` are
+    imported inside ``try/except ImportError`` (contract C14): without them, nothing. Never raises."""
+    try:
+        from yuki.skills.names import TURN_BAR, best_match, score
+    except ImportError:
+        return []
+    try:
+        pool = [str(n) for n in (names or ()) if str(n or "").strip()]
+        words = [str(w.get("word") or "") for w in (items or ()) if isinstance(w, dict)
+                 and str(w.get("word") or "").strip()]
+        if not pool or not words:
+            return []
+        clean = [w.strip(" ,.?!;:\"'()\u0964") for w in words]
+        stretches: list[list[int]] = [[]]
+        for i, w in enumerate(words):
+            stretches[-1].append(i)
+            if w.rstrip("\"')").endswith(tuple(STRETCH_MARKS)):
+                stretches.append([])
+        skip = set(skip or ())
+        out: list[tuple[float, str, str, set[int]]] = []
+        for places in stretches:
+            places = [i for i in places if clean[i]]
+            if not places:
+                continue
+            text = " ".join(clean[i] for i in places)
+            got = best_match(text, pool, as_name=True, literal_ok=False)
+            if got is None:
+                continue
+            name, top = str(got[0]), float(got[1])
+            span: list[int] = places
+            for n in range(1, len(places) + 1):
+                tail = places[-n:]
+                if score(" ".join(clean[i] for i in tail), name, as_name=True) >= top - 1e-9:
+                    span = tail
+                    break
+            if skip & set(span):
+                continue
+            heard = " ".join(clean[i] for i in span)
+            if top < TURN_BAR and not _tail_shaped(span, clean, name, top, score):
+                continue
+            out.append((top, heard, name, set(span)))
+        return out
+    except Exception:  # noqa: BLE001 - the Speech line goes without it
+        return []
+
+
+def _tail_shaped(span: list[int], clean: list[str], name: str, top: float, score: Callable[..., float]) -> bool:
+    """voice22 (A4): whether a measured match of two heard words came from names21's tail shape, with the name's first
+    letters standing at the end of the word before as written ("Porb|ex Kaladra" for "Ex|calidraw": the word boundary
+    moved, the letters stayed): the word before ends in the name's first one or two letters (:data:`APP_TAIL_HEAD`),
+    and the pair scores more than its last word alone and more than its two words read as one (names21's own
+    ``score``). names21's other head rule, a short word that sounds like the head ("the" for "di"), is left to its
+    whole-turn bar: re-measured, below that bar it made "are saying" a channel whose spoken form is an everyday word.
+    Letters and names21's measure only."""
+    if len(span) != 2:
+        return False
+    fold = lambda text: "".join(ch for ch in str(text or "").casefold() if ch.isalpha())   # noqa: E731
+    said = said_site(name) if " " not in name.strip() and "." in name.strip(".") else name.split("(")[0]
+    before, last, letters = fold(clean[span[0]]), fold(clean[span[-1]]), fold(said)
+    if not last or not any(len(letters) - j >= LOW_WORD_MIN_LETTERS - 1 and len(before) > j
+                           and before.endswith(letters[:j]) for j in range(1, APP_TAIL_HEAD + 1)):
+        return False
+    joined = clean[span[0]] + clean[span[-1]]
+    return top > max(score(clean[span[-1]], name, as_name=True), score(joined, name, as_name=True)) + 1e-9
 
 
 #: voice20 (final-D S12): at most this many running apps are measured (a busy desk's own list, never cut by name).
@@ -1339,10 +1457,26 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 self._yuki_held_calls = None
                 hooks.speculation("dropped_calls", len(held))
 
-        async def _yuki_say_early(self, call: LlmCall, tool_id: str, words: str) -> None:
-            """Speak a call's say_first now, while the rest of the call is still being written."""
+        async def _yuki_say_early(self, call: LlmCall, tool_id: str, words: str, name: str = "",
+                                  args: str = "") -> None:
+            """Speak a call's say_first now, while the rest of the call is still being written. voice22 (A25): not
+            while a game is in front and the gate holds the act (``bridge.say_waits_for_game``, read off the loop;
+            ``args``: the call's JSON so far, for a skill's key): the call decides again once it is whole, before it
+            runs (``VoiceBridge._ack_if_silent``)."""
             from pipecat.frames.frames import TTSSpeakFrame
 
+            from yuki.voice.bridge import GAME_GATED_SAYS, say_waits_for_game
+
+            if name in GAME_GATED_SAYS:
+                try:
+                    waits = await asyncio.to_thread(say_waits_for_game, name, early_text(args, "skill") or "")
+                except Exception:  # noqa: BLE001 - no read: as before
+                    waits = False
+                if waits:
+                    held = getattr(hooks, "early_held", None)
+                    if callable(held):
+                        held(call, name)
+                    return
             self._yuki_early.add(tool_id)
             if hook("may_ack", default=True) is False:
                 return   # an acknowledgement was said for these words already (v3.12): this one stays unsaid
@@ -1706,7 +1840,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                             if words is not None:
                                 said = True
                                 if call.first_text is None:  # a reply that already spoke keeps its own words
-                                    await self._yuki_say_early(call, tool_id, words)
+                                    await self._yuki_say_early(call, tool_id, words, name, args)
                         yield event
                 finally:
                     if channel is not None:
@@ -2654,9 +2788,10 @@ class TurnObserver:
         if isinstance(frame, EagerTranscriptionFrame):
             # A speculative reply starts from these words: what recognition was unsure of in them (v3.5).
             result = getattr(frame, "result", None)
+            own = self._own_names()
             note, low, near = heard_note(result.get("words") if isinstance(result, dict) else None, self.keyterms,
                                          cut_before=self.cut_before(), screen=self.screen_terms,
-                                         apps=self._desk_apps(), own=self._own_names())
+                                         apps=self._desk_apps(), own=own, measured=own)
             self.heard, self.heard_plain = note, bool(note and not (low or near))
             return
         if isinstance(frame, UserStartedSpeakingFrame):
@@ -2699,9 +2834,11 @@ class TurnObserver:
             turn.transcript_at = now
             turn.speech_end, turn.eos_source = self._end_of_speech(now)
             result = getattr(frame, "result", None)
+            own = self._own_names()   # voice22 (A4): the same list for names21's measured match (``measured``)
             self.heard, turn.heard_low, turn.heard_near = heard_note(
                 result.get("words") if isinstance(result, dict) else None, self.keyterms,
-                cut_before=self.cut_before(), screen=self.screen_terms, apps=self._desk_apps(), own=self._own_names())
+                cut_before=self.cut_before(), screen=self.screen_terms, apps=self._desk_apps(), own=own,
+                measured=own)
             self.heard_plain = bool(self.heard and not (turn.heard_low or turn.heard_near))
             self.last_user_text = turn.user_text
             if turn.user_text.strip():
@@ -2929,6 +3066,11 @@ class _Hooks:
                          after_request_ms=round((call.early_say - call.sent) * 1000) if call.sent and call.early_say
                          else None)
 
+    def early_held(self, call: LlmCall, tool: str) -> None:
+        """voice22 (A25): a call's say_first was kept from the voice while it was written: a game is in front and the
+        gate holds its act (content-free log: the tool's name only)."""
+        self.c.log.event("early_say", held="game", tool=str(tool or ""))
+
     # -- the mouth's model failover (v3.5) ----------------------------------------
 
     def routed(self) -> bool:
@@ -3079,10 +3221,17 @@ class _Hooks:
         return self.c.channel
 
     def rerun(self) -> bool:
-        """Whether this call answers the user's turn again because nothing of the last reply to it was heard."""
+        """Whether this call answers the user's turn again because nothing of the last reply to it was heard; voice22
+        (A9): or answers again the talker's run for the refusal of a quiet on their opening words that gave them
+        nothing (``Conversation._opened_answer``: its call follows that refusal's result, not their words)."""
         turn = self.c.observer.turn
         call = getattr(getattr(self.c, "_llm", None), "_yuki_call", None)
-        return bool(turn is not None and turn.rerun and turn.trigger == "user" and (call is None or call.user_turn))
+        if turn is None or not turn.rerun:
+            return False
+        if turn.trigger == "user":
+            return bool(call is None or call.user_turn)
+        opened = getattr(self.c, "_opened_answer", None)
+        return bool(callable(opened) and opened(turn))
 
     def marker_report(self, call: LlmCall, channel: Any) -> None:
         """A reply's text was read by the marker channel: record it on its turn and log it (content-free)."""
@@ -4702,7 +4851,41 @@ class OneVoice:
             # the rerun spoke nothing either and nothing is owed: the error tone says so (a non-speech notice)
             self.c._tone("error")
             self._log("unheard_close", round=int(getattr(call, "one_round", 0) or 0), gave_up=True)
+        if self._opened_marker(call):
+            # voice22 (A9, final-D S10 leftover): round 1 chose a quiet marker alone on the first words of a
+            # conversation they opened: refused once like a stay_quiet; the turn ends here as the agent's, and the
+            # conversation's reply watch answers it again (round 2, the turn's block made again with the note)
+            self.turn_over("opened_quiet")
+            return
         self.turn_over("model")
+
+    def _opened_marker(self, call: Any) -> bool:
+        """voice22 (A9, the S10 leftover of voice21): round 1's reply is a quiet marker alone (no call: a stay_quiet
+        call is :meth:`control`'s, refused by :meth:`_quiet_unanswered`), nothing of it spoken and no say_first, on the
+        first words of a conversation they opened themselves (``Conversation._opened_quiet``, ``via`` one_marker: once
+        a conversation, with its own conditions: no call live, no game, no dictation, nothing heard or acted). Refused
+        once like a stay_quiet: the conversation's turn has its marker waived and is marked ``opened_quiet``, so the
+        reply watch answers it again once with ``mouth.OPENED_RERUN_NOTE`` (``Conversation._unanswered``; the rerun
+        makes the turn's block again). The rerun's own quiet is final. Stream facts only; never raises (no refusal)."""
+        try:
+            if int(getattr(call, "one_round", 0) or 0) != 1 or self._quiet_refused or not self.anchor_text:
+                return False
+            if getattr(call, "one_marker", None) != "quiet" or getattr(call, "one_unmarked", False):
+                return False
+            if getattr(call, "first_text", None) is not None or getattr(call, "early_say", None) is not None:
+                return False
+            opened = getattr(self.c, "_opened_quiet", None)
+            if not callable(opened) or not opened(spoke=False, via="one_marker"):
+                return False
+            self._quiet_refused = True
+            turn = getattr(getattr(self.c, "observer", None), "turn", None)
+            if turn is not None and getattr(turn, "trigger", None) == "user":
+                turn.marker, turn.opened_quiet = None, True
+            self._log("quiet", refused="opened_first", round=1, via="marker")
+            return True
+        except Exception as exc:  # noqa: BLE001 - the quiet stands
+            self._log("quiet", error=type(exc).__name__)
+            return False
 
     def _rerun_silent(self, call: Any) -> bool:
         """Review fix F1: the rerun's closing reply gave them nothing, judged from its own stream facts when it ends
@@ -6036,6 +6219,9 @@ class Conversation:
         #: voice21 (final-D S10): the one refusal of a quiet on the first words of a conversation the user opened
         #: themselves was used (:meth:`_opened_quiet`): a second quiet is final.
         self._opened_quiet_used = False
+        #: voice22 (A9): the observer's number of the user turn whose quiet the bridge refused that way (its answer is
+        #: the next turn: :meth:`_opened_answer`), ``None`` before any.
+        self._opened_refused_n: int | None = None
         #: Review F4: ``(start of speech, named, how)`` of the words being finished now, set by the fast path on each
         #: eager and final transcript (:meth:`_utterance_named`).
         self._utterance: tuple[float, bool, str] | None = None
@@ -9091,7 +9277,9 @@ class Conversation:
         """
         obs = self.observer
         turn = obs.turn
-        if turn is None or turn.trigger != "user" or not (turn.user_text or "").strip():
+        if turn is None:
+            return None
+        if (turn.trigger != "user" or not (turn.user_text or "").strip()) and not self._opened_answer(turn):
             return None
         # final-B (one-voice RC F, compare O3a): only an acting call makes a turn answered; reads (quick_memory, and
         # under one its look and memory reads) still owe their answer aloud
@@ -9106,6 +9294,18 @@ class Conversation:
         if not (turn.cut or turn.responses):
             return None  # its reply may still be on its way
         return turn
+
+    def _opened_answer(self, turn: Any) -> bool:
+        """voice22 (A9, the S10 leftover of voice21): ``turn`` is the talker's run that answers the bridge's refusal of
+        the first quiet on their opening words (``mouth.OPENED_QUIET``, :meth:`_opened_quiet_result`): the result turn
+        the observer opened right after that user turn. Under "all" only (ONE's refusal is ``OneVoice.control``'s and
+        its round 2 is its own). Such a run that gave them nothing audible, acted on nothing and did not choose quiet
+        again (a second quiet is final) is unanswered once more (:meth:`_unanswered`): the reply watch answers it
+        again once with ``mouth.RERUN_NOTE``, and a silent rerun gets the give-up tone (live final-D q_discord_today:
+        a reply of unmarked text, none of it spoken). Turn numbers only, never the words."""
+        n = getattr(self, "_opened_refused_n", None)
+        return (n is not None and getattr(self, "one_driver", None) is None
+                and getattr(turn, "trigger", None) == "result" and getattr(turn, "n", None) == n + 1)
 
     def _opened_marker_quiet(self, turn: Any) -> bool:
         """voice21 (final-D S10): the user turn's silence was a quiet marker with no stay_quiet call, on the first words
@@ -9195,7 +9395,10 @@ class Conversation:
                 if obs.bot_speaking or obs.generating or obs.user_speaking or obs.speech_pending:
                     continue
                 now = time.monotonic()
-                if turn.transcript_at is None or now - turn.transcript_at < self.REPLY_WATCH_AFTER_S:
+                said_at = turn.transcript_at
+                if said_at is None and self._opened_answer(turn):
+                    said_at = turn.opened   # voice22 (A9): the refusal's answer run has no words of its own
+                if said_at is None or now - said_at < self.REPLY_WATCH_AFTER_S:
                     continue
                 if self._quiet_for() < self.REPLY_WATCH_QUIET_S:
                     continue
@@ -9213,9 +9416,10 @@ class Conversation:
                     turn.claim_dropped, turn.claim_rerun = False, True
                 obs.rerun_turn = turn
                 self.log.event("reply_watch", op="rerun", turn=turn.n, cut=bool(turn.cut),
-                               responses=turn.responses, after_ms=round((now - turn.transcript_at) * 1000),
+                               responses=turn.responses, after_ms=round((now - said_at) * 1000),
                                marker=turn.marker, unmarked=turn.unmarked, tts_silent=turn.tts_silent,
-                               guarded=turn.guarded, opened_quiet=bool(getattr(turn, "opened_quiet", False)))
+                               guarded=turn.guarded, opened_quiet=bool(getattr(turn, "opened_quiet", False)),
+                               opened_answer=turn.trigger == "result")
                 await self.worker.queue_frame(LLMRunFrame())
         except asyncio.CancelledError:
             return
@@ -9429,7 +9633,8 @@ class Conversation:
         ends the conversation on a quiet there), no dictation measured while they spoke (:meth:`_dictating_now`) and
         nothing of Yuki's heard this turn (its words left the speaker, or ``spoke``: the reply making the quiet put
         words out). Taken once a conversation (``True`` uses it): a second quiet is final, and "go away" still ends the
-        conversation through end_conversation. ``via`` (``bridge``, ``marker``, ``one``) goes to the content-free log.
+        conversation through end_conversation. ``via`` (``bridge``, ``marker``, ``one``, voice22's ``one_marker``)
+        goes to the content-free log.
         Live final-D: q_discord_today (all) and p24_hinglish_garbled (one) went silent on such words. Never a turn that
         already acted or has an answer on its way (:meth:`_opened_acted`). Never raises."""
         try:
@@ -9494,6 +9699,9 @@ class Conversation:
             return None
         from yuki.voice.mouth import MARKER_REMINDER
 
+        # voice22 (A9): the talker's run that answers this refusal is the next turn the observer opens (a result run);
+        # a silent one gets the reply watch's rerun (:meth:`_opened_answer`)
+        self._opened_refused_n = getattr(self.observer.turn, "n", None)
         out: dict[str, Any] = {"not_quiet": OPENED_QUIET}
         if getattr(self, "channel", "") == "marker":
             out[ONE_FORMAT_KEY] = MARKER_REMINDER
