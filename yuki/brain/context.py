@@ -112,12 +112,13 @@ SEED_RECALL_N = 10
 SEED_MEMORY_NAMES = 3
 #: How a pick memory holds is said to the planner (code's words, the names fenced after it): ``paired`` the pairing the
 #: Spotify driver learned when that row played for those very words (``taste.said_target``), ``facts`` the names of
-#: the rows read that memory's own facts about the words name.
+#: the rows read that memory's own facts about the words name. kw2 (B5): context for the planner's own pick, never an
+#: order: no "do it with that one; no question" (a pairing from last week is no proof they mean it now, a playlist
+#: made since may be the one); the seed block's own line ("pick the one they most likely mean ... ask only if none
+#: could be it") leaves the choice, and a question, to the planner.
 SEED_MEMORY_LINES: dict[str, str] = {
-    "paired": ('Memory: their "{value}" is the {missing} below (it played for those very words before). Do it by '
-               'steps now with that one; no question.'),
-    "facts": ('Memory\'s facts about their "{value}" {missing} name {which} below. Do it by steps now with {that}; no '
-              'question.'),
+    "paired": 'Memory: the {missing} below played for their very words "{value}" before.',
+    "facts": 'Memory\'s facts about their "{value}" {missing} name {which} below.',
 }
 CHECK_LABEL = "[Yuki's check, not the user]"
 STEER_LABEL = "[The user added while you were working]"
@@ -126,6 +127,14 @@ CHANNEL_LINES = {
     "voice": "[Channel: voice. Your reply is spoken: one or two short sentences]",
     "typed": "[Channel: typed]",
 }
+#: kw2 (contract K1): the planner's own mark that its spoken reply waits for the user's answer (it offers them something
+#: or asks them something back), so their next words carry this request (``outcome["awaits"]``, read by the voice's
+#: exchange). Taken off by code before the reply is said (:func:`take_awaits`). An exact reply format code set (as
+#: :data:`REST_DONE_WORD`), the model's own judgement of its reply, never a reading of the reply's words. Asked of the
+#: ``all`` planner on voice only (:func:`request_turn` ``awaits_mark``).
+AWAITS_MARK = "<awaits/>"
+AWAITS_LINE = (f"[A plain-text spoken reply of yours (never a plan's question) that offers them something or asks "
+               f"them something they answer next ends with {AWAITS_MARK} (code takes it off, never said)]")
 #: Most people named that get a card (routes and last messages) in the request turn.
 PEOPLE_MAX = 2
 #: Most of the user's own last messages shown per request turn (design 2.3: the last 3 or fewer, dated).
@@ -842,9 +851,10 @@ def _names_in(name: str, text: str) -> bool:
 def seed_memory(memory: Any, seed: Mapping[str, Any] | None, *, timeout_s: float = SEED_MEMORY_WAIT_S
                 ) -> dict[str, Any] | None:
     """bRound2 (B08): which of the names a skill read on screen memory ties to the value its routes found no row for
-    (IF-seed ``missing``, the value the caller gave in ``slots``, the names in ``seen``), so the planner plays it
-    rather than asking "which one's your Japanese playlist?" (16 Oct: 2 of 6 runs asked, though memory's facts say
-    the user's Japanese and anime playlist is ネオン and the 4 Oct session played it for those words):
+    (IF-seed ``missing``, the value the caller gave in ``slots``, the names in ``seen``), as context for the planner's
+    own pick (16 Oct: 2 of 6 runs asked "which one's your Japanese playlist?", though memory's facts say the user's
+    Japanese and anime playlist is ネオン and the 4 Oct session played it for those words; kw2, B5: the planner
+    weighs it, never forced):
 
     * ``paired``: the row the skill's driver learned for these very words when it played for them
       (``yuki.skills.taste.said_target``, the slot's taste kind);
@@ -926,8 +936,8 @@ def seed_memory(memory: Any, seed: Mapping[str, Any] | None, *, timeout_s: float
 
 
 def seed_memory_text(hint: Mapping[str, Any] | None, *, nonce: str = "") -> str:
-    """The seed block's line for :func:`seed_memory`'s pick: code's words, then the names fenced (they are the screen's
-    text). ``""`` without one."""
+    """The seed block's line for what :func:`seed_memory` found: code's words (a fact, never an order: kw2, B5), then
+    the names fenced (they are the screen's text). ``""`` without one."""
     if not isinstance(hint, Mapping) or not hint.get("names"):
         return ""
     names = [one_line(n, 80) for n in hint["names"] if str(n or "").strip()]
@@ -938,8 +948,7 @@ def seed_memory_text(hint: Mapping[str, Any] | None, *, nonce: str = "") -> str:
     value = one_line(hint.get("value"), 80)
     missing = one_line(hint.get("missing"), 40)
     one = len(names) == 1
-    line = template.format(value=value, missing=missing, which="one" if one else "these",
-                           that="that one" if one else "the likelier one")
+    line = template.format(value=value, missing=missing, which="one" if one else "these")
     listed = "\n".join(f"- {n}" for n in names)
     return line + "\n" + fence(listed, source=f"the {missing} names memory ties to their words", nonce=nonce or "seed")
 
@@ -993,7 +1002,7 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "",
         text += "\n" + fence(listed, source=f"{where} the skill read on screen", nonce=nonce or "seed")
     told = seed_memory_text(hint, nonce=nonce) if missing and not rerun else ""
     if told:
-        # bRound2 (B08): the pick memory holds for their words (seed_memory), so it is made, not asked
+        # bRound2 (B08): what memory ties to their words (seed_memory), as context for the planner's own pick
         text += "\n" + told
     return text
 
@@ -1046,13 +1055,17 @@ def understanding_block(understanding: Mapping[str, Any] | None, *, nonce: str =
 def request_turn(*, words: Sequence[str], channel: str, context: str, gathered: Gathered,
                  history: Sequence[Exchange], seed: Mapping[str, Any] | None, limits: Any,
                  nonce: str, seed_hint: Mapping[str, Any] | None = None,
-                 understanding: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
-    """The request's one user turn, as text blocks in the design's order; the last block carries breakpoint 4."""
+                 understanding: Mapping[str, Any] | None = None, awaits_mark: bool = False) -> list[dict[str, Any]]:
+    """The request's one user turn, as text blocks in the design's order; the last block carries breakpoint 4.
+    ``awaits_mark`` (kw2, K1): on voice, the channel line is followed by :data:`AWAITS_LINE` (the ``all`` planner's
+    own mark of a reply that waits for their answer; the ONE agent passes none)."""
     texts: list[str] = []
     recent = recent_block(history, limit=limits.recent_chars)
     if recent:
         texts.append(recent)
     texts.append(CHANNEL_LINES.get(channel, CHANNEL_LINES["typed"]))
+    if awaits_mark and channel == "voice":
+        texts.append(AWAITS_LINE)
     said = "\n".join(w.strip() for w in words if str(w).strip())
     texts.append(f"{WORDS_LABEL}\n{said}" if said else NO_WORDS_LINE)
     seeded = understanding_block(understanding, nonce=nonce)
@@ -1299,6 +1312,31 @@ def look_report(result: ExecResult | Mapping[str, Any], plan: Plan | None) -> st
 #: The one-word reply the planner gives after a part was done when all they asked is done
 #: (:func:`part_rest_report`; ``yuki.brain.agent.rest_done_reply`` compares it exactly).
 REST_DONE_WORD = "done"
+
+
+def take_awaits(text: Any) -> tuple[str, bool]:
+    """kw2 (contract K1): ``(the reply without the mark, whether it carried it)``: the planner's own
+    :data:`AWAITS_MARK` (an exact mark code set, case aside, also written with a space before its slash), every one
+    taken off, the reply's lines kept (trailing spaces dropped). Never a reading of the reply's words."""
+    raw = str(text or "")
+    marks = (AWAITS_MARK, AWAITS_MARK.replace("/", " /"))
+    out: list[str] = []
+    found = False
+    at = 0
+    while at < len(raw):
+        mark = next((m for m in marks if raw[at:at + len(m)].casefold() == m), None)
+        if mark is None:
+            out.append(raw[at])
+            at += 1
+            continue
+        found = True
+        at += len(mark)
+    if not found:
+        return raw, False
+    kept = "\n".join(line.rstrip() for line in "".join(out).splitlines())
+    return kept.strip(), True
+
+
 #: pBrain review r1 (M1: B14 on a skill route, the goal "Open a new tab in Arc with YouTube's front page." and the rest
 #: turn's ``done`` for "Open a new tab and put something on from the front page"): a rest turn reads their words, not
 #: the plan's goal, to the last thing they ask for; a pick their words leave to Yuki is Yuki's to make, never a reason
@@ -1422,7 +1460,8 @@ __all__ = ["ALSO_OPEN_CHARS", "KEEP_THEIRS", "SITUATION_CHARS", "also_open", "de
            "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "seed_memory", "seed_memory_text",
            "request_turn", "Conversation",
            "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report",
-           "look_report", "REST_DONE_WORD", "invalid_report", "unconfirmed_report",
+           "look_report", "REST_DONE_WORD", "AWAITS_MARK", "AWAITS_LINE", "take_awaits", "invalid_report",
+           "unconfirmed_report",
            "part_rest_report", "text_back_report", "answer_part_report", "REST_LAST_PART",
            "answer_report", "clip",
            "one_line", "fence", "CHECK_LABEL", "STEER_LABEL"]

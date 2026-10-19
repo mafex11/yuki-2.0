@@ -549,6 +549,14 @@ class Mismatch:
         return "\n".join(parts)
 
 
+#: kw2 (contract K1): code's own lines that end a request on a question or an offer of its own (try again in a moment,
+#: who it is for, another way, after the round): a request that ends on one waits for the user's answer, so their
+#: next words carry it (``outcome["awaits"]``, read by the voice's exchange). Identity of code's own words (which line
+#: it chose), never a reading of the user's or a model's words. A skill's own question (``LINE_SKILL_ASK`` with the
+#: engine's ``ask``) is marked where it is made.
+ASKING_LINES: frozenset[str] = frozenset({LINE_BUSY, LINE_WHO, LINE_SKILL_HANDED, LINE_SKILL_FAILED, consent.LINE_GAME})
+
+
 @dataclass
 class RunResult:
     """One plan's run, for the planner loop.
@@ -577,6 +585,13 @@ class RunResult:
     #: tidy-up turn (``""``: nothing flagged, no turn); ``after_facts``: the diff's content-free facts.
     after: str = ""
     after_facts: dict[str, Any] = field(default_factory=dict)
+    #: kw2 (contract K1): ``line`` is code's own question or offer (:data:`ASKING_LINES`, or a skill's own question):
+    #: a request that ends on it waits for their answer (``outcome["awaits"]``).
+    asks: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.asks and self.line in ASKING_LINES:
+            self.asks = True
 
     def statuses_text(self) -> str:
         """The step statuses in one block, for the replan message."""
@@ -661,8 +676,6 @@ class Executor:
         self.seed = dict(plan_seed) if isinstance(plan_seed, Mapping) and plan_seed else None
         self.words: list[str] = [str(w) for w in (getattr(host, "user_words", None) or []) if str(w).strip()]
         self.earlier: list[str] = [str(w) for w in (getattr(host, "earlier_words", None) or []) if str(w).strip()]
-        #: bRound2: the user's turns of the whole conversation (memory's turn log), read on first use (:meth:`_said_before`)
-        self._convo: list[str] | None = None
         self.steers: list[str] = []
         self.started = time.time()
         self.started_mono = time.monotonic()
@@ -2218,7 +2231,8 @@ class Executor:
             status.state, status.why = "failed", "asked"
             ask = _engine_ask(outcome)
             return self._mismatch_result(index, "asked", seen=str(outcome.summary or ""), call=call,
-                                         line=LINE_SKILL_ASK.format(ask=ask) if ask else LINE_SKILL_ASK_PLAIN)
+                                         line=LINE_SKILL_ASK.format(ask=ask) if ask else LINE_SKILL_ASK_PLAIN,
+                                         asks=bool(ask))
         if not outcome.ok or state in ("failed", "refused"):
             status.state, status.why = "failed", state or "failed"
             return self._mismatch_result(index, state or "failed", seen=str(outcome.summary or ""), call=call,
@@ -3711,11 +3725,13 @@ class Executor:
 
     def _mismatch_result(self, index: int, why: str, *, refused: bool = False, seen: str = "",
                          call: Call | None = None, seed: dict[str, Any] | None = None,
-                         seen_fenced: bool = False, line: str = "") -> RunResult:
+                         seen_fenced: bool = False, line: str = "", asks: bool = False) -> RunResult:
         """A step that didn't go as planned: its status, the planner's mismatch (with that window's view), and the
         failed step kept for the "same step again" rejection. ``seen_fenced``: ``seen`` is outside text already
         capped and fenced (it is not cut again). ``line``: code's plain line for the user if the request ends on this
-        step (the Brain says it instead of a stuck line built from ``why``); ``""``: none of its own."""
+        step (the Brain says it instead of a stuck line built from ``why``); ``""``: none of its own. ``asks``: that
+        line is a question of the skill's own (kw2, K1: a request ending on it waits for their answer; code's own asking
+        lines are marked by :class:`RunResult` itself)."""
         status = self.statuses[index] if 0 <= index < len(self.statuses) else None
         if status is not None and status.state == "pending":
             status.state, status.why = ("refused" if refused else "failed"), why
@@ -3736,7 +3752,7 @@ class Executor:
                             why=why, refused=refused, seed=seed, seen_fenced=fenced)
         self._emit_log("brain_mismatch", verb=self._verb(step), why=_code(why), refused=refused)
         return RunResult("mismatch", plan_id=self.plan_id, statuses=list(self.statuses), mismatch=mismatch,
-                         reads=list(self.read_results), line=line)
+                         reads=list(self.read_results), line=line, asks=asks)
 
     def _view(self, hwnd: int | None) -> str:
         """That window as a look shows it now (for the replan), capped."""
@@ -4148,54 +4164,35 @@ class Executor:
                 out.append((words(value), types.get(str(name), "")))
         return out
 
-    def _said_before(self) -> list[str]:
-        """bRound2 (B28): the user's own turns of this conversation that memory's turn log holds
-        (``host.said_before()``: their words as heard, said to Yuki, the last minutes, newest last), read once per
-        request and only when a step gives an app no turn of this request or an earlier one says. ``[]`` when the host
-        has none or memory can't say."""
-        if self._convo is None:
-            fn = getattr(self.host, "said_before", None)
-            try:
-                got = fn() if callable(fn) else []
-            except Exception:  # noqa: BLE001 - a help only: without it the spans are the requests' own
-                got = []
-            self._convo = [str(t) for t in (got or []) if str(t).strip()]
-        return self._convo
-
     def _skill_words(self, call: Call | None = None) -> tuple[list[str], list[str]]:
         """``(words, earlier)``: the user's own words a capability checks this step's slot values against (x9, fix plan
         item 9: "skill words = self.words + self.earlier").
 
         ``words``: this exchange's turns as they stand now (with what was added mid-task), newest last; before them,
-        each value this very step gives that the exchange doesn't hold but an earlier request of theirs does, as the
-        span of their own (newest such) turn that says it: "Arc" out of "open YouTube in Arc" a request ago, then
-        "just do it", keeps the planner's ``browser: Arc`` instead of dropping it. Only the span goes in, never the rest
-        of that turn: the engine also fills an empty app slot from ``words``, newest turn last (x6's merge note), so
-        an older turn read whole could fill a slot nobody named now ("...the YouTube tab in Chrome" filling the
-        browser), and appended after the exchange it would read as the newest.
+        each text, person or entity value this very step gives that the exchange doesn't hold but an earlier request of
+        theirs does, as the span of their own (newest such) turn that says it (a message's text or a person named a
+        request ago, then "just do it": these feed the send checks, kw2 F2). Only the span goes in, never the rest of
+        that turn: the engine also fills an empty slot from ``words``, newest turn last (x6's merge note), so an older
+        turn read whole could fill a slot nobody named now, and appended after the exchange it would read as the
+        newest.
 
-        ``earlier``: every earlier request's turns, oldest first, for the resolver's validate-only ``earlier=`` once
-        the Dispatcher passes ``skill_context["earlier"]`` through. Whole words in order, never meaning.
+        kw2 (B6): never an app value (a browser, an app; slot type ``app``). A span cannot see "not" ("open YouTube in
+        Arc, not in Chrome" let a planner's Chrome through on the span "Chrome"), so an app the planner gives stands as
+        its own reading of what they meant, as an undoable app slot takes the caller's value (``skills.resolve``): no
+        earlier turn's span of it joins ``words`` (what the engine fills from and reads the exchange's own names in),
+        and memory's turn log of the conversation (bRound2's ``said_before`` read) is gone. The resolver still
+        validates every given value, an app's too, against ``earlier`` below (validate-only, never a fill).
 
-        bRound2 (B28, 10 Oct 21:09: "Open the fucking YouTube tab..." after "I ask you to open YouTube in arc not in
-        Chrome" four minutes before): an app value (a browser, an app; slot type ``app``) that neither this exchange
-        nor an earlier request of the Brain's says is looked for in the user's own turns of the whole conversation
-        (:meth:`_said_before`: memory's turn log, which also holds the turns only the voice talker answered), newest
-        first, the same span only. So what they named anywhere in the conversation beats a learned fill policy or
-        their most-used browser, and only for a value the planner itself gave from that conversation (never a fill
-        from the words, and never a message's text or a person: those keep the request's own words, rule 8)."""
+        ``earlier``: every earlier request's turns, oldest first, for the resolver's validate-only ``earlier=`` (the
+        engine forwards ``skill_context["earlier"]``). Whole words in order, never meaning."""
         older = self._earlier_requests()
         spans: list[str] = []
         for value, kind in self._given_typed(call):
-            if consent.in_words(value, self.words):
+            if kind == "app" or consent.in_words(value, self.words):
                 continue
             # the newest earlier request that says it (the request the user most likely meant)
             found = next((s for request in reversed(older) for turn in reversed(request)
                           if (s := _span_text(value, turn))), "")
-            if not found and kind == "app":
-                found = next((s for turn in reversed(self._said_before()) if (s := _span_text(value, turn))), "")
-                if found:
-                    self._emit_log("brain_said_before", turns=len(self._said_before()))
             if found and found.casefold() not in {s.casefold() for s in spans}:
                 spans.append(found)
         return spans + list(self.words), [turn for request in older for turn in request]

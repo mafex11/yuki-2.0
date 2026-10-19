@@ -976,11 +976,6 @@ SEED_ALSO_PROBE = "driver"
 DONE_STRENGTH: dict[str, int] = {"verified": 3, "likely": 2, "unverified": 1, "failed": 0}
 
 
-#: hands19: the mark a sentence asking something ends with, in the forms the recognizer and the talker write it (ASCII,
-#: full-width, Arabic): punctuation, never a word.
-QUESTION_MARKS: tuple[str, ...] = ("?", "\uff1f", "\u061f")
-
-
 #: hands19 review M1: the lead of the voice's note that parts of these very words were done and verified already in
 #: this turn by its own hands (``voice.bridge.DONE_HERE_CONTEXT`` starts with it): code's own words, never the user's,
 #: so the brain reads from its request's context that the voice began a request of several parts.
@@ -998,19 +993,6 @@ def several_parts(understanding: Mapping[str, Any] | None) -> bool:
     tool's structure, never a reading of the words."""
     parts = understanding.get("parts") if isinstance(understanding, Mapping) else None
     return isinstance(parts, (list, tuple)) and sum(1 for p in parts if isinstance(p, Mapping)) >= 2
-
-
-def goal_is_question(words: Sequence[str], understanding: Mapping[str, Any] | None = None) -> bool:
-    """hands19 (final-B all-questions RC3: "pause the song, also when's my meeting tomorrow" ended on the pause's line
-    and the question was never answered): whether a handed-over request asks something, by the marks it came with: the
-    talker's reading of it (its ``understanding`` goal or a part's ``what``) or one of the user's own sentences as the
-    speech recognizer punctuated it ends with a question mark. Punctuation the recognizer and the talker wrote, never a
-    reading of the words."""
-    texts: list[str] = [str(w) for w in words or () if str(w or "").strip()]
-    if isinstance(understanding, Mapping):
-        texts.append(str(understanding.get("goal") or ""))
-        texts += [str(p.get("what") or "") for p in understanding.get("parts") or () if isinstance(p, Mapping)]
-    return any(mark in text for text in texts for mark in QUESTION_MARKS)
 
 
 def stronger_done(own: Any, seed: Any) -> bool:
@@ -1463,6 +1445,10 @@ class ExecResult:
     #: P1.3: a done plan whose acts took something the user had (the executor's after-look flagged it): the "After:"
     #: block for one tidy-up turn; ``""``: nothing flagged (no turn).
     after: str = ""
+    #: kw2 (contract K1): ``line`` is code's own question or offer (another way, after the round, in a moment, a skill's
+    #: own question: ``executor.ASKING_LINES``), so a request that ends on it waits for their answer
+    #: (``outcome["awaits"]``). Set by the executor from which of its own lines it chose, never from the line's words.
+    asks: bool = False
 
 
 __all__ = [
@@ -1476,6 +1462,6 @@ __all__ = [
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",
     "probe_args_text", "probe_errors", "error_code", "error_codes", "SEED_RERUN_OK", "skill_family", "seed_skill",
     "spent_skills", "unescape", "seed_sends",
-    "person_open", "handoff_person_open", "SEED_ALSO_PROBE", "DONE_STRENGTH", "stronger_done", "QUESTION_MARKS",
-    "goal_is_question", "DONE_HERE_LEAD", "done_here_given", "several_parts",
+    "person_open", "handoff_person_open", "SEED_ALSO_PROBE", "DONE_STRENGTH", "stronger_done", "DONE_HERE_LEAD",
+    "done_here_given", "several_parts",
 ]
