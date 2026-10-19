@@ -145,8 +145,8 @@ CLICK_TOOL = _tool(
 
 TYPE_TOOL = _tool(
     "type",
-    "Type exact text into the field that has the keyboard (or a field's [id] from look window). enter: press Enter "
-    "after it (submits a search; in a chat it would send, so it is checked). Verified by reading the field back.",
+    "Type exact text into the field that has the keyboard (or a field's [id] from look window); never in a chat: text "
+    "for a person is run_skill message. enter: press Enter after it. Verified by reading the field back.",
     {"window": _WINDOW, "text": {"type": "string"}, "id": {"type": "integer"}, "enter": {"type": "boolean"},
      "say_when_done": _DONE, "then": _THEN},
     ["window", "text", "then"])
@@ -231,9 +231,9 @@ LOOK_ONE_TOOL["properties"] = {**LOOK_ONE_TOOL["properties"],
 
 KEYS_TOOL = _tool(
     "keys",
-    "Press keys in a window: key (one key, times) or keys (a combination, [\"ctrl\", \"l\"]). Keys that can close, "
-    "send or submit are checked against their words first; Enter where Yuki's text waits unsent is a send and "
-    "refused.",
+    "Press keys in a window: key (one key, times) or keys (a combination, [\"ctrl\", \"l\"]). Keys that can close or "
+    "submit are checked against their words first. Enter in a chat, or where Yuki's text waits unsent, is refused: "
+    "a chat is reached and drafted with run_skill message. Escape closes what your own act opened there.",
     {"window": _WINDOW, "key": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}},
      "times": {"type": "integer"}, "then": _THEN},
     ["window", "then"])
