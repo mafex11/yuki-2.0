@@ -395,7 +395,21 @@ def _launch_seen(result: Any) -> dict[str, Any]:
             "front": details.get("foreground") is True, "process": str(details.get("process_name") or ""),
             "before": befores.get(hwnd, ""), "befores": befores,
             # the browser wasn't running before this launch: none of its windows showed a page before it
-            "cold": details.get("already_running") is False and bool(details.get("launched"))}
+            "cold": details.get("already_running") is False and bool(details.get("launched")),
+            # integration (chat19 merge note 3): the launch's own stage ends (code words and numbers only), logged
+            # by :func:`_log_open` so a long hand-off shows where its time went
+            "timings": _stage_ms(details.get("timings_ms"))}
+
+
+def _stage_ms(timings: Any) -> str:
+    """A launch's ``timings_ms`` (stage -> ms) as one content-free ``stage=ms`` list, or ``""``."""
+    if not isinstance(timings, Mapping):
+        return ""
+    parts = []
+    for stage, ms in timings.items():
+        if isinstance(ms, (int, float)) and not isinstance(ms, bool):
+            parts.append(f"{str(stage)[:24]}={float(ms):.0f}")
+    return ",".join(parts[:16])
 
 
 def _log_open(call: RouteCall, rung: str, seen: Mapping[str, Any], status: str) -> None:
@@ -404,7 +418,7 @@ def _log_open(call: RouteCall, rung: str, seen: Mapping[str, Any], status: str) 
     window it acted in and whether that window came to the front."""
     _log(call.ctx)("web_open", stage=rung, via=str(seen.get("via") or ""), status=status,
                    process=str(seen.get("process") or ""), front=bool(seen.get("front")),
-                   state=str(seen.get("state") or ""))
+                   state=str(seen.get("state") or ""), ms=str(seen.get("timings") or ""))
 
 
 # x8WebArc: the window a rung of this run opened (or tried to open) a page in, for the next rung of the same run (the

@@ -4685,6 +4685,13 @@ class Dispatcher:
         if result.guessed:
             # Phase 2.1: the values Yuki guessed (slot, value, from); the done line already names them
             payload["guessed"] = [dict(g) for g in result.guessed if isinstance(g, dict)]
+        if result.outcome == "asked" and result.ask:
+            # one19 merge note 1: the run's own question, structured, so the ONE agent never reads one out of the report
+            payload["ask"] = result.ask
+        # one19 merge note 1 (contract C1): what the engine measured the run took and touched, for the desk path's scope
+        payload["focus_taken"] = bool(result.focus_taken)
+        payload["acted"] = bool(result.acted)
+        payload["acted_apps"] = [str(a) for a in result.acted_apps or ()]
         if blocked or result.held:
             payload["refused"] = details["refused"]
         return ToolOutcome(name="run_skill", ok=ok, summary=text.split("\n", 1)[0][:200],

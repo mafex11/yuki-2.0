@@ -1120,6 +1120,16 @@ def _holder(hands: Any) -> Any:
     return snap if snap is not None and getattr(snap, "ok", True) else None
 
 
+@dataclass(frozen=True)
+class _Ident:
+    """A field identity (:func:`_field`) read back as a snapshot's attributes, for :func:`_fits`."""
+
+    window: int
+    hwnd: int
+    role: str
+    name: str
+
+
 def _ident(snap: Any) -> tuple[int, int, str, str] | None:
     """A focus read as an identity (its window, native window, role and name: UI facts, never read for meaning)."""
     if snap is None:
@@ -1216,6 +1226,12 @@ def _run_switch(call: RouteCall, hands: Any, steps: list[dict[str, Any]], *, app
     # the switcher's field, waited for even when the shortcut's own run stopped there (a dialog it brought up, no
     # change seen yet): what it opened is then known before it is closed
     opened = _field_opened(call.ctx, hands, before)
+    if ok and opened is not None and data is not None and _fits(_Ident(*opened), composer_shapes(data)):
+        # integration (skill19 review M2): the field that took the keyboard is a chat's composer, not the switcher
+        # (a switcher already open closed on its own shortcut and gave the keyboard back): the chat's name typed and
+        # Enter there would send it to whoever's chat is open. Nothing more is sent, nothing of this run's is open
+        first["switcher"] = "composer"
+        return False, first
     if not ok or opened is None:
         first["switcher"] = "unfinished" if not ok else "unseen"
         if data is not None:
