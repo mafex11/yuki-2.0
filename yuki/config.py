@@ -537,9 +537,15 @@ class Settings:
             and starts it ~1 s after they stop instead of when the talker begins its hand-off (v3.17, E3a). On since
             vGame (5 Oct: the user asked for the thinker to start at once); in a game or a call only on words said to
             Yuki by name (docs/research/revamp-2026-10-02/26-build-voice-speed.md, 79-build-vGame.md).
-        voice_fast_dismiss / voice_fast_ack: vGame (79-build-vGame.md). A turn that is only the user's words for "go
-            away" (``yuki.voice.fastpath.DISMISS_PHRASES``) ends the conversation on its final transcript, with no
-            model call; a turn said to Yuki by name gets an instant "Mm-hm" in her voice ("Yeah?" to the name alone).
+        voice_router_end: D1 (20 Oct 2026, keyword audit A1): the router's small model also judges, on each user turn
+            and under every brain, whether the user is ending the conversation (they send Yuki away or sign off); when
+            it is and nothing waits for their words or runs for them, the conversation ends at once with the end cue
+            (~1.5-2 s after the words). It replaced the fast "go away" word list; the talker's own end_conversation
+            still ends it too. While a send of theirs counts down, its judgement that they call it off stops the send
+            at once (nothing sent) and ends the conversation. Under ``brain = "all"`` and ``one`` this is the router's
+            only job (its hand-off is off).
+        voice_fast_ack: vGame (79-build-vGame.md). A turn said to Yuki by name gets an instant "Mm-hm" in her voice
+            ("Yeah?" to the name alone).
         voice_focus_mode: vGame. While a full-screen game is in front or a call is on: replies short and quieter, no
             follow-ups or small talk, no step lines, a rescued sound-alike never wakes it, and
             ``voice_focus_close_on_quiet``: a turn the talker judged not for Yuki ends the conversation at once,
@@ -562,23 +568,9 @@ class Settings:
             loop, the speaker's writer and the microphone's callback threads too (v3.17, D7).
         voice_mmcss: Those threads also join the MMCSS "Audio" task (Windows' scheduler for audio threads).
         voice_hand_traces: Every talker hand is kept as a run trace in memory (v3.18; written off the voice loop).
-        voice_reflex: lSpeed (live test 17 Oct 2026, problem 1; ``yuki.voice.reflex``). The user's own words for which
-            one talker hand (a media key, a relative volume change or mute, a window brought up, restored or
-            minimised, a scroll, an app opened) was verified done, and nothing else was done for that turn, are kept
-            (encrypted, in memory); the next time exactly those words are heard, that hand runs at once at the end of
-            their turn, with no model in front, and the talker only speaks. Never for sends, closes, tabs, messages,
-            joins or with a game in front; words that mapped to two different calls are dropped; a correction in the
-            next words (a small model call, within ``voice_reflex_correct_s``) drops the entry.
-        voice_reflex_at: When a reflex acts: ``"eager"`` (Flux's eager end of turn, measured 17 Oct: median 0.48-0.67 s
-            after speech; the final transcript is re-checked and nothing acts twice) or ``"final"`` (the final
-            transcript, 0.32-0.48 s later).
-        voice_reflex_wait_s: The talker's call for those words waits at most this long for the reflex's outcome (a
-            hand takes 4-400 ms), so it is told it is done and only speaks.
-        voice_reflex_seed_days / voice_reflex_seed_skip: The first seeding reads the user's own repeated talker hands
-            of this many days (practice memory's hand traces). The live test harness's sessions are always left out
-            (``yuki.memory.testtag``: ``TEST_SESSION_PREFIX`` / ``is_test_session``, xGlue), and so are sessions whose
-            id starts with one of these. A test conversation (or one whose session id starts with one of these) never
-            teaches the book, live or seeded: the stored book is only read, and nothing is written to it.
+            (The learned reflexes of 17 Oct, ``voice_reflex*``, were removed on 20 Oct, keyword audit A5 / D2: exact
+            words mapped to a stored hand ran it before any model read the turn; every hand is the talker's or the
+            ONE agent's own call again, and the stored book is deleted once by code.)
         skills: The skill path (PLAN.md Phase S, docs/research/audit-2026-10-09): the talker's Skills menu and its
             ``run_skill`` / ``keep_usual`` hands, the thinker's ``run_skill`` tool. With a ``volume`` skill loaded the
             talker's own ``app_volume`` hand, its volume keys and the thinker's ``app_volume`` tool are off; ``false``
@@ -741,10 +733,11 @@ class Settings:
     voice_router: bool = True
     voice_router_model: str = ""
     voice_router_adopt_s: float = 2.5
+    # D1 (20 Oct 2026, keyword audit A1): the router's model may end the conversation by intent, under every brain
+    voice_router_end: bool = True
     voice_talker: str = ""
     voice_reply_words_cap: int = 45
     # vGame (docs/research/revamp-2026-10-02/79-build-vGame.md)
-    voice_fast_dismiss: bool = True
     voice_fast_ack: bool = True
     voice_focus_mode: bool = True
     voice_focus_close_on_quiet: bool = True
@@ -755,13 +748,6 @@ class Settings:
     voice_mmcss: bool = True
     # v3.18: the talker's hands are kept as run traces in memory (the old talker learning path is deleted, kClean)
     voice_hand_traces: bool = True
-    # lSpeed (live test 17 Oct 2026, problem 1): the learned reflex path (yuki.voice.reflex)
-    voice_reflex: bool = True
-    voice_reflex_at: str = "eager"
-    voice_reflex_wait_s: float = 0.45
-    voice_reflex_correct_s: float = 20.0
-    voice_reflex_seed_days: float = 30.0
-    voice_reflex_seed_skip: tuple[str, ...] = ("livetest-",)
     # Phase S skills (docs/research/audit-2026-10-09/PLAN.md; yuki.skills.DEFAULTS mirrors these). The switch (failure
     # fix-plan Item 1): YUKI_SKILLS, else "skills" in settings.json, else on; "capabilities" hides the learned rows
     skills: bool = field(default_factory=lambda: skills_mode() != "off")

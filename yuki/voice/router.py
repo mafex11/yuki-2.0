@@ -10,9 +10,20 @@ already makes, ``VoiceBridge.begin_early``); the talker's ``tell_yuki`` then ado
 talker decides otherwise (an answer, a hand, silence) or does not hand over within ``voice_router_adopt_s``, the job is
 withdrawn before its first action, unspoken.
 
-Behind ``Settings.voice_router`` (off by default; measured in docs/research/revamp-2026-10-02/26-build-voice-speed.md).
-No keywords anywhere: the decision is the router model's, from worked examples; the code reads only its tool call's own
-JSON (a fixed format).
+Behind ``Settings.voice_router`` (measured in docs/research/revamp-2026-10-02/26-build-voice-speed.md; the hand-off part
+never runs under ``brain = "all"`` or ``one``: ``yuki.voice.mouth.router_on``).
+
+**The end** (D1, 20 Oct 2026; keyword audit A1): the same call also judges whether the user is ending the conversation
+(``to = "end"``), under every brain (``Settings.voice_router_end``, :func:`ends_on`). The fast "go away" word list it
+replaces ended "stop" said about the music, and "not now" or "cancel" answering a question, with no model; the router
+judges the intent from the words, the earlier turns and the screen summary, so a dismissal still ends in ~1.5-2 s. The
+pipeline acts on it only when nothing waits for the user's words or runs for them (a task's question, a held call, a
+hand at work), and only while the talker has not begun its own reply to the same words. While a send of theirs counts
+down, ``end`` also means they call it off: the send is stopped at once, nothing sent, even when the talker answered
+first (a wrong stop never sends).
+
+No keywords anywhere: the decision is the router model's, from principles and worked examples; the code reads only its
+tool call's own JSON (a fixed format).
 """
 
 from __future__ import annotations
@@ -23,12 +34,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-#: The router's prompt (about 600 tokens; with the turn's inputs the request stays well under 2k).
+#: The router's prompt (about 950 tokens with the end of 20 Oct; with the turn's inputs the request is ~2k at most).
 ROUTER_PROMPT = """\
 You route one turn of a spoken conversation between a user and Yuki, an assistant on their Windows PC. Yuki has two \
 halves. The talker is a quick voice: it answers, and does single steps itself on what the screen summary shows. The \
 thinker is slower and has the user's memory, activity timeline, calls, files, the inside of every window, and many \
-steps. Decide whether this turn needs the thinker, and call route once.
+steps. Decide whether this turn needs the thinker, or ends the conversation, and call route once.
 
 The talker handles alone (to = talker):
 - social turns: greetings, thanks, reactions, small talk, an acknowledgement ("okay", "nice"), frustration at Yuki;
@@ -46,7 +57,7 @@ the skill that plays it: the talker runs it with Yuki choosing (code picks from 
 - a message to someone (the message skill: it opens their chat and types their words);
 - a short question about their day, what they did, who they talked to or what they usually pick (the talker reads its \
 day block and one quick memory look);
-- ending this conversation, or quiet time.
+- quiet time for a while or for a call, and a goodbye said with anything else.
 
 The thinker is needed (to = thinker) for everything else: their files, plans, calls and meetings in detail, memory \
 beyond a short day question; anything of several steps inside an app; anything inside a window that no items line \
@@ -55,25 +66,37 @@ a fact about their life); and a redo of something Yuki did wrong.
 
 screen is true when doing it needs what is inside the window in front (a video, a button, an item, a message on it).
 
+They end the conversation (to = end) when the whole turn sends Yuki away or signs off and asks for nothing \
+more now. Judge what they mean, never single words: what answers a question Yuki just asked is that answer (to = \
+talker), and stop, pause or off said about something playing or running is about that (a hand: talker). While a \
+message of theirs counts down to send, words that call it off (they do not want it sent) are an end too: nothing \
+is sent; words that change it (another person, more text) are the talker's. On a call, when words that would end \
+the conversation could be for Yuki, end: a wrong end costs them only her name, while staying listens in on the call.
+
 Good: "what did I do today?" -> talker. "summarise my meetings this week" -> thinker. "pause the music" -> talker. "open Chrome" -> talker. "thanks, perfect" -> \
 talker. "click the mix" and the mix is on the items line -> talker; it is not -> thinker, screen true. "open Spotify \
 and play my focus playlist" -> talker when the Skills line has a playlist skill, else thinker. "who's my \
 accountant?" -> thinker. "close the Claude tabs" and they are on the tabs line -> talker. On a call, "bro did you see that clutch" -> talker. "my cousin just got a job at Zomato" -> \
-thinker (a fact to keep)."""
+thinker (a fact to keep). "okay that's all, thanks" after Yuki's answer -> end. "not now" to Yuki's "send it \
+now?" -> talker (an answer)."""
 
 #: The one tool, forced: its fields are written in this order, so ``to`` is known a few tokens in.
 ROUTE_TOOL: dict[str, Any] = {
     "name": "route",
-    "description": "Say which half of Yuki this turn needs.",
+    "description": "Say which half of Yuki this turn needs, or that it ends the conversation.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "to": {"type": "string", "enum": ["thinker", "talker"]},
+            "to": {"type": "string", "enum": ["thinker", "talker", "end"],
+                   "description": "end: they end this conversation with Yuki, or call off a send counting down."},
             "screen": {"type": "boolean", "description": "Doing it needs what is inside the window in front."},
         },
         "required": ["to", "screen"],
     },
 }
+
+#: The decisions the router's tool call may write (``to``).
+ROUTES = ("thinker", "talker", "end")
 
 #: Inputs are cut to these sizes (characters): the earlier turns, and the screen summary.
 HISTORY_CHARS = 700
@@ -82,7 +105,8 @@ DESK_CHARS = 2400
 
 @dataclass
 class Route:
-    """One decision: ``to`` (``thinker`` / ``talker`` / ``None`` when it failed), ``screen``, and its timing."""
+    """One decision: ``to`` (``thinker`` / ``talker`` / ``end`` / ``None`` when it failed), ``screen``, and its
+    timing."""
 
     to: str | None = None
     screen: bool = False
@@ -113,16 +137,34 @@ def skills_line(menu: str | None) -> str:
     return "\n".join(out)
 
 
+#: D1: the measured facts the router is told as one line each (the pipeline's, never the words'): the words were said
+#: to Yuki by name (the wake word's evidence), and a send of theirs is counting down now.
+NAMED_LINE = "[They said these words to Yuki by name.]"
+SENDING_LINE = "[A message of theirs is counting down to send right now; it goes unless it is stopped.]"
+
+
+def ends_on(settings: Any) -> bool:
+    """D1 (20 Oct): whether the router's model may end the conversation by its judgement (``voice_router_end``), under
+    every brain; its hand-off part runs only where ``yuki.voice.mouth.router_on`` says."""
+    return bool(getattr(settings, "voice_router_end", True))
+
+
 def router_request(words: str, *, history: list[tuple[str, str]] | None = None, desk: str | None = None,
-                   call: str | None = None, model: str = "", skills: str | None = None) -> dict[str, Any]:
+                   call: str | None = None, model: str = "", skills: str | None = None, named: bool = False,
+                   sending: bool = False) -> dict[str, Any]:
     """The router's request: its prompt, the forced tool, and one user message with the turn's inputs. ``skills``:
-    the talker's Skills menu this conversation (each skill's key and what it does go on a Skills line)."""
+    the talker's Skills menu this conversation (each skill's key and what it does go on a Skills line). ``named``:
+    the words were said to Yuki by name (measured); ``sending``: a send of theirs is counting down (measured)."""
     lines: list[str] = []
     line = skills_line(skills)
     if line:
         lines.append("[Skills line (the talker runs each in one call):\n" + line + "]")
     if call:
         lines.append(f"[They are on a voice call on {call}: most of what they say is for the people on it.]")
+    if named:
+        lines.append(NAMED_LINE)
+    if sending:
+        lines.append(SENDING_LINE)
     past = list(history or [])[-4:]
     if past:
         text = " / ".join(f"{who}: {' '.join(str(said).split())}" for who, said in past)
@@ -164,7 +206,7 @@ def _field(partial: str, name: str) -> Any:
 async def decide(client: Any, request: dict[str, Any], *, timeout_s: float = 3.0) -> Route:
     """Stream the router's call and return as soon as its decision is complete (``to``, and ``screen`` when it is the
     thinker). Never raises: a failure or a timeout gives ``Route(to=None)`` (the talker's own hand-off then starts the
-    thinker, as without a router)."""
+    thinker, as without a router, and the talker's own end_conversation ends the conversation)."""
     started = time.monotonic()
     route = Route()
     partial = ""
@@ -177,9 +219,9 @@ async def decide(client: Any, request: dict[str, Any], *, timeout_s: float = 3.0
                         continue
                     partial += event.delta.partial_json or ""
                     to = _field(partial, "to")
-                    if to in ("thinker", "talker"):
+                    if to in ROUTES:
                         screen = _field(partial, "screen")
-                        if to == "talker" or screen is not None:
+                        if to != "thinker" or screen is not None:
                             route.to, route.screen = str(to), bool(screen)
                             route.ms = round((time.monotonic() - started) * 1000, 1)
                             return route
@@ -187,7 +229,7 @@ async def decide(client: Any, request: dict[str, Any], *, timeout_s: float = 3.0
                 for block in getattr(final, "content", []) or []:
                     if getattr(block, "type", "") == "tool_use":
                         data = dict(getattr(block, "input", {}) or {})
-                        if data.get("to") in ("thinker", "talker"):
+                        if data.get("to") in ROUTES:
                             route.to, route.screen = str(data["to"]), bool(data.get("screen"))
                 usage = getattr(final, "usage", None)
                 if usage is not None:
@@ -201,4 +243,5 @@ async def decide(client: Any, request: dict[str, Any], *, timeout_s: float = 3.0
     return route
 
 
-__all__ = ["ROUTER_PROMPT", "ROUTE_TOOL", "Route", "decide", "router_request", "skills_line"]
+__all__ = ["NAMED_LINE", "ROUTER_PROMPT", "ROUTES", "ROUTE_TOOL", "Route", "SENDING_LINE", "decide", "ends_on",
+           "router_request", "skills_line"]

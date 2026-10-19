@@ -2199,12 +2199,9 @@ class _Turn:
     quiet_refused: bool = False          # integration F4: its quiet on their opening words was refused (S10, any path)
     # vGame (5 Oct): said to Yuki by measured evidence, and what the fast path did with it
     named: bool = False                  # the name was heard with it (the wake word), or it came right after the name
-    fast: str | None = None              # "dismiss" (ended at once) | "name" (the name alone, answered at once)
+    fast: str | None = None              # "name" (the name alone, answered at once) | "end" (D1: the router ended it)
     ack_at: float | None = None          # when the instant acknowledgement started playing (monotonic)
     quiet_seen: bool = False             # its quiet choice was passed to the conversation already (once per turn)
-    # lSpeed (live test 17 Oct, problem 1): a learned reflex ran a hand for these words, with no model in front
-    reflex_at: float | None = None       # when the reflex's act went out (monotonic)
-    reflex: str | None = None            # its outcome: "done" (verified) | "failed" | "skipped:<why>"
 
     @property
     def heard(self) -> bool:
@@ -2302,8 +2299,8 @@ class TurnObserver:
         #: asked, the words a learned way may type or send, and what the authorization check of a hand reads; content,
         #: RAM only).
         self.recent_words: deque[str] = deque(maxlen=8)
-        #: x3 (IF-words): the user's final turns that reached the talker (the fast path's own, the name alone or a
-        #: dismissal, never do), with when each was heard (monotonic), oldest first: the current exchange for the hands'
+        #: x3 (IF-words): the user's final turns that reached the talker (the fast path's own, the name alone, never
+        #: do), with when each was heard (monotonic), oldest first: the current exchange for the hands'
         #: commit check and a held call's words is cut from these (``Conversation._turn_reached``; content, RAM only).
         self.recent_heard: deque[tuple[float, str]] = deque(maxlen=8)
         #: ``(words)``: the user's turn ended with these words (the thinker's request pack is built then, v3.18).
@@ -2338,10 +2335,7 @@ class TurnObserver:
         #: vGame: ``(turn)``: the talker chose silence on a user turn (stay_quiet or a quiet marker); set by the
         #: conversation (in a game or a call that ends the conversation at once, silently).
         self.on_quiet_turn: Callable[[Any], None] | None = None
-        #: lSpeed: ``(turn)``: a user turn opened from a final transcript; the conversation marks it with the reflex that
-        #: ran for its words, if one did (set by the conversation).
-        self.on_user_turn: Callable[[Any], None] | None = None
-        #: oVoice (phase 4): ``()`` at Flux's start of turn, ``(words)`` at each final transcript (a dismissal's too): a
+        #: oVoice (phase 4): ``()`` at Flux's start of turn, ``(words)`` at each final transcript (any words): a
         #: ONE send countdown pauses on their speech and their words decide (set by the conversation under one only).
         self.on_user_started: Callable[[], None] | None = None
         self.on_user_words: Callable[[str], None] | None = None
@@ -2369,14 +2363,16 @@ class TurnObserver:
             return []
 
     def fast_handled(self, kind: str) -> None:
-        """vGame: the open user turn was answered by the fast path (``"dismiss"`` or ``"name"``): it was said to Yuki
-        and answered, never "for others" (the talker never ran on it)."""
+        """The open user turn was answered with no talker reply: ``"name"`` (vGame: the name alone, answered "Yeah?"
+        at once: said to Yuki by measured evidence) or ``"end"`` (D1, 20 Oct: the router's model judged that the words
+        end the conversation). Either way it was answered, never "for others"."""
         turn = self.turn
         if turn is None or turn.trigger != "user":
             return
         turn.fast = kind
-        turn.named = True
-        turn.tools.append("end_conversation" if kind == "dismiss" else "answer_name")
+        if kind == "name":
+            turn.named = True
+        turn.tools.append("end_conversation" if kind == "end" else "answer_name")
         self.owes_reply_since = None
         self._took_part(time.monotonic())
         if self.state == "thinking":
@@ -2738,9 +2734,6 @@ class TurnObserver:
         if turn.trigger == "user" and (turn.named or turn.fast or turn.ack_at is not None):
             # vGame: said to Yuki by measured evidence; what the fast path did; end of speech -> the instant "Mm-hm"
             row.update(named=turn.named, fast=turn.fast, eos_to_ack_ms=ms(turn.speech_end, turn.ack_at))
-        if turn.trigger == "user" and turn.reflex is not None:
-            # lSpeed: a learned reflex ran for these words (end of speech -> its act; its outcome code)
-            row.update(reflex=turn.reflex, eos_to_reflex_ms=ms(turn.speech_end, turn.reflex_at))
         if turn.call:
             row["call_mode"] = True
             if turn.trigger == "user":
@@ -2854,9 +2847,6 @@ class TurnObserver:
                     self.on_user_words(frame.text or "")
                 except Exception:  # noqa: BLE001 - the countdown's own pause limit then
                     pass
-            if self.turn is not None and self.turn.trigger == "user" and self.turn.fast == "dismiss":
-                self.turn.user_text = frame.text or self.turn.user_text   # vGame: ended on its eager words already
-                return
             turn = self._open("user")
             turn.user_text = frame.text or ""
             self.chat({"type": "user_utterance", "text": turn.user_text, "ts": time.time(), "turn_id": self.turn_id()})
@@ -2891,11 +2881,6 @@ class TurnObserver:
                 turn.llm = pending  # the eager (speculative) reply, confirmed by this transcript
             lang = getattr(frame, "language", None)
             turn.language = str(getattr(lang, "value", lang)) if lang else None
-            if self.on_user_turn is not None:
-                try:
-                    self.on_user_turn(turn)   # lSpeed: a reflex that ran for these words marks the turn
-                except Exception:  # noqa: BLE001 - timings only
-                    pass
             self.user_turns += 1
             self.last_user_at = now
             self.owes_reply_since = now
@@ -3039,10 +3024,6 @@ class _Hooks:
         # the desktop summary and the lookup (review F3: never in front of them)
         recent_task = (asyncio.ensure_future(self._recent(job, getattr(self.c, "_recent_close", None)))
                        if job is not None else None)
-        if user_turn:
-            # lSpeed: a reflex running for these words (a hand, 4-400 ms) is waited for, bounded, so the call is told
-            # whether it is done and only speaks
-            await self.c._reflex_wait()
         lookup_text = await self._lookup(call, user_turn)
         if recent_task is not None:
             await recent_task
@@ -3448,31 +3429,6 @@ def _trailing_tool_ids(context: Any) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _answered_words(context: Any) -> str:
-    """lSpeed review r1 M1: the user's words a talker reply answers, as its context holds them: their messages in a row
-    up to the newest one (a tool's activation note between them aside), joined; ``""`` when it cannot be read.
-    Whatever stands after their newest message is this reply's own calls."""
-    try:
-        messages = list(context.get_messages() or [])
-    except Exception:  # noqa: BLE001
-        return ""
-    i = len(messages) - 1
-    while i >= 0 and not (isinstance(messages[i], dict) and messages[i].get("role") == "user"):
-        i -= 1
-    parts: list[str] = []
-    while i >= 0:
-        message = messages[i]
-        role = message.get("role") if isinstance(message, dict) else None
-        if role == "user":
-            text = _user_text(message)
-            if text:
-                parts.append(text)
-        elif role != "developer":
-            break
-        i -= 1
-    return " ".join(reversed(parts))
-
-
 def _holds_words_since_user(messages: list[Any], words: str) -> bool:
     """Whether an assistant message after the newest user message already says ``words`` (whitespace aside)."""
     for message in reversed(messages):
@@ -3770,24 +3726,18 @@ class HeldWords:
 def fast_path_processor(conversation: Any) -> Any:
     """vGame: the frame processor between speech recognition and the talker's context (``Conversation._fast_turn``).
 
-    It sees each transcript before the user aggregator does: a final one the fast path takes (a dismissal, the name
-    alone) never reaches the talker; an eager one that is a dismissal starts no speculative talker call. Every other
-    frame passes untouched. The turn observer saw the transcript already (observers see a frame as it is pushed here),
-    so the turn is logged as usual.
-
-    Second review R1/G1: a dismissal is provisional (``Conversation._dismiss_pending``). Its final transcript is held
-    here; Flux withdrawing the eager end of turn (``EagerEndOfTurnCancelFrame``), a new start of turn or words that are
-    not a dismissal withdraw it, and the held words then go on to the talker, after the frame that withdrew it (so the
-    aggregator takes them into the turn they belong to)."""
-    from pipecat.frames.frames import (
-        EagerEndOfTurnCancelFrame, EagerTranscriptionFrame, ProposedUserStartedSpeakingFrame, TranscriptionFrame,
-    )
+    It sees each transcript before the user aggregator does: a final one the fast path takes (the name alone, said to
+    Yuki: answered "Yeah?" at once) never reaches the talker, and an eager one of the name alone starts no speculative
+    talker call. Every other frame passes untouched. The turn observer saw the transcript already (observers see a
+    frame as it is pushed here), so the turn is logged as usual. Keyword audit A1-A5 (20 Oct): nothing here acts on what
+    the words say any more (no dismiss word list, no learned reflex): every other turn reaches the talker whole."""
+    from pipecat.frames.frames import EagerTranscriptionFrame, TranscriptionFrame
     from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
     def answered(frame: Any) -> None:
         # x3 (IF-words, fix-plan 3g IF-answer): a final transcript that goes on to the talker is the user's turn: kept
-        # for the current exchange, and offered to the voice job waiting for their answer (the fast path's own turns,
-        # the name alone or a dismissal, never are)
+        # for the current exchange, and offered to the voice job waiting for their answer (the fast path's own turn,
+        # the name alone, never is)
         if isinstance(frame, TranscriptionFrame) and not isinstance(frame, EagerTranscriptionFrame):
             try:
                 conversation._turn_reached(frame.text or "")
@@ -3801,39 +3751,35 @@ def fast_path_processor(conversation: Any) -> Any:
                                                                              EagerTranscriptionFrame)):
                 try:
                     taken = conversation._fast_turn(frame.text or "",
-                                                    final=not isinstance(frame, EagerTranscriptionFrame), frame=frame)
+                                                    final=not isinstance(frame, EagerTranscriptionFrame))
                 except Exception as exc:  # noqa: BLE001 - the talker then, as before
                     taken = False
                     conversation.log.event("fast_path", op="error", error=f"{type(exc).__name__}: {str(exc)[:160]}")
-                for held in conversation._fast_released():
-                    answered(held)
-                    await self.push_frame(held, direction)   # the withdrawn dismissal's words, before the new ones
                 if taken:
                     return
-                try:
-                    # lSpeed: words the user's own learned reflex knows run their hand now, before the talker's call
-                    # (which then only speaks); on the eager end of turn, the final transcript is re-checked
-                    conversation._reflex_heard(frame.text or "",
-                                               final=not isinstance(frame, EagerTranscriptionFrame))
-                except Exception as exc:  # noqa: BLE001 - the talker does it then, as before
-                    conversation.log.event("reflex", op="error", error=f"{type(exc).__name__}: {str(exc)[:160]}")
                 answered(frame)
                 await self.push_frame(frame, direction)
-                return
-            if direction == FrameDirection.DOWNSTREAM and isinstance(frame, (EagerEndOfTurnCancelFrame,
-                                                                             ProposedUserStartedSpeakingFrame)):
-                try:
-                    conversation._fast_resumed(type(frame).__name__)
-                except Exception as exc:  # noqa: BLE001
-                    conversation.log.event("fast_path", op="error", error=f"{type(exc).__name__}: {str(exc)[:160]}")
-                await self.push_frame(frame, direction)
-                for held in conversation._fast_released():
-                    answered(held)
-                    await self.push_frame(held, direction)
                 return
             await self.push_frame(frame, direction)
 
     return FastPath(name="yuki-fast-path")
+
+
+#: D2 (20 Oct, keyword audit A5): the retired reflex book's row in memory's ``nudge_state`` (encrypted: the user's
+#: words and the hand each ran): deleted once by code (:func:`drop_old_reflexes`), never read again.
+OLD_REFLEX_STATE = "voice_reflex"
+#: Whether this process deleted it (or found none) already: tried once per process, again after a failure.
+_OLD_REFLEXES: dict[str, bool] = {"done": False}
+
+
+def drop_old_reflexes(store: Any) -> bool:
+    """D2: delete the retired reflex book's stored row from ``store`` (an open ``yuki.memory.store.Store``),
+    idempotently: a database without it changes nothing. ``True``: a row was deleted. Raises only when the store itself
+    cannot be read or written (the caller tries again later)."""
+    if store.nudge_state(OLD_REFLEX_STATE) is None:
+        return False
+    store.set_nudge_state(OLD_REFLEX_STATE, None)
+    return True
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -4028,12 +3974,6 @@ ONE_FIELDS: tuple[str, ...] = ("name", "status", "verified", "result", "said", "
 #: Review fix H1: the user-words mark of the turn whose call is running on this thread (the runner's worker), read by
 #: the countdown's ``publish`` as it opens: words heard after that mark came after the request the send is for.
 _ONE_CALL_MARK: contextvars.ContextVar[int | None] = contextvars.ContextVar("yuki_one_call_mark", default=None)
-#: Review fix M3: the learned reflexes that run under ``brain = "one"`` (each through the one gate first): the sound
-#: hands and the volume skill (no window, nothing lasting; the same tool and arguments as the ONE agent's own call,
-#: so its call for the same words is matched and never pressed twice). A window, scroll or opening reflex stays off.
-ONE_REFLEX_TOOLS: frozenset[str] = frozenset({"media_key", "app_volume", "run_skill"})
-#: Review fix M3: the runner's fallback for a reflex's press whose effect was not seen (``runner.OWED_LINES``).
-ONE_NOT_CONFIRMED_LINE = "I couldn't confirm that worked."
 #: Thinking once a turn is structurally hard (design 2.6, lead decision 3): adaptive at this effort, with room for it
 #: (the talker's 400-token output ceiling would cut a thought short). Its text is omitted (never spoken, never read).
 ONE_EFFORT = "medium"
@@ -4327,8 +4267,8 @@ class _OneReply:
     owed: set[str] = field(default_factory=set)
     spoke: bool = False
     #: Final-B (one-voice RC B/O1b): the turn's owed tokens this reply took on (held while its calls run, dropped once
-    #: their results are in), and the calls of it that were tried (an act or write that ran through the runner or a
-    #: reflex; never a read: review fix F4).
+    #: their results are in), and the calls of it that were tried (an act or write that ran through the runner; never
+    #: a read: review fix F4).
     took: list[int] = field(default_factory=list)
     tried: set[str] = field(default_factory=set)
     released: bool = False
@@ -4671,17 +4611,6 @@ class OneVoice:
         self._log("turn", n=self._seq, words=len(words), earlier=len(earlier), asks=len(turn.asks),
                   sent_before=len(turn.sent_before))
 
-    def reflex_turn(self, words: str) -> Any:
-        """Review fix M3: the gate turn for a learned reflex's act on these words (any thread): its own, with no
-        budget and nothing carried (a sound act: the gate's game check, Act switch and row decide it)."""
-        from yuki.one import policy
-
-        checker, settings = self._checker()
-        return policy.Turn("voice", [words] if str(words or "").strip() else [], (),
-                           request_id=f"{getattr(self.c, 'session', '')}-one-reflex-{int(time.time() * 1000)}",
-                           checker=checker,
-                           settings=settings, people_in=self._people_in, recent=self._recent_to, log=self._gate_log)
-
     def _read_answer(self, turn: Any, reply: str) -> None:
         """The user answered the gate's question from last turn (or said something else): its yes/no read, on a
         worker, recorded on the turn as a code fact before any of the turn's calls goes to the gate."""
@@ -4764,9 +4693,7 @@ class OneVoice:
 
     def state(self, state: dict[str, Any] | None) -> dict[str, Any]:
         """The measured states for the ONE turn's block: the conversation's (``_prompt_state``) without the talker's
-        hand notes (they name hand_over; the agent reads each result itself). The learned reflex that ran for these
-        words stays (review fix M3: a sound reflex runs under one too, through the one gate; its note tells the agent
-        it is done, and the agent's same call is matched and never pressed twice)."""
+        hand notes (they name hand_over; the agent reads each result itself)."""
         return {k: v for k, v in (state or {}).items() if k not in ("hand_trouble", "hand_game", "acted")}
 
     def volatile(self, call: Any, make: Callable[[], dict[str, Any]]) -> tuple[dict[str, Any], str | None]:
@@ -5244,7 +5171,7 @@ class OneVoice:
         """A non-success act that code said nothing for owes code's fallback (``OwedLedger``): said only if the
         agent's next round is not heard (it chose silence, or never came within ``RUN_WAIT_S``). ``keep``: the token
         is the current turn's (dropped when it settles by code); an earlier turn's late result keeps its own (review
-        fix L1). A held call or a reflex's call still under way owes nothing (``_no_owe``: the agent asks or says it).
+        fix L1). A held call still under way owes nothing (``_no_owe``: the agent asks or says it).
         Returns the owed token (voice20: :meth:`_owe_group` marks a claimed act's), else ``None``."""
         ledger = getattr(self.c, "ledger", None)
         status = str(result.get("status") or "").strip().lower()
@@ -5680,14 +5607,7 @@ class OneVoice:
                 result: dict[str, Any] = {"status": "closed", "note": ONE_LATE_NOTE, "settle": True, "silent": True}
                 how = "late"
             else:
-                # review fix M3: the learned reflex already did this very call for these words (it went through the
-                # one gate first): never pressed twice; its result stands for the call
-                dup = getattr(self.c, "_reflex_one_dup", None)
-                got = await dup(name, args) if callable(dup) else None
-                if isinstance(got, dict):
-                    result, how = got, "reflex"
-                    self._tried(group, call_id, name)
-                elif self._held_call(name, call_id, args, turn):
+                if self._held_call(name, call_id, args, turn):
                     # review fix M4: words and this act together on a turn recognition was unsure of: nothing is done
                     # and nothing was said; the agent's next round asks about the unsure word or calls it again alone
                     # (no thinker: the hold resolves through the agent itself)
@@ -6041,7 +5961,7 @@ class OneVoice:
         self._watch_noise()
 
     def user_words(self, text: str) -> None:
-        """Their final words (any, a dismissal too): an open countdown ends, nothing sent; the agent decides. Review
+        """Their final words (any): an open countdown ends, nothing sent; the agent decides. Review
         fix H1: a countdown still counting (their speech began before it opened, so nothing paused it) is paused and
         ended the same way; words with no text resume a paused one (noise)."""
         words = bool(" ".join(str(text or "").split()))
@@ -6275,19 +6195,13 @@ class Conversation:
         #: Final-B (one-voice RC F): quick_memory reads in flight (a read-only turn is not answered again while one runs).
         self._reads_running = 0
         self._read_done_at = 0.0
-        #: Second review R1/G1: a dismissal heard but not acted on yet (``phrase``, ``busy``, ``text``, ``start``,
-        #: ``at``, ``end``, ``final``, ``frames``): it ends the conversation after :attr:`DISMISS_GRACE_S` with no
-        #: resumed speech (:meth:`_dismiss_tick`), else it is withdrawn and its words go to the talker.
-        self._dismiss_pending: dict[str, Any] | None = None
-        #: Held transcript frames of a withdrawn dismissal, for the fast path processor to pass on.
-        self._released: list[Any] = []
-        self._dismiss_task: Any = None
         #: The instant acknowledgement lines in this conversation's voice (:class:`yuki.voice.fastpath.AckVoice`).
         self.ack: Any = None
         #: ``(pcm, kind)``: play a short clip of Yuki's voice now (24 kHz int16 mono) on the conversation's output,
         #: outside the pipeline (the acknowledgement); set by the session.
         self.on_sound: Callable[[bytes, str], None] | None = None
-        #: ``()``: the user dismissed Yuki on the fast path: the end cue now (the session's); set by the session.
+        #: ``()``: the user ended the conversation and no goodbye is said (the router's end, D1, or the talker's
+        #: end_conversation with an empty say_first): the end cue now (the session's); set by the session.
         self.on_dismissed: Callable[[], None] | None = None
         #: Review F2/F5: the first words decide whether they were said to Yuki: speech recognition must have written
         #: the name opening them (a wake in a game or a call, or right after a goodbye). Set by the session at the wake.
@@ -6307,17 +6221,6 @@ class Conversation:
         #: new wake (the session reads it).
         self.stopped_at: float | None = None
         self.observer.on_quiet_turn = self._quiet_turn
-        # -- lSpeed (live test 17 Oct, problem 1): the learned reflex path (yuki.voice.reflex) --------------------
-        #: The reflex of the words being finished now (``start``: their start of speech, ``key``, ``entry``, ``args``,
-        #: ``state`` running | done | failed | skipped, ``verified``, ``report``, ``facts``, ``task``, ...; RAM only).
-        self._reflex: dict[str, Any] | None = None
-        #: Per utterance (by its start of speech): what a talker hand may be learned from (``asked``, ``job``, ``key``,
-        #: ``acts``: the acting calls made for it, ``cand``: a verified hand waiting to be kept; RAM only, bounded).
-        self._reflex_turns: dict[float, dict[str, Any]] = {}
-        #: The last reflex run or learned (``at``, ``key``, ``sig``, ``what``, ``words``, ``start``): a correction in
-        #: the user's next words within ``voice_reflex_correct_s`` drops it (a model's judgement; RAM only).
-        self._reflex_last: dict[str, Any] | None = None
-        self.observer.on_user_turn = self._reflex_mark_turn
 
     # -- vGame: the fast path, focus mode, the name heard while talking ---------------------------------------------
 
@@ -6408,57 +6311,30 @@ class Conversation:
         start = float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)
         return bool(mark is not None and mark[0] == start and mark[1])
 
-    def _asked_last(self) -> bool:
-        """Review F3: Yuki's last line heard was a question (her own words, written with a question mark: a fixed
-        format), so "that's it" may be its answer, not a goodbye."""
-        said = getattr(self.observer, "last_said", None) or {}
-        return str(said.get("written") or said.get("heard") or "").rstrip().endswith("?")
-
-    def _busy_for_dismiss(self) -> bool:
-        """Something runs that "stop" could mean (a voice task, a scroll, a hand at work)."""
-        try:
-            return bool(self.bridge.open_voice_jobs() or self._scrolling_line() or getattr(self.bridge, "busy_tools", 0))
-        except Exception:  # noqa: BLE001 - when unsure, "stop" is the talker's
-            return True
-
-    def _fast_turn(self, text: str, *, final: bool, frame: Any = None) -> bool:
+    def _fast_turn(self, text: str, *, final: bool) -> bool:
         """vGame: the fast path on a transcript before the talker (``FastPath``). ``True``: the frame is taken.
 
-        A dismissal (:func:`yuki.voice.fastpath.dismissal`) ends the conversation with no model call. Second review
-        R1/G1: the match is provisional: it is held (:attr:`_dismiss_pending`) and acted on after a short grace with no
-        resumed speech (:meth:`_dismiss_tick`); "Stop... the music" and "Nothing... actually open Spotify" start with
-        dismiss words, and Flux's eager end of turn (or a split final) fires at that pause. Words that are not a
-        dismissal withdraw it and reach the talker whole (a held final with them). The name alone, said to Yuki, is
-        answered "Yeah?" at once and the next turn counts as said to her. A turn said to her by name gets the instant
-        "Mm-hm" and goes on to the talker as before."""
-        from yuki.voice.fastpath import bare_name, dismissal, vocabulary_only, with_name
+        Only the wake word's measured evidence is read here, never what the words mean. The name alone, said to
+        Yuki, is answered "Yeah?" at once and the next turn counts as said to her. A turn said to her by name gets the
+        instant "Mm-hm" (on its eager end of turn when that comes first, once per utterance) and goes on to the talker
+        as before.
+        Keyword audit A1-A4 (20 Oct, decision D1): the fast "go away" word list, its grace, its echo check and its
+        held "Mm-hm" are gone; the router's model and the talker end the conversation by their judgement of intent
+        (:meth:`_route_end`, ``end_conversation``)."""
+        from yuki.voice.fastpath import bare_name, with_name
         from yuki.voice.keyterms import name_forms
 
         if self._stop.is_set():
-            return self.reason == "user_asked"   # after a dismissal nothing more reaches the talker
+            return self.reason == "user_asked"   # once they ended it, nothing more reaches the talker
         if self.dormant:
             return False
         # report 88: how recognition wrote the name before (memory's learned forms, "UK" for Yuki) counts as the name
         # where it opens what was said; for these checks only (the talker gets the words as heard)
-        heard, (text, form) = text, with_name(text, name_forms())
+        text, form = with_name(text, name_forms())
         if form is not None and final:
             self.log.event("fast_path", op="name_form", session=self.session, words=len(form.split()))
         s = self.settings
-        phrase = None
-        busy = False
-        if getattr(s, "voice_fast_dismiss", True):
-            busy = self._busy_for_dismiss()
-            phrase = dismissal(text, busy=busy, asked=self._asked_last(), call=bool(self.call_app))
-            if phrase is not None and self._her_own_words(phrase):
-                # G2: the words are in what Yuki is saying or just said (her echo on speakers): the talker judges them
-                self.log.event("fast_path", op="dismiss_echo", session=self.session, phrase=phrase, eager=not final)
-                phrase = None
         start = float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)
-        if phrase is not None:
-            self._hold_dismissal(phrase, busy, heard, start=start, final=final, frame=frame)
-            return True
-        if self._dismiss_pending is not None:
-            self._withdraw_dismissal("words", text=text)   # words that are not a dismissal: all of it to the talker
         named, how = self._named_turn(text, final=final)
         prev = self._utterance
         if not named and prev is not None and prev[0] == start and prev[1]:
@@ -6474,8 +6350,6 @@ class Conversation:
                 return True   # the name alone is answered on its final words: no speculative talker reply to it
             if self._eager_ack_at is not None and self._eager_ack_start == start:
                 return False   # review F7 / R2: once per utterance ("open... uh... Spotify": eager, resumed, eager)
-            if vocabulary_only(text):
-                return False   # R4: "Yuki, no..." may still become "go away": no "Mm-hm" before the end tone
             self._ack("request", how, eager=True)
             return False
         # R2/R8: the eager acknowledgement belongs to this utterance only; cleared on every final transcript
@@ -6497,140 +6371,6 @@ class Conversation:
             return True
         self._ack("request", how)
         return False
-
-    #: Second review R1/G1: a dismissal is acted on this long after it was heard, when no speech resumed (s). Measured
-    #: (review probe, real Flux): eager end of turn -> TurnResumed / EndOfTurn 0.2-0.6 s; a pause inside "Stop. The
-    #: music" ~0.6 s.
-    DISMISS_GRACE_S = 0.8
-    #: The microphone voiced after the dismiss words keeps it waiting (Flux's own word on a resumed turn comes ~0.3-1 s
-    #: into speech) until this long after the match at most; then sound that recognition never made a turn of is noise.
-    DISMISS_MAX_WAIT_S = 2.5
-    #: Voiced sound newer than this (s) is speech going on.
-    DISMISS_QUIET_S = 0.45
-    #: Yuki's line counts as just said this long after she stopped (s): her echo on speakers comes back late.
-    ECHO_AFTER_S = 1.5
-
-    def _her_own_words(self, phrase: str) -> bool:
-        """G2: the dismiss words stand in Yuki's line while she speaks, a line is on its way, or she just stopped."""
-        from yuki.voice.fastpath import said_in
-
-        obs = self.observer
-        now = time.monotonic()
-        last_stop = float(getattr(obs, "last_bot_stop", 0.0) or 0.0)
-        if not (obs.bot_speaking or obs.speech_pending or (last_stop and now - last_stop < self.ECHO_AFTER_S)):
-            return False
-        said = getattr(obs, "last_said", None) or {}
-        lines = [str(said.get("written") or ""), str(said.get("heard") or "")]
-        turn = obs.turn
-        if turn is not None:
-            lines.append(strip_tags("".join(turn.reply)))
-        return any(said_in(phrase, line) for line in lines if line)
-
-    def _hold_dismissal(self, phrase: str, busy: bool, text: str, *, start: float, final: bool, frame: Any) -> None:
-        pending = self._dismiss_pending
-        now = time.monotonic()
-        if pending is None:
-            end, _how = self.observer._end_of_speech(now)
-            pending = self._dismiss_pending = {"phrase": phrase, "busy": busy, "text": text, "start": start, "at": now,
-                                               "end": end if end is not None else now - 0.3, "final": False,
-                                               "frames": []}
-            self.log.event("fast_path", op="dismiss_held", session=self.session, phrase=phrase, eager=not final)
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None   # (tests drive _dismiss_tick themselves)
-            if loop is not None:
-                self._dismiss_task = loop.create_task(self._dismiss_watch())
-        else:
-            pending.update(phrase=phrase, busy=busy)
-        pending["text"] = text
-        if final:
-            pending["final"] = True
-            if frame is not None:
-                pending["frames"].append(frame)
-
-    def _withdraw_dismissal(self, why: str, text: str = "") -> None:
-        pending, self._dismiss_pending = self._dismiss_pending, None
-        if pending is None:
-            return
-        self._released.extend(pending["frames"])
-        self.log.event("fast_path", op="dismiss_withdrawn", session=self.session, phrase=pending["phrase"], by=why,
-                       held_ms=round((time.monotonic() - pending["at"]) * 1000), released=len(pending["frames"]),
-                       words=len(text.split()))
-
-    def _fast_resumed(self, frame_name: str) -> None:
-        """Flux withdrew its eager end of turn or a new turn started: a held dismissal was the start of more words."""
-        if self._dismiss_pending is not None and not self._stop.is_set():
-            self._withdraw_dismissal("resumed" if "Cancel" in frame_name else "start_of_turn")
-
-    def _fast_released(self) -> list[Any]:
-        released, self._released = self._released, []
-        return released
-
-    def _voiced_after(self, pending: dict[str, Any], now: float) -> bool:
-        """The microphone heard voice after the dismiss words, and recently (speech going on, not a long noise)."""
-        if self._voice_activity is None:
-            return False
-        try:
-            since, last = self._voice_activity()
-        except Exception:  # noqa: BLE001
-            return False
-        return bool(last and last > pending["end"] + 0.15 and now - last < self.DISMISS_QUIET_S
-                    and (last - since) < self.SOUND_MAX_STRETCH_S)
-
-    def _dismiss_tick(self, now: float | None = None) -> bool:
-        """Act on a held dismissal once its grace passed with no voice after it. ``True``: nothing is held any more."""
-        pending = self._dismiss_pending
-        if pending is None or self._stop.is_set():
-            self._dismiss_pending = None
-            return True
-        now = time.monotonic() if now is None else now
-        waited = now - pending["at"]
-        if waited < self.DISMISS_GRACE_S:
-            return False
-        if waited < self.DISMISS_MAX_WAIT_S and self._voiced_after(pending, now):
-            return False
-        self._dismiss_pending = None
-        self._fast_dismiss(pending["phrase"], pending["busy"], eager=not pending["final"], text=pending["text"],
-                           held_ms=round(waited * 1000))
-        return True
-
-    async def _dismiss_watch(self) -> None:
-        while not self._dismiss_tick():
-            await asyncio.sleep(0.04)
-
-    def _fast_dismiss(self, phrase: str, busy: bool, eager: bool = False, text: str = "", held_ms: int = 0) -> None:
-        obs = self.observer
-        turn = obs.turn
-        if eager:
-            start = float(getattr(obs, "_user_started_at", 0.0) or 0.0)
-            if (turn is not None and turn.trigger == "user" and turn.transcript_at is not None
-                    and turn.transcript_at >= start and not turn.counted):
-                pass   # G3: the observer opened it from the final words already (milliseconds apart): the same turn
-            else:
-                # the final transcript has not come: the dismissal opens the turn with the eager words (logged as
-                # usual, said to Yuki); a final transcript after it only updates them (TurnObserver)
-                now = time.monotonic()
-                turn = obs._open("user")
-                turn.user_text = text
-                turn.transcript_at = now
-                turn.speech_end, turn.eos_source = obs._end_of_speech(now)
-                obs.user_turns += 1
-                # R3: the chat thread shows what they said, as for a final transcript
-                obs.chat({"type": "user_utterance", "text": text, "ts": time.time(), "turn_id": obs.turn_id()})
-        obs.fast_handled("dismiss")
-        now = time.monotonic()
-        self.log.event("fast_path", op="dismiss", session=self.session, phrase=phrase, busy=busy, eager=eager,
-                       call_mode=bool(self.call_app), game=bool(self.game_app), held_ms=held_ms,
-                       eos_to_end_ms=round((now - turn.speech_end) * 1000) if turn is not None and turn.speech_end
-                       else None)
-        if self.on_dismissed is not None:
-            try:
-                self.on_dismissed()
-            except Exception:  # noqa: BLE001 - the cue is a courtesy; the end is not
-                pass
-        self.log.event("session", state="end_asked", session=self.session, waited_ms=0, fast=True)
-        self._set_stop("user_asked")
 
     def _ack(self, kind: str, how: str, *, eager: bool = False) -> None:
         """Play the instant acknowledgement (``"request"``: "Mm-hm.", ``"name"``: "Yeah?") unless Yuki is speaking.
@@ -6690,861 +6430,9 @@ class Conversation:
                        call_mode=self._call_focus, turn=getattr(turn, "n", None))
         self._set_stop("not_for_yuki")
 
-    # -- lSpeed (live test 17 Oct, problem 1): the learned reflex path (yuki.voice.reflex) ---------------------------
-    #
-    # Words the user said before, for which one talker hand was verified done and nothing else was done, run that hand
-    # again at the end of their turn with no model in front (Flux's eager end of turn by default; measured 17 Oct:
-    # median 0.48-0.67 s after speech, the final transcript 0.32-0.48 s later). The talker still runs for the words,
-    # told what the reflex did (``mouth.REFLEX_NOTES``), and its call for the same thing is skipped (never twice).
-
-    #: A verified talker hand is kept as a reflex once nothing more was done for its turn this long (s), or at once
-    #: when the user's next words reach the talker.
-    REFLEX_SETTLE_S = 6.0
-    #: The talker's call that repeats the reflex's is skipped this long after the reflex was done (s).
-    REFLEX_DUP_S = 12.0
-    #: The talker's call that repeats a reflex still running waits for it at most this long (s).
-    REFLEX_DUP_WAIT_S = 3.0
-    #: A reflex whose words never got a final transcript (they went on talking) blocks a new one this long at most (s).
-    REFLEX_OPEN_S = 8.0
-    #: At most this many utterances' learning state are kept.
-    REFLEX_TURNS = 8
-    #: The states of a reflex that went through (``reflex.act_state``): its effect seen, nothing more possible with no
-    #: change seen (review r2 L3), or sent with its effect not seen in time; and those with one still running.
-    REFLEX_WENT = ("done", "settled", "sent")
-    REFLEX_LIVE = ("running",) + REFLEX_WENT
-
-    def _reflex_on(self) -> bool:
-        """The reflex path runs: the setting (``voice_reflex``), the talker's hands, and a desktop to act on. oVoice
-        (review fix M3): under ``brain = "one"`` too, for the sound reflexes only (:data:`ONE_REFLEX_TOOLS`), each
-        decided by the one gate before it acts (:meth:`_reflex_one_gate`) and matched against the ONE agent's own
-        call so it is never pressed twice (:meth:`_reflex_one_dup`). Under one the book is read, not grown (it learns
-        from the talker's own hands)."""
-        s = self.settings
-        return bool(getattr(s, "voice_reflex", True) and getattr(s, "voice_hands", True)
-                    and getattr(self.bridge, "hands", None) is not None)
-
-    def _reflex_volume(self) -> bool:
-        """Whether the volume skill is on this conversation's menu (then volume is ``run_skill volume``)."""
-        from yuki.voice.hands import VOLUME_SKILL
-
-        return VOLUME_SKILL in tuple(getattr(getattr(self.bridge, "hands", None), "skill_keys", ()) or ())
-
-    def _reflex_skip_sessions(self) -> tuple[str, ...]:
-        """The session id prefixes whose conversations never teach the book: the live test harness's own
-        (``testtag.TEST_SESSION_PREFIX``, the one predicate every learner uses: lBrain), plus any extra prefix in
-        ``voice_reflex_seed_skip``."""
-        from yuki.memory.testtag import TEST_SESSION_PREFIX
-
-        extra = tuple(str(p) for p in (getattr(self.settings, "voice_reflex_seed_skip", ()) or ()) if str(p or ""))
-        return (TEST_SESSION_PREFIX, *[p for p in extra if p != TEST_SESSION_PREFIX])
-
-    def _reflex_test(self) -> bool:
-        """This conversation is the live test harness's own (``testtag.is_test_session``, or a session id that starts
-        with an extra prefix of ``voice_reflex_seed_skip``). xGlue (lBrain's merge note, the lead's decision):
-        reflexes are never learned from a test session, live or seeded; the stored book is only read (it still runs
-        and takes corrections in RAM), and nothing of it is ever written to the user's memory (review r2 L5)."""
-        from yuki.memory.testtag import is_test_session
-
-        session = str(self.session or "")
-        return is_test_session(session) or any(session.startswith(p) for p in self._reflex_skip_sessions())
-
-    def _reflex_start(self) -> float:
-        """The start of speech of the words being finished now (the observer's), the identity of an utterance here."""
-        return float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)
-
-    def _reflex_load(self) -> None:
-        """Read the learned reflexes once per process, off the loop (the first time ever, seeded from the hand traces
-        of the user's own sessions). Lookups before it lands miss, and the talker does the turn as before. Review r1
-        M4: a read that failed is tried again from a later turn (``ReflexBook.may_load``), and nothing is written over
-        the stored book before it was read."""
-        if not self._reflex_on():
-            return
-        from yuki.voice.reflex import book
-        from yuki.voice.workers import ordered, shared
-
-        reflexes = book()
-        if self.memory is None or not reflexes.may_load():
-            return   # without memory the book lives in RAM, unread (nothing is written until it was read)
-        s, memory, log = self.settings, self.memory, self.log
-        volume = self._reflex_volume()
-        days = float(getattr(s, "voice_reflex_seed_days", 30.0) or 0.0)
-        skip = self._reflex_skip_sessions()   # xGlue: testtag's prefix always (reflexkv also applies testtag's SQL)
-        keep = not self._reflex_test()   # review r2 L5: the live test harness's sessions never write the book
-        # review r2 L4: the write after the read goes through the ordered worker, as every other save does
-        shared().submit(lambda: reflexes.load(memory, volume_skill=volume, seed_days=days, skip_sessions=skip,
-                                              log=log, writer=lambda fn: ordered().submit(fn), keep=keep))
-
-    #: A reflex's use count is written at most this often (s); what was learned or dropped is written at once.
-    REFLEX_SAVE_EVERY_S = 120.0
-
-    def _reflex_save(self, *, soft: bool = False) -> None:
-        """Keep the book in memory (encrypted), off the loop. ``soft``: only a use count changed, written at most every
-        :attr:`REFLEX_SAVE_EVERY_S` (the next learn, drop or soft save carries it)."""
-        from yuki.voice.reflex import book
-        from yuki.voice.workers import ordered
-
-        memory = self.memory
-        if memory is None or self._reflex_test():
-            return   # review r2 L5: what the live test harness's sessions learn or correct stays in RAM
-        now = time.monotonic()
-        if soft and now - float(getattr(self, "_reflex_saved_at", 0.0) or 0.0) < self.REFLEX_SAVE_EVERY_S:
-            return
-        self._reflex_saved_at = now
-        ordered().submit(lambda: book().save(memory))
-
     def _hand_words(self) -> list[str]:
-        """The hands' ``words``: the user's final utterances, plus the words a reflex is running on before their final
-        transcript came (the eager end of turn), so its checks and a skill's resolver read the words it acts for."""
-        words = list(self.observer.recent_words)
-        rec = self._reflex
-        if rec is not None and rec.get("state") == "running" and not rec.get("final") and rec.get("text"):
-            if not words or words[-1] != rec["text"]:
-                words.append(rec["text"])
-        return words
-
-    def _reflex_block(self) -> str:
-        """Why no reflex may run on these words now (a code word), or ``""``. Measured states only: a game in front
-        (D17), a call or a game where the words were not said to Yuki by name, right after a goodbye, a dismissal
-        being held, Yuki's last line a question (they may be its answer), a task waiting for their answer, a held
-        call waiting for it, text going into another app while they spoke."""
-        if self.game_app:
-            return "game"
-        if self.focus and not self._utterance_named():
-            return "not_named"
-        if self.after_goodbye and self.observer.user_turns <= 1:
-            return "after_goodbye"
-        if self._dismiss_pending is not None:
-            return "dismiss"
-        if self._asked_last():
-            return "asked"
-        one = getattr(self, "one_driver", None)
-        if one is not None:
-            # review fix M3: under one, a send counting down (these words may be its stop) or a question the gate asked
-            # that waits for their answer (these words may be it): the agent has the turn
-            countdown = getattr(one, "_countdown", None)
-            if countdown is not None and countdown.counting:
-                return "countdown"
-            if getattr(getattr(one, "turn", None), "asks", None):
-                return "gate_asked"
-        bridge = self.bridge
-        try:
-            if bridge.has_open_voice_job() and not bridge.open_voice_jobs():
-                return "job_waiting"   # every open task waits for their answer: these words may be it
-        except Exception:  # noqa: BLE001 - unknown: the talker decides
-            return "job"
-        if self._held_pending(time.monotonic()):
-            return "held"
-        hands = getattr(bridge, "hands", None)
-        if getattr(hands, "halted", None):
-            # review r2 M2: the hands' halt after an earlier hand lasts until the final transcript of these words
-            # (Hands.new_user_turn), after the eager end of turn a reflex acts on: never acted on through it (refused,
-            # or after lane lVoice's merge let through as the previous turn's one retry); the talker does the turn
-            return "halted"
-        dictating = getattr(hands, "dictating", None)
-        if isinstance(dictating, dict) and float(dictating.get("since") or 0.0) >= self._reflex_start() - 1.0:
-            return "dictating"
-        return ""
-
-    def _reflex_heard(self, text: str, *, final: bool) -> None:
-        """A transcript that goes on to the talker (``FastPath``): when its words are a learned reflex's and nothing
-        blocks it, the reflex's hand runs now (a task; the talker's call starts on the same words right after). One
-        reflex per utterance: on its final transcript after an eager one, the words are only compared (``changed``:
-        they went on after the pause the reflex acted on), never acted on again."""
-        if not self._reflex_on() or self.dormant or self._stop.is_set():
-            return
-        from yuki.voice.reflex import book, describe, runnable, words_key
-
-        start = self._reflex_start()
-        rec = self._reflex
-        now = time.monotonic()
-        if rec is not None and rec.get("start") == start:
-            if final and not rec.get("final"):
-                rec["final"] = True
-                rec["changed"] = words_key(text) != rec["key"]
-                if rec["changed"]:
-                    self.log.event("reflex", op="final_changed", session=self.session, tool=rec["entry"]["tool"],
-                                   state=rec.get("state"))
-                if rec["changed"] and rec.get("state") in self.REFLEX_LIVE:
-                    # review r1 M5: what they went on to say may contradict the part acted on ("mute the PC... no,
-                    # Spotify"): judged like a correction (in the background; the talker's note says to undo or redo
-                    # it as they now say); a correction drops the entry (no strike: the words may still be right)
-                    last = {"key": rec["key"], "sig": rec["entry"].get("sig"), "what": rec["what"],
-                            "words": rec["text"], "start": start, "same_breath": True}
-                    asyncio.ensure_future(self._reflex_judge(last, " ".join(str(text).split()), 0.0))
-            return
-        if rec is not None and not rec.get("final") and now - float(rec.get("at") or 0.0) < self.REFLEX_OPEN_S:
-            return   # the last reflex's words went on and never got their final transcript: never a second act
-        at = str(getattr(self.settings, "voice_reflex_at", "eager") or "eager").strip().lower()
-        if not final and at == "final":
-            return
-        key = words_key(text)
-        entry = book().get(key)
-        if entry is None:
-            return
-        if getattr(self, "one", False) and not self._reflex_one_tool(entry):
-            # review fix M3: under one only a sound reflex runs (a window, scroll or opening reflex stays the agent's)
-            self.log.event("reflex", op="skip", session=self.session, tool=entry.get("tool"), why="one_tool",
-                           eager=not final)
-            return
-        why = self._reflex_block()
-        hands = self.bridge.hands
-        volume = self._reflex_volume()
-        args = None
-        if not why:
-            args, why = runnable(entry, getattr(hands, "last", None), volume_skill=volume)
-        if args is None:
-            self.log.event("reflex", op="skip", session=self.session, tool=entry["tool"], why=why, eager=not final)
-            return
-        self._reflex = rec = {"start": start, "key": key, "text": " ".join(str(text).split()), "entry": entry,
-                              "args": args, "state": "running", "eager": not final, "final": final, "at": now,
-                              "changed": False, "verified": False, "report": "", "facts": {}, "volume": volume,
-                              "what": describe(entry), "turn_key": f"{self.session}-reflex-{int(time.time() * 1000)}"}
-        turn = getattr(self.observer, "turn", None)
-        if final and turn is not None and getattr(turn, "trigger", None) == "user" and turn.reflex is None \
-                and getattr(turn, "transcript_at", None) is not None and now - float(turn.transcript_at) < 2.0:
-            # review r1 L4: on the final transcript the observer opened the turn just before (observers see the frame
-            # first), so it is marked from here
-            rec["turn"] = turn
-        self.log.event("reflex", op="hit", session=self.session, tool=entry["tool"], src=entry.get("src"),
-                       n=int(entry.get("n") or 0), eager=not final)
-        rec["task"] = asyncio.ensure_future(self._reflex_run(rec))
-
-    def _reflex_act(self, hands: Any, rec: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
-        """Blocking (a worker thread): the reflex's hand through the hands' own act (``Hands._acting_run``, or the
-        skill hand for the volume skill): their checks, their D17 game gate and their verification. A game in front
-        (read again here, failing closed) or a window that is not there for certain runs nothing. A reflex that sent
-        nothing never stops the talker's own try (the hands' halt it set is undone); one sent but not seen to take
-        effect keeps it."""
-        from yuki.voice.reflex import act_state, refused_first, runnable
-
-        entry, args = rec["entry"], dict(rec["args"])
-        tool = str(entry["tool"])
-        closed = getattr(hands, "_game_closed", None)
-        game = closed() if callable(closed) else ""
-        if game:
-            return False, "", {"skipped": "game"}
-        if getattr(self, "one", False):
-            # review fix M3: under one every act passes the one gate first (a game in front, the Act switch, the row);
-            # anything but an allow runs nothing and the agent does the turn
-            why = self._reflex_one_gate(tool, args, rec)
-            if why:
-                return False, "", {"skipped": why}
-        if tool in ("window", "scroll"):
-            # the window in front read now only for a reflex learned on it (a scroll, a minimise of what was in front)
-            front = (hands._foreground() if (entry.get("target") or {}).get("front")
-                     and callable(getattr(hands, "_foreground", None)) else None)
-            args, why = runnable(entry, getattr(hands, "last", None), volume_skill=bool(rec.get("volume")),
-                                 foreground=front)
-            if args is None:
-                return False, "", {"skipped": why}
-            rec["hwnd"] = int(args["window"])
-        halted = getattr(hands, "halted", None)
-        if halted:
-            # review r2 M2: a halt set since the words were heard (_reflex_block): nothing is tried through it (after
-            # lane lVoice's merge it could take the previous turn's one retry); the talker does the turn
-            return False, "", {"skipped": "halted"}
-        turns = self.observer.user_turns
-        hand_id = hands._mint_hand_id(None, key=rec["turn_key"])
-        ok, report, facts = False, "", {}
-        try:
-            if tool == "run_skill":
-                ok, report, facts = hands._skill_hand(args, hand_id, rec["turn_key"], bracket=False)
-                for name in ("_prefs", "_values", "_tried", "_words"):
-                    facts.pop(name, None)
-            else:
-                ok, report, facts = hands._acting_run(tool, args, hand_id, bracket=False)
-            if refused_first(facts):
-                # review r2 M2: refused before anything went out (a halt set meanwhile, a game, the thinker on the
-                # desktop, a check): nothing was tried, so it is a skip (no action-log line, no step, no trace, no
-                # note), never a failure the talker is told about
-                facts["skipped"] = "halted" if facts.get("halted") or getattr(hands, "halted", None) else "refused"
-        finally:
-            # review r1 M2: the hands' halt this act set is undone only when nothing went out (the talker's own try
-            # runs then); an act sent but not seen to take effect keeps it (as on main: never pressed twice). Review r1
-            # L6: only the halt this act set (a new user turn in between cleared it: left as it is)
-            after = getattr(hands, "halted", None)
-            if act_state(tool, ok, facts) == "failed" and after is not None and after != halted:
-                try:
-                    if getattr(hands, "halted", None) == after:
-                        # a user turn that began meanwhile cleared the halt from before: none comes back
-                        hands.halted = halted if self.observer.user_turns == turns else None
-                except Exception:  # noqa: BLE001 - bookkeeping only
-                    pass
-        return ok, report, facts
-
-    async def _reflex_run(self, rec: dict[str, Any]) -> None:
-        """Run one reflex and keep what it did: the shared action log (the talker's and the thinker's "done on the
-        desktop"), the chat's step, the hand's trace, the turn's timing; a content-free ``reflex`` line."""
-        from yuki.voice.reflex import act_state, book
-
-        hands = self.bridge.hands
-        tool = str(rec["entry"]["tool"])
-        started = time.monotonic()
-        try:
-            ok, report, facts = await asyncio.to_thread(self._reflex_act, hands, rec)
-        except Exception as exc:  # noqa: BLE001 - a crash is a reflex that did not get there
-            ok, report, facts = False, f"{type(exc).__name__}", {"error": True}
-        ms = round((time.monotonic() - started) * 1000)
-        skipped = facts.get("skipped")
-        verified = bool(ok and (facts.get("verified") is True or (tool == "scroll" and facts.get("expected"))))
-        # review r1 M2: "sent" (it went out, its effect not seen in time) is never "failed": the talker never repeats it
-        state = act_state(tool, ok, facts)
-        rec.update(state=state, verified=verified, report=str(report or "")[:400], facts=facts,
-                   done_at=time.monotonic(), ms=ms, sent_at=facts.get("sent_at"))
-        # phase 2.3 (aResolve merge note): a skill's non-success report ends with its Evidence line; the action log and
-        # the step strip keep only the first line (``rec["report"]``, the talker's, keeps it whole)
-        first_line = str(report or "").split("\n", 1)[0] if tool == "run_skill" else str(report or "")
-        if not skipped:
-            try:
-                hands.actions.add("your reflex", rec["what"], first_line[:400], ok=bool(ok),
-                                  verified=facts.get("verified"))
-            except Exception as exc:  # noqa: BLE001 - a record only, never the reflex's result (content-free log)
-                try:
-                    self.log.event("reflex", op="record_error", session=self.session, tool=tool,
-                                   ledger_error=type(exc).__name__)
-                except Exception:  # noqa: BLE001 - logging never breaks a reflex
-                    pass
-            on_step = getattr(hands, "on_step", None)
-            if callable(on_step):
-                try:
-                    on_step(tool, rec["what"], verified, first_line[:400], ms)
-                except Exception:  # noqa: BLE001 - the screen never breaks a hand
-                    pass
-            if tool != "run_skill" and callable(getattr(hands, "_trace", None)):
-                try:   # practice memory sees it as a hand of the voice's (the skill engine keeps its own ledger)
-                    hands._trace(tool, dict(rec["args"]), ok=bool(ok), verified=facts.get("verified"),
-                                 report=str(report or ""), facts=facts, ms=ms, call=None)
-                except Exception:  # noqa: BLE001
-                    pass
-        if state == "done":
-            # lane lVoice's hook (probed): Hands.handle answers the talker's own call for this same step as already
-            # done for its REFLEX_SAME_S, across the turn count that moves at the final transcript. Only for an effect
-            # seen: one sent but not seen is never called done (_reflex_dup answers that call "not seen")
-            hook = getattr(hands, "reflex_done", None)
-            if callable(hook):
-                try:
-                    hook(tool, {**rec["args"], **({"window": int(rec["hwnd"])} if rec.get("hwnd") else {})})
-                except Exception:  # noqa: BLE001 - bookkeeping only
-                    pass
-        if state in ("done", "settled"):
-            book().used(rec["key"])
-            self._reflex_save(soft=True)
-        if state in self.REFLEX_WENT and not rec.get("dropped"):
-            self._reflex_last = {"at": rec["done_at"], "key": rec["key"], "sig": rec["entry"]["sig"],
-                                 "what": rec["what"], "words": rec["text"], "start": rec["start"]}
-        if rec.get("reached"):
-            self._reflex_note(rec)   # review r1 M3: its turn was counted while it ran: its step goes in now
-        self._reflex_mark(rec)
-        end, _how = self.observer._end_of_speech(started)
-        sent = facts.get("sent_at") if isinstance(facts.get("sent_at"), (int, float)) else None
-        self.log.event("reflex", op="acted", session=self.session, tool=tool, ok=bool(ok), verified=verified,
-                       state=state, skipped=skipped or None, ms=ms, eager=rec["eager"],
-                       eos_to_start_ms=round((started - end) * 1000) if end else None,
-                       eos_to_sent_ms=round((sent - end) * 1000) if end and sent else None,
-                       eos_to_done_ms=round((rec["done_at"] - end) * 1000) if end else None)
-
-    def _reflex_mark(self, rec: dict[str, Any]) -> None:
-        """The user turn of the reflex's words gets its outcome and act time (now, or when it opens)."""
-        turn = rec.get("turn")
-        if turn is None:
-            return
-        state = str(rec.get("state") or "")
-        turn.reflex = f"skipped:{(rec.get('facts') or {}).get('skipped')}" if state == "skipped" else state
-        sent = rec.get("sent_at")
-        turn.reflex_at = sent if isinstance(sent, (int, float)) else rec.get("done_at")
-        if state in self.REFLEX_WENT and turn.reflex_at is not None and turn.action_at is None:
-            turn.action_at = turn.reflex_at   # the turn's end of speech -> action is the reflex's
-        if "reflex" not in turn.tools:
-            turn.tools.append("reflex")
-
-    def _reflex_mark_turn(self, turn: Any) -> None:
-        """A user turn opened from a final transcript (the observer): the reflex of its words, if any, marks it."""
-        rec = self._reflex
-        if rec is None or getattr(turn, "trigger", None) != "user" or rec.get("start") != self._reflex_start():
-            return
-        rec["turn"] = turn
-        if rec.get("state") != "running":
-            self._reflex_mark(rec)
-
-    async def _reflex_wait(self) -> None:
-        """Before a talker call for the user's words: a reflex still running for them is waited for, at most
-        ``voice_reflex_wait_s``, so the call is told whether it is done (and then only speaks)."""
-        rec = self._reflex
-        if rec is None or rec.get("state") != "running" or rec.get("start") != self._reflex_start():
-            return
-        task = rec.get("task")
-        wait_s = float(getattr(self.settings, "voice_reflex_wait_s", 0.45) or 0.0)
-        if task is None or wait_s <= 0:
-            return
-        started = time.monotonic()
-        await asyncio.wait({task}, timeout=wait_s)
-        rec["waited_ms"] = round((time.monotonic() - started) * 1000)
-        self.log.event("reflex", op="talker_waited", session=self.session, ms=rec["waited_ms"],
-                       state=rec.get("state"))
-
-    def _reflex_note(self, rec: dict[str, Any]) -> None:
-        """Review r1 M3: the reflex's act goes into the hands' list of this user turn's steps (``Hands._note_call``:
-        the thinker's list of steps, and the claim gate's "something was asked").
-        Only once the observer counted the turn of its words (``reached``),
-        never at the eager end of turn (the hands' turn is still the one before), and only for an act that went out.
-        Once per reflex."""
-        if rec.get("noted") or not rec.get("reached") or rec.get("state") not in self.REFLEX_WENT:
-            return
-        rec["noted"] = True
-        hands = getattr(self.bridge, "hands", None)
-        args = dict(rec.get("args") or {})
-        if rec.get("hwnd"):
-            args["window"] = int(rec["hwnd"])   # the window it acted on (picked again when it ran)
-        hook = getattr(hands, "_note_call", None)
-        if callable(hook):
-            try:
-                hook(str(rec["entry"]["tool"]), args)
-            except Exception:  # noqa: BLE001 - bookkeeping only
-                pass
-        if rec.get("state") == "sent" and not rec.get("changed") and hands is not None:
-            # review r1 M2: sent but not seen to take effect halts the hands for this turn, as a talker hand's would
-            # (Hands._run). Acting at the eager end of turn, that halt was cleared when the final transcript opened the
-            # turn (Hands.new_user_turn), so it is set again here, once the turn is counted. Not when they went on
-            # after the pause: what they said next may be a request of its own. Through lane lVoice's
-            # ``Hands._halt_now`` when it is there (its one retry on another target keeps its bookkeeping).
-            try:
-                if getattr(hands, "halted", None) is None:
-                    tool = str(rec["entry"]["tool"])
-                    report = " ".join(str(rec.get("report") or "").split())
-                    halt_now = getattr(hands, "_halt_now", None)
-                    if callable(halt_now):
-                        halt_now(tool, args, report)
-                    else:
-                        hands.halted = f"{tool}: {report[:160]}"
-            except Exception:  # noqa: BLE001 - bookkeeping only
-                pass
-
-    def _reflex_state(self) -> dict[str, Any] | None:
-        """The reflex of the words being answered, for the talker's volatile block (``mouth.REFLEX_NOTES``), or
-        ``None``: its state, what it did, its report, and whether they went on talking after the pause it acted on.
-        Review r1 L3: only in the runs their own words started, and at most :attr:`REFLEX_DUP_S` after it acted (a
-        thinker's result arriving later is not told it again)."""
-        rec = self._reflex
-        if rec is None or rec.get("start") != self._reflex_start() or rec.get("state") == "skipped":
-            return None
-        call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
-        if call is not None and not getattr(call, "user_turn", True):
-            return None
-        if time.monotonic() - float(rec.get("done_at") or rec.get("at") or 0.0) > self.REFLEX_DUP_S:
-            return None
-        return {"state": rec.get("state"), "what": rec.get("what") or "",
-                "report": " ".join(str(rec.get("report") or "").split())[:240], "changed": bool(rec.get("changed"))}
-
-    # -- review fix M3: the sound reflexes under brain = "one" ---------------------------------------------------------
-
-    @staticmethod
-    def _reflex_one_tool(entry: Any) -> bool:
-        """A reflex that may run under one (:data:`ONE_REFLEX_TOOLS`): a media key, an app's volume, the volume skill."""
-        from yuki.voice.reflex import VOLUME_SKILL
-
-        entry = entry if isinstance(entry, dict) else {}
-        tool = str(entry.get("tool") or "")
-        if tool not in ONE_REFLEX_TOOLS:
-            return False
-        if tool == "run_skill":
-            return str((entry.get("args") or {}).get("skill") or "") == VOLUME_SKILL
-        return True
-
-    def _reflex_one_gate(self, tool: str, args: dict[str, Any], rec: dict[str, Any]) -> str:
-        """Blocking (the reflex's worker thread): the one gate's decision for a learned reflex's act under one, on its
-        own gate turn (``OneVoice.reflex_turn``): ``""`` when it allows, else why nothing runs (the agent does the
-        turn). Never raises."""
-        one = getattr(self, "one_driver", None)
-        if one is None:
-            return "one_gate"
-        try:
-            from yuki.one import policy
-
-            target: dict[str, Any] = {}
-            if tool == "run_skill":
-                try:
-                    from yuki.skills.catalog import load
-
-                    target["app"] = str(getattr(load().get(str(args.get("skill") or "")), "app", "") or "")
-                except Exception:  # noqa: BLE001 - the gate reads the skill itself
-                    pass
-            decision = policy.gate(tool, dict(args), target, one.reflex_turn(str(rec.get("text") or "")))
-        except Exception as exc:  # noqa: BLE001 - fail closed: nothing runs
-            self.log.event("reflex", op="gate", session=self.session, tool=tool, error=type(exc).__name__)
-            return "gate"
-        if getattr(decision, "allowed", False):
-            return ""
-        self.log.event("reflex", op="gate", session=self.session, tool=tool, verdict=getattr(decision, "kind", None),
-                       reason=getattr(decision, "reason", None))
-        return "gate"
-
-    async def _reflex_one_dup(self, name: str, args: dict[str, Any]) -> dict[str, Any] | None:
-        """The ONE agent's call is the sound reflex's own for these words (the same call by its identity, or the same
-        kind of call when the reflex acted on no app by name), as :meth:`_reflex_dup` reads it for the talker: its
-        result stands for the call (``OneVoice.handle``), nothing is pressed twice. ``None``: no reflex ran for these
-        words, it did not get there (the agent's own call runs), or this is another call."""
-        if not getattr(self, "one", False):
-            return None
-        from yuki.voice.reflex import shape_of, target_of
-
-        rec = self._reflex
-        if rec is None or rec.get("state") in ("skipped", "failed") or rec.get("start") != self._reflex_start():
-            return None
-        entry = rec.get("entry") or {}
-        if name != entry.get("tool") or not self._reflex_one_tool(entry):
-            return None
-        a = args if isinstance(args, dict) else {}
-        hands = getattr(self.bridge, "hands", None)
-        shape = shape_of(name, a, snap=getattr(hands, "last", None), volume_skill=bool(rec.get("volume")))
-        same = shape is not None and shape.sig == entry.get("sig")
-        kind = (not same and not rec.get("changed") and not target_of(entry)
-                and (name != "run_skill" or str(a.get("skill") or "") == str((rec.get("args") or {}).get("skill") or "")))
-        if not same and not kind:
-            return None
-        task = rec.get("task")
-        if rec.get("state") == "running" and task is not None:
-            await asyncio.wait({task}, timeout=self.REFLEX_DUP_WAIT_S)
-        state = rec.get("state")
-        fresh = state == "running" or time.monotonic() - float(rec.get("done_at") or 0.0) <= self.REFLEX_DUP_S
-        if not fresh or state not in self.REFLEX_LIVE:
-            return None
-        from yuki.voice.mouth import (REFLEX_DUP_RUNNING, REFLEX_DUP_SAID, REFLEX_DUP_SETTLED, REFLEX_DUP_SILENT,
-                                      REFLEX_DUP_UNSEEN)
-
-        report = str(rec.get("report") or "")[:700]
-        self.log.event("reflex", op="dup_skipped", session=self.session, tool=name, state=state, one=True)
-        if state == "sent":
-            # it went out once and was not seen to take effect: never a second press (a toggle would undo it)
-            return {"status": "not_confirmed", "verified": None, "result": report, "note": REFLEX_DUP_UNSEEN,
-                    "owed": ONE_NOT_CONFIRMED_LINE}
-        if state == "running":
-            return {"status": "starting", "verified": None, "result": "still being done", "note": REFLEX_DUP_RUNNING,
-                    "_no_owe": True}
-        if state == "settled":
-            return {"status": "no_change", "verified": None, "result": report, "note": REFLEX_DUP_SETTLED,
-                    "_no_owe": True}
-        line = (str((rec.get("facts") or {}).get("done_line") or "") if name == "run_skill"
-                else " ".join(str(a.get("say_when_done") or "").split()))
-        said = ""
-        if line and not rec.get("said"):
-            said = rec["said"] = line
-            await self._speak_result([line])
-        return {"status": "done", "verified": True, "result": report, "said": said,
-                "note": REFLEX_DUP_SAID if said else REFLEX_DUP_SILENT}
-
-    async def _reflex_dup(self, params: Any) -> bool:
-        """The talker's call is the reflex's own for these words (the same call by its identity, or the same window and
-        operation): it is skipped, its done line said by code as a verified hand's is, and the call settled with no
-        talker run. ``False`` when the reflex did not get there (the talker's own try runs) or this is another call."""
-        from yuki.voice.reflex import REFLEX_TOOLS, shape_of, target_of
-
-        rec = self._reflex
-        name = params.function_name
-        if rec is None or name not in REFLEX_TOOLS or rec.get("state") in ("skipped", "failed"):
-            return False
-        if rec.get("start") != self._reflex_start():
-            return False
-        args = params.arguments if isinstance(params.arguments, dict) else {}
-        hands = self.bridge.hands
-        shape = shape_of(name, args, snap=getattr(hands, "last", None), volume_skill=bool(rec.get("volume")))
-        same = shape is not None and shape.sig == rec["entry"].get("sig")
-        if not same and name == rec["entry"].get("tool") and name in ("window", "scroll") and rec.get("hwnd"):
-            field_ = "action" if name == "window" else "direction"
-            try:
-                same = (int(args.get("window")) == rec["hwnd"]
-                        and str(args.get(field_) or ("down" if name == "scroll" else "")) == str(rec["args"].get(field_)))
-            except (TypeError, ValueError):
-                same = False
-        kind = (not same and not rec.get("changed") and not target_of(rec["entry"])
-                and name == rec["entry"].get("tool")
-                and (name != "run_skill" or str(args.get("skill") or "") == str(rec["args"].get("skill") or "")))
-        # ``kind``: the same kind of call for the same words, another target or value, when the reflex acts on no app
-        # by name (a media key, the PC's own volume, the window in front): the talker's other reading of words the
-        # reflex already did as they got it before (live sim: "mute the piece" -> run_skill volume on the app playing
-        # after the reflex muted the PC). Review r1 M1: never when the reflex acted on an app by name: then the
-        # talker's call for another app is its own and runs
-        if not same and not kind:
-            return False
-        task = rec.get("task")
-        if rec.get("state") == "running" and task is not None:
-            await asyncio.wait({task}, timeout=self.REFLEX_DUP_WAIT_S)
-        state = rec.get("state")
-        # review r2 L1: still running after the wait (a cold open, the Spotify slider's warm-up): its call is never run
-        # a second time beside it (the reflex is in neither of the hands' in-flight lists)
-        fresh = state == "running" or time.monotonic() - float(rec.get("done_at") or 0.0) <= self.REFLEX_DUP_S
-        if not fresh or state not in self.REFLEX_LIVE:
-            # failed or skipped (nothing went out: the talker's own try runs), or long ago. Sent but not seen: the same
-            # call, and another reading of the same kind (a playpause with no want after the reflex's pause would
-            # toggle it back), is never pressed a second time (review r1 M2)
-            return False
-        from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
-
-        from yuki.voice.mouth import (REFLEX_DUP_RUNNING, REFLEX_DUP_SAID, REFLEX_DUP_SETTLED, REFLEX_DUP_SILENT,
-                                      REFLEX_DUP_UNSEEN)
-
-        said = ""
-        if state == "done":
-            line = (str((rec.get("facts") or {}).get("done_line") or "") if name == "run_skill"
-                    else " ".join(str(args.get("say_when_done") or "").split()))
-            if line and not rec.get("said"):
-                try:
-                    await params.llm.push_frame(TTSSpeakFrame(text=line))
-                    said = rec["said"] = line
-                except Exception:  # noqa: BLE001 - not said: the call settles as silent
-                    said = ""
-        self.log.event("reflex", op="dup_skipped", session=self.session, tool=name, said=bool(said), state=state,
-                       call=params.tool_call_id)
-        hook = getattr(hands, "call_skipped", None)
-        if callable(hook):
-            # a hands-side queue of a reply's calls (lane lVoice, probed) is told this call never reaches Hands.handle
-            # (the reflex's own act is in the turn's steps already: _reflex_note, review r1 M3)
-            try:
-                hook(params.tool_call_id)
-            except Exception:  # noqa: BLE001 - bookkeeping only
-                pass
-        if state == "sent":
-            # review r1 M2: it went out once and was not seen to take effect: never a second press (a toggle would undo
-            # it, a skip would skip two); the talker tells them or hands it over
-            await params.result_callback({"not_verified": str(rec.get("report") or "")[:700], "sent_again": False,
-                                          "how_to_handle_it": REFLEX_DUP_UNSEEN})
-            return True
-        if state == "running":
-            # review r2 L1: never "done": the talker may say it is under way
-            await params.result_callback({"not_verified": "still being done", "started_again": False,
-                                          "how_to_handle_it": REFLEX_DUP_RUNNING})
-            return True
-        if state == "settled":
-            # review r2 L3: no change was seen and nothing more can happen: the report, never the done line
-            await params.result_callback({"not_changed": str(rec.get("report") or "")[:700], "tried_again": False,
-                                          "how_to_handle_it": REFLEX_DUP_SETTLED})
-            return True
-        await params.result_callback({"done": str(rec.get("report") or "")[:700], "said": said,
-                                      "how_to_handle_it": REFLEX_DUP_SAID if said else REFLEX_DUP_SILENT},
-                                     properties=FunctionCallResultProperties(run_llm=False))
-        return True
-
-    def _reflex_act_seen(self) -> None:
-        """An acting call (a hand, a skill, a hand-off) was made for the words being answered: counted, so a turn
-        where more than one thing was done is never kept as a reflex."""
-        meta = self._reflex_turns.get(self._reflex_start())
-        if meta is not None:
-            meta["acts"] = int(meta.get("acts") or 0) + 1
-
-    def _reflex_watch(self, params: Any) -> Any:
-        """A talker hand about to run: counted for its turn, and when it may be learned (one of the reflex hands, in
-        the run the user's own words started, not an answer to Yuki's question nor while a task waits), its result is
-        watched: verified done makes it this turn's candidate (:meth:`_reflex_finalize` keeps it)."""
-        if not self._reflex_on():
-            return params
-        from yuki.voice.reflex import REFLEX_TOOLS, shape_of
-
-        start = self._reflex_start()
-        self._reflex_act_seen()
-        meta = self._reflex_turns.get(start)
-        name = params.function_name
-        if meta is None or name not in REFLEX_TOOLS or meta.get("asked") or meta.get("job") or meta.get("reflexed"):
-            return params
-        if self._reflex_test():
-            # xGlue (lBrain's merge note, the lead's call): a live test session never teaches the book; nothing is
-            # watched, so no naming check (a model call) runs for it either
-            if not meta.get("test_logged"):
-                meta["test_logged"] = True
-                self.log.event("reflex", op="not_learned", session=self.session, tool=name, why="test_session")
-            return params
-        call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
-        user_run = (bool(getattr(call, "user_turn", False)) if call is not None
-                    else _last_role(getattr(params, "context", None)) == "user")
-        if not user_run:
-            return params   # a run a result started (as the bridge's user_turn reads it): not the turn's own call
-        from yuki.voice.reflex import words_key
-
-        key = str(meta.get("key") or "")
-        heard = words_key(_answered_words(getattr(params, "context", None)))
-        if meta.get("multi") or (key and heard != key and heard.endswith(" " + key)):
-            # review r1 M1: the reply answers more than these words (an earlier utterance it never answered: "Spotify."
-            # then "pause it"): the call is never kept for the last words alone
-            meta["multi"] = True
-            if not meta.get("multi_logged"):
-                meta["multi_logged"] = True
-                self.log.event("reflex", op="not_learned", session=self.session, tool=name, why="multi_utterance")
-            return params
-        hands = self.bridge.hands
-        shape = shape_of(name, params.arguments, snap=getattr(hands, "last", None), volume_skill=self._reflex_volume())
-        if shape is None:
-            return params
-        original = params.result_callback
-
-        async def watched(result: Any, *, properties: Any = None) -> None:
-            try:
-                self._reflex_result(start, shape, result)
-            except Exception as exc:  # noqa: BLE001 - learning never breaks a hand
-                self.log.event("reflex", op="error", error=f"{type(exc).__name__}: {str(exc)[:160]}")
-            await original(result, properties=properties)
-
-        try:
-            import dataclasses
-
-            return dataclasses.replace(params, result_callback=watched)
-        except Exception:  # noqa: BLE001 - a stand-in params object
-            params.result_callback = watched
-            return params
-
-    def _reflex_result(self, start: float, shape: Any, result: Any) -> None:
-        """A watched hand's result: verified done for the whole of it (no "then" left, nothing passed on) makes it the
-        turn's candidate, kept when nothing else is done for the turn (:attr:`REFLEX_SETTLE_S`, or their next words)."""
-        if not isinstance(result, dict) or "done" not in result or result.get("then") or result.get("passed_on"):
-            return
-        meta = self._reflex_turns.get(start)
-        if meta is None or meta.get("cand") is not None:
-            return
-        from yuki.voice.reflex import aim_of, describe, named_by_code
-
-        entry = shape.as_entry()
-        cand: dict[str, Any] = {"shape": shape, "at": time.monotonic(), "what": describe(entry)}
-        meta["cand"] = cand
-        if not named_by_code(str(meta.get("key") or ""), entry):
-            # review r1 M1, r2 M1: every call but a transport key or a window/scroll on the window in front is kept
-            # only when their words alone say what it acts on (an app, the PC, or whatever plays); unless the app's own
-            # name is among them, a small model judges it while the hand settles (no verdict by the time it is kept:
-            # not kept this time). "Turn it up" after "turn Discord down" is never kept as "turn up what plays"
-            cand["names"] = asyncio.ensure_future(self._reflex_names(cand["what"], aim_of(entry),
-                                                                     str(meta.get("text") or "")))
-        loop = self._loop
-        if loop is not None and not loop.is_closed():
-            loop.call_later(self.REFLEX_SETTLE_S, self._reflex_finalize, start)
-
-    async def _reflex_names(self, did: str, target: str, words: str) -> bool | None:
-        """Review r1 M1, r2 M1: whether ``words`` alone say what the call acted on (``target``, ``reflex.aim_of``; a
-        model's judgement; ``None``: no client, no verdict)."""
-        from yuki.voice.reflex import names_request, names_verdict
-
-        client = getattr(self, "_client", None)
-        if client is None:
-            return None
-        s = self.settings
-        model = str(getattr(s, "voice_router_model", "") or s.voice_mouth_model)
-        verdict, ms, error = await names_verdict(client, names_request(model, did=did, target=target, words=words))
-        self.log.event("reflex", op="names_judged", session=self.session, names_it=verdict, ms=ms, error=error)
-        return verdict
-
-    def _reflex_finalize(self, start: float) -> None:
-        """Keep a turn's candidate: only when it was the one thing done for that turn. The book says whether it is new,
-        the same call again, or ambiguous (the words mapped to another call before: dropped for good)."""
-        meta = self._reflex_turns.get(start)
-        if meta is None or meta.get("cand") is None or meta.get("kept"):
-            return
-        cand = meta["cand"]
-        from yuki.voice.reflex import book
-
-        why = ""
-        names = cand.get("names")
-        if self._reflex_test():
-            why = "test_session"   # xGlue: never learned from a live test session (a backstop; the watch skips it)
-        elif int(meta.get("acts") or 0) != 1:
-            why = "more_than_one"
-        elif meta.get("multi"):
-            why = "multi_utterance"   # review r1 M1: the reply answered more than these words
-        elif names is not None and not (names.done() and not names.cancelled() and names.exception() is None
-                                        and names.result() is True):
-            why = "target_not_named" if names.done() else "naming_pending"   # review r1 M1
-        if why:
-            meta["kept"] = why
-            if names is not None and not names.done():
-                names.cancel()
-            self.log.event("reflex", op="not_learned", session=self.session, tool=cand["shape"].tool,
-                           why=why, acts=int(meta.get("acts") or 0))
-            return
-        got = book().learn(meta["key"], cand["shape"], src="talker")
-        meta["kept"] = got
-        entry = book().get(meta["key"])
-        self.log.event("reflex", op="learned", session=self.session, tool=cand["shape"].tool, result=got,
-                       n=int((entry or {}).get("n") or 0))
-        if got in ("new", "again", "ambiguous"):
-            self._reflex_save()
-        if got in ("new", "again"):
-            self._reflex_last = {"at": cand["at"], "key": meta["key"], "sig": cand["shape"].sig, "what": cand["what"],
-                                 "words": meta.get("text") or "", "start": start}
-
-    def _reflex_turn(self, words: str) -> None:
-        """The user's final words reached the talker (``_turn_reached``): earlier turns' candidates are kept now (their
-        turn is over), a reflex run or kept just before these words is checked for a correction in them (a model's
-        judgement, in the background), and these words' learning state starts."""
-        if not self._reflex_on():
-            return
-        from yuki.voice.reflex import words_key
-
-        self._reflex_load()   # review r1 M4: a first read that failed is tried again (at most every 30 s)
-        start = self._reflex_start()
-        others = [s for s in self._reflex_turns if s != start]
-        for other in others:
-            self._reflex_finalize(other)
-        now = time.monotonic()
-        last = self._reflex_last
-        window = float(getattr(self.settings, "voice_reflex_correct_s", 20.0) or 0.0)
-        if last is not None and last.get("start") != start:
-            self._reflex_last = None   # judged once, by the next words only
-            if now - float(last.get("at") or 0.0) <= window:
-                asyncio.ensure_future(self._reflex_judge(last, words, now - float(last["at"])))
-        rec = self._reflex
-        reflexed = bool(rec is not None and rec.get("start") == start
-                        and rec.get("state") in self.REFLEX_LIVE)
-        if rec is not None and rec.get("start") == start:
-            # review r1 M3: the observer counted this turn: the reflex's act goes into the hands' steps of it now (or
-            # when it finishes)
-            rec["reached"] = True
-            self._reflex_note(rec)
-        job = False
-        try:
-            job = bool(self.bridge.has_open_voice_job())
-        except Exception:  # noqa: BLE001
-            job = True
-        if start not in self._reflex_turns:
-            # review r1 M1: the utterance before this one never got a reply (no words, no call): this reply answers
-            # both, so nothing it does is kept for these words alone
-            prev = self._reflex_turns.get(others[-1]) if others else None
-            told = (prev or {}).get("obs_turn")
-            multi = bool(told is not None and not (getattr(told, "responses", 0) or getattr(told, "tools", None)
-                                                   or "".join(getattr(told, "reply", None) or []).strip()))
-            self._reflex_turns[start] = {"key": words_key(words), "text": words, "asked": self._asked_last(),
-                                         "job": job, "acts": 0, "cand": None, "reflexed": reflexed, "multi": multi,
-                                         "obs_turn": getattr(self.observer, "turn", None)}
-        while len(self._reflex_turns) > self.REFLEX_TURNS:
-            self._reflex_turns.pop(next(iter(self._reflex_turns)))
-
-    async def _reflex_judge(self, last: dict[str, Any], later: str, secs: float) -> None:
-        """Their next words after a reflex ran (or a hand was kept as one): a small model call judges whether they
-        correct it. A correction drops that entry; only one where they plainly said no, complained or said it was wrong
-        gives its call a strike against those words (review r1 H1: barred for ``reflex.BAD_HOLD_S``, for good at the
-        second; review r2 M3: the opposite asked for, play after a pause, is a new request). ``last["same_breath"]``
-        (review r1 M5): the words they went on to say after the pause a reflex acted on; a correction there drops the
-        entry with no strike (the words before the pause may still be right for that call)."""
-        from yuki.voice.reflex import book, correction_request, correction_verdict
-
-        client = getattr(self, "_client", None)
-        if client is None:
-            return
-        s = self.settings
-        same_breath = bool(last.get("same_breath"))
-        model = str(getattr(s, "voice_router_model", "") or s.voice_mouth_model)
-        request = correction_request(model, did=last.get("what") or "", words=last.get("words") or "", later=later,
-                                     secs=secs, same_breath=same_breath)
-        verdict, wrong, ms, error = await correction_verdict(client, request)
-        self.log.event("reflex", op="judged", session=self.session, correction=verdict, said_wrong=wrong, ms=ms,
-                       error=error, after_s=round(secs, 1), same_breath=same_breath or None)
-        if verdict is True:
-            # review r2 M3: only a plain no or complaint strikes the call; another correction (the same target asked
-            # for another way with no complaint) drops the entry only
-            gone = book().drop(last["key"], last.get("sig"), strike=wrong and not same_breath)
-            if same_breath:
-                rec = self._reflex
-                if rec is not None and rec.get("start") == last.get("start"):
-                    rec["dropped"] = True   # its run, if still going, sets no correction check of its own
-                held = self._reflex_last
-                if held is not None and held.get("start") == last.get("start") and held.get("key") == last["key"]:
-                    self._reflex_last = None
-            self._reflex_save()
-            self.log.event("reflex", op="dropped", session=self.session,
-                           why="changed_in_breath" if same_breath else "corrected", was_entry=gone)
+        """The hands' ``words``: the user's final utterances (the hands' checks and a skill's resolver read them)."""
+        return list(self.observer.recent_words)
 
     def _on_activity(self) -> None:
         self._activity.set()
@@ -7802,7 +6690,6 @@ class Conversation:
                 "args": strip_tags(what) if isinstance(what, str) else what, "ok": ok, "result": report, "ms": ms})
             # v3.18: memory keeps the hands' run traces
             hands.memory = self.memory if getattr(self.settings, "voice_hand_traces", True) else None
-            # lSpeed: with a reflex running on the eager end of turn, its words count before their final transcript
             hands.words = self._hand_words
             # x3 (fix-plan 3a, IF-words): the turns of the current exchange, which the hands' commit check reads as
             # this request (probed by the hands: an older Hands has no such hook)
@@ -7833,7 +6720,7 @@ class Conversation:
         hands = getattr(self.bridge, "hands", None)
         if s.voice_hands and hands is not None and hasattr(hands, "prefetch_desk"):
             hands.prefetch_desk()   # the first reply's desktop block, read while they talk
-        self._reflex_load()   # lSpeed: the learned reflexes, read once per process off the loop
+        self._drop_old_reflexes()   # D2 (20 Oct): the retired reflex book's stored row, deleted once
         if s.voice_hands and hands is not None and callable(getattr(hands, "warm_check", None)):
             hands.warm_check()   # vRound2 review r1 M1: the commit check's model client, made off the loop (no call)
         tts = getattr(self, "_tts", None)
@@ -8851,16 +7738,12 @@ class Conversation:
         return out
 
     def _turn_reached(self, text: str) -> None:
-        """A final turn of the user's goes on to the talker (``FastPath``: not the name alone, not a dismissal): kept, with
-        when it was heard, for the current exchange (:meth:`_exchange_words`; x3, IF-words), then offered to the voice job
-        waiting for their answer (:meth:`_answer_turn`)."""
+        """A final turn of the user's goes on to the talker (``FastPath``: not the name alone): kept, with when it was
+        heard, for the current exchange (:meth:`_exchange_words`; x3, IF-words), then offered to the voice job waiting
+        for their answer (:meth:`_answer_turn`)."""
         words = " ".join(str(text or "").split())
         if not words:
             return
-        try:
-            self._reflex_turn(words)   # lSpeed: before the waiting job may claim it (its state is read here)
-        except Exception as exc:  # noqa: BLE001 - learning is a side path; the turn goes on
-            self.log.event("reflex", op="error", error=f"{type(exc).__name__}: {str(exc)[:160]}")
         self.observer.recent_heard.append((time.monotonic(), words))
         self._answer_turn(words)
 
@@ -8868,7 +7751,7 @@ class Conversation:
         """x3 (fix-plan 3g, IF-answer): the user's turn that reaches the talker goes to the voice job waiting for their
         answer (``VoiceBridge.answer_waiting``, Item 2; probed): it claims the turn and routes it unless the talker's own
         call for that turn says it is a new task or replaces the job. Live 10 Oct "Yeah." and "Yes." after "Did you mean
-        Hemanth?" never reached the job. The fast path's own turns (the name alone, a dismissal) never come here."""
+        Hemanth?" never reached the job. The fast path's own turn (the name alone) never comes here."""
         answer = getattr(self.bridge, "answer_waiting", None)
         if not callable(answer) or self.dormant or not " ".join(str(text or "").split()):
             return
@@ -8901,7 +7784,6 @@ class Conversation:
         name = params.function_name if params.function_name in HANDOFF_TOOLS else "tell_yuki"
         if await self._skip_left_out(params):
             return
-        self._reflex_act_seen()   # lSpeed: a hand-off for these words: no single hand is learned from them
         if self._held(name, params.tool_call_id):
             self.bridge.drop_early(str(params.tool_call_id))
             await self._hold(params)
@@ -8949,19 +7831,32 @@ class Conversation:
         if started:
             self.observer.handoff_started(time.monotonic())
 
-    # -- E3a (v3.17): the hand-off router ------------------------------------------------------------------------
+    # -- E3a (v3.17): the hand-off router; D1 (20 Oct): its end of the conversation by intent ----------------------
 
     def _route_turn(self, context: Any, call: Any) -> None:
         """The talker's call for the user's turn begins: the router decides alongside it whether the turn needs the
-        thinker (``voice_router``; yuki.voice.router). Not on words recognition was unsure of (a call may be held until
-        they answer), not while a voice task is open (a follow-up routes by that task's state), not while dormant."""
-        if not router_on(self.settings) or self.dormant or not getattr(call, "user_turn", False):
+        thinker (``voice_router``; yuki.voice.router) and, D1 (20 Oct, keyword audit A1), whether the user is ending
+        the conversation or calling off a send that counts down (``voice_router_end``, under every brain:
+        :meth:`_route_end`). Not while dormant; in a game or a call only on words said to Yuki by name (review F4),
+        but for the end any words while a send counts down (a wrong stop never sends). The hand-off: not on words
+        recognition was unsure of (a call may be held until they answer), not while a voice task is open (a follow-up
+        routes by that task's state). The end: not while anything else waits for their words or runs for them
+        (:meth:`_words_awaited`: then the words are the conversation's), but a send counting down comes first, so the
+        router judges a spoken stop of it even then (review L1; the end itself is still refused,
+        :meth:`_route_end_block`)."""
+        from yuki.voice.router import ends_on
+
+        handoff, ends = router_on(self.settings), ends_on(self.settings)
+        if not (handoff or ends) or self.dormant or not getattr(call, "user_turn", False):
             return
-        if self.focus and not self._utterance_named():
-            return   # vGame: in a game or a call only words said to Yuki by name start the thinker early (review F4)
-        if (self._reflex_state() or {}).get("state") in self.REFLEX_LIVE:
-            return   # lSpeed: a learned reflex has these words: the thinker is never started beside it (one that sent
-            #          nothing leaves the turn as usual)
+        named = self._utterance_named()
+        awaited = self._words_awaited() if ends else ""
+        if self.focus and not named:
+            # vGame: in a game or a call only words said to Yuki by name go to the router (review F4); while a send of
+            # theirs counts down, any words may call it off, so the router judges them for the end only
+            if awaited != "countdown":
+                return
+            handoff = False
         self._cancel_route()
         pending = getattr(self.bridge, "routed_job", None)
         if callable(pending) and pending() is not None:
@@ -8969,6 +7864,10 @@ class Conversation:
             self.log.event("router", op="withdrawn", why="new_run")
             self.bridge.drop_early(getattr(self.bridge, "ROUTE_KEY", "router"))
         if (self.observer.heard and not getattr(self.observer, "heard_plain", False)) or self.bridge.has_open_voice_job():
+            handoff = False
+        if awaited not in ("", "countdown"):
+            ends = False
+        if not (handoff or ends):
             return
         from yuki.voice.bridge import heard_words
         from yuki.voice.router import router_request
@@ -8997,18 +7896,29 @@ class Conversation:
         request = router_request(heard[-1], history=history, desk=getattr(snap, "text", None) or None,
                                  call=self.call_app,
                                  model=str(getattr(s, "voice_router_model", "") or s.voice_mouth_model),
-                                 skills=menu)
+                                 skills=menu, named=named, sending=awaited == "countdown")
         turn = self.observer.user_turns
-        self._router_task = asyncio.ensure_future(self._route(request, heard, context, call, turn))
+        # what this decision may still do: the talker's reply ending first voids its hand-off (:meth:`_reply_done`)
+        state = {"handoff": handoff, "ends": ends,
+                 "start": float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)}
+        self._route_state = state
+        self._router_task = asyncio.ensure_future(self._route(request, heard, context, call, turn, state))
 
-    async def _route(self, request: dict[str, Any], heard: list[str], context: Any, call: Any, turn: int) -> None:
+    async def _route(self, request: dict[str, Any], heard: list[str], context: Any, call: Any, turn: int,
+                     state: dict[str, Any] | None = None) -> None:
         from yuki.voice.bridge import spoken_words
         from yuki.voice.router import decide
 
+        state = state if state is not None else {"handoff": True, "ends": False, "start": 0.0}
         route = await decide(self._client, request)
         call.route, call.route_ms = route.to, route.ms
-        self.log.event("router", op="decided", to=route.to, screen=route.screen, ms=route.ms, error=route.error)
-        if route.to != "thinker":
+        self.log.event("router", op="decided", to=route.to, screen=route.screen, ms=route.ms, error=route.error,
+                       **({} if state["handoff"] else {"handoff": False}))
+        if route.to == "end":
+            if state["ends"]:
+                await self._route_end(float(state["start"]))
+            return
+        if route.to != "thinker" or not state["handoff"]:
             return
         llm = getattr(self, "_llm", None)
         waited = 0.0
@@ -9048,7 +7958,10 @@ class Conversation:
             self.bridge.drop_early(getattr(self.bridge, "ROUTE_KEY", "router"))
 
     def _reply_done(self, pending: bool) -> None:
-        """The talker's reply ended: a router start it did not take (it answered, used a hand, stayed quiet) is void."""
+        """The talker's reply ended: a router start it did not take (it answered, used a hand, stayed quiet) is void.
+        D1: a router decision still out that may end the conversation runs on (its end reads the reply itself: words
+        said or a call made keep the conversation, :meth:`_route_end_block`; a silent stay_quiet does not), but a late
+        "thinker" from it starts nothing."""
         if pending:
             return
         routed = getattr(self.bridge, "routed_job", None)
@@ -9061,10 +7974,199 @@ class Conversation:
         else:
             task = getattr(self, "_router_task", None)
             if task is not None and not task.done():
+                state = getattr(self, "_route_state", None)
+                if isinstance(state, dict) and state.get("ends"):
+                    state["handoff"] = False   # the talker answered first: a late "thinker" must start nothing
+                    return
                 task.cancel()   # the talker answered first: a late "thinker" must start nothing
                 self.log.event("router", op="cancelled", why="reply_first")
 
+    #: D1: the router's end waits at most this long for Flux's eager end of turn to be confirmed by the final words (s);
+    #: a speculation withdrawn (they went on talking) cancels the decision with the talker's call (``early_withdrawn``).
+    ROUTE_END_WAIT_S = 3.0
+
+    async def _route_end(self, start: float) -> None:
+        """D1 (20 Oct, keyword audit A1): the router's model judged that the user's words end the conversation (they
+        send Yuki away or sign off) or, while a send of theirs counts down, call it off. Once a speculative talker call
+        on the same words was confirmed (bounded): a send counting down is stopped at once, nothing sent, even when the
+        talker answered first (:meth:`_stop_sends`: a wrong stop never sends); then the conversation ends with no
+        goodbye, the end cue only, unless :meth:`_route_end_block` says why not (then the talker's own judgement
+        stands: its end_conversation ends it). ``start``: the start of speech of the words judged. Measured states
+        only, never the words; logged content-free."""
+        llm = getattr(self, "_llm", None)
+        waited = 0.0
+        while llm is not None and getattr(getattr(llm, "_speculation_gate", None), "is_speculating", False):
+            if waited >= self.ROUTE_END_WAIT_S:
+                self.log.event("router", op="end_skipped", session=self.session, why="unconfirmed")
+                return
+            await asyncio.sleep(0.02)
+            waited += 0.02
+        obs = self.observer
+        sending = self._words_awaited() == "countdown"
+        if sending and not self._stop.is_set() \
+                and float(getattr(obs, "_user_started_at", 0.0) or 0.0) == float(start):
+            self._stop_sends()
+        why = self._route_end_block(start, sending=sending)
+        if why:
+            self.log.event("router", op="end_skipped", session=self.session, why=why)
+            return
+        turn = obs.turn
+        obs.fast_handled("end")
+        now = time.monotonic()
+        self.log.event("router", op="end", session=self.session, call_mode=bool(self.call_app),
+                       game=bool(self.game_app), sending=sending or None,
+                       eos_to_end_ms=round((now - turn.speech_end) * 1000) if turn is not None and turn.speech_end
+                       else None)
+        self._end_cue_now()
+        self.log.event("session", state="end_asked", session=self.session, waited_ms=0, by="router")
+        self._set_stop("user_asked")
+
+    def _route_end_block(self, start: float, *, sending: bool = False) -> str:
+        """Why the router's end may not act now (a code word), else ``""``: the conversation is ending or dormant;
+        they spoke again or are speaking (a new start of speech, their voice just now); something now waits for their
+        words or runs for them (:meth:`_words_awaited`; a send counting down is ended with the conversation, never
+        sent, and with ``sending``, the send just stopped, so is the ONE runner call that held it); there is no user
+        turn open for the words; or the talker already answered them: Yuki is speaking or about to, its reply has
+        words, or it made a call other than stay_quiet. A send still counting down hides nothing else (review L1:
+        :meth:`_words_awaited` puts it first only for the router's judgement of a spoken stop): a hand at work, a
+        scroll, a call held for their answer or another task still refuses the end. Measured states only; never
+        raises."""
+        try:
+            if self._stop.is_set() or self.dormant:
+                return "stopping"
+            obs = self.observer
+            if float(getattr(obs, "_user_started_at", 0.0) or 0.0) != float(start):
+                return "spoke_again"
+            if obs.user_speaking or self._user_voiced(time.monotonic()):
+                return "speaking"
+            awaited = self._words_awaited()
+            if awaited == "countdown":
+                awaited = self._words_awaited(besides_send=True)
+            if awaited not in ("", "countdown") and not (sending and awaited == "running"):
+                return "awaited"
+            turn = obs.turn
+            if turn is None or turn.trigger != "user":
+                return "no_turn"
+            if obs.bot_speaking or obs.speech_pending or strip_tags("".join(turn.reply)).strip():
+                return "replied"
+            if [t for t in turn.tools if t != "stay_quiet"]:
+                return "acted"
+            return ""
+        except Exception:  # noqa: BLE001 - unsure: the talker's own judgement
+            return "unknown"
+
+    def _words_awaited(self, *, besides_send: bool = False) -> str:
+        """D1 / keyword audit A1: what waits for the user's next words or runs for them now (a code word), else ``""``.
+        ``"countdown"``: a send of theirs counting down (an "all" voice job's, ``VoiceBridge.awaiting_words``; under one
+        the countdown): their words decide it (the talker cancels it, the router may stop it), and an end never lets it
+        go. It comes first (review L1): the router judges a spoken stop of a send even while a hand works, a scroll
+        runs or a call is held. ``besides_send``: what else waits, the countdown left out (the router's end itself is
+        refused while anything does, :meth:`_route_end_block`). Anything else means their words are the
+        conversation's, for the talker (or the ONE agent) to judge, never the router's end: a voice task queued,
+        running or waiting for their answer ("cancel" may be that answer), a hand at work, a continuous scroll, a call
+        held until they answer (their first turn after it only, :meth:`_held_unanswered`), and under one a question of
+        the gate's or a runner call still running. Measured states only; unsure: ``"unknown"``. Never raises."""
+        try:
+            bridge = self.bridge
+            one = getattr(self, "one_driver", None)
+            if one is not None:
+                countdown = getattr(one, "_countdown", None)
+                if not besides_send and countdown is not None and countdown.counting:
+                    return "countdown"
+                if getattr(getattr(one, "turn", None), "asks", None):
+                    return "gate_asked"
+                if int(getattr(one, "_running", 0) or 0) > 0:
+                    return "running"
+            awaiting = getattr(bridge, "awaiting_words", None)
+            jobs = str(awaiting() or "") if callable(awaiting) else ("task" if bridge.has_open_voice_job() else "")
+            if jobs == "countdown" and not besides_send:
+                return jobs
+            if jobs and jobs != "countdown":
+                return jobs
+            if int(getattr(bridge, "busy_tools", 0) or 0) > 0:
+                return "hand"
+            if self._scrolling_line() is not None:
+                return "scroll"
+            if getattr(bridge, "held_call", None) is not None and self._held_unanswered(bridge):
+                return "held"
+            return ""
+        except Exception:  # noqa: BLE001
+            return "unknown"
+
+    def _held_unanswered(self, bridge: Any) -> bool:
+        """Review M1: whether the call the talker held until the user answers (``_hold``: doubtful words) still waits
+        for that answer, for the words judged now. The held call is cleared only when the bridge unbinds or on a second
+        stay_quiet, never when they answer, so its age alone (``voice_hold_max_s``, 600 s) kept every later turn of the
+        conversation "held". It waits through their first turn after it only: no final turn of theirs reached the
+        talker (``recent_heard``, :meth:`_turn_reached`) between the hold and the start of the speech judged now. That
+        start, not a count of turns, so an eager (speculative) call on their next words, whose own final is not in
+        yet, reads the same as its confirmed call. No time of the hold: held (unsure). Measured times only."""
+        at = getattr(bridge, "held_at", None)
+        if at is None:
+            return True
+        at = float(at)
+        if time.monotonic() - at > float(getattr(self.settings, "voice_hold_max_s", 600.0)):
+            return False
+        start = float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)
+        heard = list(getattr(self.observer, "recent_heard", ()) or ())
+        return not any(at < float(when) < start for when, _words in heard)
+
+    def _stop_sends(self) -> None:
+        """D1: the router judged that the user's words call off a send counting down (or send Yuki away while one
+        does): it is stopped at once, nothing sent. Under one the driver's countdown is cancelled (``OneVoice.
+        stop_send``); under all the bridge stops the job whose countdown is open (``VoiceBridge.stop_sends``). Logged
+        content-free. Never raises."""
+        one = getattr(self, "one_driver", None)
+        try:
+            if one is not None:
+                stopped = int(bool(one.stop_send()))
+            else:
+                stop = getattr(self.bridge, "stop_sends", None)
+                stopped = int(stop() or 0) if callable(stop) else 0
+        except Exception as exc:  # noqa: BLE001 - the held countdown never counts on past the end either way
+            self.log.event("router", op="send_stop_error", session=self.session, error=type(exc).__name__)
+            return
+        self.log.event("router", op="send_stopped", session=self.session, n=stopped)
+
+    def _end_cue_now(self) -> None:
+        """The end cue for an end with no goodbye said (``on_dismissed``: the session's soft end tone, the user's End
+        tone choice). Never raises."""
+        if self.on_dismissed is not None:
+            try:
+                self.on_dismissed()
+            except Exception:  # noqa: BLE001 - the cue is a courtesy; the end is not
+                pass
+
+    def _drop_old_reflexes(self) -> None:
+        """D2 (20 Oct, keyword audit A5): the reflex book is gone; its stored row is deleted once per process, off the
+        loop (the ordered worker the voice's memory writes go through), idempotently (:func:`drop_old_reflexes`; a
+        failure is tried again by a later conversation). Logged content-free: whether a row was there. Never raises."""
+        memory = self.memory
+        call = getattr(memory, "call", None) if memory is not None else None
+        if _OLD_REFLEXES["done"] or not callable(call):
+            return
+        _OLD_REFLEXES["done"] = True
+        log = self.log
+
+        def work() -> None:
+            try:
+                gone = bool(call("voice reflex drop", lambda c: drop_old_reflexes(c.store), timeout_s=3.0))
+            except Exception as exc:  # noqa: BLE001 - memory slow or away: a later conversation tries again
+                _OLD_REFLEXES["done"] = False
+                log.event("reflex", op="drop_error", error=type(exc).__name__)
+                return
+            log.event("reflex", op="dropped_store", removed=gone)
+
+        try:
+            from yuki.voice.workers import ordered
+
+            ordered().submit(work)
+        except Exception as exc:  # noqa: BLE001
+            _OLD_REFLEXES["done"] = False
+            log.event("reflex", op="drop_error", error=type(exc).__name__)
+
     def _cancel_route(self) -> None:
+        self._route_state = None
         task, self._router_task = getattr(self, "_router_task", None), None
         if task is not None and not task.done():
             task.cancel()
@@ -9121,15 +8223,11 @@ class Conversation:
             self.log.event("hands", op=params.function_name, thinker_holds=True, call=params.tool_call_id)
             await params.result_callback(dict(THINKER_HOLDS), properties=FunctionCallResultProperties(run_llm=False))
             return
-        if await self._reflex_dup(params):
-            # lSpeed: the reflex already did this very call for these words, checked: never twice (before the hold:
-            # the reflex acted on the exact words it learned, so nothing is left to ask about)
-            return
         if self._held(params.function_name, params.tool_call_id, params.arguments):
             await self._hold(params)
             return
         params = self._resent(params)
-        await self.bridge.hands.handle(self._reflex_watch(params))
+        await self.bridge.hands.handle(params)
 
     def _quiet_for(self) -> float:
         """Seconds since anyone spoke (Yuki, or the user by the mic or a transcript); 0 while someone speaks."""
@@ -9670,9 +8768,6 @@ class Conversation:
                 state["acted"] = acted
         if self._opened_by_hand():
             state["opened"] = True   # fTalk: the first words of a conversation they opened themselves (mouth.OPENED_NOTE)
-        reflex = self._reflex_state()
-        if reflex:
-            state["reflex"] = reflex   # lSpeed: the reflex that ran for these words (mouth.REFLEX_NOTES)
         return state
 
     def _dictating_now(self) -> dict[str, Any] | None:
@@ -9747,21 +8842,16 @@ class Conversation:
         """voice21 review M1: the turn's words already got an act, or one is on its way, so a quiet with it is the
         talker's "say nothing more" and never refused by :meth:`_opened_quiet` (its note says nothing answered them,
         which would ask for a second act: a playpause pressed again toggles back). Any of: an acting call of the turn
-        other than the reflex's mark (a hand, run_skill, a hand-off; the calls that never act, :data:`NOT_ACTING`,
-        do not count, nor ONE's reads); a call that closes it (end_conversation, go_quiet); a learned reflex for these
-        words that went through (``turn.reflex`` in :attr:`REFLEX_WENT`) or is still running
-        (:meth:`_reflex_state`); a hand acting now (``busy_tools``) or a task for these words whose outcome will be
+        (a hand, run_skill, a hand-off; the calls that never act, :data:`NOT_ACTING`, do not count, nor ONE's reads);
+        a call that closes it (end_conversation, go_quiet); a hand acting now (``busy_tools``) or a task for these
+        words whose outcome will be
         said (``VoiceBridge._answer_for_words``). Stream and job facts only, never the words. Never raises (unsure:
         acted, so the quiet stands)."""
         try:
             tools = list(getattr(turn, "tools", None) or ())
-            if [t for t in self._acting_tools(tools) if t not in NOT_ACTING and t != "reflex"]:
+            if [t for t in self._acting_tools(tools) if t not in NOT_ACTING]:
                 return True
             if "end_conversation" in tools or "go_quiet" in tools:
-                return True
-            if str(getattr(turn, "reflex", None) or "") in self.REFLEX_WENT:
-                return True
-            if (self._reflex_state() or {}).get("state") in self.REFLEX_LIVE:
                 return True
             bridge = getattr(self, "bridge", None)
             if bridge is not None:
@@ -9821,8 +8911,8 @@ class Conversation:
     def _claim_open(self) -> bool:
         """kMind (the claim gate), phase 2 (2.4): the talker's words now can claim something done that is not: this
         reply makes no call (its own result speaks for a call), the talker called something in this user turn
-        (something was asked: its own tool use says so, :meth:`Hands.called_this_turn`) and nothing it or a reflex
-        did verified (``Hands.acted_this_turn``). A plain reply (no call in the turn) and a turn with a verified act
+        (something was asked: its own tool use says so, :meth:`Hands.called_this_turn`) and nothing it did verified
+        (``Hands.acted_this_turn``). A plain reply (no call in the turn) and a turn with a verified act
         get no model call. A stream and state fact, never the words. Never raises."""
         try:
             call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
@@ -9835,10 +8925,7 @@ class Conversation:
             called = getattr(hands, "called_this_turn", None)
             if not callable(called) or not called():
                 return False
-            if hands.acted_this_turn():
-                return False
-            rec = self._reflex_state()
-            return not (rec and rec.get("state") == "done")
+            return not hands.acted_this_turn()
         except Exception:  # noqa: BLE001
             return False
 
@@ -9851,9 +8938,9 @@ class Conversation:
             self.log.event("claim_gate", op="dropped", turn=turn.n)
 
     def _acted_this_turn(self) -> bool | None:
-        """kMind (the claim gate, ``Hands.acted_this_turn``): ``True`` / ``False`` for a user turn (a reflex that did
-        it counts), ``None`` when there are no hands or this call is not a user turn's. Never raises. oVoice: ``None``
-        under ``brain = "one"`` (the agent reads its own results)."""
+        """kMind (the claim gate, ``Hands.acted_this_turn``): ``True`` / ``False`` for a user turn, ``None`` when
+        there are no hands or this call is not a user turn's. Never raises. oVoice: ``None`` under ``brain = "one"``
+        (the agent reads its own results)."""
         if getattr(self, "one", False):
             return None
         call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
@@ -9864,10 +8951,7 @@ class Conversation:
         if not callable(fn):
             return None
         try:
-            if fn():
-                return True
-            rec = self._reflex_state()
-            return bool(rec and rec.get("state") == "done")
+            return bool(fn())
         except Exception:  # noqa: BLE001
             return None
 
@@ -10003,6 +9087,8 @@ class Conversation:
             if not heard and time.monotonic() - started > (self.QUICK_END_S if quick else 2.0):
                 break  # no goodbye was spoken
             await asyncio.sleep(0.05)
+        if quick and not heard:
+            self._end_cue_now()   # D1: told to go, with no goodbye: the end cue, as the router's end gives
         self.log.event("session", state="end_asked", session=self.session, waited_ms=round(
             (time.monotonic() - started) * 1000))
         self._set_stop("user_asked")
