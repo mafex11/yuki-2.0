@@ -46,6 +46,14 @@ window goes to the measured front before the act
 that never read runs once more; a pick-kind value no route found runs as Yuki's pick with it as context), or one short
 question when its value was only the agent's reading of their words (S12); the hand-off text is written for ONE.
 
+**One22**: a reading no route found is measured against the user's own apps and sites first (A5, decision 3:
+:meth:`Runner._names_winner`, ``skills.names.best_match``); a clear winner is acted on by code
+(:meth:`Runner._take_name`: an open or a switch, through the gate), and only a reading nothing measures is asked about.
+A re-ask of the slot the same skill's verified run just had is a correction of it (D5,
+:meth:`Runner._as_correction`). ``remember`` kind ``way`` keeps the way the turn's acts took as the user's own told
+way (A13, contract C13, :meth:`Runner._keep_way`). The agent's own typing is marked as Yuki's unsent text only once it
+landed (A21, :func:`_typing_landed`).
+
 **The turn state** (:class:`RunState` on the gate's ``Turn``): every result, the act's own windows (tidy), the lines
 said; ``private_read`` and the refusal count are the gate's and the budget's (``policy.Turn``, ``budget.TurnBudget``).
 
@@ -134,9 +142,36 @@ CODE_TIDY = "tidy_by_code"
 FRONT_KEEP_S = 600.0
 #: One20 (final-D S12): a run that didn't land on a value that is only the agent's own reading of their words (none of
 #: their things, not in what they said, no route found it), and that would change what plays or take the front.
+#: One22 (A5, the user's decision 3): that reading is measured against the user's own apps and sites first
+#: (``skills.names.best_match``: the value as a name, else their newest words); a clear winner is acted on by code
+#: (:meth:`Runner._take_name`), never asked about. The question is left only for a reading nothing measures.
 LINE_GUESS_ASK = "Did you mean {value}?"
 GUESS_HELD = ("Held as a question: {value} is your own reading of their words (none of their things, not in what they "
-              "said), and no route found it. Ask them; do nothing else for it until they answer.")
+              "said), and no route found it, and none of their apps or sites measures close to it. Ask them; do "
+              "nothing else for it until they answer.")
+#: One22 (A5): code acted on the measured name in place of the reading (the model reads it; the done line was code's).
+NAME_TAKEN = ("Code took their words as {name}, one of their own {kind}s (measured by spelling and sound), in place of "
+              "{value} (nothing of {value} ran), and {did}. Never name the reading to them.")
+#: What code did with the measured name, by kind and by whether it took.
+NAME_DID: dict[tuple[str, bool], str] = {("app", True): "brought it up", ("app", False): "tried to bring it up",
+                                         ("site", True): "opened it", ("site", False): "tried to open it"}
+#: The name of code's own act on a measured name (no ONE tool: the gate judges it as an inner step at its rows).
+CODE_NAMES = "names_by_code"
+#: One22 (decision D5): how long after a skill's verified run a re-ask of its slot counts as a correction of it
+#: (``skills.prefs.CORRECTION_S``, the talker hands' correction window; read at call time).
+CORRECTION_FALLBACK_S = 600.0
+#: The caller's own notes among a skill's slots (``engine.NOTE_SLOTS`` and the choice slots): never a re-asked value.
+NOTE_SLOTS = frozenset({"choose", "context", "why", "from"})
+CORRECTED = "Code ran it as a correction of that skill's run just before (corrects true{pick})."
+#: One22 (A13, contract C13): ``remember`` kind ``way``: the way this turn's (else the turn before's) acting steps
+#: took, kept as the user's own told way (``skills.learn.ways.spec_from_steps`` then ``keep_told``, read with getattr).
+WAY_KIND = T.WAY_KIND
+LINE_WAY_KEPT = "Kept as their own way in {app}: {name}. Next time they ask for it by name it runs that way."
+LINE_WAY_NAME = "Not kept: give the way a name in their words (text), then call it again."
+LINE_WAY_NO_STEPS = "Not kept: no act of yours took in this turn or the one before, so there is no way to keep."
+LINE_WAY_UNBUILT = "Not kept: Yuki can't keep a told way here yet; say so in a few words."
+LINE_WAY_NO_SPEC = "Not kept: those steps make no way Yuki can run again; say so in a few words."
+LINE_WAY_FAILED = "Not kept: memory didn't take it; say so in a few words."
 #: One20 (final-D S5): the engine's outcomes after which a run handed back with its request still open.
 OPEN_OUTCOMES = frozenset({"handed_over", "failed"})
 #: The engine's hand-off reasons after which nothing may run again (it may have acted, or a step was the user's):
@@ -289,6 +324,9 @@ class OneResult:
     cover: str = ""
     #: One20 (S5): what code already did as the second way inside this call (a code word: ``unread``, ``choose``).
     second: str = ""
+    #: One22 (D5): code read this run as a correction of the same skill's run just before (a code word: ``corrects``,
+    #: ``choose``: corrects true, and Yuki's pick other than what that run played).
+    correction: str = ""
     #: names21 (merge note 5): an ``open_app`` whose launch took a misheard name for one of the user's own apps or
     #: sites: the measure's content-free facts (kind, how, score, margin, source), for the log line only.
     names_match: Mapping[str, Any] | None = None
@@ -350,7 +388,7 @@ class OneResult:
                 "said": bool(self.said), "heard": self.heard, "settle": self.settle, "silent": self.silent,
                 "tidy": self.tidy, "tidy_step": bool(self.tidy_step), "tidied": self.tidy_state or None,
                 "cover": bool(self.cover),
-                "second": self.second or None,
+                "second": self.second or None, "correction": self.correction or None,
                 "names_match": dict(self.names_match) if self.names_match else None,
                 "countdown": self.countdown or None, "result_chars": len(self.result), "after_chars": len(self.after),
                 "evidence": len(self.evidence), "ms": round(self.ms, 1)}
@@ -718,6 +756,64 @@ def _submits(tool: str, tool_input: Mapping[str, Any]) -> bool:
         return False
 
 
+def _typing_landed(ok: bool, facts: Mapping[str, Any]) -> bool:
+    """One22 (A21): whether the agent's own typing may have reached its window, from the verb's own facts: never when
+    nothing was dispatched (``sent_at`` unset: refused before it) or the dispatcher refused it (``refused``: a game, the
+    Act switch); yes when it took; a dispatch that failed partway may have typed part of it, so it counts (Yuki's text
+    may wait there: the safe side) unless the hands say no character went out (``typed_any`` False)."""
+    if facts.get("sent_at") is None or facts.get("refused"):
+        return False
+    if ok:
+        return True
+    return facts.get("typed_any") is not False
+
+
+def _land_typed(turn: Any, landed: bool) -> None:
+    """The gate's staged typing of this thread's call marked (it landed) or dropped (:meth:`policy.Turn.land_typed`).
+    Never raises."""
+    land = getattr(turn, "land_typed", None)
+    if callable(land):
+        try:
+            land(bool(landed))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _step_record(name: str, args: Mapping[str, Any], target: Mapping[str, Any], facts: Mapping[str, Any],
+                 status: str, verified: Any, verb: str) -> dict[str, Any]:
+    """One22 (A13, contract C13): one acting step as ``ways.spec_from_steps`` reads it: the ONE tool and the verb it ran
+    as, the window's app and hwnd, the control's own role and name (a click, a typing, a slider), what the step was
+    (a window or tab action, the app or address opened, the skill run, the keys pressed; for a typing only how many
+    characters and whether Enter followed: typed text is never kept), its status and when. Code facts only."""
+    role, cname = _words(target.get("role")), _words(target.get("name"))
+    if not role and not cname:
+        role, cname = _element_parts(target.get("element") or facts.get("target"))
+    step: dict[str, Any] = {"tool": str(name), "verb": str(verb or (T.SPECS[name].verb if name in T.SPECS else name)),
+                            "app": _words(target.get("app") or facts.get("app")),
+                            "hwnd": _hwnd_of(next((h for h in (target.get("hwnd"), facts.get("live_hwnd"),
+                                                               args.get("window")) if h is not None), None)),
+                            "status": str(status), "ok": status in (DONE, ALREADY), "verified": verified,
+                            "at": time.time()}
+    if name in ("click", "type", "slider"):
+        step.update(role=role, name=cname)
+        if args.get("id") is not None:
+            step["by_id"] = True
+    if name == "type":
+        step.update(chars=len(str(args.get("text") or "")), enter=args.get("enter") is True)
+    elif name == "keys":
+        keys = args.get("keys")
+        step["keys"] = [str(k) for k in keys] if isinstance(keys, list) and keys else [str(args.get("key") or "")]
+    elif name in ("window", "tab"):
+        step["action"] = str(args.get("action") or ("show" if name == "tab" else ""))
+    elif name == "open_app":
+        step["open"] = _words(args.get("name"))
+    elif name == "open_url":
+        step["url"] = _words(args.get("url"))
+    elif name == "run_skill":
+        step["skill"] = _words(args.get("skill"))
+    return step
+
+
 def _own_run_step(ctx: CallContext, tool: str, tool_input: Mapping[str, Any], facts: dict[str, Any],
                   earlier: Sequence[str] | None, *, force: bool) -> Any:
     """One step of a run on the hands' own skill path through the gate (inner), the run's own typing kept as the run's
@@ -813,12 +909,15 @@ class Runner:
         menu: The Skills menu text (``memory`` kind ``skills``).
         lease: Take the desk lease for acts (checks may turn it off).
         effect_budget_s: How long an act whose own report could not verify it has its effect read.
+        own_names: One22 (A5): ``own_names() -> [name]``, the user's own apps and sites a reading is measured against;
+            ``None``: ``skills.names.own_names`` (contract C14, read-only).
     """
 
     def __init__(self, verbs: Any, *, channel: str = "voice", settings: Any = None, countdown: Any = None,
                  memory: Any = None, dispatcher: Any = None, log: Callable[..., None] | None = None,
                  speak: Callable[[str], Any] | None = None, menu: str = "", lease: bool = True,
-                 lease_wait_s: float = LEASE_WAIT_S, effect_budget_s: float = reads.EFFECT_BUDGET_S) -> None:
+                 lease_wait_s: float = LEASE_WAIT_S, effect_budget_s: float = reads.EFFECT_BUDGET_S,
+                 own_names: Callable[[], Sequence[str]] | None = None) -> None:
         self.verbs = verbs
         self.channel = "voice" if channel == "voice" else "typed"
         self.settings = settings if settings is not None else getattr(verbs, "settings", None)
@@ -832,6 +931,7 @@ class Runner:
         self.lease_wait_s = float(lease_wait_s)
         self.effect_budget_s = float(effect_budget_s)
         self._desk_shape: str | None = None   # review fix F2: the verbs' desk_read form, read once
+        self.own_names = own_names
         #: One20 (S2): the window in front before the newest act that moved the front (measured by its diff) and when:
         #: a ``focus_back`` with no window and no open tidy-up goes there (``Hands._front_before``'s reach).
         self._front_kept: tuple[int, float, Any] | None = None
@@ -1004,6 +1104,8 @@ class Runner:
             said, heard = self._speak(line, say, state) if ok and line else ("", False)
             return OneResult(name, WRITTEN if ok else FAILED, verified=True if ok else None, result=line,
                              said=said, heard=heard, decision=decision, verb="keep_usual")
+        if name == "remember" and str(args.get("kind") or "") == WAY_KIND:
+            return self._keep_way(args, turn, decision)
         try:
             from yuki.brain.tools import run_remember
 
@@ -1050,8 +1152,15 @@ class Runner:
             if not lease.got:
                 return OneResult(name, BUSY, verified=None, result=LINE_BUSY, evidence={"why": LINE_BUSY},
                                  verb=spec.verb)
-            with one_call(ctx):
-                ok, report, facts = self.verbs.run(name, args)
+            # one22 (A21): the gate stages the agent's own typing; it is marked as Yuki's unsent text only once it
+            # landed (a verb that broke: unknown, so marked: the safe side)
+            landed = True
+            try:
+                with one_call(ctx):
+                    ok, report, facts = self.verbs.run(name, args)
+                landed = _typing_landed(ok, dict(facts or {}))
+            finally:
+                _land_typed(turn, landed)
         return self._finish(name, args, turn, ctx, ok, report, dict(facts or {}), say, state)
 
     def _finish(self, name: str, args: dict[str, Any], turn: policy.Turn, ctx: CallContext, ok: bool, report: str,
@@ -1143,6 +1252,13 @@ class Runner:
                 self.verbs.record(name, resolved, report, ok=bool(ok), verified=verified, facts=facts)
             except Exception:  # noqa: BLE001 - a record never breaks an act
                 pass
+            note = getattr(turn, "note_step", None)
+            if callable(note):
+                # one22 (A13): the turn's acting steps, for "remember how I do this" (``remember`` kind way)
+                try:
+                    note(_step_record(name, args, ctx.facts, facts, result.status, result.verified, verb))
+                except Exception:  # noqa: BLE001 - bookkeeping only
+                    pass
         elif name == "run_skill" and budget is not None and decision is not None and result.status == REFUSED \
                 and str(facts.get("outcome") or "") in OPEN_OUTCOMES and not facts.get("refused"):
             # one20 (C9): a run that handed back with nothing done leaves a part of their request open (no verb ran: no
@@ -1630,6 +1746,10 @@ class Runner:
 
         key, slots = rule.skill_input(rule.Call("run_skill", dict(args)))
         sk = util.skill(key)
+        # one22 (decision D5): a re-ask of the slot the same skill's verified run just had is a correction of it
+        args, corrected, played = self._as_correction(key, sk, args, turn)
+        if corrected:
+            key, slots = rule.skill_input(rule.Call("run_skill", dict(args)))
         app = str(getattr(sk, "app", "") or "")
         ctx = self._ctx(turn, "run_skill", args, bracket=False)
         ctx.skill_app = app
@@ -1700,11 +1820,15 @@ class Runner:
         facts = dict(facts or {})
         if second:
             facts["second_way"] = second
-        guess = None if desk_path else self._guess_question(key, sk, run_args, facts, turn, state)
+        guess = None if desk_path else self._guess_reading(key, sk, run_args, facts, turn, state)
+        if guess is not None and guess[0] == "name":
+            # one22 (A5, decision 3): the reading measured as one of their own apps or sites: code acts on that name
+            # (undoable: an open or a switch), never a question and never a word about the mishearing
+            return self._take_name(guess[1], guess[2], guess[3], guess[4], args, turn, say, state)
         if guess is not None:
             # one20 (S12): a run that didn't land on a value that is only the agent's reading of their words, that would
-            # change what plays or take the front: one short question back, nothing more done for it
-            facts["_asked"], report = guess
+            # change what plays or take the front, and that nothing of theirs measures close to: one short question
+            facts["_asked"], report = guess[1], guess[2]
         elif str(facts.get("outcome") or "") == "handed_over":
             report = self._one_handoff(report, facts, turn, second)   # one20 (S5): written for ONE
         if desk_path and can_send and not decision.join and facts.get("verified") is True:
@@ -1752,13 +1876,25 @@ class Runner:
         result = self._finish("run_skill", args, turn, ctx, ok, report, facts, say, state, done_line=line,
                               scope=scope, lasting=bool(decision.countdown or decision.join))
         result.second = second
+        result.correction = corrected
+        if corrected:
+            note = CORRECTED.format(pick=f", Yuki's pick other than {played}" if corrected == "choose" else "")
+            result.result = f"{note} {result.result}".strip()[:RESULT_CHARS]
         if counted:
             result.countdown = "sent"
         if result.status == DONE and result.verified is True:
-            # one20 (S5): a later pick re-run of this skill (this turn or the next) is a correction of this run
+            # one20 (S5): a later pick re-run of this skill (this turn or the next) is a correction of this run;
+            # one22 (D5): with the slots it was given, so a re-ask of one of them is read as one too
             note = getattr(turn, "note_skill_done", None)
             if callable(note):
-                note(key, self._pick_value(sk, facts))
+                given = dict(run_args.get("slots") or {}) if isinstance(run_args.get("slots"), Mapping) else {}
+                pick, value = self._pick_slot(sk), self._pick_value(sk, facts)
+                if pick and value and not _value_text(given.get(pick)):
+                    given[pick] = value   # Yuki's own pick filled it: a re-ask of that slot is one of this run too
+                try:
+                    note(key, value, given=given)
+                except TypeError:   # a turn without D5's facts
+                    note(key, value)
         if prefs is not None:
             self._after_skill(prefs)
         return result
@@ -1895,12 +2031,18 @@ class Runner:
         again_slots.update(choose=True, context=context)
         return "choose", again
 
-    def _guess_question(self, key: str, sk: Any, run_args: Mapping[str, Any], facts: Mapping[str, Any],
-                        turn: policy.Turn, state: RunState) -> tuple[str, str] | None:
-        """One20 (final-D S12, ONE part): ``(question, report)`` when a run did not land, the agent did not ask Yuki to
-        choose, a value it gave is only its own reading of their words (:meth:`_reading_guess`), the skill would
-        change what plays or take the front (a pick kind, a route that takes focus, an ``open`` skill: its data) and
-        that reading was not asked about this turn or the last; ``None`` otherwise. Marks it asked."""
+    def _guess_reading(self, key: str, sk: Any, run_args: Mapping[str, Any], facts: Mapping[str, Any],
+                       turn: policy.Turn, state: RunState) -> tuple[Any, ...] | None:
+        """One20 (final-D S12, ONE part), one22 (A5, the user's decision 3): a run did not land, the agent did not ask
+        Yuki to choose, a value it gave is only its own reading of their words (:meth:`_reading_guess`) and the skill
+        would change what plays or take the front (a pick kind, a route that takes focus, an ``open`` skill: its
+        data). Then that reading is measured against the user's own apps and sites (:meth:`_names_winner`):
+
+        * a clear winner: ``("name", name, kind, facts, the reading)``: code acts on it (:meth:`_take_name`);
+        * nothing measures: ``("ask", question, report)``, once (not when that reading was asked about this turn or
+          the last; marks it asked).
+
+        ``None`` otherwise."""
         if sk is None or self._open_run(facts) is None:
             return None
         slots = run_args.get("slots") if isinstance(run_args.get("slots"), Mapping) else {}
@@ -1917,13 +2059,234 @@ class Runner:
                 bool(getattr(r, "needs_focus", False)) for r in getattr(sk, "routes", ()) or ())
         except Exception:  # noqa: BLE001
             moves = False
+        if not moves:
+            return None
+        won = self._names_winner(guess[1], turn, avoid=self._skill_apps(sk, slots))
+        if won is not None:
+            self._emit("one_guess", skill=key, asked=False, took=won[1], how=won[2].get("how"),
+                       score=won[2].get("score"), margin=won[2].get("margin"))
+            return ("name", won[0], won[1], won[2], guess[1])
         mark = (str(key), guess[0], guess[1].casefold())
         asked, note = getattr(turn, "guess_asked", None), getattr(turn, "note_guess_asked", None)
-        if not moves or not callable(asked) or not callable(note) or asked(mark):
+        if not callable(asked) or not callable(note) or asked(mark):
             return None
         note(mark)
         self._emit("one_guess", skill=key, asked=True)
-        return LINE_GUESS_ASK.format(value=guess[1]), GUESS_HELD.format(value=guess[1])
+        return ("ask", LINE_GUESS_ASK.format(value=guess[1]), GUESS_HELD.format(value=guess[1]))
+
+    @staticmethod
+    def _skill_apps(sk: Any, slots: Mapping[str, Any]) -> list[str]:
+        """The apps a run named or drives (its own app, its app-typed slots' values): a measured name that is one of
+        them is no other thing of theirs (the run already aimed there; its value was the guess)."""
+        out = [_words(getattr(sk, "app", ""))]
+        for sl in getattr(sk, "slots", ()) or ():
+            if getattr(sl, "type", "") == "app":
+                out.append(_value_text((slots or {}).get(getattr(sl, "name", ""))))
+        return [a for a in dict.fromkeys(out) if a]
+
+    def _own_names(self) -> list[str]:
+        """The user's own apps and sites (contract C14: ``skills.names.own_names``, read-only: memory's timeline and
+        links seen, the windows open, the Start menu as last read), or the runner's own source. Never raises."""
+        try:
+            fn = self.own_names
+            if callable(fn):
+                got = fn()
+            else:
+                from yuki.skills import names as N
+
+                memory = self.memory
+                got = N.own_names(getattr(memory, "store", None) if memory is not None else None)
+            return [_words(n) for n in got or () if _words(n)]
+        except Exception:  # noqa: BLE001 - no names: nothing measures (the question stands)
+            return []
+
+    def _names_winner(self, value: str, turn: policy.Turn, *, avoid: Sequence[str] = ()
+                      ) -> tuple[str, str, dict[str, Any]] | None:
+        """One22 (A5, decision 3): the one of the user's own apps and sites a reading names, measured by spelling and
+        sound (``skills.names.best_match``, contract C14): the reading as a name given to the act (its bar), else their
+        newest words as a whole turn (the turn bar, mishearings only: a name heard right is their own word for it).
+        ``(name, kind, facts)`` (``kind``: ``app`` / ``site``; facts content-free: how, score, margin), or ``None``:
+        no clear winner, or the winner is one of ``avoid`` (the run's own apps). Pure but for the names read."""
+        try:
+            from yuki.skills import names as N
+        except Exception:  # noqa: BLE001 - not merged: nothing measures
+            return None
+        try:
+            pool = self._own_names()
+            if not pool:
+                return None
+            got, how = (N.best_match(value, pool, as_name=True), "value") if _words(value) else (None, "value")
+            if got is None:
+                newest = [w for w in list(getattr(turn, "words", None) or [])[-1:] if _words(w)]
+                if newest:
+                    got, how = N.best_match(newest[0], pool, literal_ok=False), "turn"
+            if got is None:
+                return None
+            name = _words(got[0])
+            if not name or any(N.same_group(name, a) for a in avoid if _words(a)):
+                return None
+            kind = N.SITE if N.is_site(name) else N.APP
+            return name, kind, {"kind": kind, "how": how, "score": got[1], "margin": got[2], "source": "one_reading"}
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _take_name(self, name: str, kind: str, measure: Mapping[str, Any], reading: str, args: Mapping[str, Any],
+                   turn: policy.Turn, say: Any, state: RunState) -> OneResult:
+        """One22 (A5, decision 3): code acts on the measured name in place of the agent's reading: an app is opened or
+        brought up (``open_app``), a site opened (``open_url`` at its address), under a call context of code's own
+        (:data:`CODE_NAMES`): the gate judges it as an inner step at its rows (a game in front, the Act switch, the
+        commit check), the desk lease, the act diff and the tidy as for any act, and code's done line ("Opening
+        Discord.") is said; no question, no word about the mishearing. The result is the run_skill call's (the agent
+        reads :data:`NAME_TAKEN`). Never raises."""
+        try:
+            from yuki.skills import names as N
+            from yuki.voice.hands import one_call
+
+            if kind == N.SITE:
+                tool, call = "open_url", {"url": N.site_url(name), "then": T.then_of(args)}
+            else:
+                tool, call = "open_app", {"name": name, "then": T.then_of(args)}
+            spec = T.SPECS[tool]
+            ctx = self._ctx(turn, CODE_NAMES, call, bracket=True)
+            with _Lease(turn, wanted=self.lease, wait_s=self.lease_wait_s) as lease:
+                if not lease.got:
+                    return OneResult("run_skill", BUSY, verified=None, result=LINE_BUSY, evidence={"why": LINE_BUSY},
+                                     verb=spec.verb)
+                with one_call(ctx):
+                    ok, report, facts = self.verbs.run(tool, call)
+            result = self._finish(tool, call, turn, ctx, ok, report, dict(facts or {}), say, state)
+        except Exception as exc:  # noqa: BLE001 - nothing more is known: a failure, nothing more done
+            self._emit("one_names_take", error=type(exc).__name__)
+            return OneResult("run_skill", FAILED, verified=False, result=type(exc).__name__,
+                             evidence={"why": "Yuki's runner broke on this call"}, owed=OWED_LINES[FAILED])
+        result.name = "run_skill"
+        result.names_match = {**dict(result.names_match or {}), **dict(measure)}
+        did = NAME_DID.get((kind, result.status in (DONE, ALREADY)), "tried it")
+        lead = NAME_TAKEN.format(name=name, kind=kind, did=did, value=reading)
+        result.result = f"{lead} {result.result}".strip()[:RESULT_CHARS]
+        self._emit("one_names_take", kind=kind, how=measure.get("how"), status=result.status)
+        return result
+
+    # -- one22: "not that one" (D5) and a told way (A13) ---------------------------------------------------------------
+
+    def _as_correction(self, key: str, sk: Any, args: dict[str, Any], turn: policy.Turn
+                       ) -> tuple[dict[str, Any], str, str]:
+        """One22 (decision D5; final-D spotify P3: "no not this one, the other playlist" went out as the playlist of
+        their earlier words, with no ``corrects``): a call of the same skill that ran verified this turn or the turn
+        before (within the talker hands' correction window, ``prefs.CORRECTION_S``), not ``again``, not already a
+        correction or a pick, that gives again a slot that run was given, with none of the values it gives again in
+        their newest words (a string measure: the agent re-sent earlier words, so it is no new ask of theirs). It is a
+        correction of that run: ``corrects`` true; and for a pick-kind skill whose run played a value, Yuki's pick with
+        their value as context, other than that one (the S5 second way's shape: a guess-free re-run that never plays
+        the same one again, and writes no preference). Never a skill that sends or joins. ``(the call to run, how, the
+        value played)``; ``how``: ``""`` (the call as it came), ``corrects``, ``choose``. Code facts only. Never
+        raises."""
+        try:
+            if sk is None or args.get("again") is True or args.get("corrects") is True:
+                return args, "", ""
+            if bool(getattr(sk, "sends", False)) or rule.skill_joins(sk):
+                return args, "", ""   # a message or a join is never a pick: their words name whom and what
+            previous = getattr(turn, "previous_run", None)
+            if not callable(previous):
+                return args, "", ""
+            try:
+                from yuki.skills.prefs import CORRECTION_S as within
+            except Exception:  # noqa: BLE001
+                within = CORRECTION_FALLBACK_S
+            before = previous(key, within_s=float(within))
+            if not before:
+                return args, "", ""
+            slots = dict(args.get("slots") or {}) if isinstance(args.get("slots"), Mapping) else {}
+            if str(slots.get("choose")).strip().casefold() in ("true", "1", "yes"):
+                return args, "", ""
+            had = dict(before.get("given") or {})
+            again = {k: _value_text(v) for k, v in slots.items() if k in had and k not in NOTE_SLOTS}
+            again = {k: v for k, v in again.items() if v}
+            newest = [w for w in list(turn.words or [])[-1:] if _words(w)]
+            if not again or not newest or any(rule.in_words(v, newest) for v in again.values()):
+                return args, "", ""
+            out: dict[str, Any] = {**dict(args), "corrects": True}
+            pick = self._pick_slot(sk)
+            cap = str(getattr(sk, "capability", "") or getattr(sk, "key", "") or "")
+            played = _words(before.get("value"))
+            how = "corrects"
+            if pick and pick in again and cap not in NO_PICK_RERUN and played:
+                context = _words(slots.get("context"))
+                value = again[pick]
+                if value.casefold() != played.casefold() and value.casefold() not in context.casefold():
+                    context = f"{context}; {value}" if context else value
+                if played.casefold() not in context.casefold():
+                    context = f"{context}, other than {played}" if context else f"other than {played}"
+                picked = {k: v for k, v in slots.items() if k not in (pick, "choose", "context")}
+                picked.update(choose=True, context=context)
+                out["slots"] = picked
+                how = "choose"
+            self._emit("one_correction", skill=key, how=how)
+            return out, how, played
+        except Exception as exc:  # noqa: BLE001 - the call as it came
+            self._emit("one_correction", error=type(exc).__name__)
+            return args, "", ""
+
+    def _with_store(self, what: str, fn: Callable[[Any], Any], *, timeout_s: float = 1.0) -> Any:
+        """``fn(store)`` on the runner's memory: through its bounded call (a ``MemoryAccess``), else on the store it
+        holds (a client or the store itself; the hands' ``_memory_call`` rule). ``None`` on failure."""
+        memory = self.memory
+        if memory is None:
+            return None
+        try:
+            call = getattr(memory, "call", None)
+            if callable(call) and not hasattr(memory, "store"):
+                return call(what, lambda client: fn(getattr(client, "store", client)), timeout_s=timeout_s)
+            return fn(getattr(memory, "store", memory))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _keep_way(self, args: Mapping[str, Any], turn: policy.Turn, decision: Any) -> OneResult:
+        """One22 (A13, contract C13; audit A13: ``ways.keep_told`` had no caller, "learn after one go"): ``remember``
+        kind ``way``, "remember how I do this": the acting steps that took this turn (else the turn before's,
+        :meth:`policy.Turn.note_step`) as a told way (``ways.spec_from_steps(app, steps)``, read with getattr), kept at
+        once as the user's own (``ways.keep_told(store, app=, spec=, name=)``: no bar, never retired by the nightly
+        pass), named by ``text`` (their words). The app is the one the last step acted in. Content-free log
+        (``one_way``). Never raises: a way not kept is ``failed`` with a line for the agent."""
+        name = _words(args.get("text"))[:120]
+
+        def done(status: str, line: str, why: str, steps: int = 0) -> OneResult:
+            self._emit("one_way", kept=status == WRITTEN, why=why, steps=steps)
+            return OneResult("remember", status, verified=True if status == WRITTEN else None, result=line,
+                             decision=decision, verb="remember")
+
+        if not name:
+            return done(FAILED, LINE_WAY_NAME, "no_name")
+        steps = [dict(s) for s in getattr(turn, "steps", None) or [] if isinstance(s, Mapping) and s.get("ok")]
+        if not steps:
+            steps = [dict(s) for s in getattr(turn, "steps_before", None) or []
+                     if isinstance(s, Mapping) and s.get("ok")]
+        if not steps:
+            return done(FAILED, LINE_WAY_NO_STEPS, "no_steps")
+        app = next((_words(s.get("app")) for s in reversed(steps) if _words(s.get("app"))), "")
+        try:
+            from yuki.skills.learn import ways
+        except Exception:  # noqa: BLE001
+            ways = None
+        build, keep = getattr(ways, "spec_from_steps", None), getattr(ways, "keep_told", None)
+        if not callable(build) or not callable(keep):
+            return done(FAILED, LINE_WAY_UNBUILT, "unbuilt", len(steps))
+        if not app:
+            return done(FAILED, LINE_WAY_NO_SPEC, "no_app", len(steps))
+        try:
+            spec = build(app, steps, end=None)
+        except Exception:  # noqa: BLE001
+            spec = None
+        if not isinstance(spec, Mapping) or not spec:
+            return done(FAILED, LINE_WAY_NO_SPEC, "no_spec", len(steps))
+        key = self._with_store("one_keep_way", lambda store: keep(store, app=app, spec=dict(spec), name=name))
+        if not key:
+            return done(FAILED, LINE_WAY_FAILED, "not_kept", len(steps))
+        try:
+            shown = util.app_name(app) or app
+        except Exception:  # noqa: BLE001
+            shown = app
+        return done(WRITTEN, LINE_WAY_KEPT.format(app=shown, name=name), "kept", len(steps))
 
     def _one_handoff(self, report: str, facts: Mapping[str, Any], turn: policy.Turn, second: str) -> str:
         """One20 (final-D S5, one-core §3 fix 3): the engine's hand-off text was written for the planner ("with the

@@ -36,6 +36,9 @@ LOOK_PAGE_CHARS: dict[str, int] = {"voice": 6000, "typed": 12000}
 READ_CHARS: dict[str, int] = {"voice": 4000, "typed": 12000}
 #: A non-success's evidence for the agent (design §3.1 "evidence ≤420").
 EVIDENCE_CHARS = 420
+#: One22 (E4): a skill run's fill sources (contract C10, ``slot source, ...``) join its evidence only when this short;
+#: longer, they would push the run's own facts out of the line's room.
+FILL_SOURCES_CHARS = 80
 #: A wait at most (s) (``executor.WAIT_MAX_S``).
 WAIT_MAX_S = 10.0
 #: How long an act's effect is read when its own report could not verify it (``done.EXPECT_BUDGET_S``).
@@ -397,7 +400,9 @@ def ending_facts(*, did: str = "", stuck: str = "", why: str = "", probe: str = 
     plain words for the agent (content: never logged). ``did``: what it did, as done; ``stuck``: the step that failed or
     was refused, and ``why`` when its reason is plain words (a code word is left out); ``claim``: what the effect read
     looked for, and ``seen``: what it saw, when it didn't read it done (``unread``: it couldn't read at all); a skill
-    run's own evidence (``tried``, ``missing``, ``seen``) as it gave it."""
+    run's own evidence (``tried``, ``missing``, ``seen``) as it gave it. One22 (E4): the skill's own ``unread`` (the
+    rungs that never read) always stands, before its other facts; its ``fill_sources`` fold in last, as ``filled
+    from``, only when at most :data:`FILL_SOURCES_CHARS` long."""
     out: dict[str, str] = {}
     try:
         if _words(did):
@@ -418,10 +423,24 @@ def ending_facts(*, did: str = "", stuck: str = "", why: str = "", probe: str = 
                 out["seen"] = seen
             if verdict is None:
                 out["unread"] = "yes"
-        for key, value in dict(skill or {}).items():
+        given = dict(skill or {})
+        # one22 (E4): the skill's own ``unread`` (contract C10: the rungs that never read the app) is always shown,
+        # first of its facts (the agent's "look at it first"); it says more than the effect read's bare "yes"
+        unread = given.pop("unread", None)
+        unread_text = "yes" if unread is True else "" if isinstance(unread, bool) else _words(
+            unread if not isinstance(unread, (list, tuple)) else ", ".join(map(str, unread)))
+        if unread_text:
+            out["unread"] = unread_text[:160]
+        fills = given.pop("fill_sources", None)
+        for key, value in given.items():
             text = _words(value if not isinstance(value, (list, tuple)) else "; ".join(map(str, value)))
             if text and key not in out and isinstance(key, str):
                 out[key] = text[:160]
+        # one22 (E4): each slot's fill source folds in last, and only when short (the line's room is the rest's)
+        if isinstance(fills, Mapping):
+            text = ", ".join(f"{_words(k)} {_words(v)}" for k, v in fills.items() if _words(k) and _words(v))
+            if text and len(text) <= FILL_SOURCES_CHARS:
+                out["filled from"] = text
     except Exception:  # noqa: BLE001 - no facts: the report stands
         pass
     return {k: v for k, v in out.items() if v}
@@ -433,6 +452,6 @@ def evidence_text(facts: Mapping[str, str], limit: int = EVIDENCE_CHARS) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-__all__ = ["DERIVED_WINDOW_STATES", "EFFECT_BUDGET_S", "EVIDENCE_CHARS", "LOOK_CHARS", "LOOK_PAGE_CHARS", "LOOK_TOOLS",
-           "MEMORY_KINDS", "PRIVATE_TOOLS", "READ_CHARS", "ReadResult", "WAIT_MAX_S", "effect_probe", "ending_facts",
-           "evidence_text", "is_page_read", "page_first", "read", "read_effect", "wait"]
+__all__ = ["DERIVED_WINDOW_STATES", "EFFECT_BUDGET_S", "EVIDENCE_CHARS", "FILL_SOURCES_CHARS", "LOOK_CHARS",
+           "LOOK_PAGE_CHARS", "LOOK_TOOLS", "MEMORY_KINDS", "PRIVATE_TOOLS", "READ_CHARS", "ReadResult", "WAIT_MAX_S",
+           "effect_probe", "ending_facts", "evidence_text", "is_page_read", "page_first", "read", "read_effect", "wait"]

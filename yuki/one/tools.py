@@ -260,7 +260,19 @@ MEMORY_ONE_TOOL = _from_anthropic(
                 "activity: time per app, site or page (group_by). calls; call_timeline: one call (call, words). "
                 "threads: their work. before: what came before a moment (at, event, minutes). links. people: a "
                 "person (name). skills.")
+#: One22 (A13, contract C13): ``remember`` kind ``way`` on the ONE agent: "remember how I do this" keeps the way the
+#: turn's own acts just took as the user's own told way (the runner's ``_keep_way``: ``skills.learn.ways``). Added to
+#: the planner's schema here only when it doesn't carry it yet (a later merge that adds it there stays one kind).
+WAY_KIND = "way"
+_WAY_SENTENCE = " way: keep how your acts just did it as their own way (text: its name, their words)."
 REMEMBER_ONE_TOOL = _from_anthropic(REMEMBER_TOOL)
+_kinds = dict(REMEMBER_ONE_TOOL["properties"].get("kind") or {})
+if WAY_KIND not in list(_kinds.get("enum") or []):
+    REMEMBER_ONE_TOOL["properties"] = {**REMEMBER_ONE_TOOL["properties"],
+                                       "kind": {**_kinds, "enum": [*list(_kinds.get("enum") or []), WAY_KIND]}}
+if " way:" not in str(REMEMBER_ONE_TOOL["description"]):
+    REMEMBER_ONE_TOOL["description"] = str(REMEMBER_ONE_TOOL["description"]).rstrip() + _WAY_SENTENCE
+del _kinds
 
 
 def _plain(tool: Mapping[str, Any]) -> dict[str, Any]:

@@ -49,7 +49,9 @@ committing click (the hands' rule for an unknown role). The second refusal of a 
 (``Decision.settle``; :mod:`yuki.one.budget`). Content-free log, one line per decision.
 
 The hands' consent state lives here now, as turn state: the newest-words close rule, the windows holding Yuki's unsent
-text (process-wide, :func:`mark_typed`: a voice act and a typed act see the same desk), the join grant.
+text (process-wide, :func:`mark_typed`: a voice act and a typed act see the same desk), the join grant. One22 (A21):
+the agent's own typing is marked only once it landed (:meth:`Turn.stage_typed`, then the runner's
+:meth:`Turn.land_typed`); the skill engine's own typing is marked when the gate allows it, as before.
 """
 
 from __future__ import annotations
@@ -355,6 +357,19 @@ class Turn:
         #: turn before (voice, :meth:`carry`): a pick re-run by code is a correction (``corrects``) of that run.
         self.skills_done: dict[str, str] = {}
         self.skills_before: dict[str, str] = {}
+        #: one22 (decision D5): the slots each of those runs was given and when it ran (key -> (slots, wall time)),
+        #: this turn's and the turn before's: a re-ask of the same skill's slot is read against them
+        #: (:meth:`previous_run`).
+        self.skills_given: dict[str, tuple[dict[str, Any], float]] = {}
+        self.skills_given_before: dict[str, tuple[dict[str, Any], float]] = {}
+        #: one22 (A13, contract C13): the acting steps this turn's calls ran, in order (content-free but for the
+        #: controls' own role and name; never typed text), and the turn before's: "remember how I do this" keeps a way
+        #: from them (``Runner._keep_way``).
+        self.steps: list[dict[str, Any]] = []
+        self.steps_before: list[dict[str, Any]] = []
+        #: one22 (A21): the agent's own typing the gate allowed, not marked as Yuki's unsent text until it landed
+        #: (:meth:`stage_typed`, :meth:`land_typed`): thread id -> {hwnd: the text to mark}.
+        self._staged: dict[int, dict[int, str]] = {}
         #: One20 (final-D S12): the guessed readings this turn asked about (skill, slot, value folded), and those the
         #: turn before asked (its answer is in these words: never asked twice).
         self.guesses_asked: set[tuple[str, str, str]] = set()
@@ -442,7 +457,9 @@ class Turn:
                 fresh = {k: v for k, v in previous.asks.items() if k not in previous._carried_asks}
                 sent = set(previous.sent)
                 done = dict(getattr(previous, "skills_done", {}) or {})
+                given = dict(getattr(previous, "skills_given", {}) or {})
                 guessed = set(getattr(previous, "guesses_asked", set()) or set())
+                steps = list(getattr(previous, "steps", []) or [])
             with self._lock:
                 for k, v in fresh.items():
                     if k not in self.asks:
@@ -450,7 +467,9 @@ class Turn:
                         self._carried_asks.add(k)
                 self.sent_before |= sent
                 self.skills_before.update(done)
+                self.skills_given_before.update(given)
                 self.guesses_before |= guessed
+                self.steps_before = steps
         return self
 
     # -- one20: the turn's own windows, chats, skill runs and guesses (the runner's code facts) --------------------
@@ -469,11 +488,64 @@ class Turn:
             with self._lock:
                 self.chats_opened.add(key)
 
-    def note_skill_done(self, skill: str, value: str = "") -> None:
-        """A skill ran verified this turn (``value``: its pick slot's value, as shown; ``""``: none)."""
+    def note_skill_done(self, skill: str, value: str = "", given: Mapping[str, Any] | None = None,
+                        at: float | None = None) -> None:
+        """A skill ran verified this turn (``value``: its pick slot's value, as shown; ``""``: none; one22 D5:
+        ``given``, the slots the call gave it, and ``at``, when, wall clock)."""
         if skill:
             with self._lock:
                 self.skills_done[str(skill)] = " ".join(str(value or "").split())
+                if given is not None:
+                    self.skills_given[str(skill)] = (dict(given), float(time.time() if at is None else at))
+
+    def previous_run(self, skill: str, *, within_s: float, now: float | None = None) -> dict[str, Any] | None:
+        """One22 (decision D5): the same skill's verified run of this turn or the turn before, within ``within_s`` of
+        ``now`` (wall clock): ``{"value": its pick slot's value as shown ("" none), "given": the slots it was given,
+        "at": when}``; ``None``: none (or too long ago)."""
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            if skill in self.skills_given:
+                given, at = self.skills_given[skill]
+                value = self.skills_done.get(skill, "")
+            elif skill in self.skills_given_before:
+                given, at = self.skills_given_before[skill]
+                value = self.skills_before.get(skill, "")
+            else:
+                return None
+        if now - at > within_s:
+            return None
+        return {"value": value, "given": dict(given), "at": at}
+
+    def note_step(self, step: Mapping[str, Any]) -> None:
+        """One22 (A13): an acting step this turn's call ran (``Runner._step_record``: content-free but for a control's
+        own role and name)."""
+        if isinstance(step, Mapping):
+            with self._lock:
+                self.steps.append(dict(step))
+
+    # -- one22 (A21): the agent's own typing is marked once it landed -------------------------------------------------
+
+    def stage_typed(self, hwnd: Any, text: str) -> None:
+        """The gate allowed the agent's own typing into ``hwnd`` (``text``: what will wait there, Yuki's unsent text):
+        held for this thread's call until the runner knows the typing landed (:meth:`land_typed`)."""
+        key = _hwnd(hwnd)
+        if key is not None:
+            with self._lock:
+                self._staged.setdefault(threading.get_ident(), {})[key] = " ".join(str(text or "").split())
+
+    def land_typed(self, landed: bool) -> int:
+        """This thread's call ended: its staged typing is marked as Yuki's unsent text when it ``landed`` (or may have,
+        in part), else dropped (nothing was typed). Returns how many windows were marked. Never raises."""
+        try:
+            with self._lock:
+                staged = self._staged.pop(threading.get_ident(), {})
+            if not landed:
+                return 0
+            for hwnd, text in staged.items():
+                mark_typed(hwnd, text)
+            return len(staged)
+        except Exception:  # noqa: BLE001 - the safe side: nothing more is known
+            return 0
 
     def ran_before(self, skill: str) -> str | None:
         """The value the same skill ran verified with earlier this turn or in the turn before (``""``: no pick value),
@@ -787,7 +859,15 @@ def _decide(name: str, spec: T.Spec, verb: str, vinput: dict[str, Any], args: di
                 clear_typed(hwnd)
             else:   # Yuki's words wait there unsent (after any that waited already)
                 text = " ".join(str(vinput.get("text") or "").split())
-                mark_typed(hwnd, f"{waiting} {text}".strip() if waiting else text)
+                waits = f"{waiting} {text}".strip() if waiting else text
+                if inner:
+                    # the skill engine's own typing (and the runner's typing of a draft's wording): marked at once, as
+                    # before (the run's next step in that window reads it: ``runner._own_run_step``)
+                    mark_typed(hwnd, waits)
+                else:
+                    # one22 (A21): the agent's own typing is marked once it landed (the runner's ``land_typed``
+                    # after the verb ran): a typing the verb refused, or that never went out, leaves no mark behind
+                    turn.stage_typed(hwnd, waits)
     return decision
 
 

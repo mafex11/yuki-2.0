@@ -22,7 +22,8 @@ One :class:`TurnBudget` per user turn (voice) or request (typed). Every number i
   not apply to it (the gate's two-steps cap does).
 * **The closing hold** (one20, contract C9: :meth:`TurnBudget.closing_hold`): the turn's one miss (an act that did not
   take, or a skill run that handed back with nothing done, :meth:`TurnBudget.unfinished_run`), no act tried after it,
-  the retry window still open: a closing reply is held once by the voice driver with :data:`LINE_HOLD_MISS`.
+  the retry window still open: a closing reply is held once by the voice driver with :data:`LINE_HOLD_MISS`, and
+  (one22, A15) by the typed loop (``yuki.one.loop.closing_hold``).
 
 Every settle (the hard stop, the rounds, the second refusal) closes the turn: a later call in the same reply, or a
 late result, settles silently, so code's line is said once. The driver calls :meth:`TurnBudget.round` before **every**
@@ -63,7 +64,8 @@ LINE_LASTING_RETRY = ("Not tried: a send or join already did not go through this
 #: The turn was closed by code (the hard stop): a late result settles with no words.
 LINE_CLOSED = "The turn is over; nothing was done. Say nothing."
 #: One20 (contract C9, final-D S5): why a closing reply (a quiet, or words with no call) is held once: the turn's one
-#: miss, nothing tried after it, time left for another way. The voice driver returns it to the agent as the refusal.
+#: miss, nothing tried after it, time left for another way. The voice driver returns it to the agent as the refusal;
+#: the typed loop (one22, A15) as the note of the held round.
 LINE_HOLD_MISS = ("Not done yet: one step of their request didn't take and nothing else was tried. Try one other way "
                   "now with an undoable act (never the same step), then say in a few words what is left.")
 
