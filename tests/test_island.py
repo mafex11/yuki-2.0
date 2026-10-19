@@ -209,19 +209,6 @@ def test_the_frame_and_playbooks_become_the_run_cards_chips(qapp):
         isl.stop()
 
 
-def test_frame_view_reads_the_agents_frame_as_plain_data():
-    from yuki.ui.runtime import frame_view
-
-    cand = SimpleNamespace(label="Riya", where="the chat in front", age_s=240.0)
-    frame = SimpleNamespace(persons=[{"name": "Riya", "routes": [{"label": "WhatsApp chat", "app": "WhatsApp",
-                                                                  "mine": 64, "ref": "route:2"}]}],
-                            people=[cand], playbooks=[3, "x"])
-    view = frame_view(SimpleNamespace(_frame=frame))
-    assert view["persons"][0]["routes"][0]["mine"] == 64 and view["playbooks"] == [3]
-    assert view["where"] == "the chat in front 4 min ago"
-    assert frame_view(SimpleNamespace()) is None
-
-
 # -- the cards' keys reach memory's offer ops ----------------------------------------------------------------
 
 

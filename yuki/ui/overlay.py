@@ -904,7 +904,10 @@ class IntentCard(QWidget):
         self.show()
 
     def show_resolved(self, request: str, frame: dict[str, Any]) -> bool:
-        """The frame's first person and their usual route as chips; ``False`` when the frame named nobody."""
+        """The person the model's own call named (``runtime.named_view``: the frame narrowed to them, keyword audit
+        D1) and their usual route as chips; ``False`` when the frame names nobody. The heading says "resolved from
+        memory" only for a person the model chose and memory has routes for, never a name found in the request's
+        words."""
         persons = [p for p in (frame or {}).get("persons") or [] if isinstance(p, dict) and p.get("name")]
         if not persons:
             return False
@@ -1219,7 +1222,8 @@ class Overlay(SurfaceWindow):
         self.fit()
 
     def show_resolved(self, request: str, frame: dict[str, Any]) -> None:
-        """A request's task frame named a person: its chips (who, where, because) in the Intent card."""
+        """The model's own call named a person of the request's task frame (``runtime.named_view``): its chips (who,
+        where, because) in the Intent card."""
         if self.intent.show_resolved(request, frame):
             self.intent_box.setVisible(True)
             self.fit()

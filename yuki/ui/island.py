@@ -2578,22 +2578,29 @@ class Island(QObject):
         self._close_card()
 
     def set_frame(self, request_id: int, frame: dict[str, Any]) -> None:
-        """The agent's task frame for the run: a person and their usual route become the first step's
-        "from memory" chip ("you message Sam on WhatsApp, 78 times")."""
+        """The person the model's own call named (``yuki.ui.runtime.named_view``) and their usual route from memory:
+        that call's step's "from memory" chip ("you message Sam on WhatsApp, 78 times"). The frame comes right after
+        the call's ``tool_called``, so the chip goes on the latest step shown (the first when none shows yet). Keyword
+        audit D1 (20 Oct): never the thinking line, and never before the model named the person (the review F4 line
+        that showed a name memory found in the request's words before any plan is gone)."""
         run = self.inputs.run
         if run is None or run.id != request_id:
             return
         run.frame = frame
         chip = _route_chip(frame)
         if chip:
-            run.chips.setdefault(1, []).insert(0, ("memory", chip))
-        if chip and run.steps == 0 and not run.thought:
-            # review F4: before the first step the brain has written nothing yet; what Yuki already worked out (who,
-            # and their usual route, from memory) is the thinking line's real source until its own note arrives
-            self.update(run=replace(run, thought=chip[:1].upper() + chip[1:]))
-            return
+            run.chips.setdefault(max(1, self._shown_steps(run)), []).insert(0, ("memory", chip))
         if self.expanded:
             self._render(animate=False)
+
+    def _shown_steps(self, run: RunInfo) -> int:
+        """How many steps the run's card shows now (the chat thread's real steps; 0 without one)."""
+        finder = getattr(self.model, "item_for_job", None) if self.model is not None else None
+        try:
+            item = finder(run.id) if callable(finder) else None
+            return len(item.real_steps()) if item is not None else 0
+        except Exception:
+            return 0
 
     # -- final word ------------------------------------------------------------------------------------------
 

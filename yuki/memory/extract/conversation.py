@@ -10,8 +10,11 @@ say, or no longer matches, is found from structure:
   navigation landmarks and side columns (so a sidebar of conversations with
   preview times is not mistaken for the conversation);
 * **rows**: the list's items (single-child wrappers looked through);
-* **day separators**: rows whose whole text is a day label ("Today",
-  "Saturday", "31 August") - they set the day for the rows below them;
+* **day separators**: the app's own separator elements when its profile
+  names them; else rows whose whole text is a day label alone ("Today",
+  "Saturday", "31 August"; never a message that only mentions a day) at a
+  place a history allows (a later day than the separator above, not after
+  the capture's day) - they set the day for the rows below them;
 * **time**: the row's first element whose text (or description) is a time
   label and nothing else;
 * **sender**: the row's first short text before the body that is a link,
@@ -29,6 +32,7 @@ whole message's next time.
 
 from __future__ import annotations
 
+import datetime as _dt
 import re
 from dataclasses import dataclass, field
 
@@ -387,6 +391,12 @@ def extract_conversation(
     composer = query.first_tier(profile.composer, root) if profile and profile.composer else []
 
     day_label: str | None = None
+    #: The day the separator above names (rows of a history below it are not from an earlier day).
+    day_at: _dt.date | None = None
+    # Keyword audit D2 (20 Oct 2026): a row is a day separator by the capture's structure, never by a day word
+    # standing in it. An app whose profile names its separator elements has those as its only separators; another
+    # list's row is one only when its whole text is a day label alone and its place fits (:func:`_separator_day`).
+    marked = bool(profile and profile.day_separator)
     last_sender: str | None = None
     last_me = False
     last_parent: Node | None = None
@@ -395,17 +405,19 @@ def extract_conversation(
         if what == "sep":
             label = _day_text(row, date_order)
             if label:
-                day_label = label
+                day_label, day_at = label, timeparse.day_of(label, now=now, date_order=date_order)
             continue
         own_sep = [s for s in separators if row.contains(s)]
         if own_sep:
             label = _day_text(own_sep[0], date_order)
             if label:
-                day_label = label
-        row_text = clean(join(pieces(row, drop_actions=False)))
-        if not own_sep and row_text and timeparse.is_day_label(row_text, date_order=date_order):
-            day_label = row_text
-            continue
+                day_label, day_at = label, timeparse.day_of(label, now=now, date_order=date_order)
+        if not own_sep and not marked:
+            row_text = clean(join(pieces(row, drop_actions=False)))
+            day = _separator_day(row_text, day_at, now=now, date_order=date_order) if row_text else None
+            if day is not None:
+                day_label, day_at = row_text, day
+                continue
         if not _wholly_visible(row, _row_clip(row, list_node, clip)):
             result.skipped_partial += 1
             continue
@@ -446,12 +458,31 @@ def extract_conversation(
 
 
 def _day_text(node: Node, date_order: str | None) -> str | None:
+    """The day an element the app's own markup marks as a day separator shows (a profile's ``day_separator``
+    anchor), read from its name, else its text, a sentence at a time."""
     for raw in (clean(node.name), clean(join(pieces(node, drop_actions=False)))):
         if raw:
             for part in [raw, *raw.split(". ")]:
-                if timeparse.is_day_label(part.strip(), date_order=date_order):
+                if timeparse.names_a_day(part.strip(), date_order=date_order):
                     return part.strip()
     return None
+
+
+def _separator_day(text: str, above: _dt.date | None, *, now: float, date_order: str | None) -> _dt.date | None:
+    """The day a row of a list whose app marks no separator elements stands for as a day separator, else ``None``.
+
+    Keyword audit D2 (20 Oct 2026): any row in which "tomorrow" or a weekday stood used to be one ("see you
+    tomorrow", "call me monday"), and the messages below it were dated by it. Now it is read from the capture's
+    structure: the row's whole text is a day label and nothing else (:func:`timeparse.is_day_label`, a fixed
+    format), and its place in the list fits a history, which runs oldest first: the day it names comes after the
+    day of the separator above it (``above``) and is not after the capture's own day. So a reply "Monday" below
+    "Today", or "Tomorrow" anywhere, is a message, not a separator."""
+    if not timeparse.is_day_label(text, date_order=date_order):
+        return None
+    day = timeparse.day_of(text, now=now, date_order=date_order)
+    if day is None or day > _dt.datetime.fromtimestamp(now).date() or (above is not None and day <= above):
+        return None
+    return day
 
 
 def _message(

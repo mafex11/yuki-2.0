@@ -215,10 +215,58 @@ def parse(label: str | None, *, date_order: str | None = None) -> Parsed | None:
     return Parsed(kind=kind, **fields)  # type: ignore[arg-type]
 
 
-def is_day_label(label: str | None, *, date_order: str | None = None) -> bool:
-    """Whether ``label`` names a day only ("Today", "Saturday", "31 August")."""
+def names_a_day(label: str | None, *, date_order: str | None = None) -> bool:
+    """Whether ``label`` reads as a day and no clock time (it may hold other words: "Today, new messages"). Only for
+    an element the app's own markup marks as a day separator (a profile's ``day_separator`` anchor); for text
+    whose kind the markup does not say, :func:`is_day_label`."""
     parsed = parse(label, date_order=date_order)
     return parsed is not None and parsed.kind == "day"
+
+
+#: The words a written day label is made of (the parser's own lexicon above): month and weekday names, the relative
+#: days, "of" and "the" ("the 24th of September"), and the ordinal endings written after a number ("24th").
+_DAY_WORDS = frozenset(set(_MONTHS) | set(_WEEKDAYS) | set(_RELATIVE_DAYS) | {"of", "the", "st", "nd", "rd", "th"})
+#: The marks a written date uses besides digits and spaces ("Monday, 22 Sept.", "18/09/2026", "2026-09-18"), and the
+#: rules apps draw around a separator's text ("- Today -", "· Today ·").
+_DATE_MARKS = frozenset(",./-–—·•")
+
+
+def _date_form(text: str) -> bool:
+    """Whether ``text`` is made of day-label words, digits and date marks alone (a fixed format, read character by
+    character: "see you tomorrow" is not, "Monday, September 22nd" is)."""
+    words: list[str] = []
+    word: list[str] = []
+    for ch in text.casefold():
+        if ch.isalpha():
+            word.append(ch)
+            continue
+        if word:
+            words.append("".join(word))
+            word = []
+        if not (ch.isdigit() or ch.isspace() or ch in _DATE_MARKS):
+            return False
+    if word:
+        words.append("".join(word))
+    return all(w in _DAY_WORDS for w in words)
+
+
+def is_day_label(label: str | None, *, date_order: str | None = None) -> bool:
+    """Whether ``label`` is a day label and nothing else ("Today", "SATURDAY", "31 August", "Monday, September 22nd",
+    "18/09/2026"): it names a day and no clock time, and it is written in a day label's fixed format alone
+    (:func:`_date_form`). Keyword audit D2 (20 Oct 2026): this used to be true for any text in which a day word
+    stood ("see you tomorrow", "call me monday"), so a chat row saying so was taken as a day separator and the
+    messages below it were dated by it."""
+    text = " ".join(str(label or "").split())
+    return bool(text) and _date_form(text) and names_a_day(text, date_order=date_order)
+
+
+def day_of(label: str | None, *, now: float, date_order: str | None = None) -> _dt.date | None:
+    """The local calendar day a label names, read at ``now`` (a weekday is the most recent past one, a date without
+    a year the latest one not more than a day ahead); ``None`` when it names no day."""
+    parsed = parse(label, date_order=date_order)
+    if parsed is None or not parsed.has_day:
+        return None
+    return _resolve_day(parsed, _dt.datetime.fromtimestamp(now).astimezone())
 
 
 def _resolve_day(parsed: Parsed, now: _dt.datetime) -> _dt.date | None:
