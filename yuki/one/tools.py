@@ -174,9 +174,11 @@ _MEDIA_DESCRIPTION = (
     "A media key for the media session playing, else the current one (Windows' media controls; never a game's). "
     "volumeup, volumedown, volumemute: the SYSTEM volume (every app, 2% a press); one app's is app_volume. Verified "
     "from the session's status or the volume.")
+#: Final-B (contract C6, all-spotify RC4): the same principle sentence as ``voice.hands.MEDIA_KEY_TRANSPORT_DESCRIPTION``.
 _MEDIA_DESCRIPTION_SKILL = (
     "A media key for the media session playing, else the current one (Windows' media controls; never a game's). "
-    "Volume is run_skill volume. Verified from the session's status.")
+    "Volume is run_skill volume; muting or silencing one app (its sound off while it plays on) is the volume skill "
+    "with mute on, never a pause. Verified from the session's status.")
 MEDIA_KEY_TOOL = _tool(
     "media_key", _MEDIA_DESCRIPTION,
     {"key": {"type": "string", "enum": list(MEDIA_KEYS)},

@@ -660,9 +660,9 @@ MESSAGE_SENTENCE = (
 
 #: Every volume request is the volume skill (map-skills S5): the talker's mixer hand and volume keys are off.
 VOLUME_PARAGRAPH = """\
-Every volume request is run_skill volume (the whole PC, an app's own, Spotify's slider, your own voice): the app they \
-named as target, the change (a number, up or down), the level, or mute (on or off); code picks their usual control, \
-says which, and asks when the app is unclear. Fine with a game in front.
+Every volume request is run_skill volume (the whole PC, an app's own, Spotify's slider, your own voice): target only \
+if they named an app or the PC (system), the change (up, down or signed points), the level, or mute (on or off); code \
+picks their usual control, says which, and asks when the app is unclear. Fine with a game in front.
 
 """
 
@@ -1079,9 +1079,12 @@ LEAN_MESSAGE_SENTENCE = (
     "You block settles it, text their exact words, send \"send\" when it is to go out (code counts down aloud and they "
     "can stop it), else \"draft\".")
 
+#: Final-B (contract C5, all-spotify RC5): a target only when they named an app or the whole PC (a bare "louder" names
+#: none), and ``change`` in the points slot's own form (the menu states it from the slot's type: up | down | signed
+#: points); the ONE agent's paragraph (``yuki.one.prompt.VOLUME_PARAGRAPH``) says the same words.
 LEAN_VOLUME_PARAGRAPH = """\
-Every volume ask is run_skill volume: target (the app named, or system), change, level or mute from their words; \
-code picks their usual control. Fine with a game in front."""
+Volume asks are run_skill volume: target only if they named an app or the PC (system); change up, down or signed \
+points, level or mute as they say; code picks their usual control. Fine with a game in front."""
 
 
 def lean_hands_prompt(skill_keys: Any = ()) -> str:
