@@ -1256,8 +1256,9 @@ class Runner:
             given = args.get("say_when_done") if name != "run_skill" else None
             line = (done_line if done_line is not None else
                     (_words(given) if given is not None else self.verbs.code_line(name, resolved, facts)))
+            # integ22 fix names-2: an open_url (or a new tab's address) taken for one of their own channels too
             named = _words(facts.get("opened_name")) \
-                if name == "open_app" and isinstance(facts.get("names_match"), Mapping) else ""
+                if name in ("open_app", "open_url", "tab") and isinstance(facts.get("names_match"), Mapping) else ""
             if named and done_line is None and named.casefold() not in line.casefold():
                 # integration F2 (decision 3): a misheard name taken as one of their own apps or sites is said as what
                 # opened (code's line), never the words as heard in the agent's line written before the act

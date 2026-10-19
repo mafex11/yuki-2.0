@@ -143,6 +143,10 @@ NAME_RULE_MAX = round(TURN_BAR - 0.01, 2)
 #: skill22 (A6, contract C14): at most this many of the user's own channels (:data:`CHANNEL`), their room kept inside
 #: :data:`OWN_MAX` when they are listed with the apps and sites (skill22 fix L2).
 OWN_CHANNELS = 40
+#: integ22 fix names-1: a raw address's value swapped for one of the user's channels (:func:`own_url`) and given again
+#: within this long opens as written: the second ask of the very same value is a correction ("no, the main MKBHD
+#: channel"), so a wrong swap costs one "not that". RAM only (the value's identity, never logged).
+CHANNEL_SWAP_KEEP_S = 120.0
 
 #: The kinds of names (code words, logged).
 APP, SITE, CHANNEL = "app", "site", "channel"
@@ -616,6 +620,10 @@ def best_match(heard: Any, names: Iterable[Any], *, literal_ok: bool = True, as_
 _lock = threading.Lock()
 _memory_cache: dict[str, tuple[float, list[Own]]] = {}
 _running_cache: list[tuple[float, list[str]]] = []
+#: integ22 fix names-1: every channel of the user's as written, uncapped (``(site, page, squashed value)``), per
+#: database for :data:`OWN_TTL_S`; and the squashed values :func:`own_url` swapped, with when (RAM only).
+_written_cache: dict[str, tuple[float, frozenset[tuple[str, str, str]]]] = {}
+_swapped: dict[str, float] = {}
 
 
 def _squash(text: str) -> str:
@@ -900,6 +908,58 @@ def own_channel_entries(store: Any = None) -> list[Own]:
         return []
 
 
+def _channels_written(store: Any) -> frozenset[tuple[str, str, str]]:
+    """integ22 fix names-1: every channel of the user's as written, ``(site, page, squashed value)``: for each taste
+    kind of a site page with one speakable value (:func:`_channel_entries`' kinds), all the values they picked and all
+    their own app showed, never capped (:data:`OWN_CHANNELS` caps only the match pool). Cached per database for
+    :data:`OWN_TTL_S`. Never raises (empty)."""
+    if store is None:
+        return frozenset()
+    cache_key = str(getattr(store, "path", id(store)))
+    now = time.monotonic()
+    with _lock:
+        hit = _written_cache.get(cache_key)
+        if hit is not None and now - hit[0] < OWN_TTL_S:
+            return hit[1]
+    out: set[tuple[str, str, str]] = set()
+    try:
+        from yuki.skills import taste
+
+        for kind, site, page, _var in taste.site_kinds():
+            try:
+                values = [t.name for t in taste.top(store, kind, n=10_000)] + list(taste.seen_names(store, kind))
+            except Exception:  # noqa: BLE001 - this kind unread: the others
+                continue
+            out |= {(site, page, _squash(str(v or "").lstrip("@"))) for v in values if _squash(str(v or ""))}
+    except Exception:  # noqa: BLE001
+        return frozenset()
+    got = frozenset(out)
+    with _lock:
+        _written_cache[cache_key] = (now, got)
+    return got
+
+
+def own_channels_written(store: Any = None) -> frozenset[tuple[str, str, str]]:
+    """:func:`_channels_written` on ``store``, else on this process's own memory when it is open (a bounded call of
+    :data:`STORE_WAIT_S`, as :func:`_default_entries`). Never raises (empty)."""
+    if store is not None:
+        return _channels_written(store)
+    module = sys.modules.get("yuki.agent.memory")
+    access = getattr(module, "_default", None) if module is not None else None
+    if access is None or getattr(access, "_client", None) is None:
+        return frozenset()
+    try:
+        got = access.call("own_channels", lambda c: _channels_written(getattr(c, "store", c)), timeout_s=STORE_WAIT_S)
+        return got if isinstance(got, frozenset) else frozenset()
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+def _digits(text: Any) -> str:
+    """The digits of ``text`` in order (a format rule: "NikoOmilana2" -> "2")."""
+    return "".join(ch for ch in str(text or "") if ch.isdigit())
+
+
 def channel_url(entry: Own) -> str:
     """The address of one of the user's channels (its site file's template for its page kind, filled with its value);
     ``""`` when it can't be built. Data only (``yuki/connect/sites``)."""
@@ -927,11 +987,17 @@ def own_url(url: Any, *, store: Any = None) -> dict[str, Any] | None:
     ``taste.site_kinds``, YouTube's ``/@handle``) that is none of the user's own channels of that page as written, but
     is one of them by the same measure as every name given to an act (:func:`best_match` in name mode against their
     channels' display names and values: "Deezy" -> Deji 0.75; no clip: a channel's short name is often another
-    channel's whole one, "Sidemen" for "SidemenReacts"), else by taste's closed-set sound tier
-    (``taste.heard_as``, loose: an initialism spelled out, "MBL" -> NDL). ``{"url": that channel's own address, "name":
-    its name (RAM only), "kind": "channel", "how": "heard", "score", "margin", "source": "taste"}``; ``None`` when the
-    address is no such page, its value is one of theirs as written, or none measures clearly (the address stays as
-    given). The callers log only the code words and numbers. ``store`` as for :func:`own_entries`. Never raises."""
+    channel's whole one, "Sidemen" for "SidemenReacts"). ``{"url": that channel's own address, "name": its name (RAM
+    only), "kind": "channel", "how": "heard", "score", "margin", "source": "taste"}``; ``None`` when the address is no
+    such page, its value is one of theirs as written, or none measures clearly (the address stays as given). The
+    callers log only the code words and numbers. ``store`` as for :func:`own_entries`. Never raises.
+
+    integ22 fixes (S5, names-1): "as written" is checked against every channel of theirs of that page kind, uncapped
+    (:func:`own_channels_written`; only the match pool keeps :data:`OWN_CHANNELS`); the address is model-built, so only
+    :func:`best_match` measures it (taste's loose sound tier stays with the user's own words); a value whose digits
+    are not the channel's ("NikoOmilana2" for NikoOmilana) is another channel, never swapped; and the same value given
+    again within :data:`CHANNEL_SWAP_KEEP_S` of its swap opens as written (a correction: a wrong swap costs one "not
+    that")."""
     try:
         from urllib.parse import unquote
 
@@ -944,31 +1010,33 @@ def own_url(url: Any, *, store: Any = None) -> dict[str, Any] | None:
         entries = [e for e in own_channel_entries(store) if e.site == m.site and e.page == m.kind]
         if not value or not entries:
             return None
-        if any(_squash(value) in (_squash(e.name), _squash(e.key)) for e in entries):
-            return None          # one of theirs as written: nothing to change
+        heard = _squash(value)
+        if any(heard in (_squash(e.name), _squash(e.key)) for e in entries) \
+                or (m.site, m.kind, heard) in own_channels_written(store):
+            return None          # one of theirs as written (any of them, past the match pool's cap): nothing to change
+        now = time.monotonic()
+        with _lock:
+            for old in [k for k, t in _swapped.items() if now - t > CHANNEL_SWAP_KEEP_S]:
+                _swapped.pop(old, None)
+            if heard in _swapped:
+                return None      # given again right after its swap: a correction, opened as written
         names: dict[str, Own] = {}
         for e in entries:
             for n in (e.name, e.key):
                 names.setdefault(" ".join(str(n or "").split()), e)
         got = best_match(value, list(names), as_name=True, clip=False)
-        how_score: tuple[float | None, float | None] = (None, None)
-        entry: Own | None = None
-        if got is not None:
-            entry, how_score = names.get(got[0]), (got[1], got[2])
-        else:
-            from yuki.skills.taste import heard_as
-
-            alike = heard_as(list(names), value, loose=True)
-            entry = names.get(alike) if alike else None
-        if entry is None:
+        entry = names.get(got[0]) if got is not None else None
+        if got is None or entry is None:
             return None
+        if _digits(value) and _digits(value) not in (_digits(entry.key), _digits(entry.name)):
+            return None          # the same letters with another number: another channel
         new = channel_url(entry)
         if not new or new.casefold() == str(url or "").strip().casefold():
             return None
-        out: dict[str, Any] = {"url": new, "name": entry.name, "kind": CHANNEL, "how": "heard", "source": TASTE}
-        if how_score[0] is not None:
-            out.update(score=how_score[0], margin=how_score[1])
-        return out
+        with _lock:
+            _swapped[heard] = now
+        return {"url": new, "name": entry.name, "kind": CHANNEL, "how": "heard", "source": TASTE, "score": got[1],
+                "margin": got[2]}
     except Exception:  # noqa: BLE001 - no measure: the address as given
         return None
 
@@ -1014,10 +1082,11 @@ def site_browser(host: Any, store: Any = None) -> str:
         return ""
 
 
-__all__ = ["APP", "BAR", "TURN_BAR", "BROWSER_MIN_SITES", "CHANNEL", "CLIP_SHARE", "LENGTH_RATIO", "LINKS", "MARGIN",
-           "MAX_WORDS", "MIN_LETTERS", "NAME_RULE_MAX", "NAME_VOWEL_COST", "NEAR_MIN_LETTERS", "OWN_CHANNELS",
-           "OWN_MAX", "Own",
+__all__ = ["APP", "BAR", "TURN_BAR", "BROWSER_MIN_SITES", "CHANNEL", "CHANNEL_SWAP_KEEP_S", "CLIP_SHARE",
+           "LENGTH_RATIO", "LINKS", "MARGIN", "MAX_WORDS", "MIN_LETTERS", "NAME_RULE_MAX", "NAME_VOWEL_COST",
+           "NEAR_MIN_LETTERS", "OWN_CHANNELS", "OWN_MAX", "Own",
            "RUNNING", "SHORT_BAR", "SITE", "SITE_MIN_VISITS", "START", "TAIL_HEAD", "TAIL_MIN_LETTERS", "TASTE",
-           "TIMELINE", "best_match", "channel_url", "is_site", "literal", "own_channel_entries", "own_entries",
+           "TIMELINE", "best_match", "channel_url", "is_site", "literal", "own_channel_entries", "own_channels_written",
+           "own_entries",
            "own_names", "own_site_entries", "own_url", "same_group", "score", "site_browser", "site_url", "sites_of",
            "sound_code", "start_names"]

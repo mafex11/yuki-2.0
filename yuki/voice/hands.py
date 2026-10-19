@@ -1597,6 +1597,9 @@ class Hands:
         #: sVoiceFix (F4, F6): ``(turn, n)``: calls refused for their own shape, and run_skill calls with no skill,
         #: given back to the talker in this user turn (once each; the next goes on as before)
         self._shape_given: tuple[Any, int] | None = None
+        #: integ22 fix S3: ``(turn, hand, skill)``: the one re-call a shape give-back asked for, let through the
+        #: look-only rule once (:meth:`handle`); used up by that call
+        self._shape_pass: tuple[Any, str, str] | None = None
         self._malformed_given: tuple[Any, int] | None = None
         #: pVoice: the ``then`` a verified step gave back to the talker in this user turn, while the rest it names is
         #: still open (``{"turn", "steps" (code's words), "hand", "args", "report"}``; RAM only), and ``(turn, n)``:
@@ -1666,6 +1669,7 @@ class Hands:
         self._turn_calls = None
         self._step_checked = None
         self._shape_given = None
+        self._shape_pass = None
         self._malformed_given = None
         self._then_looks = None
         self._drop_deferred("new_conversation")
@@ -2570,7 +2574,7 @@ class Hands:
 
     async def _look_after(self, params: Any, name: str, args: dict[str, Any], facts: dict[str, Any],
                           before: Any, rest: bool = False, end: bool = False,
-                          front_ok: Any = None) -> dict[str, Any] | None:
+                          front_ok: Any = None, queued: bool = False) -> dict[str, Any] | None:
         """P1.3: once the act's done line is queued, read the desk again and compare it with ``before``. When the act
         took something the user had (``diff.any_flag``: measured shares and focus only) and the tidy dial is not off
         (integration review c2desk-2: or, whatever the dial, what they asked for did not reach its purpose: the sound
@@ -2676,8 +2680,10 @@ class Hands:
                          else "")
             # desk22 (D4): under "do", a part 1 with a rest leaves the turn's look to the turn's end (its earliest
             # before stays open; the rest's acts join it)
-            defer = bool(rest and not end and look and windowed and level == "do" and same_before and not purpose
-                         and (step is not None or flag_said))
+            # integ22 fix S2: or a part 1 with the reply's next part queued behind it (both parts in one reply, then
+            # ""): ``queued`` only widens this test; ``rest`` and the look's own ``rest`` are unchanged
+            defer = bool((rest or queued) and not end and look and windowed and level == "do" and same_before
+                         and not purpose and (step is not None or flag_said))
             if self.log is not None:
                 self.log.event("hands", op=name, after_look=bool(text) and not defer, tidy=level or None,
                                call=params.tool_call_id, tidy_step=(step or {}).get("action"), cover_said=bool(cover),
@@ -2868,7 +2874,9 @@ class Hands:
                 self._drop_deferred("handed_over")
                 return
             ours = set(HAND_NAMES) | {SKILL_HAND, KEEP_USUAL_HAND, KEEP_WAY_HAND}
-            if names & ours:
+            # integ22 fix S1: only a reply with no call (or only stay_quiet) ends the turn; any other call (a read:
+            # quick_memory, check_progress, more_of_result; a control) has a follow-up reply of its own
+            if names & ours or names - {"stay_quiet", ""}:
                 return
             task = asyncio.ensure_future(self._tidy_deferred("reply_end"))
             self._background.add(task)
@@ -3476,7 +3484,10 @@ class Hands:
             args = params.arguments if isinstance(params.arguments, dict) else {}
             spared = name in (KEEP_USUAL_HAND, KEEP_WAY_HAND) or (name == "scroll" and args.get("keep") == "stop")
             look = self._look_now(self._call_safely(self.user_turn, None))
-            in_look = look is not None and arrived >= float(look.get("at") or 0.0) and not look.get("rest")
+            # integ22 fix S1: an end look's result reached no talker call, so a later call of the turn is never held
+            # to the look-only rule after it (a second look is still refused: ``_look_now`` is set)
+            in_look = (look is not None and arrived >= float(look.get("at") or 0.0) and not look.get("rest")
+                       and not look.get("end"))
             placing = name == "window" and str(args.get("action") or "") in PLACE_OPS
             # integration review c2desk-2: a look whose After shows the sound still silent lets one volume step through
             # (its one step, as a placement's is); everything else stays held. tidy21: a window step code took itself
@@ -3487,8 +3498,16 @@ class Hands:
                 or (name == SKILL_HAND and str(args.get("skill") or "").strip() == VOLUME_SKILL)))
             if sound_step:
                 look["used"] = look["sound_used"] = True
+            # integ22 fix S3: the one re-call a shape give-back asked for (same turn, same hand, same skill) gets
+            # through the look-only rule once; it is not the look's tidy step (``look["used"]`` is left alone)
+            sp = getattr(self, "_shape_pass", None)
+            reshape = bool(in_look and sp is not None and sp[0] == self._call_safely(self.user_turn, None)
+                           and sp[1] == name
+                           and (name != SKILL_HAND or sp[2] == str(args.get("skill") or "").strip()))
+            if reshape:
+                self._shape_pass = None
             if (gate is not None and gate.get("passed") and not spared) or (
-                    in_look and not placing and not spared and not sound_step):
+                    in_look and not placing and not spared and not sound_step and not reshape):
                 from pipecat.frames.frames import FunctionCallResultProperties
 
                 if self.log is not None:
@@ -3648,7 +3667,9 @@ class Hands:
             # or tab brought up: its step line, below)
             line = self._code_line(name, args, facts)
             coded = bool(line)
-        named = _opened_name(facts) if confirmed and name == "open_app" else ""
+        # integ22 fix names-2: an open_url (or a new tab's address) taken for one of their own channels too
+        named = (_opened_name(facts) if confirmed and (name in OPEN_HANDS or (name == "tab" and op == "new"))
+                 else "")
         if named and named.casefold() not in " ".join(line.casefold().split()):
             # integration F2 (decision 3): a misheard name taken as one of their own apps or sites is said as what
             # opened (code's line), never the words as heard in the model's line written before the act
@@ -3855,7 +3876,7 @@ class Hands:
             if speak:
                 await params.llm.push_frame(TTSSpeakFrame(text=line))
             # P1.3: the done line is queued; only an act that took something the user had gets one more run
-            look = await self._look_after(params, name, args, facts, desk_before)
+            look = await self._look_after(params, name, args, facts, desk_before, queued=queued)
             cover = str((look or {}).pop("_cover", "") or "")   # desk20 (S3): said by code after the done line
             quiet = bool((look or {}).pop("_quiet", False))   # tidy21: code took the tidy step; nothing for the talker
             said = " ".join(x for x in (line if speak else "", cover) if x)
@@ -3911,6 +3932,7 @@ class Hands:
             # again as the report says (never a loop: the next such refusal goes to the thinker by code, below)
             if shape_retry:
                 self._shape_given = (turn, self._given(self._shape_given, turn) + 1)
+                self._shape_pass = (turn, name, "")   # integ22 fix S3: its re-call passes the look-only rule once
                 if self.log is not None:
                     self.log.event("hands", op=name, shape_retry=True, call=params.tool_call_id)
                 await params.result_callback({"not_done": report[:700], "how_to_handle_it": _SHAPE_NOTE})
@@ -4434,6 +4456,9 @@ class Hands:
             url = " ".join(str(args.get("url") or "").split())[:160]
             if name == "open_url":
                 where = " ".join(str(args.get("app") or "").split())[:40] or "the browser"
+                named = _opened_name(facts)
+                if named and (facts or {}).get("names_match", {}).get("kind") == "channel":
+                    return f"opened their channel {named} in {where}"   # integ22 fix names-2: what opened
                 return f"opened the address {url} in {where}"
             if name == "open_app":
                 named = _opened_name(facts)
@@ -4601,6 +4626,11 @@ class Hands:
                 return "Closed it."
             if name == "open_url" or (name == "tab" and str(args.get("action") or "") == "new"
                                       and str(args.get("url") or "").strip()):
+                # integ22 fix names-2: an address taken for one of their own channels is named as what opened
+                # ("Opened Deji's channel."), never the handle as heard
+                named = _opened_name(facts)
+                if named and (facts or {}).get("names_match", {}).get("kind") == "channel":
+                    return f"Opened {named}'s channel."
                 return "It's up."   # verified at the address and titled (never silent after "On it.")
             if name == "open_app":
                 # names21 (the user's decision 3): a misheard name taken as one of their own apps or sites is named as
@@ -4975,6 +5005,16 @@ class Hands:
         facts.pop("_tried", None)
         facts.pop("_words", None)
         try:
+            # integ22 fix S6: a skill run is this turn's request acting: the newest request's steps are this turn's
+            # hand steps (none: empty), never an older request's (a thinker fallback's own close replaces them)
+            from yuki.brain.executor import note_steps
+
+            way_now = self._turn_now()
+            note_steps(self._way_turn[1] if isinstance(self._way_turn, tuple) and self._way_turn[0] == way_now
+                       else [], source="talker", acted=True)
+        except Exception:  # noqa: BLE001 - the steps note never breaks a hand
+            pass
+        try:
             await self._skill_reply(params, name, args, ok, report, facts, ms, hand_id=hand_id, fallback=fallback,
                                     gate=gate, before=desk_before)
         finally:
@@ -5060,6 +5100,8 @@ class Hands:
             shape_turn = self._call_safely(self.user_turn, None)
             if shape_turn is not None and self._given(self._shape_given, shape_turn) < 1:
                 self._shape_given = (shape_turn, self._given(self._shape_given, shape_turn) + 1)
+                # integ22 fix S3: the talker's re-call of this skill passes the look-only rule once (:meth:`handle`)
+                self._shape_pass = (shape_turn, name, str(args.get("skill") or "").strip())
                 self._skill_reply_log(params, name, ok, report, facts, ms, hand_id, line=False, fallback=None)
                 if self.log is not None:
                     self.log.event("hands", op=name, shape_retry=True, call=params.tool_call_id)
@@ -5164,7 +5206,7 @@ class Hands:
             # usual?": that question waits for their answer)
             look = None
             if verified and not facts.get("keep_question"):
-                look = await self._look_after(params, name, args, facts, before)
+                look = await self._look_after(params, name, args, facts, before, queued=self._queued_behind(gate))
             cover = str((look or {}).pop("_cover", "") or "")   # desk20 (S3): said by code after the done line
             quiet = bool((look or {}).pop("_quiet", False))   # tidy21: code took the tidy step; nothing for the talker
             said = " ".join(x for x in (line, cover) if x)
@@ -7219,7 +7261,12 @@ class Hands:
         return False, (f"the browser's reopen brought back {where}, which is NOT the one wanted (\"{expect}\"); it is "
                        f"left as it is"), facts
 
-    def _open_url(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    def _open_url(self, args: dict[str, Any], facts: dict[str, Any], *,
+                  heard: bool = True) -> tuple[bool, str, dict[str, Any]]:
+        """The open_url hand (and a new tab's address). integ22 fix S5: ``heard`` (the talker's and ONE's own call: an
+        address built from heard words) lets the launch take a channel page's value for one of the user's own
+        channels (``launch.open_url``'s ``heard``); a told way's replay passes ``False`` (its address opens as
+        recorded)."""
         url = str(args.get("url") or "").strip()
         if not url:
             raise _Refused("no address given")
@@ -7232,6 +7279,8 @@ class Hands:
         kw: dict[str, Any] = {"app": app} if app else {}
         if _takes_kw(opener, "deadline"):
             kw["deadline"] = end
+        if heard and _takes_kw(opener, "heard"):
+            kw["heard"] = True   # integ22 fix S5: the channel swap is for a heard address only
         result = opener(url, **kw)
         ok, report, facts = self._report(result, "", facts)
         details = getattr(result, "details", None) or {}
@@ -7242,6 +7291,9 @@ class Hands:
             # that opened in this hand's report (the launch's summary names what opened)
             facts["names_match"] = {k: match.get(k) for k in ("kind", "how", "score", "margin", "source")}
             url = str(details.get("url"))
+            # integ22 fix names-2: what opened (the channel's name), for code's done line and the step words only; a
+            # string fact, never logged (as open_app's)
+            facts["opened_name"] = " ".join(str(details.get("channel_name") or "").split())[:60]
         page = details.get("page") if isinstance(details.get("page"), dict) else {}
         hwnd = details.get("hwnd")
         stages = _stage_ms(details.get("timings_ms"))

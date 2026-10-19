@@ -303,12 +303,19 @@ def way_end(steps: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
-def note_steps(steps: Sequence[Mapping[str, Any]], *, source: str) -> None:
+def note_steps(steps: Sequence[Mapping[str, Any]], *, source: str, acted: bool = False) -> None:
     """The newest request's act steps (``source``: ``planner`` or ``talker``), in :func:`way_step`'s shape, kept in
-    RAM for "remember how I do this" (:func:`keep_way`); a request with no such step keeps the older ones. Never
+    RAM for "remember how I do this" (:func:`keep_way`). integ22 fix S6: a request that acted (``acted``: a skill run,
+    any act) with no way step makes the newest entry empty (:func:`keep_way` then says ``no_steps``, never an older
+    request's steps under the newer one's name); one that did not act (a read, a chat) keeps the older ones. Never
     raises."""
     try:
         kept = [dict(s) for s in steps or () if isinstance(s, Mapping) and s.get("verb") in WAY_VERBS]
+        if not kept and acted:
+            with _last_lock:
+                _last_steps.clear()
+                _last_steps.update({"steps": [], "at": time.monotonic(), "source": str(source)})
+            return
         if not kept:
             return
         with _last_lock:
@@ -930,7 +937,11 @@ class Executor:
         self.lease.release()
         if self._pool is not None:
             self._pool.shutdown(wait=False)
-        note_steps(self.way_steps(), source="planner")   # desk22 (A13): "remember how I do this" reads these next
+        # desk22 (A13): "remember how I do this" reads these next. integ22 fix S6: a request that acted (a run_skill
+        # step too) with no way step is the newest request all the same (an older request's steps are never kept
+        # under its name)
+        acted = any(isinstance(s, Mapping) and s.get("kind") == "action" and not s.get("refused") for s in self.trace)
+        note_steps(self.way_steps(), source="planner", acted=acted)
         run = self._run_row(reply=reply, outcome=outcome)
         thread = self._recheck
         if thread is not None and thread.is_alive():
@@ -3906,7 +3917,13 @@ class Executor:
         name = words(field_of(step, "value", ""))
         try:
             own = self.way_steps()
-            key, why = keep_way(getattr(self.host, "memory", None), name, own or None)
+            if not own and any(isinstance(s, Mapping) and s.get("kind") == "action" and not s.get("refused")
+                               for s in self.trace):
+                # integ22 fix S6: this request acted with no way step (a run_skill): an older request's steps are
+                # never kept under its name
+                key, why = None, "no_steps"
+            else:
+                key, why = keep_way(getattr(self.host, "memory", None), name, own or None)
             ok = key is not None
             line = (LINE_WAY_KEPT.format(name=name) if ok else LINE_WAY_NONE if why == "no_steps"
                     else LINE_WAY_FAILED)

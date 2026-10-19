@@ -1740,7 +1740,8 @@ class SkillRunner:
                 ok, report, facts = hands._act("open_app", {"name": step.name or step.app}, facts)
                 tool, target, app = "launch_app", f'app "{step.name or step.app}"', step.name or step.app
             else:
-                ok, report, facts = hands._open_url({"url": step.url, "app": step.app}, facts)
+                # integ22 fix S5: a told way's address opens as recorded (never taken for another channel)
+                ok, report, facts = hands._open_url({"url": step.url, "app": step.app}, facts, heard=False)
                 tool, target, app = "open_url", step.url, step.app or None
         except _TakenOver:
             raise
@@ -3011,7 +3012,7 @@ class DeskHands:
     def _act(self, name: str, args: dict[str, Any], facts: dict[str, Any]) -> Any:
         raise RuntimeError("not on the brain's desk hands: the planner does it")
 
-    def _open_url(self, args: dict[str, Any], facts: dict[str, Any]) -> Any:
+    def _open_url(self, args: dict[str, Any], facts: dict[str, Any], *, heard: bool = True) -> Any:
         raise RuntimeError("not on the brain's desk hands: the planner does it")
 
     def act_off(self, app: str | None) -> str | None:

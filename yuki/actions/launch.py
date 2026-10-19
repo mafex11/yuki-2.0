@@ -4510,6 +4510,9 @@ def _channel_named(result: ActionResult, took: dict, given: str) -> ActionResult
     try:
         details = result.details if isinstance(result.details, dict) else {}
         details["names_match"] = {k: took[k] for k in ("kind", "how", "score", "margin", "source") if k in took}
+        # integ22 fix names-2: the channel's name, for the hands' done line ("Opened Deji's channel."): a string fact
+        # (as open_app's ``name``), never in the content-free match
+        details["channel_name"] = " ".join(str(took.get("name") or "").split())[:60]
         heard = given
         try:
             from urllib.parse import unquote
@@ -4532,7 +4535,7 @@ def _channel_named(result: ActionResult, took: dict, given: str) -> ActionResult
 
 def open_url(
     url: str, *, app: str | None = None, content_timeout_s: float = CONTENT_WAIT_S,
-    deadline: float | None = None, address_bar: bool = True,
+    deadline: float | None = None, address_bar: bool = True, heard: bool = False,
 ) -> ActionResult:
     """Open a URL (or any shell target: a file, a folder).
 
@@ -4565,6 +4568,11 @@ def open_url(
             page wait capped at :data:`_NOTED_PAGE_S` while the note holds the
             browser). The skill measures that hand-off into the note itself
             (:func:`note_handoff`), so this path writes no note (review M3).
+        heard: integ22 fix S5: the address is the talker's own, built from
+            heard words (the hands' ``open_url`` and new tab): only then may a
+            channel page's value be taken for one of the user's own channels
+            (:func:`_own_channel`). An address read from a message or a page,
+            the planner's, a told way's replay: opened exactly as given.
 
     A web address handed to a browser that was already running is checked
     against what its windows showed right before (:func:`_pages_before`): an
@@ -4596,12 +4604,13 @@ def open_url(
     # D17: an opened link brings its handler forward (a browser, Spotify, Discord): never with a game in front
     if (refused := _gate.refuse("open_url")) is not None:
         return finish(False, refused, {"url": target, "refused": _gate.kind_of(refused)})
-    if address_bar and (took := _own_channel(target)) is not None:
+    if heard and address_bar and (took := _own_channel(target)) is not None:
         # integ22 (skill22 merge note 1, A6; final-D youtube_channel_deji_arc): a raw address of a page named by a
         # value that is none of the user's own channels as written but measures as one of them ("@Deezy" for their
-        # Deji) opens that channel's own address, named as what opened (decision 3: never a question). The hands' path
-        # only: the web skill's own call (``address_bar=False``) has skill19's heard match already. The channel's
-        # address is one of theirs as written, so the call below measures nothing more.
+        # Deji) opens that channel's own address, named as what opened (decision 3: never a question). integ22 fix S5:
+        # the hands' heard address only (``heard``); the web skill's own call (``address_bar=False``) has skill19's
+        # heard match already, and an address read, never heard, opens as given. The call below leaves ``heard`` out
+        # (its address is one of theirs as written).
         return _channel_named(open_url(took["url"], app=app, content_timeout_s=content_timeout_s, deadline=deadline,
                                        address_bar=address_bar), took, target)
     if app is not None and app.strip():
