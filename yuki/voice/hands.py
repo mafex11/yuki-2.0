@@ -1493,9 +1493,6 @@ class Hands:
         #: Review r1 M4: the call id of the last call answered "not tried" (:meth:`_halted_result`): a call not tried
         #: leaves the earlier outcome's own line owed (nothing was tried over it), and owes no line of its own.
         self._halted_call: Any = None
-        #: lVoice (a hook for lSpeed's reflex path, :meth:`reflex_done`): ``{step key: when}`` of steps the reflex ran
-        #: for the words being heard, so the talker's own call for the same step is that step, never a second act.
-        self._reflex: dict[str, float] = {}
         #: lVoice review r1 M2 (rule 8): the user turn in which a verified skill run's skill sends to other people or
         #: joins a call (its data): no rest of that turn is handed on by code (never a risk of a second send).
         self._commit_turn: Any = None
@@ -2248,30 +2245,6 @@ class Hands:
             return None
         except Exception:  # noqa: BLE001 - unknown: the line is kept
             return None
-
-    #: lVoice: how long a step the reflex ran answers the talker's own call for the same step (s).
-    REFLEX_SAME_S = 10.0
-
-    def reflex_done(self, name: str, args: dict[str, Any]) -> None:
-        """lVoice, a backstop for lSpeed's reflex path (which acts at the eager end of turn, before the user turn is
-        counted). The reflex calls the hands' own act directly (:meth:`_acting_run`, or :meth:`_skill_hand` for the
-        volume skill), never :meth:`handle`; ``pipeline._reflex_dup`` answers the talker's duplicate call before
-        :meth:`handle`, and ``pipeline._reflex_note`` files the act under its user turn (:meth:`_note_call`) once the
-        turn is counted. This is called only for an effect that was seen done (the reflex's ``done``; never ``sent``,
-        ``settled`` or ``skipped``): the step (the hand or skill ``name`` with ``args``, as a talker call would give
-        them) then answers a talker call for the same step that still reaches :meth:`handle` (:func:`_step_key`: its
-        arguments but its words) within :attr:`REFLEX_SAME_S` as already done, with no second act and no second line.
-        Never raises."""
-        try:
-            now = time.monotonic()
-            self._reflex = {k: t for k, t in self._reflex.items() if now - t < self.REFLEX_SAME_S}
-            self._reflex[_step_key(str(name), dict(args or {}))] = now
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _reflex_ran(self, key: str, now: float) -> bool:
-        at = self._reflex.get(key)
-        return at is not None and now - at < self.REFLEX_SAME_S
 
     def called_this_turn(self) -> bool:
         """Phase 2 (2.4, the claim gate's "something was asked"): whether the talker called a hand or a skill in the
@@ -3608,10 +3581,9 @@ class Hands:
         url = _url_key(args) if name == "open_url" or (name == "tab" and str(args.get("action") or "") == "new") \
             else ""
         again = gate is not None and (key in gate["done"] or bool(url and url in gate["urls"]))
-        if again or self._reflex_ran(key, started):
+        if again:
             # lVoice: the same step again in this user turn (a reply that wrote "open it in Arc", "in Chrome" and "in
-            # Google Chrome" as three calls: once one opened the address, the next are that step), or one the reflex
-            # just ran for these words: never twice
+            # Google Chrome" as three calls: once one opened the address, the next are that step): never twice
             recent = (started, "this step was already done for these words: " + (
                 "that address is open now" if url and gate is not None and url in gate["urls"] else "the same step"))
         if key in self._inflight or (recent is not None and started - recent[0] < _OPEN_REPEAT_S):
@@ -4899,7 +4871,7 @@ class Hands:
                                               "how_to_handle_it": _MALFORMED_NOTE})
                 return
         key = _step_key(name, args)
-        if (gate is not None and key in gate["done"]) or self._reflex_ran(key, time.monotonic()):
+        if gate is not None and key in gate["done"]:
             # lVoice: the same skill run with the same values again in this user turn (a reply's repeat): done once
             if self.log is not None:
                 self.log.event("hands", op=name, deduped=True, running=False, call=params.tool_call_id)
@@ -5471,7 +5443,7 @@ class Hands:
         words: a correction naming another option (:func:`yuki.skills.prefs.note_correction`), the pending "Keep this
         as your usual?", a "still your usual?" card. The acting marker goes up only right before a rung that takes
         focus (D18: sound-only runs publish none). ``(ok, report, facts)`` as :meth:`SkillResult.as_voice` gives.
-        P1.2: with ``bracket`` (not a reflex's run), the desk is read right before the run, kept as
+        P1.2: with ``bracket`` (not a code-made run's), the desk is read right before the run, kept as
         ``facts["_desk_before"]`` with whose change is whose (``facts["_desk_scope"]``) for the look after it.
         hands19 (final-B all-desk RC1(a)): read before every bracketed run (never a sound-only one), not only before a
         rung that declares it takes focus: Spotify's declared no-focus rungs took the front on this PC and no before was
@@ -6088,7 +6060,7 @@ class Hands:
         Yuki's doing, not the user's (5 Oct the Riot window the open_app hand brought up was logged as the user's own
         for 107 s). Blocking, off the loop; the marker is a small file write. Sound-only hands publish nothing.
         ``hand_id``: the hand's id (phase F): the marker carries it as its ``request_id``, as the hand's trace does.
-        ``bracket``: False for a reflex (lSpeed: no look after acting there, so no desk read before it)."""
+        ``bracket``: False for a run code makes with no look after it (so no desk read before it)."""
         with self._acting(name, hand_id):
             return self._run(name, args, bracket=bracket)
 

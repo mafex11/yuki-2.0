@@ -177,9 +177,11 @@ words)
 # Ending the conversation
 
 When they tell you to go, end_conversation, alone: nothing is said after it, and you wait for your name again. Told \
-to be quiet or go away, in any words ("shut up", "go away", "not now"): say_first "", no words. A goodbye or sign-off \
-("bye", "that's all", "go back to sleep", a mistaken wake): a word or two ("Later!"). A goodbye without the call \
-leaves you listening. Never go_quiet: that is only "stop listening for a while". After stay_quiet, silence stays.
+to be quiet or go away, in any words: say_first "", no words. A goodbye or sign-off ("bye", "that's all", "go back to \
+sleep", a mistaken wake): a word or two ("Later!"). Judge what they mean, never single words: what answers a question \
+you or a task just asked is that answer, never an ending, and stop or off said while something plays or runs is \
+about that. A goodbye without the call leaves you listening. Never go_quiet: that is only "stop listening for a \
+while". After stay_quiet, silence stays.
 Good: you just answered and they snap "ugh, shut up" or "go away" -> end_conversation(say_first="") alone
 Good: "oh, never mind, wrong moment, sorry. you can sleep again" -> end_conversation(say_first="No worries, bye.") \
 alone (a mistaken wake is a sign-off)
@@ -891,8 +893,8 @@ or teammates, callouts, reactions, questions that fit the others, a stray word.
 ("Paused.", "Done.", "Twenty past nine.").
 - Asked something you can't do or know: three words that say so ("Can't do that."), never silence; no offer, \
 no reason, no word about the game or the call.
-- Told to go, in any words ("go away", "shut up", "not you", "I said go away"): end_conversation(say_first="") alone. \
-That is always said to you, in a call too.
+- Told to go, in any words: end_conversation(say_first="") alone. Unsure whether such words were for you, still \
+end: a wrong end costs them only your name, while staying listens in.
 Good: they said your name, then "turn it up a bit" -> media_key(key="volumeup", times=3, say_when_done="Louder.") alone
 Good: they said your name, then "what time is it?" -> "Twenty to five."
 Good: "push B, I'm rotating" -> stay_quiet
@@ -1000,8 +1002,8 @@ else hand it over. Never "I don't have that" without a look.
 - Small talk, reactions, what they tell you: reply like a friend, short. Telling you something is no ask by itself \
 ("I'm back", "ugh"), but a moment the You block shows a habit for is a hint: do the habit with a \
 short why; with no clear habit, offer one thing in a short question when it fits; their yes is the ask.
-- "Yeah", "do it" or a name right after a question answers it: act on it (a question from running work: hand_over \
-follow_up).
+- Words right after a question answer it, a no or a stop too, never an ending: act on it (a question from \
+running work: hand_over follow_up).
 - Not done, done wrong, "try another way", "just do it": hand_over now (say_first "My bad, on it."), unless it is \
 another value for a skill's last run (that skill again, corrects true).
 - Something to keep (a rule for you, a correction or a fact about their life): react like a friend and hand_over \
@@ -1026,8 +1028,8 @@ countdowns said by code are your own words, already heard: follow on, never repe
 something held or not confirmed: one short line of your own from what it shows, never more, no question after a \
 done one; stuck, offer one other way. Offer only what you know they have and Yuki can do. Yuki's questions \
 (yuki_asks): ask once, never answer them yourself. A message with nothing new gets stay_quiet. \
-Told to go or be quiet: end_conversation, say_first "", alone; a goodbye or a mistaken wake: end_conversation with a \
-word or two; go_quiet only when they ask you to stop listening for a while.
+Sent away: end_conversation alone, say_first ""; a goodbye or a mistaken wake: a word or two; go_quiet only to stop \
+listening a while. Stop or off while something plays or runs means that.
 
 # How you speak
 Everything you write after the say line is spoken word for word: no reasoning, plans or notes; your judgement is in \
@@ -1126,14 +1128,15 @@ unsaved work gets the question). Letters said one by one are one word spelled ou
 LEAN_FOCUS_GUIDE = """\
 Private, never to be said: they are {where} right now, so you stay out of the way. Words with your name, or the next \
 step of what they just asked you, are for you: do it, answer, or say in a few words that you can't. Anything else gets \
-stay_quiet alone. No questions back, no offers, no small talk; a few words at most. Told to go: \
-end_conversation(say_first="") alone."""
+stay_quiet alone. No questions back, no offers, no small talk; a few words at most. Told to go, even if unsure it was \
+to you: end_conversation(say_first="") alone (a wrong end costs them only your name)."""
 
 LEAN_CALL_LAYER = """\
 [Private, never to be said: the user is on a voice call on {app} right now, for every reply until this goes away.]
 Their words are for you only when they call you by name or plainly go on talking with you; everything else gets \
-stay_quiet alone, never a word about the call. Unsure means the call. Answer briefly. "Stop listening": go_quiet with \
-this_call true and a very short okay.
+stay_quiet alone, never a word about the call. Unsure means the call, but words that would end the conversation \
+and could be for you end it (end_conversation, say_first ""): a wrong end costs them only your name. Answer \
+briefly. "Stop listening": go_quiet with this_call true and a very short okay.
 [End of the call note]"""
 
 LEAN_CALL_LAYER_UNSURE = """\
@@ -1214,67 +1217,6 @@ HAND_OVER: dict[str, Any] = {
     },
     "required": ["say_first", "intent"],
 }
-
-#: lSpeed (live test 17 Oct, problem 1): what the talker reads about the learned reflex that ran for the words it
-#: answers (``state["reflex"]``, set by the pipeline): the reflex ran the user's own learned hand at the end of their
-#: turn, with no model in front, through the hands' own act and check. By its state: done (checked), still running,
-#: sent but not seen to take effect, settled (no change seen, nothing more possible), or nothing went out. A reflex the
-#: hands refused before it acted has no note (review r2 M2). ``{changed}``: they went on talking after the pause it
-#: acted on.
-REFLEX_NOTES = {
-    # review r1 M1: no "never another target": when the words meant another app the talker's call for it runs
-    "done": ("[Done already, by code, and checked: {what} ({report}); these exact words of theirs got this before. "
-             "For it say only the few done words you would have given it (\"Paused.\"), or nothing when they can see "
-             "it happen; no call for it (the same call is skipped).{changed}]"),
-    "running": ("[Being done right now, by code, for these exact words of theirs (what they got before): {what}. "
-                "Make your usual call for their request: when it is the same call, code skips it once this is done "
-                "and says its done line.{changed}]"),
-    # review r1 M2: it went out once and its effect was not seen in time (Spotify's status can lag ~1.5 s): never again
-    "sent": ("[Sent once by code for these exact words of theirs, but its effect was not seen in time: {what} "
-             "({report}). Never repeat it (the same call is skipped): tell them in a few words it may not have taken "
-             "effect, or hand it over.{changed}]"),
-    # review r2 L3: nothing more could happen (at the end already, nothing moved): said as the report says, never done
-    "settled": ("[Tried at once by code for these exact words of theirs: {what}, but no change was seen ({report}). "
-                "No call for it (the same call is skipped): tell them in a few words what that report says (\"It's "
-                "already at the bottom.\"), never that it was done.{changed}]"),
-    "failed": ("[Tried by code for their words, and nothing went out: {what} ({report}). Nothing of it is done: "
-               "handle their request as usual.]"),
-}
-#: ... when the words the reflex acted on were only the start of what they said (Flux's eager end of turn, then more).
-#: Review r1 M5: what they went on to say may change or undo the part acted on ("mute the PC... no, Spotify"); it
-#: stands last in the note, after what was done and how to speak of it.
-REFLEX_CHANGED = (" But that was only the start of what they said: they went on after a pause. If what they went on "
-                  "to say changes or undoes it, undo or redo it as they now say; otherwise do the rest of what they "
-                  "said as usual.")
-#: The result of the talker's call that repeats the reflex's own (skipped: it was done once, checked).
-REFLEX_DUP_SAID = ("Already done a moment ago for these same words, and checked, so it was not done twice. Your done "
-                   "line was said. Do not say it again.")
-REFLEX_DUP_SILENT = ("Already done a moment ago for these same words, and checked, so it was not done twice. Say "
-                     "nothing about it.")
-#: ... skipped because the reflex sent it once and its effect was not seen in time (review r1 M2).
-REFLEX_DUP_UNSEEN = ("Sent once a moment ago for these same words, but its effect was not seen in time; it was not "
-                     "sent again (a second press can undo it or do it twice). Never repeat it: tell them in a few "
-                     "words it may not have taken effect, or hand it over.")
-#: ... skipped because the reflex tried it and no change was seen, nothing more being possible (review r2 L3).
-REFLEX_DUP_SETTLED = ("Tried a moment ago by code for these same words; no change was seen and nothing more can "
-                      "happen (its report is in this result), so it was not tried twice. Tell them in a few words what "
-                      "the report says, never that it was done.")
-#: ... skipped because the reflex is still running for these words (review r2 L1: never started twice).
-REFLEX_DUP_RUNNING = ("Being done by code right now for these same words, so it was not started twice. Never repeat "
-                      "it: say in a few words that it is under way, or nothing; never that it is done.")
-
-
-def reflex_note(state: dict[str, Any] | None) -> str:
-    """The volatile block's line for the reflex that ran for the words (``""``: none)."""
-    if not isinstance(state, dict):
-        return ""
-    template = REFLEX_NOTES.get(str(state.get("state") or ""))
-    if template is None:
-        return ""
-    report = " ".join(str(state.get("report") or "").split())[:240] or "checked"
-    return template.format(what=" ".join(str(state.get("what") or "").split())[:160], report=report,
-                           changed=REFLEX_CHANGED if state.get("changed") else "")
-
 
 #: The lean talker's cancel tool (Pipecat's ``cancel_hand_over``), worded like the full talker's.
 CANCEL_HAND_OVER_DESCRIPTION = (
@@ -1618,9 +1560,10 @@ scroll down" right after you opened a page for them).
 - For the people on the call: everything else. Chat, banter, game talk, reactions, laughter, questions to their \
 friends, and talk about you rather than to you ("Yuki's being slow today").
 When their words were for the call, your whole reply is the stay_quiet call: no words at all, no reaction, no \
-"okay", and never a word about the call or about whom the words were for. When you cannot tell, it was for the \
-call: if it was for you, they will say your name. When it was for you, answer as usual and as briefly as you \
-can; the people on the call do not hear you, only the user does, over their friends.
+"okay", never a word about the call or about whom the words were for. Unsure, it was for the call (if it was \
+for you, they will say your name), except words that would end the conversation: those end it (end_conversation, \
+say_first ""), as a wrong end costs them only your name. When it was for you, answer as briefly as you can: only \
+the user hears you, over their friends.
 In a call, when they tell you to stop listening ("stop listening", "don't listen to this call", "turn yourself \
 off"), they mean for the rest of this call: go_quiet with this_call true and a very short okay as its say_first. \
 You listen for your name again by yourself when the call ends.
@@ -1633,7 +1576,6 @@ Bad: "can you guys hear me?" -> "Loud and clear!", or "Those words were for the 
 quiet." + stay_quiet (a question to the call; and every word is said aloud: stay_quiet alone)
 Good: you just said "Paused.", then "wait, put it back on" -> media_key(key="playpause", \
 say_when_done="Back on.") alone (still with you)
-Good: "Yuki, what time is it?" -> "Twenty past nine."
 Good: "Yuki, stop listening" -> go_quiet(say_first="Sure, I'm off for this call.", minutes=60, this_call=true) alone
 [End of the call note]"""
 
@@ -1815,7 +1757,8 @@ END_CONVERSATION: dict[str, Any] = {
     "description": (
         "End this voice conversation now (\"shut up\", \"go away\", \"bye\", \"go back to sleep\", \"stop listening\" "
         "with no while). Call it alone; nothing is said after it. Running tasks go on; it is not a rule: nothing is "
-        "saved. In a voice call, \"stop listening\" is go_quiet with this_call true."
+        "saved. In a voice call, \"stop listening\" is go_quiet with this_call true. Never for what answers a question "
+        "you or a task just asked, nor for stop or off said about something playing or running."
     ),
     "properties": {
         "say_first": {"type": "string", "description": (
@@ -2652,9 +2595,6 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     at most 300 characters; the pipeline sets it for the lean talker only, from its background cache) rides as
     :data:`YOU_LINE` right after the focus guide.
 
-    lSpeed: ``state["reflex"]`` (the learned reflex that ran for these words: its state, what it did, its report,
-    whether they went on talking after it) rides as :func:`reflex_note` right after the desktop block.
-
     voice21 (final-D S10): ``state["opened_quiet"]`` on a rerun (the quiet marker on the first words of a conversation
     they opened was waived once) gives :data:`OPENED_RERUN_NOTE` in place of :data:`RERUN_NOTE`.
     """
@@ -2744,10 +2684,6 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += ("\n" if state.get("skills_now") else "\n\n") + "[" + options_line + "]"
     if desk:
         text += f"\n\n{DESK_LABEL}\n{desk.strip()}]"
-    reflex = reflex_note(state.get("reflex"))
-    if reflex:
-        # lSpeed: the learned reflex that ran for these words (after the desktop it acted on, before the game note)
-        text += "\n\n" + reflex
     if state.get("hand_trouble"):
         # review r1 H1: last, so it outweighs the cores' "just do it: hand it over". Review r2 M1: keyed to the hands'
         # own game signal when the pipeline gives it (the key present), else to the hand's report, never to the focus

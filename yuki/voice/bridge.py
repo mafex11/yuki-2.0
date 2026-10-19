@@ -180,8 +180,8 @@ ANSWER_S = 120.0
 #: A claim stands for the user's turn it holds this long after their last words in it (s): a talker's call for a turn
 #: comes within :data:`ANSWER_HOLD_MAX_S`; the same words said again later are a new turn.
 CLAIM_TURN_S = 20.0
-#: The same turn offered to :meth:`VoiceBridge.answer_waiting` twice this close together (s; a held final transcript
-#: the fast path releases again) is taken once.
+#: The same turn offered to :meth:`VoiceBridge.answer_waiting` twice this close together (s; the same final transcript
+#: passed on twice) is taken once.
 ANSWER_SAME_TURN_S = 2.0
 #: hands19 (final-B all-questions RC3a: "pause the song, also when's my meeting tomorrow": the hand-off started before
 #: the pause's result came back, the planner re-did the pause and toggled the music back on): a hand-off waits for the
@@ -1265,6 +1265,52 @@ class VoiceBridge(QObject):
         return any(j.source == "voice" and j.state in OPEN_STATES and j.events is not None and not j.unadopted
                    for j in live)
 
+    def awaiting_words(self) -> str:
+        """D1 (20 Oct, keyword audit A1): what of this conversation's spoken requests the user's next words belong to,
+        as a code word: ``"task"`` (one is queued or running, or waits for their answer: their words are its, for the
+        talker to route), ``"countdown"`` (the only open ones are sends counting down, :attr:`Job.sending`: their speech
+        holds the send, their words decide it, and an end of the conversation never lets it go), ``""`` (none). A job
+        already stopping (its stop asked) waits for no words. The router's end of the conversation reads it
+        (``Conversation._words_awaited``). State only; never raises (unsure: ``"task"``)."""
+        try:
+            with self._lock:
+                live = [j for j in list(self._jobs.values()) + list(self._unsubmitted.values())
+                        if j.source == "voice" and j.state in OPEN_STATES and j.events is not None and not j.unadopted
+                        and not j.cancel_requested]
+            if not live:
+                return ""
+            if all(j.state == RUNNING and j.sending for j in live):
+                return "countdown"
+            return "task"
+        except Exception:  # noqa: BLE001
+            return "task"
+
+    def stop_sends(self) -> int:
+        """D1 (20 Oct): stop at once every send of this conversation's spoken requests that is counting down now (an
+        "all" voice job's open countdown, :attr:`Job.sending`, counting or held): the router's model judged that the
+        user's words call it off, or send Yuki away while it counts. The job stops as the voice's own stop
+        (:meth:`_cancel`, on the GUI thread): nothing is sent. A send that went already is never touched. Under brain
+        one: ``0`` (its own countdown is cancelled by the pipeline's driver). Returns how many were stopped. State only;
+        never raises."""
+        try:
+            if getattr(self, "one", False):
+                return 0
+            with self._lock:
+                live = [j for j in self._jobs.values() if j.source == "voice" and j.state == RUNNING and j.sending
+                        and not j.sent and not j.cancel_requested and not j.superseded and j.job_id is not None]
+            for job in live:
+                job.cancel_requested = True
+                job.cancel_had_send = True
+                self._gui(lambda j=job: self._cancel(j))
+                self._unowe(job)
+            if live:
+                self._log("bridge", op="sends_stopped", n=len(live), by="router")
+                self._changed()
+            return len(live)
+        except Exception as exc:  # noqa: BLE001 - the held countdown never counts on past the end either way
+            self._log("bridge_error", error=f"stop_sends: {type(exc).__name__}")
+            return 0
+
     def brain_busy(self) -> bool:
         """Whether any request (typed or spoken) is still open."""
         with self._lock:
@@ -1296,21 +1342,25 @@ class VoiceBridge(QObject):
     def _closes_exchange(job: Job, state: str) -> bool:
         """IF-words (Item 2a): whether a finished job ends the exchange, so the user's next words start a new one.
 
-        Every spoken request that ended (done, failed, "couldn't confirm", stopped) ends it, unless its own closing
-        line asks them something ("I got stuck ... Try another way?", "Which one?"): then their next words are its
-        answer and carry the request ("try another way" after the stuck line is about that same playlist). Its words
-        are never carried into a new request (live 10 Oct a request after a failed one re-ran the failed YouTube task;
-        the brain takes every carried turn as their request): what they say next ("message Hemanth", or "just do it")
-        goes with the labelled earlier lines instead. A done act at ``verified``, ``likely`` or ``unverified`` ends it
+        Every spoken request that ended (done, failed, "couldn't confirm", stopped) ends it, unless the brain marked
+        its ending as waiting for their answer (contract K1, keyword audit A7: ``verdict["awaits"]``, set by the brain
+        when it ended on a question to them, a plan that asks, or an offer it made, "I can try your liked songs
+        instead" with no question mark included): then their next words are its answer and carry the request ("try
+        another way" after the stuck line is about that same playlist). A verdict without the field (an older brain)
+        closes it, as a finished act does. A "?" in the closing line no longer decides it (punctuation is no
+        intent). Its words are never carried into a new request (live 10 Oct a request after a failed one re-ran the
+        failed YouTube task; the brain takes every carried turn as their request): what they say next ("message
+        Hemanth", or "just do it") goes with the labelled earlier lines instead. A done act at ``verified``,
+        ``likely`` or ``unverified`` ends it
         even with an offer after it ("Want it louder?" then "yes" never plays it again; review r2 L2: below likely the
         thinker's words, offer and all, are never said as written, and an act that may have worked is never redone by
         the next request), and so does any request that tried to send
         (the verdict's ``send``, or a send countdown of its that ended ``going``: the new brain's stuck endings carry
         no ``send`` even after one went, review r1 M2): nothing is ever sent twice (rule 8). A request to keep
         (``remember``) ends it when it ends (review r1 L2: its words are never handed over, or saved, again). A request
-        withdrawn for a newer one leaves its words to that one. A done act at ``failed`` keeps the rule of its words
-        ("That didn't work. Want me to try another way?" stays open). The verdict's fields, the job's own marks and the
-        outcome's own closing mark only (:func:`asks`), never the words."""
+        withdrawn for a newer one leaves its words to that one. A done act at ``failed`` keeps the brain's own mark
+        ("That didn't work. Want me to try another way?" stays open when it awaits their answer). The verdict's fields
+        and the job's own marks only, never the words nor their punctuation."""
         if job.source != "voice" or job.unadopted:
             return False
         verdict = job.verdict if isinstance(job.verdict, dict) else {}
@@ -1323,7 +1373,7 @@ class VoiceBridge(QObject):
         level = str(verdict.get("level") or "")
         if state == DONE and (level in ("verified", "likely") or (level == "unverified" and verdict.get("acted"))):
             return True
-        return not asks(job.outcome or "")
+        return not bool(verdict.get("awaits"))
 
     def exchange_floor(self, newest_at: Any = _NEWEST) -> float | None:
         """IF-words (Item 2a): the time before which a heard turn is not part of the current exchange (monotonic), or
@@ -4652,9 +4702,9 @@ class VoiceBridge(QObject):
                     self._log("bridge", op="send_words_unsteered", job_id=job.job_id, turns=turns)
                     return
                 if self.closing or self._loop is None:
-                    # integration review VC-1: the conversation is ending (a dismissal the fast path took, or any end):
-                    # never counted on past it; the brain's pause limit ends it with nothing sent, as brain one's
-                    # close() does
+                    # integration review VC-1: the conversation is ending (the user ended it, by the router's or the
+                    # talker's judgement, or any end): never counted on past it; the brain's pause limit ends it with
+                    # nothing sent, as brain one's close() does
                     self._log("bridge", op="send_held_closing", job_id=job.job_id)
                     return
                 job.send_held = False

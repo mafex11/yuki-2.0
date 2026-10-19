@@ -10,7 +10,7 @@ migration 45 retired every row they wrote, and nothing writes a new one. What st
   (window ids, element ids and coordinates are taken out and kept apart as the run's *numbers*), the verdict and why,
   result facts up to :data:`RESULT_CHARS`, duration, the share of its model call's cost. Step 0 is the request itself:
   the user's words, the outcome, the measured signals (:func:`run_signals`). Secret-filtered, then encrypted; pruned
-  with the captures (30 days). Read by the Activity ledger, the finish gate's :func:`control_record` and the reflex.
+  with the captures (30 days). Read by the Activity ledger and the finish gate's :func:`control_record`.
 * **The ledger** (``playbook_events``, :func:`evaluate`, :func:`recompute`) and the Playbook page's old sections
   (:func:`workflows`, :func:`workflow_edit`): empty since migration 45, kept until the page drops them.
 * **Step helpers** for the skill learner's compiler (``yuki.skills.learn.compile``): :func:`demo_step`,

@@ -1,26 +1,17 @@
-"""Instant local answers before any model (vGame, 5 Oct 2026): "go away" ends at once, a request is acknowledged at once.
+"""Instant local answers before any model (vGame, 5 Oct 2026): a request said to Yuki by name is acknowledged at once.
 
-The user's words (5 Oct): "when I say you can go away, it should go away immediately, not take 10, 20 seconds", and
-"whenever I say Yuki, do this or do that, it should immediately respond: yeah, I'm on it". Measured on seven days of
-real use (report 76, logs of 28 Sep - 5 Oct): a dismissal went through the talker (its first token ~1.5 s), a spoken
-goodbye and a wait for it to play (~2 s), so the conversation ended ~4 s after the words (p50 4.0 s, max 5.1 s), and in
-a call 13 of 37 were judged as said to the friends: nothing ended, the call idle ran out 6-9 s later, he said it again.
+The user's words (5 Oct): "whenever I say Yuki, do this or do that, it should immediately respond: yeah, I'm on it".
 
-Two things here, both deliberately small and logged:
+**The instant acknowledgement** (:class:`AckVoice`): a short line in Yuki's own voice ("Mm-hm.", or "Yeah?" to the
+name alone), rendered once by the voice's own service and kept on disk, played the moment a turn said to Yuki by name
+is transcribed. Whether a turn was said to Yuki is measured (the wake word's own hit, never words); what it says is
+the same neutral line for every request, so nothing is decided about the request itself.
 
-* **The dismiss vocabulary** (:data:`DISMISS_PHRASES`): the user's own words for "go away" are a *command vocabulary*,
-  like a hotkey, not a judgement. A turn whose words are only those phrases (with the few filler words in
-  :data:`FILLER_WORDS` around them: the name, "okay", "dude", "please") ends the conversation on its final transcript,
-  with no model call. Anything longer or different goes to the talker as before (the model judges "turn yourself off for
-  two hours", "tell him to go away"). Closing when the words were for someone else costs little (say the name to talk
-  again); staying open is what hurt. A match is provisional (second review R1/G1): it ends the conversation only after
-  a short grace with no resumed speech, since "Stop... the music" and "Nothing... actually open Spotify" begin with
-  these words and must reach the talker whole. A few phrases mean "stop *that*" when something is running (a task, a scroll):
-  :data:`WHEN_IDLE_ONLY` are a dismissal only when nothing is.
-* **The instant acknowledgement** (:class:`AckVoice`): a short line in Yuki's own voice ("Mm-hm.", or "Yeah?" to the
-  name alone), rendered once by the voice's own service and kept on disk, played the moment a turn said to Yuki by name
-  is transcribed. Whether a turn was said to Yuki is measured (the wake word's own hit, never words); what it says is
-  the same neutral line for every request, so nothing is decided about the request itself.
+Nothing here decides what the words mean. The fast "go away" vocabulary of 5 Oct (a turn made only of the user's
+dismiss phrases ended the conversation with no model call) was removed on 20 Oct (the user: "it should be intelligence
+and intent that should drive the assistant"; keyword audit A1-A4, decision D1): "stop" while music plays, "not now"
+answering "send it now?" and "cancel" answering a task's question all ended the conversation. The router's small model
+and the talker now end it by their judgement of intent (``yuki.voice.router``, ``end_conversation``).
 """
 
 from __future__ import annotations
@@ -30,105 +21,16 @@ from typing import Any
 
 import numpy as np
 
-#: Phrases that, alone, end the conversation (normalised: lower case, apostrophes kept). The user's own words from the
-#: week's dismissals (counts only, report 76) plus their plain variants. Keep this small: it is a command vocabulary.
-DISMISS_PHRASES = frozenset({
-    "go away", "go away now", "you can go", "you can go away", "you can go now", "get lost",
-    "shut up", "be quiet", "quiet", "stop listening", "turn off", "go to sleep", "go back to sleep", "sleep",
-    "you can go back to sleep", "you can sleep",
-    "that's all", "thats all", "that's it", "thats it",
-    "not you", "not now", "not talking to you", "i wasn't talking to you", "wasn't talking to you",
-    "nothing", "bye", "bye bye", "goodbye", "good bye",
-    "stop", "stop it", "cancel", "never mind", "nevermind", "leave it",
-})
-#: Of those, the ones that mean "stop that" while something runs (a task, a scroll, a hand): a dismissal only when
-#: nothing does; otherwise the talker decides (it stops the scroll or cancels the task).
-WHEN_IDLE_ONLY = frozenset({"stop", "stop it", "cancel", "never mind", "nevermind", "leave it"})
-#: Of those, the ones that also confirm an answer ("The report from yesterday?" "That's it."): a dismissal only when
-#: Yuki's last line was not a question and nothing runs (review F3, 5 Oct); otherwise the talker decides.
-WHEN_NOT_ASKED = frozenset({"that's it", "thats it", "that's all", "thats all"})
-#: Of those, the ones that mean something else in a call (second review R9, 5 Oct): "stop listening" there is go_quiet
-#: for the rest of the call (the wake word off, CALL_LAYER), which only the talker does; a plain end left the wake on.
-IN_CALL_TALKERS = frozenset({"stop listening"})
-#: Words that may stand around a dismissal without changing it ("okay okay go away", "dude, shut up", "Yuki, bye").
-#: Not "yes"/"yeah": "Yeah, that's it." confirms (review F3); "no" stays ("No, that's all." answers "anything else").
-FILLER_WORDS = frozenset({
-    "yuki", "hey", "ok", "okay", "no", "nah", "dude", "bro", "man", "please", "just", "now",
-    "for now", "you", "so", "oh", "uh", "um", "and", "then", "thanks", "thank you", "alright", "all right", "sorry",
-    "i said", "i just said", "already", "again", "seriously",
-})
 #: Words that may stand with the name alone ("hey Yuki", "Yuki?"): the user called her and is about to ask.
 NAME_COMPANIONS = frozenset({"hey", "hi", "yo", "ok", "okay", "oh", "um", "uh"})
 #: The wake word as speech recognition writes it (it is a keyterm of every conversation).
 NAME = "yuki"
-#: Longest phrase in the vocabularies, in words.
-_LONGEST = max(len(p.split()) for p in DISMISS_PHRASES | FILLER_WORDS)
-#: A dismissal is a short turn; anything longer is the talker's to judge.
-MAX_WORDS = 12
 
 
 def words(text: str) -> list[str]:
     """``text`` as lower-case words: letters, digits and apostrophes kept, everything else a space (a fixed format)."""
     text = (text or "").replace("’", "'").replace("‘", "'").lower()
     return "".join(ch if (ch.isalnum() or ch == "'") else " " for ch in text).split()
-
-
-def dismissal(text: str, *, busy: bool = False, asked: bool = False, call: bool = False) -> str | None:
-    """The dismiss phrase ``text`` consists of (with fillers around it), or ``None`` when it is anything else.
-
-    ``busy``: something is running (a voice task, a scroll, a hand): :data:`WHEN_IDLE_ONLY` and :data:`WHEN_NOT_ASKED`
-    phrases are then not a dismissal. ``asked``: Yuki's last line was a question: :data:`WHEN_NOT_ASKED` phrases are
-    then an answer, not a dismissal. ``call``: a call is on: :data:`IN_CALL_TALKERS` phrases are the talker's (the
-    whole turn goes to it). Every word must belong to the vocabulary; at least one must be a dismiss phrase.
-    A transcript written as a question ("So that's it?") is never a command.
-    """
-    if (text or "").rstrip().endswith("?"):
-        return None   # speech recognition's own punctuation: asked, not told (a fixed format)
-    tokens = words(text)
-    if not tokens or len(tokens) > MAX_WORDS:
-        return None
-    found: str | None = None
-    i = 0
-    while i < len(tokens):
-        for k in range(min(_LONGEST, len(tokens) - i), 0, -1):
-            phrase = " ".join(tokens[i:i + k])
-            if phrase in DISMISS_PHRASES:
-                if call and phrase in IN_CALL_TALKERS:
-                    return None   # R9: in a call "stop listening" is go_quiet for the call, the talker's
-                # a phrase that is not a dismissal now ("that's all" answering her question) is neutral: another
-                # phrase in the same words may still be one ("That's all for now. Bye.")
-                if not (busy and phrase in WHEN_IDLE_ONLY) and not ((busy or asked) and phrase in WHEN_NOT_ASKED):
-                    found = found or phrase
-                i += k
-                break
-            if phrase in FILLER_WORDS:
-                i += k
-                break
-        else:
-            return None
-    return found
-
-
-def vocabulary_only(text: str) -> bool:
-    """Whether every word of ``text`` belongs to the dismiss vocabulary or its fillers ("Yuki, no", "Okay, turn off"):
-    words that may still become a dismissal, so the eager acknowledgement waits for more (second review R4)."""
-    tokens = words(text)
-    i = 0
-    while i < len(tokens):
-        for k in range(min(_LONGEST, len(tokens) - i), 0, -1):
-            if " ".join(tokens[i:i + k]) in DISMISS_PHRASES | FILLER_WORDS:
-                i += k
-                break
-        else:
-            return False
-    return bool(tokens)
-
-
-def said_in(phrase: str, line: str) -> bool:
-    """Whether the words of ``phrase`` stand together in ``line`` (both as :func:`words`): Yuki's own line holding the
-    dismiss words, so a transcript of them may be her echo (second review G2)."""
-    need, have = words(phrase), words(line)
-    return bool(need) and any(have[i:i + len(need)] == need for i in range(len(have) - len(need) + 1))
 
 
 def bare_name(text: str) -> bool:
@@ -163,8 +65,8 @@ def with_name(text: str, forms: Any = ()) -> tuple[str, str | None]:
     """``text`` with a learned heard form of the name (``forms``: memory's data, how speech recognition wrote "Yuki"
     before, :func:`yuki.voice.keyterms.name_forms`) written as the name where it opens a sentence, after the
     companions ("UK, pause the music." -> "Yuki pause the music."; "hey yoki" -> "hey Yuki"), and the form used (or
-    ``None``). Inside a sentence nothing changes ("I lived in the UK"). For the fast path's checks only (the
-    dismissal, the name alone, the name opening the words); the words go on to the talker as heard."""
+    ``None``). Inside a sentence nothing changes ("I lived in the UK"). For the fast path's checks only (the name
+    alone, the name opening the words); the words go on to the talker as heard."""
     variants = sorted({tuple(words(f)) for f in forms or () if words(f)} - {(NAME,)}, key=len, reverse=True)
     if not variants or not text:
         return text, None
@@ -305,5 +207,5 @@ class AckVoice:
             return response.read()
 
 
-__all__ = ["DISMISS_PHRASES", "WHEN_IDLE_ONLY", "WHEN_NOT_ASKED", "IN_CALL_TALKERS", "FILLER_WORDS", "ACK_LINES", "AckVoice", "dismissal",
-           "bare_name", "name_opens", "vocabulary_only", "said_in", "words", "trim", "scale"]
+__all__ = ["ACK_LINES", "AckVoice", "NAME", "NAME_COMPANIONS", "bare_name", "name_opens", "scale", "trim",
+           "with_name", "words"]

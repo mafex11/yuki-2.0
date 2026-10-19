@@ -320,14 +320,13 @@ def test_the_keyterms_read_also_brings_yukis_learned_forms_for_the_fast_path(sto
 
 
 def test_with_name_writes_a_learned_form_as_the_name_only_where_it_opens_a_sentence():
-    from yuki.voice.fastpath import bare_name, dismissal, name_opens, with_name
+    from yuki.voice.fastpath import bare_name, name_opens, with_name
 
     forms = ["UK", "u k", "Youki"]
     text, used = with_name("UK, pause the music.", forms)
     assert name_opens(text) and used == "uk"
     assert bare_name(with_name("hey Youki?", forms)[0])
     assert bare_name(with_name("u k.", forms)[0])
-    assert dismissal(with_name("UK, go away.", forms)[0]) == "go away"
     assert with_name("I lived in the UK for a year.", forms) == ("I lived in the UK for a year.", None)
     assert with_name("UK, pause it.", []) == ("UK, pause it.", None)
     assert not name_opens(with_name("Ukulele time.", forms)[0])
