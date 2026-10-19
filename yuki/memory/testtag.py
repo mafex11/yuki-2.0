@@ -33,7 +33,8 @@ and occasions (with the preference observations fed from them) learned inside it
 (ended, with the journal and portrait changes their pass made undone). mem22: by the spans of this purge and of earlier
 ones (:data:`KEPT_SPANS_STATE`), the know-how dated by a test exchange or inside a span at no real exchange's time
 (:func:`_purge_knowhow`; a real row it had superseded current again), the pages a test had in front and nobody saw
-outside its span (:func:`_purge_links`), and the YouTube offers' live switch when the test fed it
+outside its span (:func:`_purge_links`), the ways told to Yuki inside a span and never used outside one (integ22
+MEM-3, :func:`_purge_told_ways`), and the YouTube offers' live switch when the test fed it
 (:func:`_reset_offers_off`, by the feed's own state name). **Except what real use confirmed** (phase 3,
 3.4; dots audit 18 Oct: the purge took "lumen = chill" and the Japanese playlist's meaning, learned in test sessions):
 a "said" taste row (a pairing of the user's words with a playlist, or a pick they named) or a name alias still in
@@ -232,6 +233,8 @@ CONFIRM_RUN_S = 180.0
 CONFIRM_DAYS = 60
 #: The kind suffix of the taste rows that keep what the user called an entity (``yuki.skills.taste.SAID_SUFFIX``).
 SAID_SUFFIX = "@said"
+#: The skills rows of the ways learned or told (``yuki.skills.learn.ways.ORIGIN``).
+WAY_ORIGIN = "learned_way"
 
 
 def _fold(value: Any) -> str:
@@ -845,6 +848,38 @@ def _purge_links(conn: sqlite3.Connection, known: Sequence[tuple[float, float]])
     return {"links_seen": n} if n else {}
 
 
+def _purge_told_ways(conn: sqlite3.Connection, known: Sequence[tuple[float, float]]) -> dict[str, int]:
+    """integ22 (MEM-3): a way TOLD to Yuki ("remember how I do this": ``ways.keep_told``, provenance ``told``) kept
+    inside a live test's span (``known``: this purge's and the kept ones) and never used outside one: the test's,
+    never the user's (the row carries no session or request; the harness drove the desktop in the span). A told way
+    used after its span (a real replay stamps ``last_used_at``) stays, and so does one a route row points at.
+    Idempotent. Content-free counts."""
+    if not known or not _has(conn, "skills", "provenance"):
+        return {}
+    cond, params = _in_spans("created_at", known)
+    gone: list[int] = []
+    for r in conn.execute(f"SELECT id, provenance, last_used_at FROM skills WHERE origin = ? AND {cond}",
+                          (WAY_ORIGIN, *params)).fetchall():
+        try:
+            prov = json.loads(r[1] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not (isinstance(prov, dict) and prov.get("told")):
+            continue
+        if r[2] is not None and not any(a <= float(r[2]) <= b for a, b in known):
+            continue   # used outside every span: a real run of it
+        gone.append(int(r[0]))
+    if gone and _has(conn, "skill_routes", "skill_id"):
+        routed = set()
+        for i in range(0, len(gone), 400):
+            part = gone[i:i + 400]
+            routed |= set(_ids(conn.execute(f"SELECT DISTINCT skill_id FROM skill_routes WHERE skill_id IN"
+                                            f" ({','.join('?' * len(part))})", part)))
+        gone = [i for i in gone if i not in routed]
+    n = _delete_ids(conn, "skills", "id", gone)
+    return {"told_ways": n} if n else {}
+
+
 def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: float) -> dict[str, int]:
     """Delete what the live test left and what was learned from it (module docstring), inside the caller's write
     transaction (``conn``; ``dec`` decrypts a stored field). Idempotent: a second run finds nothing. Counts per kind,
@@ -1008,6 +1043,8 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
     for kind, n in _purge_knowhow(conn, known, test_ats, dec).items():
         count(kind, n)
     for kind, n in _purge_links(conn, known).items():
+        count(kind, n)
+    for kind, n in _purge_told_ways(conn, known).items():
         count(kind, n)
     if spans:
         # learned inside the test's span; none of these rows carries a session

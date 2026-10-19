@@ -4509,6 +4509,9 @@ def _channel_named(result: ActionResult, took: dict, given: str) -> ActionResult
     value is read from the address as given (its page kind's one value). Never raises."""
     try:
         details = result.details if isinstance(result.details, dict) else {}
+        if isinstance(details.get("names_match"), dict):
+            # integ22 names-4: the browser's own measured name (launch_app's, "Ark" read as Arc) kept beside it
+            details["names_match_app"] = dict(details["names_match"])
         details["names_match"] = {k: took[k] for k in ("kind", "how", "score", "margin", "source") if k in took}
         # integ22 fix names-2: the channel's name, for the hands' done line ("Opened Deji's channel."): a string fact
         # (as open_app's ``name``), never in the content-free match

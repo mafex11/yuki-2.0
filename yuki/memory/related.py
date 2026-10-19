@@ -772,7 +772,8 @@ def item_for(client: Any, hit: dict[str, Any], *, now: float | None = None) -> d
         # S19 (mem22, the user's decision D3): a viewed page is dated by the user's own last visit (links.own_last:
         # never a sighting while Yuki acted or a live test ran), so a test's or Yuki's reopen of an older episode
         # never reads as their page "today"; a page Yuki opened is said to be Yuki's
-        own = links.own_last(store, link, now=now)
+        measured: set[int] = set()   # integ22 MEM-1: its own visits were read (none: the line says so too)
+        own = links.own_lasts(store, [link], now=now, measured=measured).get(int(link.id))
         at = own if own is not None and own < float(link.last_seen) else float(link.last_seen)
         if link.how == "shared":
             source = f"a link shared in a conversation, {_day(link.last_seen)}"
@@ -786,7 +787,8 @@ def item_for(client: Any, hit: dict[str, Any], *, now: float | None = None) -> d
         else:
             source = f"a page the user had open, {_day(link.last_seen)}"
         return {**base, "kind": "link", "at": _iso(at), "until": None, "url": link.url,
-                "text": links.describe(link, secs, now, own_last=own), "source": source}
+                "text": links.describe(link, secs, now, own_last=own, own_known=int(link.id) in measured),
+                "source": source}
     return None
 
 

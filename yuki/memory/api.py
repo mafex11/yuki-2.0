@@ -4192,7 +4192,8 @@ class MemoryClient:
             return None
         d = describe_thread(self.store, t)
         secs = _links.seconds_of(self.store, d["links"])
-        own = _links.own_lasts(self.store, d["links"])   # S19 (mem22): dated by the user's own visits
+        measured: set[int] = set()   # integ22 MEM-1: the links whose own visits were read (none: said so)
+        own = _links.own_lasts(self.store, d["links"], measured=measured)   # S19 (mem22): by the user's own visits
         return {
             **self._thread_dict(t),
             **self._thread_extras([t]).get(int(t.id), {}),
@@ -4205,7 +4206,8 @@ class MemoryClient:
                        "end": _iso(c.ended_at)} for c in d["calls"]],
             "chats": [{"start": _iso(s.started_at), "end": _iso(s.ended_at), "text": s.text} for s in d["chats"]],
             "links": [{"url": link.url, "title": link.title,
-                       "line": _links.describe(link, secs.get(link.id), own_last=own.get(int(link.id)))}
+                       "line": _links.describe(link, secs.get(link.id), own_last=own.get(int(link.id)),
+                                               own_known=int(link.id) in measured)}
                       for link in d["links"]],
         }
 
@@ -4269,12 +4271,13 @@ class MemoryClient:
         sighting of a page Yuki opened or a live test's (``None`` when there is none). Never raises."""
         from yuki.memory import links as _links
 
+        measured: set[int] = set()   # integ22 MEM-1: the links whose own visits were read (none: said so)
         try:
             found = _links.search(self.store, (lambda texts: self.embedder.embed(texts, embed_wait_s)),
                                   query, since=_time_arg(since), until=_time_arg(until), how=how, limit=limit)
             secs = _links.seconds_of(self.store, found)
             # S19 (mem22): how far the user themselves got on each page (never a sighting of Yuki's or a test's)
-            own = _links.own_lasts(self.store, found)
+            own = _links.own_lasts(self.store, found, measured=measured)
         except Exception:
             return []
 
@@ -4286,7 +4289,8 @@ class MemoryClient:
                  "last_seen": _iso(link.last_seen), "own_last_seen": _iso(own_last(link)) if own_last(link) else None,
                  "seconds": round(secs.get(link.id, 0.0), 1), "visits": link.visits,
                  "thread": f"thread:{link.work_thread_id}" if link.work_thread_id else None, "by_yuki": link.by_yuki,
-                 "score": link.score, "line": _links.describe(link, secs.get(link.id), own_last=own_last(link))}
+                 "score": link.score, "line": _links.describe(link, secs.get(link.id), own_last=own_last(link),
+                                                              own_known=int(link.id) in measured)}
                 for link in found]
 
     # ======================================================================================================

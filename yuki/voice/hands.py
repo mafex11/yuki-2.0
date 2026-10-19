@@ -3696,9 +3696,10 @@ class Hands:
             gate["done"].add(key)   # lVoice: this step is done for these words (a repeat of it is the same step)
             if url:
                 gate["urls"].add(url)
-            elif facts.get("opened_url"):
+            if facts.get("opened_url"):
                 # names21 (merge note 6): a site open_app opened by a measured name is that address opened this turn
-                # (a later open_url of it is the same step, never a second tab)
+                # (a later open_url of it is the same step, never a second tab); integ22 names-5: so is the channel
+                # address an open_url's swap opened (beside the address as given)
                 gate["urls"].add(_url_key({"url": facts["opened_url"]}))
         # fx2: an opening that leaves part of their request to do (the talker's own "then") is not the whole request;
         # x3 (3b): nor is a window or tab step that does (a focus, a restore, a tab shown or opened first); phase 2
@@ -3876,7 +3877,10 @@ class Hands:
             if speak:
                 await params.llm.push_frame(TTSSpeakFrame(text=line))
             # P1.3: the done line is queued; only an act that took something the user had gets one more run
-            look = await self._look_after(params, name, args, facts, desk_before, queued=queued)
+            # integ22 turns-2: whether the reply's next part waits behind it now (read at the look, not before the
+            # done line was queued: a part 2 that entered the gate since is the turn's rest too)
+            look = await self._look_after(params, name, args, facts, desk_before,
+                                          queued=self._queued_behind(gate))
             cover = str((look or {}).pop("_cover", "") or "")   # desk20 (S3): said by code after the done line
             quiet = bool((look or {}).pop("_quiet", False))   # tidy21: code took the tidy step; nothing for the talker
             said = " ".join(x for x in (line if speak else "", cover) if x)
@@ -4466,6 +4470,10 @@ class Hands:
                     return f"opened their site {named}"
                 return "opened the app " + (named or " ".join(str(args.get("name") or "").split())[:60])
             if name == "tab" and op == "new":
+                named = _opened_name(facts) if url else ""
+                if named and (facts or {}).get("names_match", {}).get("kind") == "channel":
+                    # integ22 names-5: a new tab's address taken for one of their channels names what opened
+                    return f"opened their channel {named} in a new tab of {app or 'the browser'}"
                 return (f"opened the address {url} in a new tab of {app or 'the browser'}" if url
                         else f"opened an empty new tab in {app or 'the browser'}")
             if name == "scroll":
@@ -7294,6 +7302,13 @@ class Hands:
             # integ22 fix names-2: what opened (the channel's name), for code's done line and the step words only; a
             # string fact, never logged (as open_app's)
             facts["opened_name"] = " ".join(str(details.get("channel_name") or "").split())[:60]
+            # integ22 names-5: the address that opened, for the turn's url gate (a later open of it in this turn is
+            # the same step, never a second tab) and the step words; a string fact, never logged
+            facts["opened_url"] = url
+        elif match is not None:
+            # integ22 names-4: the browser's measured name (its launch's, "Ark" read as Arc): the measure only, for the
+            # hands' log and ONE's step facts; no name fact, so no line or step word changes
+            facts["names_match"] = {k: match.get(k) for k in ("kind", "how", "score", "margin", "source")}
         page = details.get("page") if isinstance(details.get("page"), dict) else {}
         hwnd = details.get("hwnd")
         stages = _stage_ms(details.get("timings_ms"))

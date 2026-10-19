@@ -23,16 +23,18 @@ Public API::
     embed_call_digests(store, embedder, limit=64) -> int                 # vectors for call digests (whole-memory ranking)
     link_text(link) -> str                                               # what a link is embedded as
     search(store, embed, query=None, *, since=None, until=None, how=None, limit=10) -> list[LinkSeen]
-    describe(link, seconds=None, now=None, own_last=None) -> str
+    describe(link, seconds=None, now=None, own_last=None, *, own_known=False) -> str
     own_visits(store, page_keys, *, since=None, now=None) -> {page_key: end}   # the user's own newest stretch (S19)
     own_days(store, hosts, *, since, now=None) -> {host: days}                 # days they had its pages in front
     own_captures(store, thread_ids, *, since=None, now=None) -> {thread_id: at}  # a keyless page's own last capture
-    own_lasts(store, links, *, since=None, now=None) -> {link_id: end}          # each viewed link's own last visit
+    own_lasts(store, links, *, since=None, now=None, measured=None) -> {link_id: end}  # each viewed link's own last
     own_last(store, link, *, since=None, now=None) -> float | None              # one link's
 
 A page's ``last_seen`` moves with every sighting, a page Yuki opened (or a live test) included; how far the user
-themselves got is read from their own timeline rows (:func:`own_visits`, mem22 S19: "where I left off"), and for a
-page with no timeline key from their own captures of it (:func:`own_captures`).
+themselves got is read from their own timeline rows (:func:`own_visits`, mem22 S19: "where I left off"; integ22
+MEM-2: under the page's address in every browser seen on its site, not only the browser of its newest sighting), and
+for a page with no timeline key from their own captures of it (:func:`own_captures`). A keyed page measured with no
+visit of theirs says so (integ22 MEM-1: ``own_known``).
 """
 
 from __future__ import annotations
@@ -304,13 +306,16 @@ def _when(at: float, now: float) -> str:
         "%a %d %b %H:%M")
 
 
-def describe(link: Any, seconds: float | None = None, now: float | None = None, own_last: float | None = None) -> str:
+def describe(link: Any, seconds: float | None = None, now: float | None = None, own_last: float | None = None, *,
+             own_known: bool = False) -> str:
     """One line: ``"Title" - https://... (github.com; viewed in Google Chrome, last Tue 29 Sep 03:40, 4 min in front,
     3 visits)``, or for a shared link who sent it and where. ``own_last`` (S19: :func:`own_last`): when the user's own
     last visit ended. When the page was seen later than that, the line leads with their own visit and says the later
     sightings were never theirs in front (own visits count only their own stretches with them present: a later
     sighting was Yuki acting, a test, the page up while they were away, or the page behind another one they had in
-    front), so a cut line still dates it by their visit."""
+    front), so a cut line still dates it by their visit. ``own_known`` (integ22 MEM-1): the caller measured this
+    link's own visits (:func:`own_lasts`' ``measured``), so ``own_last`` None means none of theirs, not unmeasured: a
+    keyed page in front with none is marked as never theirs (the related block's wording), never read as their page."""
     now = time.time() if now is None else float(now)
     when = _when(link.last_seen, now)
     title = f"\"{' '.join((link.title or '').split())[:120]}\" - " if link.title else ""
@@ -328,6 +333,10 @@ def describe(link: Any, seconds: float | None = None, now: float | None = None, 
         if later:   # measured 19 Oct on the copy: mostly behind another page of theirs, else Yuki's, a test's, away
             bits.append(f"seen later ({when}), never in front as theirs since (Yuki acting, a test, away, or behind "
                         "another page)")
+        elif own_known and own_last is None and link.page_key and not link.by_yuki:
+            # integ22 MEM-1: its key's stretches are the timeline's present ones and none is theirs (a page Yuki opened
+            # left up after the act, or a test's); a keyless page stays unmarked (own captures miss some own visits)
+            bits.append("never in front as theirs: up only while Yuki acted or a test ran (not their own progress)")
         if seconds:
             minutes = int(round(seconds / 60.0))
             bits.append(f"{minutes} min in front" if minutes else f"{int(seconds)} s in front")
@@ -368,20 +377,66 @@ def own_visits(store: Any, page_keys: Sequence[str], *, since: float | None = No
     keys = sorted({str(k) for k in page_keys if k})
     if not keys:
         return {}
+    try:
+        return _own_visits(store, keys, since=since, now=now)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _own_visits(store: Any, keys: Sequence[str], *, since: float | None, now: float | None) -> dict[str, float]:
+    """:func:`own_visits`' read (``keys``: distinct, non-empty). Raises what the read raises."""
     now = time.time() if now is None else float(now)
     lo = float(since) if since is not None else 0.0
     out: dict[str, float] = {}
+    for i in range(0, len(keys), 400):
+        part = list(keys[i:i + 400])
+        for key, last in _own_rows(
+                store, f"SELECT t.page_key, max(coalesce(t.ended_at, t.started_at)) FROM timeline t WHERE "
+                f"t.page_key IN ({','.join('?' * len(part))}) AND t.state = 'present' AND t.started_at >= ? "
+                "AND t.started_at <= ?{own} GROUP BY t.page_key", (*part, lo, now), lo, now):
+            if key and last is not None:
+                out[str(key)] = float(last)
+    return out
+
+
+def _address_paths(link: Any) -> set[str]:
+    """integ22 MEM-2: the path (with its query) a keyed link's timeline rows were keyed by, both spellings the sync
+    may have read it from (it writes ``https://host`` + the path with one ``/`` put in front when it had none)."""
+    url, host = str(getattr(link, "url", "") or ""), str(getattr(link, "host", "") or "")
+    head = f"https://{host}"
+    rest = url[len(head):] if host and url.startswith(head) else ""
+    if not rest.startswith("/"):
+        parts = urlsplit(url)
+        rest = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+    return {rest, rest[1:]}
+
+
+def _page_keys(store: Any, links: Sequence[Any]) -> dict[int, set[str]]:
+    """integ22 MEM-2: each keyed link's timeline keys: its stored one (its newest sighting's), and its address under
+    every program the timeline saw on its site (a key holds the browser's process, so the same page had in Chrome and
+    then opened by Yuki or a test in Arc is two keys, and the link keeps only the newest). Data only: the programs are
+    read, never named. On a failed read, the stored key alone."""
+    out = {int(link.id): {str(link.page_key)} for link in links if link.page_key}
+    hosts = sorted({str(link.host) for link in links if link.page_key and link.host})
+    if not hosts:
+        return out
+    procs: dict[str, set[str]] = {}
     try:
-        for i in range(0, len(keys), 400):
-            part = keys[i:i + 400]
-            for key, last in _own_rows(
-                    store, f"SELECT t.page_key, max(coalesce(t.ended_at, t.started_at)) FROM timeline t WHERE "
-                    f"t.page_key IN ({','.join('?' * len(part))}) AND t.state = 'present' AND t.started_at >= ? "
-                    "AND t.started_at <= ?{own} GROUP BY t.page_key", (*part, lo, now), lo, now):
-                if key and last is not None:
-                    out[str(key)] = float(last)
-    except Exception:  # noqa: BLE001
-        return {}
+        for i in range(0, len(hosts), 400):
+            part = hosts[i:i + 400]
+            for host, proc in store._query(
+                    f"SELECT DISTINCT host, process FROM timeline WHERE host IN ({','.join('?' * len(part))})"
+                    " AND page_key IS NOT NULL", tuple(part)):
+                if host and proc:
+                    procs.setdefault(str(host), set()).add(str(proc))
+        for link in links:
+            if not link.page_key or not procs.get(str(link.host)):
+                continue
+            paths = _address_paths(link)
+            out[int(link.id)] |= {store.timeline_key(proc, link.host, path, None)
+                                  for proc in procs[str(link.host)] for path in paths}
+    except Exception:  # noqa: BLE001 - the stored keys only, as before
+        return {int(link.id): {str(link.page_key)} for link in links if link.page_key}
     return out
 
 
@@ -457,19 +512,35 @@ def own_captures(store: Any, thread_ids: Sequence[int], *, since: float | None =
 
 
 def own_lasts(store: Any, links: Sequence[Any], *, since: float | None = None,
-              now: float | None = None) -> dict[int, float]:
-    """S19 (mem22): ``{link id: when the user's own last visit of that viewed page ended}`` - its timeline key's own
-    stretches (:func:`own_visits`), else, for a page with no key, their own captures of it (:func:`own_captures`). Left
-    out: a shared link, a page only beside the window in front, one with no visit of theirs. Never raises (``{}``)."""
+              now: float | None = None, measured: set[int] | None = None) -> dict[int, float]:
+    """S19 (mem22): ``{link id: when the user's own last visit of that viewed page ended}`` - its timeline keys' own
+    stretches (:func:`own_visits`; integ22 MEM-2: the stored key and its address under every program seen on its site,
+    :func:`_page_keys`), else, for a page with no key, their own captures of it (:func:`own_captures`). Left out: a
+    shared link, a page only beside the window in front, one with no visit of theirs. ``measured`` (integ22 MEM-1):
+    filled with the ids of the keyed viewed links whose own visits were read (a link left out of the result with its
+    id in it has none of theirs; :func:`describe`'s ``own_known``). Never raises (``{}``)."""
     viewed = [link for link in links if getattr(link, "how", None) == "viewed"
               and getattr(link, "attention", None) != "visible"]
-    keyed = own_visits(store, [link.page_key for link in viewed if link.page_key], since=since, now=now)
+    keyed_links = [link for link in viewed if link.page_key]
+    keys_of = _page_keys(store, keyed_links) if keyed_links else {}
+    wanted = sorted({k for ks in keys_of.values() for k in ks if k})
+    keyed: dict[str, float] = {}
+    if wanted:
+        try:
+            keyed = _own_visits(store, wanted, since=since, now=now)
+            if measured is not None:
+                measured.update(int(link.id) for link in keyed_links)
+        except Exception:  # noqa: BLE001 - not measured: no link reads as never theirs
+            keyed = {}
     keyless = own_captures(store, [link.capture_thread_id for link in viewed if not link.page_key
                                    and link.capture_thread_id is not None], since=since, now=now)
     out: dict[int, float] = {}
     for link in viewed:
-        at = (keyed.get(str(link.page_key)) if link.page_key else
-              keyless.get(int(link.capture_thread_id)) if link.capture_thread_id is not None else None)
+        if link.page_key:
+            ats = [keyed[k] for k in keys_of.get(int(link.id), {str(link.page_key)}) if k in keyed]
+            at = max(ats) if ats else None
+        else:
+            at = keyless.get(int(link.capture_thread_id)) if link.capture_thread_id is not None else None
         if at is not None:
             out[int(link.id)] = float(at)
     return out

@@ -344,6 +344,32 @@ def _way_app(steps: Sequence[Mapping[str, Any]]) -> str:
     return ""
 
 
+def _way_run(steps: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """integ22 S7: of a told way's steps, the newest run in its app (:func:`_way_app`), as ONE's
+    ``Runner._way_steps`` cuts them: going back from the last step, a step in another app ends it (a step with no app
+    of its own stays in), so a control clicked in another app never becomes a step of this app's way. Code facts only
+    (the program names, compared as ``app_key``). Never raises (the steps as they came)."""
+    rows = [dict(s) for s in steps or () if isinstance(s, Mapping)]
+    try:
+        try:
+            from yuki.memory.store import app_key
+        except Exception:  # noqa: BLE001
+            app_key = None
+
+        def key(app: Any) -> str:
+            text = " ".join(str(app or "").split())
+            return str((app_key(text) if callable(app_key) else None) or text.casefold())
+
+        app = key(_way_app(rows))
+        start = len(rows)
+        while start > 0 and (not " ".join(str(rows[start - 1].get("app") or "").split())
+                             or key(rows[start - 1].get("app")) == app):
+            start -= 1
+        return rows[start:]
+    except Exception:  # noqa: BLE001
+        return rows
+
+
 def keep_way(memory: Any, name: str, steps: Sequence[Mapping[str, Any]] | None = None) -> tuple[str | None, str]:
     """desk22 (A13, contract C13): keep the steps just done (``steps``, else :func:`last_steps`) as the user's own told
     way, named ``name`` (their words for it): ``ways.spec_from_steps(app, steps, end=...)`` builds the spec (skill22),
@@ -366,6 +392,7 @@ def keep_way(memory: Any, name: str, steps: Sequence[Mapping[str, Any]] | None =
         if not callable(build) or not callable(keep):
             return None, "no_helper"
         app = _way_app(got)
+        got = _way_run(got)   # integ22 S7: only the newest run in that app (never another app's controls)
         spec = build(app, got, end=way_end(got))
         if not isinstance(spec, Mapping) or not spec:
             return None, "no_spec"
@@ -3775,16 +3802,18 @@ class Executor:
     def _names_log(self, call: Call, outcome: Any) -> None:
         """names21 (merge note 5): a ``launch_app`` that took a misheard name for one of the user's own apps or sites
         (its result's ``details["names_match"]``, which the Dispatcher's outcome carries as it came) logs the measure,
-        content-free: kind, how, source, score, margin; never the name or the words. Never raises."""
-        if call.tool != "launch_app":
+        content-free: kind, how, source, score, margin; never the name or the words. integ22 names-4: an ``open_url``'s
+        too (its browser's name measured through ``launch_app``, and the app's measure kept beside a channel's,
+        ``names_match_app``). Never raises."""
+        if call.tool not in ("launch_app", "open_url"):
             return
         try:
             payload = outcome.payload if isinstance(getattr(outcome, "payload", None), dict) else {}
             details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
-            match = details.get("names_match")
-            if isinstance(match, dict):
-                self._emit_log("names_match", verb=call.tool, kind=match.get("kind"), how=match.get("how"),
-                               source=match.get("source"), score=match.get("score"), margin=match.get("margin"))
+            for match in (details.get("names_match"), details.get("names_match_app")):
+                if isinstance(match, dict):
+                    self._emit_log("names_match", verb=call.tool, kind=match.get("kind"), how=match.get("how"),
+                                   source=match.get("source"), score=match.get("score"), margin=match.get("margin"))
         except Exception:  # noqa: BLE001 - a log line only
             pass
 

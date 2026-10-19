@@ -2007,7 +2007,7 @@ class Runner:
                 if pick and value and not _value_text(given.get(pick)):
                     given[pick] = value   # Yuki's own pick filled it: a re-ask of that slot is one of this run too
                 try:
-                    note(key, value, given=given)
+                    note(key, value, given=given, place=_words(run_args.get("place")))
                 except TypeError:   # a turn without D5's facts
                     note(key, value)
         if prefs is not None:
@@ -2362,7 +2362,10 @@ class Runner:
                     return None
                 with one_call(ctx):
                     ok, report, facts = self.verbs.run(tool, call)
-            result = self._finish(tool, call, turn, ctx, ok, report, dict(facts or {}), say, state)
+            # integ22 names-3: the exact own name measured nothing at the launch, so code's line names what opened
+            # itself ("Opened Discord.", a site by its host), as under "all", never a bare "It's open."
+            result = self._finish(tool, call, turn, ctx, ok, report, dict(facts or {}), say, state,
+                                  done_line=f"Opened {' '.join(name.split())[:60]}." if _words(name) else None)
         except Exception as exc:  # noqa: BLE001 - nothing more is known: a failure, nothing more done
             self._emit("one_names_take", error=type(exc).__name__)
             return OneResult("run_skill", FAILED, verified=False, result=type(exc).__name__,
@@ -2384,8 +2387,10 @@ class Runner:
         before (within the talker hands' correction window, ``prefs.CORRECTION_S``), not ``again``, not already a
         correction or a pick, that gives again the very values that run had (review H1: each slot it gives that the
         run was given holds the same value, letters folded: what the run was given, or for the pick slot what it
-        played; any other value is a new ask of theirs and runs as it came), none of them in their newest words (a
-        string measure: the agent re-sent earlier words). It is a correction of that run: ``corrects`` true; and for a
+        played; any other value is a new ask of theirs and runs as it came; integ22 turns-1: so is a slot that run was
+        not given, or another place, a refinement, as the engine's ``_rejected_slot`` reads one: the same ask again
+        only), none of them in their newest words (a string measure: the agent re-sent earlier words). It is a
+        correction of that run: ``corrects`` true; and for a
         pick-kind skill whose run played a value, Yuki's pick with their value as context, other than that one (the S5
         second way's shape: a guess-free re-run that never plays the same one again, and writes no preference). Never
         a skill that sends or joins. ``(the call to run, how, the value played)``; ``how``: ``""`` (the call as it
@@ -2409,6 +2414,8 @@ class Runner:
             if str(slots.get("choose")).strip().casefold() in ("true", "1", "yes"):
                 return args, "", ""
             had = dict(before.get("given") or {})
+            if _words(args.get("place")).casefold() != _words(before.get("place")).casefold():
+                return args, "", ""   # integ22 turns-1: another place than that run had: a refinement, as it came
             pick = self._pick_slot(sk)
             played = _words(before.get("value"))
 
@@ -2421,8 +2428,10 @@ class Runner:
             again: dict[str, str] = {}
             for k, v in slots.items():
                 text = shown(v)
-                if k in NOTE_SLOTS or k not in had or not text:
+                if k in NOTE_SLOTS or not text:
                     continue
+                if k not in had:
+                    return args, "", ""   # integ22 turns-1: a slot that run was not given (a browser): a refinement
                 earlier = {folded(had.get(k)), folded(played) if k == pick else ""} - {""}
                 if folded(text) not in earlier:
                     return args, "", ""   # review H1: another value than that run had: their new ask, as it came
@@ -2520,9 +2529,10 @@ class Runner:
     def _way_steps(turn: Any, now: float | None = None) -> list[dict[str, Any]]:
         """One22 review L1: the steps a told way is kept from, in the order they ran: the turns' just before
         (``steps_before``) then this turn's, within ``policy.STEPS_KEEP_S`` of ``now``; of them the newest run in one
-        app (going back from the last step, a step in another app ends it; a step with no app of its own, an
-        ``open_app``, stays in); a step that did not take is left out when the same step took after it (a retry), with
-        the steps of that failed go between them. Each keeps its ``ok`` flag. Code facts only; never raises (``[]``)."""
+        app (going back from the last step, a step in another app ends it, and so does a skill run, integ22; a step
+        with no app of its own, an ``open_app``, stays in); a step that did not take is left out when the same step
+        took after it (a retry), with the steps of that failed go between them. Each keeps its ``ok`` flag. Code facts
+        only; never raises (``[]``)."""
         try:
             try:
                 from yuki.memory.store import app_key
@@ -2538,6 +2548,11 @@ class Runner:
             ran = [*(getattr(turn, "steps_before", None) or []), *(getattr(turn, "steps", None) or [])]
             rows = [dict(s) for s in ran if isinstance(s, Mapping)
                     and not (isinstance(s.get("at"), (int, float)) and now - float(s["at"]) > keep_s)]
+            # integ22 (the S6 rule under ONE): a skill run's own steps are never recorded here, so the steps before
+            # it are not the way just done: going back from the last step, a run_skill ends the run (a skill run
+            # last, "remember how I do this" after it: no steps, never an older go's steps in the same app)
+            ran_skill = max((i for i, s in enumerate(rows) if s.get("tool") == "run_skill"), default=-1)
+            rows = rows[ran_skill + 1:]
             app = next((key(s.get("app")) for s in reversed(rows) if _words(s.get("app"))), "")
             start = len(rows)
             while start > 0 and (not _words(rows[start - 1].get("app")) or key(rows[start - 1].get("app")) == app):
