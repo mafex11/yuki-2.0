@@ -773,7 +773,8 @@ Weigh it with the meaning, and resolve it against the screen first: the desktop 
 of them sounds like their words ("brochure" and a chat named Bro, "rest chat", "EES chat" or "address chart" and a chat named \
 Res, "cloud tabs" and two Claude tabs), that is what they meant: act on it with that name (hand it over with \
 screen true and the name in context), no question. So is a name the Speech line says they most likely said (an \
-app or site of theirs): act on it and name it, never a question about it. A person's name is often split across \
+app or site of theirs): for anything undoable act on it and name it, never a question about it; a lasting act (closing, \
+sending, deleting) keeps the rule below. A person's name is often split across \
 words ("hey meant" for Hemanth), and the Speech line matches names only by spelling: who a message goes to is the \
 thinker's to resolve, \
 never yours, and never a question of yours. When the Speech line names a person, or more than one, hand it over (their \
@@ -795,11 +796,10 @@ the next word, and the names on the screen include Bro -> tell_yuki(screen=true,
 context="'brochure' = the Bro chat on the screen", acts=true, intent="new_task") alone
 Bad: the same -> "Speech recognition was unsure of brochure. Brochure? You mean a file or a message?" (it is on \
 the screen, and never say what recognition heard)
-Good: "close the cloud tabs", the Speech line says 'cloud' sounds close to Claude and they most likely said Claude, \
-the tabs line has 3 "Sign in successful | Claude Platform" and 4 "Claude" -> tab(action="close", tabs=[3, 4], ...) \
-alone, and its done line names the two Claude tabs
-Bad: the same -> "The Claude tabs?" (a question about a name the Speech line settled), or that question together \
-with tab(action="close", ...)
+Good: "close the cloud tabs", the Speech line says 'cloud' sounds close to Claude, the tabs line has 3 \
+"Sign in successful | Claude Platform" and 4 "Claude", and a close is not undone lightly -> "The two Claude \
+tabs?" and nothing else; they say "yeah" -> tab(action="close", tabs=[3, 4], ...)
+Bad: the same -> "The Claude tabs?" + tab(action="close", ...) (acting before they answer)
 Good: you asked "Priya, on WhatsApp?" and they say "yes, Riya" (the Speech line: 'Riya' sounds close \
 to Priya) -> tell_yuki for Priya: their yes confirms what you asked
 Good: their answer is garbled again -> "Sorry, one more time: who should I message?"
@@ -1113,10 +1113,11 @@ that take no window work any time."""
 
 LEAN_RECOGNITION_GUIDE = """\
 The Speech line names words recognition was unsure of and the names they sound close to. A name it says they most \
-likely said is what they said, as is a name on the screen or in the You block that sounds like their words: act on it \
-now and name it in your reply as what they asked ("Opening <app>."), never a question about it, never that you guessed \
-or heard something else. A person goes as heard (the message skill settles who). Ask back only when nothing fits and \
-the word matters for something lasting. Letters said one by one are one word spelled out. Never mention recognition."""
+likely said is what they said, as is a name on the screen or in the You block that sounds like their words. For \
+anything undoable, act on it now and name it as what they asked in the call's say_first or say_when_done ("Opening \
+<app>."), never a question about it, never that you guessed or heard something else. A person goes as heard (the \
+message skill settles who). Anything else lasting keeps its own rule (their plain words): a misheard word that \
+matters for it gets one short question. Letters said one by one are one word spelled out. Never mention recognition."""
 
 LEAN_FOCUS_GUIDE = """\
 Private, never to be said: they are {where} right now, so you stay out of the way. Words with your name, or the next \
@@ -2503,14 +2504,17 @@ OPENED_NOTE = ("[They opened this conversation themselves a moment ago: these fi
 #: yet that turn, is refused once by code with this (``VoiceBridge.stay_quiet``, ``OneVoice.control``): live final-D
 #: q_discord_today (all) and p24_hinglish_garbled (one) went silent with OPENED_NOTE in the prompt. A second quiet is
 #: final; "go away" still ends the conversation (end_conversation).
+#: Review L3: told to go (in any words), the answer is end_conversation, never a second quiet nor "I'm still here" (V2).
 OPENED_QUIET = ("Not quiet: they opened this conversation themselves and these are their first words to you; nothing "
                 "has answered them yet. Act on a reading that plainly fits (a name they most likely said included), or "
-                "say in a few words you didn't catch it. Only if they plainly spoke to someone else, stay_quiet again.")
+                "say in a few words you didn't catch it. Only if they plainly spoke to someone else, stay_quiet again; "
+                "told to go, end_conversation with say_first \"\", alone.")
 #: ... and the same when that first quiet was a quiet marker with no stay_quiet call: the reply watch answers the turn
 #: again once, with this note (``Conversation._unanswered``).
 OPENED_RERUN_NOTE = ("[You chose silence on their first words, but they opened this conversation themselves and "
                      "nothing has answered them yet. Answer them now: act on a reading that plainly fits, or say in a "
-                     "few words you didn't catch it. Only if they plainly spoke to someone else, choose quiet again.]")
+                     "few words you didn't catch it. Only if they plainly spoke to someone else, choose quiet again; "
+                     "told to go, end_conversation with say_first \"\", alone.]")
 #: The last line of every request's volatile block in marker mode (v3.16): the format, right where the reply begins.
 MARKER_REMINDER = "[Start your reply with its marker line: say, act or quiet, alone on the first line.]"
 #: Added when the user's turn is answered again because nothing of the last reply to it was heard (v3.16).

@@ -656,11 +656,14 @@ APP_TAIL_HEAD = 2
 NEAR_KINDS = {"screen": "a name on the screen", "running": "an app running now", "own": "one of their apps or sites",
               "known": "a name you know"}
 #: ... and what the note says of the closest near name of each heard stretch: it is what they most likely said, to be
-#: used and named in the reply, never asked about. A farther one for the same heard words is named as less likely.
+#: used and named, never asked about. A farther one for the same heard words is named as less likely.
 #: A person still goes as heard: whom a message goes to is the message skill's to settle (a send is never matched by
-#: sound there).
-NEAR_ACT = ("take each most likely name as what they said: act on it and name it in your reply, never ask about it; a "
-            "person still goes as heard")
+#: sound there). Review L1/L2 (voice21): the name goes in the call's own lines (say_first, say_when_done), never in
+#: words written beside the call (a window call written with words on a Speech-line turn is held: ``_held``), and only
+#: for an undoable act; something lasting keeps each brain's own lasting rule.
+NEAR_ACT = ("for anything undoable, take each most likely name as what they said: act on it and name it in the call's "
+            "say_first or say_when_done, never ask about it; a person still goes as heard, and anything else lasting "
+            "keeps its own rule")
 
 
 def heard_note(words: Any, keyterms: list[str], *, cut_before: bool = False,
@@ -9371,7 +9374,8 @@ class Conversation:
         nothing of Yuki's heard this turn (its words left the speaker, or ``spoke``: the reply making the quiet put
         words out). Taken once a conversation (``True`` uses it): a second quiet is final, and "go away" still ends the
         conversation through end_conversation. ``via`` (``bridge``, ``marker``, ``one``) goes to the content-free log.
-        Live final-D: q_discord_today (all) and p24_hinglish_garbled (one) went silent on such words. Never raises."""
+        Live final-D: q_discord_today (all) and p24_hinglish_garbled (one) went silent on such words. Never a turn that
+        already acted or has an answer on its way (:meth:`_opened_acted`). Never raises."""
         try:
             if getattr(self, "_opened_quiet_used", False) or self.call_app or self.focus or spoke:
                 return False
@@ -9381,6 +9385,8 @@ class Conversation:
             turn = self.observer.turn
             if turn is None or turn.trigger != "user" or turn.heard:
                 return False
+            if self._opened_acted(turn):
+                return False
             one = getattr(self, "one_driver", None)
             if one is not None and one.heard_this_turn():
                 return False
@@ -9389,6 +9395,37 @@ class Conversation:
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    def _opened_acted(self, turn: Any) -> bool:
+        """voice21 review M1: the turn's words already got an act, or one is on its way, so a quiet with it is the
+        talker's "say nothing more" and never refused by :meth:`_opened_quiet` (its note says nothing answered them,
+        which would ask for a second act: a playpause pressed again toggles back). Any of: an acting call of the turn
+        other than the reflex's mark (a hand, run_skill, a hand-off; the calls that never act, :data:`NOT_ACTING`,
+        do not count, nor ONE's reads); a call that closes it (end_conversation, go_quiet); a learned reflex for these
+        words that went through (``turn.reflex`` in :attr:`REFLEX_WENT`) or is still running
+        (:meth:`_reflex_state`); a hand acting now (``busy_tools``) or a task whose outcome will be said
+        (``VoiceBridge._answer_on_its_way``). Stream and job facts only, never the words. Never raises (unsure: acted,
+        so the quiet stands)."""
+        try:
+            tools = list(getattr(turn, "tools", None) or ())
+            if [t for t in self._acting_tools(tools) if t not in NOT_ACTING and t != "reflex"]:
+                return True
+            if "end_conversation" in tools or "go_quiet" in tools:
+                return True
+            if str(getattr(turn, "reflex", None) or "") in self.REFLEX_WENT:
+                return True
+            if (self._reflex_state() or {}).get("state") in self.REFLEX_LIVE:
+                return True
+            bridge = getattr(self, "bridge", None)
+            if bridge is not None:
+                if int(getattr(bridge, "busy_tools", 0) or 0) > 0:
+                    return True
+                on_way = getattr(bridge, "_answer_on_its_way", None)
+                if callable(on_way) and on_way():
+                    return True
+            return False
+        except Exception:  # noqa: BLE001
+            return True
 
     def _opened_quiet_result(self, spoke: bool = False) -> dict[str, Any] | None:
         """voice21 (final-D S10): the bridge's stay_quiet refusal (:meth:`_opened_quiet`, ``via`` bridge) as its tool
