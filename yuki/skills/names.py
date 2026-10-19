@@ -12,6 +12,11 @@ user's timeline in memory shows them using, most used first, then the Start menu
 links seen: the pages the user had in front in a browser, never a page Yuki opened; one per registrable domain, named
 by its most visited host, at least :data:`SITE_MIN_VISITS` visits), each once, at most :data:`OWN_MAX`. An app is
 named as the user sees it ("Process Lasso"), a site by its host ("excalidraw.com": :func:`is_site`, :func:`site_url`).
+skill22 (A6, contract C14): with ``channels``, also their own channels on the sites' named pages (:data:`CHANNEL`:
+taste's kinds of a site file's page with a speakable value, YouTube's ``/@handle``; their picked ones, most picked
+first, then the ones their own app showed), each by its own display name when the site gave one, at most
+:data:`OWN_CHANNELS`, their room kept inside :data:`OWN_MAX`; :func:`own_names` lists them. :func:`own_url` puts a raw
+address of such a page through the same measure.
 
 **The measure** (:func:`best_match`, :func:`score`). Runs of one to :data:`MAX_WORDS` heard words are compared with
 each name's spoken forms (an app's name, with and without a bracketed part; a site's registrable name, "excalidraw" for
@@ -32,6 +37,17 @@ letters put back when the word before ends in them as written, or is them heard 
 Two modes. A whole turn (the default, contract C11's use): every run, bar :data:`TURN_BAR`. A name given to an act
 (``as_name``: a launch's app name, a site value, an app slot's value): the name whole, or the runs that end at its last
 word (never a part before them: "microsoft edge" is no teams.microsoft.com), bar :data:`BAR`.
+
+skill22 (A14: "this card", "chat BP", "InstaCol" and "Ark" scored under the bar). A possessive's "'s" is no word
+("Deezy's" is "Deezy": a format rule), and the sound code says "j" as the voiced "ch" (:func:`sound_code`). A name
+given to an act, and only that, is also measured three more ways, each a fixed rule over letters and sounds: a short
+name (three or four letters) by the very same sounds (:data:`SHORT_BAR`: "Ark" for Arc, "Deezy" for Deji); a vowel
+heard as another class costing half an edit (:data:`NAME_VOWEL_COST`: "this card" for Discord); a one-word name of
+theirs said by its first letters as written, when the given name is one written word (:data:`CLIP_SHARE`: "insta" for
+instagram.com; a word the recognizer wrote as two joined ones, "InstaCol", by its first part). The short rule and the
+clip score under :data:`TURN_BAR` (:data:`NAME_RULE_MAX`), so only the name bar takes a name by them. A whole turn is
+measured exactly as before. "chat BP" stays under the bar (0.69: one letter of "GPT" dropped and one changed is two edits of
+seven; no fixed rule raises it without raising plain words).
 
 **The winner** must reach the bar and beat the best name of every other group by :data:`MARGIN`. Names one of which
 holds the other ("Chrome" in "Google Chrome") or with the same spoken form (the Claude app and claude.ai) are one
@@ -102,12 +118,37 @@ TURN_BAR = 0.85
 #: ...and beat the best name of every other group by at least this much (else two names are close: none is taken). The
 #: clips' true winners led by 0.26-0.60; of the user's 200 names, 2 score 0.75 or more against another group's.
 MARGIN = 0.1
+#: skill22 (A14), a name given to an act only. A name of :data:`MIN_LETTERS` to ``NEAR_MIN_LETTERS - 1`` letters and a
+#: run of as few say the very same sounds (one sound code, one onset): they score the mean of their spelling and 1.0,
+#: at most :data:`NAME_RULE_MAX` ("Ark" / "arc" 0.83; "Deezy" / "deji" 0.75: "z" and "j" in one class, "ee" and "i" one vowel). A whole turn never
+#: takes a short name by its sound (one letter off a four-letter name is a plain word there: :data:`NEAR_MIN_LETTERS`).
+SHORT_BAR = 1.0
+#: ...a vowel heard as one of another class (:data:`_VOWEL_CLASS`) costs this much of an edit in the sound distance:
+#: "this card" / Discord (a / o) 0.74 -> 0.78. A whole turn keeps the whole cost ("What's up" / WhatsApp would cross
+#: the turn bar).
+NAME_VOWEL_COST = 0.5
+#: ...a name said by its first letters (a clip: "insta" for instagram.com): the given name's first word, when the name
+#: was written as one word (its parts split where the recognizer joined two: "InstaCol" -> "Insta"), is a form's first
+#: letters as written, at least :data:`NEAR_MIN_LETTERS` of them and at least this share of the form's letters; it
+#: scores ``(1 + share) / 2`` ("insta" / "instagram" 5 of 9: 0.78). A longer name never: "Photoshop" is no "Photos".
+CLIP_SHARE = 0.5
+#: ...and a word the recognizer joined to the clip ("InstaCol": "insta khol", the Hindi "open" after the name) has at
+#: most this many letters after the joint (measured: "PowerPoint" read as "Power" + "Point" took PowerToys, 0.78).
+FUSED_MAX_LETTERS = 3
+#: ...the short rule and the clip score at most this, under :data:`TURN_BAR`: they serve a name given to an act (bar
+#: :data:`BAR`) and never a reader that keeps only winners of a whole turn's strength (skill22 fix M3: voice22's
+#: near reading, ``as_name`` at :data:`TURN_BAR`, took the plain word "life" for teams.live.com at 0.875 by the short
+#: rule; "photo" for Photos scored 0.917 by the clip).
+NAME_RULE_MAX = round(TURN_BAR - 0.01, 2)
+#: skill22 (A6, contract C14): at most this many of the user's own channels (:data:`CHANNEL`), their room kept inside
+#: :data:`OWN_MAX` when they are listed with the apps and sites (skill22 fix L2).
+OWN_CHANNELS = 40
 
 #: The kinds of names (code words, logged).
-APP, SITE = "app", "site"
+APP, SITE, CHANNEL = "app", "site", "channel"
 #: Where a name came from (code words, logged): a program with a window now, the user's timeline, memory's links seen,
-#: the Start menu.
-RUNNING, TIMELINE, LINKS, START = "running", "timeline", "links", "start"
+#: the Start menu, the user's taste (their channels).
+RUNNING, TIMELINE, LINKS, START, TASTE = "running", "timeline", "links", "start", "taste"
 
 
 @dataclass(frozen=True)
@@ -116,7 +157,9 @@ class Own:
     (:data:`APP` / :data:`SITE`), ``source`` (:data:`RUNNING`, :data:`TIMELINE`, :data:`LINKS`, :data:`START`),
     ``uses`` (a site's visits, an app's timeline stretches; 0 unknown); for a site, ``app``: the program its pages
     were most often in front in (its display name as memory keeps it), ``""`` when unknown; for an app of the
-    timeline, ``key``: its process key ("chrome"), how a running program is named as the timeline names it."""
+    timeline, ``key``: its process key ("chrome"), how a running program is named as the timeline names it. skill22:
+    for a channel (:data:`CHANNEL`), ``key`` is its page's own value (a handle), ``site`` and ``page`` the site file
+    and the page kind it is a page of (``youtube``, ``handle``), ``uses`` how often they picked it."""
 
     name: str
     kind: str
@@ -124,6 +167,8 @@ class Own:
     uses: int = 0
     app: str = ""
     key: str = ""
+    site: str = ""
+    page: str = ""
 
 
 @dataclass(frozen=True)
@@ -153,14 +198,19 @@ def _latin(word: str) -> str:
 #: user's own turns, one class for every vowel made plain words their names ("click" ~ Clock, "leave" ~ live.com,
 #: "open you" ~ openai.com); the three keep "discored" ~ Discord and "excaladra" ~ Excalidraw.
 _VOWEL_CLASS = {"a": "A", "e": "I", "i": "I", "y": "I", "o": "U", "u": "U"}
+_VOWEL_CODES = frozenset(_VOWEL_CLASS.values())
+#: skill22 (A14): "j" is the voiced "ch" (the people index keeps it apart), so it joins ch's class as voicing merges
+#: everywhere else in the code (b/p, d/t, g/k, z/s): "Deezy" / "Deji" say the same sounds (final-D deji row).
+_CODE_MERGE = {"J": "S"}
 
 
 def sound_code(letters: str) -> str:
     """The sound code of Latin letters: the people index's consonant classes (:data:`yuki.memory.contacts._SOUND_PAIRS`
-    and ``_SOUND``: voicing, aspiration and the s/sh/ch, v/w/f merges; "chr"/"chl" said k; "c" before e/i/y said s)
-    and the vowels in three classes (:data:`_VOWEL_CLASS`); a lone "h" says nothing, nor a "w" that no vowel follows
-    ("draw"); the same class twice in a row counts once. "discord" -> ``TISKURT``, "the|scored" with "di" put back ->
-    ``TISKURIT``. A fixed format rule over letters, never a word list."""
+    and ``_SOUND``: voicing, aspiration and the s/sh/ch, v/w/f merges; "chr"/"chl" said k; "c" before e/i/y said s;
+    skill22: "j" with ch, :data:`_CODE_MERGE`) and the vowels in three classes (:data:`_VOWEL_CLASS`); a lone "h" says
+    nothing, nor a "w" that no vowel follows ("draw"); the same class twice in a row counts once. "discord" ->
+    ``TISKURT``, "the|scored" with "di" put back -> ``TISKURIT``. A fixed format rule over letters, never a word
+    list."""
     from yuki.memory.contacts import _SOUND, _SOUND_PAIRS
 
     s = "".join(ch for ch in str(letters or "").casefold() if "a" <= ch <= "z")
@@ -186,6 +236,7 @@ def sound_code(letters: str) -> str:
             else:
                 code = _SOUND.get(ch, "")
         for k in code:
+            k = _CODE_MERGE.get(k, k)
             if not out or out[-1] != k:
                 out.append(k)
     return "".join(out)
@@ -213,15 +264,55 @@ def _distance(a: str, b: str) -> float:
     return distance(a, b)
 
 
-def _pair(run: _Form, form: _Form) -> float:
+def _code_distance(a: str, b: str, vowel_cost: float) -> float:
+    """:func:`_distance` of two sound codes where a vowel class put for another costs ``vowel_cost`` of an edit
+    (skill22, a name given to an act: :data:`NAME_VOWEL_COST`); with 1.0 it is :func:`_distance`. Pure."""
+    if vowel_cost >= 1.0 or a == b:
+        return _distance(a, b)
+    if not a or not b:
+        return 1.0
+    prev = [float(j) for j in range(len(b) + 1)]
+    for i, ca in enumerate(a, 1):
+        cur = [float(i)]
+        for j, cb in enumerate(b, 1):
+            swap = 0.0 if ca == cb else (vowel_cost if ca in _VOWEL_CODES and cb in _VOWEL_CODES else 1.0)
+            cur.append(min(prev[j] + 1.0, cur[j - 1] + 1.0, prev[j - 1] + swap))
+        prev = cur
+    return prev[-1] / max(len(a), len(b))
+
+
+def _pair(run: _Form, form: _Form, as_name: bool = False) -> float:
     """How alike a run of heard words and a name's form are (0..1): the mean of the spelling and the sound
-    similarities, 0 when they open with another sound, are too short or too unlike in length."""
+    similarities, 0 when they open with another sound, are too short or too unlike in length. skill22, ``as_name`` (a
+    name given to an act): a short pair (:data:`SHORT_BAR`) is measured by the very same sounds, and a vowel of
+    another class costs :data:`NAME_VOWEL_COST` of an edit in the sound distance."""
     la, lb = len(run.letters), len(form.letters)
-    if min(la, lb) < NEAR_MIN_LETTERS or min(la, lb) < LENGTH_RATIO * max(la, lb) or run.onset != form.onset:
+    if run.onset != form.onset:
+        return 0.0
+    if as_name and MIN_LETTERS <= min(la, lb) and max(la, lb) < NEAR_MIN_LETTERS:
+        if not run.code or run.code != form.code:
+            return 0.0
+        return min((1.0 - _distance(run.letters, form.letters) + SHORT_BAR) / 2.0, NAME_RULE_MAX)
+    if min(la, lb) < NEAR_MIN_LETTERS or min(la, lb) < LENGTH_RATIO * max(la, lb):
         return 0.0
     spell = 1.0 - _distance(run.letters, form.letters)
-    sound = 1.0 - _distance(run.code, form.code) if run.code and form.code else spell
+    if run.code and form.code:
+        sound = 1.0 - _code_distance(run.code, form.code, NAME_VOWEL_COST if as_name else 1.0)
+    else:
+        sound = spell
     return (spell + sound) / 2.0
+
+
+def _clip(head: _Form | None, form: _Form) -> float:
+    """skill22 (A14): a name given to an act said by the first letters of one of the user's names, as written
+    (:data:`CLIP_SHARE`: "insta" for instagram.com); its score ``(1 + share) / 2``, else 0. ``head``: the given name's
+    first word when it was written as one word (:attr:`_Heard.head`)."""
+    if head is None:
+        return 0.0
+    n, m = len(head.letters), len(form.letters)
+    if n < NEAR_MIN_LETTERS or n >= m or n < CLIP_SHARE * m or not form.letters.startswith(head.letters):
+        return 0.0
+    return min((1.0 + n / m) / 2.0, NAME_RULE_MAX)
 
 
 def is_site(name: Any) -> bool:
@@ -280,21 +371,69 @@ def _name_forms(name: str) -> tuple[_Form, ...]:
     return tuple(forms)
 
 
+@lru_cache(maxsize=4096)
+def _clip_forms(name: str) -> tuple[_Form, ...]:
+    """skill22 (A14): the forms of a name that a clip may stand for (:func:`_clip`): those written as one word
+    ("instagram", "audiomack", "WhatsApp"), never a name of several words, whose first word said alone is a partial
+    name, no clip ("About Java", "Control Panel": the Start menu's own partial match has those)."""
+    from yuki.memory.contacts import spoken_words
+
+    text = " ".join(str(name or "").split())
+    if is_site(text):
+        host = text.casefold()
+        raw = _registrable(host[4:] if host.startswith("www.") else host).split(".")[0]
+    else:
+        raw = text
+    if len(spoken_words(raw)) != 1:
+        return ()
+    return tuple(f for f in _name_forms(name)[:1])
+
+
 @dataclass(frozen=True)
 class _Heard:
     """The heard words as the measure reads them: every run of 1 to :data:`MAX_WORDS` words (its form, its number of
     letters, whether it ends at the last word, whether it is every word) and every (word before, word) pair the tail
-    shape may apply to (with whether the word is the last one)."""
+    shape may apply to (with whether the word is the last one). skill22: ``head``, the first word's form when the
+    words were written as one word (a clip's place: :func:`_clip`), else ``None``."""
 
     runs: tuple[tuple[_Form, int, bool, bool], ...]
     tails: tuple[tuple[str, str, _Form, bool], ...]
+    head: _Form | None = None
+
+
+def _split_joined(word: str) -> list[str]:
+    """skill22 (A14): a word the recognizer wrote as two joined words, split where a small letter meets a capital
+    ("InstaCol" -> "Insta", "Col"; "ChatGPT" -> "Chat", "GPT"); a word in one case stays whole ("DISCRD"). A format of
+    the text, never a guess at meaning."""
+    out: list[str] = []
+    start = 0
+    for i in range(1, len(word)):
+        if word[i].isupper() and word[i - 1].islower():
+            out.append(word[start:i])
+            start = i
+    out.append(word[start:])
+    return [w for w in out if w]
+
+
+def _written_words(text: str) -> list[str]:
+    """The heard text's words as written (:func:`yuki.memory.contacts.spoken_words`), a possessive's "'s" left out
+    ("Deezy's" -> "Deezy": English writes it with an apostrophe). A format rule only."""
+    from yuki.memory.contacts import spoken_words
+
+    spans = spoken_words(text)
+    kept: list[str] = []
+    for i, (start, word) in enumerate(spans):
+        if i and word.casefold() == "s" and start >= 1 and text[start - 1] in "'’" and \
+                spans[i - 1][0] + len(spans[i - 1][1]) == start - 1:
+            continue        # the possessive's "s" of the word before it
+        kept.append(word)
+    return kept
 
 
 @lru_cache(maxsize=256)
 def _heard(text: str) -> _Heard:
-    from yuki.memory.contacts import spoken_words
-
-    words = [_latin(w) for _s, w in spoken_words(text)]
+    written = _written_words(text)
+    words = [_latin(w) for w in written]
     last = len(words)
     runs: list[tuple[_Form, int, bool, bool]] = []
     for i in range(len(words)):
@@ -309,13 +448,22 @@ def _heard(text: str) -> _Heard:
         before, word = words[i - 1], words[i]
         if before and len(word) >= TAIL_MIN_LETTERS:
             tails.append((before, word, _form(before), i + 1 == last))
-    return _Heard(tuple(runs), tuple(tails))
+    # the clip's place: a name written as one word, or the first part of one the recognizer joined to a short word
+    # ("InstaCol" -> "Insta"; measured: "PowerPoint" -> "Power" made PowerToys, so a longer second part is no fused
+    # word); the parts never make runs of their own ("PowerPoint" is no "Point")
+    parts = _split_joined(written[0]) if len(written) == 1 else []
+    if len(parts) > 1 and len(_latin("".join(parts[1:]))) > FUSED_MAX_LETTERS:
+        parts = []
+    first = _latin(parts[0]) if parts else ""
+    head = _form(first) if first else None
+    return _Heard(tuple(runs), tuple(tails), head)
 
 
 def _heard_of(heard: Any) -> _Heard | None:
     """The heard words as the measure reads them (:class:`_Heard`), or ``None`` for none. ``heard``: a text, or a list
     or tuple of texts, the parts of one turn (a caller's cut: resolve's ``_outside``, the turn outside the message's
-    own text): each part read alone, so a run never spans two parts. A part's runs end at that part's own last word."""
+    own text): each part read alone, so a run never spans two parts. A part's runs end at that part's own last word.
+    Parts have no ``head`` (a clip is a name given to an act, never a turn's)."""
     if isinstance(heard, (list, tuple)):
         parts = [_heard(t) for t in (" ".join(str(p or "").split()) for p in heard if isinstance(p, str)) if t]
         if not parts:
@@ -340,6 +488,11 @@ def _consonants(code: str) -> str:
     return "".join(k for k in code if k not in ("A", "I", "U"))
 
 
+def _no_head(heard: _Heard) -> _Heard:
+    """The heard words with no clip's place (:func:`best_match` ``clip=False``)."""
+    return _Heard(heard.runs, heard.tails, None) if heard.head is not None else heard
+
+
 def _measure(heard: _Heard, name: str, as_name: bool = False) -> tuple[float, int]:
     """``(score, letters of the heard run it came from)`` of one name against the heard words (0 when nothing
     compares). ``as_name``: the heard words are a name given to an act ("Porbex Kaladra", "the scored"): a form counts
@@ -353,11 +506,15 @@ def _measure(heard: _Heard, name: str, as_name: bool = False) -> tuple[float, in
             if run.letters == form.letters:
                 got = (1.0 if (every or not as_name) else 0.0, size)
             else:
-                got = (_pair(run, form), size)
+                got = (_pair(run, form, as_name), size)
             if got > best:
                 best = got
         if best[0] >= 1.0:
             continue
+        if as_name and heard.head is not None and form in _clip_forms(name):
+            got = (_clip(heard.head, form), len(heard.head.letters))
+            if got > best:
+                best = got
         for before, word, before_form, at_end in heard.tails:
             if as_name and not at_end:
                 continue
@@ -366,7 +523,7 @@ def _measure(heard: _Heard, name: str, as_name: bool = False) -> tuple[float, in
                 if len(form.letters) - j < TAIL_MIN_LETTERS - 1 or len(before) < j or \
                         not _head_taken(before, before_form, head):
                     continue
-                got = (_pair(_form(head + word), form), len(word))
+                got = (_pair(_form(head + word), form, as_name), len(word))
                 if got > best:
                     best = got
     return best
@@ -411,7 +568,7 @@ def literal(heard: Any, name: Any) -> bool:
 
 
 def best_match(heard: Any, names: Iterable[Any], *, literal_ok: bool = True, as_name: bool = False,
-               bar: float | None = None) -> tuple[str, float, float] | None:
+               bar: float | None = None, clip: bool = True) -> tuple[str, float, float] | None:
     """The one of ``names`` (the user's own: :func:`own_names`, or a caller's subset) the heard words name, measured
     (see the module docstring): ``(name, score, margin)`` when it scores at least the bar and beats the best name of
     every other group by :data:`MARGIN`; else ``None``. ``heard``: a whole turn ("Bring up the scored.", bar
@@ -420,7 +577,9 @@ def best_match(heard: Any, names: Iterable[Any], *, literal_ok: bool = True, as_
     the parts of one turn a caller cut (resolve: the turn outside the message's own text): a run never spans two
     parts. ``literal_ok=False``: a name whose form stands in the words as written is left out (a caller that wants
     only mishearings: a name heard right needs no help). ``bar``: another bar for a caller that has one (resolve's
-    agreement with a model's own pick reads a turn at :data:`TURN_BAR` too: integration F3). Pure; never raises
+    agreement with a model's own pick reads a turn at :data:`TURN_BAR` too: integration F3). skill22: ``clip=False``
+    leaves the clip out (:func:`_clip`; :func:`own_url`: a channel's own short name is often another channel's
+    whole one, "Sidemen" and "SidemenReacts"). Pure; never raises
     (``None``)."""
     try:
         got = _heard_of(heard)
@@ -432,7 +591,7 @@ def best_match(heard: Any, names: Iterable[Any], *, literal_ok: bool = True, as_
         for i, name in enumerate(pool):
             if not literal_ok and any(f.letters in runs for f in _name_forms(name)):
                 continue
-            value, size = _measure(got, name, as_name)
+            value, size = _measure(got if clip else _no_head(got), name, as_name)
             if value > 0.0:
                 scored.append((value, size, i, name))
         if not scored:
@@ -490,9 +649,40 @@ def _memory_entries(store: Any) -> list[Own]:
         out += _site_entries(store.links(how="viewed", limit=LINKS_READ))
     except Exception:  # noqa: BLE001 - no links: the apps alone
         pass
+    out += _channel_entries(store)
     with _lock:
         _memory_cache[cache_key] = (now, list(out))
     return out
+
+
+def _channel_entries(store: Any) -> list[Own]:
+    """skill22 (A6, contract C14): the user's own channels (:data:`CHANNEL`): for each taste kind of a site file's page
+    with one speakable value (``taste.site_kinds``: YouTube's ``/@handle`` pages), the ones they picked (most picked
+    first), then the ones their own app showed (``taste.seen_names``), each named by the display name the site gave it
+    (``youtube_feed.display_names``, for that module's own kind) or else by its page's value, at most
+    :data:`OWN_CHANNELS`. Never raises (``[]``)."""
+    out: list[Own] = []
+    try:
+        from yuki.skills import taste, youtube_feed
+
+        kinds = taste.site_kinds()
+    except Exception:  # noqa: BLE001
+        return []
+    for kind, site, page, _var in kinds:
+        try:
+            picked = sorted(taste.top(store, kind, n=10_000), key=lambda t: (-t.n_obs, t.entity_key))
+            rows = [(" ".join(str(t.name or "").split()), int(t.n_obs or 0)) for t in picked]
+            have = {_squash(n) for n, _u in rows}
+            rows += [(n, 0) for n in taste.seen_names(store, kind) if _squash(n) not in have]
+            rows = [(n.lstrip("@"), u) for n, u in rows if n.lstrip("@")][:OWN_CHANNELS]
+            shown = youtube_feed.display_names(store, [n for n, _u in rows]) \
+                if kind == youtube_feed.CHANNEL_KIND else {}
+        except Exception:  # noqa: BLE001 - this kind unread: the others
+            continue
+        for handle, uses in rows:
+            out.append(Own(" ".join(str(shown.get(handle) or handle).split()), CHANNEL, TASTE, uses, key=handle,
+                           site=site, page=page))
+    return out[:OWN_CHANNELS]
 
 
 def _site_entries(links: Iterable[Any]) -> list[Own]:
@@ -604,14 +794,17 @@ def start_names(apps: Sequence[Any]) -> list[str]:
 
 
 def own_entries(store: Any = None, *, running: Sequence[str] | None = None,
-                start: Sequence[Any] | None = None) -> list[Own]:
+                start: Sequence[Any] | None = None, channels: bool = False) -> list[Own]:
     """The user's own apps and sites (:class:`Own`), in use first: the programs with a window now (``running``, else a
     read of the window list), the apps their timeline shows (most used first), the sites they visit (most visited
     first), then the Start menu's entries (``start``: ``[{"name", "appid"}]`` or names, else the list this process last
     read); each name once (letters and digits compared), at most :data:`OWN_MAX`. Each kind keeps at least half of
     that when both have more (in use first; a kind with fewer leaves its room to the other), so a growing timeline
     never cuts the sites. ``store``: the memory to read (else this process's own memory when it is open; else no
-    timeline and no sites). A running program is named as the timeline names it when it knows it. Never raises."""
+    timeline and no sites). A running program is named as the timeline names it when it knows it. skill22
+    (``channels``, contract C14): then the user's own channels (:func:`_channel_entries`), at most
+    :data:`OWN_CHANNELS`, a name an app or a site already has left out; their room is kept inside :data:`OWN_MAX`
+    (the apps and sites share what is left), so the whole list is at most :data:`OWN_MAX`. Never raises."""
     try:
         memory = _memory_entries(store) if store is not None else _default_entries()
         shown: dict[str, str] = {}
@@ -643,10 +836,21 @@ def own_entries(store: Any = None, *, running: Sequence[str] | None = None,
                 add(e)
         for n in (start_names(start) if start is not None else _start_now()):
             add(Own(n, APP, START))
-        # names21 review F5: each kind capped on its own within OWN_MAX, in the listed order (in use first)
+        # skill22 fix L2: the channels' room is kept inside OWN_MAX (a reader that keeps OWN_MAX names, the voice's,
+        # cuts from the end: the channels came last and lost 6 of 39 on the DB copy)
+        chans: list[Own] = []
+        if channels:
+            have: set[str] = set()
+            for e in [e for e in memory if e.kind == CHANNEL][:OWN_CHANNELS]:
+                key = _squash(e.name)
+                if len(key) >= MIN_LETTERS and key not in have:
+                    have.add(key)
+                    chans.append(e)
+        room = OWN_MAX - len(chans)
+        # names21 review F5: each kind capped on its own within that room, in the listed order (in use first)
         sites = sum(1 for e in listed if e.kind == SITE)
-        keep_sites = min(sites, max(OWN_MAX // 2, OWN_MAX - (len(listed) - sites)))
-        keep_apps = OWN_MAX - keep_sites
+        keep_sites = min(sites, max(room // 2, room - (len(listed) - sites)))
+        keep_apps = room - keep_sites
         out: list[Own] = []
         for e in listed:
             if e.kind == SITE and keep_sites > 0:
@@ -655,6 +859,8 @@ def own_entries(store: Any = None, *, running: Sequence[str] | None = None,
             elif e.kind != SITE and keep_apps > 0:
                 keep_apps -= 1
                 out.append(e)
+        taken = {_squash(e.name) for e in out}
+        out += [e for e in chans if _squash(e.name) not in taken]
         return out
     except Exception:  # noqa: BLE001
         return []
@@ -671,10 +877,100 @@ def own_site_entries(store: Any = None) -> list[Own]:
         return []
 
 
-def own_names(store: Any = None) -> list[str]:
-    """Contract C11: the user's own apps and sites as names (:func:`own_entries`: an app's display name, a site's
-    host), deduped, at most :data:`OWN_MAX`, in use first. Pure apart from the reads; never raises (``[]``)."""
-    return [e.name for e in own_entries(store)]
+def own_names(store: Any = None, *, running: Sequence[str] | None = (), channels: bool = True) -> list[str]:
+    """Contracts C11 and C14: the user's own apps and sites as names (:func:`own_entries`: an app's display name, a
+    site's host), deduped, in use first; skill22 (C14, A6): then their own channels (a channel's display name:
+    "Deji"), at most :data:`OWN_CHANNELS` (``channels=False``: none), at most :data:`OWN_MAX` names in all (the
+    channels' room kept inside it). A caller that acts on a name by its kind reads :func:`own_entries` (``.kind``):
+    a channel is never an app (skill22 fix M2). skill22 (E5): the
+    window list is never read here (``running``: the programs with a window now, when a caller has read them; ``None``
+    reads the window list as :func:`own_entries` does): the voice's own-names read takes the apps from memory's
+    timeline and the Start list only. Pure apart from the reads; never raises (``[]``)."""
+    return [e.name for e in own_entries(store, running=running, channels=channels)]
+
+
+def own_channel_entries(store: Any = None) -> list[Own]:
+    """skill22 (A6): the user's own channels (:class:`Own`, kind :data:`CHANNEL`), most picked first, at most
+    :data:`OWN_CHANNELS`, never cut for apps or sites. ``store`` as for :func:`own_entries`; no desk read. Never
+    raises (``[]``)."""
+    try:
+        memory = _memory_entries(store) if store is not None else _default_entries()
+        return [e for e in memory if e.kind == CHANNEL][:OWN_CHANNELS]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def channel_url(entry: Own) -> str:
+    """The address of one of the user's channels (its site file's template for its page kind, filled with its value);
+    ``""`` when it can't be built. Data only (``yuki/connect/sites``)."""
+    try:
+        from yuki.connect.templates import fill
+
+        if getattr(entry, "kind", "") != CHANNEL or not entry.site or not entry.page or not entry.key:
+            return ""
+        return str(fill(entry.site, entry.page, **{_page_var(entry.site, entry.page): entry.key}) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _page_var(site: str, page: str) -> str:
+    """The one speakable value's name in a site page kind's template (``handle`` for YouTube's ``/@{handle}``)."""
+    from yuki.skills import taste
+
+    return next((var for _k, s, p, var in taste.site_kinds() if s == site and p == page), "")
+
+
+def own_url(url: Any, *, store: Any = None) -> dict[str, Any] | None:
+    """skill22 (A6; final-D youtube_channel_deji_arc: "Pull up Deezy's YouTube channel in Ark." became a raw
+    ``open_url`` of ``https://www.youtube.com/@Deezy``, a stranger's page, since skill19's heard match runs only inside
+    the web skill): a raw address of a site page whose value is a name (a page kind with one speakable value:
+    ``taste.site_kinds``, YouTube's ``/@handle``) that is none of the user's own channels of that page as written, but
+    is one of them by the same measure as every name given to an act (:func:`best_match` in name mode against their
+    channels' display names and values: "Deezy" -> Deji 0.75; no clip: a channel's short name is often another
+    channel's whole one, "Sidemen" for "SidemenReacts"), else by taste's closed-set sound tier
+    (``taste.heard_as``, loose: an initialism spelled out, "MBL" -> NDL). ``{"url": that channel's own address, "name":
+    its name (RAM only), "kind": "channel", "how": "heard", "score", "margin", "source": "taste"}``; ``None`` when the
+    address is no such page, its value is one of theirs as written, or none measures clearly (the address stays as
+    given). The callers log only the code words and numbers. ``store`` as for :func:`own_entries`. Never raises."""
+    try:
+        from urllib.parse import unquote
+
+        from yuki.connect.templates import page_of
+
+        m = page_of(str(url or "").strip())
+        if m is None or not m.entity:
+            return None
+        value = " ".join(unquote(str(m.entity)).split()).lstrip("@")
+        entries = [e for e in own_channel_entries(store) if e.site == m.site and e.page == m.kind]
+        if not value or not entries:
+            return None
+        if any(_squash(value) in (_squash(e.name), _squash(e.key)) for e in entries):
+            return None          # one of theirs as written: nothing to change
+        names: dict[str, Own] = {}
+        for e in entries:
+            for n in (e.name, e.key):
+                names.setdefault(" ".join(str(n or "").split()), e)
+        got = best_match(value, list(names), as_name=True, clip=False)
+        how_score: tuple[float | None, float | None] = (None, None)
+        entry: Own | None = None
+        if got is not None:
+            entry, how_score = names.get(got[0]), (got[1], got[2])
+        else:
+            from yuki.skills.taste import heard_as
+
+            alike = heard_as(list(names), value, loose=True)
+            entry = names.get(alike) if alike else None
+        if entry is None:
+            return None
+        new = channel_url(entry)
+        if not new or new.casefold() == str(url or "").strip().casefold():
+            return None
+        out: dict[str, Any] = {"url": new, "name": entry.name, "kind": CHANNEL, "how": "heard", "source": TASTE}
+        if how_score[0] is not None:
+            out.update(score=how_score[0], margin=how_score[1])
+        return out
+    except Exception:  # noqa: BLE001 - no measure: the address as given
+        return None
 
 
 def sites_of(entries: Iterable[Own]) -> list[str]:
@@ -718,10 +1014,10 @@ def site_browser(host: Any, store: Any = None) -> str:
         return ""
 
 
-__all__ = ["APP", "BAR", "TURN_BAR", "BROWSER_MIN_SITES", "LENGTH_RATIO", "LINKS", "MARGIN", "MAX_WORDS", "MIN_LETTERS",
-           "NEAR_MIN_LETTERS", "OWN_MAX", "Own", "RUNNING",
-           "SITE", "SITE_MIN_VISITS", "START", "TAIL_HEAD", "TAIL_MIN_LETTERS", "TIMELINE", "best_match", "is_site",
-           "literal", "own_entries", "own_names", "own_site_entries", "same_group", "score", "site_browser", "site_url",
-           "sites_of",
-           "sound_code",
-           "start_names"]
+__all__ = ["APP", "BAR", "TURN_BAR", "BROWSER_MIN_SITES", "CHANNEL", "CLIP_SHARE", "LENGTH_RATIO", "LINKS", "MARGIN",
+           "MAX_WORDS", "MIN_LETTERS", "NAME_RULE_MAX", "NAME_VOWEL_COST", "NEAR_MIN_LETTERS", "OWN_CHANNELS",
+           "OWN_MAX", "Own",
+           "RUNNING", "SHORT_BAR", "SITE", "SITE_MIN_VISITS", "START", "TAIL_HEAD", "TAIL_MIN_LETTERS", "TASTE",
+           "TIMELINE", "best_match", "channel_url", "is_site", "literal", "own_channel_entries", "own_entries",
+           "own_names", "own_site_entries", "own_url", "same_group", "score", "site_browser", "site_url", "sites_of",
+           "sound_code", "start_names"]

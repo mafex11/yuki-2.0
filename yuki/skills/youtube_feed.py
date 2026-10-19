@@ -54,7 +54,8 @@ user's next YouTube pick within :data:`OUTCOME_S` was one of the three (``hit``)
 (``channel``), something else (``miss``), or nothing (``none``). Once :data:`LIVE_MIN_PICKS` picks are on record, a
 rate under :data:`LIVE_MIN_RATE` switches the offers off (PLAN.md Phase T: plain YouTube home stays), noted once.
 
-Logs and returned counts are content-free (``yt_fetch``: channels, ok, failed, capped, bytes, ms); names, handles,
+Logs and returned counts are content-free (``yt_fetch``: channels, ok, failed, capped, bytes, ms; skill22: errors,
+the failed reads' kinds as code words with counts, and retried); names, handles,
 ids and titles are encrypted at rest and decrypted in RAM only. None of the tables is in the MCP.
 """
 
@@ -93,6 +94,16 @@ FEED_CHANNELS = 8
 FEED_FRESH_S = 3600.0
 #: How long a request waits for the feeds (T1.4: 1.5 s); a slower feed serves the next request.
 REQUEST_BUDGET_S = 1.5
+#: skill22 (A10): a feed read answered with one of these (not found, a server error: YouTube's public feed answers so
+#: now and then for a feed that is there), or dropped with no answer by one of these error kinds, is read once more
+#: (:func:`fetch_feed`) when at least :data:`RETRY_MIN_S` of its deadline is left; a 429 (slow down) never is.
+RETRY_STATUSES = frozenset({404, 500, 502, 503, 504})
+RETRY_ERRORS = frozenset({"remotedisconnected", "connectionreseterror", "urlerror_connectionreseterror",
+                          "incompleteread", "badstatusline"})
+RETRY_MIN_S = 0.3
+#: ...after this short gap (skill22 fix L3: in final-D 5 of 7 parallel reads failed within 672 ms; a retry at once in
+#: the same burst could get an edge-cached error answer again). Taken from the same deadline.
+RETRY_GAP_S = 0.25
 #: Fresh: published within this many days; the age weight's scale (T1.4).
 FRESH_DAYS = 14.0
 AGE_DAYS = 7.0
@@ -107,8 +118,10 @@ OUTCOME_OPEN_S = 3 * 86400.0
 LIVE_MIN_PICKS = 10
 LIVE_MIN_RATE = 0.5
 LIVE_DAYS = 30.0
-#: The nudge-state row that says the offers are off (``off:<epoch>``; delete it to turn them back on).
+#: The nudge-state row that says the offers are off (``off:<epoch>``; delete it to turn them back on). skill22 (contract
+#: C15): exported by name, with its value's prefix and :func:`off_at`, so the test purge can reset it.
 OFF_STATE = "taste.youtube_offers"
+OFF_PREFIX = "off"
 #: A channel id lookup that failed is retried after this long, at most this many times in all.
 LOOKUP_RETRY_S = 7 * 86400.0
 LOOKUP_TRIES = 3
@@ -215,6 +228,23 @@ def channel_key(store: Any, handle: str) -> str:
     return entity_key(store, CHANNEL_KIND, handle)
 
 
+def display_names(store: Any, handles: Iterable[str]) -> dict[str, str]:
+    """skill22 (A6, contract C14): ``{handle: the channel's own display name}`` for the user's channels whose feed or
+    oEmbed named them (``yt_channels``), decrypted in RAM only (``yuki.skills.names``' own channels say "MrBeast
+    Gaming" for ``@MrBeastGaming``). A handle with no known name is left out. Never raises (``{}``)."""
+    try:
+        keys = {channel_key(store, str(h)): str(h) for h in handles or () if str(h or "").strip()}
+        known = store.yt_channels(list(keys)) if keys else {}
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, str] = {}
+    for key, info in (known or {}).items():
+        name = " ".join(str((info or {}).get("name") or "").split())
+        if name and key in keys:
+            out[keys[key]] = name
+    return out
+
+
 def _handle_group(store: Any, handle: str) -> str:
     """The moments' ``entity_key`` of the channel's handle page: the group a watched video's pick joins in taste."""
     from yuki.memory.moments import entity_key
@@ -282,9 +312,22 @@ def blocked(game: str | None = None) -> str | None:
 def enabled(store: Any) -> bool:
     """Whether the offers are on (the live check switches them off: :data:`OFF_STATE`)."""
     try:
-        return not str(store.nudge_state(OFF_STATE) or "").startswith("off")
+        return not str(store.nudge_state(OFF_STATE) or "").startswith(OFF_PREFIX)
     except Exception:  # noqa: BLE001
         return True
+
+
+def off_at(value: Any) -> float | None:
+    """skill22 (contract C15): when the live check switched the offers off, from :data:`OFF_STATE`'s value
+    (``off:<epoch>``, :func:`settle`), else ``None`` (on, or another value). A fixed format of this module's own; the
+    test purge (``yuki.memory.testtag``) resets the state by its name when that time falls in a test span."""
+    text = str(value or "")
+    if not text.startswith(OFF_PREFIX + ":"):
+        return None
+    try:
+        return float(text.split(":", 1)[1])
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -304,11 +347,29 @@ def request_cap(store: Any, now: float | None = None) -> int:
     return MAX_READS_PER_HOUR + night
 
 
+def error_kind(exc: BaseException) -> str:
+    """skill22 (A10): a failed read's kind as a code word, never its message: ``http_<status>`` for an error answer,
+    ``timeout`` for a socket timeout, else the exception's class (an address error by its reason's class:
+    ``urlerror_gaierror`` offline, ``urlerror_sslerror``), lower case."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"http_{int(getattr(exc, 'code', 0) or 0)}"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, TimeoutError):
+            return "timeout"
+        return "urlerror_" + (type(reason).__name__.casefold() if isinstance(reason, BaseException) else "other")
+    return type(exc).__name__.casefold()
+
+
 def _read(store: Any, kind: str, url: str | None, *, max_bytes: int, timeout_s: float, deadline: float | None = None,
-          stop: Callable[[bytes], bool] | None = None, cap: int = MAX_READS_PER_HOUR) -> tuple[int, bytes] | None:
+          stop: Callable[[bytes], bool] | None = None, cap: int = MAX_READS_PER_HOUR,
+          why: dict[str, Any] | None = None) -> tuple[int, bytes] | None:
     """One GET under the hourly cap ``cap`` (every kind counted, across processes): ``(HTTP status, body)`` (status 0:
     no answer), or None when the cap is reached or the address is not an https template (nothing read).
-    ``stop(chunk)`` True ends the read early. Never raises."""
+    ``stop(chunk)`` True ends the read early. skill22 (A10): ``why`` (the caller's dict) gets ``error``, the code word
+    of a read that failed (:func:`error_kind`), or ``cut`` when the deadline ended the body early. Never raises."""
     if not url or not url.startswith("https://"):
         return None
     try:
@@ -325,6 +386,8 @@ def _read(store: Any, kind: str, url: str | None, *, max_bytes: int, timeout_s: 
             status = int(getattr(resp, "status", 200) or 200)
             while n < max_bytes:
                 if deadline is not None and time.perf_counter() > deadline:
+                    if why is not None:
+                        why["error"] = "cut"
                     break
                 chunk = resp.read(min(CHUNK, max_bytes - n))
                 if not chunk:
@@ -335,8 +398,12 @@ def _read(store: Any, kind: str, url: str | None, *, max_bytes: int, timeout_s: 
                     break
     except urllib.error.HTTPError as exc:
         status = int(getattr(exc, "code", 0) or 0)
-    except Exception:  # noqa: BLE001 - offline, a timeout, a reset: status 0
+        if why is not None:
+            why["error"] = error_kind(exc)
+    except Exception as exc:  # noqa: BLE001 - offline, a timeout, a reset: status 0
         status = 0
+        if why is not None:
+            why["error"] = error_kind(exc)
     body = b"".join(parts)
     try:
         store.yt_read_done(rid, status=status, nbytes=len(body), ms=(time.perf_counter() - started) * 1000.0)
@@ -430,11 +497,30 @@ def fetch_feed(store: Any, key: str, channel_id: str, *, now: float, timeout_s: 
     cache row. The cache row marks the feed read only once its body parsed (tTaste r1 L2), or for an error answer (a
     404, a 429: it waits :data:`FEED_FRESH_S` like a read one, a backoff under the hourly cap); no answer (offline, a
     timeout) or a body cut off by the deadline leaves it stale, so the next request reads it again. Content-free
-    counts: ``ok`` / ``failed`` / ``capped``, ``bytes``, ``videos``."""
-    got = _read(store, "feed", _url(FEED_URL, id=channel_id), max_bytes=FEED_MAX_BYTES, timeout_s=timeout_s,
-                deadline=deadline, cap=cap)
+    counts: ``ok`` / ``failed`` / ``capped``, ``bytes``, ``videos``; skill22 (A10) ``error`` (a failed read's code word:
+    :func:`error_kind`, ``cut``, ``empty``, ``not_atom``, ``save``) and ``retried``.
+
+    skill22 (A10, final-D: 7 of 9 feed reads failed, each in 0.16-0.7 s with no body: an error answer, not a timeout;
+    on the 19 Oct morning copy one feed answered 404 an hour after the same feed had answered 200, and a read now of a
+    public feed answers 200): YouTube's public feed answers an error now and then for a feed that is there, and one
+    such answer kept that channel's uploads stale for the hour. An error answer of :data:`RETRY_STATUSES` (or a
+    connection dropped with no answer, :data:`RETRY_ERRORS`) is read once more after :data:`RETRY_GAP_S`, within the
+    deadline and under the same cap (``retry_ok`` when that second read mended it); only a second failure waits the
+    hour as before."""
+    url = _url(FEED_URL, id=channel_id)
+    why: dict[str, Any] = {}
+    got = _read(store, "feed", url, max_bytes=FEED_MAX_BYTES, timeout_s=timeout_s, deadline=deadline, cap=cap, why=why)
     if got is None:
         return {"capped": 1}
+    retried = 0
+    if (got[0] in RETRY_STATUSES or (not got[0] and why.get("error") in RETRY_ERRORS)) and \
+            (deadline is None or time.perf_counter() < deadline - RETRY_MIN_S - RETRY_GAP_S):
+        time.sleep(RETRY_GAP_S)       # its own short thread (:func:`_fetch_all`): never the request's
+        again: dict[str, Any] = {}
+        second = _read(store, "feed", url, max_bytes=FEED_MAX_BYTES, timeout_s=timeout_s, deadline=deadline, cap=cap,
+                       why=again)
+        if second is not None:
+            got, why, retried = second, again, 1
     status, body = got
 
     def cached() -> None:
@@ -443,13 +529,19 @@ def fetch_feed(store: Any, key: str, channel_id: str, *, now: float, timeout_s: 
         except Exception:  # noqa: BLE001
             pass
 
+    def failed(error: str) -> dict[str, Any]:
+        out: dict[str, Any] = {"failed": 1, "bytes": len(body), "error": error}
+        if retried:
+            out["retried"] = 1
+        return out
+
     if status != 200:
         if status:
             cached()
-        return {"failed": 1, "bytes": len(body)}
+        return failed(str(why.get("error") or (f"http_{status}" if status else "no_answer")))
     parsed = _parse_feed(body)
     if parsed is None:
-        return {"failed": 1, "bytes": len(body)}
+        return failed(str(why.get("error") or ("empty" if not body else "not_atom")))
     name, entries = parsed
     rows = [{"video_key": video_key(store, e["video_id"]), "channel_key": key, "video_id": e["video_id"],
              "title": e["title"] or None, "published_at": e["published_at"], "source": "feed"}
@@ -459,9 +551,13 @@ def fetch_feed(store: Any, key: str, channel_id: str, *, now: float, timeout_s: 
         if name:
             store.save_yt_channel(key, name=name, at=now)
     except Exception:  # noqa: BLE001
-        return {"failed": 1, "bytes": len(body)}
+        return failed("save")
     cached()
-    return {"ok": 1, "bytes": len(body), "videos": len(rows)}
+    out: dict[str, Any] = {"ok": 1, "bytes": len(body), "videos": len(rows)}
+    if retried:
+        out["retried"] = 1
+        out["retry_ok"] = 1       # skill22 fix L3: the second read mended it (logged: does the retry help?)
+    return out
 
 
 def _fetch_all(store: Any, todo: Sequence[tuple[str, str]], *, now: float, budget_s: float,
@@ -487,12 +583,17 @@ def _fetch_all(store: Any, todo: Sequence[tuple[str, str]], *, now: float, budge
         t.start()
     for t in threads:
         t.join(max(0.0, deadline - time.perf_counter()))
+    errors: dict[str, int] = {}
     with lock:
         for r in results:
-            for k in ("ok", "failed", "capped", "bytes"):
-                counts[k] += int(r.get(k, 0))
+            for k in ("ok", "failed", "capped", "bytes", "retried", "retry_ok"):
+                counts[k] = counts.get(k, 0) + int(r.get(k, 0) or 0)
+            if r.get("error"):
+                errors[str(r["error"])] = errors.get(str(r["error"]), 0) + 1
         counts["late"] = len(todo) - len(results)
-    _log(log, "yt_fetch", ms=round((time.perf_counter() - started) * 1000.0, 1), **counts)
+    # skill22 (A10): why each failed read failed, as code words with counts (``{"http_404": 2}``), never a message
+    _log(log, "yt_fetch", ms=round((time.perf_counter() - started) * 1000.0, 1), errors=errors or None,
+         **{k: v for k, v in counts.items() if k not in ("retried", "retry_ok") or v})
     return counts
 
 
@@ -1196,7 +1297,7 @@ def settle(store: Any, *, now: float, log: LogFn | None = None) -> dict[str, int
             counts["outcomes"] += 1
     bar = live_bar(store, now=now)
     if not bar.get("off") and int(bar.get("picks") or 0) >= LIVE_MIN_PICKS and (bar.get("rate") or 0.0) < LIVE_MIN_RATE:
-        store.set_nudge_state(OFF_STATE, f"off:{int(now)}")
+        store.set_nudge_state(OFF_STATE, f"{OFF_PREFIX}:{int(now)}")
         store.add_taste_event("offers_off", {"picks": bar["picks"], "in_three": bar["in_three"]}, at=now)
         counts["switched_off"] = 1
         _log(log, "taste_offers_off", picks=bar["picks"], in_three=bar["in_three"])
@@ -1233,7 +1334,9 @@ def nightly(store: Any, *, now: float | None = None, log: LogFn | None = None, n
 
 
 __all__ = ["SITE", "CHANNEL_KIND", "MAX_READS_PER_HOUR", "FEED_CHANNELS", "REQUEST_BUDGET_S", "FRESH_DAYS",
-           "OFFER_N", "OFFER_KEEP_S", "OFF_STATE", "NIGHT_LOOKUPS", "NIGHT_OEMBED", "NIGHT_KINDS", "UNIT_S", "Offer",
+           "OFFER_N", "OFFER_KEEP_S", "OFF_STATE", "OFF_PREFIX", "RETRY_STATUSES", "RETRY_GAP_S", "off_at",
+           "display_names",
+           "error_kind", "NIGHT_LOOKUPS", "NIGHT_OEMBED", "NIGHT_KINDS", "UNIT_S", "Offer",
            "Pending", "wants", "blocked", "enabled", "video_key", "channel_key", "parse_feed", "channel_id_of",
            "fetch_feed", "request_cap", "refresh", "rank", "offer", "said", "offer_line", "start", "offered", "pick",
            "units", "watched", "attribute_local", "attributed", "by_channel", "fresh_ages", "lookup_channels",

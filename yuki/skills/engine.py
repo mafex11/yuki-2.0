@@ -341,6 +341,11 @@ class RunContext:
     #: window and every window's visible share), replaced by name in tests and replays; ``None``: the live read (an eval
     #: run reads nothing: its focus is the route's declaration).
     front: Callable[[], Any] | None = None
+    #: skill22 (A19): whether the caller calls a run again once when a slot came in another form than it takes (the
+    #: report says which form; :func:`_first_form_slip`): ``True`` / ``False``, or ``None`` by origin (the thinker reads
+    #: its tool result and calls again: on; the voice hands until they give such a result back as a call's own shape:
+    #: off, the question as before).
+    form_recall: bool | None = None
 
     def game_now(self) -> str:
         """D9, read now (fails closed: a check that raised counts as a game)."""
@@ -436,6 +441,14 @@ class SkillResult:
             words = evidence_words(self.evidence)
             if words:
                 text = f"{text}\n{words}"
+            recall = _recall_line(self.evidence) if self.evidence.get(FORM_RECALL) else ""
+            if recall:
+                # skill22 (A19, fix L1): nothing was done, and the value it went without came in another form than it
+                # takes: the re-call is the FIRST line (the planner reads only the first line, cut at 200 characters);
+                # the code's own line stays behind its "Say: " mark there (``brain.done.engine_line``), the fallback
+                # said when the request ends without the call
+                say = " ".join(str(self.say or "").split())
+                text = f"{recall} Else Say: {say}\n{text}" if say else f"{recall}\n{text}"
         return text
 
     def _report(self) -> str:
@@ -450,7 +463,10 @@ class SkillResult:
             # silently: the caller reads which slot and the form it takes (the question stays the user's)
             forms = (self.evidence or {}).get("form") if isinstance(self.evidence, Mapping) else None
             if isinstance(forms, Mapping) and forms:
-                given = "; ".join(f"{k} as given isn't a form it takes ({v})" for k, v in forms.items())
+                if (self.evidence or {}).get(FORM_RECALL):
+                    # skill22 (A19): the first such slip of a request is the caller's to mend, never a question
+                    return _recall_line(self.evidence)
+                given = _forms_given(forms)
                 return f"Ask them: {self.ask}\n{given}: pass it in that form when their words give it."
             return f"Ask them: {self.ask}"
         if self.outcome == "held_game":
@@ -535,6 +551,10 @@ class SkillResult:
             facts["unread"] = list(self.unread)
         if self.sends and self.sent_key is not None:
             facts["sent_key"] = bool(self.sent_key)
+        if isinstance(self.evidence, Mapping) and self.evidence.get(FORM_RECALL):
+            # skill22 (A19): refused for the call's own shape (a slot in another form than it takes), nothing done: the
+            # voice hands give such a call back once to be made again (their ``shape`` retry), never a question
+            facts["shape"] = True
         if self.outcome == HELD_BLOCKED:
             facts["refused"] = HELD_BLOCKED      # fHands: never said as a game (``held`` stays empty)
         elif self.held:
@@ -1495,7 +1515,25 @@ def run(resolved: Any, ctx: RunContext | None = None) -> SkillResult:
         except Exception:  # noqa: BLE001 - the declared values stand
             pass
     _stamp_sources(result, resolved, state)
+    _stamp_form_recall(result, ctx)
     return result
+
+
+def _stamp_form_recall(result: SkillResult, ctx: RunContext) -> None:
+    """skill22 (A19, the plan's side of :func:`_first_form_slip`): a run that went on without a value given in another
+    form than its slot takes (``evidence["form"]``), touched nothing and ended refused or failed is handed back to a
+    caller that calls again (:attr:`RunContext.form_recall`), once per
+    request: ``evidence["recall"]``, which its report and ``as_voice`` (``shape``) carry. Never raises."""
+    try:
+        ev = result.evidence if isinstance(result.evidence, dict) else None
+        forms = ev.get("form") if ev else None
+        if (not ev or not isinstance(forms, Mapping) or not forms or ev.get(FORM_RECALL) or result.done
+                or result.acted or ev.get("acted") or result.outcome not in ("failed", "refused")):
+            return
+        if _first_form_slip(ctx, str(result.skill or ""), forms):
+            ev[FORM_RECALL] = True
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _stamp_sources(result: SkillResult, resolved: Any, state: Mapping[str, Any]) -> None:
@@ -1609,6 +1647,58 @@ def _code_slot_forms(skill: Skill | None, dropped: Sequence[str] | None) -> dict
             if form:
                 out[str(name)] = form
     return out
+
+
+#: skill22 (A19): the evidence flag of a slot given in another form than it takes, handed back to the caller to call
+#: once more (:func:`_first_form_slip`), and how long one request's slip is remembered (RAM only).
+FORM_RECALL = "recall"
+FORM_RECALL_S = 120.0
+_form_slips: dict[tuple[str, str, tuple[str, ...]], float] = {}
+_form_lock = threading.Lock()
+
+
+def _forms_given(forms: Mapping[str, Any]) -> str:
+    """The slots given in another form than they take, each with the form it takes (code's words: the slot's name and
+    its form). Pure."""
+    return "; ".join(f"{k} as given isn't a form it takes ({v})" for k, v in forms.items())
+
+
+def _recall_line(evidence: Mapping[str, Any]) -> str:
+    """skill22 (A19, fix L1): the one line that hands a run back to its caller to call once more, the slot in the form
+    it takes. It is a report's first line on both sides (asked, and a refused or failed run that touched nothing),
+    and short enough to stand whole in the planner's summary (the first line, cut at 200 characters) with one slot's
+    form. ``""`` with no form. Pure."""
+    forms = evidence.get("form") if isinstance(evidence, Mapping) else None
+    if not isinstance(forms, Mapping) or not forms:
+        return ""
+    return (f"Nothing was done yet: {_forms_given(forms)}. Call run_skill again now, once: same skill, that slot "
+            f"in that form from their words; say nothing first.")
+
+
+def _first_form_slip(ctx: RunContext, skill_key: str, forms: Mapping[str, str]) -> bool:
+    """skill22 (A19): whether this is the first time in this request (its id, else its session) that ``skill_key`` got
+    these slots in another form than they take: then the caller calls once more in the stated form; a second slip
+    of the same slots is the user's question, as before. Only for a caller that calls again
+    (:attr:`RunContext.form_recall`); a run with neither id (an eval, a test) or from a card never re-calls. Noted
+    as it is read. RAM only; never raises."""
+    try:
+        who = str(getattr(ctx, "request_id", None) or getattr(ctx, "session_id", None) or "")
+        wanted = getattr(ctx, "form_recall", None)
+        if wanted is None:
+            wanted = getattr(ctx, "origin", "") == "thinker"
+        if not wanted or not who or getattr(ctx, "origin", "") in ("eval", "card"):
+            return False
+        key = (who, str(skill_key), tuple(sorted(str(k) for k in forms)))
+        now = time.monotonic()
+        with _form_lock:
+            for k in [k for k, at in _form_slips.items() if now - at > FORM_RECALL_S]:
+                _form_slips.pop(k, None)
+            if key in _form_slips:
+                return False
+            _form_slips[key] = now
+        return True
+    except Exception:  # noqa: BLE001 - unknown: the question, as before
+        return False
 
 
 def _absolute_values(skill: Skill, values: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -1792,14 +1882,22 @@ def _commit_gate(skill: Skill, ctx: RunContext, started: float) -> SkillResult |
 
 def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] | None = None) -> SkillResult:
     if isinstance(resolved, Ask):
-        _emit(ctx, "skill_resolve", skill=resolved.skill, result="asked", slot_source="ask")
-        asked_ev: dict[str, Any] = {"acted": False, "reason": "asked", "fallback_line": resolved.question}
         try:
             from yuki.skills.catalog import load
 
             forms = _code_slot_forms(load().get(str(resolved.skill or "")), getattr(resolved, "dropped", None))
         except Exception:  # noqa: BLE001
             forms = {}
+        if forms and _first_form_slip(ctx, str(resolved.skill or ""), forms):
+            # skill22 (A19; final-D k_spotify_louder: "louder" given for the volume's signed change was dropped and the
+            # user was asked "Louder, quieter, or to what level?" after saying "louder"): the first such slip of a
+            # request goes back to the caller to call once more in the stated form; nothing is asked or said
+            _emit(ctx, "skill_resolve", skill=resolved.skill, result="asked", slot_source="ask", reason="form_recall",
+                  dropped_slots=_slot_flags(list(forms)))
+            return _simple(resolved.skill, "asked", ctx, started, ask="", options=[], say="",
+                           evidence={"acted": False, "reason": "form", "form": forms, FORM_RECALL: True})
+        _emit(ctx, "skill_resolve", skill=resolved.skill, result="asked", slot_source="ask")
+        asked_ev: dict[str, Any] = {"acted": False, "reason": "asked", "fallback_line": resolved.question}
         if forms:
             asked_ev["form"] = forms      # skill19 (RC5a): a dropped code-typed value is never dropped silently
         return _simple(resolved.skill, "asked", ctx, started, ask=resolved.question, options=list(resolved.options),
@@ -2753,8 +2851,18 @@ def _title_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunCont
         if got is None:
             got = web_route.link_for_title(title, windows=web_route.title_windows(given.get("browser")))
         if got is None:
-            _emit(ctx, "skill_resolve", skill=skill.key, result="title_link", reason="no_fit", origin=ctx.origin)
-            return None
+            # skill22 (A8): no clear fit: the video site's own search for the title (``youtube.toml [urls] search``),
+            # opened and named as a search, never as "playing" (web_route._searched); the caller takes it on from the
+            # results. A title too short to search (a name) goes on as before
+            search = web_route.search_link(title)
+            _emit(ctx, "skill_resolve", skill=skill.key, result="title_link",
+                  reason="search" if search is not None else "no_fit", origin=ctx.origin)
+            if search is None:
+                return None
+            from yuki.skills.uia_route import said
+
+            where = "words" if said(title, ctx.words) else "screen"
+            return slot.name, search, where
         from yuki.skills.uia_route import said
 
         where = "words" if said(title, ctx.words) else (FROM_CARD if got.get("via") == "feed" else "screen")
@@ -3182,7 +3290,7 @@ def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = 
 
 __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_OTHER_DEVICE", "LINE_ALREADY",
            "LINE_COMMIT_USER", "TO_PLANNER", "WHY_UNVERIFIED", "WHY_DROPPED", "WHY_ERROR", "REFUSED_BY_STEPS",
-           "REPEAT_HANDOFF_S", "SETTLED_REASONS",
+           "REPEAT_HANDOFF_S", "SETTLED_REASONS", "FORM_RECALL",
            "HANDOFF_ORIGINS", "FROM_UNHEARD", "FROM_GIVEN", "SEEN_MAX", "COMMIT_BY_END", "COMMIT_BY_NEED", "commit_for",
            "run_commit", "served_commit", "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult",
            "VERB_FUNCS", "open_uri", "pinned", "SEED_KEYS", "plan_seed", "run", "resolve_and_run", "run_for_voice",
