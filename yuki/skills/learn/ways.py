@@ -837,14 +837,23 @@ def _import_evidence(store: Any, *, now: float) -> bool:
         return False
 
 
-#: skill22 (contract C13): the act steps :func:`spec_from_steps` reads, by their ``do`` (the hands' and the desk's own
-#: step words): a click on a control or a row, typing into a field, keys pressed.
+#: skill22 (contract C13): the act steps :func:`spec_from_steps` reads, by their kind: a click on a control or a row,
+#: typing into a field, keys pressed. Each set holds every caller's own code words for it: skill22's ``do`` words,
+#: desk22's ``verb`` (``brain.executor.way_step``: ``click``, ``type_text``, ``hotkey``, ``press``) and ONE's ``tool``
+#: (``one.runner._step_record``: ``click``, ``type``, ``keys``).
 TOLD_CLICKS = frozenset({"click", "dclick", "select", "invoke", "pick", "press_button", "toggle", "expand"})
-TOLD_TEXT = frozenset({"type", "paste", "set_text", "set_value", "write"})
+TOLD_TEXT = frozenset({"type", "type_text", "paste", "set_text", "set_value", "write"})
 TOLD_KEYS = frozenset({"keys", "press", "press_keys", "hotkey", "key"})
+#: The step fields a step's kind is read from, the first one set winning: ``do``, else ``verb``, else ``tool``.
+TOLD_KIND_FIELDS = ("do", "verb", "tool")
+#: The step fields its keys are read from, the first one set winning (a list, or a chord written with "+").
+TOLD_KEY_FIELDS = ("keys", "value", "key")
 #: The roles a told control may have (a command's own control, as :func:`_labels` reads them): anything else clicked
 #: before the typing (a message, a line of text) is content, never a step of a way.
 TOLD_CONTROL_ROLES = frozenset({"Button", "MenuItem", "ComboBox", "Tab", "TabItem", "SplitButton", "Hyperlink"})
+#: The UI Automation roles of a list's row (code words): a click on one that carries no ``item`` / ``index`` of its own
+#: is the way's item slot (which row differs from one go to the next; its name is never kept).
+TOLD_ROW_ROLES = frozenset({"ListItem", "TreeItem", "DataItem"})
 
 
 def _step_role(step: Mapping[str, Any]) -> str:
@@ -855,20 +864,54 @@ def _step_name(step: Mapping[str, Any]) -> str:
     return " ".join(str(step.get("name") or step.get("label") or "").split())
 
 
+def _step_kind(step: Mapping[str, Any]) -> str:
+    """A step's kind, ``click`` / ``text`` / ``keys`` / ``""``, from the first of :data:`TOLD_KIND_FIELDS` it sets."""
+    word = next((w for w in (" ".join(str(step.get(f) or "").split()) for f in TOLD_KIND_FIELDS) if w), "")
+    return ("text" if word in TOLD_TEXT else "click" if word in TOLD_CLICKS else "keys" if word in TOLD_KEYS
+            else "")
+
+
+def _step_keys(step: Mapping[str, Any]) -> list[str]:
+    """A keys step's chord as key names (casefolded), from the first of :data:`TOLD_KEY_FIELDS` it sets."""
+    raw = next((step.get(f) for f in TOLD_KEY_FIELDS if step.get(f) not in (None, "", [], ())), None)
+    parts = raw if isinstance(raw, (list, tuple)) else [] if raw is None else [raw]
+    return [k.strip().casefold() for p in parts for k in str(p).split("+") if k.strip()]
+
+
+def _step_submits(step: Mapping[str, Any]) -> bool:
+    """A typing step that pressed Enter itself (desk22's ``submit``, ONE's ``enter``)."""
+    return step.get("submit") is True or step.get("enter") is True
+
+
+def _step_is_row(step: Mapping[str, Any], role: str) -> bool:
+    """A click on a list's row: ``item`` true or an ``index`` given, else (neither given) a row's role."""
+    index = step.get("index")
+    if step.get("item") is not None or index is not None:
+        return bool(step.get("item")) or isinstance(index, int) and not isinstance(index, bool)
+    return role in TOLD_ROW_ROLES
+
+
 def spec_from_steps(app: str, steps: Sequence[Mapping[str, Any]], end: Mapping[str, Any] | None = None
                     ) -> dict[str, Any] | None:
     """skill22 (contract C13; "learn after one go"): the spec of a way the user tells Yuki to keep ("remember how I do
     this"), built from the steps an act just ran, in the shape :func:`keep_told` takes (:func:`template`'s). Pure.
 
-    ``steps``, in the order they ran, each a mapping with ``do`` and the UI facts of what it acted on (never its
-    text): a click (:data:`TOLD_CLICKS`) on a control (``role``, its own ``name``, ``aid`` its AutomationId, ``parent``
-    its parent's role) or on a row of a list (``item`` true, or an ``index``: which row differs from one go to the
-    next, so it becomes the way's item slot); typing (:data:`TOLD_TEXT`) into a field (``role``, its own ``name``,
-    ``parent``; the typed text is never read: it is the way's text slot); keys (:data:`TOLD_KEYS`, ``keys``: the chord).
+    ``steps``, in the order they ran, each a mapping with its kind (``do``, else ``verb``, else ``tool``: every caller's
+    own words, :data:`TOLD_CLICKS` / :data:`TOLD_TEXT` / :data:`TOLD_KEYS`) and the UI facts of what it acted on
+    (never its text); a step whose ``ok`` is ``False`` did not take and is left out.
+    - A click on a control (``role``, its own ``name``, ``aid`` its AutomationId, ``parent`` its parent's role), or on
+      a row of a list (``item`` true, or an ``index``, else a row's role :data:`TOLD_ROW_ROLES`: which row differs
+      from one go to the next, so it becomes the way's item slot, its name never kept).
+    - Typing into a field (``role``, its own ``name``, ``parent``; when it names none, the click just before it into
+      that field). The typed text is never read: it is the way's text slot. ``submit`` / ``enter``: Enter pressed with
+      it.
+    - Keys (``keys``, else ``value``, else ``key``: the chord).
+
     Only the steps before the first typing are the way's place, as in :func:`template`: its first row picked (the item
     slot) and at most :data:`MAX_CONTROLS` command controls (:data:`TOLD_CONTROL_ROLES`, a name of one part: a row's
-    composite name is never a control's). The field is the one the last typing went into; the end is the keys
-    pressed after it (``end``: ``{"kind", "keys"}`` given by the caller wins), else none (a draft way).
+    composite name is never a control's). The field is the one the last typing went into. The end is Enter pressed
+    with that typing, else the keys pressed right after it; ``end`` (``{"kind", "keys"}``) given by the caller names
+    the kind, and its keys win when it gives some; else none (a draft way).
 
     ``None`` when nothing of it can be kept: no app, no typing into a field (a way ends in a field), or no place step
     (only typing into one field: the hands do that without a way, :func:`find`'s own rule). The field's own name is
@@ -879,25 +922,39 @@ def spec_from_steps(app: str, steps: Sequence[Mapping[str, Any]], end: Mapping[s
         app_k = app_key(str(app or "")) or " ".join(str(app or "").split()).casefold()
         if not app_k:
             return None
-        rows = [s for s in steps or () if isinstance(s, Mapping)]
-        typed_at = next((i for i, s in enumerate(rows) if str(s.get("do") or "") in TOLD_TEXT), None)
-        if typed_at is None:
+        rows = [s for s in steps or () if isinstance(s, Mapping) and s.get("ok") is not False]
+        kinds = [_step_kind(s) for s in rows]
+        acts = [i for i, k in enumerate(kinds) if k]
+        typed = [i for i in acts if kinds[i] == "text"]
+        if not typed:
             return None
-        field_step = [s for s in rows if str(s.get("do") or "") in TOLD_TEXT][-1]
+        typed_at, last = typed[0], typed[-1]
+        field_step = rows[last]
         field_role, field_name = _step_role(field_step), _step_name(field_step)
+        if not field_role or not field_name:
+            # the typing names no field of its own: the click just before it put the caret there (neither a row's nor a
+            # command control's)
+            before = [i for i in acts if i < last]
+            if before and kinds[before[-1]] == "click":
+                into = rows[before[-1]]
+                role, name = _step_role(into), _step_name(into)
+                if role and name and role not in TOLD_CONTROL_ROLES and not _step_is_row(into, role):
+                    field_step, field_role, field_name = into, role, name
         if not field_role or not field_name:
             return None
         out_steps: list[dict[str, Any]] = []
         item: dict[str, Any] | None = None
         controls = 0
-        for s in rows[:typed_at]:
-            if str(s.get("do") or "") not in TOLD_CLICKS:
+        for i in acts:
+            if i >= typed_at:
+                break
+            if kinds[i] != "click":
                 continue
+            s = rows[i]
             role, name = _step_role(s), _step_name(s)
             if role == field_role and name == field_name:
                 continue          # a click into the field itself: the field step below
-            is_row = bool(s.get("item")) or isinstance(s.get("index"), int) and not isinstance(s.get("index"), bool)
-            if is_row:
+            if _step_is_row(s, role):
                 if item is None and role:
                     item = {"role": role, "parent": " ".join(str(s.get("parent") or "").split()), "things": [],
                             "demos": 1, "days": 1}
@@ -913,15 +970,15 @@ def spec_from_steps(app: str, steps: Sequence[Mapping[str, Any]], end: Mapping[s
             return None
         out_steps += [{"do": "field"}, {"do": "text"}]
         keys: list[str] = []
-        if isinstance(end, Mapping) and isinstance(end.get("keys"), (list, tuple)):
-            keys = [str(k).casefold() for k in end["keys"] if str(k).strip()]
+        given = end.get("keys") if isinstance(end, Mapping) else None
+        if isinstance(given, (list, tuple)) and any(str(k).strip() for k in given):
+            keys = [str(k).strip().casefold() for k in given if str(k).strip()]
+        elif _step_submits(rows[last]):
+            keys = ["enter"]
         else:
-            last = typed_at + max(i for i, s in enumerate(rows[typed_at:]) if str(s.get("do") or "") in TOLD_TEXT)
-            after = [s for s in rows[last + 1:] if str(s.get("do") or "") in TOLD_KEYS]
-            if after:
-                raw = after[-1].get("keys") if after[-1].get("keys") is not None else after[-1].get("key")
-                raw = raw if isinstance(raw, (list, tuple)) else str(raw or "").split("+")
-                keys = [str(k).strip().casefold() for k in raw if str(k).strip()]
+            after = [i for i in acts if i > last]
+            if after and kinds[after[0]] == "keys":
+                keys = _step_keys(rows[after[0]])
         kind = str((end or {}).get("kind") or "field_submitted") if isinstance(end, Mapping) else "field_submitted"
         field_id = {"role": field_role, "parent": " ".join(str(field_step.get("parent") or "").split()),
                     "box": " ".join(str(field_step.get("box") or "").split()), "name": field_name}

@@ -95,12 +95,15 @@ FEED_FRESH_S = 3600.0
 #: How long a request waits for the feeds (T1.4: 1.5 s); a slower feed serves the next request.
 REQUEST_BUDGET_S = 1.5
 #: skill22 (A10): a feed read answered with one of these (not found, a server error: YouTube's public feed answers so
-#: now and then for a feed that is there), or dropped with no answer by one of these error kinds, is read once more at
-#: once (:func:`fetch_feed`) when at least :data:`RETRY_MIN_S` of its deadline is left; a 429 (slow down) never is.
+#: now and then for a feed that is there), or dropped with no answer by one of these error kinds, is read once more
+#: (:func:`fetch_feed`) when at least :data:`RETRY_MIN_S` of its deadline is left; a 429 (slow down) never is.
 RETRY_STATUSES = frozenset({404, 500, 502, 503, 504})
 RETRY_ERRORS = frozenset({"remotedisconnected", "connectionreseterror", "urlerror_connectionreseterror",
                           "incompleteread", "badstatusline"})
 RETRY_MIN_S = 0.3
+#: ...after this short gap (skill22 fix L3: in final-D 5 of 7 parallel reads failed within 672 ms; a retry at once in
+#: the same burst could get an edge-cached error answer again). Taken from the same deadline.
+RETRY_GAP_S = 0.25
 #: Fresh: published within this many days; the age weight's scale (T1.4).
 FRESH_DAYS = 14.0
 AGE_DAYS = 7.0
@@ -501,8 +504,9 @@ def fetch_feed(store: Any, key: str, channel_id: str, *, now: float, timeout_s: 
     on the 19 Oct morning copy one feed answered 404 an hour after the same feed had answered 200, and a read now of a
     public feed answers 200): YouTube's public feed answers an error now and then for a feed that is there, and one
     such answer kept that channel's uploads stale for the hour. An error answer of :data:`RETRY_STATUSES` (or a
-    connection dropped with no answer, :data:`RETRY_ERRORS`) is read once more at once, within the deadline and under
-    the same cap; only a second failure waits the hour as before."""
+    connection dropped with no answer, :data:`RETRY_ERRORS`) is read once more after :data:`RETRY_GAP_S`, within the
+    deadline and under the same cap (``retry_ok`` when that second read mended it); only a second failure waits the
+    hour as before."""
     url = _url(FEED_URL, id=channel_id)
     why: dict[str, Any] = {}
     got = _read(store, "feed", url, max_bytes=FEED_MAX_BYTES, timeout_s=timeout_s, deadline=deadline, cap=cap, why=why)
@@ -510,7 +514,8 @@ def fetch_feed(store: Any, key: str, channel_id: str, *, now: float, timeout_s: 
         return {"capped": 1}
     retried = 0
     if (got[0] in RETRY_STATUSES or (not got[0] and why.get("error") in RETRY_ERRORS)) and \
-            (deadline is None or time.perf_counter() < deadline - RETRY_MIN_S):
+            (deadline is None or time.perf_counter() < deadline - RETRY_MIN_S - RETRY_GAP_S):
+        time.sleep(RETRY_GAP_S)       # its own short thread (:func:`_fetch_all`): never the request's
         again: dict[str, Any] = {}
         second = _read(store, "feed", url, max_bytes=FEED_MAX_BYTES, timeout_s=timeout_s, deadline=deadline, cap=cap,
                        why=again)
@@ -551,6 +556,7 @@ def fetch_feed(store: Any, key: str, channel_id: str, *, now: float, timeout_s: 
     out: dict[str, Any] = {"ok": 1, "bytes": len(body), "videos": len(rows)}
     if retried:
         out["retried"] = 1
+        out["retry_ok"] = 1       # skill22 fix L3: the second read mended it (logged: does the retry help?)
     return out
 
 
@@ -580,14 +586,14 @@ def _fetch_all(store: Any, todo: Sequence[tuple[str, str]], *, now: float, budge
     errors: dict[str, int] = {}
     with lock:
         for r in results:
-            for k in ("ok", "failed", "capped", "bytes", "retried"):
+            for k in ("ok", "failed", "capped", "bytes", "retried", "retry_ok"):
                 counts[k] = counts.get(k, 0) + int(r.get(k, 0) or 0)
             if r.get("error"):
                 errors[str(r["error"])] = errors.get(str(r["error"]), 0) + 1
         counts["late"] = len(todo) - len(results)
     # skill22 (A10): why each failed read failed, as code words with counts (``{"http_404": 2}``), never a message
     _log(log, "yt_fetch", ms=round((time.perf_counter() - started) * 1000.0, 1), errors=errors or None,
-         **{k: v for k, v in counts.items() if k != "retried" or v})
+         **{k: v for k, v in counts.items() if k not in ("retried", "retry_ok") or v})
     return counts
 
 
@@ -1328,7 +1334,8 @@ def nightly(store: Any, *, now: float | None = None, log: LogFn | None = None, n
 
 
 __all__ = ["SITE", "CHANNEL_KIND", "MAX_READS_PER_HOUR", "FEED_CHANNELS", "REQUEST_BUDGET_S", "FRESH_DAYS",
-           "OFFER_N", "OFFER_KEEP_S", "OFF_STATE", "OFF_PREFIX", "RETRY_STATUSES", "off_at", "display_names",
+           "OFFER_N", "OFFER_KEEP_S", "OFF_STATE", "OFF_PREFIX", "RETRY_STATUSES", "RETRY_GAP_S", "off_at",
+           "display_names",
            "error_kind", "NIGHT_LOOKUPS", "NIGHT_OEMBED", "NIGHT_KINDS", "UNIT_S", "Offer",
            "Pending", "wants", "blocked", "enabled", "video_key", "channel_key", "parse_feed", "channel_id_of",
            "fetch_feed", "request_cap", "refresh", "rank", "offer", "said", "offer_line", "start", "offered", "pick",

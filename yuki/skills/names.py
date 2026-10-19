@@ -15,8 +15,8 @@ named as the user sees it ("Process Lasso"), a site by its host ("excalidraw.com
 skill22 (A6, contract C14): with ``channels``, also their own channels on the sites' named pages (:data:`CHANNEL`:
 taste's kinds of a site file's page with a speakable value, YouTube's ``/@handle``; their picked ones, most picked
 first, then the ones their own app showed), each by its own display name when the site gave one, at most
-:data:`OWN_CHANNELS` more; :func:`own_names` lists them. :func:`own_url` puts a raw address of such a page through the
-same measure.
+:data:`OWN_CHANNELS`, their room kept inside :data:`OWN_MAX`; :func:`own_names` lists them. :func:`own_url` puts a raw
+address of such a page through the same measure.
 
 **The measure** (:func:`best_match`, :func:`score`). Runs of one to :data:`MAX_WORDS` heard words are compared with
 each name's spoken forms (an app's name, with and without a bracketed part; a site's registrable name, "excalidraw" for
@@ -44,8 +44,9 @@ given to an act, and only that, is also measured three more ways, each a fixed r
 name (three or four letters) by the very same sounds (:data:`SHORT_BAR`: "Ark" for Arc, "Deezy" for Deji); a vowel
 heard as another class costing half an edit (:data:`NAME_VOWEL_COST`: "this card" for Discord); a one-word name of
 theirs said by its first letters as written, when the given name is one written word (:data:`CLIP_SHARE`: "insta" for
-instagram.com; a word the recognizer wrote as two joined ones, "InstaCol", by its first part). A whole turn is measured
-exactly as before. "chat BP" stays under the bar (0.69: one letter of "GPT" dropped and one changed is two edits of
+instagram.com; a word the recognizer wrote as two joined ones, "InstaCol", by its first part). The short rule and the
+clip score under :data:`TURN_BAR` (:data:`NAME_RULE_MAX`), so only the name bar takes a name by them. A whole turn is
+measured exactly as before. "chat BP" stays under the bar (0.69: one letter of "GPT" dropped and one changed is two edits of
 seven; no fixed rule raises it without raising plain words).
 
 **The winner** must reach the bar and beat the best name of every other group by :data:`MARGIN`. Names one of which
@@ -118,8 +119,8 @@ TURN_BAR = 0.85
 #: clips' true winners led by 0.26-0.60; of the user's 200 names, 2 score 0.75 or more against another group's.
 MARGIN = 0.1
 #: skill22 (A14), a name given to an act only. A name of :data:`MIN_LETTERS` to ``NEAR_MIN_LETTERS - 1`` letters and a
-#: run of as few say the very same sounds (one sound code, one onset): they score the mean of their spelling and 1.0
-#: ("Ark" / "arc" 0.83; "Deezy" / "deji" 0.75: "z" and "j" in one class, "ee" and "i" one vowel). A whole turn never
+#: run of as few say the very same sounds (one sound code, one onset): they score the mean of their spelling and 1.0,
+#: at most :data:`NAME_RULE_MAX` ("Ark" / "arc" 0.83; "Deezy" / "deji" 0.75: "z" and "j" in one class, "ee" and "i" one vowel). A whole turn never
 #: takes a short name by its sound (one letter off a four-letter name is a plain word there: :data:`NEAR_MIN_LETTERS`).
 SHORT_BAR = 1.0
 #: ...a vowel heard as one of another class (:data:`_VOWEL_CLASS`) costs this much of an edit in the sound distance:
@@ -134,8 +135,13 @@ CLIP_SHARE = 0.5
 #: ...and a word the recognizer joined to the clip ("InstaCol": "insta khol", the Hindi "open" after the name) has at
 #: most this many letters after the joint (measured: "PowerPoint" read as "Power" + "Point" took PowerToys, 0.78).
 FUSED_MAX_LETTERS = 3
-#: skill22 (A6, contract C14): at most this many of the user's own channels (:data:`CHANNEL`) on top of
-#: :data:`OWN_MAX`.
+#: ...the short rule and the clip score at most this, under :data:`TURN_BAR`: they serve a name given to an act (bar
+#: :data:`BAR`) and never a reader that keeps only winners of a whole turn's strength (skill22 fix M3: voice22's
+#: near reading, ``as_name`` at :data:`TURN_BAR`, took the plain word "life" for teams.live.com at 0.875 by the short
+#: rule; "photo" for Photos scored 0.917 by the clip).
+NAME_RULE_MAX = round(TURN_BAR - 0.01, 2)
+#: skill22 (A6, contract C14): at most this many of the user's own channels (:data:`CHANNEL`), their room kept inside
+#: :data:`OWN_MAX` when they are listed with the apps and sites (skill22 fix L2).
 OWN_CHANNELS = 40
 
 #: The kinds of names (code words, logged).
@@ -286,7 +292,7 @@ def _pair(run: _Form, form: _Form, as_name: bool = False) -> float:
     if as_name and MIN_LETTERS <= min(la, lb) and max(la, lb) < NEAR_MIN_LETTERS:
         if not run.code or run.code != form.code:
             return 0.0
-        return (1.0 - _distance(run.letters, form.letters) + SHORT_BAR) / 2.0
+        return min((1.0 - _distance(run.letters, form.letters) + SHORT_BAR) / 2.0, NAME_RULE_MAX)
     if min(la, lb) < NEAR_MIN_LETTERS or min(la, lb) < LENGTH_RATIO * max(la, lb):
         return 0.0
     spell = 1.0 - _distance(run.letters, form.letters)
@@ -306,7 +312,7 @@ def _clip(head: _Form | None, form: _Form) -> float:
     n, m = len(head.letters), len(form.letters)
     if n < NEAR_MIN_LETTERS or n >= m or n < CLIP_SHARE * m or not form.letters.startswith(head.letters):
         return 0.0
-    return (1.0 + n / m) / 2.0
+    return min((1.0 + n / m) / 2.0, NAME_RULE_MAX)
 
 
 def is_site(name: Any) -> bool:
@@ -797,7 +803,8 @@ def own_entries(store: Any = None, *, running: Sequence[str] | None = None,
     never cuts the sites. ``store``: the memory to read (else this process's own memory when it is open; else no
     timeline and no sites). A running program is named as the timeline names it when it knows it. skill22
     (``channels``, contract C14): then the user's own channels (:func:`_channel_entries`), at most
-    :data:`OWN_CHANNELS` more, a name an app or a site already has left out. Never raises."""
+    :data:`OWN_CHANNELS`, a name an app or a site already has left out; their room is kept inside :data:`OWN_MAX`
+    (the apps and sites share what is left), so the whole list is at most :data:`OWN_MAX`. Never raises."""
     try:
         memory = _memory_entries(store) if store is not None else _default_entries()
         shown: dict[str, str] = {}
@@ -829,10 +836,21 @@ def own_entries(store: Any = None, *, running: Sequence[str] | None = None,
                 add(e)
         for n in (start_names(start) if start is not None else _start_now()):
             add(Own(n, APP, START))
-        # names21 review F5: each kind capped on its own within OWN_MAX, in the listed order (in use first)
+        # skill22 fix L2: the channels' room is kept inside OWN_MAX (a reader that keeps OWN_MAX names, the voice's,
+        # cuts from the end: the channels came last and lost 6 of 39 on the DB copy)
+        chans: list[Own] = []
+        if channels:
+            have: set[str] = set()
+            for e in [e for e in memory if e.kind == CHANNEL][:OWN_CHANNELS]:
+                key = _squash(e.name)
+                if len(key) >= MIN_LETTERS and key not in have:
+                    have.add(key)
+                    chans.append(e)
+        room = OWN_MAX - len(chans)
+        # names21 review F5: each kind capped on its own within that room, in the listed order (in use first)
         sites = sum(1 for e in listed if e.kind == SITE)
-        keep_sites = min(sites, max(OWN_MAX // 2, OWN_MAX - (len(listed) - sites)))
-        keep_apps = OWN_MAX - keep_sites
+        keep_sites = min(sites, max(room // 2, room - (len(listed) - sites)))
+        keep_apps = room - keep_sites
         out: list[Own] = []
         for e in listed:
             if e.kind == SITE and keep_sites > 0:
@@ -841,12 +859,8 @@ def own_entries(store: Any = None, *, running: Sequence[str] | None = None,
             elif e.kind != SITE and keep_apps > 0:
                 keep_apps -= 1
                 out.append(e)
-        if channels:
-            taken = {_squash(e.name) for e in out}
-            for e in [e for e in memory if e.kind == CHANNEL][:OWN_CHANNELS]:
-                if len(_squash(e.name)) >= MIN_LETTERS and _squash(e.name) not in taken:
-                    taken.add(_squash(e.name))
-                    out.append(e)
+        taken = {_squash(e.name) for e in out}
+        out += [e for e in chans if _squash(e.name) not in taken]
         return out
     except Exception:  # noqa: BLE001
         return []
@@ -865,8 +879,10 @@ def own_site_entries(store: Any = None) -> list[Own]:
 
 def own_names(store: Any = None, *, running: Sequence[str] | None = (), channels: bool = True) -> list[str]:
     """Contracts C11 and C14: the user's own apps and sites as names (:func:`own_entries`: an app's display name, a
-    site's host), deduped, at most :data:`OWN_MAX`, in use first; skill22 (C14, A6): then their own channels (a
-    channel's display name: "Deji"), at most :data:`OWN_CHANNELS` more (``channels=False``: none). skill22 (E5): the
+    site's host), deduped, in use first; skill22 (C14, A6): then their own channels (a channel's display name:
+    "Deji"), at most :data:`OWN_CHANNELS` (``channels=False``: none), at most :data:`OWN_MAX` names in all (the
+    channels' room kept inside it). A caller that acts on a name by its kind reads :func:`own_entries` (``.kind``):
+    a channel is never an app (skill22 fix M2). skill22 (E5): the
     window list is never read here (``running``: the programs with a window now, when a caller has read them; ``None``
     reads the window list as :func:`own_entries` does): the voice's own-names read takes the apps from memory's
     timeline and the Start list only. Pure apart from the reads; never raises (``[]``)."""
@@ -999,7 +1015,8 @@ def site_browser(host: Any, store: Any = None) -> str:
 
 
 __all__ = ["APP", "BAR", "TURN_BAR", "BROWSER_MIN_SITES", "CHANNEL", "CLIP_SHARE", "LENGTH_RATIO", "LINKS", "MARGIN",
-           "MAX_WORDS", "MIN_LETTERS", "NAME_VOWEL_COST", "NEAR_MIN_LETTERS", "OWN_CHANNELS", "OWN_MAX", "Own",
+           "MAX_WORDS", "MIN_LETTERS", "NAME_RULE_MAX", "NAME_VOWEL_COST", "NEAR_MIN_LETTERS", "OWN_CHANNELS",
+           "OWN_MAX", "Own",
            "RUNNING", "SHORT_BAR", "SITE", "SITE_MIN_VISITS", "START", "TAIL_HEAD", "TAIL_MIN_LETTERS", "TASTE",
            "TIMELINE", "best_match", "channel_url", "is_site", "literal", "own_channel_entries", "own_entries",
            "own_names", "own_site_entries", "own_url", "same_group", "score", "site_browser", "site_url", "sites_of",

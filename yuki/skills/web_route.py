@@ -63,8 +63,8 @@ x8WebArc (10 Oct: "open YouTube in Arc" opened nothing new in Arc five times, an
   "already" (review r1 M1), said only once the done-check sees it, never a fresh "done".
 * **A browser that ignored the last two hand-offs** (kept the very page it had) is not handed the next one for a while
   (RAM, this process; review r1 L1): its address-bar rung runs at once. skill22 (A16): the launch's persisted note
-  (:func:`persisted_note`) says so across restarts too, learns from this skill's own hand-offs, and an expired one
-  (``recheck``) gets one hand-off with its page wait capped (:data:`IGNORED_WAIT_S`).
+  (:func:`persisted_note`) says so across restarts too. The launch writes that note (this skill's hand-offs included)
+  and caps an expired one's (``recheck``) page wait itself.
 
 lSkills (live 17 Oct: every Arc open failed with protocol activation's ``0x80270254``, then the address-bar rung said
 "no window" in 96 ms with Arc up, and Yuki opened Excalidraw in Chrome):
@@ -459,11 +459,10 @@ def _noted_window(call: RouteCall, key: str) -> int:
 _ignored: dict[str, tuple[int, float]] = {}
 
 
-def _note_ignored(key: str, ignored: bool, name: str = "") -> None:
-    """One more hand-off ``key`` ignored (``ignored``), or one it opened newly (the count is cleared). skill22 (A16):
-    the launch's persisted note learns it too (:data:`PERSISTED_WRITE`, by the browser's ``name`` as the Start menu
-    has it, else its key): the launch's own open_url notes only the hands' path, since this skill asks it for the
-    hand-off alone."""
+def _note_ignored(key: str, ignored: bool) -> None:
+    """One more hand-off ``key`` ignored (``ignored``), or one it opened newly (the count is cleared). RAM only: the
+    launch's persisted note is written by the launch itself (desk22: its ``open_url`` measures this skill's hand-off
+    too, ``address_bar=False``), so one hand-off is counted there once (skill22 fix M1)."""
     key = _app_key(key)
     if not key:
         return
@@ -472,38 +471,26 @@ def _note_ignored(key: str, ignored: bool, name: str = "") -> None:
             _ignored[key] = (_ignored.get(key, (0, 0.0))[0] + 1, time.monotonic())
         else:
             _ignored.pop(key, None)
-    try:
-        from yuki.actions import launch
-
-        fn = getattr(launch, PERSISTED_WRITE, None)
-        if callable(fn):
-            fn(_words(name) or key, bool(ignored))
-    except Exception:  # noqa: BLE001
-        pass
 
 
-def _ignores_handoff(key: str, name: str = "", note: str | None = None) -> bool:
+def _ignores_handoff(key: str, name: str = "") -> bool:
     """Whether browser ``key`` ignored the last :data:`IGNORED_AFTER` hand-offs, the latest within
     :data:`IGNORED_KEEP_S`; skill22 (A16): or the launch's persisted note says it ignores them
-    (:func:`persisted_note` ``ignores``; ``note``: that note already read), so the first open after each start no
-    longer pays a hand-off the browser always ignores (final-D: Arc's skill path spent 3.4 s of its 7.6 s on it)."""
+    (:func:`persisted_note` ``ignores``, by the browser's ``name``), so the first open after each start no longer pays
+    a hand-off the browser always ignores (final-D: Arc's skill path spent 3.4 s of its 7.6 s on it)."""
     with _noted_lock:
         got = _ignored.get(_app_key(key))
     if bool(got) and got[0] >= IGNORED_AFTER and time.monotonic() - got[1] < IGNORED_KEEP_S:
         return True
-    return (persisted_note(key, name) if note is None else note) == "ignores"
+    return persisted_note(key, name) == "ignores"
 
 
-#: skill22 (A16): the launch's persisted per-browser note (desk22, ``yuki/actions/launch.py``):
+#: skill22 (A16): the launch's persisted per-browser note (desk22, ``yuki/actions/launch.py``), read only here:
 #: ``handoff_note(app) -> "ignores" | "recheck" | ""`` (it ignores hand-offs; it did, but the note has expired: hand it
-#: over once more with the page wait capped and measure it again; nothing known) and its writer
-#: ``note_handoff(app, ignored)``, both by the browser's Start menu name. Read through ``getattr``: a launch without
-#: them reads ``""`` (this process's own note only, as before).
+#: over once more and measure it again; nothing known), by the browser's Start menu name. Read through ``getattr``: a
+#: launch without it reads ``""`` (this process's own note only, as before). The launch writes the note and caps a
+#: noted hand-off's page wait itself (its ``open_url``, ``address_bar=False`` included), so this skill does neither.
 PERSISTED_NOTE = "handoff_note"
-PERSISTED_WRITE = "note_handoff"
-#: ...with that note, the longest a hand-off's page wait may take: a ``recheck``, or an ``ignores`` on a route whose
-#: next rung is not the address bar (the hand-off is the one way left there).
-IGNORED_WAIT_S = 1.5
 
 
 def persisted_note(key: str, name: str = "") -> str:
@@ -789,14 +776,14 @@ def route_told_link(call: RouteCall) -> RouteResult:
             # x8WebArc: the browser kept the page it had: not opened (page_blank, review r1 M1: a protocol-refused
             # browser came up showing no page at all: not opened either)
             if source != "default" and seen["state"] == "same":
-                _note_ignored(key, True, name)
+                _note_ignored(key, True)
             _log_open(call, "protocol", seen, seen["reason"])
             return RouteResult(ran=False, outcome=seen["reason"],
                                facts={"browser_from": source, "via": seen["via"], "state": seen["state"]})
         if not (isinstance(details, Mapping) and (details.get("launched") or details.get("hwnd"))):
             return RouteResult(ran=False, outcome="not_opened", facts={"browser_from": source, "via": seen["via"]})
     if seen["verified"] and source != "default":
-        _note_ignored(key, False, name)
+        _note_ignored(key, False)
     _log_open(call, "protocol", seen, "already" if seen["already"] else "page" if seen["verified"] else "unread")
     words = {"service": service or said or "It", "browser": _browser_title(key) or name or "the browser"}
     return RouteResult(ran=True, outcome="opened", app=key or None, say=LINE_TAB_UP.format(**words),
@@ -1444,21 +1431,15 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
     if source == "default" and not key:
         key = _handler_key(url)
     named = source != "default"
-    note = persisted_note(key, name) if named else ""
-    ignores = named and _ignores_handoff(key, name, note)
-    if bar_next and ignores:
+    if bar_next and named and _ignores_handoff(key, name):
+        # skill22 (A16): also when the launch's kept note says so (across restarts); a ``recheck`` note, or ``ignores``
+        # with no address-bar rung next, is handed over, and the launch caps that hand-off's page wait itself
         _log_open(call, "protocol", {}, "skipped_ignored")
         return RouteResult(ran=False, outcome="handoff_ignored", facts={"browser_from": source}), \
             name, key, source, {}
     _claim_app(call, key)
     tabs_before = _tabs_before(key, url) if key else {}
-    deadline = _launch_deadline(call)
-    if ignores or note == "recheck":
-        # skill22 (A16): a browser the kept note says ignores hand-offs, on a route with no address-bar rung next (the
-        # hand-off is the one way left), or one whose note has expired (handed over once more, measured again): its
-        # page wait is capped (the launch's own wait would run its whole floor on a page that never comes)
-        deadline = min(deadline, time.monotonic() + IGNORED_WAIT_S)
-    result = _open_url(url, name if named else None, deadline)
+    result = _open_url(url, name if named else None, _launch_deadline(call))
     if kind := _held_by_game(result):
         return RouteResult(ran=False, held=kind, outcome="refused"), name, key, source, {}
     seen = _launch_seen(result)
@@ -1474,7 +1455,7 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
             if named and seen["state"] in ("same", "blank"):
                 # fSkills (live 18 Oct: Arc refused the address and came up blank, 3.4 s, before the address bar):
                 # a blank window is the address ignored too, so after IGNORED_AFTER of them the bar runs at once
-                _note_ignored(key, True, name)
+                _note_ignored(key, True)
             _log_open(call, "protocol", seen, seen["reason"])
             return RouteResult(ran=False, outcome=seen["reason"], facts={**facts, "state": seen["state"]}), \
                 name, key, source, seen
@@ -1485,7 +1466,7 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (), po
         return (None if launched else RouteResult(ran=False, outcome="not_opened", facts=facts)), \
             name, key, source, seen
     if seen["verified"] and named:
-        _note_ignored(key, False, name)
+        _note_ignored(key, False)
     _log_open(call, "protocol", seen, "already" if seen["already"] else "page" if seen["verified"] else "unread")
     return None, name, key, source, seen
 

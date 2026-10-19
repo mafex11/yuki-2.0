@@ -441,10 +441,14 @@ class SkillResult:
             words = evidence_words(self.evidence)
             if words:
                 text = f"{text}\n{words}"
-            if self.evidence.get(FORM_RECALL):
-                # skill22 (A19): nothing was done, and the value it went without came in another form than it takes
-                text += ("\nNothing was done: call run_skill again now, once, with that slot in the form it takes, "
-                         "read from their words.")
+            recall = _recall_line(self.evidence) if self.evidence.get(FORM_RECALL) else ""
+            if recall:
+                # skill22 (A19, fix L1): nothing was done, and the value it went without came in another form than it
+                # takes: the re-call is the FIRST line (the planner reads only the first line, cut at 200 characters);
+                # the code's own line stays behind its "Say: " mark there (``brain.done.engine_line``), the fallback
+                # said when the request ends without the call
+                say = " ".join(str(self.say or "").split())
+                text = f"{recall} Else Say: {say}\n{text}" if say else f"{recall}\n{text}"
         return text
 
     def _report(self) -> str:
@@ -459,11 +463,10 @@ class SkillResult:
             # silently: the caller reads which slot and the form it takes (the question stays the user's)
             forms = (self.evidence or {}).get("form") if isinstance(self.evidence, Mapping) else None
             if isinstance(forms, Mapping) and forms:
-                given = "; ".join(f"{k} as given isn't a form it takes ({v})" for k, v in forms.items())
                 if (self.evidence or {}).get(FORM_RECALL):
                     # skill22 (A19): the first such slip of a request is the caller's to mend, never a question
-                    return (f"Not run yet, and nothing was done: {given}. Call run_skill again now, once, with the "
-                            f"same skill and that slot in that form, read from their words; say nothing first.")
+                    return _recall_line(self.evidence)
+                given = _forms_given(forms)
                 return f"Ask them: {self.ask}\n{given}: pass it in that form when their words give it."
             return f"Ask them: {self.ask}"
         if self.outcome == "held_game":
@@ -1652,6 +1655,24 @@ FORM_RECALL = "recall"
 FORM_RECALL_S = 120.0
 _form_slips: dict[tuple[str, str, tuple[str, ...]], float] = {}
 _form_lock = threading.Lock()
+
+
+def _forms_given(forms: Mapping[str, Any]) -> str:
+    """The slots given in another form than they take, each with the form it takes (code's words: the slot's name and
+    its form). Pure."""
+    return "; ".join(f"{k} as given isn't a form it takes ({v})" for k, v in forms.items())
+
+
+def _recall_line(evidence: Mapping[str, Any]) -> str:
+    """skill22 (A19, fix L1): the one line that hands a run back to its caller to call once more, the slot in the form
+    it takes. It is a report's first line on both sides (asked, and a refused or failed run that touched nothing),
+    and short enough to stand whole in the planner's summary (the first line, cut at 200 characters) with one slot's
+    form. ``""`` with no form. Pure."""
+    forms = evidence.get("form") if isinstance(evidence, Mapping) else None
+    if not isinstance(forms, Mapping) or not forms:
+        return ""
+    return (f"Nothing was done yet: {_forms_given(forms)}. Call run_skill again now, once: same skill, that slot "
+            f"in that form from their words; say nothing first.")
 
 
 def _first_form_slip(ctx: RunContext, skill_key: str, forms: Mapping[str, str]) -> bool:
