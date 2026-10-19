@@ -1667,10 +1667,49 @@ def _target(call: RouteCall, opens: str) -> tuple[str | None, dict[str, Any], st
         return got[0], got[1], LINE_VIDEO_UP, LINE_VIDEO_ALREADY
     said = _words(call.values.get("site"))
     url, expect = page_address(said, call.values.get("page"), call.values.get("item"))
+    if not url and expect.get("why") == "no_address" and not _words(call.values.get("page")):
+        # names21 (final-D S18; the user's decision 3): a site value no site file and no address names ("Porbex
+        # Kaladra") that is, measured, one of the user's own sites (excalidraw.com) opens that site, named in the done
+        # line ("Excalidraw.com is up."); none clearly: as before (no address, the next rung or the hand-off)
+        took = measured_site(call, said)
+        if took:
+            said = took
+            url, expect = page_address(said)
     if not url:
         return None, expect, "", ""
     site = _site_title(expect, said)
     return url, expect, LINE_PAGE_UP.format(site=site), LINE_PAGE_ALREADY.format(site=site)
+
+
+def measured_site(call: RouteCall, said: str) -> str:
+    """names21 (final-D S18): the user's own site (its host, :func:`yuki.skills.names.own_site_entries`) a site value
+    with no address is a mishearing of: the value measured as a name given to the act
+    (:func:`yuki.skills.names.best_match` ``as_name``: "Porbex Kaladra" -> excalidraw.com), else the user's newest turn
+    measured whole (the stricter turn bar: a value that is the model's description, "drawing site", for "Open Porbex
+    Kaladra"; mishearings only: a site the turn names as written is the user's own word for another site, never this
+    one, so "close youtube and open my drawing site" is no youtube.com, names21 review F2); one clear winner, else
+    ``""``. Logged content-free (``names_match``: where the words came from, the name's source, the score and the
+    margin). Never raises."""
+    try:
+        from yuki.skills import names as N
+
+        entries = N.own_site_entries(_store(call.ctx))
+        sites = [e.name for e in entries]
+        if not sites:
+            return ""
+        got, how = (N.best_match(said, sites, as_name=True), "value") if said else (None, "value")
+        if got is None:
+            turns = [str(w) for w in getattr(call.ctx, "words", None) or () if str(w or "").strip()]
+            if turns:
+                got, how = N.best_match(turns[-1], sites, literal_ok=False), "turn"
+        if got is None:
+            return ""
+        name, score, margin = got
+        source = next((e.source for e in entries if e.name == name), "")
+        _log(call.ctx)("names_match", how=how, source=source, score=score, margin=margin, skill=call.skill.key)
+        return name
+    except Exception:  # noqa: BLE001 - no measure: as before
+        return ""
 
 
 def video_page(ref: Any) -> tuple[str, dict[str, Any]] | None:

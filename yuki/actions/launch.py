@@ -131,7 +131,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
@@ -242,6 +242,13 @@ def get_start_apps(*, refresh: bool = False) -> list[dict[str, str]]:
         ]
         _start_apps_cache = apps
         return apps
+
+
+def start_apps_cached() -> list[dict[str, str]] | None:
+    """names21: the Start menu list as this process last read it (:func:`get_start_apps`), or ``None`` when it was
+    never read: never a new read (the names measure, :mod:`yuki.skills.names`, must not start PowerShell)."""
+    with _start_apps_lock:
+        return list(_start_apps_cache) if _start_apps_cache is not None else None
 
 
 def _powershell_json(script: str, *, what: str, timeout_s: float = 20.0) -> list:
@@ -2795,6 +2802,97 @@ def _launch_verdict(ok: bool, details: dict) -> bool | None:
     return True
 
 
+#: names21: how a launch's summary names what a heard name was taken as, a plain fact (the model reads it and says what
+#: opened: "Opening Discord."). The user's decision 3: named, never a warning, so no doubt and no score here (the
+#: score is in ``details["names_match"]``). The first when the launch went through, the second when it didn't.
+MEASURED_OPENED_LINE = "Opened {name} (heard as {query!r}). "
+MEASURED_TAKEN_LINE = "Took {query!r} as {name}. "
+
+
+def _measured_name(query: str, apps: list[dict[str, str]], *, sites: bool) -> dict | None:
+    """names21 (final-D S18; the user's decision 3, "it should automatically understand it and work"): the user's own
+    app or site a launch's name is a mishearing of, when no Start entry goes by it (p24: "Porbex Kaladra" for their
+    site excalidraw.com, "the scored" for Discord). Measured among the user's own names and every Start entry
+    (:func:`yuki.skills.names.best_match` in name mode: one clear winner by spelling and sound, else none); a site only
+    when ``sites`` (a launch handed no arguments). ``{"kind": "app" | "site", "name", "entry" (an app's Start entry),
+    "url" and "app" (a site's front page and the program memory saw it in most), "query" (the name as given, for the
+    summary's words: :data:`MEASURED_OPENED_LINE`), "log" (content-free: kind, how, score, margin, source)}``, or
+    ``None``: as before. An app the measure names that no Start entry goes by (a program the Start menu lists under
+    another name) is ``None`` too. A path, an address or a command is no name. Never raises."""
+    text = " ".join(str(query or "").split())
+    if not text or any(ch in text for ch in "\\/:"):
+        return None
+    try:
+        from yuki.skills import names as N
+
+        own = N.own_entries(start=apps)
+        pool = [e.name for e in own if sites or e.kind == N.APP]
+        listed = set(pool)
+        pool += [n for n in N.start_names(apps) if n not in listed]
+        got = N.best_match(text, pool, as_name=True)
+        if got is None:
+            return None
+        name, score, margin = got
+        entry = next((e for e in own if e.name == name), None)
+        kind = entry.kind if entry is not None else N.APP
+        log = {"kind": kind, "how": "name", "score": score, "margin": margin,
+               "source": entry.source if entry is not None else N.START}
+        if kind == N.SITE:
+            url = N.site_url(name)
+            if not url:
+                return None
+            return {"kind": kind, "name": name, "url": url, "app": entry.app if entry is not None else "", "log": log,
+                    "query": text}
+        chosen, _candidates = _match_apps(name, apps)
+        if chosen is None:
+            return None
+        return {"kind": kind, "name": chosen["name"], "entry": chosen, "log": log, "query": text}
+    except Exception:  # noqa: BLE001 - no measure: as before
+        return None
+
+
+def _act_off(app: str) -> bool:
+    """names21: whether the user switched Act (clicking and typing) off for ``app`` (Settings, App access; the brain's
+    own policy reader). An unreadable policy never blocks. Never raises."""
+    try:
+        from yuki.brain.util import _shared_reader
+
+        return bool(_shared_reader().app_off(app))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _open_measured_site(took: dict, finish: Callable[[bool, str, dict], ActionResult], *, content_timeout_s: float,
+                        deadline: float | None) -> ActionResult:
+    """names21: a launch's name taken as one of the user's sites (:func:`_measured_name`): its front page opened in the
+    browser the user opens that site in (:func:`yuki.skills.names.site_browser`: web_route's rule, the browser its
+    visits are concentrated in; else the program memory saw its pages in most), a Start entry by that name, else the
+    default handler (:func:`open_url`: the game gate, the page check and the address bar's rescue as for any open; no
+    address typed into a browser whose Act switch is off). The result is ``finish``'s (the launch's own verdict and the
+    measure's note)."""
+    browser = ""
+    try:
+        from yuki.skills.names import site_browser
+
+        browser = site_browser(took["name"]) or str(took.get("app") or "")
+    except Exception:  # noqa: BLE001
+        browser = str(took.get("app") or "")
+    entry = None
+    if browser:
+        entry, _candidates = _match_apps(browser, get_start_apps())
+    # the launch was judged as a launch, never as typing: with the browser's Act switch off (Settings, App access) its
+    # address bar is never typed into here (the hand-off alone, as the web skill's first rung does)
+    typing_ok = entry is None or not _act_off(entry["name"])
+    opened = open_url(took["url"], app=entry["name"] if entry else None, content_timeout_s=content_timeout_s,
+                      deadline=deadline, address_bar=typing_ok)
+    details = dict(opened.details or {})
+    details.setdefault("launched", bool(opened.ok))
+    details.setdefault("hwnd", None)
+    details["candidates"] = []
+    details["site"] = took["name"]
+    return finish(bool(opened.ok), opened.summary, details)
+
+
 def launch_app(
     query: str,
     *,
@@ -2807,7 +2905,15 @@ def launch_app(
 
     Args:
         query: what the user called the app; matched against Start menu display
-            names (exact, then substring).
+            names (exact, then substring). names21 (final-D S18): a name no
+            entry goes by that is, measured by spelling and sound, clearly one
+            of the user's own apps or sites (:func:`_measured_name`: "the
+            scored" for Discord, "Porbex Kaladra" for their excalidraw.com) is
+            that one - an app launched as by its own name, a site's front page
+            opened in the browser they open it in - and the summary starts by
+            naming it as a plain fact ("Opened Discord (heard as 'the
+            scored')."; ``details["names_match"]``: kind, how, score, margin,
+            source); with no clear winner, as before.
         args: command-line arguments for the app (a URL, a file, a folder).  The
             app is resolved exactly as without them and then started so that it
             receives them - see the module docstring for how.  An app that
@@ -2879,10 +2985,16 @@ def launch_app(
         ``resolution_notes``, and ``pid`` when the start reported one.
     """
     started = time.perf_counter()
+    # names21 (S18): the user's own app or site the name given was taken as (:func:`_measured_name`), else empty
+    measured: dict = {}
 
     def finish(ok: bool, summary: str, details: dict) -> ActionResult:
         if "verified" not in details:
             details["verified"] = _launch_verdict(ok, details)
+        if measured:
+            details["names_match"] = dict(measured["log"])   # content-free: kind, how, score, margin, source
+            line = MEASURED_OPENED_LINE if ok else MEASURED_TAKEN_LINE
+            summary = line.format(name=measured["name"], query=measured["query"]) + summary
         return ActionResult(
             ok=ok,
             summary=summary,
@@ -2922,6 +3034,17 @@ def launch_app(
     apps = get_start_apps()
     mark("start_menu")
     chosen, candidates = _match_apps(query, apps)
+    if chosen is None and not candidates:
+        # names21 (final-D S18; the user's decision 3): a name no Start entry goes by ("the scored", "Porbex Kaladra")
+        # that the measure takes, clearly, for one of the user's own apps or sites is that one, opened and named in
+        # the summary; none clearly: as before (the model picks)
+        took = _measured_name(query, apps, sites=not arg_list)
+        mark("names")
+        if took is not None:
+            measured.update(took)
+            if took["kind"] == "site":
+                return _open_measured_site(took, finish, content_timeout_s=content_timeout_s, deadline=deadline)
+            chosen = took["entry"]
     if chosen is None:
         listed = ", ".join(app["name"] for app in candidates) or "none"
         return finish(
