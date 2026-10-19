@@ -76,10 +76,12 @@ needs_focus = true
 means = "browser"
 # the browser window it opened the page in shows it (by template value, or by host for a host-scope page). fSkills (live
 # 18 Oct): a window that showed the same address before counts by its selected tab's identity (another tab selected
-# now: the page opened; read before the open), and a window whose Documents can't be read (Arc) by the rungs' own
-# page-only read, so a page opened is no false contradiction (two of those disabled this rung for every site)
+# now: the page opened; read before the open). skill20 (final-D: Chrome exposed its background tabs' pages, and the
+# first Documents read as the page shown said "other page" on good opens): the window's main page is read by the
+# rungs' own page-only reader, which leaves background tabs out; its Documents only when no main page reads
 done = { probe = "driver", driver = "web_route", call = "page_shown", within_s = 6 }
-# the watcher's own read of that window (memory's Now board), a second source
+# the watcher's own read of that window (memory's Now board), a second source; skill20: only a read taken after the
+# done verdict, of that very window, with an address, counts (an older or empty read is no contradiction)
 recheck = { probe = "driver", driver = "web_route", call = "page_seen", after_s = 3 }
 
 # x8WebArc: the rung before it didn't open the page (the browser kept the page it had, or another page shows): in the
@@ -112,6 +114,8 @@ handoff = true
 # with only=; any longer words, a title or "the one about the island", go the normal way: the thinker finds it); or
 # Yuki's own pick when the user asked it to choose (choose = true). No entity kind on purpose: the taste fill never
 # guesses a video for a request that asked for none; only a request that asked Yuki to choose plays one nobody named.
+# skill20 (final-D B6): a title given with no link is matched by code to one video's own link (the uploads cached from
+# their channels' feeds, then the links of the page shown; a string measure, one clear fit only), else as before.
 [[capability."web.open_video".slot]]
 name = "video"
 type = "entity"

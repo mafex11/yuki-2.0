@@ -775,8 +775,14 @@ def judge(said: str, words: Any, items: list[dict[str, Any]], *, kind: str = "sp
     text = " ".join(str(said or "").split())
     if not names or not text:
         return Meant(None, "unknown")
-    # the same words against the same descriptions (a new pairing or play changes them, and the answer may change)
-    key = (str(kind), _norm(text), json.dumps(items, ensure_ascii=False, sort_keys=True))
+    turns = [str(w) for w in (words if isinstance(words, (list, tuple)) else [words]) if str(w or "").strip()]
+    # the same words against the same descriptions (a new pairing or play changes them, and the answer may change).
+    # skill20 (final-D P5: a late answer judged with one exchange's "No, not this one. The other playlist" was replayed
+    # 0.21 s into another exchange's "Play the Japanese playlist" and played the wrong row): the user's turns sent with
+    # the request are part of the key, so an answer is reused only for the same request (a retry, the hand-off's own
+    # run)
+    key = (str(kind), _norm(text), json.dumps(items, ensure_ascii=False, sort_keys=True),
+           json.dumps([_norm(t) for t in turns[-3:]], ensure_ascii=False))
     now_m = time.monotonic()
     with _meaning_lock:
         got = _meaning_cache.get(key)
@@ -792,7 +798,6 @@ def judge(said: str, words: Any, items: list[dict[str, Any]], *, kind: str = "sp
     except Exception:  # noqa: BLE001 - no model here: no judgement
         return Meant(None, "unknown", round((time.perf_counter() - started) * 1000.0, 1))
     things = "playlists" if kind.endswith("playlist") else (kind.rsplit("_", 1)[-1] + "s")
-    turns = [str(w) for w in (words if isinstance(words, (list, tuple)) else [words]) if str(w or "").strip()]
     tool = {"name": "pick", "description": "Which of their items the words mean (or none).",
             "input_schema": {"type": "object", "properties": {
                 "name": {"type": "string", "enum": names + [""], "description": "the item's exact name, or empty"},
@@ -1695,23 +1700,33 @@ def _channels(store: Any, now: float, skips: Mapping[str, float], only: str) -> 
 
 
 def _videos(store: Any, channels: list[_Cand], now: float, *, network: bool, log: LogFn | None,
-            budget_s: float) -> list[_Cand]:
+            budget_s: float, stats: dict[str, Any] | None = None) -> list[_Cand]:
     """The unwatched uploads of the best :data:`CHOOSE_CHANNELS` channels (their feeds read first when older than an
-    hour and ``network``), at most two per channel, scored by the channel's score and the upload's age."""
+    hour and ``network``), at most two per channel, scored by the channel's score and the upload's age. ``stats``
+    (skill20, final-D B5): filled with content-free counts of why none may be left (``channels``, the feed reads'
+    ``feed_ok`` / ``feed_failed``, ``uploads`` cached unwatched, ``seen`` of them already seen on a page)."""
     from yuki.connect.templates import fill
     from yuki.skills import youtube_feed
 
+    stats = stats if stats is not None else {}
     top_ch = channels[:CHOOSE_CHANNELS]
+    stats["channels"] = len(top_ch)
     if not top_ch:
         return []
     if network and budget_s > 0 and youtube_feed.blocked() is None:
-        youtube_feed.refresh(store, [c.key for c in top_ch], now=now, budget_s=budget_s, log=log)
+        got = youtube_feed.refresh(store, [c.key for c in top_ch], now=now, budget_s=budget_s, log=log)
+        if isinstance(got, Mapping):
+            stats["feed_ok"] = int(got.get("ok") or 0)
+            stats["feed_failed"] = int(got.get("failed") or 0)
     by = {c.key: c for c in top_ch}
     try:
         vids = store.yt_videos(channel_keys=list(by), unwatched=True)
         seen = store.page_entity_keys_seen([v["video_key"] for v in vids])
     except Exception:  # noqa: BLE001
+        stats["error"] = True
         return []
+    stats["uploads"] = len(vids)
+    stats["seen"] = sum(1 for v in vids if str(v.get("video_key")) in seen)
     per: dict[str, int] = {}
     out: list[_Cand] = []
     for v in vids:      # newest first
@@ -1907,7 +1922,8 @@ def choose(store: Any, kind: str, *, words: Any = (), context: str = "", session
     that is none of theirs ("something chill" given as the video) is their words for the judgement and the pick is free
     (review M1), else None. ``source`` :data:`FROM_CARD` (asked, a name they never said): ``only`` is the talker's or
     the planner's own pick, the card's pick for now (:func:`now_picks`): the same upload or playlist, a guess (never
-    ``named``); one that is none of theirs is their words for the judgement, as above. A pick kept from
+    ``named``); one that is none of theirs is their words for the judgement, as above, and (skill20) one of theirs
+    with nothing playable widens the pick to their other candidates (it joins the judgement's words). A pick kept from
     a held request (:func:`keep_for_later`) comes first. None when there is nothing to pick. Nothing plays here; the
     only thing noted is a ``skipped`` event (once per pick) when this asks again within :data:`SKIP_S` of the last pick
     (:func:`chosen` notes the pick, once it played). Content-free logs; never raises."""
@@ -1939,19 +1955,35 @@ def choose(store: Any, kind: str, *, words: Any = (), context: str = "", session
                 context = " ".join(f"{context or ''} {only}".split())
             only = ""
             cands = every if every is not None else _channels(store, now, skips, "")
+        base_n = len(cands)          # the channels or playlists the pick is made among
+        stats: dict[str, Any] = {}
+        budget = CHOOSE_FEED_S if feed_budget_s is None else float(feed_budget_s)
         if kind == "video":
-            budget = CHOOSE_FEED_S if feed_budget_s is None else float(feed_budget_s)
-            cands = _videos(store, cands, now, network=network, log=log, budget_s=budget)
+            cands = _videos(store, cands, now, network=network, log=log, budget_s=budget, stats=stats)
         given = set(state.get("keys") or [])
-        left = [c for c in cands if c.key not in given]
-        if not left and cands and given:
-            # every candidate was put on already: around again, never the one playing now
-            left = [c for c in cands if not last or c.key != last[0]]
-        # "another one": another channel or playlist before a second of one already put on in this conversation
-        groups = set(state.get("groups") or [])
-        left = [c for c in left if c.group not in groups] + [c for c in left if c.group in groups]
+        left = _left_of(cands, given, last, state)
+        widened = None
+        if not left and only and asked and source == FROM_CARD:
+            # skill20 (final-D B5: "Just sat down to eat" -> the agent's own {video: "<a channel>", choose: true};
+            # that channel had no unwatched upload cached, n=0, and the run ended no_route): the user asked Yuki to
+            # choose and never named that channel (the caller's pick, FROM_CARD), so it is a hint, not a limit: the
+            # pick widens to their other candidates (the hint joins the judgement's words), said as Yuki's own pick.
+            # A channel or playlist the user named themselves stays the limit (None: the normal way finds one)
+            widened = _empty_why(kind, base_n, stats, given)
+            if _norm(only) not in _norm(context):
+                context = " ".join(f"{context or ''} {only}".split())
+            only = ""
+            cands = every if every is not None else _channels(store, now, skips, "")
+            base_n = len(cands)
+            if kind == "video":
+                stats = {}
+                spent = time.perf_counter() - started
+                cands = _videos(store, cands, now, network=network, log=log, budget_s=max(0.0, budget - spent),
+                                stats=stats)
+            left = _left_of(cands, given, last, state)
         if not left:
-            _log_choose(log, kind, n=0, started=started)
+            # skill20 (final-D B5): why nothing is left, as a code word (never a name)
+            _log_choose(log, kind, n=0, started=started, why=_empty_why(kind, base_n, stats, given), widened=widened)
             return None
         # the pick named for later when a game or a call held it (:func:`keep_for_later`): first, as said (the
         # judgement still weighs new words against it: "go on then" keeps it, "something chill" may not)
@@ -1976,11 +2008,43 @@ def choose(store: Any, kind: str, *, words: Any = (), context: str = "", session
                         round((time.perf_counter() - started) * 1000.0, 1), bool(only) and not card,
                         FROM_CARD if card else "")
         _log_choose(log, kind, n=len(left), started=started, judged=judged, moved=moved, fresh_d=best.fresh_d,
-                    skips=len(skips), again=len(given), kept=bool(kept) or None, card=card or None)
+                    skips=len(skips), again=len(given), kept=bool(kept) or None, card=card or None,
+                    widened=widened)
         return choice
     except Exception as exc:  # noqa: BLE001 - no pick: the request goes the normal way
         _log_choose(log, kind, n=0, started=started, error=type(exc).__name__)
         return None
+
+
+def _left_of(cands: list[_Cand], given: set[str], last: Any, state: Mapping[str, Any]) -> list[_Cand]:
+    """The candidates not yet put on in this conversation ("another one", "not that": the next), another channel or
+    playlist before a second of one already put on; every one put on already: around again, never the one playing."""
+    left = [c for c in cands if c.key not in given]
+    if not left and cands and given:
+        left = [c for c in cands if not last or c.key != last[0]]
+    groups = set(state.get("groups") or [])
+    return [c for c in left if c.group not in groups] + [c for c in left if c.group in groups]
+
+
+def _empty_why(kind: str, base_n: int, stats: Mapping[str, Any], given: set[str]) -> str:
+    """skill20 (final-D B5): why a pick found nothing, as one code word for the content-free log: ``no_candidates``
+    (no channel or playlist of theirs to pick among), ``read_failed`` (the cached uploads couldn't be read),
+    ``feed_failed`` (no upload cached, and this request's feed reads all failed), ``no_uploads`` (no unwatched upload
+    cached), ``all_seen`` (every one already seen on a page), ``no_playable`` (none with an id and a past publish
+    time), ``all_given`` (every candidate already put on in this conversation)."""
+    if base_n <= 0:
+        return "no_candidates"
+    if kind != "video":
+        return "all_given" if given else "no_candidates"
+    if stats.get("error"):
+        return "read_failed"
+    uploads, seen = int(stats.get("uploads") or 0), int(stats.get("seen") or 0)
+    if uploads <= 0:
+        failed, ok = int(stats.get("feed_failed") or 0), int(stats.get("feed_ok") or 0)
+        return "feed_failed" if failed and not ok else "no_uploads"
+    if seen >= uploads:
+        return "all_seen"
+    return "all_given" if given else "no_playable"
 
 
 def keep_for_later(choice: Choice, *, session: str | None = None, now: float | None = None) -> None:
