@@ -111,7 +111,11 @@ REFUSED_BY_STEPS: dict[str, str] = {"unknown_skill": "no skill has that key", "s
 REPEAT_HANDOFF_S = 120.0
 #: The check's own code word for a result that took but somewhere else (Spotify started it on another device): said
 #: plainly as the driver words it, never handed to the thinker to "finish" (it would press play again: a pause).
-SETTLED_REASONS: tuple[str, ...] = ("other_device",)
+SETTLED_REASONS: tuple[str, ...] = ("other_device", "row_stale")
+#: skill19 (live 19 Oct RC1): ``row_stale`` is Spotify's check after a press on a window that isn't drawing: the
+#: session plays now (it did not before the press) with sound here, and only the row's label never redrew. Said plainly
+#: as "couldn't confirm it's that one", never handed to the thinker (it would raise the window to read the row) and
+#: never followed by a second rung (a second press would pause it).
 #: The origins whose unconfirmed or dropped runs go to rung C: the talker and the thinker. A card never starts an agent
 #: run (``yuki.ui.nudges``: a hand-off there is dropped) and an eval measures the skill itself.
 HANDOFF_ORIGINS: tuple[str, ...] = ("voice", "thinker")

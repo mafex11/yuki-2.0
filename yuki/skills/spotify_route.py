@@ -105,6 +105,9 @@ LINE_OTHER_VOLUME = "Spotify is playing on another device, so I left its volume.
 LINE_OTHER_AFTER = ("Spotify took it, but there's no sound from Spotify on this PC: it's playing on another device. "
                     "Say pause to stop it.")
 LINE_PLAY_UNCONFIRMED = "I pressed play on it, but I couldn't confirm it's playing."
+#: skill19 (RC1): the press took (the session plays now, with sound here) but the window, minimised or covered, never
+#: redrew its row, so which playlist plays is unread.
+LINE_PLAY_STALE = "Spotify's playing now, but its window didn't update, so I couldn't confirm it's {name}."
 LINE_ALREADY_UNCONFIRMED = "Spotify shows it as already playing, but I couldn't confirm that, so I left it."
 LINE_VOLUME_UNCONFIRMED = "I moved it, but I couldn't confirm the new level."
 LINE_KEYS_SHORT = "I moved Spotify's volume to {now:g}%, but ran out of time before {target:g}%."
@@ -2292,6 +2295,9 @@ def probe_playing_here(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, 
         # contradiction (the stale-label rule :func:`_confirm_flip` applies at the press). Which playlist plays is
         # unknown, so never True either: "couldn't confirm", which never counts against the rung
         ev["reason"] = "row_stale"
+        # settled by the engine (``engine.SETTLED_REASONS``): said plainly, never handed to the thinker to look (it would
+        # bring the window up to read a row the press already took) and never a second rung (a second press pauses it)
+        _set_line(ctx, LINE_PLAY_STALE.format(name=look.name or str(args.get("name") or "it")))
         return None, ev
     if look.status == "ok" and (look.state == "play" or status in ("paused", "stopped")):
         return False, ev
