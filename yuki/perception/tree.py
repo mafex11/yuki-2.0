@@ -5973,7 +5973,8 @@ def format_window_tree(tree: WindowTree, *, within: int | None = None,
     window read, not a ``within`` one) ``page element [<id>], listed first``: that
     page's Document and everything below it are listed before the rest of the
     window (its toolbar, tab strip, bookmarks), so a reader cut from the head gets
-    the page; then the window, the element count,
+    the page (``page element [<id>]`` alone when there was nothing to reorder:
+    nothing of the page listed, or nothing else); then the window, the element count,
     how long the read took, and - when there are any - how the tree was built,
     its status, that it is partial, what was left off screen, and the note.
 
@@ -6032,8 +6033,15 @@ def format_window_tree(tree: WindowTree, *, within: int | None = None,
     # toolbar, extensions and bookmarks came first and filled a 3000-character look), and can read it whole by that id
     page_first = within is None and page is not None and page.element_id >= 0 and any(
         element.id == page.element_id for element in tree.elements)
-    if page_first:
-        facts.append(f"page element [{page.element_id}], listed first")
+    listed = _drop_redundant(
+        [element for element in tree.elements if _listed(element)], tree.elements
+    )
+    # desk20 review 4: ", listed first" only when the reorder happened (a page with nothing of it listed, or nothing
+    # else listed, keeps tree order); the id is named either way
+    reordered = (_ordered_page_first(listed, tree.elements, page.element_id)
+                 if page_first and page is not None else None)
+    if page_first and page is not None:
+        facts.append(f"page element [{page.element_id}]" + (", listed first" if reordered is not None else ""))
     # The window's own tabs, counted: tab controls inside a page (a site's
     # "Browse | Chat" switch) are not among them, and a long list is easy to miscount.
     by_id = {element.id: element for element in tree.elements}
@@ -6070,9 +6078,6 @@ def format_window_tree(tree: WindowTree, *, within: int | None = None,
         facts.append(f"note: {note}")
     lines = [" | ".join(facts)]
 
-    listed = _drop_redundant(
-        [element for element in tree.elements if _listed(element)], tree.elements
-    )
     if budget is None:
         budget = FORMAT_WITHIN_BUDGET_CHARS if within is not None else FORMAT_BUDGET_CHARS
     if within is not None:
@@ -6081,9 +6086,7 @@ def format_window_tree(tree: WindowTree, *, within: int | None = None,
             return lines[0] + f"\n(this read has no element [{within}]; read the whole window)"
         listed = [element for element in listed if element.id in part]
         lines[0] += f" | only [{within}] and what is below it"
-    reordered = (_ordered_page_first(listed, tree.elements, page.element_id)
-                 if page_first and page is not None else None)
-    if reordered is not None:
+    if reordered is not None:   # only for a whole-window read (``page_first``: no ``within``), computed above
         listed, parents = reordered
     else:
         parents = _parents(listed, tree.elements)

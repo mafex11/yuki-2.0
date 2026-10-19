@@ -20,6 +20,11 @@ with no single close control then goes by the browser's own close-tab key, from 
 Document: the strip walk never enters one, and the tab's own ancestors are checked again before any key), the Act
 switch and the game gate are asked first, the tab is selected and seen selected, the window is brought to the front
 and seen there, the key is sent to that window only, and the strip is read again to see the tab gone.
+
+desk20 review: the close key closes every selected tab (a browser's strip is multiselectable), so right before the key
+the tab must be the one and only selected TabItem of the whole strip, read whole (:func:`_only_selected`; a user's
+multi-selection is collapsed to it by its Select first, and no key goes otherwise). After any close, the tab counts as
+gone only from a re-read that found the strip and could tell (:func:`_gone`): a read cut short is never "closed".
 """
 
 from __future__ import annotations
@@ -291,6 +296,59 @@ def _rows(found: list[tuple[Any, Any]]) -> list[dict[str, Any]]:
             for t, _e in found]
 
 
+def _mates(before: list[dict[str, Any]], tab_id: str) -> set[str]:
+    """The ids of the other tabs of ``tab_id``'s own group in the read before the close (``_rows``); empty when unknown."""
+    row = next((r for r in before or () if r.get("id") == tab_id), None)
+    if row is None:
+        return set()
+    return {str(r["id"]) for r in before if r.get("id") and r["id"] != tab_id and r.get("group") == row.get("group")}
+
+
+def _gone(now: list[tuple[Any, Any]], diag: dict[str, Any], whole: bool, tab_id: str, mates: set[str]) -> bool:
+    """desk20 review 2: whether one re-read of the strip shows the tab gone. Only a read that found the strip
+    (``reason`` None) and lacks the id counts, and only when it was read whole, or when every other tab of the tab's own
+    group is in it (a group's tabs are read in one piece, so the tab would be there too). A read cut short, one that
+    found no strip, or a window that can't be read never counts as gone. Pure."""
+    if diag.get("reason") is not None:
+        return False
+    ids = {t.tab_id for t, _e in now if t.tab_id}
+    if tab_id in ids:
+        return False
+    return bool(whole) or (bool(mates) and mates <= ids)
+
+
+def _watch_gone(automation: Any, hwnd: int, tab_id: str, mates: set[str], out: dict[str, Any]) -> None:
+    """desk20 review 2: watch ``hwnd``'s strip for the tab leaving it (re-reads, a condition poll of
+    :data:`CLOSE_WATCH_S`), then read it once more for what is there now. ``out`` gets ``seen`` (a read that counts,
+    :func:`_gone`, lacks it, and the last read does not hold it), ``read_back`` (some read told: it held the tab, or
+    counts as gone), ``after`` and ``after_complete``. Blocking; never raises for a window that went away."""
+    from yuki.perception.tabs import walk_tabs
+
+    def holds(now: list[tuple[Any, Any]]) -> bool:
+        return any(t.tab_id == tab_id for t, _e in now)
+
+    seen = read_back = False
+    deadline = time.monotonic() + CLOSE_WATCH_S
+    while time.monotonic() < deadline:
+        diag: dict[str, Any] = {}
+        now, _n, whole = walk_tabs(automation, int(hwnd), time.monotonic() + 0.3, all_groups=True, diagnostics=diag)
+        if diag.get("reason") == "error":
+            break   # the window can't be read (gone): not seen, said as it is
+        if _gone(now, diag, whole, tab_id, mates):
+            seen = read_back = True
+            break
+        read_back = read_back or holds(now)
+        time.sleep(POLL_S)
+    diag = {}
+    later, _n, whole = walk_tabs(automation, int(hwnd), time.monotonic() + ACTION_BUDGET_S * 0.2, all_groups=True,
+                                 diagnostics=diag)
+    if holds(later):
+        seen, read_back = False, True   # the last read holds it: it is still there, whatever an earlier read showed
+    elif not seen and _gone(later, diag, whole, tab_id, mates):
+        seen = read_back = True
+    out.update(seen=seen, read_back=read_back, after=_rows(later), after_complete=bool(whole))
+
+
 # ---------------------------------------------------------------------------
 # desk20 (final-D S9): the keyboard rung of a tab close
 # ---------------------------------------------------------------------------
@@ -364,20 +422,35 @@ def _inside_document(automation: Any, element: Any) -> bool:
         return True
 
 
-def _find(automation: Any, hwnd: int, tab_id: str, budget_s: float) -> tuple[Any, Any, list[tuple[Any, Any]]]:
-    """``(tab, element, every tab found)`` for the tab whose RuntimeId is ``tab_id`` in ``hwnd``'s strip (every group;
-    the walk never enters a Document); ``(None, None, found)`` when it is not there."""
+def _find(automation: Any, hwnd: int, tab_id: str,
+          budget_s: float) -> tuple[Any, Any, list[tuple[Any, Any]], bool]:
+    """``(tab, element, every tab found, read whole)`` for the tab whose RuntimeId is ``tab_id`` in ``hwnd``'s strip
+    (every group; the walk never enters a Document); ``(None, None, found, whole)`` when it is not there."""
     from yuki.perception.tabs import walk_tabs
 
-    found, _nodes, _complete = walk_tabs(automation, int(hwnd), time.monotonic() + budget_s, all_groups=True)
+    found, _nodes, complete = walk_tabs(automation, int(hwnd), time.monotonic() + budget_s, all_groups=True)
     match = next(((t, e) for t, e in found if t.tab_id and t.tab_id == tab_id), None)
-    return (match[0], match[1], found) if match else (None, None, found)
+    return (match[0], match[1], found, bool(complete)) if match else (None, None, found, bool(complete))
+
+
+def _only_selected(found: list[tuple[Any, Any]], tab_id: str, whole: bool) -> str:
+    """desk20 review 1: ``""`` when the tab ``tab_id`` is the one and only selected TabItem of a strip read whole
+    (every group), else why not: ``several_selected``, ``not_selected`` or ``not_read`` (a read cut short may miss a
+    group's selected tab). The close key closes every selected tab (a browser's strip is multiselectable: a tab the user
+    highlighted reports itself selected too), and with a selected tab in another group the key would close the active
+    one, not this one. Pure."""
+    picked = [t for t, _e in found if t.selected]
+    if len(picked) > 1:
+        return "several_selected"
+    if not picked or picked[0].tab_id != tab_id:
+        return "not_selected"
+    return "" if whole else "not_read"
 
 
 def _close_by_keys(hwnd: int, tab_id: str, keys: tuple[str, ...]) -> dict[str, Any]:
     """The keyboard rung (module docstring), blocking: ``{"how", "sent", "why", "refused", "focus_ms", ...}``. Every
-    check comes before the key; the key goes only to ``hwnd`` in front with that tab selected. The caller watches the
-    strip afterwards."""
+    check comes before the key; the key goes only to ``hwnd`` in front with that tab its strip's only selected tab
+    (review 1). The caller watches the strip afterwards."""
     from yuki.actions import gate as _gate
     from yuki.actions.input import _Pending, _user32, hotkey
     from yuki.actions.launch import focus_window, web_app
@@ -402,31 +475,32 @@ def _close_by_keys(hwnd: int, tab_id: str, keys: tuple[str, ...]) -> dict[str, A
         return out
 
     def select(automation: Any, shared: dict) -> None:
-        tab, element, _found = _find(automation, hwnd, tab_id, KEYS_SELECT_S * 0.5)
+        begun = time.monotonic()
+        tab, element, found, whole = _find(automation, hwnd, tab_id, KEYS_SELECT_S * 0.4)
         if tab is None:
             shared["why"] = "gone"
             return
         if _inside_document(automation, element):
             shared["why"] = "in_page"   # a page's own tab widget: never a key
             return
-        if not tab.selected:
+        state = _only_selected(found, tab_id, whole)
+        if state:
+            # review 1: not selected, or other tabs selected with it (a multi-selection the key would close too), or
+            # not read whole: its Select (UIA's SelectionItem.Select deselects the rest) makes it the only selected
+            # tab, seen on re-reads of the whole strip
             shared["select"] = _select(element, _uia_core())
-            deadline = time.monotonic() + WATCH_S
+            deadline = min(time.monotonic() + WATCH_S, begun + KEYS_SELECT_S - 0.4)
             while shared["select"] and time.monotonic() < deadline:
-                try:
-                    if bool(element.GetCurrentPropertyValue(_P_SELECTION_ITEM_IS_SELECTED)):
-                        break
-                except Exception:  # noqa: BLE001
-                    break
                 time.sleep(POLL_S)
-        try:
-            shared["selected"] = bool(element.GetCurrentPropertyValue(_P_SELECTION_ITEM_IS_SELECTED))
-        except Exception:  # noqa: BLE001
-            shared["selected"] = False
+                again, _e, now, whole = _find(automation, hwnd, tab_id, 0.3)
+                state = _only_selected(now, tab_id, whole) if again is not None else "gone"
+                if state in ("", "gone"):
+                    break
+        shared["state"] = state
 
     picked = _Pending(select, "yuki-tab-keys", KEYS_SELECT_S).wait()
-    if picked.get("why") or not picked.get("selected"):
-        out["why"] = picked.get("why") or "not_selected"
+    if picked.get("why") or picked.get("state") != "":
+        out["why"] = picked.get("why") or picked.get("state") or "not_selected"
         return out
     started = time.monotonic()
     if int(_user32.GetForegroundWindow() or 0) != int(hwnd):
@@ -438,18 +512,26 @@ def _close_by_keys(hwnd: int, tab_id: str, keys: tuple[str, ...]) -> dict[str, A
     out["focus_ms"] = round((time.monotonic() - started) * 1000)
 
     def check(automation: Any, shared: dict) -> None:
-        tab, element, _found = _find(automation, hwnd, tab_id, KEYS_CHECK_S * 0.6)
-        if tab is None or _inside_document(automation, element):
-            shared["ok"] = False
+        tab, element, found, whole = _find(automation, hwnd, tab_id, KEYS_CHECK_S * 0.6)
+        if tab is None:
+            shared["why"] = "gone"
             return
-        try:
-            shared["ok"] = bool(element.GetCurrentPropertyValue(_P_SELECTION_ITEM_IS_SELECTED))
-        except Exception:  # noqa: BLE001
-            shared["ok"] = False
+        if _inside_document(automation, element):
+            shared["why"] = "in_page"
+            return
+        # review 1: the one and only selected tab of the whole strip (every group), so the key closes this tab alone
+        why = _only_selected(found, tab_id, whole)
+        if not why:
+            try:
+                why = "" if bool(element.GetCurrentPropertyValue(_P_SELECTION_ITEM_IS_SELECTED)) else "not_selected"
+            except Exception:  # noqa: BLE001
+                why = "not_selected"
+        shared["why"], shared["ok"] = why, not why
 
-    # right before the key: the tab is still the selected one, and its window is the one in front
-    if not _Pending(check, "yuki-tab-keys-check", KEYS_CHECK_S).wait().get("ok"):
-        out["why"] = "not_selected"
+    # right before the key: the tab is still the only selected one, and its window is the one in front
+    checked = _Pending(check, "yuki-tab-keys-check", KEYS_CHECK_S).wait()
+    if not checked.get("ok"):
+        out["why"] = checked.get("why") or "not_selected"
         return out
     if int(_user32.GetForegroundWindow() or 0) != int(hwnd):
         out["why"] = "not_front"
@@ -530,13 +612,9 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
                 shared["no_control"] = True
             elif _invoke(control, module):
                 shared["how"] = "its close control"
-                deadline = time.monotonic() + CLOSE_WATCH_S
-                while time.monotonic() < deadline:
-                    now, _n, _c = walk_tabs(automation, int(hwnd), time.monotonic() + 0.3, all_groups=True)
-                    if not any(t.tab_id == tab_id for t, _e in now):
-                        shared["seen"] = True
-                        break
-                    time.sleep(POLL_S)
+                # review 2: gone only by a read that counts (:func:`_gone`), and the last read must not hold it
+                _watch_gone(automation, int(hwnd), tab_id, _mates(shared["before"], tab_id), shared)
+                return
         after, _n, complete = walk_tabs(automation, int(hwnd), time.monotonic() + ACTION_BUDGET_S * 0.2,
                                         all_groups=True)
         shared["after"], shared["after_complete"] = _rows(after), complete
@@ -557,33 +635,25 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
         if rung.get("sent"):
             shared["no_control"], shared["how"] = False, rung["how"]
 
-            def watch(automation: Any, out: dict) -> None:
-                deadline = time.monotonic() + CLOSE_WATCH_S
-                while time.monotonic() < deadline:
-                    diag: dict[str, Any] = {}
-                    now, _n, _c = walk_tabs(automation, int(hwnd), time.monotonic() + 0.3, all_groups=True,
-                                            diagnostics=diag)
-                    if diag.get("reason") == "error":
-                        break   # the window can't be read (gone): not seen, said as it is
-                    if not any(t.tab_id == tab_id for t, _e in now):
-                        out["seen"] = True
-                        break
-                    time.sleep(POLL_S)
-                later, _n, complete = walk_tabs(automation, int(hwnd), time.monotonic() + ACTION_BUDGET_S * 0.2,
-                                                all_groups=True, diagnostics={})
-                out["after"], out["after_complete"] = _rows(later), complete
+            mates = _mates(shared.get("before") or [], tab_id)
 
-            seen = _Pending(watch, "yuki-tab-keys-watch", CLOSE_WATCH_S + ACTION_BUDGET_S * 0.25).wait()
-            shared["seen"] = bool(seen.get("seen"))
+            def watch(automation: Any, out: dict) -> None:
+                # review 2: a re-read cut short (Chrome busy, e.g. with a "Leave site?" prompt up) is never "gone"
+                _watch_gone(automation, int(hwnd), tab_id, mates, out)
+
+            seen = _Pending(watch, "yuki-tab-keys-watch", CLOSE_WATCH_S + ACTION_BUDGET_S * 0.3).wait()
+            shared["seen"], shared["read_back"] = bool(seen.get("seen")), bool(seen.get("read_back"))
             if "after" in seen:
                 shared["after"], shared["after_complete"] = seen["after"], seen.get("after_complete", True)
+            else:
+                shared["after"], shared["after_complete"] = [], False   # no read after the key: never the old one
         else:
             shared["keys_why"], shared["keys_said"] = rung.get("why"), rung.get("said")
     tab = shared.get("tab") or {}
     after = list(shared.get("after") or [])
     details.update({"count": shared.get("count"), "nodes": shared.get("nodes"), "tab": tab or None,
                     "how": shared.get("how"), "verified": bool(shared.get("seen")), "tabs_after": after,
-                    "tabs_after_complete": bool(shared.get("after_complete", True))})
+                    "tabs_after_complete": bool(shared.get("after_complete", "after" in shared))})
     if shared.get("error"):
         return finish(False, f"could not read the tabs of window {hwnd}: {shared['error']}")
     if pending.timed_out and not tab:
@@ -614,14 +684,26 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
         return finish(False, f"{where} has no single close control of its own; nothing was closed")
     if not shared.get("how"):
         return finish(False, f"{where}: its close control did not accept the request; nothing was closed")
+    whole = bool(shared.get("after_complete")) and bool(after)
+    # review 2: tabs counted as gone only from a strip read whole (a read cut short lists fewer than there are)
+    ids_after = {a.get("id") for a in after}
+    lost = [r for r in shared.get("before") or ()
+            if r.get("id") and r["id"] != tab_id and r["id"] not in ids_after] if whole else []
+    if lost:
+        details["closed_other"] = len(lost)
+    details["read_back"] = bool(shared.get("read_back"))
     if not shared.get("seen"):
-        lost = [r for r in shared.get("before") or () if r.get("id") and r["id"] not in {a.get("id") for a in after}]
-        if lost:
-            details["closed_other"] = len(lost)
+        if not shared.get("read_back"):
+            return finish(False, f"asked {where} to close ({shared.get('how')}), but its strip could not be read again "
+                                 f"in {CLOSE_WATCH_S:g} s to see it gone, so it is not known to be closed")
         return finish(False, f"asked {where} to close ({shared.get('how')}), but it is still in the strip after "
                              f"{CLOSE_WATCH_S:g} s" + (f"; {len(lost)} other tab(s) left the strip meanwhile"
                                                        if lost else ""))
-    return finish(True, f"closed {where} ({shared.get('how')}); the strip, read again, has {len(after)} tabs")
+    if not whole:
+        return finish(True, f"closed {where} ({shared.get('how')}); seen gone from the strip (the last read of it was "
+                            f"cut short)")
+    return finish(True, f"closed {where} ({shared.get('how')}); the strip, read again, has {len(after)} tabs"
+                        + (f"; {len(lost)} other tab(s) left the strip with it" if lost else ""))
 
 
 #: Why the keyboard rung sent no key, in words for the report (codes from :func:`_close_by_keys`).
@@ -634,6 +716,8 @@ _KEYS_WHY: dict[str, str] = {
     "blocked": "something on the PC stopped it",
     "in_page": "that tab is a web page's own widget, not the browser's tab",
     "not_selected": "the tab could not be made the selected one",
+    "several_selected": "more than one tab is selected, and the close key would close them all",
+    "not_read": "the tab strip could not be read whole right before the key",
     "focus": "its window could not be brought to the front",
     "not_front": "its window was not in front right before the key",
     "key": "the key was refused",

@@ -139,10 +139,12 @@ _TITLE_WAIT_S = 6.0
 #: desk20 (final-D S21, browser B4: deji_arc took 18.5 s through this hand, launch 3.7 s + a 6.1 s title wait Arc's
 #: strip can never end): the open_url hand's launch answers by this deadline (s), as the web skill's rungs answer by
 #: theirs; the title wait then gets what is left of it, at least _TITLE_FLOOR_S, at most _TITLE_WAIT_S. A browser with no
-#: tab strip is read by its main page, each read within _MAIN_PAGE_READ_S.
+#: tab strip is read by its main page, each read within _MAIN_PAGE_READ_S. Review 5: whether there is no strip at all
+#: needs a strip read that finished, so that read gets _NO_STRIP_READ_S (a quick strip answers sooner).
 _OPEN_URL_S = 15.0
 _TITLE_FLOOR_S = 2.0
 _MAIN_PAGE_READ_S = 0.8
+_NO_STRIP_READ_S = 0.8
 #: The foreground window's tabs are read within this when the summary needs them now.
 _TABS_BUDGET_S = 0.15
 #: A tab strip read ahead (when the user starts talking) serves a summary for this long, while the
@@ -6608,12 +6610,13 @@ class Hands:
 
     def _no_strip(self, hwnd: Any) -> bool:
         """desk20 (S21): whether ``hwnd``'s strip was read and holds no tab at all (a browser that draws none: Arc), as
-        opposed to a strip that could not be read or has no tab selected yet. Never raises (``False``)."""
+        opposed to a strip that could not be read or has no tab selected yet. Never raises (``False``). Review 5: the
+        read gets :data:`_NO_STRIP_READ_S`, so a slow walk still finishes and can tell (a read cut short never does)."""
         read = getattr(self.backend, "read_tabs", None)
         if not callable(read) or not hwnd:
             return False
         try:
-            strip = read(int(hwnd), budget_s=0.3)
+            strip = read(int(hwnd), budget_s=_NO_STRIP_READ_S)
         except Exception:  # noqa: BLE001
             return False
         return (not getattr(strip, "tabs", None) and not getattr(strip, "error", None)
