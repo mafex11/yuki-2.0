@@ -2580,7 +2580,8 @@ class Island(QObject):
     def set_frame(self, request_id: int, frame: dict[str, Any]) -> None:
         """The person the model's own call named (``yuki.ui.runtime.named_view``) and their usual route from memory:
         that call's step's "from memory" chip ("you message Sam on WhatsApp, 78 times"). The frame comes right after
-        the call's ``tool_called``, so the chip goes on the latest step shown (the first when none shows yet). Keyword
+        the call's ``tool_called`` (or, for an ``about`` call, its ``tool_finished``), so the chip goes on the latest
+        step shown (the first when none shows yet). Keyword
         audit D1 (20 Oct): never the thinking line, and never before the model named the person (the review F4 line
         that showed a name memory found in the request's words before any plan is gone)."""
         run = self.inputs.run

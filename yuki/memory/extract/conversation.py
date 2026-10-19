@@ -11,10 +11,11 @@ say, or no longer matches, is found from structure:
   preview times is not mistaken for the conversation);
 * **rows**: the list's items (single-child wrappers looked through);
 * **day separators**: the app's own separator elements when its profile
-  names them; else rows whose whole text is a day label alone ("Today",
-  "Saturday", "31 August"; never a message that only mentions a day) at a
-  place a history allows (a later day than the separator above, not after
-  the capture's day) - they set the day for the rows below them;
+  names them and they match in this capture; else rows whose whole text is
+  a day label alone ("Today", "Saturday", "31 August"; never a message that
+  only mentions a day) at a place a history allows (a later day than the
+  separator above, not after the capture's day) - they set the day for the
+  rows below them;
 * **time**: the row's first element whose text (or description) is a time
   label and nothing else;
 * **sender**: the row's first short text before the body that is a link,
@@ -394,9 +395,10 @@ def extract_conversation(
     #: The day the separator above names (rows of a history below it are not from an earlier day).
     day_at: _dt.date | None = None
     # Keyword audit D2 (20 Oct 2026): a row is a day separator by the capture's structure, never by a day word
-    # standing in it. An app whose profile names its separator elements has those as its only separators; another
-    # list's row is one only when its whole text is a day label alone and its place fits (:func:`_separator_day`).
-    marked = bool(profile and profile.day_separator)
+    # standing in it. When the profile's separator elements are in this capture, they are its only separators;
+    # otherwise (no anchors, or stale ones that match nothing here, as stale sender anchors are read above) a row is
+    # one only when its whole text is a day label alone and its place fits (:func:`_separator_day`).
+    marked = bool(separators)
     last_sender: str | None = None
     last_me = False
     last_parent: Node | None = None
