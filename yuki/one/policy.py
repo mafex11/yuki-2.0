@@ -120,6 +120,11 @@ ONE_LINES: dict[str, str] = {
 TIDY_STEPS = 2
 #: A window Yuki typed into counts as holding its unsent text this long (``voice.hands.Hands.TYPED_WAIT_S``).
 TYPED_WAIT_S = 600.0
+#: One22 review L1: the acting steps of earlier turns carried for a told way ("remember how I do this") this long
+#: after they ran (the talker hands' correction window, ``skills.prefs.CORRECTION_S``)...
+STEPS_KEEP_S = 600.0
+#: ...and at most this many (newest kept): a way is a few clicks, a typing and its keys.
+STEPS_KEEP = 40
 #: Key names that submit (a fixed key vocabulary, never words).
 ENTER_KEYS = frozenset({"enter", "return"})
 #: One20 (final-D one-core §2b): the key that dismisses what an act of the turn opened (a fixed key vocabulary).
@@ -363,8 +368,9 @@ class Turn:
         self.skills_given: dict[str, tuple[dict[str, Any], float]] = {}
         self.skills_given_before: dict[str, tuple[dict[str, Any], float]] = {}
         #: one22 (A13, contract C13): the acting steps this turn's calls ran, in order (content-free but for the
-        #: controls' own role and name; never typed text), and the turn before's: "remember how I do this" keeps a way
-        #: from them (``Runner._keep_way``).
+        #: controls' own role and name; never typed text), and the turns' before it (review L1: carried across turns
+        #: for :data:`STEPS_KEEP_S`, at most :data:`STEPS_KEEP`): "remember how I do this" keeps a way from them
+        #: (``Runner._keep_way``).
         self.steps: list[dict[str, Any]] = []
         self.steps_before: list[dict[str, Any]] = []
         #: one22 (A21): the agent's own typing the gate allowed, not marked as Yuki's unsent text until it landed
@@ -459,7 +465,11 @@ class Turn:
                 done = dict(getattr(previous, "skills_done", {}) or {})
                 given = dict(getattr(previous, "skills_given", {}) or {})
                 guessed = set(getattr(previous, "guesses_asked", set()) or set())
-                steps = list(getattr(previous, "steps", []) or [])
+                # one22 review L1: the steps of the turns before it too (a way shown over several turns), while fresh
+                steps = [*(getattr(previous, "steps_before", []) or []), *(getattr(previous, "steps", []) or [])]
+            now = time.time()
+            steps = [s for s in steps if not (isinstance(s, Mapping) and isinstance(s.get("at"), (int, float))
+                                              and now - float(s["at"]) > STEPS_KEEP_S)][-STEPS_KEEP:]
             with self._lock:
                 for k, v in fresh.items():
                     if k not in self.asks:
