@@ -257,6 +257,14 @@ class Tidy:
     attention: set[int] = field(default_factory=set)
     acts: int = 0
     asked_yes: bool = False
+    #: Final-B (one-desk D3/F6): the flagged act's own desk read before it and its scope (``acted``, ``touched``, the
+    #: app whose mixer row was read), so a reply code would settle while this is still open with no tidy step taken
+    #: is measured once against it (``Runner.tidy_debt``); ``given``: that measure was made (never twice a turn).
+    before: Any = None
+    acted: Any = None
+    touched: Any = None
+    sound_app: str = ""
+    given: bool = False
 
 
 class Turn:
@@ -401,11 +409,14 @@ class Turn:
 
     # -- the runner's facts -------------------------------------------------------------------------------------------
 
-    def flag(self, *, own: Sequence[Any] = (), attention: Sequence[Any] = ()) -> None:
+    def flag(self, *, own: Sequence[Any] = (), attention: Sequence[Any] = (), before: Any = None, acted: Any = None,
+             touched: Any = None, sound_app: str = "") -> None:
         """An act's diff came back flagged (it covered what they watched, took the keyboard, left something open):
-        a tidy-up may follow, on these windows only."""
+        a tidy-up may follow, on these windows only. ``before`` and the scope (``acted``, ``touched``, ``sound_app``):
+        that act's own before and whose change was whose, for the turn's tidy debt (``Runner.tidy_debt``)."""
         self.tidy = Tidy(open=True, own={h for h in map(_hwnd, own) if h},
-                         attention={h for h in map(_hwnd, attention) if h})
+                         attention={h for h in map(_hwnd, attention) if h}, before=before, acted=acted,
+                         touched=touched, sound_app=str(sound_app or ""))
 
     def begin_skill(self, decision: Decision, tool_input: Mapping[str, Any], *, counted: bool = False) -> None:
         """A ``run_skill`` the gate allowed starts on this thread (the runner calls it there, right before the run):

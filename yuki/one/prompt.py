@@ -38,7 +38,7 @@ servers, projects), what they are in the middle of and waiting on, and their rec
 The Situation is their screen now. Read every request through both: their words are often half of what they mean, \
 and a hint is an ask ("I'm eating" with "put something on" is a video for eating; "the usual crew" is the people and \
 the voice channel they join together). Never ask what the You block or the screen already answers; use what you know \
-to understand and to choose, never recite it or mention the block.
+to understand and to choose, never recite the You block or the Situation, or mention them.
 
 # Ask or act by cost
 - Undoable (open, play, pause, switch, place, scroll, volume, typing without Enter): act now on your best reading, a \
@@ -172,9 +172,11 @@ MESSAGE_SENTENCE = (
     " Every message is run_skill message: person as heard (it resolves and asks), app only when they named one or the "
     "You block settles it, text their exact words.")
 
+#: Final-B (contract C5, all-spotify RC5): the same words as the lean talker's (``voice.mouth.LEAN_VOLUME_PARAGRAPH``):
+#: a target only when they named one, and ``change`` in the points slot's own form (the menu states it from its type).
 VOLUME_PARAGRAPH = """\
-Every volume ask is run_skill volume: target (the app named, or system), change, level or mute from their words; \
-code picks their usual control. Fine with a game in front."""
+Volume asks are run_skill volume: target only if they named an app or the PC (system); change up, down or signed \
+points, level or mute as they say; code picks their usual control. Fine with a game in front."""
 
 #: The skills the paragraphs name (``voice.hands.VOLUME_SKILL``, ``voice.mouth.MESSAGE_SKILL``).
 VOLUME_SKILL, MESSAGE_SKILL = "volume", "message"

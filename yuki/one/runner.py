@@ -345,13 +345,16 @@ class CallContext:
     or a typing's own control: the call's own step; the skill engine's steps: the gate's inner steps). Thread-safe."""
 
     def __init__(self, runner: "Runner | None", turn: policy.Turn, name: str, args: Mapping[str, Any], *,
-                 settings: Any = None, desk_read: Callable[[], Any] | None = None, bracket: bool = False) -> None:
+                 settings: Any = None, desk_read: Callable[..., Any] | None = None, bracket: bool = False) -> None:
         self.runner = runner
         self.turn = turn
         self.name = str(name)
         self.args = dict(args or {})
         self.settings = settings
         self._desk_read = desk_read
+        #: Final-B (contract C2): the app whose mixer row both desk reads of this act carry (the first allowed
+        #: target's app, or a skill's app slot), so the diff sees a sound change of the acted app; ``""``: none.
+        self.sound_app = ""
         #: Read the desk right after the first allowing decision (the act's before).
         self.bracket = bool(bracket)
         self.first: Any = None
@@ -370,6 +373,17 @@ class CallContext:
         #: When the call began (wall clock: an effect read looks at what happened since).
         self.started_wall = time.time()
         self._lock = threading.RLock()
+
+    def read_desk(self) -> Any:
+        """One desk read for this act (its before or its after): with the master and :attr:`sound_app`'s mixer row
+        (contract C2), the same on both sides. A reader that takes no app (a stand-in) is read plainly."""
+        read = self._desk_read
+        if read is None:
+            return None
+        try:
+            return read(self.sound_app)
+        except TypeError:
+            return read()
 
     @property
     def decided(self) -> bool:
@@ -411,8 +425,10 @@ class CallContext:
                 if self.first is None:
                     self.first = decision
         if getattr(decision, "allowed", False) and self.bracket and self.before is None and self._desk_read:
+            if not self.sound_app:
+                self.sound_app = _words(target.get("app"))
             try:
-                self.before = self._desk_read()   # right after the gate, right before the act
+                self.before = self.read_desk()   # right after the gate, right before the act
             except Exception:  # noqa: BLE001 - no read: no diff for this act
                 self.before = None
         return decision
@@ -512,6 +528,18 @@ def skill_step(hands: Any, tool: str, tool_input: Mapping[str, Any], target: Map
                 return gated
         return None
     return _own_run_step(ctx, tool, tool_input, facts, earlier, force=force)
+
+
+def _skill_app(sk: Any, slots: Mapping[str, Any], app: str) -> str:
+    """The app a skill run acts on, for its desk reads' mixer row (contract C2): the value of its slot of type ``app``
+    (the volume's ``target``, a web skill's ``browser``) when given, else the skill's own app. Code facts: the skill's
+    declared slot types, never words."""
+    for sl in getattr(sk, "slots", ()) or ():
+        if getattr(sl, "type", "") == "app":
+            given = _words((slots or {}).get(getattr(sl, "name", "")))
+            if given:
+                return given
+    return _words(app)
 
 
 def _hwnd_of(value: Any) -> int | None:
@@ -646,6 +674,7 @@ class Runner:
         self.lease = bool(lease)
         self.lease_wait_s = float(lease_wait_s)
         self.effect_budget_s = float(effect_budget_s)
+        self._desk_shape: str | None = None   # review fix F2: the verbs' desk_read form, read once
 
     @property
     def memory(self) -> Any:
@@ -990,7 +1019,7 @@ class Runner:
         the After text and its flags; the act's own windows and the attention windows before it to the turn (a
         tidy-up's only targets); new windows actable by id."""
         try:
-            after = self._desk_read()
+            after = self._desk_read(ctx.sound_app)   # the same app's mixer row as its before (C2)
             if after is None:
                 return
             from yuki.perception import diff as desk_diff
@@ -1014,16 +1043,82 @@ class Runner:
                 # a new flagged diff opens a tidy-up on its windows; a tidy step's own flagged diff never renews it
                 # (its two steps per flagged diff stay counted)
                 attention = [h for h in [*list(d.attention or []), d.focus_from] if h]
-                turn.flag(own=sorted(own), attention=attention)
+                turn.flag(own=sorted(own), attention=attention, before=ctx.before, acted=acted, touched=touched,
+                          sound_app=ctx.sound_app)
             self._emit("one_diff", tool=name, **d.facts())
         except Exception as exc:  # noqa: BLE001 - no diff: the result stands
             self._emit("one_diff_error", tool=name, error=type(exc).__name__)
 
-    def _desk_read(self) -> Any:
-        try:
-            return self.verbs.desk_read()
-        except Exception:  # noqa: BLE001
+    def tidy_debt(self, turn: policy.Turn) -> dict[str, Any] | None:
+        """Final-B (one-desk D3/F6): a reply code would settle while the turn's tidy-up is still open with no tidy step
+        taken (an earlier act of the turn was flagged; the act that finished their request was clean against its own
+        before, which already held the cover). The desk is read once and compared with the flagged act's own before,
+        with that act's scope: still flagged, the net ``after`` and its ``flags`` (the agent gets one round with them);
+        the cover gone, ``None`` (code settles as before). Once a turn (``Tidy.given``), so never a loop. Blocking
+        (one desk read, a few ms). Never raises."""
+        tidy = getattr(turn, "tidy", None)
+        if tidy is None or not tidy.open or tidy.acts or tidy.given or tidy.before is None:
             return None
+        tidy.given = True
+        try:
+            now = self._desk_read(tidy.sound_app)
+            if now is None:
+                return None
+            from yuki.perception import diff as desk_diff
+
+            d = desk_diff.compare(tidy.before, now, acted=tidy.acted, touched=tidy.touched)
+            self._emit("one_tidy_debt", **d.facts())
+            if not d.any_flag:
+                return None
+            return {"after": desk_diff.render(d, max_chars=AFTER_CHARS),
+                    "flags": [k for k, v in dict(d.flags).items() if v]}
+        except Exception as exc:  # noqa: BLE001 - no measure: code settles as before
+            self._emit("one_tidy_debt_error", error=type(exc).__name__)
+            return None
+
+    def _desk_read(self, app: str = "") -> Any:
+        """The desk now (``situation.DeskState``) for an act's before or after: final-B contract C2, with the master
+        level and mute and ``app``'s own mixer row, so the diff sees what an act did to the sound. The call's shape is
+        chosen once from the verbs' own signature (:meth:`_desk_read_shape`), never by catching a TypeError (that
+        would hide one raised inside a real read). ``None``: no read."""
+        read = getattr(self.verbs, "desk_read", None)
+        if not callable(read):
+            return None
+        shape = self._desk_read_shape(read)
+        rows = [app] if app else []
+        try:
+            if shape == "apps":
+                return read(apps=rows)                  # hands19: the master always, and these apps' mixer rows
+            if shape == "master_audio":
+                return read(master=True, audio=rows)
+            return read()
+        except Exception as exc:  # noqa: BLE001
+            self._emit("one_desk_read", op="error", shape=shape, error=type(exc).__name__)
+            return None
+
+    def _desk_read_shape(self, read: Callable[..., Any]) -> str:
+        """Review fix F2: which form the verbs' ``desk_read`` takes, from its signature (read once): ``apps`` (hands19's
+        ``desk_read(apps=...)``; the master is always read), ``master_audio`` (``master=..., audio=...``), else
+        ``plain`` (no sound parts: the diff never sees the acted app's mixer row). A plain read is logged once,
+        content-free, so a live test shows C2 is not wired."""
+        if self._desk_shape is not None:
+            return self._desk_shape
+        import inspect
+
+        try:
+            params = inspect.signature(read).parameters
+        except (TypeError, ValueError):
+            params = {}
+        names = set(params)
+        if "apps" in names:
+            shape = "apps"
+        elif {"master", "audio"} <= names:
+            shape = "master_audio"
+        else:
+            shape = "plain"
+            self._emit("one_desk_read", op="fallback", shape=shape)
+        self._desk_shape = shape
+        return shape
 
     def _facts_of(self, hwnd: Any) -> dict[str, Any]:
         if hwnd is None:
@@ -1085,7 +1180,10 @@ class Runner:
                 return OneResult("run_skill", BUSY, result=LINE_BUSY, evidence={"why": LINE_BUSY}, decision=decision,
                                  verb="run_skill")
             with one_call(ctx):
-                ctx.before = self._desk_read()   # after the gate and the countdown, right before the run
+                # contract C2: the skill's own app (its app slot's value, e.g. the volume's target, else the skill's
+                # app) is the one whose mixer row both reads carry
+                ctx.sound_app = _skill_app(sk, slots, app)
+                ctx.before = self._desk_read(ctx.sound_app)   # after the gate and the countdown, right before the run
                 turn.begin_skill(decision, run_args, counted=counted)
                 try:
                     if desk_path:
@@ -1109,15 +1207,29 @@ class Runner:
             except Exception:  # noqa: BLE001
                 scope = None
         elif ctx.before is not None:
-            scope = {"apps": [a for a in (app,) if a], "focus": True,
+            # final-B (contract C1): the engine's measured front change when the run's payload carries it (else a run
+            # on the desk path may have taken the front: counted as the act's, as before); the app-typed slot's value
+            # is the act's too (one-desk RC1(b): by slot type, never words)
+            # Review fix F6: the engine's measured ``acted`` False (no rung touched the PC, the front never changed) and
+            # no draft typed after it: no change on the desk is this run's (its apps are not the act's); its measured
+            # ``acted_apps`` are the act's too, as the hands' ``_skill_scope`` takes them
+            measured = facts.get("focus_taken")
+            untouched = facts.get("acted") is False and measured is not True and not drafted
+            apps = [] if untouched else [a for a in dict.fromkeys(
+                (app, ctx.sound_app, *(facts.get("acted_apps") or ()))) if a]
+            scope = {"apps": apps,
+                     "focus": measured if isinstance(measured, bool) else True,
                      "open": str(getattr(sk, "kind", "") or "") == "open", "left": drafted}
         line = _words(facts.get("done_line")) if facts.get("verified") is True else ""
         if drafted and facts.get("verified") is True and not line:
             line = rule.LINE_DRAFTED   # a draft is never "sent": consent's own words
         if str(facts.get("outcome") or "") == "asked":
             # the skill's own question (its resolver's: which one, who to): theirs to answer, the agent asks it; not a
-            # failed step (``_finish`` books no miss for it)
-            facts["_asked"] = _words(facts.get("ask")) or _words(str(report or "").split("\n", 1)[0])
+            # failed step (``_finish`` books no miss for it). Final-B (one-voice RC E): only the structured question
+            # (``facts["ask"]``, the engine's own field), never words read back out of the report: its first line is
+            # the engine's model-facing shape ("Ask them: ...") and was spoken by the owed ledger. No question: the
+            # status stays asked, nothing is owed as an ask, and the agent words it from the result
+            facts["_asked"] = _words(facts.get("ask"))
         result = self._finish("run_skill", args, turn, ctx, ok, report, facts, say, state, done_line=line,
                               scope=scope, lasting=bool(decision.countdown or decision.join))
         if counted:
@@ -1238,7 +1350,16 @@ class Runner:
         facts: dict[str, Any] = {"verified": verified if isinstance(verified, bool) else None,
                                  "outcome": str(payload.get("outcome") or ""),
                                  "done_line": str(payload.get("done_line") or ""), "skill": key,
+                                 # final-B (one-voice RC E): an asked run's question as the engine's own field
+                                 # (``payload["ask"]``, set by ``Dispatcher._run_skill`` for an ``asked`` outcome)
+                                 "ask": str(payload.get("ask") or ""),
                                  "sent_at": started if payload.get("outcome") not in ("refused", None) else None}
+        if isinstance(payload.get("focus_taken"), bool):
+            facts["focus_taken"] = payload["focus_taken"]   # contract C1: measured per rung by the engine
+        if isinstance(payload.get("acted"), bool):
+            facts["acted"] = payload["acted"]               # C1 (review fix F6): something on the PC was touched
+        if isinstance(payload.get("acted_apps"), (list, tuple)):
+            facts["acted_apps"] = [str(a) for a in payload["acted_apps"] if isinstance(a, str) and a.strip()]
         if isinstance(payload.get("evidence"), Mapping):
             facts["evidence"] = dict(payload["evidence"])
         if refused:

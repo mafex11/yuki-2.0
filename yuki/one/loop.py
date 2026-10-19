@@ -264,6 +264,19 @@ def runner_settles(results: Sequence[Any]) -> bool:
         return False
 
 
+def tidy_debt(runner: Any, turn: Any) -> dict[str, Any] | None:
+    """The runner's tidy debt for a reply code would settle (``yuki.one.runner.Runner.tidy_debt``: the net After and
+    flags of an earlier flagged act whose cover is still there, once a turn), else ``None``. Never raises."""
+    measure = getattr(runner, "tidy_debt", None)
+    if not callable(measure):
+        return None
+    try:
+        got = measure(turn)
+    except Exception:  # noqa: BLE001 - no measure: code settles as before
+        return None
+    return dict(got) if isinstance(got, Mapping) and got else None
+
+
 def typed_menu(menu_lines: str) -> tuple[str, list[str]]:
     """The ONE typed agent's Skills block and keys from the menu lines the request read (``gather``'s, the planner's
     heading first): the talker's heading over the same lines (``run_skill`` with the key: the ONE tool's words, not the
@@ -642,12 +655,21 @@ class OneAgent(Brain):
                 self._push(self._cancel_event())
                 return
             if os_.settle == "code" and not facts.own and runner_settles(facts.results):
-                # addendum decision 2 / must-fix 2: a clean reply ends in code, as today, by the runner's one settle
-                # rule: code's verified line (said at verification) is the reply, no closing model call
-                self._ended_by = "code"
-                text = " ".join(lines) or LINE_DONE
-                self._final(text, self._outcome_one(state, level=self._level()))
-                return
+                # final-B (one-desk D3/F6): an earlier flagged act's cover still there with no tidy step taken: the
+                # net After goes on this reply's last result and the model gets one round (once a turn)
+                debt = tidy_debt(runner, turn)
+                if debt is None:
+                    # addendum decision 2 / must-fix 2: a clean reply ends in code, as today, by the runner's one
+                    # settle rule: code's verified line (said at verification) is the reply, no closing model call
+                    self._ended_by = "code"
+                    text = " ".join(lines) or LINE_DONE
+                    self._final(text, self._outcome_one(state, level=self._level()))
+                    return
+                if results and isinstance(results[-1], dict):
+                    last = results[-1]
+                    old = "".join(str(b.get("text") or "") for b in last.get("content") or [] if isinstance(b, dict))
+                    results[-1] = tool_result(str(last.get("tool_use_id") or ""),
+                                              f"{old}\n{model_text(debt)}".strip(), error=bool(last.get("is_error")))
             for line in lines:   # said at verification: shown now as progress; the model reads them in its results
                 self._push(Say(line))
                 shown.append(line)
@@ -1054,4 +1076,4 @@ class OneAgent(Brain):
 
 __all__ = ["BAD_INPUT_TEXT", "FIELD_LABELS", "Got", "LINE_DONE", "LINE_NOT_RUN", "LINE_NOT_YES", "NO_SKILLS", "NOT_OK",
            "OneAgent", "RAN", "REPLY_HELD", "Reply", "TOOK", "Use", "model_text", "read_result", "reply_uses",
-           "runner_settles", "typed_menu"]
+           "runner_settles", "tidy_debt", "typed_menu"]
