@@ -1347,11 +1347,11 @@ class VoiceBridge(QObject):
         when it ended on a question to them, a plan that asks, or an offer it made, "I can try your liked songs
         instead" with no question mark included): then their next words are its answer and carry the request ("try
         another way" after the stuck line is about that same playlist). A verdict without the field (an older brain)
-        closes it, as a finished act does. A "?" in the closing line no longer decides it (punctuation is no
-        intent). Its words are never carried into a new request (live 10 Oct a request after a failed one re-ran the
-        failed YouTube task; the brain takes every carried turn as their request): what they say next ("message
-        Hemanth", or "just do it") goes with the labelled earlier lines instead. A done act at ``verified``,
-        ``likely`` or ``unverified`` ends it
+        closes it, as a finished act does, and so does any value but ``True`` (the safe side). A "?" in the closing
+        line no longer decides it (punctuation is no intent). Its words are never carried into a new request (live
+        10 Oct a request after a failed one re-ran the failed YouTube task; the brain takes every carried turn as
+        their request): what they say next ("message Hemanth", or "just do it") goes with the labelled earlier lines
+        instead. A done act at ``verified``, ``likely`` or ``unverified`` ends it
         even with an offer after it ("Want it louder?" then "yes" never plays it again; review r2 L2: below likely the
         thinker's words, offer and all, are never said as written, and an act that may have worked is never redone by
         the next request), and so does any request that tried to send
@@ -1373,7 +1373,7 @@ class VoiceBridge(QObject):
         level = str(verdict.get("level") or "")
         if state == DONE and (level in ("verified", "likely") or (level == "unverified" and verdict.get("acted"))):
             return True
-        return not bool(verdict.get("awaits"))
+        return verdict.get("awaits") is not True
 
     def exchange_floor(self, newest_at: Any = _NEWEST) -> float | None:
         """IF-words (Item 2a): the time before which a heard turn is not part of the current exchange (monotonic), or

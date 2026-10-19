@@ -7841,7 +7841,9 @@ class Conversation:
         but for the end any words while a send counts down (a wrong stop never sends). The hand-off: not on words
         recognition was unsure of (a call may be held until they answer), not while a voice task is open (a follow-up
         routes by that task's state). The end: not while anything else waits for their words or runs for them
-        (:meth:`_words_awaited`: then the words are the conversation's)."""
+        (:meth:`_words_awaited`: then the words are the conversation's), but a send counting down comes first, so the
+        router judges a spoken stop of it even then (review L1; the end itself is still refused,
+        :meth:`_route_end_block`)."""
         from yuki.voice.router import ends_on
 
         handoff, ends = router_on(self.settings), ends_on(self.settings)
@@ -8025,7 +8027,10 @@ class Conversation:
         words or runs for them (:meth:`_words_awaited`; a send counting down is ended with the conversation, never
         sent, and with ``sending``, the send just stopped, so is the ONE runner call that held it); there is no user
         turn open for the words; or the talker already answered them: Yuki is speaking or about to, its reply has
-        words, or it made a call other than stay_quiet. Measured states only; never raises."""
+        words, or it made a call other than stay_quiet. A send still counting down hides nothing else (review L1:
+        :meth:`_words_awaited` puts it first only for the router's judgement of a spoken stop): a hand at work, a
+        scroll, a call held for their answer or another task still refuses the end. Measured states only; never
+        raises."""
         try:
             if self._stop.is_set() or self.dormant:
                 return "stopping"
@@ -8035,6 +8040,8 @@ class Conversation:
             if obs.user_speaking or self._user_voiced(time.monotonic()):
                 return "speaking"
             awaited = self._words_awaited()
+            if awaited == "countdown":
+                awaited = self._words_awaited(besides_send=True)
             if awaited not in ("", "countdown") and not (sending and awaited == "running"):
                 return "awaited"
             turn = obs.turn
@@ -8048,20 +8055,23 @@ class Conversation:
         except Exception:  # noqa: BLE001 - unsure: the talker's own judgement
             return "unknown"
 
-    def _words_awaited(self) -> str:
+    def _words_awaited(self, *, besides_send: bool = False) -> str:
         """D1 / keyword audit A1: what waits for the user's next words or runs for them now (a code word), else ``""``.
         ``"countdown"``: a send of theirs counting down (an "all" voice job's, ``VoiceBridge.awaiting_words``; under one
-        the countdown): their words decide it (the talker cancels it), and an end never lets it go. Anything else means
-        their words are the conversation's, for the talker (or the ONE agent) to judge, never the router's end: a voice
-        task queued, running or waiting for their answer ("cancel" may be that answer), a hand at work, a continuous
-        scroll, a call held until they answer, and under one a question of the gate's or a runner call still running.
-        Measured states only; unsure: ``"unknown"``. Never raises."""
+        the countdown): their words decide it (the talker cancels it, the router may stop it), and an end never lets it
+        go. It comes first (review L1): the router judges a spoken stop of a send even while a hand works, a scroll
+        runs or a call is held. ``besides_send``: what else waits, the countdown left out (the router's end itself is
+        refused while anything does, :meth:`_route_end_block`). Anything else means their words are the
+        conversation's, for the talker (or the ONE agent) to judge, never the router's end: a voice task queued,
+        running or waiting for their answer ("cancel" may be that answer), a hand at work, a continuous scroll, a call
+        held until they answer (their first turn after it only, :meth:`_held_unanswered`), and under one a question of
+        the gate's or a runner call still running. Measured states only; unsure: ``"unknown"``. Never raises."""
         try:
             bridge = self.bridge
             one = getattr(self, "one_driver", None)
             if one is not None:
                 countdown = getattr(one, "_countdown", None)
-                if countdown is not None and countdown.counting:
+                if not besides_send and countdown is not None and countdown.counting:
                     return "countdown"
                 if getattr(getattr(one, "turn", None), "asks", None):
                     return "gate_asked"
@@ -8069,20 +8079,37 @@ class Conversation:
                     return "running"
             awaiting = getattr(bridge, "awaiting_words", None)
             jobs = str(awaiting() or "") if callable(awaiting) else ("task" if bridge.has_open_voice_job() else "")
+            if jobs == "countdown" and not besides_send:
+                return jobs
             if jobs and jobs != "countdown":
                 return jobs
             if int(getattr(bridge, "busy_tools", 0) or 0) > 0:
                 return "hand"
             if self._scrolling_line() is not None:
                 return "scroll"
-            if getattr(bridge, "held_call", None) is not None:
-                at = getattr(bridge, "held_at", None)
-                hold_s = float(getattr(self.settings, "voice_hold_max_s", 30.0))
-                if at is None or time.monotonic() - float(at) <= hold_s:
-                    return "held"
-            return jobs
+            if getattr(bridge, "held_call", None) is not None and self._held_unanswered(bridge):
+                return "held"
+            return ""
         except Exception:  # noqa: BLE001
             return "unknown"
+
+    def _held_unanswered(self, bridge: Any) -> bool:
+        """Review M1: whether the call the talker held until the user answers (``_hold``: doubtful words) still waits
+        for that answer, for the words judged now. The held call is cleared only when the bridge unbinds or on a second
+        stay_quiet, never when they answer, so its age alone (``voice_hold_max_s``, 600 s) kept every later turn of the
+        conversation "held". It waits through their first turn after it only: no final turn of theirs reached the
+        talker (``recent_heard``, :meth:`_turn_reached`) between the hold and the start of the speech judged now. That
+        start, not a count of turns, so an eager (speculative) call on their next words, whose own final is not in
+        yet, reads the same as its confirmed call. No time of the hold: held (unsure). Measured times only."""
+        at = getattr(bridge, "held_at", None)
+        if at is None:
+            return True
+        at = float(at)
+        if time.monotonic() - at > float(getattr(self.settings, "voice_hold_max_s", 600.0)):
+            return False
+        start = float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)
+        heard = list(getattr(self.observer, "recent_heard", ()) or ())
+        return not any(at < float(when) < start for when, _words in heard)
 
     def _stop_sends(self) -> None:
         """D1: the router judged that the user's words call off a send counting down (or send Yuki away while one
