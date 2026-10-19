@@ -65,8 +65,8 @@ from PySide6.QtCore import QObject, Signal
 
 from yuki.voice.expressive import strip_tags
 from yuki.voice.mouth import (
-    APP_NAMED_NOTE, CODE_SAID_NOTE, CORRECTION_MARK, HANDOFF_TOOLS, REMEMBER_NOTE, SAVED_NOTE, SPOKEN_NOTE,
-    WITHDRAWN_NOTE,
+    APP_NAMED_NOTE, CODE_SAID_NOTE, CORRECTION_MARK, HANDOFF_TOOLS, OPENED_QUIET, REMEMBER_NOTE, SAVED_NOTE,
+    SPOKEN_NOTE, WITHDRAWN_NOTE,
     brain_request, outcome_fields, result_payload, say_first_words, talker_kind, voice_on_brain, voice_one,
     waiting_payload,
 )
@@ -149,6 +149,11 @@ HANDS_TICK_S = 0.05
 DONE_HERE_CONTEXT = ("Done already for these very words in this turn by Yuki's voice, and verified by the PC's own "
                      "check (code facts, not their words): {done}. Those parts are done: never do them again; plan "
                      "only what is left of their words.")
+#: voice21 (final-D S22c, desk20 merge note 3): what the follow-up's note adds when the finished request it quotes ended
+#: by asking them something (its own question mark: Yuki's question or offer). Live final-D k_video_another_one t2
+#: (all): the talker folded Yuki's own "want me to bring it up?" into a new hand-off; the volume went up unasked.
+FINISHED_OFFER_NOTE = (" That ending was Yuki's own question or offer, not their request: it is done only if their "
+                       "newest words take it up.")
 #: hands19 (final-B all-messaging RC3, contract C4): a send countdown the user's speech paused counts on (their words
 #: neither stopped nor changed it) once the talker settled on their turn this long (s), never sooner than
 #: ANSWER_HOLD_MIN_S after their last words; a pause that brought no words, with nobody speaking, was noise after this
@@ -742,6 +747,12 @@ class VoiceBridge(QObject):
         self.call_evidence: Callable[[], str | None] | None = None
         #: ``(minutes)``: the user asked Yuki to go quiet for a while (``go_quiet``; set by the conversation).
         self.quiet_requested: Callable[[float], None] | None = None
+        #: voice21 (final-D S10): ``(spoke) -> result | None``: a stay_quiet on the user's turn now is the one refused
+        #: (the first words of a conversation they opened themselves, no call, no dictation, nothing heard yet;
+        #: ``spoke``: this reply put words out), taken once a conversation (``Conversation._opened_quiet``): the
+        #: refusal's tool result (``mouth.OPENED_QUIET``, with the reply format in the marker channel; ``True``: the
+        #: note alone), else ``None``. Set by the conversation.
+        self.opened_quiet: Callable[[bool], Any] | None = None
         #: Whether the mouth run now answers the first words after the wake word heard the user say the name
         #: (set by the conversation; v3.6): those words were said to Yuki, so staying quiet is refused once.
         self.named_turn: Callable[[], bool] | None = None
@@ -893,6 +904,7 @@ class VoiceBridge(QObject):
             self.call_mode = None
             self.call_evidence = None
             self.quiet_requested = None
+            self.opened_quiet = None
             self.named_turn = None
             self.said_early = None
             self.on_jobs_changed = None
@@ -2370,10 +2382,26 @@ class VoiceBridge(QObject):
             return   # sVoiceFix (F5): never silence after a step that only brought something up
         if by_user or spoke_now:
             self._drop_step_line()
+        if by_user and not in_call and not getattr(self, "one", False) and self.opened_quiet is not None:
+            # voice21 (final-D S10, the user's decision 2 of 19 Oct): the one exception to V2 below. A quiet on the
+            # first words of a conversation they opened themselves (the wake word, the hotkey, the tray or a card), with
+            # no call, no dictation and nothing heard yet, is refused once (live final-D q_discord_today: unmarked
+            # scratch and stay_quiet on a question to Yuki); the talker runs once more. A second quiet is final, and
+            # "go away" still ends it (end_conversation). Under one, OneVoice.control decides.
+            try:
+                refused = self.opened_quiet(spoke_now)
+            except Exception:  # noqa: BLE001 - no reading: the quiet stands
+                refused = None
+            if refused:
+                self._log("bridge", op="quiet", refused="opened_first", asked_by_user=True)
+                await params.result_callback(dict(refused) if isinstance(refused, dict)
+                                             else {"not_quiet": OPENED_QUIET})
+                return
         # V2 (3 Oct): a stay_quiet on the user's own words is final. It used to be refused once after the name (v3.6)
         # and once in a live exchange (v3.9); live 3 Oct "go away" got a quiet, the refusal made the talker run again,
         # and it said it was still there. Whom the words were for is the talker's judgement (the prompt: outside a
         # call they are for Yuki unless plainly not), and code never makes it speak after it chose silence.
+        # voice21: but for the S10 refusal above, once a conversation.
         spoke = bool(self.spoke_in_reply()) if self.spoke_in_reply is not None else False
         held = self.held_at
         if not by_user and not spoke and held is not None and time.monotonic() - held < 20.0:
@@ -4252,8 +4280,13 @@ class VoiceBridge(QObject):
                                                  properties=FunctionCallResultProperties(run_llm=False))
                     return
                 prev = target.outcome or (target.closing[1] if target.closing else "")
+                quoted = condense(prev, max_sentences=2, max_chars=300)[0] if prev else ""
+                # voice21 (final-D S22c, desk20 merge note 3): an ending that asked them something (its own question
+                # mark: Yuki's question or offer, "want me to bring it up?") is no part of this request unless their
+                # newest words take it up (live final-D k_video_another_one t2: the offer was done unasked)
                 extra = (f'These words add to the request just before ("{target.brief()}"), which had just finished'
-                         + (f": {condense(prev, max_sentences=2, max_chars=300)[0]}" if prev else ".")
+                         + (f": {quoted}" if quoted else ".")
+                         + (FINISHED_OFFER_NOTE if quoted and asks(quoted) else "")
                          + " Take it from what the screen shows now.")
         if intent == "follow_up":
             done_here = await self._hands_first(params, turn)   # review L2: it starts a new request after all

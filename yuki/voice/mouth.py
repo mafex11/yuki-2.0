@@ -772,8 +772,11 @@ Weigh it with the meaning, and resolve it against the screen first: the desktop 
 (the chats, items, links and buttons in front of them) and its tabs are what they are most likely naming. When one \
 of them sounds like their words ("brochure" and a chat named Bro, "rest chat", "EES chat" or "address chart" and a chat named \
 Res, "cloud tabs" and two Claude tabs), that is what they meant: act on it with that name (hand it over with \
-screen true and the name in context), no question. A person's name is often split across words ("hey meant" \
-for Hemanth), and the Speech line matches names only by spelling: who a message goes to is the thinker's to resolve, \
+screen true and the name in context), no question. So is a name the Speech line says they most likely said (an \
+app or site of theirs): for anything undoable act on it and name it, never a question about it; a lasting act (closing, \
+sending, deleting) keeps the rule below. A person's name is often split across \
+words ("hey meant" for Hemanth), and the Speech line matches names only by spelling: who a message goes to is the \
+thinker's to resolve, \
 never yours, and never a question of yours. When the Speech line names a person, or more than one, hand it over (their \
 words go as heard) with the names it gave in context; the thinker knows their people, how close each is and who was \
 on their calls, and asks them when two fit. Good: "message dar vesh on telegram", the Speech line names Carmen for \
@@ -965,7 +968,7 @@ they join together). Never ask what the You block or the screen already answers;
 to choose, never recite it or mention the block.
 Speech recognition mishears them, Hindi and Hinglish most. Read odd words by how they sound against the screen, the \
 You block and what they usually ask. For anything undoable, act on your reading and pass it as the real name (the \
-site, app, YouTube channel, playlist or video, never the garble): code takes it and says your guess aloud, so a \
+site, app, channel, playlist or video, never the garble): name it as what they asked, never a guess or a question; a \
 wrong one costs one "not that". A person or a place to join goes as heard. Ask back only when no reading fits, or two \
 do and the wrong one would last.
 
@@ -1109,10 +1112,12 @@ when it adds to it, instead only when their words drop it (say_first names what 
 that take no window work any time."""
 
 LEAN_RECOGNITION_GUIDE = """\
-The Speech line names words recognition was unsure of and the names they sound close to: a name on the screen or in \
-the You block that sounds like them is what they meant (pass that name for anything undoable; a person goes as \
-heard). Ask back only when nothing fits and the word matters for something lasting. Letters said one by one are one \
-word spelled out. Never mention recognition."""
+The Speech line names words recognition was unsure of and the names they sound close to. A name it says they most \
+likely said is what they said, as is a name on the screen or in the You block that sounds like their words. For \
+anything undoable, act on it now and name it as what they asked in the call's say_first or say_when_done ("Opening \
+<app>."), never a question about it, never that you guessed or heard something else. A person goes as heard (the \
+message skill settles who). Anything else lasting keeps its own rule (their plain words): a misheard word that \
+matters for it gets one short question. Letters said one by one are one word spelled out. Never mention recognition."""
 
 LEAN_FOCUS_GUIDE = """\
 Private, never to be said: they are {where} right now, so you stay out of the way. Words with your name, or the next \
@@ -1160,7 +1165,8 @@ UNDERSTANDING: dict[str, Any] = {
         "it). Leave it out when their words say it all. goal: one short line; parts: only when they asked for several "
         "things, each in a few words with the skill key that covers it (\"\" if none) and values you know from the You "
         "block; choose: true when they left a pick to Yuki; context: what you know that their words do not say "
-        "(which project, person or app they mean, what they are doing)."),
+        "(which project, person or app they mean, what they are doing). A question or offer of Yuki's own from "
+        "before goes in goal or parts only when their newest words take it up."),
     "properties": {
         "goal": {"type": "string"},
         "parts": {"type": "array", "items": {"type": "object", "properties": {
@@ -2493,6 +2499,22 @@ NOTHING_DONE_YET = "[For their latest words nothing has been done on the PC yet.
 OPENED_NOTE = ("[They opened this conversation themselves a moment ago: these first words are said to you, even when "
                "they make little sense as written. Never stay_quiet on them: act on a reading that plainly fits, or say "
                "in a few words you didn't catch it.]")
+#: voice21 (final-D S10, the user's decision 2 of 19 Oct): the first quiet on the first words of a conversation the user
+#: opened themselves (the wake word, the hotkey, the tray or a card), with no call live, no dictation and nothing heard
+#: yet that turn, is refused once by code with this (``VoiceBridge.stay_quiet``, ``OneVoice.control``): live final-D
+#: q_discord_today (all) and p24_hinglish_garbled (one) went silent with OPENED_NOTE in the prompt. A second quiet is
+#: final; "go away" still ends the conversation (end_conversation).
+#: Review L3: told to go (in any words), the answer is end_conversation, never a second quiet nor "I'm still here" (V2).
+OPENED_QUIET = ("Not quiet: they opened this conversation themselves and these are their first words to you; nothing "
+                "has answered them yet. Act on a reading that plainly fits (a name they most likely said included), or "
+                "say in a few words you didn't catch it. Only if they plainly spoke to someone else, stay_quiet again; "
+                "told to go, end_conversation with say_first \"\", alone.")
+#: ... and the same when that first quiet was a quiet marker with no stay_quiet call: the reply watch answers the turn
+#: again once, with this note (``Conversation._unanswered``).
+OPENED_RERUN_NOTE = ("[You chose silence on their first words, but they opened this conversation themselves and "
+                     "nothing has answered them yet. Answer them now: act on a reading that plainly fits, or say in a "
+                     "few words you didn't catch it. Only if they plainly spoke to someone else, choose quiet again; "
+                     "told to go, end_conversation with say_first \"\", alone.]")
 #: The last line of every request's volatile block in marker mode (v3.16): the format, right where the reply begins.
 MARKER_REMINDER = "[Start your reply with its marker line: say, act or quiet, alone on the first line.]"
 #: Added when the user's turn is answered again because nothing of the last reply to it was heard (v3.16).
@@ -2628,6 +2650,9 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
 
     lSpeed: ``state["reflex"]`` (the learned reflex that ran for these words: its state, what it did, its report,
     whether they went on talking after it) rides as :func:`reflex_note` right after the desktop block.
+
+    voice21 (final-D S10): ``state["opened_quiet"]`` on a rerun (the quiet marker on the first words of a conversation
+    they opened was waived once) gives :data:`OPENED_RERUN_NOTE` in place of :data:`RERUN_NOTE`.
     """
     state = state or {}
     keys = state.get("skill_keys") or ()
@@ -2695,7 +2720,8 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += (f"\n[Your thinker now (background: for when they ask what is happening, and to choose follow_up, "
                  f"instead or new_task): {work}. {skill_guide(WORK_GUIDE, keys).strip()}]")
     if rerun:
-        text += "\n" + (CLAIM_NOTE if state.get("claim") else REPEAT_NOTE if state.get("repeat") else RERUN_NOTE)
+        text += "\n" + (CLAIM_NOTE if state.get("claim") else REPEAT_NOTE if state.get("repeat")
+                        else OPENED_RERUN_NOTE if state.get("opened_quiet") else RERUN_NOTE)
     if state.get("scrolling"):
         # V7: a page scrolling on by itself (the keep_scrolling hand, or the thinker's scroll until stopped)
         text += (f"\n[Scrolling now: {' '.join(str(state['scrolling']).split())[:200]}. It pauses by itself while "
