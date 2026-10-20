@@ -1701,10 +1701,15 @@ class Hands:
         self._forced_memo: dict[str, Any] = {}
         self._acts_cache: tuple[Any, dict[str, bool]] | None = None
         #: bTalk (``brain = "all"``): this user turn's commit check for the hands (``yuki.brain.check.CommitCheck``,
-        #: made on first use, fresh each turn), and the windows the type hand typed into with no send (hwnd -> when):
-        #: a later click there is told that Yuki's text waits, so a send control is judged as the send it would be.
+        #: made on first use, fresh each turn), and the windows the type hand typed into with no send: a later click
+        #: there is told that Yuki's text waits, so a send control is judged as the send it would be. gb (B1, final-G2
+        #: R13, contract K-T): kept by the field the text went into, per window (hwnd -> ``[(when, field)]``, newest
+        #: last; ``field`` the identity :meth:`_field_ident` read, ``None`` when it couldn't be read). RAM only.
         self._commit_check: Any = None
-        self._typed_waiting: dict[int, float] = {}
+        self._typed_fields: dict[int, list[tuple[float, tuple[int, int, str, str] | None]]] = {}
+        #: gb (B2, contract K-U): per thread, a run's own close of what its own shortcut opened (:meth:`own_undo`):
+        #: ``thread -> (keys as declared, the field it opened)``. RAM only.
+        self._own_undo: dict[int, tuple[tuple[str, ...], tuple[int, int, str, str]]] = {}
         #: Review r1 H1.3 (decision 7): ``(thread, app id, skill)`` while a voice capability whose join the consent
         #: rule allowed on plain words runs: its own steps in its app pass row 3 (:meth:`_join_granted`).
         self._join_grant: tuple[int, str, str] | None = None
@@ -1957,8 +1962,160 @@ class Hands:
             self._commit_check = CommitCheck(client, settings, self._check_log)
         return self._commit_check
 
-    #: A window the type hand typed into counts as holding Yuki's unsent text for this long (s).
+    #: A field the type hand typed into counts as holding Yuki's unsent text for this long (s).
     TYPED_WAIT_S = 600.0
+    #: gb (B1): at most this many fields per window are kept as holding Yuki's unsent text (newest kept; a bound only:
+    #: a few typings a window in :data:`TYPED_WAIT_S` is the measured norm).
+    TYPED_FIELDS = 16
+    #: gb (B1, B2): the focus read a step's check takes for the facts below (s; only where Yuki's text waits, or while
+    #: a run's own undo is declared).
+    TYPED_FOCUS_S = 0.3
+
+    @staticmethod
+    def _field_ident(snap: Any) -> tuple[int, int, str, str] | None:
+        """gb (B1): the text field a focus read shows holding the keyboard, as an identity: its top-level window, its
+        native window, its control type and its name (UI facts, the shape ``yuki.skills.chat._field`` reads; never read
+        for meaning, never logged). ``None`` when the read shows no text field (or a password field) or none at all."""
+        if snap is None or not getattr(snap, "accepts_text", False) or getattr(snap, "is_password", False):
+            return None
+        return (int(getattr(snap, "window", 0) or 0), int(getattr(snap, "hwnd", 0) or 0),
+                " ".join(str(getattr(snap, "role", "") or "").split()),
+                " ".join(str(getattr(snap, "name", "") or "").split()))
+
+    def _typed_live(self, hwnd: int | None) -> list[tuple[float, tuple[int, int, str, str] | None]]:
+        """gb (B1): the fields of window ``hwnd`` holding Yuki's unsent text now (within :data:`TYPED_WAIT_S`), oldest
+        first; expired ones are let go."""
+        if hwnd is None:
+            return []
+        now = time.monotonic()
+        kept = [(at, f) for at, f in self._typed_fields.get(int(hwnd), []) if now - at < self.TYPED_WAIT_S]
+        if kept:
+            self._typed_fields[int(hwnd)] = kept
+        else:
+            self._typed_fields.pop(int(hwnd), None)
+        return kept
+
+    def _note_typed(self, hwnd: int, field: tuple[int, int, str, str] | None) -> None:
+        """gb (B1, contract K-T): Yuki's words wait unsent in ``field`` of window ``hwnd`` (``None``: the field could
+        not be read; the window as a whole then, as before). A field typed into again is kept once, as the newest."""
+        kept = [(at, f) for at, f in self._typed_live(hwnd) if f != field]
+        self._typed_fields[int(hwnd)] = (kept + [(time.monotonic(), field)])[-self.TYPED_FIELDS:]
+
+    def _unnote_typed(self, hwnd: int, field: tuple[int, int, str, str] | None) -> None:
+        """gb (B1): the typing into ``field`` sent no character (integ22: no unsent mark): its record is let go."""
+        kept = [(at, f) for at, f in self._typed_live(hwnd) if f != field]
+        if kept:
+            self._typed_fields[int(hwnd)] = kept
+        else:
+            self._typed_fields.pop(int(hwnd), None)
+
+    def _typed_facts(self, tool: str, tool_input: dict[str, Any], hwnd: int | None, facts: dict[str, Any],
+                     held: tuple[int, int, str, str] | None, read: bool) -> None:
+        """gb (B1, final-G2 R13; contract K-T, writer): the facts of Yuki's unsent text in the step's window, for Yuki's
+        check (RAM only, never logged; the step's own facts dict, the target ``yuki.brain.check.one`` reads):
+
+        * ``typed_pending`` (bool): Yuki's unsent text waits in a field of this window (today's window-wide flag,
+          unchanged for every reader that knows nothing else);
+        * ``typed_fields`` (int): how many fields of this window hold it;
+        * ``typed_field`` (``{"window", "native", "role", "name"}``): the field it waits in (the one this step goes to
+          when it is one of them, else the newest); absent when the field couldn't be read as it was typed into;
+        * ``typed_field_held`` (bool, ``None`` unread): that field holds the keyboard now (this step's focus read);
+        * ``typed_to_field`` (bool, ``None`` unknown): this step goes to a field holding Yuki's text: a key or typing
+          goes where the keyboard is, a click to its own control (that field's role and name in this window); ``None``
+          for a field that couldn't be read, a focus read that failed, or another kind of step (the reader then keeps
+          today's window-wide flag).
+
+        Measured identity only (the focus read's window, native window, role and name), never the user's words."""
+        records = self._typed_live(hwnd)
+        if not records:
+            return
+        facts["typed_pending"] = True
+        facts["typed_fields"] = len(records)
+        known = [f for _at, f in records if f is not None]
+        unknown = len(known) < len(records)
+        if not known:
+            return   # no field was read as it was typed into: the window-wide flag alone, as before
+        to: bool | None = None
+        pick = known[-1]
+        if tool in ("press", "hotkey", "type_text"):
+            if read and held is not None and held in known:
+                to, pick = True, held
+            elif read:
+                to = None if unknown else False
+        elif tool == "click":
+            role = " ".join(str(facts.get("role") or "").split()).casefold()
+            name = " ".join(str(facts.get("name") or facts.get("element_name") or "").split()).casefold()
+            hit = next((f for f in reversed(known) if (role or name) and f[2].casefold() == role
+                        and f[3].casefold() == name and (not f[0] or hwnd is None or f[0] == int(hwnd))), None)
+            if hit is not None:
+                to, pick = True, hit
+            elif role or name:
+                to = None if unknown else False
+        facts["typed_field"] = {"window": pick[0], "native": pick[1], "role": pick[2], "name": pick[3]}
+        facts["typed_field_held"] = (held == pick) if read else None
+        facts["typed_to_field"] = to
+
+    @contextlib.contextmanager
+    def own_undo(self, *, keys: Sequence[str], field: Sequence[Any] | None) -> Any:
+        """gb (B2, final-G2 R13; contract K-U, writer): while a skill run presses the app's own close key for what its
+        own shortcut opened and did not finish (the chat driver's ``_close_own``: Discord's Quick Switcher, whose
+        search field Yuki typed a name into), a key step of that run on this thread whose keys are exactly ``keys``
+        carries ``own_undo`` to Yuki's check, but only when this step's own focus read shows ``field`` (the identity
+        the run measured when its shortcut gave that field the keyboard: window, native window, role, name) still
+        holding the keyboard. The key then closes the run's own act (its undo), not anything of the user's. ``field``
+        ``None`` or no keys: nothing is declared (the check as today). Every gate still applies (a game in front, the
+        Act switch)."""
+        ident = _as_field(field)
+        norm = tuple(" ".join(str(k).split()).casefold() for k in keys or () if str(k).strip())
+        if ident is None or not norm:
+            yield
+            return
+        me = threading.get_ident()
+        before = self._own_undo.get(me)
+        self._own_undo[me] = (norm, ident)
+        try:
+            yield
+        finally:
+            if before is None:
+                self._own_undo.pop(me, None)
+            else:
+                self._own_undo[me] = before
+
+    def _own_undo_measured(self, tool: str, tool_input: dict[str, Any], hwnd: int | None,
+                           held: tuple[int, int, str, str] | None) -> bool:
+        """gb (B2): whether this step is the declared own undo (:meth:`own_undo`) of this thread's run: a key step whose
+        keys are exactly the declared ones, into the declared field's window, while the focus read ``held`` shows that
+        very field holding the keyboard. Identity and keys only."""
+        decl = self._own_undo.get(threading.get_ident())
+        if decl is None or held is None or tool not in ("hotkey", "press"):
+            return False
+        keys, field = decl
+        given = tool_input or {}
+        if tool == "hotkey":
+            pressed = given.get("keys") if isinstance(given.get("keys"), (list, tuple)) else []
+        else:
+            times = given.get("times")
+            pressed = [given.get("key")] if times in (None, 1) else []
+        norm = tuple(" ".join(str(k).split()).casefold() for k in pressed if str(k or "").strip())
+        if norm != keys:
+            return False
+        if hwnd is not None and field[0] and int(hwnd) != int(field[0]):
+            return False
+        return held == field
+
+    def own_undo_now(self, tool: str, tool_input: dict[str, Any], target: dict[str, Any] | None) -> bool:
+        """gb (B2, contract K-U): :meth:`_own_undo_measured` with this step's own focus read, for a gate that judges a
+        run's steps without :meth:`_consent` (the ONE gate's ``skill_step``). ``False`` when nothing is declared on
+        this thread. Never raises."""
+        try:
+            if self._own_undo.get(threading.get_ident()) is None:
+                return False
+            raw = (target or {}).get("hwnd")
+            hwnd = int(raw) if raw is not None and str(raw).lstrip("-").isdigit() else None
+            held = self._field_ident(self._focus(timeout_s=self.TYPED_FOCUS_S))
+            return self._own_undo_measured(tool, dict(tool_input or {}), hwnd, held)
+        except Exception:  # noqa: BLE001 - unsure: not the run's own undo (the check as today)
+            return False
 
     def _consent(self, tool: str, tool_input: dict[str, Any], target: dict[str, Any] | None,
                  earlier: list[str] | None, *, force: bool = False) -> Any:
@@ -2007,10 +2164,18 @@ class Hands:
         raw = facts.get("hwnd")
         hwnd = int(raw) if raw is not None and str(raw).lstrip("-").isdigit() else None
         facts["hwnd"] = hwnd
-        now = time.monotonic()
-        self._typed_waiting = {h: at for h, at in self._typed_waiting.items() if now - at < self.TYPED_WAIT_S}
-        if hwnd is not None and hwnd in self._typed_waiting:
-            facts["typed_pending"] = True
+        # gb (B1): the field the type hand's own focus read named (RAM only; never a fact for the check)
+        typing_into = _as_field(facts.pop("field_ident", None))
+        # gb (B1, B2; contracts K-T, K-U): one focus read for this step, only where Yuki's text waits in its window or
+        # while this thread's run declared its own undo; what holds the keyboard now (a text field's identity)
+        declared = self._own_undo.get(threading.get_ident()) is not None and tool in ("hotkey", "press")
+        read, held = False, None
+        if hwnd is not None and (self._typed_live(hwnd) or declared):
+            snap = self._focus(timeout_s=self.TYPED_FOCUS_S)
+            read, held = snap is not None, self._field_ident(snap)
+        self._typed_facts(tool, tool_input, hwnd, facts, held, read)
+        if declared and self._own_undo_measured(tool, tool_input, hwnd, held):
+            facts["own_undo"] = True   # K-U: the run's own close of the field its own shortcut opened, held now
         try:
             verdict = one(tool, tool_input, facts, words=words, checker=self._checker(), earlier=before,
                           log=self._check_log)
@@ -2024,12 +2189,19 @@ class Hands:
             verdict = SimpleNamespace(allowed=True, decision="allow", question="", source="row3", handover=False,
                                       act_off="", row=3, why="join_words")
         if tool == "type_text" and hwnd is not None and getattr(verdict, "allowed", False):
-            self._typed_waiting[hwnd] = time.monotonic()   # Yuki's words will wait there, unsent
+            # Yuki's words will wait there, unsent: gb (B1) in the field the keyboard is in (the type hand's own read,
+            # else this step's, else one read now; ``None`` when none can be read: the window as a whole, as before)
+            if typing_into is None:
+                typing_into = held if read else self._field_ident(self._focus(timeout_s=self.TYPED_FOCUS_S))
+            self._note_typed(hwnd, typing_into)
         if self.log is not None:
+            # gb (B1, B2): the field facts as booleans only (never the field's name or role)
             self.log.event("consent", who="voice_hand", tool=tool, allowed=bool(getattr(verdict, "allowed", False)),
                            row=getattr(verdict, "row", None), source=getattr(verdict, "source", None),
                            handover=bool(getattr(verdict, "handover", False)), typed=bool(facts.get("typed_pending")),
-                           role_read=bool(facts.get("role")), join_grant=granted)
+                           typed_held=facts.get("typed_field_held"), typed_to=facts.get("typed_to_field"),
+                           own_undo=bool(facts.get("own_undo")), role_read=bool(facts.get("role")),
+                           join_grant=granted)
         return verdict
 
     def _join_granted(self, tool: str, tool_input: dict[str, Any], facts: dict[str, Any]) -> bool:
@@ -3877,10 +4049,12 @@ class Hands:
             line = self._code_line(name, args, facts)
             coded = bool(line)
         focus_line = " ".join(str(facts.get("focus_line") or "").split())
-        if confirmed and line and focus_line and name == "window" and op == "focus":
+        if confirmed and line and focus_line and ((name == "window" and op == "focus")
+                                                  or (name == "tab" and facts.get("app_other"))):
             # fa (A2, final-F multi_open_then_close_yt_tab: "YouTube's up in Chrome." when what came up was their own
             # paused video): a browser window brought up is said by code from the tab it shows now, never the model's
-            # line written before the act (a call with no line says it as its step line, below)
+            # line written before the act (a call with no line says it as its step line, below). gb (B5): so is a tab
+            # shown in a window that is not the app the call named (measured by program identity)
             line, coded = focus_line, True
         game = _game_trouble(facts)
         turn = self._call_safely(self.user_turn, None)
@@ -3982,6 +4156,8 @@ class Hands:
                               if isinstance(facts.get("names_match"), dict) else {}),
                            # integ27 (fd merge note 2): why a heard address stayed as given (a code word)
                            **({"names_miss": facts["names_miss"]} if isinstance(facts.get("names_miss"), str) else {}),
+                           # gb (B6): why the address bar did not open it (a code word)
+                           **({"bar_why": facts["bar_why"]} if isinstance(facts.get("bar_why"), str) else {}),
                            **{k: v for k, v in facts.items()
                               if (isinstance(v, (int, float, bool)) or v is None)
                               and k not in ("question", "request_id", "refused_why", "refused_at")})
@@ -6434,6 +6610,17 @@ class Hands:
                 # fa (A2): code's done line for a browser window brought up: the tab it shows (said instead of the
                 # model's line, written before the act: "YouTube's up" over their own video)
                 facts["focus_line"] = str(facts.get("step_line") or "") or self._step_line(name, args, facts)
+            named_app = " ".join(str(args.get("app") or "").split())
+            if name == "tab" and str(args.get("action") or "show") == "show" and named_app and ok \
+                    and facts.get("verified") is True and not self._of_app(facts.get("live_hwnd"), named_app):
+                # gb (B5, final-G2 kw_chrome_crashing_youtube): the window the tab came up in is not a window of the
+                # app the call named (by its program's identity): the model's line written before the act ("YouTube's
+                # up in Arc.") is never said; code's line says what came up, as fa (A2) does for a window brought up,
+                # and the result says it too
+                facts["app_other"] = True   # logged (a boolean)
+                facts["focus_line"] = str(facts.get("step_line") or "") or self._step_line(name, args, facts)
+                came = self._browser_app(int(facts.get("live_hwnd") or 0)) or "another app"
+                report = f"{report} (it came up in {came}'s window, not {named_app}'s)"
             return ok, report, facts
         except _Refused as exc:
             facts["refused"] = True  # nothing was done: the talker says why ...
@@ -7067,15 +7254,27 @@ class Hands:
         # 34-review H1/M1: the type hand never presses Enter, so plain words cannot send; a line break in them can
         # (Enter or Ctrl+Enter sends in most chats and mail): then Yuki's own check, with their heard words
         sends = "\r" in text or "\n" in text
+        # gb (B1): the field this read names goes to the consent rule's own bookkeeping (``brain = "all"`` only: never
+        # a fact for another gate)
+        field_now = self._field_ident(snap)
+        own_rule = self._on_brain() and one_now() is None
+        # Yuki's earlier unsent words already wait in that very field (a typing that sends nothing leaves them there)
+        had = str(hwnd).lstrip("-").isdigit() and any(f == field_now for _at, f in self._typed_live(int(hwnd)))
         verdict = self.authorize("type_text", {"hwnd": hwnd, "text": text},
                                  {"hwnd": hwnd, "app": facts.get("app"), "title": self._title_shown(hwnd),
-                                  "element": facts["target"]}, force=sends)
+                                  "element": facts["target"], **({"field_ident": field_now} if own_rule else {})},
+                                 force=sends)
         if verdict is not None and not getattr(verdict, "allowed", False):
             raise self._held_refusal(verdict)
         facts["sent_at"] = time.monotonic()
         outcome = self._dispatcher.dispatch("type_text", {"text": text, "expect_hwnd": hwnd})
         if self._on_brain() and str(hwnd).lstrip("-").isdigit():
-            self._typed_waiting[int(hwnd)] = time.monotonic()   # bTalk: Yuki's words wait there, unsent
+            # bTalk: Yuki's words wait there, unsent; gb (B1): in that field (none went out: no unsent mark, integ22)
+            if typed_none(outcome):
+                if not had:
+                    self._unnote_typed(int(hwnd), field_now)
+            else:
+                self._note_typed(int(hwnd), field_now)
         if outcome.ok and str(hwnd).lstrip("-").isdigit():
             # fMsg M1: a draft this hand typed is Yuki's own, so the message skill may replace it (hinglish); the window
             # alone (this hand can't say which chat), kept as a keyed digest in RAM only
@@ -7248,6 +7447,14 @@ class Hands:
         windows = [w for w in overview.get("windows") or [] if isinstance(w, dict) and w.get("hwnd") is not None]
         return app_windows(app, windows)
 
+    def _of_app(self, hwnd: Any, app: str) -> bool:
+        """gb (B5): whether window ``hwnd`` is one of the app named ``app`` by its program's identity
+        (:meth:`_windows_of`, names only, never a title). An unknown window is not. Never raises."""
+        try:
+            return hwnd is not None and int(hwnd) in self._windows_of(app)
+        except Exception:  # noqa: BLE001
+            return False
+
     def _no_app_window(self, app: str) -> _Refused:
         """The refusal for an app named that no window on the desk block is (kHands r1 L8): stale, so the thinker
         resolves it (a nickname, or open it), with the open apps' names for it; never "it isn't open" on a name."""
@@ -7275,8 +7482,8 @@ class Hands:
         """The windows a tab named by words is looked for in, nearest first (kHands r1 M3/M6): the browser named
         (``app``) first, the window given first among them when it is one; then the window given and its program's
         other windows, then the window in front and the rest as stacked, browsers only (:meth:`_is_browser`: a
-        terminal's or an editor's tabs are searched only in a window the talker gave). ``only_app`` (a close): the
-        browser named binds, none of the rest."""
+        terminal's or an editor's tabs are searched only in a window the talker gave). ``only_app`` (a close, and gb B4
+        a show given ``app``): the browser named binds, none of the rest."""
         with self._lock:
             overview = self.last.overview or {}
             front = self.last.foreground
@@ -7301,7 +7508,8 @@ class Hands:
     def _tab_args(self, args: dict[str, Any]) -> dict[str, Any]:
         """A tab hand's arguments with the tabs it acts on found (``_targets``: ``[(place, title, id, hwnd)]``), for show
         and close (kHands). A tab is named by their word for it (``named``, or ``title``: "YouTube", "aniwave"), looked
-        for in the windows :meth:`_search_order` gives (the browser named first; a close stays in it), each strip read
+        for in the windows :meth:`_search_order` gives (the browser named first; a close stays in it, and gb B4 a show
+        given ``app`` too: no match there is refused naming that browser), each strip read
         with every group (a pinned tab too): the first window with a tab whose title holds those words is the one
         (:func:`tabs_titled`). Several there: show brings up the one already showing among them, else the first (cheap
         and undone with a word: named by the step line); close asks which by title (:data:`_TAB_CHOOSE_NOTE`) unless
@@ -7378,7 +7586,11 @@ class Hands:
 
                 raise _Refused(refusal_text(game, "front"), reason="game")
         every = action == "close" and bool(args.get("every"))
-        order = self._search_order(hwnd, app, only_app=action == "close")
+        # gb (B4, final-G2 kw_chrome_crashing_youtube: "tab show YouTube app Arc" showed the user's Chrome tab and
+        # "YouTube's up in Arc." was said): a browser they named binds a show as it binds a close, by the windows'
+        # program identity; their tab in another browser is never the one shown for it
+        order = self._search_order(hwnd, app, only_app=action == "close" or bool(app))
+        within = self._browser_app(order[0]) if app and order else None   # the named browser's own name, for the words
         read: list[str] = []
         gathered: list[tuple[Any, int]] = []
         deadline = time.monotonic() + self.TAB_SEARCH_TOTAL_S
@@ -7430,17 +7642,24 @@ class Hands:
             out["window"] = gathered[0][1]
             out["_targets"] = [(t.index, t.name, getattr(t, "tab_id", "") or "", h) for t, h in gathered]
             return out
+        where = f" of {within}" if within else ""   # gb (B4): the browser they named, by its program's name
         if not read:
-            raise _Refused("no tab strip could be read in the windows looked at; nothing was done", stale=True,
+            raise _Refused(f"no tab strip could be read in the windows{where} looked at; nothing was done", stale=True,
                            reason="no_strip")
         if len(words.split()) > 1:
             # kHands r1 M4: words beyond the title's ("the aniwave", "the YouTube tab") match no title: given back once
             # with the titles read, so the next call names the tab by its title's own words (then the thinker)
             listed = "; ".join(f'"{n[:60]}"' for n in list(dict.fromkeys(read))[:12])
-            raise _Refused(f"no tab's title holds all the words in named; the tabs open: {listed}. If one of these is "
-                           f"the tab their words meant, call it again with named = the words of its title they said; "
-                           f"if none is, call it again exactly as before. Nothing was done", shape=True,
+            inside = f" in {within}" if within else ""
+            raise _Refused(f"no tab's title holds all the words in named; the tabs open{inside}: {listed}. If one of "
+                           f"these is the tab their words meant, call it again with named = the words of its title "
+                           f"they said; if none is, call it again exactly as before. Nothing was done", shape=True,
                            reason="no_match_words")
+        if within:
+            # gb (B4): no tab of theirs in the browser they named holds those words: said so, naming it; a tab of
+            # another browser is never shown in its place (it may be the very one they asked to get away from)
+            raise _Refused(f"no tab of {within}'s holds those words (only {within}'s windows were looked at, as they "
+                           f"named it); nothing was done", stale=True, reason="no_match")
         raise _Refused("no tab's title holds those words in the windows looked at; nothing was done", stale=True,
                        reason="no_match")
 
@@ -7698,6 +7917,10 @@ class Hands:
             # integ27 (fd merge note 2, D7): why a heard address stayed as given (the names measure's own code word,
             # ``names.MISS_WORDS``), for the hands' log line only
             facts["names_miss"] = str(details["names_miss"])[:20]
+        if isinstance(details.get("bar_why"), str) and details["bar_why"].replace("_", "").isalpha():
+            # gb (B6, final-G2 kw_chrome_crashing_youtube): why the browser's own address bar did not open it (didn't
+            # apply, wasn't called for, or how it ended: ``launch.BAR_WHY`` and its stages), for the hands' log only
+            facts["bar_why"] = details["bar_why"][:20]
         page = details.get("page") if isinstance(details.get("page"), dict) else {}
         hwnd = details.get("hwnd")
         stages = _stage_ms(details.get("timings_ms"))
@@ -8670,6 +8893,17 @@ def _element_parts(element: Any) -> tuple[str, str]:
     role = head.strip()
     name = rest[:rest.rindex('"')].strip()
     return ("" if role.casefold() in _NO_ROLE else role), name
+
+
+def _as_field(field: Any) -> tuple[int, int, str, str] | None:
+    """gb (B2): a field identity as a caller measured it (``yuki.skills.chat._field``: window, native window, role,
+    name) in :meth:`Hands._field_ident`'s form (whitespace folded), or ``None`` when it isn't one. Plumbing only."""
+    try:
+        window, native, role, name = field
+        return (int(window or 0), int(native or 0), " ".join(str(role or "").split()),
+                " ".join(str(name or "").split()))
+    except (TypeError, ValueError):
+        return None
 
 
 def _app_id(app: Any) -> str:

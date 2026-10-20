@@ -40,7 +40,10 @@ send check would refuse is refused before the chat opens.
   shortcut (the switcher or the search box opened; :func:`_run_switch`); otherwise nothing more is sent. chat19 (final
   test 19 Oct, RC1): a switcher run whose shortcut went out but that didn't finish closes what it opened with the app's
   own close key (``[chat] close``, on its own judged run: :func:`_tidy_switch`) and ends ``switcher_failed``; the chat
-  is never "opened" by the shortcut alone.
+  is never "opened" by the shortcut alone. gb (final-G2 R13): that close key goes as the run's own undo of the field
+  its own shortcut opened (contract K-U: Yuki's check is told so only while its focus read shows that field holding
+  the keyboard), and a switcher still holding the keyboard as the run ends (measured) ends ``switcher_held``, with
+  ``facts["switcher_held"]`` and why it stopped (``stopped``, a code word: contract K-S).
 
 **The keyboard in the composer** (chat19, :func:`_composer_focus`): before anything is typed, the opened chat's
 composer gets the keyboard: found by the app's own label for it (``[chat.labels.<lang>] composer``, Discord's
@@ -1143,16 +1146,46 @@ def _close_key(data: Mapping[str, Any]) -> list[str]:
     return [str(k) for k in data.get("close") or [] if str(k).strip()]
 
 
-def _close_own(call: RouteCall, hands: Any, data: Mapping[str, Any], *, apps: Sequence[str], key: str) -> str:
+def _close_own(call: RouteCall, hands: Any, data: Mapping[str, Any], *, apps: Sequence[str], key: str,
+               field: Sequence[Any] | None = None) -> str:
     """chat19: the app's own close key (:func:`_close_key`) on its own run (each key judged by Yuki's own check and the
     game gate like the switcher's, into the app's own window only), for a switcher or search this very run opened and
     did not finish. A code word: ``sent`` (the key went out), ``not_sent`` (refused, held or stopped), ``no_key`` (the
-    app's data has none: nothing is pressed)."""
+    app's data has none: nothing is pressed).
+
+    gb (B2, final-G2 R13; contract K-U, writer): ``field`` is the text field this run's own shortcut gave the keyboard
+    to, as this run measured it (:func:`_field`: window, native window, role, name). With hands that take it
+    (``hands.own_undo``, the voice hands), the close key is declared as the run's own undo of that field: Yuki's check
+    is told so only while its own focus read at that key shows that very field still holding the keyboard (the name
+    Yuki typed into the switcher's search is then this run's own act, never a message to send). ``None`` (no field was
+    seen opening): nothing is declared and the check reads the key as before."""
     keys = _close_key(data)
     if not keys:
         return "no_key"
-    _ok, facts = run_steps(hands, [{"do": "keys", "keys": keys}], words=call.ctx.words, apps=apps, key=key)
+    declare = getattr(hands, "own_undo", None) if field is not None else None
+    try:
+        scope = declare(keys=keys, field=tuple(field)) if callable(declare) else nullcontext()
+    except Exception:  # noqa: BLE001 - declared or not, the key is judged; never a run broken by it
+        scope = nullcontext()
+    with scope:
+        _ok, facts = run_steps(hands, [{"do": "keys", "keys": keys}], words=call.ctx.words, apps=apps, key=key)
     return "sent" if _dispatched(facts, "keys") else "not_sent"
+
+
+def _still_held(hands: Any, held_by: Sequence[Any] | None) -> bool | None:
+    """gb (B3): whether what this run's shortcut opened (``held_by``: its identity, :func:`_ident`) still holds the
+    keyboard now, by one focus read; ``None`` when that can't be told (nothing known to compare, or no read)."""
+    if held_by is None:
+        return None
+    now = _ident(_holder(hands))
+    return None if now is None else now == tuple(held_by)
+
+
+def _mark_held(run: dict[str, Any], hands: Any, held_by: Sequence[Any] | None) -> None:
+    """gb (B3, contract K-S, writer): ``run["switcher_held"]`` from :func:`_still_held` (left out when unknown)."""
+    held = _still_held(hands, held_by)
+    if held is not None:
+        run["switcher_held"] = held
 
 
 def _tidy_switch(call: RouteCall, hands: Any, data: Mapping[str, Any], run: dict[str, Any], *, apps: Sequence[str],
@@ -1169,34 +1202,46 @@ def _tidy_switch(call: RouteCall, hands: Any, data: Mapping[str, Any], run: dict
     text field (the opened chat's composer, a message being edited), and a close key there would land in the app's
     own field. ``run["switcher_closed"]``: ``yes`` / ``no`` (still held by what the shortcut opened) / ``unknown``
     (the focus can't be read) / ``unchanged`` (nothing opened) / ``already`` (it closed itself: nothing pressed) /
-    ``theirs`` / ``no_key`` / ``not_sent``."""
+    ``theirs`` / ``no_key`` / ``not_sent``.
+
+    gb (B2): the close key goes as the run's own undo of the field it opened (``opened``, :func:`_close_own`). gb (B3,
+    contract K-S): ``run["switcher_held"]`` (bool, measured by the focus read; left out when it can't be told, or when
+    the user took over): what the shortcut opened still holds the keyboard as the run ends."""
     if run.get("took_over_at"):
         run["switcher_closed"] = "theirs"
         return
     if _refused("keys"):
         run["switcher_closed"] = "not_sent"
+        _mark_held(run, hands, opened)
         return
     snap = _holder(hands)
     now = _ident(snap)
     if opened is None and before is not None and now is not None and now == before:
         run["switcher_closed"] = "unchanged"
+        run["switcher_held"] = False
         return
     if opened is not None and now is not None and now != tuple(opened) and (now == before or _is_field(snap)):
         run["switcher_closed"] = "already"
+        run["switcher_held"] = False
         return
     held_by = opened if opened is not None else now
-    sent = _close_own(call, hands, data, apps=apps, key=key)
+    sent = _close_own(call, hands, data, apps=apps, key=key, field=opened)
     if sent != "sent":
         run["switcher_closed"] = sent
+        _mark_held(run, hands, held_by)
         return
     deadline = call.ctx.clock() + SWITCHER_WAIT_S
     while True:
         after = _ident(_holder(hands))
         if after is not None and after != held_by:
             run["switcher_closed"] = "yes"
+            if held_by is not None:
+                run["switcher_held"] = False
             return
         if call.ctx.clock() + POLL_S > deadline:
             run["switcher_closed"] = "unknown" if after is None else "no"
+            if after is not None and held_by is not None:
+                run["switcher_held"] = True   # measured: what it opened still holds the keyboard after its close key
             return
         call.ctx.sleep(POLL_S)
 
@@ -1322,12 +1367,38 @@ def _board_refresh(hwnd: int) -> bool:
         return False
 
 
+def _other_chat(store: Any, tid: int | None, ids: set[int], person_id: int | None) -> dict[str, Any]:
+    """gb (B6, final-G2 R13's trigger lead: the deep link opened the right person's DM, yet the board's read named a
+    thread outside the route's ids): content-free facts of that read. ``other_ids``: how many thread ids the route
+    had; ``other_thread``: ``known`` (memory has a thread for the window in front) or ``unknown``; with the person's id
+    in memory's people index, ``other_same_person``: whether that thread is on one of that same person's own routes
+    (``contacts.contacts_of_threads``: identity), and ``other_holders``: how many of their people hold a route on it.
+    Counts and booleans only. Never raises."""
+    out: dict[str, Any] = {"other_ids": len(ids), "other_thread": "unknown" if tid is None else "known"}
+    if tid is None or person_id is None:
+        return out
+    try:
+        from yuki.memory import contacts as C
+
+        holders = {int(c.id) for c, _r in C.contacts_of_threads(store, [int(tid)]).get(int(tid), [])}
+        out["other_same_person"] = int(person_id) in holders
+        out["other_holders"] = len(holders)
+    except Exception:  # noqa: BLE001 - the counts alone
+        pass
+    return out
+
+
+#: gb (B6): the content-free facts :func:`_other_chat` adds to an ``other_chat`` read, carried to the route's facts.
+OTHER_CHAT_FACTS = ("other_ids", "other_thread", "other_same_person", "other_holders")
+
+
 def chat_state(store: Any, thread_ids: Sequence[int], data: Mapping[str, Any], since: float,
-               board: Mapping[str, Any] | None) -> tuple[bool | None, dict[str, Any]]:
+               board: Mapping[str, Any] | None, *, person_id: int | None = None) -> tuple[bool | None, dict[str, Any]]:
     """Whether the chat with these capture threads is open now: memory's read of the window in front (read after
     ``since``, with a chat scope or an address) is one of them -> True; another chat or view of the same app in front
     -> False; else one of the threads read since -> True; else None. Identity by keyed digests of the chat's scope or
-    address (``Store.find_thread``), never a window title."""
+    address (``Store.find_thread``), never a window title. gb (B6): an ``other_chat`` read carries
+    :func:`_other_chat`'s content-free facts (``person_id``: the person the route is for, when one is)."""
     ids = {int(t) for t in thread_ids or []}
     if not ids:
         return None, {"status": "no_threads"}
@@ -1354,7 +1425,7 @@ def chat_state(store: Any, thread_ids: Sequence[int], data: Mapping[str, Any], s
                 tid = None
             if tid is not None and int(tid) in ids:
                 return True, {"by": "board"}
-            return False, {"by": "board", "status": "other_chat"}
+            return False, {"by": "board", "status": "other_chat", **_other_chat(store, tid, ids, person_id)}
     else:
         ev["board"] = "none"
     marks = ",".join("?" * len(ids))
@@ -1369,11 +1440,11 @@ def chat_state(store: Any, thread_ids: Sequence[int], data: Mapping[str, Any], s
     return None, ev
 
 
-def _wait_chat(call: RouteCall, data: Mapping[str, Any], route: ChatRoute, since: float, hwnd: int
-               ) -> tuple[bool | None, dict[str, Any]]:
+def _wait_chat(call: RouteCall, data: Mapping[str, Any], route: ChatRoute, since: float, hwnd: int,
+               person_id: int | None = None) -> tuple[bool | None, dict[str, Any]]:
     """:func:`chat_state` read every :data:`POLL_S` for at most :data:`CHAT_WAIT_S` (only while this skill waits),
     asking the watcher once to read the window again. Ends at the first "open"; else the last read's word (a "no" only
-    if the window still shows another chat at the end)."""
+    if the window still shows another chat at the end). ``person_id``: gb (B6), for the ``other_chat`` read's facts."""
     from yuki.skills.engine import _mem, _store_of
 
     ctx = call.ctx
@@ -1384,7 +1455,8 @@ def _wait_chat(call: RouteCall, data: Mapping[str, Any], route: ChatRoute, since
     while True:
         board = _board_now()
         got = _mem(ctx.memory, "chat_state",
-                   lambda c: chat_state(_store_of(c), route.thread_ids, data, since, board), timeout_s=0.8)
+                   lambda c: chat_state(_store_of(c), route.thread_ids, data, since, board, person_id=person_id),
+                   timeout_s=0.8)
         verdict, ev = got if isinstance(got, tuple) else (None, {"status": "unread"})
         if verdict is True:
             return verdict, ev
@@ -1736,8 +1808,10 @@ def _composer_focus(call: RouteCall, app: str, data: Mapping[str, Any], route: C
         if closed or own_field is None or _ident(holder) != tuple(own_field):
             return _Keyboard(False, how, holder)
         # the switcher this very run opened still holds the keyboard (its open key went and the chat showed, but it
-        # stayed): closed with the app's own close key, then the composer once more
-        if _close_own(call, hands, data, apps=list(data.get("images") or []), key="message") != "sent":
+        # stayed): closed with the app's own close key (gb B2: as the run's own undo of that field), then the composer
+        # once more
+        if _close_own(call, hands, data, apps=list(data.get("images") or []), key="message",
+                      field=own_field) != "sent":
             return _Keyboard(False, "own_left", holder)
         closed = True
 
@@ -1785,10 +1859,15 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     send = send and not as_draft
     name = target.name
     where = _where(call.values, app)
-    chat, ev = _wait_chat(call, data, route, since, hwnd)
+    person_id = getattr(target, "id", None) if not getattr(target, "place", False) else None
+    chat, ev = _wait_chat(call, data, route, since, hwnd, person_id=person_id)
     facts: dict[str, Any] = {"via": via, "chat": {True: "open", False: "other", None: "unknown"}[chat],
                              "by": str(ev.get("by") or ev.get("board") or ev.get("status") or ""),
                              "mode": "send" if send else ("draft" if text else "open")}
+    if chat is False:
+        # gb (B6, final-G2 R13's trigger lead): what the "another chat" read was, content-free (counts, booleans and a
+        # code word), for the route's logged facts
+        facts.update({k: ev[k] for k in OTHER_CHAT_FACTS if k in ev})
     if as_draft:
         facts["as_draft"] = "sound_alike"
     ram: dict[str, Any] = {"app": app, "thread_ids": list(route.thread_ids), "chat": chat}
@@ -1816,6 +1895,10 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
         keyboard.stop.facts_ram = {**ram, "typed": False, "pressed": False}
         return keyboard.stop
     if not keyboard.ok:
+        if keyboard.how == "own_left":
+            # gb (B3, contract K-S): this run's own switcher was left holding the keyboard (its close key didn't go):
+            # measured once more, for the hand-off
+            _mark_held(facts, call.ctx.hands, own_field)
         return _not_typed(call, app, name, hwnd, facts, ram, keyboard.holder, read=False)
     # The composer is read before anything is typed (review r1 L6, r2 H1), the field's own text (never the caret
     # context, fMsg). Exactly these words already there (a draft Yuki typed on an earlier run whose send key was held,
@@ -2013,23 +2096,69 @@ def route_switcher(call: RouteCall) -> RouteResult:
         stop.facts.update(tidy)
         return stop
     if run.get("switcher") == "unseen":
-        # review r1 L1: the shortcut went but no other field took the keyboard: nothing typed, nothing sent
-        return RouteResult(ran=False, outcome="switcher_unseen", facts=tidy)
+        # review r1 L1: the shortcut went but no other field took the keyboard: nothing typed, nothing sent (gb B3:
+        # ``switcher_held`` when what it opened still holds the keyboard, measured)
+        return RouteResult(ran=False, outcome=_switch_outcome(run, "switcher_unseen"), facts=tidy)
     if not run.get("finished"):
         # chat19 (RC1): never on to the chat with only part of the switcher done (the shortcut alone counted before,
         # and the chat already on screen passed for the one opened while the switcher kept the keyboard); what it
-        # opened was closed (:func:`_tidy_switch`), nothing typed, nothing sent
-        return RouteResult(ran=False, outcome="switcher_failed", facts=tidy)
+        # opened was closed (:func:`_tidy_switch`), nothing typed, nothing sent. gb (B3, contract K-S): one its close
+        # key did not close ends ``switcher_held`` (measured), so the hand-off knows the switcher holds the keyboard
+        return RouteResult(ran=False, outcome=_switch_outcome(run, "switcher_failed"), facts=tidy)
     return _after_open(call, app, data, target, route, via="switcher", since=since, hwnd=hwnd, as_draft=as_draft,
                        own_field=run.get("switcher_field"))
 
 
 def _switch_facts(run: Mapping[str, Any], steps: Sequence[Any]) -> dict[str, Any]:
-    """A switcher run's content-free facts: its steps, how many went, and (chat19) whether what it opened was closed."""
+    """A switcher run's content-free facts: its steps, how many went, and (chat19) whether what it opened was closed.
+
+    gb (B3, final-G2 R13; contract K-S, writer): ``switcher_held`` (bool, measured: what this run's shortcut opened
+    still holds the app's keyboard as the run ends; left out when it can't be told) and, for a run that stopped before
+    its last step, ``stopped``: why, as a code word (:func:`_stop_word`)."""
     out: dict[str, Any] = {"steps": len(steps), "steps_done": int(run.get("steps_done") or 0)}
     if run.get("switcher_closed"):
         out["switcher_closed"] = str(run["switcher_closed"])
+    if isinstance(run.get("switcher_held"), bool):
+        out["switcher_held"] = run["switcher_held"]
+    word = _stop_word(run)
+    if word:
+        out["stopped"] = word
     return out
+
+
+def _stop_word(run: Mapping[str, Any]) -> str:
+    """gb (B3; final-G2 R13: "the Enter never reached consent ... the cause is not logged"): why a switcher run stopped
+    before its last step, as a code word from the step runner's own facts (``uia_route.SkillRunner``):
+    ``refused_steps``, ``taken_over``, ``act_off``, ``to_planner``, ``held``, the runner's deviation (``blind``: no key
+    after a step whose effect couldn't be seen; ``no_effect``, ``failed``, ``window``, ``no_focus``, ``dialog`` ...),
+    the switcher's own word (``unseen``, ``composer``, ``closed_own``) or ``unknown``; ``""`` for a run that finished.
+    Content-free."""
+    if run.get("finished"):
+        return ""
+    if run.get("refused_steps"):
+        return "refused_steps"
+    if run.get("took_over_at"):
+        return "taken_over"
+    if run.get("act_off"):
+        return "act_off"
+    if run.get("to_planner"):
+        return "to_planner"
+    if run.get("held"):
+        return "held"
+    dev = run.get("deviation")
+    if isinstance(dev, str) and dev and dev.replace("_", "").isalpha():
+        return dev[:20]
+    switcher = run.get("switcher")
+    if switcher in ("unseen", "composer", "closed_own"):
+        return str(switcher)
+    return "unknown"
+
+
+def _switch_outcome(run: Mapping[str, Any], word: str) -> str:
+    """gb (B3, contract K-S): a switcher run that ends with what its own shortcut opened still holding the app's
+    keyboard (measured, ``run["switcher_held"]``) ends ``switcher_held``, so the rungs tried (the hand-off's seed, the
+    talker's evidence) say so in code; otherwise its own word (``switcher_unseen`` / ``switcher_failed``)."""
+    return "switcher_held" if run.get("switcher_held") is True else word
 
 
 def _switch_steps(call: RouteCall, data: Mapping[str, Any], route: ChatRoute) -> tuple[list[dict[str, Any]], str]:
@@ -2439,10 +2568,11 @@ def route_voice_join(call: RouteCall) -> RouteResult:
         return stop
     if run.get("switcher") == "unseen":
         # review r1 L1: the switcher never took the keyboard: the channel's name is never typed into a chat
-        return RouteResult(ran=False, outcome="switcher_unseen", facts=tidy)
+        return RouteResult(ran=False, outcome=_switch_outcome(run, "switcher_unseen"), facts=tidy)
     if not run.get("finished"):
-        # chat19 (RC1): a switcher left partway is closed by its own run (:func:`_tidy_switch`); no Join pressed
-        return RouteResult(ran=False, outcome="switcher_failed", facts=tidy)
+        # chat19 (RC1): a switcher left partway is closed by its own run (:func:`_tidy_switch`); no Join pressed (gb
+        # B3: ``switcher_held`` when its close key did not close it, measured)
+        return RouteResult(ran=False, outcome=_switch_outcome(run, "switcher_failed"), facts=tidy)
     return join_tail(call, data, app, hwnd, image, before, name, {"steps_done": done})
 
 
