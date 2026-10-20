@@ -118,7 +118,8 @@ def _first_sentence(text: Any, limit: int) -> str:
 def sessions(store: Any, since: float, until: float, *, now: float | None = None,
              channels: bool = False) -> list[dict[str, Any]]:
     """The call sessions overlapping ``[since, until)`` (``yuki.memory.callspans.merged_calls``), oldest first:
-    ``{"app", "kind" (call | game), "start", "end", "ongoing", "place", "voice", "people"}``. ``place``: where it was
+    ``{"app", "process", "kind" (call | game), "start", "end", "ongoing", "place", "voice", "people"}``. ``process``:
+    the call app's program key (the calls table's own, as ``callspans`` merges by it); ``place``: where it was
     as the call's digest read the screen ("Discord, #lofi lounge voice"; the older digests' free text as it is), empty
     when that says no more than the app; ``voice``: the digest marked the place a voice channel; ``people``: the names
     seen on it, strongest first. ``channels``: each row also says the voice channel it was in (``channel``:
@@ -145,9 +146,9 @@ def sessions(store: Any, since: float, until: float, *, now: float | None = None
             people = [p["name"] for p in merge_people(*(c.get("people") or [] for c in contexts))]
         except Exception:  # noqa: BLE001
             people = []
-        row = {"app": app, "kind": str(sp.get("kind") or "call"), "start": float(sp["start"]),
-               "end": float(sp["end"]), "ongoing": bool(sp.get("ongoing")), "place": place, "voice": voice,
-               "people": people}
+        row = {"app": app, "process": str(sp.get("process") or ""), "kind": str(sp.get("kind") or "call"),
+               "start": float(sp["start"]), "end": float(sp["end"]), "ongoing": bool(sp.get("ongoing")),
+               "place": place, "voice": voice, "people": people}
         if channels:
             row["channel"] = channel_of(contexts, pool)
         out.append(row)
@@ -474,17 +475,54 @@ def _episode_rows(client: Any, since: float, until: float) -> list[dict[str, Any
     return out
 
 
-def _apps_in(rows: list[Any], since: float, until: float, n: int) -> list[tuple[str, float]]:
+def _in_calls(rows: list[Any], since: float, until: float, calls: list[dict[str, Any]]) -> Counter[str]:
+    """fe (final-F E3, q_yesterday_evening: "then a 25-minute meeting" on top of the Discord call it was): the present
+    time in ``[since, until)`` of each meeting activity (the timeline's own ``meeting`` rows, by its aggregate key)
+    that a call session covers: a meeting row of the call app's own program (the process key ``callspans`` merges a
+    call by, the rule of its ``in_front_s``) inside that call's span. Those are the call's minutes, said on its call
+    line. Identity of programs and times only, never a label's words. ``{}`` when nothing is covered."""
+    covered: Counter[str] = Counter()
+    try:
+        from yuki.memory.store import app_key
+        from yuki.memory.timeline import aggregate
+
+        for c in calls or ():
+            process = str(c.get("process") or "")
+            lo, hi = max(since, float(c["start"])), min(until, float(c["end"]))
+            if not process or hi <= lo:
+                continue
+            own = [r for r in rows if r.meeting and (r.process or app_key(r.app) or "") == process]
+            if not own:
+                continue
+            for item in aggregate(own, lo, hi, "site", titles=0).get("items") or []:
+                if item.get("meeting"):
+                    covered[str(item.get("key") or "")] += float(item.get("present_s") or 0.0)
+    except Exception:  # noqa: BLE001 - nothing folded: the activities as the timeline groups them
+        return Counter()
+    return covered
+
+
+def _apps_in(rows: list[Any], since: float, until: float, n: int,
+             calls: list[dict[str, Any]] | None = None) -> list[tuple[str, float]]:
     """The activities with most present time in ``[since, until)`` (the timeline's own aggregate, by site: a web page
-    counts as its site, any other window as its app)."""
+    counts as its site, any other window as its app). ``calls``: the call sessions of that time; a meeting activity's
+    minutes that one of them covers are folded into that call (:func:`_in_calls`): only what is left of it counts."""
     try:
         from yuki.memory.timeline import aggregate
 
-        agg = aggregate(rows, since, until, "site", limit=n + 2)
+        agg = aggregate(rows, since, until, "site", titles=0)
     except Exception:  # noqa: BLE001
         return []
-    return [(str(i.get("label") or ""), float(i.get("present_s") or 0.0)) for i in agg.get("items") or []
-            if i.get("label") and float(i.get("present_s") or 0.0) >= PART_APP_MIN_S][:n]
+    covered = _in_calls(rows, since, until, calls or []) if calls else Counter()
+    out = []
+    for i in agg.get("items") or []:
+        seconds = float(i.get("present_s") or 0.0)
+        if i.get("meeting"):
+            seconds -= covered.get(str(i.get("key") or ""), 0.0)
+        if i.get("label") and seconds >= PART_APP_MIN_S:
+            out.append((str(i.get("label") or ""), seconds))
+    out.sort(key=lambda a: -a[1])
+    return out[:n]
 
 
 def parts(client: Any, store: Any, since: float, until: float, *, episodes: int = PART_EPISODES,
@@ -512,7 +550,8 @@ def parts(client: Any, store: Any, since: float, until: float, *, episodes: int 
         if not summaries:
             shown = [{k: v for k, v in e.items() if k != "summary"} for e in shown]
         part_calls = [c for c in calls if start <= max(c["start"], lo) < end]
-        used = _apps_in(rows, start, end, apps) if rows else []
+        # E3: a meeting's minutes under a call (one that began in an earlier part too) are that call's
+        used = _apps_in(rows, start, end, apps, calls) if rows else []
         if not (shown or part_calls or used):
             continue
         out.append({"date": date, "part": name, "start": start, "end": end, "so_far": going,
@@ -532,10 +571,20 @@ def day_start(now: float) -> float:
     return day_boundary(user_day(now))
 
 
+def of_day(calls: list[dict[str, Any]], start: float) -> list[dict[str, Any]]:
+    """fe (final-F E1, q_discord_today at Tue 03:12: "on a call with ... till about 4", the Sunday-night call that
+    ran to Mon 04:18, 18 minutes into Monday's day, said as today's): the calls of the user's day that began at
+    ``start``: each one that began in it (the day a call belongs to is the day it started in, the rule :data:`PARTS`
+    keeps for the night), and one still going now, which they are on in their day whenever it began (its start is
+    dated where it is said). A call that only ended in it belongs to the day before. Pure."""
+    return [c for c in calls or [] if float(c.get("start") or 0.0) >= start or c.get("ongoing")]
+
+
 def digest(client: Any, *, now: float | None = None, hours: float = DIGEST_HOURS) -> dict[str, Any]:
     """The talker's digest of the user's days at ``now`` (see the module docstring): ``{"now", "day_start", "parts",
-    "people", "chats", "calls_today", "voice", "usuals", "ms"}``, each read on its own (a failed one is empty). Plain
-    rows; ``yuki.voice.recall.digest_view`` words it. Never raises."""
+    "people", "chats", "calls_today", "voice", "usuals", "ms"}``, each read on its own (a failed one is empty).
+    ``calls_today``: the calls of their day so far by the day each began in (:func:`of_day`). Plain rows;
+    ``yuki.voice.recall.digest_view`` words it. Never raises."""
     now = time.time() if now is None else float(now)
     started = time.perf_counter()
     store = getattr(client, "store", client)
@@ -548,7 +597,8 @@ def digest(client: Any, *, now: float | None = None, hours: float = DIGEST_HOURS
     for key, read in (("parts", lambda: parts(client, store, now - hours * 3600.0, now, now=now)),
                       ("voice", lambda: voice_usual(store, now)),
                       ("usuals", lambda: usuals(store, now)),
-                      ("calls_today", lambda: sessions(store, out["day_start"], now, now=now))):
+                      ("calls_today", lambda: of_day(sessions(store, out["day_start"], now, now=now),
+                                                     out["day_start"]))):
         try:
             out[key] = read()
         except Exception:  # noqa: BLE001 - that part is left out
@@ -592,5 +642,5 @@ def day_report(client: Any, day: str, part: str | None = None, *, now: float | N
             "chats": talked["chats"], "found": found}
 
 
-__all__ = ["DIGEST_HOURS", "PARTS", "day_report", "day_start", "digest", "parts", "people_between", "sessions",
-           "usuals", "voice_usual"]
+__all__ = ["DIGEST_HOURS", "PARTS", "day_report", "day_start", "digest", "of_day", "parts", "people_between",
+           "sessions", "usuals", "voice_usual"]
