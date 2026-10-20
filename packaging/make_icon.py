@@ -347,7 +347,9 @@ def installer_images(out_dir: Path = INSTALLER_DIR, browser: str | None = None) 
              for w, h in WIZARD]
     specs += [{"file": f"wizard-small-{s}.bmp", "w": s, "h": s, "win": s * SPLASH_PITCH / px, "cx": PLANET_CENTRE[0],
                "cy": PLANET_CENTRE[1], "text": False} for s, px in WIZARD_SMALL.items()]
-    res = browser_run({"kind": "installer", "images": specs, "set": "mint", "palette": INSTALLER_PALETTE},
+    # (20 Oct: the splash's own 'ember' set now that dots.js and planet-splash.js carry it; the palette still pins
+    # the colours, so the images stay the same)
+    res = browser_run({"kind": "installer", "images": specs, "set": "ember", "palette": INSTALLER_PALETTE},
                       [WEB_DIR / "dots.js", WEB_DIR / "planet-splash.js"], browser)
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []

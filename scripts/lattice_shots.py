@@ -356,12 +356,10 @@ def cards() -> list[tuple]:
                  "text": "Two hours at the planner without a break. Stand up for five minutes?"})
     out.append(("card-nudge", c, "card", "bottom"))
     r = ReturnCard()
+    # (20 Oct: the card's current show_run: rows and took; the older changed / learned / cost arguments are gone)
     r.show_run(title="Renamed 12 exports in the planner.", at="21:31",
-               changed=["Renamed 12 files in Documents/Planner to start with their date"],
-               needs="Nothing. The backup runs tonight.",
-               learned={"id": "pb:3", "text": "Next time I’ll rename in the planner itself, not in Explorer.",
-                        "why": "Renaming in Explorer broke the planner’s links twice before it worked."},
-               cost="1 min 9 s · 8 steps · 54¢", linger_ms=60_000)
+               rows=[{"text": "Renamed 12 files in Documents/Planner to start with their date", "icon": "check"}],
+               needs="Nothing. The backup runs tonight.", took="1 min 9 s", linger_ms=60_000)
     r.hide()
     out.append(("card-return", r, "card", "bottom"))
     k = CallConsentCard()

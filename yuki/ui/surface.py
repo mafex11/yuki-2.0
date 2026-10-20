@@ -54,7 +54,7 @@ SLIDE_PX = 6
 
 
 def accent_color() -> QColor:
-    """The user's accent (``ui.json`` ``accent``: olive green by default, or orange)."""
+    """The user's accent (``ui.json`` ``accent``: ember orange by default since 20 Oct, or mint)."""
     from yuki.ui.window.theme import theme
 
     return QColor(theme().accent)

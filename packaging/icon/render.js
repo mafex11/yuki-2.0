@@ -55,16 +55,17 @@
     if (!P) return;
     const D = window.YukiDots;
     if (P.col) Object.assign(D.COL, P.col);
-    if (P.ramp) D.RAMPS[J.set || 'mint'].c = P.ramp.slice();
+    if (P.ramp) D.RAMPS[J.set || 'ember'].c = P.ramp.slice();
   }
   /* one image: { name, w, h, win (layout px across the width), cx, cy (the layout point at its centre), name: bool } */
   function crop(spec) {
     const PS = window.PlanetSplash, k = spec.w / spec.win, REF = PS.REF;
-    const bg = (J.palette && J.palette.bg) || '#0B0B0C';
+    // (20 Oct: without a palette, the splash's own defaults: the umber ground and the ember set)
+    const bg = (J.palette && J.palette.bg) || '#090705';
     const big = document.createElement('canvas');
     // the whole 520 x 300 layout at k pixels per layout px, plus room above and below for a tall image
     const lh = Math.max(REF.h, spec.h / k);
-    PS.still(big, { width: REF.w, height: lh, scale: k, name: spec.text !== false, colorSet: J.set || 'mint', background: bg });
+    PS.still(big, { width: REF.w, height: lh, scale: k, name: spec.text !== false, colorSet: J.set || 'ember', background: bg });
     const cx = spec.cx * k, cy = (spec.cy + (lh - REF.h) / 2) * k;
     const x0 = Math.round(cx - spec.w / 2), y0 = Math.round(cy - spec.h / 2);
     const cv = document.createElement('canvas');
