@@ -3802,15 +3802,21 @@ def _fullscreen(hwnd: int, name: str, details: dict, finish) -> ActionResult:  #
 
     Live 2026-09-29 "make Warp full screen" was answered "Warp's full screen" after a maximize: maximized is not
     full screen. ``ok`` only when full screen was observed; otherwise the report says what the window is now.
+    fa (A4): full screen is an ask to see the window: it comes to the front first (gated: :func:`focus_window`), and
+    ``ok`` also needs it in view after (:func:`_in_view`: in front, and enough of it seen), already full screen too.
     """
     details["was_fullscreen"] = _is_fullscreen(hwnd)
-    if details["was_fullscreen"]:
-        return finish(True, f"{name} is already full screen", details)
     if _user32.GetForegroundWindow() != hwnd:
         focused = focus_window(hwnd)
         if not getattr(focused, "ok", False):
-            return finish(False, f"{name}: could not bring it to the front for its full-screen key: "
+            return finish(False, f"{name}: could not bring it to the front"
+                                 f"{'' if details['was_fullscreen'] else ' for its full-screen key'}: "
                                  f"{getattr(focused, 'summary', '')}", details)
+    if details["was_fullscreen"]:
+        behind = _in_view(hwnd, details)
+        if behind:
+            return finish(False, f"{name} is already full screen, but {behind}", details)
+        return finish(True, f"{name} is already full screen", details)
     from yuki.actions.input import hotkey
 
     pressed = hotkey("f11", expect_hwnd=hwnd)
@@ -3821,6 +3827,9 @@ def _fullscreen(hwnd: int, name: str, details: dict, finish) -> ActionResult:  #
     while not _is_fullscreen(hwnd) and time.monotonic() < deadline:
         time.sleep(_POLL_S)
     if _is_fullscreen(hwnd):
+        behind = _in_view(hwnd, details)   # fa (A4): verified by front and visible share too
+        if behind:
+            return finish(False, f"{name} is now full screen (F11), but {behind}", details)
         return finish(True, f"{name} is now full screen (F11)", details)
     now = "maximized, not full screen" if _is_zoomed(hwnd) else "not full screen"
     return finish(False, f"{name}: pressed F11, still {now} after {_FULLSCREEN_WAIT_S:g} s (this app may use its "
@@ -3858,6 +3867,63 @@ def _asks_before_closing(hwnd: int) -> bool:
         return False
 
 
+def _asking_window(hwnd: int, before: set[int] | frozenset[int] = frozenset()) -> int:
+    """fa (A1): the window a window asked to close is asking with: one it owns that was not up before the close
+    (``before``: ``tabs.windows_before`` read right before it), in front or a user window, else (review M2) one of its
+    process new and in front (``tabs.raised_window``); ``0`` when none is known (the close is then reported asking, as
+    before, with no window named: the hands stop on ``asking`` either way). Window facts only; never raises."""
+    try:
+        from yuki.actions.tabs import raised_window
+
+        return int(raised_window(int(hwnd), before) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+#: fa (A4, final-F p1_dt_asked_place_maximize_spotify: "Spotify's maximized." while it sat behind Chrome, share 0): a
+#: window asked to be maximised, restored or made full screen is in view when it is in front (the one front rule,
+#: ``situation.front_window``) and at least this share of it is seen (the occlusion grid's share, 0..1).
+_SHOWN_SHARE = 0.5
+
+
+def _shown(hwnd: int) -> tuple[bool, float | None, int]:
+    """fa (A4): ``(in front, visible share or None when unread, the window in front)`` of ``hwnd`` now: the one front
+    rule (``situation.front_window``: an unlisted foreground stands for the listed window holding the keyboard or its
+    owner) and the occlusion grid's share (``visibility.layout``). Read-only; never raises."""
+    try:
+        from yuki.perception.situation import front_window
+
+        front = int(front_window()[0] or 0)
+    except Exception:  # noqa: BLE001
+        front = int(_user32.GetForegroundWindow() or 0)
+    share: float | None = None
+    try:
+        from yuki.perception.visibility import layout
+
+        surface = layout().by_hwnd(int(hwnd))
+        share = float(surface.visible_share) if surface is not None else 0.0
+    except Exception:  # noqa: BLE001 - not read: the front alone decides
+        share = None
+    return front == int(hwnd), share, front
+
+
+def _in_view(hwnd: int, details: dict) -> str:
+    """fa (A4): ``""`` when ``hwnd`` is in view (:func:`_shown`), else the measured words of where it is (behind the
+    window in front, the share of it seen); the facts go in ``details`` (``front``, ``visible``: numbers only)."""
+    front, share, now = _shown(hwnd)
+    details["front"], details["visible"] = front, (round(share, 3) if share is not None else None)
+    if front and (share is None or share >= _SHOWN_SHARE):
+        return ""
+    details["behind"] = True
+    if front:
+        # fa review L2: in front by the one front rule, but too little of it is seen (another window over it)
+        return f"it is in front with only {int(round((share or 0.0) * 100))}% of it visible"
+    info = window_info(now) if now and now != int(hwnd) else None
+    over = f" behind {info.process_name}" if info is not None else ""
+    seen = f" ({int(round((share or 0.0) * 100))}% of it visible)" if share is not None else ""
+    return f"it is not in view: it is{over or ' not in front'}{seen}"
+
+
 def window_action(hwnd: int, action: str) -> ActionResult:
     """Minimize, maximize, restore, close or focus one top-level window, and verify it happened.
 
@@ -3869,6 +3935,12 @@ def window_action(hwnd: int, action: str) -> ActionResult:
     is True only when the new state was observed, so the summary is the effect,
     not the request: "Discord.exe "..." is now minimized", or "... asked to close;
     it is asking something first" (a dialog of its own in front), or "still open after 8 s".
+
+    fa (A4): ``maximize``, ``restore`` and ``fullscreen`` are asks to see the window: it is brought to the front first
+    (:func:`focus_window`, gated), and ``ok`` needs it in view afterwards too (in front by the one front rule, and at
+    least :data:`_SHOWN_SHARE` of it seen: ``details["front"]``, ``["visible"]``, ``["behind"]``); a window left behind
+    another is reported where it is, never as done. fa (A1): a close the window asks about first carries the asking
+    window's id (``details["dialog_raised"]``).
     """
     started = time.perf_counter()
 
@@ -3909,6 +3981,10 @@ def window_action(hwnd: int, action: str) -> ActionResult:
         return _fullscreen(hwnd, name, details, finish)
     if action == "close":
         was_cloaked = _is_cloaked(hwnd)
+        from yuki.actions.tabs import windows_before
+
+        # fa (A1, review M2): its own windows and its process's before, so the one the close raises is told
+        owned_before = windows_before(hwnd)
         win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
         # percFix: live 5 Oct Arc took longer than 2 s to close and was reported "still open" (it had closed a few
         # seconds later). The wait is longer now, and it ends at once on what "it is asking something" looks like:
@@ -3933,16 +4009,36 @@ def window_action(hwnd: int, action: str) -> ActionResult:
         details["close_waited_s"] = waited
         if asking:
             details["asking"] = True
+            # fa (A1): the window it asks with, by id (the commit check's measured fact that the close raised it)
+            details["dialog_raised"] = _asking_window(hwnd, owned_before) or None
+            if details["dialog_raised"]:
+                from yuki.actions.tabs import note_raised
+
+                note_raised(int(details["dialog_raised"]), int(hwnd))
             return finish(False, f"{name}: asked to close; it is asking something first (a dialog of its own is in "
-                                 f"front)", details)
+                                 f"front). Nothing in it was answered: what it asks is theirs to answer", details)
         return finish(False, f"{name}: asked to close, still open after {_CLOSE_WAIT_S:g} s", details)
 
     def reached() -> bool:
         iconic, zoomed = bool(win32gui.IsIconic(hwnd)), bool(_is_zoomed(hwnd))
         return {"minimize": iconic, "maximize": zoomed and not iconic, "restore": not iconic and not zoomed}[action]
 
-    already = reached()
-    if not already:
+    state = {"minimize": "minimized", "maximize": "maximized", "restore": "restored"}[action]
+    shows = action in ("maximize", "restore")
+    already = reached()   # before any front step: a minimised window the focus restores was not "already" restored
+    if shows and _user32.GetForegroundWindow() != hwnd:
+        # fa (A4, final-F one p1_dt_asked_place_maximize_spotify: ShowWindow from a background process maximised Spotify
+        # behind Chrome and it was said as done): maximize and restore are asks to see the window, so it comes to the
+        # front first, through the gated focus (a game in front, or into a game, refuses it there); nothing else is
+        # done when it can't
+        focused = focus_window(hwnd)
+        if not getattr(focused, "ok", False):
+            fdetails = getattr(focused, "details", None) or {}
+            if fdetails.get("refused"):
+                details["refused"] = fdetails["refused"]
+            return finish(False, f"{name}: could not bring it to the front to be {state}: "
+                                 f"{getattr(focused, 'summary', '')}; nothing else was done", details)
+    if not reached():
         command = _SHOW_COMMANDS[action]
         if action == "minimize" and _gamegate.game_in_front():
             command = win32con.SW_SHOWMINNOACTIVE   # D17: minimised without activating the next window over the game
@@ -3950,14 +4046,17 @@ def window_action(hwnd: int, action: str) -> ActionResult:
     deadline = time.monotonic() + _STATE_WAIT_S
     while not reached() and time.monotonic() < deadline:
         time.sleep(_POLL_S)
-    state = {"minimize": "minimized", "maximize": "maximized", "restore": "restored"}[action]
     if reached():
         front = _user32.GetForegroundWindow() == hwnd
         # Maximized is not full screen (v3.13): the report says which it is, so neither voice claims the other.
         full = " and full screen" if action == "maximize" and _is_fullscreen(hwnd) else (
             " (not full screen)" if action == "maximize" else "")
-        return finish(True, f"{name} is {'already ' if already else 'now '}{state}{full}"
-                            + ("; in the foreground" if front else ""), details)
+        done = f"{name} is {'already ' if already else 'now '}{state}{full}"
+        behind = _in_view(hwnd, details) if shows else ""
+        if behind:
+            # fa (A4): the state alone is not the ask: not in view is not done (no done line; the report says where)
+            return finish(False, f"{done}, but {behind}", details)
+        return finish(True, done + ("; in the foreground" if front else ""), details)
     return finish(False, f"{name}: asked to be {state}, not {state} after {_STATE_WAIT_S:g} s", details)
 
 

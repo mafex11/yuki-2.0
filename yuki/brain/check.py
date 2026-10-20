@@ -10,7 +10,12 @@ three earlier turns of theirs; the may-commit steps, one line each (the verb, th
 element's role and name, the keys, a send's text and recipient, a shell's command; for a click or a key, the text Yuki
 typed in that window and has not sent, since Enter or a click there may send it). Never screen text, tool results or
 the planner's reasoning. Titles and names are text an app wrote: they say what the target is, never what the user
-asked (the old judge's principle, so a page or a chat message can't talk it into anything).
+asked (the old judge's principle, so a page or a chat message can't talk it into anything). fa (final-F #1, A1): one
+measured fact more, when a hand measured it: the step's window came up in reply to Yuki's own step (a page's "Leave
+site?" after Yuki's tab close: :func:`note_raised`, from the hand's own window list before and after its act), or such
+a window is up over the step's window. The prompt's principle: answering that window's question is a new decision of
+the user's, and an answer that throws away something of theirs needs their words to go ahead. The model judges it;
+no button's words are read by code.
 
 **What it returns.** One strict tool, forced (Haiku without thinking takes a forced ``tool_choice``):
 ``verdicts: [{i, effect: none|send|join|delete|close|buy|setting|other, asked, question}]``. The prompt is generic (no
@@ -69,6 +74,10 @@ saying what the step would do; otherwise "".
 
 When unsure, asked is false with one plain question. Words from an earlier request authorise nothing unless this \
 request's words refer back to them.
+
+A step whose line says its window came up in reply to Yuki's own step answers a new question the app asked them: \
+asked is true only when their words answer that very question. When the answer would throw away something of \
+theirs (unsaved text, a draft, a download), asked is false unless their words said to go ahead anyway.
 """
 
 #: The one tool (strict: every field required, nothing else allowed), forced.
@@ -120,6 +129,75 @@ def _clip(text: Any, cap: int) -> str:
     return t if len(t) <= cap else t[: cap - 1] + "…"
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# fa (final-F #1, A1): windows an act of Yuki's raised, measured by the hand that acted
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: The windows a Yuki act raised (a page's "Leave site?" after its tab close, an app's save prompt after its window
+#: close): ``{dialog hwnd: (owner hwnd, the act's code word, when)}``, written by the hand that measured it
+#: (:func:`note_raised`), read by :func:`step_line` (:func:`raised_by`). Kept while that window is up, at most
+#: :data:`RAISED_KEEP_S`. Ids and code words only (content-free).
+RAISED_KEEP_S = 600.0
+_raised: dict[int, tuple[int, str, float]] = {}
+_raised_lock = threading.Lock()
+
+
+def _window_up(hwnd: int) -> bool:
+    """Whether ``hwnd`` is still a visible window (read-only Win32; ``False`` when it can't be read)."""
+    try:
+        import win32gui
+
+        return bool(win32gui.IsWindow(int(hwnd)) and win32gui.IsWindowVisible(int(hwnd)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def note_raised(hwnd: Any, owner: Any = None, act: str = "close") -> None:
+    """fa (A1): a window Yuki's own act raised (``act``: the act's code word, ``close``), measured by the hand that
+    acted (its own window list before and after the act: never a title). Never raises."""
+    try:
+        key = int(hwnd)
+        if key <= 0:
+            return
+        own = int(owner) if owner not in (None, "", 0) else 0
+    except (TypeError, ValueError):
+        return
+    with _raised_lock:
+        now = time.monotonic()
+        for h in [h for h, v in _raised.items() if now - v[2] > RAISED_KEEP_S]:
+            _raised.pop(h, None)
+        _raised[key] = (own, str(act or "close")[:20], now)
+
+
+def raised_by(hwnd: Any, *, alive: Callable[[int], bool] | None = None) -> tuple[str, bool]:
+    """fa (A1): ``(the act's code word, whether hwnd is the raised window itself)`` when ``hwnd`` is a window a Yuki act
+    raised, or the window that owns one still up; ``("", False)`` otherwise. ``alive``: whether a window is still up
+    (the real desk's read by default; a pure check passes its own). Never raises."""
+    try:
+        key = int(hwnd or 0)
+    except (TypeError, ValueError):
+        return "", False
+    if not key:
+        return "", False
+    up = alive or _window_up
+    now = time.monotonic()
+    with _raised_lock:
+        items = list(_raised.items())
+    for dialog, (owner, act, at) in items:
+        if now - at > RAISED_KEEP_S or key not in (dialog, owner):
+            continue
+        try:
+            live = bool(up(dialog))
+        except Exception:  # noqa: BLE001
+            live = False
+        if not live:
+            with _raised_lock:
+                _raised.pop(dialog, None)
+            continue
+        return act, key == dialog
+    return "", False
+
+
 #: Input fields that only point at the target (ids, read numbers, the guard window): never part of a step's identity.
 _POINTERS = frozenset({"element", "read", "expect_hwnd", "hwnd", "x", "y"})
 
@@ -129,8 +207,10 @@ def memo_key(call: Call, *, typed: bool = False) -> str:
     whether Yuki's unsent text waits in that window (a key or click there may send it: never the same step)."""
     rest = {k: v for k, v in (call.input or {}).items() if k not in _POINTERS}
     digest = hashlib.sha1(json.dumps(rest, sort_keys=True, default=str).encode("utf-8", "replace")).hexdigest()[:12]
+    # fa (A1): a window Yuki's own step raised over it (or that is that window) is another step than before it came up
+    raised = bool(raised_by(call.hwnd)[0]) if call.hwnd else False
     return json.dumps([int(call.hwnd or 0), call.tool, call.role.casefold(), _clip(call.name, NAME_CHARS).casefold(),
-                       digest, bool(typed)], ensure_ascii=False)
+                       digest, bool(typed), raised], ensure_ascii=False)
 
 
 #: The steps a waiting unsent text changes: a click, or a key (Enter, ctrl+Enter, a slider's keys) may send it.
@@ -192,6 +272,13 @@ def step_line(call: Call, *, plan: Any = None, typed: bool = False, typed_text: 
         parts.append("text Yuki typed and has not sent is waiting in this window" +
                      (f' ("{_clip(typed_text, VALUE_CHARS)}"): this step may send it' if typed_text.strip()
                       else ": this step may send it"))
+    act, itself = raised_by(call.hwnd) if call.hwnd else ("", False)
+    if act:
+        # fa (A1): a measured fact of the hand that acted (its window list before and after Yuki's own step): this
+        # window came up in reply to that step, so what it asks is a new question for the user (the prompt's rule)
+        parts.append(f"this window came up in reply to Yuki's own {act} step (measured: it was not up before it)"
+                     if itself else f"a window that came up in reply to Yuki's own {act} step is up over this one "
+                                    f"(measured)")
     return "; ".join(parts)
 
 
@@ -556,5 +643,5 @@ def _board() -> Mapping[str, Any] | None:
         return None
 
 
-__all__ = ["CHECK_PROMPT", "CHECK_TOOL", "CheckVerdict", "CommitCheck", "OneVerdict", "memo_key", "one", "parse",
-           "request", "step_line", "words_block"]
+__all__ = ["CHECK_PROMPT", "CHECK_TOOL", "CheckVerdict", "CommitCheck", "OneVerdict", "memo_key", "note_raised", "one",
+           "parse", "raised_by", "request", "step_line", "words_block"]
