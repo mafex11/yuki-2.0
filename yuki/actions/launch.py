@@ -4588,15 +4588,18 @@ def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: 
                          f"of it at that address was seen within {watch:.1f} s", "not_seen")
 
 
-def _own_channel(url: str) -> dict | None:
+def _own_channel(url: str, miss: dict | None = None) -> dict | None:
     """integ22 (skill22 merge note 1, A6): :func:`yuki.skills.names.own_url` on a raw address (no store: this
     process's open memory, a bounded call), ``{"url", "name", "kind", "how", "score", "margin", "source"}`` or
-    ``None`` (the address as given). Never raises."""
+    ``None`` (the address as given). integ27 (fd merge note 2, D7): ``miss`` (a dict) gets ``own_url``'s own code word
+    for why nothing was taken (``"why"``: one of ``names.MISS_WORDS``). Never raises."""
     try:
         from yuki.skills.names import own_url
 
-        took = own_url(url)
+        took = own_url(url, miss=miss) if miss is not None else own_url(url)
     except Exception:  # noqa: BLE001 - no measure: the address as given
+        if miss is not None:
+            miss.setdefault("why", "error")
         return None
     return took if isinstance(took, dict) and took.get("url") else None
 
@@ -4639,7 +4642,34 @@ def open_url(
     url: str, *, app: str | None = None, content_timeout_s: float = CONTENT_WAIT_S,
     deadline: float | None = None, address_bar: bool = True, heard: bool = False,
 ) -> ActionResult:
-    """Open a URL (or any shell target: a file, a folder).
+    """Open a URL (or any shell target: a file, a folder): :func:`_open_url` (its docstring is the whole contract).
+
+    integ27 (fd merge note 2, D7, final-F youtube_channel_deji_arc: "Deezy" did not swap and nothing said why): a heard
+    address the user's own channels did not take carries ``details["names_miss"]``, the names measure's own code word
+    for why (``names.MISS_WORDS``: ``no_page``, ``written``, ``slow``, ...), for the hands' content-free log line."""
+    miss: dict = {}
+    result = _open_url(url, app=app, content_timeout_s=content_timeout_s, deadline=deadline,
+                       address_bar=address_bar, heard=heard, miss=miss)
+    why = miss.get("why")
+    details = getattr(result, "details", None)
+    if isinstance(why, str) and why and isinstance(details, dict) and "names_match" not in details:
+        try:
+            from yuki.skills.names import MISS_WORDS
+
+            if why in MISS_WORDS:   # the measure's own code words only (content-free)
+                details["names_miss"] = why
+        except Exception:  # noqa: BLE001 - the open's result stands as it is
+            pass
+    return result
+
+
+def _open_url(
+    url: str, *, app: str | None = None, content_timeout_s: float = CONTENT_WAIT_S,
+    deadline: float | None = None, address_bar: bool = True, heard: bool = False,
+    miss: dict | None = None,
+) -> ActionResult:
+    """Open a URL (or any shell target: a file, a folder). ``miss``: integ27, the names measure's miss reason box
+    (:func:`open_url`).
 
     Args:
         url: the target.
@@ -4706,7 +4736,7 @@ def open_url(
     # D17: an opened link brings its handler forward (a browser, Spotify, Discord): never with a game in front
     if (refused := _gate.refuse("open_url")) is not None:
         return finish(False, refused, {"url": target, "refused": _gate.kind_of(refused)})
-    if heard and address_bar and (took := _own_channel(target)) is not None:
+    if heard and address_bar and (took := _own_channel(target, miss)) is not None:
         # integ22 (skill22 merge note 1, A6; final-D youtube_channel_deji_arc): a raw address of a page named by a
         # value that is none of the user's own channels as written but measures as one of them ("@Deezy" for their
         # Deji) opens that channel's own address, named as what opened (decision 3: never a question). integ22 fix S5:

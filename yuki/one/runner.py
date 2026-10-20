@@ -67,6 +67,15 @@ skill run that touched nothing is no act; a countdown their words changed owes `
 a skill run settled ``unverified`` is no miss of the retry window (``budget``); a done line equal to the say_first
 the voice already spoke for the call is not said again (contract K-D, ``early_said``).
 
+**integ27** (the lanes' merge notes, final-F): a close that raised the page's or the app's own question, or that was
+pressed and stayed, is ``asked`` (never failed): no tidy step around it, and no call of the turn acts in that window
+until their words change (:attr:`RunState.held`, :meth:`CallContext._held`; fa note 7). A master level or mute change
+during a turn with no sound control's call is the diff's ``master_changed``: code says ``diff.master_line`` once a
+turn and a flag set that is only that settles by code (fa note 3). At the tidy dial "ask" code says the measured
+question itself (``diff.tidy_ask``, fa note 4). A verified browser focus says the tab it shows (``focus_line``, fa
+note 5). The D6 line's front test is ``diff.front_moved_on``, one rule for both brains (fb note A3). A countdown a
+chip changed owes nothing (fc note 3).
+
 **The turn state** (:class:`RunState` on the gate's ``Turn``): every result, the act's own windows (tidy), the lines
 said; ``private_read`` and the refusal count are the gate's and the budget's (``policy.Turn``, ``budget.TurnBudget``).
 
@@ -150,7 +159,30 @@ TIDIED: dict[str, str] = {
     # integ22 (desk22 merge note 4b, D6): no legal step for a window flag: code said its one line about what is covered
     "told": "no one undoable step undoes it, so code said what is covered (said) and left their windows as they are",
     # fb (final-F B2): the tidy dial off: no window flag is anyone's to act on (the hands give no look at "off")
-    "off": "their settings leave their windows to them: code left them as they are, on purpose"}
+    "off": "their settings leave their windows to them: code left them as they are, on purpose",
+    # integ27 (fa merge note 4, A7): the dial at "ask": code asked the question itself (said); the step is in
+    # side_effect for their yes
+    "asked": "code asked them whether to undo that side effect (said); say nothing more about it now",
+    # integ27 (fa merge note 3, A9): a master change during an act not about the volume: code said what was measured
+    # (said); nothing is undone (its cause is not known)
+    "master": "code told them their PC's volume changed while this ran (said); nothing is undone: say nothing more "
+              "about it",
+    # integ27 (fa merge note 7, A1): the close raised the page's or the app's own question: code took no tidy step
+    # around it (a focus_back would hide it, a key would answer it)
+    "asking": "the page's or the app's own question is up in front of them: code left every window as it is, and "
+              "nothing in that window is done this turn"}
+#: integ27 (fa merge note 4, A7, final-F all p1_dial_ask_playlist_over_video): the dial at "ask" and code said the
+#: measured question itself (``diff.tidy_ask``): what the agent reads (its yes is the step).
+TIDY_ASKED_NOTE = ("code asked them in a few words whether to undo that side effect with its one undoable step: "
+                   "{step}. Say nothing more about it now; on their yes, call it.")
+#: integ27 (fa merge note 7, A1): code's question for a close that raised the page's or the app's own question, and
+#: its line for a tab close pressed that stayed with no window measured (``voice.hands._FALLBACK_LINE``'s words): the
+#: result's ``question`` (the voice owes it; the typed loop asks it).
+LINE_CLOSE_ASKS = "It's asking something before it closes, so it's still open. Want me to go ahead?"
+LINE_CLOSE_HELD = "I couldn't see it close. It may be asking you something first, so I left it."
+#: integ27 (fa merge note 7): a step in a window a close of this turn left asking (:meth:`CallContext._held`).
+LINE_CLOSE_ASKED = ("Not done: that window shows its own question, raised by your close this turn, and its answer is "
+                    "theirs, so nothing more is done in it this turn. Ask them in a few words, with no call.")
 #: The name of code's own tidy step's call context: no ONE tool, so the gate judges it as an inner step (never counted
 #: on the agent's budget or refusals), at row 8 like any tidy step.
 CODE_TIDY = "tidy_by_code"
@@ -236,6 +268,29 @@ def _opened_of(name: str, args: Mapping[str, Any], facts: Mapping[str, Any], act
         return tuple(dict.fromkeys(found))
     except Exception:  # noqa: BLE001 - no opened scope: the classic tab cover only
         return ()
+
+
+def _close_asking(facts: Mapping[str, Any]) -> bool:
+    """integ27 (fa merge note 7, A1): the hands measured that this close raised the page's or the app's own question
+    (``dialog_raised``: a window it owns came up in front, with or without its id; a window close measured asking) or
+    that a tab close was pressed and its tab stayed with no window measured (``close_held``: a browser that asks inside
+    its own window). The hands' own facts, never words. Never raises."""
+    try:
+        return bool(facts.get("dialog_raised") or facts.get("close_held"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _sound_call(name: str, args: Mapping[str, Any]) -> bool | None:
+    """integ27 (fa merge note 3, A9): whether a ONE call is a sound control's (``voice.hands._sound_act``: the mixer
+    hand, the volume keys, the volume skill; our own tool and skill keys, never words); ``None``: unknown (the caller
+    reads it as a sound act: the safe side, no master flag). Never raises."""
+    try:
+        from yuki.voice.hands import _sound_act
+
+        return bool(_sound_act(str(name), dict(args or {})))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _step_call(step: Any) -> dict[str, Any] | None:
@@ -385,6 +440,8 @@ class OneResult:
             out["flags"] = [k for k, v in self.flags.items() if v]
         if self.tidied:
             out["tidied"] = self.tidied
+            if self.tidy_state == "asked" and self.tidy_step:
+                out["side_effect"] = TIDY_ASKED_NOTE.format(step=self.tidy_step)   # integ27 (A7): their yes's step
         elif self.tidy_step:
             out["side_effect"] = TIDY_ASK_NOTE.format(step=self.tidy_step)
         if self.cover:
@@ -514,6 +571,15 @@ class RunState:
     #: (``hands.arranged_windows``: a ``window`` move / maximize / fullscreen / restore, a skill run given a place):
     #: code's tidy step never moves one away again (``diff.tidy_guard``'s ``asked_place``).
     arranged: set[int] = field(default_factory=set)
+    #: integ27 (fa merge note 3, A9): a call of this turn was a sound control's (``hands._sound_act``: the mixer hand,
+    #: the volume keys, the volume skill), noted at the call before it acts, so a master change measured around any
+    #: act of the turn is theirs, never a side effect; ``master_said``: code's master line was said this turn (once).
+    sound: bool = False
+    master_said: bool = False
+    #: integ27 (fa merge note 7, A1): the windows where a close of this turn raised the page's or the app's own
+    #: question (the window the close acted in, the question's own window when measured), each with their words as
+    #: they stood then: until their words change, no call of the turn acts there (:func:`_held_close`).
+    held: dict[int, tuple[str, ...]] = field(default_factory=dict)
 
 
 def state_of(turn: Any) -> RunState:
@@ -626,12 +692,16 @@ class CallContext:
         try:
             with self._lock:
                 if self.first is None and str(name) == self.name:
-                    decision = policy.gate(self.name, args, target, self.turn)
+                    # integ27 (fa merge note 7): a window a close of this turn left asking is theirs to answer first
+                    decision = self._held(self.name, args, target, inner=False) \
+                        or policy.gate(self.name, args, target, self.turn)
                     self.first, self.facts, self.first_args = decision, dict(target), dict(args)
                 else:
                     tabs = target.get("tabs") if isinstance(target.get("tabs"), list) else None
                     mapped = T.as_verb(str(name), args, tab_names=tabs)
-                    decision = policy.gate(mapped[0], mapped[1], target, self.turn, inner=True) if mapped is not None \
+                    decision = (self._held(mapped[0], mapped[1], target, inner=True)
+                                or policy.gate(mapped[0], mapped[1], target, self.turn, inner=True)) \
+                        if mapped is not None \
                         else policy.Decision(policy.REFUSE, "unknown_tool", line=policy.LINE_UNKNOWN)
                     if self.first is None:
                         self.first, self.facts = decision, dict(target)
@@ -664,6 +734,13 @@ class CallContext:
             if tool == "click" and force and not facts.get("role"):
                 facts["role"] = "Button"
             return _verdict(self.check(self.name, self.args, facts))
+        held = self._held(str(tool), dict(tool_input or {}), facts, inner=True)
+        if held is not None:
+            # integ27 (fa merge note 7): a skill step in a window a close of this turn left asking: held, theirs first
+            verdict = _verdict(held)
+            with self._lock:
+                self.inner.append(verdict)
+            return verdict
         try:
             verdict = policy.authorize(self.turn, str(tool), dict(tool_input or {}), facts, earlier, force=force)
         except Exception:  # noqa: BLE001 - fail closed
@@ -687,6 +764,44 @@ class CallContext:
         except Exception:  # noqa: BLE001 - an unreadable policy never blocks (rows 1-2 read it at the gate)
             return ""
         return ""
+
+    def _held(self, name: str, args: Mapping[str, Any], target: Mapping[str, Any], *, inner: bool) -> Any:
+        """integ27 (fa merge note 7, A1, final-F k_tab_close_leave_site): a step in a window where a close of this turn
+        raised the page's or the app's own question ("Leave site?", a save prompt) while their words are as they were
+        then (:attr:`RunState.held`): refused, so no call of the turn answers that question for them, finishes the
+        close another way (the same close again, a key, a click, the whole window) or tidies around it (a
+        ``focus_back``, an Escape); code's own tidy step too. Their next words (the next turn, or a typed answer synced
+        into this one) lift it, and the commit check judges the click on the question with the measured fact
+        (``brain.check``'s raised window). ``None``: not held. Ids and the turn's own words only; never raises."""
+        try:
+            hwnd = _held_close(self.turn, target, args)
+            if hwnd is None:
+                return None
+            decision = policy.Decision(policy.REFUSE, "close_asked", line=LINE_CLOSE_ASKED, verb=str(name))
+            if self.runner is not None:
+                self.runner._emit("one_gate", tool=str(name), inner=inner, **decision.facts())
+            return decision
+        except Exception:  # noqa: BLE001 - the gate decides as before
+            return None
+
+
+def _held_close(turn: Any, target: Mapping[str, Any] | None, args: Mapping[str, Any] | None = None) -> int | None:
+    """integ27 (fa merge note 7): the window a step acts in (its target's ``hwnd``, else its own ``hwnd`` or ``window``)
+    when a close of this turn left it asking and their words are as they were then (:attr:`RunState.held`), else
+    ``None``. Never raises."""
+    try:
+        state = getattr(turn, "_one_run", None)
+        held = state.held if isinstance(state, RunState) else None
+        if not held:
+            return None
+        words = tuple(getattr(turn, "words", None) or ())
+        for raw in ((target or {}).get("hwnd"), (args or {}).get("hwnd"), (args or {}).get("window")):
+            hwnd = _hwnd_of(raw)
+            if hwnd is not None and held.get(hwnd) == words:
+                return hwnd
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def current() -> CallContext | None:
@@ -1012,6 +1127,10 @@ class Runner:
         state = state_of(turn)
         if say is not None:
             state.speaker = say
+        if not state.sound and _sound_call(name, args) is not False:
+            # integ27 (fa merge note 3, A9; the hands' review M1 rule): a sound control's call of this turn, noted at
+            # the call before it acts (refused or not), so no master change of the turn is ever called a side effect
+            state.sound = True
         early = self._early_heard(call_id, state)
         try:
             result = self._run(name, args, turn, say, state)
@@ -1270,6 +1389,12 @@ class Runner:
         probe_note: dict[str, Any] = {}
         if status == NOT_CONFIRMED and ok and verified is None and not facts.get("refused"):
             status, verified, probe_note = self._effect(name, resolved, facts, ctx)
+        # integ27 (fa merge note 7, A1, final-F k_tab_close_leave_site): a close that raised the page's or the app's own
+        # question (``dialog_raised``, with or without its window's id) or that was pressed and stayed with no window
+        # measured (``close_held``) is theirs to answer: asked, never failed (no miss, no other way, no tidy step)
+        asking = _close_asking(facts) and status not in (DONE, ALREADY)
+        if asking:
+            status = ASKED
         if decision is None and status not in (DONE, ALREADY):
             # the verb refused before any gate (its own shape, a window not shown, a stale read): nothing was done
             status = REFUSED if facts.get("refused") or not facts.get("sent_at") else status
@@ -1287,6 +1412,12 @@ class Runner:
                 # integration F2 (decision 3): a misheard name taken as one of their own apps or sites is said as what
                 # opened (code's line), never the words as heard in the agent's line written before the act
                 line = self.verbs.code_line(name, resolved, facts)
+            focus = _words(facts.get("focus_line"))
+            if focus and done_line is None and name == "window" and str(resolved.get("action") or "") == "focus":
+                # integ27 (fa merge note 5, A2, final-F multi_open_then_close_yt_tab: "YouTube's up in Chrome." when
+                # what came up was their own paused video): a browser window brought up is said by code from the tab
+                # it shows now (the hands' read), never the agent's line written before the act, as under ``all``
+                line = focus
             if not line and done_line is None:
                 # a window or tab step the hands said their own step line for (what it left showing: "Arc is showing
                 # ..."), as they do under ``all``: never a silent focus
@@ -1304,6 +1435,13 @@ class Runner:
             result.names_match = dict(facts["names_match"])   # names21 (merge note 5): the launch's measure, logged
         if asked:
             result.question = str(facts.get("_asked") or "")
+        elif asking:
+            # integ27 (fa merge note 7): the report says what was measured and that nothing in it was answered; the
+            # question is code's (the hands' fallback words): the agent asks it, the voice owes it, the typed loop asks
+            # it and hands their answer back with the result
+            result.evidence = self._evidence(name, resolved, ok, status, report, facts, probe_note)
+            result.question = LINE_CLOSE_ASKS if facts.get("dialog_raised") else LINE_CLOSE_HELD
+            self._hold_close(turn, ctx, resolved, facts, state)
         elif status not in CLEAN and status not in (NO_CHANGE, STARTING, READ):
             result.evidence = self._evidence(name, resolved, ok, status, report, facts, probe_note)
             result.owed = str(facts.get("say") or "") or OWED_LINES.get(
@@ -1461,8 +1599,11 @@ class Runner:
                 open_tidy.touched = tuple(dict.fromkeys([*(open_tidy.touched or ()), *touched]))
                 open_tidy.opened = tuple(dict.fromkeys([*(getattr(open_tidy, "opened", None) or ()), *opened]))
             # integ22 (desk22 merge note 4a, A24): a new tab's autoplay over what played is a tab cover only in a window
-            # this act opened a page in
-            d = desk_diff.compare(ctx.before, after, acted=acted, touched=touched, opened=opened)
+            # this act opened a page in. integ27 (fa merge note 3, A9): ``sound_act`` is whether this act or any earlier
+            # call of the turn was a sound control's (:attr:`RunState.sound`); else a master level or mute change
+            # measured around this act is its side effect (``master_changed``)
+            d = desk_diff.compare(ctx.before, after, acted=acted, touched=touched, opened=opened,
+                                  sound_act=bool(state.sound))
             state.arranged |= self._arranged(name, resolved, scoped, ctx.before, after)
             own = {int(h) for h in self.verbs.act_windows(after, d, acted, touched) if h}
             state.own |= own
@@ -1476,8 +1617,14 @@ class Runner:
             elif self._front_kept is not None and self._front_kept[2] is not state:
                 self._front_kept = None   # an act of a later turn that moved no front lets an older one go (as all)
             pending: dict[str, Any] | None = None
-            settled = told = off = False
-            if result.flagged and not result.tidy:
+            step: dict[str, Any] | None = None
+            settled = told = off = ask = False
+            # integ27 (fa merge note 7, A1): a close that left the page's or the app's own question up takes no tidy
+            # step around it (a focus_back would hide it, an Escape or any key would answer it): no tidy-up is opened
+            asking = result.status == ASKED and _close_asking(facts)
+            # integ27 (fa merge note 3, A9): a master change alone is no window's side effect: no tidy-up for it
+            others = any(v for k, v in dict(d.flags).items() if k != "master_changed")
+            if result.flagged and others and not result.tidy and not asking:
                 # a new flagged diff opens a tidy-up on its windows; a tidy step's own flagged diff never renews it
                 # (its two steps per flagged diff stay counted)
                 attention = [h for h in [*list(d.attention or []), d.focus_from] if h]
@@ -1500,9 +1647,10 @@ class Runner:
                 # integration (one-tidy-on-unlanded-act): code's step only after an act that took, as the hands' look
                 # (a failed or unconfirmed try's turn goes on to another way, whose own diff or the tidy debt takes it)
                 landed = result.status in (DONE, ALREADY)
-                if do and state.tidied:
+                if state.tidied and not off:
                     # review F4: code already decided this turn's one tidy step (taken or left): a later flagged act
-                    # settles by code too, as under "all" (one look a turn), never handed to the agent
+                    # settles by code too, as under "all" (one look a turn), never handed to the agent. integ27 (fa
+                    # merge note 4): at "ask" too, once code asked its one question (or said its D6 line) this turn
                     settled = True
                 elif off:
                     # fb (final-F B2, p1_dt_dial_off_playlist): with the tidy dial off no window flag is anyone's to
@@ -1519,11 +1667,24 @@ class Runner:
                     # integ22 (desk22 merge note 4b, decision D6): no legal step for a window flag after an act that
                     # took: code's one measured line about what is covered (never silence), said after the cover line
                     told = step is None and landed
+                    # integ27 (fa merge note 4, A7): the dial at "ask" and a legal step after an act that took: code
+                    # says the measured question itself (``diff.tidy_ask``); a result with a ``then`` rest leaves it to
+                    # the agent once the rest is done, as the hands' look with a rest does
+                    ask = step is not None and landed and not result.then
             # r25 harness (H9): the diff's own record first, so a code tidy step's ``one_run`` row comes after it
             self._emit("one_diff", tool=name, **d.facts(), legal_step=bool(pending or result.tidy_step) or None)
             self._cover(d, result, turn, state, say)
-            if pending is not None:
+            # integ27 (fa merge note 3, A9): code's master line, once a turn, after the act's own lines
+            mastered = self._master(d, result, turn, state, say)
+            if asking:
+                if result.flagged:
+                    self._tidy_settled(result, "asking", None)   # its own tidy-up never opened; an earlier one stands
+            elif pending is not None:
                 self._tidy_result(pending, d, after, result, turn, state, say)
+            elif ask and step is not None:
+                how = self._tidy_ask(step, after, result, turn, state, say)
+                if how:
+                    self._tidy_settled(result, how, turn)
             elif told:
                 # fb (final-F B3): code's D6 line only over the desk the after-read saw; their own switch: silence,
                 # and the flags settle by code all the same (left as they are, no agent round for them)
@@ -1534,6 +1695,11 @@ class Runner:
                 self._tidy_settled(result, "", turn)
             elif off and result.flagged:
                 self._tidy_settled(result, "off", turn)   # fb (B2): the dial off settles by code
+            if result.flagged and not others and not asking and (mastered or state.master_said) \
+                    and dict(result.flags).get("master_changed"):
+                # integ27 (fa merge note 3): a flag set that is only the master's settles by code once its line was
+                # said (the way ``_tidy_settled`` settles code's own tidy), with no tidy-up opened: no agent round
+                self._tidy_settled(result, "master", None)
         except Exception as exc:  # noqa: BLE001 - no diff: the result stands
             self._emit("one_diff_error", tool=name, error=type(exc).__name__)
 
@@ -1779,26 +1945,101 @@ class Runner:
 
     def _front_moved_on(self, d: Any, after: Any) -> str:
         """fb (final-F B3): whether their desk's front moved on from the one code's D6 line would speak about, measured
-        only: ``front_changed`` when the window in front now is not the one the after-read saw (the same test as
-        ``diff.tidy_guard``), or when the act's own diff measured the front moving during the act to a listed window
-        that is not the act's (``focus_by_act`` false: their own switch, or another app's; final-F
-        p1_dt_alt_tab_before_tidy: the after-read already showed "Focus: Chrome -> File Explorer (not from your
-        act)", so a read of the front now alone could not tell). A front that can't be read changes nothing (the D6
-        line is said, as before). ``""``: the front is as the after-read saw it. Never raises."""
+        only (final-F p1_dt_alt_tab_before_tidy: the after-read already showed "Focus: Chrome -> File Explorer (not
+        from your act)", so a read of the front now alone could not tell).
+
+        integ27 (fb merge note A3, review finding 3): the one rule both brains read, ``diff.front_moved_on`` (the
+        hands' D6 path reads it too): ``diff.front_guard`` on the window in front now against the after-read's, plus
+        the diff's own measure (the front moved during the act to a listed window that is not the act's). The runner's
+        own copy of the front test is gone, so a front that can't be read now leaves their desk as it is with no line,
+        as the hands and code's tidy step (``diff.tidy_guard``) read it. ``""``: the front is as the after-read saw
+        it. Never raises (an error: ``""``, the line is said as before)."""
         try:
-            seen = getattr(after, "foreground", None) if after is not None else None
+            from yuki.perception import diff as desk_diff
+
             reader = getattr(self.verbs, "front_now", None) or getattr(self.verbs, "foreground", None)
             now = reader() if callable(reader) else None
-            if now is not None and seen is not None and int(now) != int(seen):
-                return "front_changed"
-            start, end = getattr(d, "focus_from", None), getattr(d, "focus_to", None)
-            window = getattr(after, "window", None)
-            listed = callable(window) and end is not None and window(end) is not None
-            if start and end and start != end and not getattr(d, "focus_by_act", False) and listed:
-                return "front_changed"
+            why = desk_diff.front_moved_on(d, now, after)
+            return "" if why == "error" else why
         except Exception:  # noqa: BLE001 - unread: as before
             return ""
-        return ""
+
+    def _master(self, d: Any, result: OneResult, turn: policy.Turn, state: RunState, say: Any) -> str:
+        """integ27 (fa merge note 3, A9, final-F one multi_japanese_and_volume: the master went to 0% and muted inside a
+        playlist run): ``diff.master_line(d)`` ("Your PC's sound got muted while I did that."), the measured master
+        change during an act that was not about the volume (``master_changed``: no call of the turn was a sound
+        control's), said by code once a turn, right after the act's own done line (a result that took: the hands say it
+        after the act's line too); never undone by code (its cause is not known). A result that did not take leaves it
+        to the agent (its After says it first, and ``flags`` has it). Not after the hard stop, nor once their next turn
+        began. Returns the line said now (``""``: none). Logs content-free (``one_master``). Never raises."""
+        try:
+            if state.master_said or result.status not in (DONE, ALREADY):
+                return ""
+            helper = _desk_helper("master_line")
+            line = _words(helper(d)) if helper is not None else ""
+            if not line:
+                return ""
+            budget = getattr(turn, "budget", None)
+            if (budget is not None and budget.late()) or getattr(turn, "moved_on", False):
+                return ""
+            said, _heard = self._speak(line, say, state)
+            if not said:
+                return ""
+            state.master_said = True
+            result.said = f"{result.said} {said}".strip()
+            result.heard = True
+            self._emit("one_master", said=True)
+            return said
+        except Exception as exc:  # noqa: BLE001 - not said: the agent reads the After
+            self._emit("one_master", error=type(exc).__name__)
+            return ""
+
+    def _tidy_ask(self, step: Mapping[str, Any], after: Any, result: OneResult, turn: policy.Turn, state: RunState,
+                  say: Any) -> str:
+        """integ27 (fa merge note 4, A7, final-F all p1_dial_ask_playlist_over_video: at "ask" the model worded the
+        question itself and asked about pausing the video): under the tidy dial "ask", code says the measured question
+        for the flagged diff's one legal step itself (``diff.tidy_ask``: "Want Chrome back in front?", "Want me to move
+        Spotify to your other screen?"), the hands' rule for both brains, once a turn, only while the window in front is
+        still the one the after-read saw (``diff.front_guard``) and their next turn has not begun. The result then
+        carries the step for their yes (:data:`TIDY_ASKED_NOTE`) and settles by code (no agent round).
+
+        Returns ``"asked"`` (said; ``result.said`` gains it), ``"left"`` (their desk moved on: nothing is asked, their
+        windows as they are), or ``""``: nothing decided (no line, no speaker, the hard stop): the agent asks, as
+        before (:data:`TIDY_ASK_NOTE`). Logs content-free (``one_tidy_code``). Never raises."""
+        try:
+            from yuki.perception import diff as desk_diff
+
+            budget = getattr(turn, "budget", None)
+            if state.tidied or (budget is not None and budget.late()):
+                return ""
+            action = str(step.get("action") or "")
+            if getattr(turn, "moved_on", False):
+                why = "moved_on"   # safety timing 4: never a question about an act after they moved on
+            else:
+                reader = getattr(self.verbs, "front_now", None) or getattr(self.verbs, "foreground", None)
+                why = desk_diff.front_guard(reader() if callable(reader) else None, getattr(after, "foreground", None))
+            tidy = getattr(turn, "tidy", None)
+            if why:
+                state.tidied = True
+                if tidy is not None:
+                    tidy.given = True   # code decided this flagged diff's tidy-up (left): never a tidy-debt round
+                self._emit("one_tidy_code", action=action, state="left", why=why, ok=False, said=False)
+                return "left"
+            raw = desk_diff.step_app(dict(step), after)
+            line = desk_diff.tidy_ask(dict(step), util.app_name(raw) if raw else "")
+            said = self._speak(line, say, state)[0] if line else ""
+            if not said:
+                return ""
+            state.tidied = True
+            if tidy is not None:
+                tidy.given = True
+            result.said = f"{result.said} {said}".strip()
+            result.heard = True
+            self._emit("one_tidy_code", action=action, state="asked", ok=True, said=True)
+            return "asked"
+        except Exception as exc:  # noqa: BLE001 - nothing said: the agent asks, as before
+            self._emit("one_tidy_code", error=type(exc).__name__)
+            return ""
 
     def _cover(self, d: Any, result: OneResult, turn: policy.Turn, state: RunState, say: Any) -> None:
         """One20 (S3, contract C7): ``perception.diff.cover_line(d)``, the measured tab-cover sentence ("GitHub is up;
@@ -1827,6 +2068,29 @@ class Runner:
                 return
         if not late:
             result.cover = line
+
+    def _hold_close(self, turn: policy.Turn, ctx: CallContext, resolved: Mapping[str, Any], facts: Mapping[str, Any],
+                    state: RunState) -> None:
+        """integ27 (fa merge note 7, A1): a close of this turn left a window asking: that window (the one the close
+        acted in: the gate's target, the hands' live window, the call's own windows) and the question's own window when
+        its id was measured are held for the rest of the turn while their words stay as they are now
+        (:attr:`RunState.held`, read by :meth:`CallContext._held`): no call of the turn answers it, finishes the close
+        another way or tidies around it. Logged content-free (``one_close_asked``). Never raises."""
+        try:
+            raw: list[Any] = [ctx.facts.get("hwnd"), facts.get("live_hwnd"), facts.get("dialog"),
+                              resolved.get("window")]
+            many = resolved.get("_hwnds")
+            if isinstance(many, (list, tuple)):
+                raw.extend(many)
+            words = tuple(getattr(turn, "words", None) or ())
+            held = {h for h in map(_hwnd_of, raw) if h is not None}
+            for hwnd in held:
+                state.held[hwnd] = words
+            self._emit("one_close_asked", dialog=bool(facts.get("dialog_raised")),
+                       held_close=bool(facts.get("close_held")), dialog_id=isinstance(facts.get("dialog"), int),
+                       windows=len(held))
+        except Exception as exc:  # noqa: BLE001 - the gate and the commit check still judge every later step
+            self._emit("one_close_asked", error=type(exc).__name__)
 
     @staticmethod
     def _note_acted(turn: policy.Turn, ctx: CallContext, facts: Mapping[str, Any], state: RunState) -> None:
@@ -2674,9 +2938,11 @@ class Runner:
                 "they spoke during the countdown; nothing was sent: their words decide")
         # fb (final-F B5, contract K-C, p24_countdown_cancel): nothing was sent, a code fact the user is owed: the
         # driver says ``LINE_STOPPED_SEND`` when the turn ends with no new send and nothing of Yuki's heard (the owed
-        # ledger's own rule), as the Stop path says it now; the agent's own words or a new send call replace it
+        # ledger's own rule), as the Stop path says it now; the agent's own words or a new send call replace it.
+        # integ27 (fc merge note 3): only for a stop by their words; a chip they tapped (``swap``) is followed by the
+        # agent's own new send of their choice, so nothing is owed for it
         return OneResult("run_skill", CHANGED, result=note, countdown="changed", swap=swap, decision=decision,
-                         verb="run_skill", evidence={"why": note}, owed=LINE_STOPPED_SEND)
+                         verb="run_skill", evidence={"why": note}, owed="" if swap else LINE_STOPPED_SEND)
 
     def _grant_person(self, run_args: Mapping[str, Any], decision: Any, sk: Any, to: str) -> int | None:
         """The one person a send's grant goes to (``uia_route.grant_person`` through memory), else ``None``."""

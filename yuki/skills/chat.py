@@ -1886,6 +1886,11 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     ram.update(typed=typed, pressed=pressed)
     facts.update(typed={True: "yes", False: "no", None: "unknown"}[typed], pressed=pressed,
                  steps=int(run.get("steps") or 0), steps_done=int(run.get("steps_done") or 0))
+    if run.get("refused_steps"):
+        # integ27 (fd merge note 1, D5, final-F k_clarify_who_draft): the step check held the run's steps (their text
+        # is not in the request's words): carried to the not-typed result, so the engine says the typing was held and
+        # whose chat opened (``typing_held``), never "nothing was typed" with no why. Content-free: a boolean
+        facts["refused_steps"] = True
     if send and run.get("refused_steps") and not went and not pressed:
         # lMsg: the send check refused the steps before any ran (whom or what isn't in the user's words, and no grant):
         # nothing typed, nothing sent. Told so, never "I tried to send it, but the PC shows it didn't go through"

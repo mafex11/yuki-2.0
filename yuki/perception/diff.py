@@ -94,6 +94,7 @@ Public API::
     flag_line(d, name=None) -> str          # code's line for a window flag no legal step undoes (desk22, D6)
     tidy_ask(step, app) -> str              # fa (A7): code's question for the step under the dial "ask"
     front_guard(front_now, front_after) -> str   # fa (A6): "" while the front is the after-read's, else why not
+    front_moved_on(d, front_now, after) -> str   # integ27: front_guard plus the diff's own measure (D6, both brains)
     master_line(d) -> str                   # fa (A9): code's line for a master change that was a side effect
 
 **fa (final-F, lane A).** ``DeskDiff.taken_front`` (contract K-B) is the one taken-front rule: ``focus_from`` when
@@ -102,6 +103,10 @@ Public API::
 level or mute is a side effect, rendered as one and said by code (:func:`master_line`); never set when the caller
 does not say (``sound_act`` ``None``). A window flag's no-step line (D6) is said only while the front is the
 after-read's (:func:`front_guard`); under the dial "ask" code says the question itself (:func:`tidy_ask`).
+
+**integ27 (fb merge note A3).** The D6 line's front test is one rule for both brains, :func:`front_moved_on`:
+:func:`front_guard` plus the diff's own measure (the front moved during the act to a listed window that is not the
+act's: their own switch).
 """
 
 from __future__ import annotations
@@ -829,6 +834,34 @@ def front_guard(front_now: Any, front_after: Any) -> str:
         return "error"
 
 
+def front_moved_on(d: Any, front_now: Any, after: Any) -> str:
+    """integ27 (fb merge note A3, review finding 3: one D6 rule for both brains): whether their desk's front moved on
+    from the one code's D6 line (:func:`flag_line`) would speak about, measured only. ``""`` when it did not, else a
+    code word:
+
+    * :func:`front_guard`'s ``front_changed`` / ``front_unread``: the window in front now is not the one the
+      after-read (``after.foreground``) saw, or it can't be told (the tidy step's own guard reads it the same way);
+    * ``front_changed`` too when the act's own diff measured the front moving during the act to a listed window that is
+      not the act's (``focus_by_act`` false: their own switch, or another app's; final-F p1_dt_alt_tab_before_tidy:
+      the after-read already showed "Focus: Chrome -> File Explorer (not from your act)", so a read of the front now
+      alone could not tell). An unlisted foreground is never read as their switch.
+
+    The hands' D6 path (``Hands._look_after``) and ONE's (``Runner._front_moved_on``) both read this. Pure; never
+    raises (``"error"``)."""
+    try:
+        moved = front_guard(front_now, getattr(after, "foreground", None) if after is not None else None)
+        if moved:
+            return moved
+        start, end = _hwnd(getattr(d, "focus_from", None)), _hwnd(getattr(d, "focus_to", None))
+        window = getattr(after, "window", None)
+        listed = callable(window) and end is not None and window(end) is not None
+        if start and end and start != end and not getattr(d, "focus_by_act", False) and listed:
+            return "front_changed"
+        return ""
+    except Exception:  # noqa: BLE001
+        return "error"
+
+
 #: fa (A9): code's line for a master change measured during an act that was not about the volume (``master_changed``):
 #: what is measured, said once, never a claim about why.
 LINE_MASTER_MUTED = "Your PC's sound got muted while I did that."
@@ -968,5 +1001,5 @@ __all__ = ["ARRANGE_ACTIONS", "COVER_KEEP", "COVER_MIN_LOSS", "DeskDiff", "LINE_
            "LINE_FLAG_MINIMISED", "LINE_FLAG_POPUP", "LINE_MASTER_LEVEL", "LINE_MASTER_MUTED", "LINE_MASTER_UNMUTED",
            "LINE_TAB_AUTOPLAY", "LINE_TAB_AUTOPLAY_PLAIN", "LINE_TAB_COVER", "LINE_TAB_COVER_PLAIN", "LINE_TIDY_ASK",
            "LINE_TIDY_DONE", "LINE_TIDY_FAILED", "MOSTLY", "NOT_YOURS", "TIDY_NO_APP", "arranges", "compare",
-           "cover_line", "flag_line", "front_guard", "master_line", "render", "step_app", "tidy_ask", "tidy_guard",
-           "tidy_line", "tidy_step", "window_flag"]
+           "cover_line", "flag_line", "front_guard", "front_moved_on", "master_line", "render", "step_app", "tidy_ask",
+           "tidy_guard", "tidy_line", "tidy_step", "window_flag"]

@@ -112,6 +112,11 @@ EXPECT_BUDGET_S = 1.5
 DONE_BUDGET_S = 2.0
 #: Without UI Automation events, the re-reads happen at these moments after the first read (s), within the budget.
 REREAD_AT_S: tuple[float, ...] = (0.5, 1.5)
+#: integ27 (fe merge note 5): the shortest time between two event-driven re-reads (s), and how old the last read must be
+#: for one more read at the budget's end.
+EVENT_GAP_S = 0.25
+#: How often a cancellable wait looks at its cancel (s).
+CANCEL_STEP_S = 0.2
 
 #: One line per probe, filled only from the probe's arguments and evidence (``{App}``: the app as people say it).
 LINES: dict[str, str] = {
@@ -476,11 +481,28 @@ def _hub(dispatcher: Any) -> Any:
         return None
 
 
+def _pause(seconds: float, cancelled: Callable[[], bool] | None = None) -> None:
+    """Wait ``seconds`` (bounded); with ``cancelled``, in steps of at most :data:`CANCEL_STEP_S` so a cancel ends the
+    wait early. Reads nothing."""
+    end = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        left = end - time.monotonic()
+        if left <= 0 or (cancelled is not None and cancelled()):
+            return
+        threading.Event().wait(min(left, CANCEL_STEP_S) if cancelled is not None else left)
+
+
 def wait_read(probe: str, args: Mapping[str, Any], env: ProbeEnv, *, budget_s: float, hwnd: int | None = None,
               cancelled: Callable[[], bool] | None = None) -> tuple[bool | None, dict[str, Any], int]:
     """A probe read until True or the budget is up: ``(verdict, evidence, reads)``. After the first read, the next one
     waits for the window's UI Automation events when they flow (``hwnd``: the window the step acted on), else for
-    the fixed moments :data:`REREAD_AT_S`. Bounded; never a polling loop."""
+    the fixed moments :data:`REREAD_AT_S`. Bounded; never a polling loop.
+
+    integ27 (fe merge note 5): two event-driven reads are at least :data:`EVENT_GAP_S` apart (a busy page's every
+    change is not a read: the changes inside the gap are read by the next read), and a read that has not come true by
+    then gets one last read at the budget's end when the last read is older than that gap (with events and no change
+    since, or past the fixed moments with no events, the budget's whole time was never read again). A cancel ends the
+    wait at once, with no last read."""
     started = time.monotonic()
     verdict, evidence = read(probe, args, env)
     reads = 1
@@ -495,9 +517,14 @@ def wait_read(probe: str, args: Mapping[str, Any], env: ProbeEnv, *, budget_s: f
         except Exception:  # noqa: BLE001
             generation = None
     moments = list(REREAD_AT_S)
+    last = time.monotonic()
+
+    def stopped() -> bool:
+        return cancelled is not None and bool(cancelled())
+
     while True:
         left = budget_s - (time.monotonic() - started)
-        if left <= 0 or (cancelled is not None and cancelled()):
+        if left <= 0 or stopped():
             break
         if generation is not None:
             try:
@@ -507,6 +534,15 @@ def wait_read(probe: str, args: Mapping[str, Any], env: ProbeEnv, *, budget_s: f
                 changed, generation = False, None
             if not changed:
                 break
+            gap = min(EVENT_GAP_S - (time.monotonic() - last), budget_s - (time.monotonic() - started))
+            if gap > 0:
+                _pause(gap, cancelled)   # the changes inside the gap are this one read's
+                if stopped():
+                    break
+                try:
+                    generation = hub.generation(int(hwnd))
+                except Exception:  # noqa: BLE001
+                    generation = None
         else:
             if not moments:
                 break
@@ -516,8 +552,15 @@ def wait_read(probe: str, args: Mapping[str, Any], env: ProbeEnv, *, budget_s: f
                 threading.Event().wait(pause)
         verdict, evidence = read(probe, args, env)
         reads += 1
+        last = time.monotonic()
         if verdict is True:
-            break
+            return verdict, evidence, reads
+    if stopped():
+        return verdict, evidence, reads
+    _pause(budget_s - (time.monotonic() - started), cancelled)
+    if not stopped() and time.monotonic() - last >= EVENT_GAP_S:
+        verdict, evidence = read(probe, args, env)   # the last read, at the budget's end
+        reads += 1
     return verdict, evidence, reads
 
 
@@ -686,7 +729,11 @@ def coverage(probe: str, args: Mapping[str, Any], plan: Any, *, window_entry: Ma
                 named = str(args.get("process") or args.get("app") or args.get("target") or "")
                 if not named and window_entry:
                     named = str(window_entry.get("process_name") or "")
-                ok = _matches(want, named) if named else probe in ("read_back",)
+                # integ27 (fe merge note 1, final-F k_resume_anime: "Google Chrome" against chrome.exe was missed): the
+                # app the plan named is also the program the probe read when it is one of Windows' names for that
+                # program (``util.app_names``: as given, its process key, the name Windows gives it). Machine names
+                ok = (_matches(want, named) or want.casefold() in util.app_names(named)) if named \
+                    else probe in ("read_back",)
             elif key == "window":
                 named = str((window_entry or {}).get("title") or args.get("window") or "")
                 if probe == "page_at":

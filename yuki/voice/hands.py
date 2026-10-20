@@ -530,10 +530,13 @@ _KEYS_NOTE_LEAN = (
 #: Every hand's done line: said the moment its report verifies the step, with no second model call. v3.14b: the
 #: schemas are the hands' contracts only; when to leave it empty and every worked example are in the prompt's "# Your
 #: hands" (the same words in nine schemas were ~1.3k tokens of the talker's prefix, measured +250-300 ms of first token
-#: once the whole prompt passed ~18k tokens).
+#: once the whole prompt passed ~18k tokens). integ27 (fc merge note 1, C8; final-F p1_dt_asked_place_maximize_spotify
+#: all: "Done, it's minimized." was the lean talker's only window example, and it minimized what they asked to maximize):
+#: no single-verb example; the line names what is now so.
 _DONE_LINE = {
     "type": "string",
-    "description": "Optional: said once verified (\"Done, it's minimized.\"); \"\": nothing; left out: code's own.",
+    "description": "Optional: said once verified (a few words naming what is now so); \"\": nothing; left out: code's "
+                   "own.",
 }
 #: kHands (two asks in one breath): no words before it. qVoice (18 Oct prompt budget): "one call per part they asked
 #: for, in their order" is said once, in both talkers' prompts (the lean "Two or more asks in one breath", the full
@@ -906,8 +909,11 @@ HAND_TOOLS: list[dict[str, Any]] = [
         "properties": {
             "window": _WINDOW,
             "app": {"type": "string", "description": "Or the app as they named it, when it is not one [hwnd]."},
+            # integ27 (fc merge note 1, C8): the action is named by the state their words ask for, never copied from an
+            # example
             "action": {"type": "string", "enum": ["focus", "minimize", "maximize", "fullscreen", "restore", "close",
-                                                  *PLACE_OPS]},
+                                                  *PLACE_OPS],
+                       "description": "The state their words ask the window to end in."},
             "monitor": {"type": "string", "description": "move: \"other\" or a monitor's number."},
             "how": {"type": "string", "enum": ["keep", "maximize", "left", "right"]},
             "named": {"type": "string", "description": "close: their own words asking to close it."},
@@ -2849,10 +2855,13 @@ class Hands:
                     self.log.event("hands", op="window", action=step.get("action"), tidy=True, by_code=True,
                                    state="asked" if asked else "left", why=moved or (None if asked else "unsaid"),
                                    end_look=end or None, call=params.tool_call_id)
-            elif flag_said and desk_diff.front_guard(await asyncio.to_thread(self._front_now),
-                                                     getattr(after, "foreground", None)):
+            elif flag_said and (left_why := desk_diff.front_moved_on(d, await asyncio.to_thread(self._front_now),
+                                                                     after)):
                 # fa (A6, final-F p1_dt_alt_tab_before_tidy: "Spotify is covering Chrome." after their own switch): the
-                # front is no longer the one the after-read saw: their desk is theirs, and code says nothing about it
+                # front is no longer the one the after-read saw: their desk is theirs, and code says nothing about it.
+                # integ27 (fb merge note A3): one rule for both brains (``diff.front_moved_on``), so the diff's own
+                # measure counts too: the front moved during the act to a listed window that is not the act's (the
+                # after-read already showed their switch, so the front now alone could not tell)
                 self._look["used"] = self._look["by_code"] = True
                 out["tidied"] = _TIDIED["left"]
                 note = _AFTER_TIDIED_NOTE + (_AFTER_PURPOSE + " Otherwise stay quiet." if purpose
@@ -2861,7 +2870,7 @@ class Hands:
                     out["_quiet"] = True
                 if self.log is not None:
                     self.log.event("hands", op="window", action=None, tidy=True, by_code=True, state="left",
-                                   why="front_changed", said=False, end_look=end or None, call=params.tool_call_id)
+                                   why=left_why, said=False, end_look=end or None, call=params.tool_call_id)
             elif flag_said:
                 # desk22 (decision D6): no legal step: code says its one line about what is covered (never silence),
                 # and the talker gets no window run for it (no undoable step exists to take or to ask about)
@@ -3899,6 +3908,8 @@ class Hands:
                            # names21 (merge note 5): a launch's names measure (code words and numbers only)
                            **({"names_match": dict(facts["names_match"])}
                               if isinstance(facts.get("names_match"), dict) else {}),
+                           # integ27 (fd merge note 2): why a heard address stayed as given (a code word)
+                           **({"names_miss": facts["names_miss"]} if isinstance(facts.get("names_miss"), str) else {}),
                            **{k: v for k, v in facts.items()
                               if (isinstance(v, (int, float, bool)) or v is None)
                               and k not in ("question", "request_id", "refused_why", "refused_at")})
@@ -7571,6 +7582,10 @@ class Hands:
             # integ22 names-4: the browser's measured name (its launch's, "Ark" read as Arc): the measure only, for the
             # hands' log and ONE's step facts; no name fact, so no line or step word changes
             facts["names_match"] = {k: match.get(k) for k in ("kind", "how", "score", "margin", "source")}
+        if match is None and isinstance(details.get("names_miss"), str):
+            # integ27 (fd merge note 2, D7): why a heard address stayed as given (the names measure's own code word,
+            # ``names.MISS_WORDS``), for the hands' log line only
+            facts["names_miss"] = str(details["names_miss"])[:20]
         page = details.get("page") if isinstance(details.get("page"), dict) else {}
         hwnd = details.get("hwnd")
         stages = _stage_ms(details.get("timings_ms"))

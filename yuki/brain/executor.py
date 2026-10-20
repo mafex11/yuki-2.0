@@ -3973,20 +3973,14 @@ class Executor:
                                 lock=self._dispatch_lock)
             began = time.monotonic()
             # review F1: re-read on the page window's own UI Automation changes (a player that starts renames its
-            # control, its clock moves), else at done.REREAD_AT_S; stops at the first read that hears it
+            # control, its clock moves), else at done.REREAD_AT_S; stops at the first read that hears it. integ27 (fe
+            # merge note 5): ``done.wait_read`` itself reads once more at the budget's end (a sound that began with no
+            # window change after it, or after the fixed moments, is heard); a cancel ends the wait with no claim
             sound, _evidence, reads = done.wait_read("audio_active", {"process": image}, env,
                                                      budget_s=NOT_PLAYING_WAIT_S, hwnd=hwnd,
                                                      cancelled=self.host.cancelled)
-            if sound is False:
-                # once more at the budget's end: a sound that began with no window change after it, or after the
-                # fixed moments, is heard (one read; the wait ends early on a cancel)
-                end = began + NOT_PLAYING_WAIT_S
-                while not self.host.cancelled() and time.monotonic() < end:
-                    threading.Event().wait(min(0.2, max(0.0, end - time.monotonic())))
-                if self.host.cancelled():
-                    return None
-                sound, _evidence = done.read("audio_active", {"process": image}, env)
-                reads += 1
+            if self.host.cancelled():
+                return None
             waited = time.monotonic() - began
             if sound is not False:
                 self._emit_log("done_not_playing", held=False, sound=sound is True, reads=reads)
