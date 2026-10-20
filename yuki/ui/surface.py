@@ -2,7 +2,7 @@
 cards, the call pill, the voice pill and the tray's panels.
 
 Each is a frameless, always-on-top tool window: a floating dialog painted from the theme's
-``popover`` surface (Lattice since 2026-10-03: the graphite field with a 1 px surface border,
+``popover`` surface (Lattice since 2026-10-03: the field, umber since 20 Oct, with a 1 px surface border,
 :mod:`yuki.ui.tokens`; 20 px corners, a soft shadow; pills are fully round) that fades and
 slides a few pixels when it appears. Opaque: whatever is behind it never shows through, so
 text reads the same over any screen. Dark only; the live colour only on live and recording

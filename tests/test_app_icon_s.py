@@ -63,7 +63,7 @@ def _ico_frames(path: Path) -> dict[int, bytes]:
 
 def test_the_picked_logo_is_the_y_and_the_badge_stays_pickable():
     cfg = M.load_config()
-    assert M.grid_mark(cfg["mark"]) == "y" and cfg["ramp"] == "mint"
+    assert M.grid_mark(cfg["mark"]) == "y" and cfg["ramp"] == "ember"    # 20 Oct: the website's colours
     assert M.is_badge("02g") and M.is_badge("Badge") and not M.is_badge("planet") and not M.is_badge("y")
     assert M.grid_mark("02g") == M.grid_mark("badge") == "badge" and M.grid_mark("planet") is None
     assert all((BADGE_FRAMES / f"{s}.png").exists() for s in M.SIZES) and M.GRIDS.exists()   # the old badge is kept

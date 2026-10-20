@@ -1,9 +1,9 @@
 """The live Yuki window: frameless Windows 11 chrome, a sidebar of hardware keys, one page at a time.
 
-Built by :mod:`yuki.ui.window.app` in the window's own process and destroyed with it. The window is opaque
-navy-charcoal ``#0B0E13``; the sidebar (Field Unit) is a column of 60 px keys, each with a status LED (lit in
-the accent on the current page), and the listening key at the bottom (lit while Yuki listens); pages are
-Horizon's flat navy modules (docs/UI-window.md).
+Built by :mod:`yuki.ui.window.app` in the window's own process and destroyed with it. The window is the opaque
+field (the theme's ``bg``: umber ``#090705`` since 20 Oct); the sidebar (Field Unit) is a column of 60 px keys,
+each with a status LED (lit in the accent on the current page), and the listening key at the bottom (lit while Yuki
+listens); pages are flat modules on the field (docs/UI-window.md).
 
 Chrome (:mod:`yuki.ui.window.chrome`): drag from the top of the sidebar or any empty part of the top band,
 resize from the edges, Aero Snap, Windows 11's snap layouts on the maximise button, double-click the top to

@@ -13,14 +13,15 @@ The role names below are the ones the widgets have always asked for (``card``, `
 
 The look:
 
-* **Graphite and bone.** The field ``#0B0B0C`` (panels are the field itself), raised keys ``#121214`` /
-  ``#18191B``, hairlines ``#1E2023`` / ``#2B2E32``, resting dots ``#26292C``, ink ``#F2EFE9`` / ``#B4B0A8`` /
-  ``#8A8780``. Floating surfaces are the field with a ``#2A2D31`` border. No gradients, glass, blur, shadows
-  or light mode.
-* **One live colour**, signal mint ``#6FEBC4`` (Settings > General > Accent "green"; "orange" ``#FFA46B`` keeps
-  the older choice working), and only for something live: listening, the working head, recording, needs-you,
-  Stop, the focus ring. Primary keys are lit bone, never coloured. Errors are said in words in the brightest
-  ink (Lattice has no red).
+* **Umber and bone** (20 Oct: the website's warm blacks, the user's pick, replacing the graphite ``#0B0B0C``
+  series). The field ``#090705`` (panels are the field itself), raised keys ``#120F0C`` / ``#1A1613``, hairlines
+  ``#211D1A`` / ``#2F2A26``, resting dots ``#292521``, marks ``#4C4742``, ink ``#F2EFE9`` / ``#B4B0A8`` /
+  ``#8A8780``. Floating surfaces are the field with a ``#2F2A26`` border (toasts and the hover card ``#38332E``).
+  No gradients, glass, blur, shadows or light mode.
+* **One live colour**, ember orange ``#FF6A1A`` (Settings > General > Accent "orange", labelled Ember, the
+  default since 20 Oct; "green" is the Lattice mint ``#6FEBC4``, the other choice), and only for something live:
+  listening, the working head, recording, needs-you, Stop, the focus ring. Primary keys are lit bone, never
+  coloured. Errors are said in words in the brightest ink (Lattice has no red).
 * **Type.** Instrument Sans for the UI, JetBrains Mono for labels, times and data, Doto for the dot-matrix
   displays (all bundled, SIL OFL: :mod:`yuki.ui.fonts`); Nirmala UI as the fallback family so Devanagari
   never shows as boxes. Without the bundled files, IBM Plex Sans, Segoe UI Variable, then Segoe UI.
@@ -70,8 +71,8 @@ SIDEBAR_W = 96
 #: Page padding (mockup ``main``: 34 36 40 32).
 PAGE_PAD = (32, 34, 36, 40)
 
-#: The accent choices (Settings > General > Accent): the live colour (``tokens.json`` ``accent``). "green" is
-#: Lattice's signal mint and the default; "orange" keeps the older choice working, tuned to the same lightness.
+#: The accent choices (Settings > General > Accent): the live colour (``tokens.json`` ``accent``). "orange" is the
+#: website's ember orange and the default (20 Oct); "green" is Lattice's signal mint, the other choice.
 ACCENTS: dict[str, str] = {name: c["live"] for name, c in T.ACCENTS.items()}
 #: Ink on the live colour (a key or chip filled with it).
 ACCENT_INK: dict[str, str] = {name: c["liveInk"] for name, c in T.ACCENTS.items()}
@@ -205,7 +206,8 @@ def _make(accent: str) -> Theme:
     acc = hexa(ACCENTS[name])
     clear = QColor(0, 0, 0, 0)
     text, text_2, text_3 = P["ink"], P["ink2"], P["mute"]
-    # the dot greys of the design, lightest to darkest (the skyline is monochrome)
+    # the dot greys of the design, lightest to darkest (the skyline is monochrome). (20 Oct: all tokens but the
+    # warm grey #6E6B66, which stays on umber as it leans warm like the text greys)
     grey_series = tuple(hexa(v) for v in (_C["text2"], _C["midTone"], _C["text3"], "#6E6B66", _C["mark"],
                                           _C["hair2"], _C["dot"], _C["raise2"]))
     t = Theme(

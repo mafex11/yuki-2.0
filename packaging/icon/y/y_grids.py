@@ -1,7 +1,9 @@
 """The "Y" app icon (the user's pick of 4 Oct 2026: just a bold Y for now): every dot of every size, hand-tuned.
 
-One bold Y in the Lattice dot style: round bone dots on the graphite tile (the badge's tiles), and one mint dot at
-the Y's joint. Each size has its own layout (below), all on whole pixels so every frame is crisp:
+One bold Y in the Lattice dot style: round bone dots on the umber tile, and one ember dot at the Y's joint (20 Oct:
+the website's colours, the user's pick, as on its favicon; the Mint set still draws the 4 Oct look, bone and mint on
+the graphite tile, whose frames stay in ``packaging/icon/y-mint/``). Each size has its own layout (below), all on
+whole pixels so every frame is crisp:
 
 * 24 px and up: round dots, 3 px or more across, an odd width centred on a pixel centre (x.5) or an even width on a
   pixel corner (whole numbers), so a dot's edge always falls on a pixel edge;
@@ -28,16 +30,25 @@ ABOUT = (
     "Dot grids per icon size, in pixels from the top-left of the icon. Draw the tile first: a rounded square with corner "
     "radius rx, anti-aliased, in fill; if stroke is set, add a 1 px stroke inset by .5 (rx - .5). Then draw every dot in "
     "order: shape \"px\" fills a block of whole pixels 2r wide centred on x, y; any other dot is an anti-aliased circle of "
-    "radius r. Colours are the Mint set; to draw another set, colour each dot by its role from colourSets[set][role] "
-    "(ink is the Y, acc its joint)."
+    "radius r. Colours are the set baseSet names (Ember); to draw another set, colour each dot by its role from "
+    "colourSets[set][role] (ink is the Y, acc its joint), and the tile in the set's tile (fill) and rim (stroke) when "
+    "it has them."
 )
-#: The badge's colour sets and tiles (one family of icons).
+#: The badge's colour sets and tiles (one family of icons). (20 Oct) Ember is the website's: bone ink, the ember
+#: joint, the darkest step of its ember dot ramp as the field, the umber dot step as the base, and the umber tile with
+#: the umber rim of its favicon (``yuki-website/public/favicon.svg``, this layout at 64 px). Mint carries its graphite
+#: tile and rim, so it still draws the committed y-mint frames byte for byte.
 COLOUR_SETS = {
-    "mint": {"ink": "#F2EFE9", "acc": "#6FEBC4", "field": "#284A50", "base": "#26292C"},
+    "mint": {"ink": "#F2EFE9", "acc": "#6FEBC4", "field": "#284A50", "base": "#26292C", "tile": "#0B0B0C",
+             "rim": "#2A2D31"},
     "night": {"ink": "#BFC8CC", "acc": "#F6F0E4", "field": "#3A4044", "base": "#26292C"},
     "bang": {"ink": "#F2EFE9", "acc": "#FFB85C", "field": "#1F3B47", "base": "#26292C"},
+    "ember": {"ink": "#F2EFE9", "acc": "#FF6A1A", "field": "#5A2E15", "base": "#292521", "tile": "#090705",
+              "rim": "#2F2A26"},
 }
-FILL, STROKE = "#0B0B0C", "#2A2D31"
+#: The set the grids are written in (each dot's ``c``, the tile's fill and stroke): the one built (icon.json ``ramp``).
+BASE_SET = "ember"
+FILL, STROKE = COLOUR_SETS[BASE_SET]["tile"], COLOUR_SETS[BASE_SET]["rim"]
 TILE_RX = {256: 56, 64: 13, 48: 10, 40: 9, 32: 7, 24: 5, 20: 4, 16: 3}
 STROKE_FROM = 32                 # the 1 px rim from 32 px up; below it the rim would eat the tile
 
@@ -68,13 +79,13 @@ def _num(v: float) -> float | int:
 
 
 def icon(size: int) -> dict:
-    """One size: its tile and its dots, the arms from the tips in, then the stem, then the mint joint (drawn last)."""
+    """One size: its tile and its dots, the arms from the tips in, then the stem, then the joint (drawn last)."""
     L = LAYOUT[size]
     cx, jy, dx, dy = L["cx"], L["jy"], L["dx"], L["dy"]
     pts = [(cx - k * dx, jy - k * dy) for k in range(L["arm"], 0, -1)]
     pts += [(cx + k * dx, jy - k * dy) for k in range(L["arm"], 0, -1)]
     pts += [(cx, jy + k * L["sy"]) for k in range(1, L["stem"] + 1)]
-    ink, acc = COLOUR_SETS["mint"]["ink"], COLOUR_SETS["mint"]["acc"]
+    ink, acc = COLOUR_SETS[BASE_SET]["ink"], COLOUR_SETS[BASE_SET]["acc"]
     extra = {"shape": L["shape"]} if L.get("shape") else {}
     dots = [{"x": _num(x), "y": _num(y), "r": _num(L["r"]), "c": ink, "role": "ink", **extra} for x, y in pts]
     dots.append({"x": _num(cx), "y": _num(jy), "r": _num(L["r"]), "c": acc, "role": "acc", **extra})
@@ -83,7 +94,7 @@ def icon(size: int) -> dict:
 
 
 def grids() -> dict:
-    return {"name": NAME, "about": ABOUT, "sizes": list(SIZES), "colourSets": COLOUR_SETS,
+    return {"name": NAME, "about": ABOUT, "sizes": list(SIZES), "baseSet": BASE_SET, "colourSets": COLOUR_SETS,
             "icons": {str(s): icon(s) for s in SIZES}}
 
 
@@ -96,7 +107,8 @@ def text() -> str:
         dots = ",\n".join("        " + c(d) for d in ic["dots"])
         icons.append(f'    {c(str(s))}: {{\n      "tile": {c(ic["tile"])},\n      "dots": [\n{dots}\n      ]\n    }}')
     return ('{\n  "name": ' + c(g["name"]) + ',\n  "about": ' + c(g["about"]) + ',\n  "sizes": ' + c(g["sizes"]) +
-            ',\n  "colourSets": ' + c(g["colourSets"]) + ',\n  "icons": {\n' + ",\n".join(icons) + "\n  }\n}\n")
+            ',\n  "baseSet": ' + c(g["baseSet"]) + ',\n  "colourSets": ' + c(g["colourSets"]) +
+            ',\n  "icons": {\n' + ",\n".join(icons) + "\n  }\n}\n")
 
 
 def write(out: Path = OUT) -> Path:

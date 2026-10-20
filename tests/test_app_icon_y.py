@@ -1,8 +1,8 @@
-"""The Y app icon (the user's pick, 4 Oct): one bold Y in round dots with a mint joint, hand-tuned per size in
-packaging/icon/y/y_grids.py. The committed grids are that layout, every dot sits on whole pixels (round dots 3 px or
-more from 24 px up, 2 x 2 pixel blocks at 16 and 20), the committed frames are drawn crisp (each dot's centre pure
-bone or mint, the tile untouched next to it) and match a fresh drawing byte for byte, and yuki.ico packs them pixel
-for pixel. Offline; the redraw uses a headless browser only when one is installed."""
+"""The Y app icon (the user's pick, 4 Oct): one bold Y in round dots with an accent joint (ember on the umber tile since
+20 Oct), hand-tuned per size in packaging/icon/y/y_grids.py. The committed grids are that layout, every dot sits on
+whole pixels (round dots 3 px or more from 24 px up, 2 x 2 pixel blocks at 16 and 20), the committed frames are drawn
+crisp (each dot's centre pure bone or ember, the tile untouched next to it) and match a fresh drawing byte for byte,
+and yuki.ico packs them pixel for pixel. Offline; the redraw uses a headless browser only when one is installed."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def _load(name: str, path: Path):
 M = _load("make_icon", PKG / "make_icon.py")
 Y = _load("y_grids", M.Y_LAYOUT)
 GRIDS = M.grids_file("y")
-FRAMES = M.frames_dir("y", "mint")
+FRAMES = M.frames_dir("y", "ember")
 
 
 def _hex(px: tuple) -> str:
@@ -45,13 +45,13 @@ def test_y_is_the_picked_mark_and_its_grids_are_its_layout():
     assert M.grid_mark(cfg["mark"]) == "y" and M.grid_mark("Y") == "y"
     assert GRIDS.read_text(encoding="utf-8") == Y.text()          # committed = the layout (no drift, no gallery needed)
     g = json.loads(GRIDS.read_text(encoding="utf-8"))
-    assert sorted(g["sizes"]) == sorted(M.SIZES) and set(g["colourSets"]) == {"mint", "night", "bang"}
+    assert sorted(g["sizes"]) == sorted(M.SIZES) and set(g["colourSets"]) == {"mint", "night", "bang", "ember"}
 
 
 @pytest.mark.parametrize("s", (16, 20, 24, 32, 40, 48, 64, 256))
 def test_every_dot_is_on_whole_pixels_and_big_enough(s):
     icon = json.loads(GRIDS.read_text(encoding="utf-8"))["icons"][str(s)]
-    assert icon["tile"]["fill"] == "#0B0B0C" and (icon["tile"]["stroke"] is not None) == (s >= 32)
+    assert icon["tile"]["fill"] == "#090705" and (icon["tile"]["stroke"] is not None) == (s >= 32)
     for d in icon["dots"]:
         assert float(d["x"] - d["r"]).is_integer() and float(d["y"] - d["r"]).is_integer(), d   # edges on pixel edges
         assert 0 < d["x"] - d["r"] and d["x"] + d["r"] < s and 0 < d["y"] - d["r"] and d["y"] + d["r"] < s
@@ -62,7 +62,7 @@ def test_every_dot_is_on_whole_pixels_and_big_enough(s):
 
 
 @pytest.mark.parametrize("s", (16, 20, 24, 32, 40, 48, 64, 256))
-def test_the_dots_draw_a_symmetric_y_with_one_mint_joint(s):
+def test_the_dots_draw_a_symmetric_y_with_one_accent_joint(s):
     dots = json.loads(GRIDS.read_text(encoding="utf-8"))["icons"][str(s)]["dots"]
     acc = [d for d in dots if d["role"] == "acc"]
     assert len(acc) == 1 and all(d["role"] in ("ink", "acc") for d in dots)
@@ -123,7 +123,7 @@ def test_the_ico_packs_the_y_frames_pixel_for_pixel():
 
 @pytest.mark.skipif(M.find_browser() is None, reason="no headless Chromium on this PC")
 def test_the_frames_redraw_identically_from_the_grids():
-    drawn = M.render_grids(GRIDS, "mint")
+    drawn = M.render_grids(GRIDS, "ember")
     for s in M.SIZES:
         assert drawn[s] == (FRAMES / f"{s}.png").read_bytes(), s
 

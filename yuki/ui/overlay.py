@@ -961,8 +961,8 @@ class IntentCard(QWidget):
 
 class Overlay(SurfaceWindow):
     """The ask bar in the Lattice design (phase E9): 780 px, 64 px from the top of the monitor in use, the field colour
-    with a ``#2E3135`` border and 22 px corners. On top the input row (the face at 4 px, your words at 19 px, Speak and
-    the shortcut), then the Intent card when there is one (words an offer put here unsent; a request's resolved chips),
+    with the panel border (20 Oct: umber ``#38332E``, the website's --edge; was ``#2E3135``) and 22 px corners. On
+    top the input row (the face at 4 px, your words at 19 px, Speak and the shortcut), then the Intent card when there is one (words an offer put here unsent; a request's resolved chips),
     the thread (the live chat, in the design's turns), and a foot of key hints with the call's timer.
 
     The hotkey while a run holds the desk shows the small :class:`SpareBar` instead, without the keyboard, and this bar
