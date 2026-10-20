@@ -17,9 +17,9 @@ label, and it stops when nothing runs (the thinking line's dots are a
 :class:`~yuki.ui.wave.Wave`, animated only while shown).
 
 Two looks (Horizon x Field Unit): ``window`` -- your messages on a glass bubble
-on the right, Yuki's on a navy panel on the left, check-ins between two rules --
-and ``overlay`` (the ask bar) -- only your own lines on a subtle bubble, Yuki's
-words plain, the check-in inline.
+on the right, Yuki's on a field-coloured umber panel on the left, check-ins
+between two rules -- and ``overlay`` (the ask bar) -- only your own lines on a
+subtle bubble, Yuki's words plain, the check-in inline.
 """
 
 from __future__ import annotations
@@ -210,9 +210,9 @@ class _Spin(QWidget):
 
 
 class _Bubble(QWidget):
-    """A message. Window look: the user's on glass on the right, Yuki's on a navy panel on the left (10 px
-    corners). Ask-bar look: only the user's own line has a subtle bubble; Yuki's words stand plain. An error
-    gets a red line (the words say what failed)."""
+    """A message. Window look: the user's on glass on the right, Yuki's on a field-coloured umber panel on the
+    left (10 px corners). Ask-bar look: only the user's own line has a subtle bubble; Yuki's words stand plain.
+    An error gets a bright line, the brightest ink (the words say what failed)."""
 
     def __init__(self, t: Theme, *, mine: bool, tone: str = "", look: str = "window") -> None:
         super().__init__()

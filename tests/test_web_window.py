@@ -406,9 +406,10 @@ def test_accent_motion_and_voice_are_saved_where_the_tray_reads_them(tmp_path, m
     voice = tmp_path / "voice.json"
     monkeypatch.setattr(settings_io, "voice_prefs_path", lambda: voice)
     win, host = _window(tmp_path, monkeypatch)
-    assert _act(win, host, "accent", accent="orange")["ok"] and _act(win, host, "motion", reduce=True)["ok"]
+    # Mint, not the default (ember): a file the accent save never reached would read as ember
+    assert _act(win, host, "accent", accent="green")["ok"] and _act(win, host, "motion", reduce=True)["ok"]
     saved = ui_settings.load(tmp_path / "ui.json")
-    assert saved.accent == "orange" and saved.reduce_motion is True
+    assert saved.accent == "green" and saved.reduce_motion is True
     assert _act(win, host, "accent", accent="pink")["ok"] is False
     r = _act(win, host, "voice", end_tone=False, tts_provider="deepgram", mic="USB mic")
     assert r["ok"] and r["offline"] is True

@@ -1,7 +1,7 @@
 """The window's building blocks in the Horizon x Field Unit look, all painted from
 :mod:`yuki.ui.window.theme` tokens.
 
-Horizon: flat navy panels (:class:`Card`, :class:`Panel`), pill buttons (:class:`Button`: primary, outline,
+Horizon: flat panels on the umber field (:class:`Card`, :class:`Panel`), pill buttons (:class:`Button`: primary, outline,
 ghost), a switch (:class:`Toggle`), a segmented choice (:class:`Segmented`), a select (:class:`Dropdown`),
 inputs, a menu, a tooltip, a thin scrollbar. Field Unit: hardware keys with a status LED (:class:`Key`,
 :class:`NavItem`), dot-matrix displays (:class:`DotDisplay`, :class:`TimeDisplay`), keycaps
@@ -119,8 +119,8 @@ def vbox(*items: QWidget | int | None, spacing: int = SPACE["s"], margins: tuple
 
 
 class Card(QWidget):
-    """A flat surface with a 1 px line. ``level``: ``card`` (a page module, navy panel) | ``muted`` (a "glass"
-    inset: evidence, a composer, an empty state) | ``display`` | ``popover``."""
+    """A flat surface with a 1 px line. ``level``: ``card`` (a page module on the umber field) | ``muted`` (a
+    "glass" inset: evidence, a composer, an empty state) | ``display`` | ``popover``."""
 
     def __init__(self, t: Theme, *, level: str = "card", radius: int | None = None, padding: int = SPACE["l"],
                  parent: QWidget | None = None) -> None:
@@ -1627,7 +1627,7 @@ def smooth(area: QScrollArea) -> SmoothScroller:
 
 
 class Shimmer(QWidget):
-    """A skeleton module: a navy panel with quiet blocks that pulse gently while a section loads. Its timer
+    """A skeleton module: a field-coloured panel with quiet blocks that pulse gently while a section loads. Its timer
     runs only while it is shown; it is deleted when the real content takes its place."""
 
     def __init__(self, t: Theme, *, rows: int = 3, height: int = 150, parent: QWidget | None = None) -> None:
