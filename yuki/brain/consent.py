@@ -112,8 +112,10 @@ ALLOW, ASK, REFUSE, DRAFT = "allow", "ask", "refuse", "draft"
 RESULTS: tuple[str, ...] = (ALLOW, ASK, REFUSE, DRAFT)
 #: The plan's declared commit (``consent.commit``, §2.2).
 COMMITS: tuple[str, ...] = ("none", "send", "join", "lasting")
-#: The commit check's effects (§2.6); every one but ``none`` is lasting.
-EFFECTS: tuple[str, ...] = ("none", "send", "join", "delete", "close", "buy", "setting", "other")
+#: The commit check's effects (§2.6); every one but ``none`` is lasting. ``later`` (A2, Z7): the step leaves something
+#: acting on its own after it returns (a hidden process, a watcher, a job, a scheduled task), refused as final whatever
+#: ``asked`` says.
+EFFECTS: tuple[str, ...] = ("none", "send", "join", "delete", "close", "buy", "setting", "later", "other")
 
 #: What the user is told (code lines; voice-shaped).
 LINE_GAME = "You're in a game: after the round?"
@@ -132,6 +134,9 @@ LINE_TYPED_ENTER = ("typing with Enter here sends what is typed (a chat app's wi
 LINE_LINE_BREAK = ("a line break in the typed text presses Enter, which may send or run it, and the commit check can't "
                    "see it: type the text without the line break and set submit (that Enter is checked), or press "
                    "Enter as its own step")
+#: A2 (Z7): a step that would leave something acting on its own after it returns (the commit check's ``later`` effect).
+#: Refused as final in both brains, whatever their words asked for: Yuki acts only while it works on the request.
+LINE_LATER = "I can't wait for that and do it later; want it now?"
 LINE_NOT_CAPABILITY = "send through the message capability"
 LINE_RECIPIENT = "the step sends to someone other than the plan's recipient"
 #: Planner-facing refusals of a declared send (code facts the planner can fix).
@@ -1381,6 +1386,12 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
     if gate is not None:
         return gate
 
+    # A2 (Z7): a step that leaves something acting on its own after it returns (a hidden process, a watcher, a job, a
+    # scheduled task: the check's `later` effect, judged from the whole step) is refused as final, whatever `asked`
+    # says. The user's words ask for a result, never for an unattended mechanism; code offers to do it now instead.
+    if effect == "later" and not failed:
+        return Verdict(REFUSE, 5, "later", line=LINE_LATER, final=True)
+
     sk = None
     if step.tool == "run_skill":
         key, slots = skill_input(step, plan)
@@ -1574,6 +1585,7 @@ def after_ask(verdict: Verdict) -> Verdict:
 
 __all__ = ["UNDOABLE",
            "ALLOW", "ASK", "CHAT_KIND", "COMMITS", "DRAFT", "EFFECTS", "LINE_ASK_SEND", "LINE_DRAFTED", "LINE_GAME",
+           "LINE_LATER",
            "NAME_GAP", "PLAIN_WHY", "REFUSE", "RESULTS", "SAID_SHARE", "SAID_SPAN", "Call", "Live", "Verdict",
            "after_ask", "ask_send_question", "spoken_name", "calling_windows", "chat_window", "check", "draft_slots",
            "failed_question", "field_of", "game_holds", "game_now", "in_words", "is_join_control", "join_controls",

@@ -63,7 +63,9 @@ For each step, by its number:
 send: a message, post, reply or submission reaches other people or a chat thread. join: it joins a call, a meeting \
 or a voice channel. \
 delete: something is removed or overwritten. close: a window, tab, app or session ends. buy: money is spent. \
-setting: a setting or a state of theirs changes (muting is one). other: any other lasting effect, or you can't tell.
+setting: a setting or a state of theirs changes (muting is one). \
+later: the step leaves something on the PC that keeps acting on its own after it returns (a background process, a \
+watcher, a job, a scheduled task, an event subscription). other: any other lasting effect, or you can't tell.
 - asked: true only when their words ask for that very effect. Asking for a result does not ask for every lasting \
 step on the way: lowering a volume is not muting it. A send is asked when they tell Yuki to send it, or to \
 message, tell, ask or reply to someone with what to say in their words. Naming only the person, asking for a draft, \
@@ -288,6 +290,8 @@ def step_line(call: Call, *, plan: Any = None, typed: bool = False, typed_text: 
         parts.append(f'types "{_clip(inp.get("text"), VALUE_CHARS)}"' + (" and presses Enter" if inp.get("press_enter")
                                                                           else ""))
     elif call.tool == "run_powershell":
+        # A1 (Z7): the executor refuses a command over ``one.tools.SHELL_CHARS`` (== :data:`VALUE_CHARS`) before it
+        # reaches the check, so a command shown here is whole, never cut: the check never judges a clipped command.
         parts.append(f'command (Yuki wrote it) "{_clip(inp.get("command"), VALUE_CHARS)}"')
     elif call.tool in ("open_url", "fetch_url"):
         parts.append(f'address "{_clip(inp.get("url"), 200)}"')

@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import logging
 import os
 import queue
 import re
@@ -64,6 +65,8 @@ import uuid
 from xml.etree import ElementTree
 
 from yuki.actions import ActionResult
+
+_log = logging.getLogger(__name__)
 
 _CREATE_NO_WINDOW = 0x08000000
 _SUMMARY_CHARS = 200
@@ -82,6 +85,24 @@ _ERROR_SUMMARY_CHARS = 400
 MAX_STREAM_CHARS = 20_000
 _CLIP_HEAD_CHARS = 12_000
 _CLIP_TAIL_CHARS = 6_000
+
+#: A3 (Z7): the measured backstop. After a command returns, anything it started that is still alive and owns no
+#: visible window anywhere in its process branch is ended, and any event subscription or background job it added to
+#: the session is removed; the result then says so (``left_running``) and ``ok`` is False. Pure process-tree and
+#: window facts, never the command's words: it also catches a payload split across several commands.
+#:
+#: The settle polls for a window up to :data:`_REAP_SETTLE_S`, and early-exits the instant no started descendant is
+#: still windowless, so a launched app that is slow to paint its first window is kept (a branch with a visible window
+#: anywhere is kept whole: an app's own windowless helpers belong to it). A process whose window status cannot be
+#: read is kept, never killed on uncertainty.
+_REAP_SETTLE_S = 4.0
+_REAP_POLL_S = 0.25
+#: The session probe that lists what could fire later (ids only, content-free): event subscriptions and jobs.
+_SESSION_STATE_PROBE = (
+    "$s=@(Get-EventSubscriber -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.SubscriptionId }); "
+    "$j=@(Get-Job -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }); "
+    "Write-Output ('YUKISUBS=' + ($s -join ',')); Write-Output ('YUKIJOBS=' + ($j -join ','))"
+)
 
 #: UTF-8 in and out (so non-ASCII output survives) and no progress records,
 #: which PowerShell otherwise serialises onto stderr.
@@ -137,6 +158,50 @@ def _kill_tree(pid: int, *, since: float | None = None) -> None:
             proc.kill()
         except Exception:
             pass
+
+
+def _visible_window_pids() -> set[int]:
+    """The pids that own at least one visible top-level window now (read-only Win32). Empty when it can't be read,
+    which makes every branch read as windowless - so the caller keeps anything it is unsure about (it kills only a
+    branch it has positively confirmed windowless)."""
+    pids: set[int] = set()
+    try:
+        import win32gui
+        import win32process
+    except Exception:  # noqa: BLE001 - no pywin32: cannot confirm windowless, so nothing is reaped
+        return pids
+
+    def _cb(hwnd: int, _: object) -> bool:
+        try:
+            if win32gui.IsWindowVisible(hwnd):
+                _tid, owner = win32process.GetWindowThreadProcessId(hwnd)
+                if owner:
+                    pids.add(int(owner))
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:  # noqa: BLE001
+        return set()
+    return pids
+
+
+def _branch_windowless(proc, visible: set[int]) -> bool:
+    """Whether ``proc`` and its whole subtree own no visible window (so the command left it running unseen). A branch
+    with a visible window anywhere is kept whole. On any read error: ``False`` (kept) - uncertainty never kills."""
+    if not visible:
+        return False
+    try:
+        if proc.pid in visible:
+            return False
+        for child in proc.children(recursive=True):
+            if child.pid in visible:
+                return False
+    except Exception:  # noqa: BLE001 - cannot read the branch: keep it
+        return False
+    return True
 
 
 def _first_line(text: str, limit: int = _SUMMARY_CHARS) -> str:
@@ -225,7 +290,7 @@ class _SessionTimeout(TimeoutError):
 class _RunOutcome:
     """Raw result of one script, before it becomes an ActionResult."""
 
-    __slots__ = ("exit_code", "stdout", "stderr", "timed_out", "transport")
+    __slots__ = ("exit_code", "stdout", "stderr", "timed_out", "transport", "left_running")
 
     def __init__(
         self,
@@ -234,12 +299,15 @@ class _RunOutcome:
         stderr: str,
         timed_out: bool,
         transport: str,
+        left_running: int = 0,
     ) -> None:
         self.exit_code = exit_code
         self.stdout = stdout
         self.stderr = stderr
         self.timed_out = timed_out
         self.transport = transport
+        #: A3 (Z7): how many still-running windowless processes / session subscriptions / jobs the backstop ended.
+        self.left_running = left_running
 
 
 class _Session:
@@ -266,6 +334,10 @@ class _Session:
         self._pump(self._process.stdout, self._stdout)
         self._pump(self._process.stderr, self._stderr)
         self._write("\n".join(_PRELUDE_LINES) + "\n")
+        #: A3 (Z7): the event-subscription and job ids already in the session (a fresh shell starts with none), so the
+        #: backstop removes only what a command adds and never touches state Yuki itself put there.
+        self._known_subs: set[str] = set()
+        self._known_jobs: set[str] = set()
 
     # -- plumbing -----------------------------------------------------------
     def _pump(self, stream, sink: queue.Queue[str | None]) -> None:
@@ -407,6 +479,114 @@ class _Session:
             transport="session",
         )
 
+    # -- A3 (Z7): the measured backstop ------------------------------------
+    def reap_after(self, command_started: float | None) -> int:
+        """End anything the command just left running unseen: windowless descendant processes, and event
+        subscriptions or jobs it added to the session. Returns how many were ended (0 when nothing was). Never
+        raises: the backstop never breaks a command that otherwise worked."""
+        if command_started is None:
+            return 0
+        try:
+            killed = self._reap_processes(float(command_started))
+        except Exception:  # noqa: BLE001
+            killed = 0
+        try:
+            removed = self._reap_session_state()
+        except Exception:  # noqa: BLE001
+            removed = 0
+        return killed + removed
+
+    def _reap_processes(self, command_started: float) -> int:
+        """Poll up to :data:`_REAP_SETTLE_S` for the command's started descendants to paint a window; end the ones
+        that stay windowless (by the top of each windowless subtree, so a branch is counted and killed once)."""
+        try:
+            import psutil
+        except Exception:  # noqa: BLE001 - no psutil: nothing is reaped
+            return 0
+        pid = self._process.pid
+        deadline = time.monotonic() + _REAP_SETTLE_S
+        while True:
+            try:
+                root = psutil.Process(pid)
+                started = [c for c in root.children(recursive=True) if _created_since(c, command_started)]
+            except Exception:  # noqa: BLE001 - the shell is gone: nothing to reap
+                return 0
+            alive = [c for c in started if _is_running(c)]
+            if not alive:
+                return 0   # nothing the command started is still running
+            visible = _visible_window_pids()
+            windowless = {c.pid: c for c in alive if _branch_windowless(c, visible)}
+            if not windowless:
+                return 0   # everything still running owns a window somewhere: all kept
+            if time.monotonic() >= deadline:
+                roots = [c for p, c in windowless.items() if _ppid(c) not in windowless]
+                killed = 0
+                for proc in roots:
+                    try:
+                        proc.kill()
+                        killed += 1
+                    except Exception:  # noqa: BLE001
+                        pass
+                return killed
+            time.sleep(_REAP_POLL_S)
+
+    def _session_state(self, timeout_s: float = 2.0) -> tuple[set[str], set[str]]:
+        """The ids of the event subscriptions and jobs the session holds now (digits only; content-free)."""
+        try:
+            outcome = self.run(_SESSION_STATE_PROBE, timeout_s)
+        except Exception:  # noqa: BLE001 - the probe could not run: treat as unchanged
+            return set(self._known_subs), set(self._known_jobs)
+        subs: set[str] = set()
+        jobs: set[str] = set()
+        for line in (outcome.stdout or "").splitlines():
+            if line.startswith("YUKISUBS="):
+                subs = {t for t in line[len("YUKISUBS="):].split(",") if t.strip().isdigit()}
+            elif line.startswith("YUKIJOBS="):
+                jobs = {t for t in line[len("YUKIJOBS="):].split(",") if t.strip().isdigit()}
+        return subs, jobs
+
+    def _reap_session_state(self) -> int:
+        """Remove the event subscriptions and jobs the command added (ids not known before it ran); leave Yuki's own
+        and any that pre-dated the command untouched. Returns how many were removed."""
+        subs, jobs = self._session_state()
+        new_subs = subs - self._known_subs
+        new_jobs = jobs - self._known_jobs
+        removed = 0
+        if new_subs or new_jobs:
+            parts = [f"Unregister-Event -SubscriptionId {int(s)} -Force -ErrorAction SilentlyContinue"
+                     for s in new_subs]
+            parts += [f"Remove-Job -Id {int(j)} -Force -ErrorAction SilentlyContinue" for j in new_jobs]
+            try:
+                self.run("; ".join(parts), 5.0)
+                removed = len(new_subs) + len(new_jobs)
+            except Exception:  # noqa: BLE001 - could not remove: report nothing removed, leave known as it was
+                removed = 0
+        # carry the ids that survive (the ones we kept) forward as the new baseline
+        self._known_subs = subs - new_subs
+        self._known_jobs = jobs - new_jobs
+        return removed
+
+
+def _created_since(proc, since: float) -> bool:
+    try:
+        return proc.create_time() >= since - 0.5
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_running(proc) -> bool:
+    try:
+        return bool(proc.is_running())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ppid(proc) -> int:
+    try:
+        return int(proc.ppid())
+    except Exception:  # noqa: BLE001
+        return -1
+
 
 _session_lock = threading.Lock()
 _session: _Session | None = None
@@ -443,7 +623,7 @@ def _run_in_session(command: str, timeout_s: float) -> _RunOutcome | None:
                 return None
         command_started = time.time()
         try:
-            return _session.run(command, timeout_s)
+            outcome = _session.run(command, timeout_s)
         except _SessionTimeout as expired:
             _session.kill(command_started=command_started)
             _session = None
@@ -459,6 +639,13 @@ def _run_in_session(command: str, timeout_s: float) -> _RunOutcome | None:
             _session.kill()
             _session = None
             return None
+        # A3 (Z7): the command returned; end anything it left acting on its own after it (windowless processes,
+        # session subscriptions, jobs). Measured, never the command's words. Never breaks a command that worked.
+        try:
+            outcome.left_running = _session.reap_after(command_started)
+        except Exception:  # noqa: BLE001
+            outcome.left_running = 0
+        return outcome
 
 
 def prewarm(*, timeout_s: float = 30.0) -> bool:
@@ -572,8 +759,11 @@ def run_powershell(
     Returns:
         ActionResult with ``details = {"command", "exit_code", "stdout",
         "stderr", "stdout_chars", "stderr_chars", "clipped", "timed_out",
-        "timeout_s", "transport"}``.  ``ok`` is True only for exit code 0 without
-        a timeout; every failure carries the full error text in ``stderr`` and
+        "timeout_s", "transport", "left_running"}``.  ``ok`` is True only for exit
+        code 0 without a timeout and with nothing left running (A3: the backstop
+        ended ``left_running`` windowless processes / session subscriptions / jobs
+        the command left acting on its own); every failure carries the full error
+        text in ``stderr`` and
         names its first line in ``summary``.  ``stdout``/``stderr`` are the full
         streams unless they exceeded :data:`MAX_STREAM_CHARS`, in which case they
         are head+tail around a marker that says how much was dropped and
@@ -659,8 +849,15 @@ def run_powershell(
     if clipped:
         summary += f" [{' and '.join(clipped)} clipped to head+tail, see the marker]"
 
+    # A3 (Z7): the backstop ended things the command left acting on its own; say so, and fail the step (its words
+    # asked for a result, not an unattended mechanism). Content-free log: a count only, never the command.
+    left_running = int(getattr(outcome, "left_running", 0) or 0)
+    if left_running:
+        summary += f" [ended {left_running} thing(s) it left running with no window]"
+        _log.info("shell backstop ended %d left-running item(s)", left_running)
+
     return ActionResult(
-        ok=not outcome.timed_out and outcome.exit_code == 0,
+        ok=not outcome.timed_out and outcome.exit_code == 0 and left_running == 0,
         summary=summary,
         details={
             "command": command,
@@ -673,6 +870,7 @@ def run_powershell(
             "timed_out": outcome.timed_out,
             "timeout_s": timeout_s,
             "transport": outcome.transport,
+            "left_running": left_running,
         },
         elapsed_ms=elapsed_ms,
     )

@@ -333,7 +333,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "run_powershell",
         "label": "Running a command",
-        "description": "Run a PowerShell command on this PC; stdout, stderr and the exit code come back.",
+        "description": ("Run a PowerShell command on this PC; stdout, stderr and the exit code come back. The command "
+                        "must finish within this step: never leave a process, watcher, job or scheduled task running "
+                        "to act on its own afterward. Do the thing now, or say plainly it would have to wait and "
+                        "offer to do it now instead."),
         "input_schema": _obj({"command": {"type": "string"}}, ["command"]),
     },
     {

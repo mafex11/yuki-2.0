@@ -464,6 +464,12 @@ LINE_CLOSE_ASKING = "It may be asking you something before it closes, so I left 
 #: safety27 D2: a shell command while a close of this request has something asking (it could end the app without it).
 QUESTION_SHELL_ASKING = ("Something I tried to close may be asking you a question first. Run that command anyway? It "
                          "could close it without saving.")
+#: A1 (Z7): a run_powershell command longer than the commit check reads whole (``one.tools.SHELL_CHARS``) is refused
+#: in the executor too, as ONE does (``one/policy.py``), so the check never judges a cut command. Planner-facing
+#: (non-final): split it into shorter commands (the session keeps variables), or say plainly what it would do and
+#: offer to do it now (A4: a step ends inside its own run).
+LINE_SHELL_LONG = ("the command is longer than the check reads whole, so it was not run: split it into shorter "
+                   "commands (the session keeps variables), or say what it would do and offer to do it now")
 LINE_BUSY = "Something else is using the mouse and keyboard right now, so I stopped. Try again in a moment?"
 LINE_PAUSE_STOP = "Stopped. Nothing else was done."
 LINE_STOPPED_SEND = "Stopped. Nothing was sent."
@@ -1757,6 +1763,9 @@ class Executor:
             call = self._predicted(i, step, payload)
             if call is None:
                 continue
+            if call.tool == "run_powershell" and \
+                    len(" ".join(str(call.input.get("command") or "").split())) > self._shell_chars():
+                continue   # A1 (Z7): refused whole at run time; never shown to the check cut
             live = Live(typed_pending=frozenset(typed), reads=frozenset(reads), join_controls=self.join_controls)
             if consent.may_commit(call, live, self.head):
                 calls.append(call)
@@ -1923,6 +1932,17 @@ class Executor:
             bounded = self._tidy_gate(index, call)
             if bounded is not None:
                 return bounded
+        if call.tool == "run_powershell" and \
+                len(" ".join(str(call.input.get("command") or "").split())) > self._shell_chars():
+            # A1 (Z7): a command the commit check could only see cut is refused in the executor first, the same
+            # measured length ONE refuses (one/policy.py:790-795); the check then only ever judges whole commands.
+            # Not final (parity with ONE): it comes back to the planner to route around with shorter commands or to
+            # offer the result now; the "same step again" guard stops a re-emit of the same long command.
+            status.state, status.why = "refused", "shell_long"
+            self._trace_step(call, None, ok=False, verdict=False, why="refused: shell_long", kind="control",
+                             refused=True)
+            self._emit_log("consent", verb=call.tool, row=0, result=consent.REFUSE, why="shell_long")
+            return self._mismatch_result(index, "shell_long", refused=True, seen=LINE_SHELL_LONG)
         live = self._live(call)
         refused = self._who_guard(index, call, live)
         if refused is not None:
@@ -2030,6 +2050,20 @@ class Executor:
             # handed over, was refused or saw nothing go (a retry after "WhatsApp instead?" -> yes) never counts
             self._sent_keys.add(send_key)
         return result
+
+    @staticmethod
+    def _shell_chars() -> int:
+        """A1 (Z7): the most characters of a run_powershell command the commit check is shown whole, shared with ONE
+        (``one.tools.SHELL_CHARS``; read the constant, never moved). A command over it is refused in the executor, so
+        a cut command never reaches the check. Falls back to the check's own clip when ONE's tools can't be read."""
+        try:
+            from yuki.one.tools import SHELL_CHARS
+
+            return int(SHELL_CHARS)
+        except Exception:  # noqa: BLE001 - the shared cap unreadable: the check's own clip length
+            from yuki.brain.check import VALUE_CHARS
+
+            return int(VALUE_CHARS)
 
     def _close_hold(self, call: Call) -> str:
         """safety27 D2 (ONE's ``_held`` rule for the planner): ``window`` when ``call`` acts in a window a close of
