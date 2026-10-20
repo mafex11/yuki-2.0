@@ -76,7 +76,9 @@
       played = true;
       timers.forEach(clearTimeout); timers.clear();
       const still = reduced();
-      ps = window.PlanetSplash.mount(box, { colorSet: 'mint', background: null, reduced: still, onDone() {
+      // (20 Oct) Yuki's own colours, ember like the app icon, whichever live colour Settings picked: the splash is the
+      // mark, and it plays before the page hears the accent
+      ps = window.PlanetSplash.mount(box, { colorSet: 'ember', background: null, reduced: still, onDone() {
         if (gone) return;
         later(() => { ended = true; settle(); }, still ? STILL_MS : 0);
         later(() => { paged = true; settle(); }, WAIT_PAGE_MS);
@@ -538,7 +540,9 @@
   function applyAppearance(a) {
     if (!a) return;
     const root = document.documentElement;
-    if (a.accent && a.accent !== 'green') root.dataset.accent = a.accent; else delete root.dataset.accent;
+    // (20 Oct: always the name, so the page never assumes which accent is the default: tokens.css has a
+    // [data-accent] block for every other choice, and the default's name matches none, leaving :root's own)
+    if (a.accent) root.dataset.accent = a.accent; else delete root.dataset.accent;
     L.refreshColors();
     const want = !!a.reduce_motion || (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
     if (want !== L.Motion.reduced) L.Motion.set(want); else root.dataset.motion = want ? 'reduced' : 'full';

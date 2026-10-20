@@ -179,7 +179,9 @@ def appearance() -> dict[str, Any]:
         s = ui_settings.load()
         return {"accent": s.accent, "reduce_motion": bool(s.reduce_motion)}
     except Exception:  # noqa: BLE001 - a broken settings file reads as defaults
-        return {"accent": "green", "reduce_motion": False}
+        from yuki.ui import tokens
+
+        return {"accent": tokens.DEFAULT_ACCENT, "reduce_motion": False}   # (20 Oct: ember, was "green")
 
 
 def app_version(ui_dir: Path | None = None) -> str:

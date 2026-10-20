@@ -11,15 +11,19 @@
   const mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : { matches: false };
   const REDUCED = qs.get('motion') === 'reduced' || mq.matches;
   const DPR = Math.min(2, window.devicePixelRatio || 1);
-  const COL = { BASE: '#26292C', OFF: '#2A2D31', TILE: '#0B0B0C', EDGE: '#2A2D31' };
+  // (20 Oct: the umber blacks of tokens.json: --dot, --dot-face, --bg, --surface-border)
+  const COL = { BASE: '#292521', OFF: '#2F2A26', TILE: '#090705', EDGE: '#2F2A26' };
 
-  /* colour ramps: dim dots first, brightest last. None of them uses Gradient Bang's hues. */
+  /* colour ramps: dim dots first, brightest last. None of them uses Gradient Bang's hues.
+     (20 Oct: ember, the website's dot ramp, is Yuki's colour set now and the default; mint, night and bang stay as
+     they were for anything that asks for them by name) */
   const RAMPS = {
+    ember: { name: 'Ember', note: 'Yuki colours: umber, ember, bone', c: ['#5A2E15', '#8D4017', '#C65518', '#FF6A1A', '#F7BA96', '#F2EFE9'] },
     mint: { name: 'Mint', note: 'Yuki colours: steel, mint, bone', c: ['#284A50', '#2F7570', '#43AE94', '#6FEBC4', '#C2F3DF', '#F2EFE9'] },
     night: { name: 'Night', note: 'no colour: greys up to a warm bone', c: ['#3A4044', '#5B6368', '#8C969C', '#BFC8CC', '#E3E5E0', '#F6F0E4'] },
     bang: { name: 'Bang', note: 'hot: deep teal, mint, bone, a warm core', c: ['#1F3B47', '#23706C', '#3CC29A', '#8DF2CF', '#F2EFE9', '#FFE1AE'] }
   };
-  const state = { ramp: RAMPS[qs.get('ramp')] ? qs.get('ramp') : 'mint' };
+  const state = { ramp: RAMPS[qs.get('ramp')] ? qs.get('ramp') : 'ember' };
   const rampC = () => RAMPS[state.ramp].c;
   const q6 = (t) => Math.max(0, Math.min(5, Math.round(t * 5)));
 
@@ -112,7 +116,7 @@
   }
   // one faint crosshair, the only star-chart touch kept
   function crosshair(ctx, x, y) {
-    ctx.strokeStyle = '#3A3E43'; ctx.lineWidth = 1; x = Math.round(x) + 0.5; y = Math.round(y) + 0.5;
+    ctx.strokeStyle = '#3E3934'; ctx.lineWidth = 1; x = Math.round(x) + 0.5; y = Math.round(y) + 0.5;
     ctx.beginPath(); ctx.moveTo(x - 4, y); ctx.lineTo(x + 4, y); ctx.moveTo(x, y - 4); ctx.lineTo(x, y + 4); ctx.stroke();
   }
 

@@ -3,11 +3,12 @@
    YUKI in the badge's dotted letters, the dot over the i the one accent. About 1.2 s of motion, then it settles.
    With reduced motion it draws the still frame at once.
 
-     const s = PlanetSplash.mount(el, { colorSet: 'mint', onDone() {} });   // fills el, keeps the 520:300 layout centred
+     const s = PlanetSplash.mount(el, { colorSet: 'ember', onDone() {} });   // fills el, keeps the 520:300 layout centred
      s.replay(); s.still(); s.destroy();
      PlanetSplash.still(canvas, { colorSet: 'night', width: 1040, height: 600 });   // the final frame, e.g. for a PNG
 
-   options: colorSet 'mint' | 'night' | 'bang', onDone(), background (default '#0B0B0C'; null leaves it transparent),
+   options: colorSet 'ember' (the default) | 'mint' | 'night' | 'bang', onDone(), background (default '#090705'; null leaves
+   it transparent),
    name (false hides it), reduced (true forces the still frame; a function is asked at each play, so a replay
    follows the current setting), autoplay (false: show the still frame and wait
    for replay(), e.g. in Settings -> About). If el has no height of its own, the canvas keeps the 520:300 shape. */
@@ -94,7 +95,8 @@
     return out;
   }
   // the badge's colours (marks-badge.js ROLE): Night has grey letters and one bright bone dot, Bang an amber dot
-  const INK = { mint: 5, night: 3, bang: 4 }, ACC = { mint: 3, night: 5, bang: '#FFB85C' };
+  // (20 Oct: Ember, Yuki's set now, as Mint was: bone letters and the accent's own step for the dot over the i)
+  const INK = { ember: 5, mint: 5, night: 3, bang: 4 }, ACC = { ember: 3, mint: 3, night: 5, bang: '#FFB85C' };
   const pick = (c, v) => (typeof v === 'string' ? v : c[v]);
 
   /* ---- the scene ---- */
@@ -141,7 +143,7 @@
     };
   }
   function frameDraw(F, sc, set, e, frame, final) {
-    const keep = D.state.ramp; D.state.ramp = D.RAMPS[set] ? set : 'mint';
+    const keep = D.state.ramp; D.state.ramp = D.RAMPS[set] ? set : 'ember';
     F.clear(); sc.anim.draw(F.ctx, final); drawName(F.ctx, sc, D.state.ramp, final ? null : e, frame);
     D.state.ramp = keep;
   }
@@ -149,15 +151,15 @@
 
   function still(cv, opt) {
     opt = opt || {};
-    const w = opt.width || REF.w, h = opt.height || REF.h, F = fit(cv, w, h, opt.scale || 1, opt.background === undefined ? '#0B0B0C' : opt.background);
+    const w = opt.width || REF.w, h = opt.height || REF.h, F = fit(cv, w, h, opt.scale || 1, opt.background === undefined ? '#090705' : opt.background);
     cv.style.width = w + 'px'; cv.style.height = h + 'px';
-    frameDraw(F, scene(opt), opt.colorSet || 'mint', 0, 0, true);
+    frameDraw(F, scene(opt), opt.colorSet || 'ember', 0, 0, true);
     return cv;
   }
 
   function mount(el, opt) {
     opt = opt || {};
-    const set = D.RAMPS[opt.colorSet] ? opt.colorSet : 'mint', bg = opt.background === undefined ? '#0B0B0C' : opt.background;
+    const set = D.RAMPS[opt.colorSet] ? opt.colorSet : 'ember', bg = opt.background === undefined ? '#090705' : opt.background;
     // a box with its own height: fill it. A box with only a width: keep the 520:300 shape (measured before the
     // canvas goes in, so the canvas's default 300 x 150 never sets the height)
     const ownH = el.clientHeight > 0;

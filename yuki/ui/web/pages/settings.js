@@ -471,7 +471,8 @@
      full-screen app; a live patch keeps the one already there; a press (or Enter) plays it again. */
   function start(el) {
     if (el.__splash || !el.isConnected) return;
-    el.__splash = window.PlanetSplash.mount(el, { colorSet: 'mint', background: null, reduced: () => window.Lattice.Motion.reduced });
+    // (20 Oct) ember, as the startup splash and the app icon: the mark's colours, not the live colour chosen above
+    el.__splash = window.PlanetSplash.mount(el, { colorSet: 'ember', background: null, reduced: () => window.Lattice.Motion.reduced });
   }
   function mount(main) {
     aiMount();

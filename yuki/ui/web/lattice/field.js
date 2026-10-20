@@ -18,7 +18,8 @@
 (function () {
   'use strict';
   const DPR = Math.min(window.devicePixelRatio || 1, 1.5);
-  const COL = { lit: [242, 239, 233], live: [111, 235, 196], mid: [150, 147, 140], base: [38, 41, 44] };
+  // (20 Oct: the umber palette of tokens.json: live is ember until --live is read, base is --dot)
+  const COL = { lit: [242, 239, 233], live: [255, 106, 26], mid: [150, 147, 140], base: [41, 37, 33] };
   /* Yuki: the live colour follows the accent setting (--live); Lattice.refreshColors() rebuilds the sprites */
   function readLive() {
     try {
@@ -349,7 +350,7 @@
         const W = this.base.width, H = this.base.height;
         b.save(); b.translate(W / 2, H / 2 - P * 0.5 * DPR); b.scale(W / 2, H / 2 + P * 0.5 * DPR);
         const g = b.createRadialGradient(0, 0, 0, 0, 0, 1);
-        g.addColorStop(0, 'rgba(11,11,12,0.94)'); g.addColorStop(0.62, 'rgba(11,11,12,0.86)'); g.addColorStop(1, 'rgba(11,11,12,0)');
+        g.addColorStop(0, 'rgba(9,7,5,0.94)'); g.addColorStop(0.62, 'rgba(9,7,5,0.86)'); g.addColorStop(1, 'rgba(9,7,5,0)');
         b.fillStyle = g; b.beginPath(); b.arc(0, 0, 1, 0, 6.2832); b.fill(); b.restore();
         b.fillStyle = `rgb(${COL.base[0]},${COL.base[1]},${COL.base[2]})`;
       }
@@ -709,7 +710,7 @@
       if (maxD > 0.003 || this.dirty) {
         const sp = this.sp, s2 = sp.s;
         x.clearRect(0, 0, this.c.width, this.c.height);
-        x.fillStyle = 'rgb(42,45,49)';
+        x.fillStyle = 'rgb(47,42,38)';   // a face's off dots: --dot-face
         for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
           const n = j * W + i, v = cur[n], cx = i * dp + dp / 2, cy = j * dp + dp / 2;
           if (v < 0.05) { x.beginPath(); x.arc(cx, cy, this.offR, 0, 6.2832); x.fill(); continue; }

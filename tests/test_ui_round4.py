@@ -234,12 +234,13 @@ def test_the_theme_is_lattice_dark():
     from yuki.ui.window.theme import ACCENTS, RADIUS, theme
 
     t = theme("light", accent="green")   # dark only: any name gives the one theme
-    # Lattice (2026-10-03, from yuki/ui/web/tokens.json): graphite field, panels are the field, bone ink
-    assert t.dark and t.bg.name() == "#0b0b0c" and t.card.name() == "#0b0b0c" and t.border.name() == "#1e2023"
+    # Lattice (2026-10-03, from yuki/ui/web/tokens.json; 20 Oct: the website's umber): the field, panels are the
+    # field, bone ink
+    assert t.dark and t.bg.name() == "#090705" and t.card.name() == "#090705" and t.border.name() == "#211d1a"
     assert t.text.name() == "#f2efe9" and t.text_2.name() == "#b4b0a8" and t.text_3.name() == "#8a8780"
-    assert t.primary.name() == "#f2efe9" and t.primary_fg.name() == "#0b0b0c"   # primary keys are lit, not coloured
+    assert t.primary.name() == "#f2efe9" and t.primary_fg.name() == "#090705"   # primary keys are lit, not coloured
     assert t.accent.name() == ACCENTS["green"].lower() == "#6febc4"            # signal mint, live states only
-    assert theme(accent="orange").accent.name() == "#ffa46b"
+    assert theme(accent="orange").accent.name() == "#ff6a1a"                   # ember, the default
     # low contrast between panel and window: no channel more than 8 apart
     assert max(abs(a - b) for a, b in zip(t.card.getRgb()[:3], t.bg.getRgb()[:3])) <= 8
     for name, surface in t.surfaces.items():   # opaque: nothing see-through anywhere
@@ -264,9 +265,9 @@ def test_surfaces_paint_opaque_with_a_border(qapp):
     img.fill(Qt.GlobalColor.transparent)
     card.render(img)
     inner = card.panel_rect().center()
-    assert img.pixelColor(inner).alpha() == 255 and img.pixelColor(inner).name() == "#0b0b0c"   # Lattice: the field
+    assert img.pixelColor(inner).alpha() == 255 and img.pixelColor(inner).name() == "#090705"   # Lattice: the field
     edge = img.pixelColor(QPoint(card.panel_rect().left() + 60, card.panel_rect().top()))
-    assert edge.name() == "#2a2d31"                                                             # its surface border
+    assert edge.name() == "#2f2a26"                                                             # its surface border
     # a plain check-in: no kind heading; the Lattice header says it as the design's break card (pause icon, "Break")
     assert card.title.text() == "" and card.head.text().startswith("Break") and card.head_icon.name == "pause"
     assert not card.do_button.isHidden() and card.do_button.text() == "Took one" and card.reply_button.isHidden()
