@@ -28,7 +28,7 @@ last 60 days of moments, each pick weighted ``0.5 ** (age / 21 days)``; the same
 the same pick (a pause and resume, a channel page then one of its videos). A pick is the user's: their own moments,
 or a request of Yuki's whose values came from their words (its runs' ``filled``: ``words`` / ``again`` / ``told``,
 never a taste guess, so a guess never feeds itself; a usual only picks the browser). Never a skill the user marked Not
-mine. Recomputed, never
+mine, and (fd, final-F D7) never a moment inside a live test's span. Recomputed, never
 incremented: a rerun changes nothing and nothing drifts; an entity whose weight fell under :data:`FLOOR` drops out.
 Never with a game in front or a call: then it is tried again later (a one-shot timer, :data:`RETRY_S`).
 
@@ -519,12 +519,13 @@ def _peak_hours(hist: list[float]) -> str:
     return ", ".join(f"{a:02d}h" if a == b else f"{a:02d}-{b:02d}h" for a, b in spans)
 
 
-def _heard_titles(store: Any, kind: str, now: float, days: float) -> dict[str, list[str]]:
+def _heard_titles(store: Any, kind: str, now: float, days: float,
+                  limit: int | None = MEANING_TITLES) -> dict[str, list[str]]:
     """``{entity name (folded): titles}``: for a capability kind read from a media context (:func:`capability_kinds`:
     Spotify's playlist), the app's own window titles (the timeline's, the user's rows) seen while that entity's context
-    ran in the last ``days``, at most :data:`MEANING_TITLES` each, most seen first; a title seen under two entities is
-    the app's own frame, not something one of them holds, and is left out. Decrypted in RAM, never logged; ``{}`` for
-    any other kind or when it can't be read."""
+    ran in the last ``days``, at most ``limit`` each (``None``: all), most seen first; a title seen under two entities
+    is the app's own frame, not something one of them holds, and is left out. Decrypted in RAM, never logged; ``{}``
+    for any other kind or when it can't be read."""
     hit = next(((app, end) for k, app, end in capability_kinds() if k == kind), None)
     if hit is None:
         return {}
@@ -571,8 +572,60 @@ def _heard_titles(store: Any, kind: str, now: float, days: float) -> dict[str, l
         if len(by) == 1:
             name, count = next(iter(by.items()))
             out.setdefault(name, {})[title] = count
-    return {name: [t for t, _c in sorted(titles.items(), key=lambda kv: (-kv[1], kv[0]))[:MEANING_TITLES]]
+    return {name: [t for t, _c in sorted(titles.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]]
             for name, titles in out.items()}
+
+
+#: fd (final-F D2): how far back the titles that played under a playlist are read for a track's playlist.
+TRACK_DAYS = 60.0
+#: A window title holds the session's title and artist with at most this many other characters (its separator).
+TRACK_SLACK = 6
+
+
+def _track_fits(window_title: str, title: str, artist: str) -> bool:
+    """Whether an app's window title is the media session's track: both the session's title and its artist inside it,
+    with no more than :data:`TRACK_SLACK` other characters (the app's own separator). Two measured texts compared,
+    never the user's words. Pure."""
+    w, t, a = _norm(window_title), _norm(title), _norm(artist)
+    return bool(t and a) and t in w and a in w and len(w) <= len(t) + len(a) + TRACK_SLACK
+
+
+def track_owner(store: Any, kind: str, title: str, artist: str, *, now: float | None = None,
+                days: float = TRACK_DAYS) -> str:
+    """fd (final-F D2; live 20 Oct: Spotify minimised never repainted its rows, so a press that played the asked
+    playlist was "couldn't confirm it's X"): the one entity of ``kind`` this track played under, by memory's own data:
+    the app's window titles seen while that entity's context ran (:func:`_heard_titles`, every title, a title seen
+    under two entities left out) holding the media session's title and artist (:func:`_track_fits`). That entity's
+    name, else ``""`` (unknown: never "not that one", since a track may be in several). Decrypted in RAM, never
+    logged. Never raises."""
+    if not str(title or "").strip() or not str(artist or "").strip():
+        return ""
+    now = time.time() if now is None else float(now)
+    try:
+        heard = _heard_titles(store, kind, now, days, limit=None)
+    except Exception:  # noqa: BLE001
+        return ""
+    hits = {name for name, titles in heard.items() if any(_track_fits(t, title, artist) for t in titles)}
+    return next(iter(hits)) if len(hits) == 1 else ""
+
+
+def _test_spans(store: Any) -> list[tuple[float, float]]:
+    """fd (final-F D7): the live tests' spans memory keeps (:func:`yuki.memory.testtag.store_test_spans`), oldest
+    first; ``[]`` when none or unreadable. Never raises."""
+    try:
+        from yuki.memory.testtag import store_test_spans
+
+        return sorted((float(a), float(b)) for a, b in store_test_spans(store))
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _in_spans(at: float, spans: Sequence[tuple[float, float]]) -> bool:
+    """Whether ``at`` lies inside one of ``spans`` (sorted, as :func:`_test_spans` gives them). Pure."""
+    import bisect
+
+    i = bisect.bisect_right([a for a, _b in spans], float(at)) - 1
+    return i >= 0 and float(at) <= spans[i][1]
 
 
 def described(store: Any, kind: str, *, now: float | None = None, names: Any = (), days: float = MEANING_DAYS,
@@ -654,7 +707,9 @@ Answer only with the pick tool:
 - none: the words name one of their {things} by a word none of these goes by ("my party playlist" with no item called
   that), or two items fit equally: pick nothing.
 "last time", when given, is the item these same words played last time: a strong clue for called, never a rule (a
-newer item may fit them better, and words that ask for a mood stay mood)."""
+newer item may fit them better, and words that ask for a mood stay mood).
+"turned down", when given, is what they just said no to: it is not among the items. Words that then only ask for
+another one, naming none, are mood."""
 
 
 _meaning_cache: dict[tuple[str, str, str], tuple[float, Meant]] = {}
@@ -720,7 +775,7 @@ def _settle(response: Any, names: list[str], text: str, ms: float,
 
 def judge(said: str, words: Any, items: list[dict[str, Any]], *, kind: str = "spotify_playlist",
           client: Any = None, model: str | None = None, settings: Any = None,
-          wait_s: float = MEANING_WAIT_S, hint: str | None = None) -> Meant:
+          wait_s: float = MEANING_WAIT_S, hint: str | None = None, not_these: Sequence[str] = ()) -> Meant:
     """lSkills (live 17 Oct: "anime playlist" asked which playlist twice although "Japanese" had just been paired with
     ネオン; "something chill" took 15-29 s): which of the user's own entities ``said`` means, judged by a small model
     (the voice's mouth model) on memory's own descriptions of them (:func:`described`), never by a word list. One
@@ -730,8 +785,15 @@ def judge(said: str, words: Any, items: list[dict[str, Any]], *, kind: str = "sp
     ask within :data:`MEANING_TTL_S` has it at once). kw3: the verdict stands as the model gave it (C8, no check of the
     words vetoes it); ``hint`` (C9), the item these same words played last time (:func:`said_target`), rides with the
     words as "last time" when it is one of the items, a clue the model weighs, never a lookup. Content (names, titles,
-    words) goes to the model only, never to a log."""
+    words) goes to the model only, never to a log.
+
+    fd (final-F D3; live 20 Oct k_playlist_not_that: "No, not this one. The other playlist." came as ``"Japanese"``,
+    the judgement and its "last time" hint picked ネオン, the very row being corrected): ``not_these``, the items a
+    correction leaves out (the corrected run's own rows, the engine's trace): never in the enum, never the hint, sent as
+    "turned down" so words that only ask for another one read as mood (the hour's usual of the rest)."""
     started = time.perf_counter()
+    gone = {_norm(n) for n in not_these or () if _norm(n)}
+    items = [i for i in items if _norm(i.get("name")) not in gone]
     # each name once (review r1 L6: a duplicate value in the tool's enum may get the request refused)
     names = list(dict.fromkeys(str(i.get("name") or "") for i in items if i.get("name")))
     text = " ".join(str(said or "").split())
@@ -744,8 +806,10 @@ def judge(said: str, words: Any, items: list[dict[str, Any]], *, kind: str = "sp
     # the request are part of the key, so an answer is reused only for the same request (a retry, the hand-off's own
     # run)
     last = next((n for n in names if hint and _norm(n) == _norm(hint)), "")
+    down = sorted(" ".join(str(n).split()) for n in not_these or () if _norm(n))
     key = (str(kind), _norm(text), json.dumps(items, ensure_ascii=False, sort_keys=True),
-           json.dumps([_norm(t) for t in turns[-3:]], ensure_ascii=False), _norm(last))
+           json.dumps([_norm(t) for t in turns[-3:]], ensure_ascii=False), _norm(last),
+           json.dumps([_norm(n) for n in down], ensure_ascii=False))
     now_m = time.monotonic()
     with _meaning_lock:
         got = _meaning_cache.get(key)
@@ -769,7 +833,8 @@ def judge(said: str, words: Any, items: list[dict[str, Any]], *, kind: str = "sp
                "system": MEANING_SYSTEM.replace("{things}", things),
                "tools": [tool], "tool_choice": {"type": "tool", "name": "pick"},
                "messages": [{"role": "user", "content": json.dumps(
-                   {"said": text, "their words": turns[-3:], **({"last time": last} if last else {}), "items": items},
+                   {"said": text, "their words": turns[-3:], **({"last time": last} if last else {}),
+                    **({"turned down": down} if down else {}), "items": items},
                    ensure_ascii=False)}]}
     box: dict[str, Any] = {}
     box_lock = threading.Lock()
@@ -1014,6 +1079,32 @@ def _listened(store: Any, heard: list[tuple[str, str, float, str, str, str, floa
         return [1.0] * len(heard)
 
 
+def _user_picks(store: Any, since: float) -> Callable[[Mapping[str, Any]], bool]:
+    """Whether a moment is one of the user's own picks: their own (``by`` user), or a request of Yuki's whose values
+    came from their words (:func:`_asked_runs`); never a skill they marked Not mine (:func:`_not_mine_moments`). fd
+    (final-F D7; live 20 Oct youtube_channel_deji_arc: the channel page Yuki's own test runs opened, "@Deezy", read as
+    one of the user's channels "as written", so the measured swap to Deji never fired): never a moment inside a live
+    test's span (:func:`_test_spans`, the spans memory keeps past a purge; links' own rows leave them out the same
+    way): what a test or Yuki did while one ran is nobody's taste."""
+    asked = _asked_runs(store, since)
+    skip = _not_mine_moments(store)
+    spans = _test_spans(store)
+
+    def users(r: Mapping[str, Any]) -> bool:
+        if r.get("id") is not None and int(r["id"]) in skip:
+            return False
+        try:
+            if spans and _in_spans(float(r.get("at") or 0.0), spans):
+                return False
+        except (TypeError, ValueError):
+            return False
+        if r.get("by", "user") == "user":
+            return True
+        return asked.get(str(r.get("request_id") or ""), False)
+
+    return users
+
+
 class _Picks:
     """The picks gathered per ``(kind, group)``: ``(at, value, ref, units)``, later collapsed into sessions and decayed.
     A session (the same entity again within :data:`SESSION_GAP_S`) weighs its picks' units summed, at most
@@ -1086,15 +1177,7 @@ def recompute(store: Any, *, now: float | None = None, days: float = SEED_DAYS, 
         rows = store.moments_between(since, now + 1.0, kinds=ends)
     except Exception:  # noqa: BLE001 - no moments table yet
         return {**counts, "error": 1}
-    asked = _asked_runs(store, since)
-    skip = _not_mine_moments(store)
-
-    def users(r: dict[str, Any]) -> bool:
-        if r.get("id") is not None and int(r["id"]) in skip:
-            return False
-        if r.get("by", "user") == "user":
-            return True
-        return asked.get(str(r.get("request_id") or ""), False)
+    users = _user_picks(store, since)
 
     from yuki.connect.templates import fill
 
@@ -1816,9 +1899,76 @@ def _time_word(now: float) -> str:
     return _day_part(now)[1]
 
 
-def _why(c: _Cand, kind: str, cands: list[_Cand], now: float, named: bool) -> str:
+#: fd (final-F D6; live 20 Oct k_video_another_one: "you usually watch them late at night" for a channel watched on one
+#: evening): a habit why ("usually", "usual") needs the user's own use of it on at least this many distinct days.
+USUAL_DAYS = 2
+#: The distinct days per channel or playlist are read once per database and kind for this long (RAM).
+DAYS_TTL_S = 600.0
+_days_lock = threading.Lock()
+_days_cache: dict[tuple[str, str, str], tuple[float, dict[str, int]]] = {}
+
+
+def _days_seen(store: Any, kind: str, taste_kind: str, now: float) -> dict[str, int]:
+    """fd (final-F D6): ``{group: distinct days}``, the local dates in the last :data:`SEED_DAYS` the user had each
+    candidate group on: a playlist's own media-context picks (:func:`_user_picks`: theirs, never a test's), a channel's
+    watched videos (:func:`yuki.skills.youtube_feed.watched`, by the channel memory knows each video is from, outside
+    the live tests' spans). Counts only, cached :data:`DAYS_TTL_S`; ``{}`` when unread. Never raises."""
+    cache_key = (str(getattr(store, "path", id(store))), str(kind), str(taste_kind))
+    at = time.monotonic()
+    with _days_lock:
+        hit = _days_cache.get(cache_key)
+        if hit is not None and at - hit[0] < DAYS_TTL_S:
+            return hit[1]
+    since = float(now) - SEED_DAYS * 86400.0
+    dates: dict[str, set[Any]] = {}
+    try:
+        if kind == "playlist":
+            hit_cap = next(((app, end) for k, app, end in capability_kinds() if k == taste_kind), None)
+            if hit_cap is not None:
+                users = _user_picks(store, since)
+                for m in store.moments_between(since, float(now) + 1.0, kinds=[hit_cap[1]], app=hit_cap[0]):
+                    if not users(m):
+                        continue
+                    name = " ".join(str(store.moment_entity(m) or "").split())
+                    if name:
+                        dates.setdefault(entity_key(store, taste_kind, name), set()).add(
+                            datetime.fromtimestamp(float(m["at"])).date())
+        else:
+            from yuki.skills import youtube_feed
+
+            spans = _test_spans(store)
+            seen = youtube_feed.watched(store, since=since, now=float(now))
+            vids = {str(v["video_key"]): str(v["channel_key"]) for v in store.yt_videos(video_keys=list(seen))
+                    if v.get("channel_key")}
+            for key, e in seen.items():
+                ch = vids.get(str(key))
+                if not ch:
+                    continue
+                for span in e.get("spans") or []:
+                    start = float(span[0])
+                    if not (spans and _in_spans(start, spans)):
+                        dates.setdefault(ch, set()).add(datetime.fromtimestamp(start).date())
+    except Exception:  # noqa: BLE001 - unread: no habit is claimed from it
+        return {}
+    out = {k: len(v) for k, v in dates.items()}
+    with _days_lock:
+        if len(_days_cache) > 16:
+            _days_cache.clear()
+        _days_cache[cache_key] = (at, out)
+    return out
+
+
+def _usual_days(c: _Cand, days: Mapping[str, int] | None) -> bool:
+    """Whether a candidate's habit may be said as a usual: no day count read (``None``: as before), or its group on at
+    least :data:`USUAL_DAYS` distinct days. Pure."""
+    return days is None or int(days.get(c.group, 0) or 0) >= USUAL_DAYS
+
+
+def _why(c: _Cand, kind: str, cands: list[_Cand], now: float, named: bool,
+         days: Mapping[str, int] | None = None) -> str:
     """The short why of a pick, from its own numbers: how new it is (a video), and its habit (watched or played at
-    this hour, the most lately, or recently)."""
+    this hour, the most lately, or recently). fd (D6): "usually" only with ``days`` (:func:`_days_seen`) showing its
+    use on :data:`USUAL_DAYS` distinct days or more."""
     parts = []
     if kind == "video" and c.fresh_d is not None:
         if c.fresh_d < 1:
@@ -1829,7 +1979,7 @@ def _why(c: _Cand, kind: str, cands: list[_Cand], now: float, named: bool) -> st
             parts.append("it's new this week")
     if not named:
         verb, past, obj = ("play", "played", "it") if kind == "playlist" else ("watch", "watched", "them")
-        if c.fit > 0 and c.fit >= HABIT_SHARE * c.peak:
+        if c.fit > 0 and c.fit >= HABIT_SHARE * c.peak and _usual_days(c, days):
             parts.append(f"you usually {verb} {obj} {_time_word(now)}")
         elif cands and c.total >= max(x.total for x in cands):
             parts.append(f"it's what you've {past} most lately")
@@ -1969,8 +2119,11 @@ def choose(store: Any, kind: str, *, words: Any = (), context: str = "", session
         extra = {"page": "handle"} if kind == "channel" else {}
         value = dict(best.value)
         card = bool(only) and source == FROM_CARD
+        # fd (D6): the days it was on are read only when its numbers would say "usually" (one bounded, cached read)
+        days = _days_seen(store, kind, taste_kind, now) \
+            if not only and best.fit > 0 and best.fit >= HABIT_SHARE * best.peak else None
         choice = Choice(kind, CHOOSE_SLOTS[kind], value, extra, best.name, best.key, best.group,
-                        _why(best, kind, cands, now, bool(only)), best.fresh_d, best.title, judged, len(left),
+                        _why(best, kind, cands, now, bool(only), days), best.fresh_d, best.title, judged, len(left),
                         round((time.perf_counter() - started) * 1000.0, 1), bool(only) and not card,
                         FROM_CARD if card else "")
         _log_choose(log, kind, n=len(left), started=started, judged=judged, moved=moved, fresh_d=best.fresh_d,
@@ -2108,13 +2261,14 @@ def _forget_now(store: Any) -> None:
         _now_cache.pop(str(getattr(store, "path", "") or ""), None)
 
 
-def why_parts(c: _Cand, kind: str, *, top_total: float, now: float, skipped: float = 0.0) -> tuple[str, str]:
+def why_parts(c: _Cand, kind: str, *, top_total: float, now: float, skipped: float = 0.0,
+              days: Mapping[str, int] | None = None) -> tuple[str, str]:
     """A candidate's why from the scorer's own numbers, ``(age, habit)``: how new a video's upload is ("new today",
     "a week old": every video candidate is unwatched; ``""`` for other kinds), and the habit of its channel or
     playlist: this part of the day ("lunch usual": its fit at this hour at least :data:`HABIT_SHARE` of its best hour
-    and :data:`USUAL_MIN`), the most time overall ("most watched"), or a recent pick by its day ("played yesterday",
-    "watched Tuesday"); a recent skip says so ("skipped lately"); ``""`` for a video with none. A format of numbers,
-    never a judgement of what it holds."""
+    and :data:`USUAL_MIN`, and fd D6: with ``days`` given, on :data:`USUAL_DAYS` distinct days or more), the most time
+    overall ("most watched"), or a recent pick by its day ("played yesterday", "watched Tuesday"); a recent skip says so
+    ("skipped lately"); ``""`` for a video with none. A format of numbers, never a judgement of what it holds."""
     age = ""
     if kind == "video" and c.fresh_d is not None:
         d, weeks = float(c.fresh_d), int(float(c.fresh_d) // 7)
@@ -2124,7 +2278,7 @@ def why_parts(c: _Cand, kind: str, *, top_total: float, now: float, skipped: flo
     habit = ""
     if skipped >= SKIPPED_W:
         habit = "skipped lately"
-    elif c.fit >= USUAL_MIN and c.fit >= HABIT_SHARE * c.peak:
+    elif c.fit >= USUAL_MIN and c.fit >= HABIT_SHARE * c.peak and _usual_days(c, days):
         habit = f"{_day_part(now)[0]} usual"
     elif top_total > 0 and c.total >= top_total:
         habit = f"most {past}"
@@ -2164,12 +2318,16 @@ def _now_picks(store: Any, now: float) -> dict[str, list[NowPick]]:
     skips = _skip_weights(store, now)
     out: dict[str, list[NowPick]] = {}
 
-    def picks(kind: str, cands: list[_Cand], every: list[_Cand]) -> None:
+    def picks(kind: str, cands: list[_Cand], every: list[_Cand], taste_kind: str = "") -> None:
         top_total = max((c.total for c in every), default=0.0)
         got = []
+        # fd (D6): the distinct days each was on, read once, only when one of them would be called a usual
+        days = _days_seen(store, kind, taste_kind, now) if any(
+            c.name and c.fit >= USUAL_MIN and c.fit >= HABIT_SHARE * c.peak for c in cands[:NOW_N]) else None
         for c in cands[:NOW_N]:
             if c.name:
-                age, habit = why_parts(c, kind, top_total=top_total, now=now, skipped=skips.get(c.group, 0.0))
+                age, habit = why_parts(c, kind, top_total=top_total, now=now, skipped=skips.get(c.group, 0.0),
+                                       days=days)
                 got.append(NowPick(kind, c.name, habit, round(c.score, 4), round(c.fit, 3),
                                    c.title if kind == "video" else "", c.fresh_d if kind == "video" else None, age))
         if got:
@@ -2192,7 +2350,7 @@ def _now_picks(store: Any, now: float) -> dict[str, list[NowPick]]:
     playlist_kind = _taste_kind_of("playlist")
     if playlist_kind:
         lists = _base(_rows_of(store, playlist_kind), now, skips)
-        picks("playlist", lists, lists)
+        picks("playlist", lists, lists, playlist_kind)
     return out
 
 
@@ -2229,7 +2387,7 @@ __all__ = ["SIGMA_MIN", "FALLBACK_MASS", "MENU_CANDIDATES", "OPTIONS_N", "SEEN_S
            "Taste", "hour_score", "score_at", "top", "candidates", "seen_names", "options", "said_kind", "said_target",
            "said_words", "find", "offered", "find_offered", "takes_offers", "MEANING_WAIT_S", "MEANING_TTL_S",
            "MEANING_ITEMS", "MEANING_TITLES", "MEANING_DAYS", "MEANING_WHYS", "Meant", "heard_as",
-           "described", "judge",
+           "described", "judge", "track_owner", "TRACK_DAYS", "TRACK_SLACK", "USUAL_DAYS",
            "prewarm",
            "SEED_DAYS", "HALF_LIFE_DAYS",
            "SESSION_GAP_S", "FLOOR", "OPAQUE_VAR", "RETIRED_KINDS", "ASKED_FILLS", "GUESS_FILLS", "OFFER_FIELDS",

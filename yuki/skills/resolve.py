@@ -471,7 +471,13 @@ def _check(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Sequence
     (by sound or a heard form) or :data:`FROM_MENU` (a name listed for the slot that the words don't hold); ``""``
     when not valid. An app slot's option (``system``, ``own_voice``) is valid as given, as an enum's option is: kw3
     (C3) the caller's ``target`` stands, never checked against a list of words for it (the slot's menu text tells the
-    caller to leave it out unless the user means one)."""
+    caller to leave it out unless the user means one).
+
+    fd (final-F D4; live 20 Oct spotify_inapp_volume_down: after the in-app rung failed, the talker's own fallback
+    ``control: mixer`` was tagged the user's words and "Keep this as your usual?" followed): an enum option the caller
+    gives is :data:`FROM_GIVEN` (the caller's reading, valid as given) unless the user's words hold it as written
+    (:data:`FROM_WORDS`); only those may be proposed as a usual. The answer to the slot's own question is the user's
+    choice whatever its wording (``resolve(answered=...)``, the engine's own record)."""
     if value is None or value == "":
         return False, None, ""
     t = slot.type
@@ -482,7 +488,9 @@ def _check(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Sequence
             # lSkills (live 17 Oct): the talker sent ``mute: true`` (a JSON boolean) for options on / off, the value
             # was dropped and the volume skill asked "Louder, quieter, or to what level?"
             hit = bool_option(slot.options, value)
-        return (hit is not None), hit, (FROM_WORDS if hit is not None else "")
+        if hit is None:
+            return False, None, ""
+        return True, hit, (FROM_WORDS if _said(hit, words) else FROM_GIVEN)
     if t == "number":
         x = _num(value)
         if x is None or (slot.min is not None and x < slot.min) or (slot.max is not None and x > slot.max):
@@ -1607,7 +1615,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             heard_person: Callable[[str, Sequence[str]], str | None] | None = None,
             granted: Mapping[str, str] | None = None, chosen: Mapping[str, Any] | None = None,
             chosen_from: str = FROM_CHOSEN, given_from: Mapping[str, str] | str | None = None,
-            own_pick: bool = False, once: bool = False, _strict: bool = False) -> Result:
+            own_pick: bool = False, once: bool = False, answered: Collection[str] = (),
+            _strict: bool = False) -> Result:
     """Fill ``skill_key``'s slots and pick its rungs (see the module docstring). ``words``: the user's own words, each
     turn exactly as heard or typed (the current exchange: their turns since the last finished job, newest last);
     ``earlier``: older turns of this conversation (their own words too), a source for validating a value the caller
@@ -1636,6 +1645,11 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
 
     kw3 (C10, contract K3): ``once``, the caller's own flag that the user wants this means value just this once ("in
     Edge, just this once"): no "Keep this as your usual?" (``Plan.ask_keep`` stays ``None``).
+
+    fd (final-F D4): ``answered``, the slots whose question this capability asked moments ago and the user has spoken
+    since (the engine's own run record, never the words): an enum option given for one of them is the user's own
+    choice (:data:`FROM_WORDS`), so "Keep this as your usual?" may follow, as the means question's design says; any
+    other enum option the words don't hold as written is the caller's reading (:data:`FROM_GIVEN`), never proposed.
 
     lResolve: on a draft or an open (a capability that may send, on a run that doesn't: :func:`_sends`, read before
     the slot loop and checked again on its values), the caller's own wording of what to write is kept as a draft
@@ -1772,6 +1786,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                                     app_names=app_names, site=skill.bind.get(slot.name) == SITE_BIND,
                                     loose=bool(slot.taste))
             if ok:
+                if how == FROM_GIVEN and slot.type == "enum" and slot.name in answered:
+                    how = FROM_WORDS      # fd (D4): their answer to this slot's own question, whatever its wording
                 value, mine = own(slot, value, menu_names, offered)
                 if mine == FROM_HEARD and how == FROM_WORDS:
                     how = FROM_HEARD      # their word, heard as one of their own things ("Lumin" -> lumen)
@@ -2002,7 +2018,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             return resolve(skill_key, slots, words, store=store, live=live, loaded=loaded, now=now, until=until,
                            again=again, disable_after=disable_after, people=people, default_step=default_step,
                            earlier=earlier, heard_person=heard_person, granted=granted, chosen=chosen,
-                           chosen_from=chosen_from, given_from=given_from, own_pick=own_pick, once=once, _strict=True)
+                           chosen_from=chosen_from, given_from=given_from, own_pick=own_pick, once=once,
+                           answered=answered, _strict=True)
     # What the user said wins over a learned skill's bound value too: its routes carry that value in their arguments,
     # so a value given for a bound slot that is another one runs its capability instead (a learned skill never hides
     # its capability; the engine's request_key does the same for a given key slot before this). Phase 2.1: any value
@@ -2015,7 +2032,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                        again=again, disable_after=disable_after, people=people, default_step=default_step,
                        earlier=earlier, heard_person=heard_person, granted=granted, chosen=chosen,
                        chosen_from=chosen_from, given_from=given_from, own_pick=own_pick, once=once,
-                       _strict=_strict)
+                       answered=answered, _strict=_strict)
     # a direction with no amount: the user's own step for it (a preference), else the default step
     for slot in skill.slots:
         v = values.get(slot.name)

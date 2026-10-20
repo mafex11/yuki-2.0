@@ -985,7 +985,45 @@ def _page_var(site: str, page: str) -> str:
     return next((var for _k, s, p, var in taste.site_kinds() if s == site and p == page), "")
 
 
-def own_url(url: Any, *, store: Any = None) -> dict[str, Any] | None:
+#: fd (final-F D7): why :func:`own_url` left an address as given, one code word for the caller's content-free log.
+MISS_WORDS: tuple[str, ...] = ("no_page", "no_entries", "written", "again", "below_bar", "digits", "same", "slow",
+                               "no_memory", "error")
+#: fd (D7): the one bounded memory call :func:`own_url` makes with no store (it read two calls of STORE_WAIT_S before).
+OWN_URL_WAIT_S = 2 * STORE_WAIT_S
+
+
+def _own_visit(store: Any, site: str, page: str, value: str) -> bool | None:
+    """fd (final-F D7; live 20 Oct youtube_channel_deji_arc: Yuki's own test opens of "@Deezy" made it one of the
+    user's channels "as written", so "Deezy" -> Deji never swapped): whether the user ever had this channel up
+    themselves, by memory's own visit attribution: a ``page`` moment of its page (the moments' key of ``site`` and the
+    value) or, for the channels :mod:`yuki.skills.youtube_feed` attributes videos to, of one of its videos, made by
+    the user (``by`` user: a visit begun while Yuki acted is Yuki's) and outside the live tests' spans. True / False
+    (every visit read was Yuki's or a test's) / None (no visit read: unknown, so "as written" stands). Never raises."""
+    try:
+        from yuki.memory.moments import entity_key as moment_key
+        from yuki.skills import taste, youtube_feed
+
+        keys = {str(moment_key(store.cipher, site, value) or "")}
+        kind = next((k for k, s, p, _v in taste.site_kinds() if s == site and p == page), "")
+        if kind and kind == youtube_feed.CHANNEL_KIND:
+            ch = youtube_feed.channel_key(store, value)
+            keys |= {str(v.get("video_key") or "") for v in store.yt_videos(channel_keys=[ch])}
+        keys.discard("")
+        if not keys:
+            return None
+        ordered = sorted(keys)
+        rows = store._query(f"SELECT at, by FROM moments WHERE kind = 'page' AND entity_key IN "
+                            f"({','.join('?' * len(ordered))})", ordered)
+    except Exception:  # noqa: BLE001
+        return None
+    if not rows:
+        return None
+    spans = taste._test_spans(store)
+    return any(str(by or "user") == "user" and not (spans and taste._in_spans(float(at or 0.0), spans))
+               for at, by in rows)
+
+
+def own_url(url: Any, *, store: Any = None, miss: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """skill22 (A6; final-D youtube_channel_deji_arc: "Pull up Deezy's YouTube channel in Ark." became a raw
     ``open_url`` of ``https://www.youtube.com/@Deezy``, a stranger's page, since skill19's heard match runs only inside
     the web skill): a raw address of a site page whose value is a name (a page kind with one speakable value:
@@ -1002,28 +1040,81 @@ def own_url(url: Any, *, store: Any = None) -> dict[str, Any] | None:
     :func:`best_match` measures it (taste's loose sound tier stays with the user's own words); a value whose digits
     are not the channel's ("NikoOmilana2" for NikoOmilana) is another channel, never swapped; and the same value given
     again within :data:`CHANNEL_SWAP_KEEP_S` of its swap opens as written (a correction: a wrong swap costs one "not
-    that")."""
+    that").
+
+    fd (final-F D7): a channel that is "theirs as written" only through pages Yuki or a live test opened is none of
+    theirs (:func:`_own_visit` False: every visit memory holds of it was Yuki's or a test's), so the measure runs
+    against their other channels; ``miss`` (a dict the caller passes) gets ``"why"``, one of :data:`MISS_WORDS`, when
+    the address stays as given, for the caller's content-free log. With no ``store`` the whole check is one bounded
+    call of this process's open memory (:data:`OWN_URL_WAIT_S`): ``slow`` when it found no answer in time."""
+    box = miss if isinstance(miss, dict) else {}
     try:
         from urllib.parse import unquote
 
         from yuki.connect.templates import page_of
 
         m = page_of(str(url or "").strip())
-        if m is None or not m.entity:
+        value = " ".join(unquote(str(m.entity)).split()).lstrip("@") if m is not None and m.entity else ""
+        if not value:
+            box["why"] = "no_page"
             return None
-        value = " ".join(unquote(str(m.entity)).split()).lstrip("@")
+        if store is not None:
+            return _swapped_now(_own_url_on(store, str(url or ""), m, value, box), value)
+        module = sys.modules.get("yuki.agent.memory")
+        access = getattr(module, "_default", None) if module is not None else None
+        if access is None or getattr(access, "_client", None) is None:
+            box["why"] = "no_memory"
+            return None
+        inner: dict[str, Any] = {}
+        try:
+            got = access.call("own_url", lambda c: _own_url_on(getattr(c, "store", c), str(url or ""), m, value,
+                                                               inner), timeout_s=OWN_URL_WAIT_S)
+        except Exception as exc:  # noqa: BLE001 - memory slow or away: the address as given
+            box["why"] = "slow" if "no answer" in str(exc) else "no_memory"
+            return None
+        if inner.get("why"):
+            box["why"] = inner["why"]
+        return _swapped_now(got if isinstance(got, dict) else None, value)
+    except Exception:  # noqa: BLE001 - no measure: the address as given
+        box.setdefault("why", "error")
+        return None
+
+
+def _swapped_now(got: dict[str, Any] | None, value: str) -> dict[str, Any] | None:
+    """A swap :func:`own_url` hands back, kept (by the value's squashed form) for :data:`CHANNEL_SWAP_KEEP_S`: the
+    same value again is a correction. Kept here, in the caller's thread, so a late answer the caller no longer waited
+    for never marks one."""
+    if got is not None:
+        with _lock:
+            _swapped[_squash(value)] = time.monotonic()
+    return got
+
+
+def _own_url_on(store: Any, url: str, m: Any, value: str, box: dict[str, Any]) -> dict[str, Any] | None:
+    """:func:`own_url` on one store, for the page ``m`` (``page_of``'s match) whose value is ``value``; ``box["why"]``
+    says why when it returns None. Never raises."""
+    try:
         entries = [e for e in own_channel_entries(store) if e.site == m.site and e.page == m.kind]
-        if not value or not entries:
+        if not entries:
+            box["why"] = "no_entries"
             return None
         heard = _squash(value)
         if any(heard in (_squash(e.name), _squash(e.key)) for e in entries) \
                 or (m.site, m.kind, heard) in own_channels_written(store):
-            return None          # one of theirs as written (any of them, past the match pool's cap): nothing to change
+            if _own_visit(store, m.site, m.kind, value) is not False:
+                box["why"] = "written"
+                return None      # one of theirs as written (any of them, past the match pool's cap): nothing to change
+            # fd (D7): theirs "as written" only through Yuki's or a test's own opens: measured against the others
+            entries = [e for e in entries if heard not in (_squash(e.name), _squash(e.key))]
+            if not entries:
+                box["why"] = "no_entries"
+                return None
         now = time.monotonic()
         with _lock:
             for old in [k for k, t in _swapped.items() if now - t > CHANNEL_SWAP_KEEP_S]:
                 _swapped.pop(old, None)
             if heard in _swapped:
+                box["why"] = "again"
                 return None      # given again right after its swap: a correction, opened as written
         names: dict[str, Own] = {}
         for e in entries:
@@ -1032,17 +1123,19 @@ def own_url(url: Any, *, store: Any = None) -> dict[str, Any] | None:
         got = best_match(value, list(names), as_name=True, clip=False)
         entry = names.get(got[0]) if got is not None else None
         if got is None or entry is None:
+            box["why"] = "below_bar"
             return None
         if _digits(value) and _digits(value) not in (_digits(entry.key), _digits(entry.name)):
+            box["why"] = "digits"
             return None          # the same letters with another number: another channel
         new = channel_url(entry)
         if not new or new.casefold() == str(url or "").strip().casefold():
+            box["why"] = "same"
             return None
-        with _lock:
-            _swapped[heard] = now
         return {"url": new, "name": entry.name, "kind": CHANNEL, "how": "heard", "source": TASTE, "score": got[1],
                 "margin": got[2]}
     except Exception:  # noqa: BLE001 - no measure: the address as given
+        box["why"] = "error"
         return None
 
 
@@ -1088,8 +1181,8 @@ def site_browser(host: Any, store: Any = None) -> str:
 
 
 __all__ = ["APP", "BAR", "TURN_BAR", "BROWSER_MIN_SITES", "CHANNEL", "CHANNEL_SWAP_KEEP_S", "CLIP_SHARE",
-           "LENGTH_RATIO", "LINKS", "MARGIN", "MAX_WORDS", "MIN_LETTERS", "NAME_RULE_MAX", "NAME_VOWEL_COST",
-           "NEAR_MIN_LETTERS", "OWN_CHANNELS", "OWN_MAX", "Own",
+           "LENGTH_RATIO", "LINKS", "MARGIN", "MAX_WORDS", "MIN_LETTERS", "MISS_WORDS", "NAME_RULE_MAX",
+           "NAME_VOWEL_COST", "NEAR_MIN_LETTERS", "OWN_CHANNELS", "OWN_MAX", "OWN_URL_WAIT_S", "Own",
            "RUNNING", "SHORT_BAR", "SITE", "SITE_MIN_VISITS", "START", "TAIL_HEAD", "TAIL_MIN_LETTERS", "TASTE",
            "TIMELINE", "best_match", "channel_url", "is_site", "literal", "own_channel_entries", "own_channels_written",
            "own_entries",
