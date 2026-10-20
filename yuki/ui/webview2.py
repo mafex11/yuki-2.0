@@ -455,9 +455,9 @@ class HostOptions:
     #: The window's and the WebView's own background before the page paints: the page's ``--bg`` (tokens.json
     #: ``color.bg``; 20 Oct: the website's umber #090705, was graphite #0B0B0C).
     background: tuple[int, int, int] = (0x09, 0x07, 0x05)
-    #: Windows 11's 1 px window border (``DWMWA_BORDER_COLOR``; 20 Oct: the page's ``--hair-2``, umber, as the native
-    #: window does with its cards' line, instead of the system's grey). ``None``: the system's own.
-    border: tuple[int, int, int] | None = (0x2F, 0x2A, 0x26)
+    #: Windows 11's 1 px window border (``DWMWA_BORDER_COLOR``; 20 Oct: umber ``--raise-2`` #1A1613, the colour the
+    #: native window gives its own, theme ``line2``, instead of the system's grey). ``None``: the system's own.
+    border: tuple[int, int, int] | None = (0x1A, 0x16, 0x13)
     #: The app icon (``yuki/ui/yuki.ico``, every size): the window's taskbar button and Alt+Tab, each loaded at
     #: the exact size Windows asks for at this DPI (the .ico has 16 to 64 px frames). ``None``: Windows' default.
     icon: Path | None = None

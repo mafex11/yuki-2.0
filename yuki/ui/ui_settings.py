@@ -117,7 +117,7 @@ def _clean(raw: dict[str, Any]) -> UiSettings:
                       accent if accent in ACCENT_NAMES else _tokens.DEFAULT_ACCENT,
                       engine if engine in WINDOW_ENGINES else "web",
                       web, bool(raw.get("web_maximized", False)), bool(raw.get("island_resting", True)),
-                      takeover_move_px=move, accent_rev=ACCENT_REV)
+                      takeover_move_px=move, accent_rev=max(rev, ACCENT_REV))   # a later build's mark is kept
 
 
 def load(path: Path | None = None) -> UiSettings:
