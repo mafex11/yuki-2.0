@@ -249,6 +249,12 @@ _AFTER_STEP_ASK_NOTE = (
     "code's measure of the part that is yours, not what they asked for. Ask in a few words whether to undo it as "
     "one_step would (the question alone, no call; their yes is the ask), unless their words asked for that very change."
 )
+#: fa (A7): the same, once code said the measured question itself (``diff.tidy_ask``; ``asked``): the talker says
+#: nothing now and maps their answer, in their next turn, to one_step.
+_AFTER_STEP_ASKED_NOTE = (
+    "Done and verified; said is what was heard already, code's own question about your side effect too (asked). Say "
+    "nothing now. When they answer it, yes is one_step called as it is, no is nothing more."
+)
 #: Integration review c2desk-2 (desk19 merge note 6, all-desk RC2): with the After lines when the measure shows what
 #: they asked for did not reach its purpose (``left_silent``), whatever the tidy dial says: the look's one step may
 #: then be a volume step (:meth:`handle`). desk20 (S3): a tab of the act's over what played is said by code
@@ -301,6 +307,22 @@ def _opens_page(name: str, args: Any, facts: Any) -> bool:
             return bool(isinstance(scope, dict) and scope.get("open"))
     except Exception:  # noqa: BLE001
         return False
+    return False
+
+
+def _sound_act(name: str, args: Any) -> bool:
+    """fa (A9): whether a hand or skill run is a sound control's (a volume or mute act, whatever its target): the mixer
+    hand, the volume keys, the volume skill. Our own verb and skill keys, never words. Pure; never raises."""
+    try:
+        args = args if isinstance(args, dict) else {}
+        if name == "app_volume":
+            return True
+        if name == "media_key":
+            return str(args.get("key") or "") in _VOLUME_KEYS
+        if name == SKILL_HAND:
+            return str(args.get("skill") or "").strip() == VOLUME_SKILL
+    except Exception:  # noqa: BLE001
+        return True   # unknown: the safe side (no master flag)
     return False
 
 
@@ -359,7 +381,9 @@ def arranged_windows(name: str, args: Any, facts: Any, before: Any = None, after
     (and the ONE ``window`` tool's) target windows for an arranging action (``diff.arranges``: move, maximize,
     fullscreen, restore, and a focus: safety WW6), as :meth:`Hands._scope` reads them; a skill run given a place (its
     ``place`` field, or desk22 A22 a ``place`` among its slots: :func:`skill_place_given`) its measured windows and the
-    window it brought to the front. Empty for anything else. Pure; never raises."""
+    window it brought to the front. Empty for anything else, and for a window call marked ``own_step: true`` (fa A8,
+    contract K-A: Yuki's own means, to read or check, so its side effects get the dial's tidy like any act's). Pure;
+    never raises."""
     out: set[int] = set()
     try:
         from yuki.perception import diff as desk_diff
@@ -367,7 +391,11 @@ def arranged_windows(name: str, args: Any, facts: Any, before: Any = None, after
         args = args if isinstance(args, dict) else {}
         facts = facts if isinstance(facts, dict) else {}
         ids: list[Any] = []
-        if name == "window" and desk_diff.arranges(args.get("action")):
+        if name == "window" and desk_diff.arranges(args.get("action")) and args.get("own_step") is not True:
+            # fa (A8, contract K-A, the reader: final-F one p1_dial_ask_playlist_over_video: ONE's own focus "to check
+            # what's playing" was taken as a placement they asked for, so code neither tidied nor asked): a window call
+            # marked ``own_step`` is Yuki's own means (to read or check), never their ask; missing is their ask (as
+            # before: the safe side, code never moves that window away)
             ids = [args.get("window"), facts.get("live_hwnd"), *(args.get("_hwnds") or [])]
             ids += [t[3] for t in args.get("_targets") or [] if isinstance(t, (list, tuple)) and len(t) > 3]
         elif name == SKILL_HAND and skill_place_given(args):
@@ -769,7 +797,21 @@ _OUTCOME_NOTE = (
 )
 #: Code's fallback lines for a hand whose talker run is not heard (fixed words, the outcome's kind only).
 _FALLBACK_LINE = {"failed": "That didn't work.", "not_verified": "I couldn't confirm that worked.",
-                  "blocked": "Something stopped that, so nothing was done."}
+                  "blocked": "Something stopped that, so nothing was done.",
+                  "dialog": "It's asking something before it closes, so it's still open. Want me to go ahead?"}
+#: fa (A1): the close raised the page's or the app's own question (measured: a window it owns came up in front): the
+#: talker asks them, never answers it and never hands it on.
+_DIALOG_NOTE = (
+    "Not done: it asks something of its own before it closes (the report names that window), so it is still open and "
+    "nothing in it was answered. Its answer is theirs: say in a few words that it is asking before it closes and ask "
+    "whether to go ahead, the question alone with no call. Never answer it yourself and never hand it on now."
+)
+#: fa (A2): the one tab their words fit is not the tab Yuki put up in that browser in this conversation.
+_TAB_THEIRS_NOTE = (
+    "Not done, nothing was closed: the one tab their words fit is not the tab you put up in that browser (the report "
+    "names both). When their words plainly meant that tab of theirs, call it again exactly as before and it closes; "
+    "otherwise ask them which in a few words, by the tabs' titles, the question alone with no call."
+)
 
 
 #: x3 (3f): several tabs fit the title the talker gave: it asks which, by title, never for a number.
@@ -1620,6 +1662,11 @@ class Hands:
         self._turn_before: dict[str, Any] | None = None
         #: desk22 (A13): ``(turn, [way steps])``: this user turn's hands that took, as "the steps just done"
         self._way_turn: tuple[Any, list[dict[str, Any]]] | None = None
+        #: fa (A2): this conversation's tab ids Yuki itself closed (a tab gone by Yuki's own close is no referent any
+        #: more), and the user's own tabs a close was given back for once (:meth:`_theirs_check`: the next close of that
+        #: very tab is the model's decision, told both identities). Ids only, RAM only.
+        self._closed_tabs: set[str] = set()
+        self._tab_told: set[str] = set()
         #: ``(hwnd, when, turn)``: the window in front before Yuki's last act that moved the focus (focus_back's
         #: default); an act of a later turn that moves no focus lets it go.
         self._front_before: tuple[int, float, Any] | None = None
@@ -1672,6 +1719,8 @@ class Hands:
         self._drop_deferred("new_conversation")
         self._turn_before = None
         self._way_turn = None
+        self._closed_tabs = set()   # fa (A2)
+        self._tab_told = set()
 
     def _turn_now(self) -> tuple[int, Any] | None:
         """hands19: the user's current turn as ``(conversation, turn)`` (the action log's conversation number and the
@@ -2514,6 +2563,10 @@ class Hands:
             if win is not None and app and _app_id(win.app) == _app_id(app) and (fresh or not out):
                 out.append(int(moved_front))
         every = [app] if app and args.get("_hwnds") else []
+        if name == "window" and args.get("own_step") is True:
+            # fa (A8, contract K-A): Yuki's own means (a focus to read or check) is no part of their ask: its windows are
+            # touched only, so what it took from them (the front, a cover) is its side effect, for the dial's tidy
+            return (), tuple(out + ([app] if app else []))
         return tuple(out + every), tuple(out + ([app] if app else []))
 
     @staticmethod
@@ -2621,7 +2674,10 @@ class Hands:
                     found = found or [x for x in (*one_acted, *one_touched) if isinstance(x, str) and x.strip()]
                     opened_ids += [x for x in dict.fromkeys(found) if x not in opened_ids]
             acted, touched = tuple(acted_ids), tuple(touched_ids)
-            d = desk_diff.compare(before, after, acted=acted, touched=touched, opened=tuple(opened_ids))
+            # fa (A9): whether one of the turn's bracketed acts was a sound control's (then a master change is its own)
+            sound = any(_sound_act(n, a) for n, a, _f in acts)
+            d = desk_diff.compare(before, after, acted=acted, touched=touched, opened=tuple(opened_ids),
+                                  sound_act=sound)
             turn = self._call_safely(self.user_turn, None)
             if d.focus_from and d.focus_from != d.focus_to and d.focus_by_act:
                 self._front_before = (int(d.focus_from), time.monotonic(), turn)
@@ -2637,13 +2693,21 @@ class Hands:
             cover = desk_diff.cover_line(d) if self._look_now(turn) is None else ""
             if cover and same_before and kept.get("cover_said"):
                 cover = ""   # desk22 (D4): said already after part 1 of this turn (once a turn)
+            # fa (A9): a master change during acts none of which was the volume's is said by code once a turn (a
+            # measure, whatever the dial: never undone by code, the cause is not known)
+            master = desk_diff.master_line(d) if self._look_now(turn) is None else ""
+            if master and same_before and kept.get("master_said"):
+                master = ""
+            tab_cover = bool(cover)
+            if master:
+                cover = " ".join(x for x in (cover, master) if x)
             windowed = desk_diff.window_flag(d)
             look = bool(d.any_flag and (purpose or (windowed and level != "off")) and self._look_now(turn) is None)
             text = desk_diff.render(d, max_chars=AFTER_CHARS) if look else ""
             off = level == "off"
-            taken = bool(d.flags.get("focus_taken")) and d.focus_from
             acts_now = set() if off else self._act_windows(after, d, acted, touched)
-            front = int(d.focus_from) if taken and not off else None
+            # fa (A5, contract K-B): the one taken-front rule both brains read (``DeskDiff.taken_front``)
+            front = d.taken_front if not off else None
             # desk20 / tidy21: code's own classification of the flag and the one legal step (measured: the act's
             # windows, the front it took, the monitors): code takes it under "do", the talker asks it under "ask"
             step = (desk_diff.tidy_step(d, acts_now, front, len(getattr(after, "monitors", None) or ()))
@@ -2665,7 +2729,8 @@ class Hands:
             if cover:
                 cover = await self._say_cover(params, cover)
                 if cover and same_before:
-                    kept["cover_said"] = True
+                    kept["cover_said"] = kept.get("cover_said") or tab_cover
+                    kept["master_said"] = kept.get("master_said") or bool(master)
             if defer:
                 kept["deferred"] = {"params": params, "at": time.monotonic(),
                                     "act": (str(name), dict(args), {k: facts.get(k) for k in ("_desk_scope",
@@ -2714,6 +2779,52 @@ class Hands:
                 out["side_effect"] = step["says"]
                 out["one_step"] = _one_step_call(step, asked=True)   # safety timing 3: the measured target screen
                 note = _AFTER_STEP_ASK_NOTE + (_AFTER_PURPOSE if purpose else "")
+                # fa (A7, final-F all p1_dial_ask_playlist_over_video: the talker worded the question and asked about
+                # pausing the video instead): code says the measured question itself (``diff.tidy_ask``), only while
+                # the front is still the after-read's (their own switch since is theirs: no question); the talker only
+                # maps their answer to one_step. A look that rides with a "still to do" rest asks once the rest is
+                # done, as before (the talker's, by _AFTER_REST)
+                ask = moved = ""
+                if not rest:
+                    moved = desk_diff.front_guard(await asyncio.to_thread(self._front_now),
+                                                  getattr(after, "foreground", None))
+                    if not moved:
+                        raw = desk_diff.step_app(step, after) or str(self._app_at(step.get("hwnd")) or "")
+                        ask = desk_diff.tidy_ask(step, _app_name(raw) if raw else "")
+                asked = await self._say_cover(params, ask) if ask else ""
+                if asked:
+                    cover = " ".join(x for x in (cover, asked) if x)
+                    out["asked"] = asked
+                    note = _AFTER_STEP_ASKED_NOTE + (_AFTER_PURPOSE + " Otherwise say nothing now." if purpose
+                                                     else "")
+                    if not purpose:
+                        out["_quiet"] = True   # the question was said; their answer is the next turn's
+                elif moved:
+                    # the front changed since the after-read: their desk is theirs, nothing is asked about it
+                    out.pop("side_effect", None)
+                    out.pop("one_step", None)
+                    out["tidied"] = _TIDIED["left"]
+                    note = _AFTER_TIDIED_NOTE + (_AFTER_PURPOSE + " Otherwise stay quiet." if purpose
+                                                 else " Say nothing now.")
+                    if not purpose:
+                        out["_quiet"] = True
+                if self.log is not None and not rest:
+                    self.log.event("hands", op="window", action=step.get("action"), tidy=True, by_code=True,
+                                   state="asked" if asked else "left", why=moved or (None if asked else "unsaid"),
+                                   end_look=end or None, call=params.tool_call_id)
+            elif flag_said and desk_diff.front_guard(await asyncio.to_thread(self._front_now),
+                                                     getattr(after, "foreground", None)):
+                # fa (A6, final-F p1_dt_alt_tab_before_tidy: "Spotify is covering Chrome." after their own switch): the
+                # front is no longer the one the after-read saw: their desk is theirs, and code says nothing about it
+                self._look["used"] = self._look["by_code"] = True
+                out["tidied"] = _TIDIED["left"]
+                note = _AFTER_TIDIED_NOTE + (_AFTER_PURPOSE + " Otherwise stay quiet." if purpose
+                                             else " Say nothing now.")
+                if not purpose:
+                    out["_quiet"] = True
+                if self.log is not None:
+                    self.log.event("hands", op="window", action=None, tidy=True, by_code=True, state="left",
+                                   why="front_changed", said=False, end_look=end or None, call=params.tool_call_id)
             elif flag_said:
                 # desk22 (decision D6): no legal step: code says its one line about what is covered (never silence),
                 # and the talker gets no window run for it (no undoable step exists to take or to ask about)
@@ -2983,9 +3094,11 @@ class Hands:
         real desktop, a stand-in desk's own overview otherwise (rule 7); ``None`` when it can't be read."""
         if _is_real_backend(self.backend):
             try:
-                import ctypes
+                # fa (A5): by the one front rule (``situation.front_window``), the same rule the after-read's
+                # ``foreground`` was found by, so an unlisted foreground never reads as a front that changed
+                from yuki.perception.situation import front_window
 
-                return int(ctypes.windll.user32.GetForegroundWindow() or 0) or None
+                return int(front_window()[0] or 0) or None
             except Exception:  # noqa: BLE001
                 return None
         return self._foreground()
@@ -3186,7 +3299,7 @@ class Hands:
                                           "how_to_handle_it": note.format(rest=rest[:200])})
             return
         if ok:
-            if line:
+            if line and not self._early_same(params, name, line):   # fa (A10)
                 await params.llm.push_frame(TTSSpeakFrame(text=line))
             await params.result_callback({"done": report[:700], "said": line,
                                           "how_to_handle_it": _SAID_NOTE if line else _SILENT_NOTE},
@@ -3647,6 +3760,12 @@ class Hands:
             # opened (code's line), never the words as heard in the model's line written before the act
             line = self._code_line(name, args, facts)
             coded = bool(line)
+        focus_line = " ".join(str(facts.get("focus_line") or "").split())
+        if confirmed and line and focus_line and name == "window" and op == "focus":
+            # fa (A2, final-F multi_open_then_close_yt_tab: "YouTube's up in Chrome." when what came up was their own
+            # paused video): a browser window brought up is said by code from the tab it shows now, never the model's
+            # line written before the act (a call with no line says it as its step line, below)
+            line, coded = focus_line, True
         game = _game_trouble(facts)
         turn = self._call_safely(self.user_turn, None)
         # lVoice (problem 3): the reply's next call waits behind this one: the rest of their request is that call's
@@ -3655,8 +3774,11 @@ class Hands:
         # ("never try again") rides with that call (it would contradict the note that asks for it)
         shape_retry = bool(facts.get("shape") and not ok and not facts.get("stale") and turn is not None
                            and self._given(self._shape_given, turn) < 1)
+        # fa (A1, A2): a page's own question the close raised, or a match that is not Yuki's tab, is a question for
+        # them, not a hand in trouble
+        asks = bool(facts.get("dialog_raised") or isinstance(facts.get("theirs"), dict))
         if game or (not confirmed and not facts.get("settled") and not facts.get("held") and not facts.get("act_off")
-                    and not shape_retry):
+                    and not shape_retry and not asks):
             self.trouble_at = time.monotonic()   # its guidance rides with the talker's next calls (v3.17)
             self.trouble_game = game
         if ok and name in ("tab", "window") and str(args.get("action") or "") == "close":
@@ -3846,7 +3968,7 @@ class Hands:
         if (confirmed and not line) or speak:
             from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
 
-            if speak:
+            if speak and not self._early_same(params, name, line):
                 await params.llm.push_frame(TTSSpeakFrame(text=line))
             # P1.3: the done line is queued; only an act that took something the user had gets one more run
             # integ22 turns-2: whether the reply's next part waits behind it now (read at the look, not before the
@@ -3879,6 +4001,18 @@ class Hands:
             # fHands (k_t3_draft): stopped by something other than a game: said as it is, never as a game
             self._owe_fallback(_FALLBACK_LINE["blocked"])
             await params.result_callback({"refused": report[:700], "how_to_handle_it": _BLOCKED_NOTE})
+            return
+        if facts.get("dialog_raised") and not ok:
+            # fa (A1, final-F all k_tab_close_leave_site: the hand-off clicked "Leave" and their unsaved text was lost):
+            # the close raised the page's (or the app's) own question: the hand stops, nothing goes to the thinker,
+            # and the question is theirs (said by the talker; code's line is its fallback)
+            self._owe_fallback(_FALLBACK_LINE["dialog"])
+            await params.result_callback({"not_done": report[:700], "how_to_handle_it": _DIALOG_NOTE})
+            return
+        if isinstance(facts.get("theirs"), dict):
+            # fa (A2): the one tab their words fit is not the tab Yuki put up in that browser: both identities go back,
+            # nothing was closed; the model decides (the same call again closes it) or asks
+            await params.result_callback({"not_done": report[:700], "how_to_handle_it": _TAB_THEIRS_NOTE})
             return
         if isinstance(facts.get("choose"), dict) and rest:
             # sVoiceFix (F4): several tabs fit, and the tab was only the first step of their request (its then): which
@@ -3964,6 +4098,24 @@ class Hands:
         if key != "report":
             self._owe_fallback(_FALLBACK_LINE[key])   # phase 2 (2.3): the talker words it; code's line its fallback
         await params.result_callback({key: report[:700], "how_to_say_it": note})
+
+    def _early_same(self, params: Any, name: str, line: str) -> bool:
+        """fa (A10, contract K-D, the reader: final-F p1_dt_dial_off_playlist said "Playing ネオン on Spotify." twice):
+        whether the done line is the very say_first already spoken early for this call (the bridge's
+        ``early_said(tool_id)``: the words actually spoken, ``""`` none), compared as two of Yuki's own lines (case,
+        spacing and the closing mark aside; no user words are read). Then the done line is not said again; the
+        result's ``said`` still carries it (it was heard). Missing or ``""``: said as before. Never raises."""
+        try:
+            read = getattr(self.bridge, "early_said", None) if self.bridge is not None else None
+            if not callable(read) or not line:
+                return False
+            early = read(str(getattr(params, "tool_call_id", "") or ""))
+            same = isinstance(early, str) and bool(early.strip()) and _same_line(early, line)
+            if same and self.log is not None:
+                self.log.event("hands", op=name, early_same=True, call=getattr(params, "tool_call_id", None))
+            return same
+        except Exception:  # noqa: BLE001
+            return False
 
     def settle_after_open(self) -> dict[str, Any]:
         """Blocking (off the loop): wait until the screen settles after an opening - the windows, the one in front and
@@ -4228,7 +4380,8 @@ class Hands:
         title = " ".join(str(facts.get("shown") or "").split())
         if name == "window" and not app:
             return ""
-        if name == "tab" and title:
+        if (name == "tab" or (name == "window" and str(args.get("action") or "") == "focus")) and title:
+            # fa (A2): a browser window brought up says the tab it shows, as a tab shown does
             cut = title if len(title) <= STEP_LINE_TITLE_CHARS else (
                 title[:STEP_LINE_TITLE_CHARS].rsplit(" ", 1)[0].rstrip(" -,:;·|") + "…")
             return f'{app} is showing "{cut}".' if app else f'"{cut}" is showing.'
@@ -5125,7 +5278,7 @@ class Hands:
             sent = self._turn_sent()
             spent = turn is not None and self._given(self._then_looks, turn) >= THEN_LOOKS_PER_TURN
             step = await asyncio.to_thread(self._end_step, name, args)
-            if line:
+            if line and not self._early_same(params, name, line):   # fa (A10): never the say_first word for word again
                 await params.llm.push_frame(TTSSpeakFrame(text=line))
             if spent:
                 self._then_open = None
@@ -5181,7 +5334,10 @@ class Hands:
                                           "how_to_say_it": _OUTCOME_NOTE})
             return
         if line:
-            await params.llm.push_frame(TTSSpeakFrame(text=line))
+            if not self._early_same(params, name, line):
+                # fa (A10, final-F p1_dt_dial_off_playlist: "Playing ネオン on Spotify." twice): a done line that is the
+                # say_first already spoken for this call is not said again (``said`` still carries it: it was heard)
+                await params.llm.push_frame(TTSSpeakFrame(text=line))
             # P1.3: a checked done that took something the user had gets one look (never after "Keep this as your
             # usual?": that question waits for their answer)
             look = None
@@ -6120,6 +6276,11 @@ class Hands:
             if before is not None:
                 facts["_desk_before"] = before
                 facts["_desk_turn"] = began
+            if ok and facts.get("verified") is True and name == "window" \
+                    and str(args.get("action") or "") == "focus" and not facts.get("shown"):
+                # fa (A2, final-F multi_open_then_close_yt_tab: "YouTube's up in Chrome." over the user's own paused
+                # video): a browser window brought up says the tab it shows now, by the hand's own read (RAM only)
+                facts["shown"] = self._front_tab_title(args.get("window"))
             if not (ok and facts.get("verified") is True) and not facts.get("settled") and one is None:
                 self._halt_now(name, args, report)   # phase 4: under a ONE call its turn budget keeps the misses
             elif ok and facts.get("verified") is True and name in STEP_FIRST_OPS \
@@ -6128,6 +6289,10 @@ class Hands:
                 # sVoiceFix (F5; review r1 L2): what a window or tab step left showing, for the step check's spoken
                 # line, built here off the voice loop (the app's name may scan processes); RAM only, never logged
                 facts["step_line"] = self._step_line(name, args, facts)
+            if name == "window" and facts.get("shown") and ok and facts.get("verified") is True:
+                # fa (A2): code's done line for a browser window brought up: the tab it shows (said instead of the
+                # model's line, written before the act: "YouTube's up" over their own video)
+                facts["focus_line"] = str(facts.get("step_line") or "") or self._step_line(name, args, facts)
             return ok, report, facts
         except _Refused as exc:
             facts["refused"] = True  # nothing was done: the talker says why ...
@@ -6151,6 +6316,8 @@ class Hands:
                 facts["handover"] = True   # ... or (bTalk) it goes to the planner by code: never refused silently
             if exc.choose is not None:
                 facts["choose"] = exc.choose   # ... or (x3) it asks which tab, by title
+            if exc.theirs is not None:
+                facts["theirs"] = dict(exc.theirs)   # ... or (fa A2) the one match is not the tab Yuki put up there
             if exc.shape:
                 facts["shape"] = True   # ... or (sVoiceFix F4) the call is made again once, as the report says
             if exc.halted:
@@ -6326,12 +6493,25 @@ class Hands:
             # kHands: an app named by the user ("minimize WhatsApp", "close Arc") is every window of it for minimize and
             # close (each read back), its nearest one for the rest
             hwnds = [int(h) for h in (args.get("_hwnds") or [hwnd])] if action in ("minimize", "close") else [hwnd]
+            # fa (A4, final-F one p1_dt_asked_place_maximize_spotify: maximised behind Chrome and said as done):
+            # maximize, restore and full screen are asks to see the window: the verb itself brings it up first through
+            # the gated focus (``launch.window_action``: before its state is read, so a minimised window restored is
+            # never "already restored"; a refusal there does nothing else) and is ok only with the window in view
+            # (in front, and enough of it seen); a window left behind is reported where it is, never verified
             facts["sent_at"] = time.monotonic()
             reports, oks = [], []
             for h in hwnds:
-                ok_one, line, facts = self._report(act(h, action), "", facts)
+                result = act(h, action)
+                ok_one, line, facts = self._report(result, "", facts)
                 oks.append(ok_one)
                 reports.append(line)
+                dialog = _detail(result, "dialog_raised") if action == "close" and not ok_one else None
+                if isinstance(dialog, int) and not isinstance(dialog, bool) and dialog:
+                    # fa (A1): the window asks something of its own before it closes (its save prompt): the hand stops
+                    # here, and the commit check reads that window as one Yuki's own close raised
+                    facts["dialog_raised"], facts["dialog"] = True, int(dialog)
+                    self._note_raised(int(dialog), int(h))
+                    break
                 if facts.get("refused") in ("game", BLOCKED_REFUSAL):
                     break   # D17: a game in front holds the rest too; so does a guard that stopped one (it would again)
             if len(hwnds) > 1:
@@ -6863,6 +7043,22 @@ class Hands:
         with self._lock:
             return list(self.last.tabs.get(hwnd) or []), list(self.last.tab_ids.get(hwnd) or [])
 
+    def _numbers_window(self, app: str) -> int | None:
+        """fa (A2): the window a tab number given without ``window`` counts on: the window in front when the talker was
+        shown its tabs line (the only tabs line it is shown) and it is a window of the browser they named (``app``;
+        any, when none was named); else ``None`` (the number is not read: their words decide). Never raises."""
+        try:
+            with self._lock:
+                front = self.last.foreground
+                shown = bool(front is not None and self.last.tabs.get(front))
+            if not shown:
+                return None
+            if app and int(front) not in self._windows_of(app):
+                return None
+            return int(front)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _read_every_group(self, hwnd: int, budget_s: float) -> Any:
         """``hwnd``'s tab strip with every group (Zen's essentials and pinned, a vertical strip's sections), read now
         and kept a short while for the action log's liveness (:attr:`_other_tabs`); ``None`` when it can't be read.
@@ -6979,6 +7175,11 @@ class Hands:
             return out
         words = " ".join(str(args.get("title") or "").split()) or " ".join(str(args.get("named") or "").split())
         numbers = ([args.get("tab")] if args.get("tab") is not None else []) + list(args.get("tabs") or [])
+        if numbers and hwnd is None:
+            # fa (A2, final-F multi_open_then_close_yt_tab: "tab": 11 with no window was dropped silently): a number
+            # given without a window is read against the one tabs line the talker was shown (the window in front's),
+            # when that window is the browser they named (or none was named); else their words decide, as before
+            hwnd = self._numbers_window(app)
         if numbers and hwnd is not None:
             names, ids = self._shown_strip(hwnd)
             try:
@@ -6993,6 +7194,10 @@ class Hands:
                                    "not name is never closed. Nothing was closed", shape=True, reason="no_words")
                 out["window"] = hwnd
                 out["_targets"] = [(n, names[n - 1], ids[n - 1] if n - 1 < len(ids) else "", hwnd) for n in wanted]
+                if action == "close" and len(out["_targets"]) == 1:
+                    # fa (A2): one tab by number: checked by identity against the tab Yuki put up there, too
+                    self._theirs_check(out["_targets"][0], words,
+                                       lambda: self._read_every_group(hwnd, self.TAB_SEARCH_BUDGET_S))
                 return out
             # kHands (live 10 Oct, 4 of the 11 refusals): a number the strip in hand doesn't hold (the strip moved, or
             # it was never on the line shown) is no guess: their words decide, and with none it is asked again
@@ -7052,6 +7257,9 @@ class Hands:
                 raise _Refused(f"{len(found)} tabs fit those words: {listed}{where}. Nothing was closed",
                                choose={"count": len(found), "titles": listed}, reason="several")
             out["_targets"] = [(t.index, t.name, getattr(t, "tab_id", "") or "", h) for t in found]
+            if not out.get("_picked_own"):
+                # fa (A2): one match: checked by identity against the tab Yuki put up in this browser
+                self._theirs_check(out["_targets"][0], words, strip)
             return out
         if gathered:
             out["window"] = gathered[0][1]
@@ -7179,6 +7387,19 @@ class Hands:
         for _n, title, tab_id, hwnd in targets:   # each in its own window (every: kHands r1 L10)
             result = act(int(hwnd), tab_id, "close")
             good = bool(getattr(result, "ok", False)) and bool(_detail(result, "verified"))
+            dialog = _detail(result, "dialog_raised") if not good else None
+            if isinstance(dialog, int) and not isinstance(dialog, bool) and dialog:
+                # fa (A1): the close raised the page's own question ("Leave site?"), measured by the tab hand (a window
+                # the browser owns, new and in front): the hand stops here (no further tab is closed) and the commit
+                # check reads that window as one Yuki's own close raised
+                facts["dialog_raised"], facts["dialog"] = True, int(dialog)
+                self._note_raised(int(dialog), int(hwnd))
+                failed.append(title)
+                lines.append(str(getattr(result, "summary", "")))
+                facts["action_ms"] = round(float(getattr(result, "elapsed_ms", 0.0) or 0.0))
+                break
+            if good:
+                self._closed_tabs.add(str(tab_id))   # fa (A2): a tab Yuki closed is no referent any more
             rung = _detail(result, "keys_rung")
             if isinstance(rung, dict) and "reselected" in rung:
                 # integration T4: what the keyboard rung put back after its close (logged: booleans only)
@@ -7197,6 +7418,10 @@ class Hands:
             facts["windows"] = len({int(t[3]) for t in targets})
         facts["verified"] = bool(closed) and not failed
         report = "; ".join(lines)
+        if facts.get("dialog_raised"):
+            # fa (A1): the measured question first; what closed before it (several tabs: every) is said too
+            done = f"closed first: {', '.join(repr(x) for x in closed)}; " if closed else ""
+            return False, done + report, facts
         if closed:
             report = ("closed, each by its identity and verified gone: " + ", ".join(f'"{x}"' for x in closed)
                       + (f"; NOT closed: {', '.join(repr(x) for x in failed)}" if failed else "") + f". ({report})")
@@ -7473,6 +7698,84 @@ class Hands:
 
         threading.Thread(target=run, name="yuki-hands-place", daemon=True).start()
 
+    def _note_raised(self, dialog: int, owner: int) -> None:
+        """fa (A1): a window Yuki's own close raised, for the commit check (``check.note_raised``: ids only), and the
+        hands' log (content-free). Never raises."""
+        try:
+            from yuki.brain.check import note_raised
+
+            note_raised(int(dialog), int(owner), "close")
+        except Exception:  # noqa: BLE001 - the check then reads the step as before
+            pass
+
+    #: fa (A2): at most this many of Yuki's put-up tabs are checked against a one-match close (newest first; each in
+    #: another window costs one bounded strip read).
+    PUT_UP_CHECKED = 3
+
+    def _put_up(self) -> list[tuple[int, str]]:
+        """fa (A2): ``(window, tab id)`` of this conversation's tabs Yuki put up whose window is known, newest first,
+        leaving out the tabs Yuki itself closed since. From the action log's identities only
+        (``ActionLog.opened_tabs``); ``[]`` when none or unknown. Never raises."""
+        opened = getattr(self.actions, "opened_tabs", None)
+        if not callable(opened):
+            return []
+        try:
+            return [(int(h), str(tid)) for h, tid in opened()
+                    if tid and h is not None and str(tid) not in self._closed_tabs]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _theirs_check(self, target: tuple[Any, ...], words: str, strip: Any) -> None:
+        """fa (A2, final-F #2, latent Z7: a close with one match was never checked against what Yuki put up): before a
+        tab is closed as the one their words fit, a tab Yuki put up in this conversation that is not the match and that
+        their words may have meant raises :class:`_Refused` with both identities (``theirs``): one in the same browser
+        (that window or another of its program) whose title holds their words or that is no longer read in its strip
+        (gone, by no close of Yuki's), or one in another browser whose title holds their words. Not when the model was
+        told about that very tab once already in this conversation (its call again is its decision). A put-up tab read
+        whose title does not hold their words is no referent (they named the other tab, as said). By identity (the
+        action log's tab ids) and the strips read; the title match is the hand's own (:func:`tabs_titled`). ``strip``:
+        the match's window's strip (or a callable reading it). Never raises anything else."""
+        try:
+            _n, title, tab_id, hwnd = target[0], str(target[1]), str(target[2] or ""), int(target[3])
+        except (TypeError, ValueError, IndexError):
+            return
+        if not tab_id or tab_id in self._tab_told:
+            return
+        mine = self._put_up()
+        if not mine or tab_id in {tid for _h, tid in mine}:
+            return
+        program = self._app_at(hwnd)
+        rivals: tuple[int, str, tuple[str, int] | None] | None = None
+        for rec_hwnd, rec_tab in mine[:self.PUT_UP_CHECKED]:
+            same = rec_hwnd == hwnd or bool(program and self._app_at(rec_hwnd) == program)
+            seen: tuple[str, int] | None = None
+            try:
+                if rec_hwnd == hwnd:
+                    read = strip() if callable(strip) else strip   # the match's own strip (read now only when needed)
+                else:
+                    read = self._read_every_group(rec_hwnd, self.TAB_SEARCH_BUDGET_S)
+                hit = next((t for t in list(getattr(read, "tabs", None) or [])
+                            if str(getattr(t, "tab_id", "") or "") == rec_tab), None)
+                seen = (str(hit.name), rec_hwnd) if hit is not None else None
+            except Exception:  # noqa: BLE001 - not read: counted as gone (the safe side: the model is told)
+                seen = None
+            fits = seen is not None and bool(words) and bool(tabs_titled(words, [seen[0]]))
+            if fits or (seen is None and same):
+                rivals = (rec_hwnd, rec_tab, seen)
+                break
+        if rivals is None:
+            return   # every tab Yuki put up is read and their words fit none of them: they named the other tab
+        rec_hwnd, rec_tab, seen = rivals
+        self._tab_told.add(tab_id)
+        yours = (f'"{seen[0][:60]}" in window {seen[1]}' if seen is not None
+                 else "no longer open (not in its window's strip now)")
+        raise _Refused(f'the one tab whose title fits those words is "{title[:60]}" in window {hwnd}, which Yuki did not '
+                       f"put up; the tab Yuki put up in this conversation that their words may mean is {yours}. "
+                       f"Nothing was closed. If their words meant that tab of theirs, call it again exactly as before "
+                       f"and it closes; otherwise ask them which, by the titles",
+                       theirs={"tab": tab_id, "put_up": rec_tab, "put_up_open": seen is not None},
+                       reason="not_put_up")
+
     def _opened_among(self, found: list[Any]) -> Any:
         """fHands (k_tab_close_it): of several tabs that fit their words, the one Yuki put up in this conversation (the
         newest such), else ``None``: "close it" after "pull up GitHub" is the GitHub tab Yuki opened, never the user's
@@ -7489,6 +7792,17 @@ class Hands:
             if hit:
                 return hit[0]
         return None
+
+    def _front_tab_title(self, hwnd: Any) -> str:
+        """fa (A2): the title of the tab a browser window shows (``""``: not a browser by machine data, or no strip
+        read), for code's line after a window focus. Blocking (one bounded strip read); never raises."""
+        try:
+            if hwnd is None or not self._is_browser(int(hwnd)):
+                return ""
+            tab = self._selected_tab(int(hwnd))
+            return " ".join(str(tab[1] or "").split()) if tab is not None else ""
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _selected_tab(self, hwnd: Any) -> tuple[int, str, int, str] | None:
         """``(place, name, count, identity)`` of the tab ``hwnd`` shows (identity: its UIA RuntimeId text, ``""``
@@ -7822,6 +8136,15 @@ class Hands:
             # fHands (k_t3_draft): stopped by something else (never said as a game): said plainly, not handed on
             facts["refused"] = BLOCKED_REFUSAL
         return ok, lead + str(getattr(result, "summary", "")), facts
+
+
+def _same_line(a: Any, b: Any) -> bool:
+    """fa (A10): two of Yuki's own spoken lines are the same sentence: equal once casefolded, their spacing collapsed
+    and their closing marks dropped. Pure."""
+    def plain(text: Any) -> str:
+        return " ".join(str(text or "").casefold().split()).rstrip(" .!?…")
+
+    return bool(plain(a)) and plain(a) == plain(b)
 
 
 def _squash(text: Any) -> str:
@@ -8190,8 +8513,12 @@ class _Refused(Exception):
 
     def __init__(self, message: str, *, stale: bool = False, held: str | None = None,
                  act_off: str | None = None, handover: bool = False, choose: dict[str, Any] | None = None,
-                 shape: bool = False, halted: bool = False, reason: str = "") -> None:
+                 shape: bool = False, halted: bool = False, reason: str = "",
+                 theirs: dict[str, Any] | None = None) -> None:
         super().__init__(message)
+        #: fa (A2): a close whose one match is not the tab Yuki put up in that browser: ``{"tab", "put_up"}`` (code
+        #: words and ids only): both identities go back to the model, nothing closed
+        self.theirs = theirs
         #: kHands (audit 17 Oct: the tab hand was refused 11 of 12 times and the log kept no reason): a content-free code
         #: word for why, logged with the hand (``refused_why``); left out, :attr:`code` derives one from the flags
         self.reason = reason
@@ -8708,9 +9035,15 @@ class Verbs:
         h = self.hands
         try:
             if not facts.get("refused") or facts.get("sent_at") is not None:
-                h.actions.add("your hand", _what(name, args), str(report or "")[:400], ok=bool(ok), verified=verified,
-                              turn=h._call_safely(h.user_turn, None), hwnd=facts.get("live_hwnd"),
-                              tab_id=facts.get("live_tab") or "")
+                record = h.actions.add("your hand", _what(name, args), str(report or "")[:400], ok=bool(ok),
+                                       verified=verified, turn=h._call_safely(h.user_turn, None),
+                                       hwnd=facts.get("live_hwnd"), tab_id=facts.get("live_tab") or "")
+                if (name == SKILL_HAND and record is not None and verified is True
+                        and (facts.get("focus_taken") or facts.get("focus_declared"))):
+                    # fa (A3, final-F one multi_open_then_close_yt_tab: ONE's run_skill records kept no tab, so "close
+                    # that YouTube tab" had no referent among two): the tab a verified skill run's page landed on is
+                    # kept on its line, as the talker's own skill reply keeps it (:meth:`Hands._place_record`)
+                    h._place_record(record)
         except Exception:  # noqa: BLE001 - a record never breaks an act
             pass
         try:

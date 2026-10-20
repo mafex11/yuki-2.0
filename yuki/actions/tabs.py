@@ -35,6 +35,13 @@ multi-selection is collapsed to it by its Select first, and no key goes otherwis
 Safety F1: that check runs once more inside ``input.hotkey`` (``before_send``), after its own waits and right before
 ``SendInput`` (only the front is read after it). After any close, the tab counts as
 gone only from a re-read that found the strip and could tell (:func:`_gone`): a read cut short is never "closed".
+
+fa (final-F #1, A1: the page's "Leave site?" was answered "Leave" for the user and their unsaved text was lost): a
+close that leaves the tab in the strip is checked for a window the browser window owns that was not up right before the
+close and is in front now (or is a user window): the page's own question (:func:`raised_window`, Win32 facts only).
+Then the close stops there: ``details["dialog_raised"]`` holds that window's id, the report says the page asks before
+its tab closes and that nothing in it was answered, and the keyboard rung leaves that tab showing and the browser in
+front with the question (``reselected`` / ``front_back``: ``dialog``). What it asks is the user's to answer.
 """
 
 from __future__ import annotations
@@ -331,6 +338,77 @@ def _strip(found: list[tuple[Any, Any]]) -> dict[str, list[str]]:
     """One read of a strip by identity alone (content-free): its tab ids in order and its selected ids. Pure."""
     return {"ids": [str(t.tab_id) for t, _e in found if t.tab_id],
             "selected": sorted(str(t.tab_id) for t, _e in found if t.selected and t.tab_id)}
+
+
+# ---------------------------------------------------------------------------
+# fa (final-F #1, A1): a window the close itself raised ("Leave site?"), measured
+# ---------------------------------------------------------------------------
+
+
+def owned_windows(hwnd: int) -> set[int]:
+    """The visible top-level windows ``hwnd`` owns now (``GetWindow(GW_OWNER)``): a page's or the app's own question
+    is one of them. Read-only Win32; an empty set when they can't be read. Never raises."""
+    found: set[int] = set()
+    try:
+        import win32gui
+
+        from yuki.perception.windows import owner_of
+
+        def collect(h: int, _extra: object) -> bool:
+            try:
+                if win32gui.IsWindowVisible(h) and owner_of(int(h)) == int(hwnd):
+                    found.add(int(h))
+            except Exception:  # noqa: BLE001 - a window that went away mid-read
+                pass
+            return True
+
+        win32gui.EnumWindows(collect, None)
+    except Exception:  # noqa: BLE001
+        return set()
+    return found
+
+
+def raised_window(hwnd: int, before: set[int] | frozenset[int] = frozenset()) -> int:
+    """The window an act on ``hwnd`` raised: a window ``hwnd`` owns that was not up before the act (``before``:
+    :func:`owned_windows` read right before it) and is in front now (its own question took the front), else one that
+    is a user window (titled, or holding its owner disabled: ``windows.is_user_window``, the window list's own rule).
+    ``0``: none. Window facts only (owner, visibility, the front, styles), never a title read for meaning. Read-only;
+    never raises."""
+    try:
+        from yuki.actions.input import _user32
+        from yuki.perception.windows import is_user_window
+
+        now = owned_windows(hwnd) - set(before or ())
+        if not now:
+            return 0
+        front = int(_user32.GetForegroundWindow() or 0)
+        if front in now:
+            return front
+        return next((h for h in sorted(now) if is_user_window(h)), 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def note_raised(dialog: int, owner: int) -> None:
+    """The measured fact for the commit check (``brain.check.note_raised``: ids only): ``dialog`` came up in reply to
+    Yuki's own close of something in ``owner``. Written here, by the act that measured it, so every caller (the talker's
+    and ONE's hands, the thinker's tab and window tools) leaves the same fact. Never raises."""
+    try:
+        from yuki.brain.check import note_raised as keep
+
+        keep(int(dialog), int(owner), "close")
+    except Exception:  # noqa: BLE001 - the check then reads the step as before
+        pass
+
+
+def _window_title(hwnd: int) -> str:
+    """The raised window's title, for the report (text the app wrote: RAM only, never logged). ``""`` unknown."""
+    try:
+        import win32gui
+
+        return " ".join(str(win32gui.GetWindowText(int(hwnd)) or "").split())[:80]
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _watch_gone(automation: Any, hwnd: int, tab_id: str, mates: set[str], out: dict[str, Any]) -> None:
@@ -801,8 +879,15 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
                                         all_groups=True)
         shared["after"], shared["after_complete"] = _rows(after), complete
 
+    # fa (A1): the windows the browser window owns right before the close, so a question the close raised is told apart
+    # from one that was already up (read-only Win32, a few ms; a select raises none)
+    owned_before = owned_windows(int(hwnd)) if action == "close" else set()
     pending = _Pending(job, "yuki-tab-action", ACTION_BUDGET_S)
     shared = pending.wait()
+    if action == "close" and shared.get("how") and not shared.get("seen"):
+        # fa (A1): the close control was pressed and the tab is still there: a window of the browser's own that came up
+        # in front since (the page's "Leave site?") is measured and stops the hand
+        shared["dialog"] = raised_window(int(hwnd), owned_before)
     keys = close_keys() if action == "close" and shared.get("no_control") and shared.get("tab") else ()
     if keys and int(shared.get("count") or 0) <= 1:
         # the window's only tab: its close key closes the window itself, which is more than a tab (never by a key)
@@ -834,11 +919,18 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
             if shared["seen"]:
                 left = seen.get("picked")   # safety WW8: the browser's own pick right after the close (None: unknown)
                 unknown, closed = left is None, seen.get("closed_strip")
-            elif not (shared["read_back"] and shared["after_complete"]):
-                left = None   # safety F5: not read back whole after the key (a prompt of the browser's may be up): kept
+            else:
+                # fa (A1): the key was sent and the tab is still there: the page's own question the close raised
+                shared["dialog"] = raised_window(int(hwnd), owned_before)
+                if not (shared["read_back"] and shared["after_complete"]):
+                    left = None   # safety F5: not read back whole after the key (a prompt may be up): kept
         else:
             shared["keys_why"], shared["keys_said"] = rung.get("why"), rung.get("said")
-        if rung.get("was_on") or rung.get("front_before"):
+        if shared.get("dialog") and (rung.get("was_on") or rung.get("front_before")):
+            # fa (A1): the page asks before its tab closes: its tab stays the one showing and the browser stays in
+            # front with that question (another tab or window brought up would hide it under their answer)
+            details["keys_rung"]["reselected"], details["keys_rung"]["front_back"] = "dialog", "dialog"
+        elif rung.get("was_on") or rung.get("front_before"):
             # integration T4, safety F5: on every exit after its select or its raise, the rung undoes its own side
             # effects (the brains' tidy steps can't: a tab switch is no window step, and the raised window counts as
             # asked): the tab they were on shows again, and the window that was in front gets the front back, only
@@ -903,6 +995,18 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
     if lost:
         details["closed_other"] = len(lost)
     details["read_back"] = bool(shared.get("read_back"))
+    dialog = int(shared.get("dialog") or 0) if not shared.get("seen") else 0
+    details["dialog_raised"] = dialog or None
+    if dialog:
+        # fa (A1, final-F k_tab_close_leave_site: "Leave" was then clicked for the user and their unsaved text lost):
+        # the close raised the page's own question; nothing in it was answered, and that answer is theirs
+        note_raised(dialog, int(hwnd))
+        title = _window_title(dialog)
+        named = f' "{title}"' if title else ""
+        left = "; the browser was left in front with it" if put_back.get("front_back") == "dialog" else ""
+        return finish(False, f"asked {where} to close ({shared.get('how')}); the page raised a window of its own "
+                             f"[{dialog}]{named} in front of it, asking before the tab closes, so the tab is still "
+                             f"open. Nothing in that window was answered: what it asks is theirs to answer{left}")
     if not shared.get("seen"):
         if not shared.get("read_back"):
             return finish(False, f"asked {where} to close ({shared.get('how')}), but its strip could not be read again "

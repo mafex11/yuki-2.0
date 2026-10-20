@@ -35,6 +35,13 @@ Public API::
     mixer_rows(rows, apps) -> list                 # pure: the mixer rows of the apps named
     monitor_of(rect, monitors) -> int | None       # pure: the monitor holding most of a rectangle
     coverer(state, window) -> Window | None        # pure: the window above that covers most of it
+    front_window(raw=None) -> (hwnd, how)          # fa (A5): the window in front now, by the one front rule
+    front_rule(raw, keyboard, root_owner, listed, popup) -> (hwnd, how)   # pure: that rule
+
+**The one front rule** (fa, final-F #4a): the front is ``GetForegroundWindow`` when it is a listed window or a popup
+the desk keeps; a foreground on no list stands for the listed window holding the keyboard, else its listed root owner.
+:func:`snapshot` and :func:`front_window` both apply it, so a diff's ``focus_to`` and a guard's "front now" read the
+same window; ``DeskState.front_how`` says which case it was (a code word, logged).
 """
 
 from __future__ import annotations
@@ -170,6 +177,9 @@ class DeskState(_Rec):
     holds: str = ""
     errors: dict[str, str] = field(default_factory=dict)
     ms: float = 0.0
+    #: fa (A5): how :attr:`foreground` was found by the one front rule (:func:`front_rule`): ``listed``, ``popup``,
+    #: ``keyboard``, ``owner``, ``unlisted``, ``none``; ``""`` when not read by :func:`snapshot` (a code word, logged).
+    front_how: str = ""
 
     def window(self, hwnd: Any) -> Window | None:
         try:
@@ -184,7 +194,7 @@ class DeskState(_Rec):
                 "popups": sum(1 for w in self.windows if w.kind == "popup"),
                 "playing": sum(1 for m in self.media if m.playing),
                 "playing_mapped": sum(1 for m in self.media if m.playing and m.hwnd),
-                "errors": sorted(self.errors), "ms": round(self.ms, 1)}
+                "errors": sorted(self.errors), "ms": round(self.ms, 1), "front_how": self.front_how or None}
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +318,73 @@ def _keyboard_root(foreground: int) -> int:
     return foreground
 
 
+#: ``GetAncestor(hwnd, GA_ROOTOWNER)``: the top of a window's owner chain.
+_GA_ROOTOWNER = 3
+
+
+def _root_owner(hwnd: int) -> int:
+    try:
+        return int(_user32.GetAncestor(ctypes.c_void_p(int(hwnd)), _GA_ROOTOWNER) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def front_rule(raw: int, keyboard: int, root_owner: int, listed: Callable[[int], bool],
+               popup: Callable[[int], bool]) -> tuple[int, str]:
+    """fa (final-F #4a, A5): the one front rule, pure. ``raw``: ``GetForegroundWindow``; ``keyboard``: the top-level
+    window that holds the keyboard (:func:`_keyboard_root`); ``root_owner``: the top of ``raw``'s owner chain;
+    ``listed(h)``: a window the user can see and switch to (``windows.is_user_window``, the window list's rule);
+    ``popup(h)``: a popup the desk lists when it is in front (``visibility``'s kind ``popup``). Returns ``(front, how)``:
+
+    * ``raw`` itself when it is listed (``listed``) or a popup in front (``popup``): as before;
+    * else the listed window holding the keyboard (``keyboard``), else the listed root owner (``owner``): a foreground
+      that is on no list (final-F one p1_spotify_down_focus_back: a Spotify window off the list held the front while
+      the listed Spotify window held the keyboard, so the front read "nothing" and no tidy step was found) stands for
+      the window people see in front;
+    * else ``raw`` (``unlisted``); ``(0, "none")`` with no foreground.
+
+    Window facts only. Never raises."""
+    try:
+        raw = int(raw or 0)
+        if not raw:
+            return 0, "none"
+        if listed(raw):
+            return raw, "listed"
+        if popup(raw):
+            return raw, "popup"
+        if keyboard and int(keyboard) != raw and listed(int(keyboard)):
+            return int(keyboard), "keyboard"
+        if root_owner and int(root_owner) != raw and listed(int(root_owner)):
+            return int(root_owner), "owner"
+        return raw, "unlisted"
+    except Exception:  # noqa: BLE001
+        return int(raw or 0), "unlisted"
+
+
+def front_window(raw: int | None = None) -> tuple[int, str]:
+    """fa (A5): the window in front now by the one front rule (:func:`front_rule`), read-only Win32 (a few ms): the
+    reader for a guard that compares the front now with a snapshot's ``foreground`` (``hands._front_now``, launch's
+    in-view check), so both read the same window. ``(0, "none")`` when there is no foreground. Never raises."""
+    try:
+        from yuki.perception.visibility import _classify, frame_bounds
+        from yuki.perception.windows import is_user_window
+
+        fg = int(raw if raw is not None else (_user32.GetForegroundWindow() or 0))
+
+        def popup(h: int) -> bool:
+            rect = frame_bounds(h)
+            kind = _classify(h, rect) if rect is not None else None
+            return bool(kind and kind[0] == "popup")
+
+        return front_rule(fg, _keyboard_root(fg), _root_owner(fg), is_user_window, popup)
+    except Exception:  # noqa: BLE001
+        try:
+            fg = int(_user32.GetForegroundWindow() or 0)
+        except Exception:  # noqa: BLE001
+            fg = 0
+        return (fg, "unlisted") if fg else (0, "none")
+
+
 def _app_name(process_name: str) -> str:
     name = str(process_name or "").strip()
     return name[:-4] if name.casefold().endswith(".exe") else name
@@ -390,11 +467,18 @@ def snapshot(*, media: Iterable[Any] | None = None, audio: Iterable[Any] | None 
                                   dpi_scale=float(m.dpi_scale)) for m in list_monitors()]
         infos = list_windows()
         lay = layout()
-        fg = int(lay.foreground or _user32.GetForegroundWindow() or 0)
-        kb = _keyboard_root(fg)
-        state.foreground, state.keyboard = (fg or None), (kb or None)
+        raw = int(lay.foreground or _user32.GetForegroundWindow() or 0)
+        kb = _keyboard_root(raw)
         surfaces = {s.hwnd: s for s in lay.surfaces}
         rank = {s.hwnd: i for i, s in enumerate(lay.surfaces)}
+        # fa (A5): the one front rule (:func:`front_rule`) over this read's own lists: a foreground on no list stands
+        # for the listed window holding the keyboard, else its listed root owner (focus_to, focus_by_act, the render
+        # and the tidy guard then all read that one window)
+        ids = {int(i.hwnd) for i in infos}
+        fg, state.front_how = front_rule(
+            raw, kb, _root_owner(raw) if raw and raw not in ids else 0, lambda h: int(h) in ids,
+            lambda h: getattr(surfaces.get(int(h)), "kind", "") == "popup")
+        state.foreground, state.keyboard = (fg or None), (kb or None)
         out: list[Window] = []
         for info in infos:
             s = surfaces.get(info.hwnd)

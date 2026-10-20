@@ -92,6 +92,16 @@ Public API::
     tidy_line(step, app, ok=True) -> str    # code's line for the step it took (or that did not take) (tidy21)
     step_app(step, state) -> str            # the raw app of the step's window in a desk read (tidy21)
     flag_line(d, name=None) -> str          # code's line for a window flag no legal step undoes (desk22, D6)
+    tidy_ask(step, app) -> str              # fa (A7): code's question for the step under the dial "ask"
+    front_guard(front_now, front_after) -> str   # fa (A6): "" while the front is the after-read's, else why not
+    master_line(d) -> str                   # fa (A9): code's line for a master change that was a side effect
+
+**fa (final-F, lane A).** ``DeskDiff.taken_front`` (contract K-B) is the one taken-front rule: ``focus_from`` when
+``focus_taken``, else ``None``; both brains' tidy steps read it. A fifth flag, ``master_changed`` (A9): with
+``compare(..., sound_act=False)`` (none of the bracketed acts was a sound control's), a measured change of the master's
+level or mute is a side effect, rendered as one and said by code (:func:`master_line`); never set when the caller
+does not say (``sound_act`` ``None``). A window flag's no-step line (D6) is said only while the front is the
+after-read's (:func:`front_guard`); under the dial "ask" code says the question itself (:func:`tidy_ask`).
 """
 
 from __future__ import annotations
@@ -146,8 +156,15 @@ class DeskDiff(_Rec):
     media_changes: list[dict[str, Any]] = field(default_factory=list)
     volume_changes: list[dict[str, Any]] = field(default_factory=list)
     flags: dict[str, bool] = field(default_factory=lambda: {"covered_attention": False, "focus_taken": False,
-                                                            "new_popup": False, "left_silent": False})
+                                                            "new_popup": False, "left_silent": False,
+                                                            "master_changed": False})
     any_flag: bool = False
+    #: fa (contract K-B, final-F #4a): the window the act took the front from (``focus_from`` when ``focus_taken``),
+    #: the one taken-front rule both brains read for their tidy step (the hands' look, ONE's ``_legal_step``); ``None``:
+    #: no front was taken, so no step gives one back.
+    taken_front: int | None = None
+    #: fa (A5): how the after-read found its front (``situation.front_rule``'s code word), for the log.
+    front_how: str = ""
     #: The attention windows before the act (ids): in front, keyboard, or playing.
     attention: list[int] = field(default_factory=list)
     #: Plain names of the windows the diff mentions, for :func:`render` (``{hwnd: '[hwnd] App "title"'}``; RAM only).
@@ -166,7 +183,8 @@ class DeskDiff(_Rec):
                 "uncovered": len(self.uncovered),
                 "focus_moved": self.focus_from != self.focus_to, "media": len(self.media_changes),
                 "volume": len(self.volume_changes), **{k: bool(v) for k, v in self.flags.items()},
-                "any_flag": self.any_flag}
+                "any_flag": self.any_flag, "taken_front": self.taken_front is not None,
+                "front_how": self.front_how or None}
 
     @property
     def empty(self) -> bool:
@@ -209,7 +227,7 @@ def _moved(a: Window, b: Window) -> bool:
 
 def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
             touched: Iterable[Any] = (), sound_apps: Iterable[Any] | None = None,
-            fresh: Iterable[Any] = (), opened: Iterable[Any] = ()) -> DeskDiff:
+            fresh: Iterable[Any] = (), opened: Iterable[Any] = (), sound_act: bool | None = None) -> DeskDiff:
     """What changed from ``before`` to ``after`` (two :func:`~yuki.perception.situation.snapshot` reads around one
     act), with the four flags (module docstring). ``acted``: what the request was about; ``touched``: the windows the
     act itself brought up or focused (ids or app names). ``sound_apps`` (integration review c2desk-1): when given, the
@@ -219,8 +237,12 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
     a skill run's measured apps). ``opened`` (desk22, A24): the windows an act opened a page in (an open_url hand or
     step, a skill of kind ``open``), by id; an app only for an act whose window was not measured (review L4: every
     window of that app then counts), for the single-session autoplay tab cover only; ``()``: as before.
-    Pure: no OS call. Never raises on odd input."""
+    ``sound_act`` (fa, A9): whether one of the bracketed acts was a sound control's (a volume or mute act, any target):
+    ``False`` makes a measured change of the master's level or mute a side effect (``master_changed``, its volume
+    entry ``side_effect``: the act was not about the volume); ``True`` or ``None`` (a caller that does not say): never
+    flagged, as before. Pure: no OS call. Never raises on odd input."""
     diff = DeskDiff()
+    diff.front_how = str(getattr(after, "front_how", "") or "")
     acted_hwnds, acted_apps = _acted_sets(acted)
     touched_hwnds, touched_apps = _acted_sets(touched)
     fresh_hwnds, fresh_apps = _acted_sets(fresh)
@@ -403,6 +425,8 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
             and not (still.foreground or still.keyboard))
         diff.flags["new_popup"] = any((n["foreground"] or n["keyboard"]) and not n["asked"] and n["by_act"]
                                       for n in diff.new_windows)
+        # fa (contract K-B): the one taken-front rule both brains read (the front given back goes to this window)
+        diff.taken_front = int(diff.focus_from) if diff.flags["focus_taken"] and diff.focus_from else None
 
     # media: by session, a status or a track change. An app with one session on both sides is keyed by its app id (so
     # a new track is a track change); an app with several (browser tabs) by app id and title.
@@ -441,8 +465,12 @@ def compare(before: DeskState, after: DeskState, *, acted: Iterable[Any] = (),
         lb, la = float(before.master.get("level") or 0.0), float(after.master.get("level") or 0.0)
         mb_, ma_ = bool(before.master.get("muted")), bool(after.master.get("muted"))
         if abs(la - lb) >= LEVEL_EPS or mb_ != ma_:
+            # fa (A9, final-F one multi_japanese_and_volume: the master went 100% -> 0% and muted inside a playlist
+            # run): a master change measured around acts none of which was a sound control's is a side effect
+            side = sound_act is False
             diff.volume_changes.append({"app": "master", "kind": "master", "level_from": lb, "level_to": la,
-                                        "muted_from": mb_, "muted_to": ma_})
+                                        "muted_from": mb_, "muted_to": ma_, "side_effect": side})
+            diff.flags["master_changed"] = side
     if "audio" not in before.errors and "audio" not in after.errors:
         ab = {_key(a.app): a for a in before.audio}
         for a in after.audio:
@@ -499,7 +527,9 @@ def _volume_line(v: dict[str, Any]) -> str:
     if "master" in why:
         bits.append(f"the master at {v.get('master_level', 0.0):g}%{' and muted' if v.get('master_muted') else ''}")
     head = "Volume (mixer):" if v.get("kind") == "app" else "Volume:"
-    return f"{head} {v['app']} {', '.join(bits)}{' (still silent)' if why else ''}."
+    # fa (A9): a master change during an act that was not about the volume is said as what it is
+    side = " (during your act, which was not about the volume)" if v.get("side_effect") else ""
+    return f"{head} {v['app']} {', '.join(bits)}{' (still silent)' if why else ''}{side}."
 
 
 def render(diff: DeskDiff, max_chars: int = 500) -> str:
@@ -528,7 +558,7 @@ def render(diff: DeskDiff, max_chars: int = 500) -> str:
         else:
             by = f", under [{c['by']}] {c['by_app']}" if c.get("by") else ""
             lines.append(f"{head}: visible {_percent(c['before'])}% -> {_percent(c['after'])}%{by}{mine}.")
-    silent = [v for v in diff.volume_changes if v.get("silent")]
+    silent = [v for v in diff.volume_changes if v.get("silent") or v.get("side_effect")]
     lines += [_volume_line(v) for v in silent]   # a flag: said before the rest, never the first to give way
     if diff.focus_from != diff.focus_to:
         mine = "" if diff.focus_by_act else f" {NOT_YOURS}"
@@ -558,7 +588,7 @@ def render(diff: DeskDiff, max_chars: int = 500) -> str:
         title = f' "{_title(m["title"], 40)}"' if m.get("title") else ""
         change = "new track" if m["track"] and m["from"] == m["to"] else f"{m['from']} -> {m['to']}"
         lines.append(f"Media: {m['app']}{title} {change}.")
-    lines += [_volume_line(v) for v in diff.volume_changes if not v.get("silent")]
+    lines += [_volume_line(v) for v in diff.volume_changes if not (v.get("silent") or v.get("side_effect"))]
     text = ""
     for line in lines:
         candidate = f"{text}\n{line}" if text else line
@@ -765,6 +795,66 @@ def tidy_line(step: Any, app: str = "", ok: bool = True) -> str:
         return ""
 
 
+#: fa (A7, final-F all p1_dial_ask_playlist_over_video: at "ask" the talker worded the question itself and asked about
+#: pausing the video): code's own question for :func:`tidy_step`'s step under the tidy dial "ask" (``{app}``: the step
+#: window's app, as people say it), the same pattern as :data:`LINE_TIDY_DONE`; the brains only map their answer to
+#: the step.
+LINE_TIDY_ASK: dict[str, str] = {"place": "Want me to move {app} to your other screen?",
+                                 "focus_back": "Want {app} back in front?"}
+
+
+def tidy_ask(step: Any, app: str = "") -> str:
+    """fa (A7): code's question for :func:`tidy_step`'s step (:data:`LINE_TIDY_ASK`; ``app`` as :func:`tidy_line`
+    takes it), ``""`` for anything that is no such step. Pure; never raises."""
+    try:
+        action = str((step or {}).get("action") or "") if isinstance(step, dict) else ""
+        if action not in LINE_TIDY_ASK:
+            return ""
+        return LINE_TIDY_ASK[action].format(app=" ".join(str(app or "").split()) or TIDY_NO_APP)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def front_guard(front_now: Any, front_after: Any) -> str:
+    """fa (A6, final-F p1_dt_alt_tab_before_tidy: "Spotify is covering Chrome." was said after the user's own switch):
+    ``""`` while the window in front now is still the one the after-read saw, else ``front_unread`` /
+    ``front_changed``: the same front check :func:`tidy_guard` makes, for a line of code's about the desk (the D6
+    :func:`flag_line`), so a desk the user changed since is theirs and gets no line. Pure; never raises."""
+    try:
+        now, then = _hwnd(front_now), _hwnd(front_after)
+        if now is None or then is None:
+            return "front_unread"
+        return "" if now == then else "front_changed"
+    except Exception:  # noqa: BLE001
+        return "error"
+
+
+#: fa (A9): code's line for a master change measured during an act that was not about the volume (``master_changed``):
+#: what is measured, said once, never a claim about why.
+LINE_MASTER_MUTED = "Your PC's sound got muted while I did that."
+LINE_MASTER_UNMUTED = "Your PC's sound got unmuted while I did that."
+LINE_MASTER_LEVEL = "Your PC's volume went from {was}% to {now}% while I did that."
+
+
+def master_line(d: Any) -> str:
+    """fa (A9): code's one line for ``master_changed`` (:data:`LINE_MASTER_MUTED`, :data:`LINE_MASTER_UNMUTED`,
+    :data:`LINE_MASTER_LEVEL`), ``""`` when that flag is not up. Numbers only, so it may be said. Pure; never
+    raises."""
+    try:
+        if d is None or not (getattr(d, "flags", None) or {}).get("master_changed"):
+            return ""
+        v = next((x for x in getattr(d, "volume_changes", None) or () if x.get("kind") == "master"
+                  and x.get("side_effect")), None)
+        if v is None:
+            return ""
+        if bool(v.get("muted_to")) != bool(v.get("muted_from")):
+            return LINE_MASTER_MUTED if v.get("muted_to") else LINE_MASTER_UNMUTED
+        return LINE_MASTER_LEVEL.format(was=int(round(float(v.get("level_from") or 0.0))),
+                                        now=int(round(float(v.get("level_to") or 0.0))))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def step_app(step: Any, state: Any) -> str:
     """tidy21: the raw app (the window's process, as :class:`~yuki.perception.situation.Window` holds it) of the
     window :func:`tidy_step`'s step acts on, in ``state`` (the after-read); ``""`` when it isn't listed. Pure."""
@@ -861,11 +951,10 @@ def tidy_guard(step: Any, d: Any, front_now: Any, front_after: Any, arranged: It
             return "no_step"
         if step["action"] == "place" and hwnd in {_hwnd(h) for h in arranged or ()}:
             return "asked_place"
-        now, then = _hwnd(front_now), _hwnd(front_after)
-        if now is None or then is None:
-            return "front_unread"
-        if now != then:
-            return "front_changed"
+        moved = front_guard(front_now, front_after)
+        if moved:
+            return moved
+        now = _hwnd(front_now)
         if step["action"] == "place" and hwnd in {_hwnd(h) for h in getattr(d, "attention", None) or ()}:
             return "theirs"
         if step["action"] == "focus_back" and hwnd == now:
@@ -876,7 +965,8 @@ def tidy_guard(step: Any, d: Any, front_now: Any, front_after: Any, arranged: It
 
 
 __all__ = ["ARRANGE_ACTIONS", "COVER_KEEP", "COVER_MIN_LOSS", "DeskDiff", "LINE_FLAG_COVERED", "LINE_FLAG_HIDDEN",
-           "LINE_FLAG_MINIMISED", "LINE_FLAG_POPUP", "LINE_TAB_AUTOPLAY", "LINE_TAB_AUTOPLAY_PLAIN", "LINE_TAB_COVER",
-           "LINE_TAB_COVER_PLAIN", "LINE_TIDY_DONE", "LINE_TIDY_FAILED", "MOSTLY", "NOT_YOURS", "TIDY_NO_APP",
-           "arranges", "compare", "cover_line", "flag_line", "render", "step_app", "tidy_guard", "tidy_line",
-           "tidy_step", "window_flag"]
+           "LINE_FLAG_MINIMISED", "LINE_FLAG_POPUP", "LINE_MASTER_LEVEL", "LINE_MASTER_MUTED", "LINE_MASTER_UNMUTED",
+           "LINE_TAB_AUTOPLAY", "LINE_TAB_AUTOPLAY_PLAIN", "LINE_TAB_COVER", "LINE_TAB_COVER_PLAIN", "LINE_TIDY_ASK",
+           "LINE_TIDY_DONE", "LINE_TIDY_FAILED", "MOSTLY", "NOT_YOURS", "TIDY_NO_APP", "arranges", "compare",
+           "cover_line", "flag_line", "front_guard", "master_line", "render", "step_app", "tidy_ask", "tidy_guard",
+           "tidy_line", "tidy_step", "window_flag"]
