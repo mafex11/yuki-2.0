@@ -807,6 +807,12 @@ class VoiceBridge(QObject):
         #: ``(tool_call_id) -> bool``: the call's say_first was already spoken while the mouth was still
         #: writing the call (v3.5, set by the conversation).
         self.said_early: Callable[[str], bool] | None = None
+        #: fc (C5, contract K-D): ``(tool_call_id) -> str``: the words that say_first spoke while the call was written
+        #: (set by the conversation; read through :meth:`early_said`).
+        self.early_words: Callable[[str], str] | None = None
+        #: fc (C5): the say_first words :meth:`_ack_if_silent` spoke by code just before a call ran, by call id (content,
+        #: RAM only, the last few; this conversation's).
+        self._acked_words: dict[str, str] = {}
         #: Called on the voice loop whenever a job starts, changes state or finishes (the pill shows
         #: "Working on it" only while a job really runs; v3.5). Set by the conversation.
         self.on_jobs_changed: Callable[[], None] | None = None
@@ -959,6 +965,8 @@ class VoiceBridge(QObject):
             self.opened_quiet = None
             self.named_turn = None
             self.said_early = None
+            self.early_words = None
+            self._acked_words = {}
             self.on_jobs_changed = None
             self.end_requested = None
             self.user_turns = None
@@ -1837,7 +1845,30 @@ class VoiceBridge(QObject):
         await params.llm.push_frame(TTSSpeakFrame(text=words))
         if self.mark_spoken is not None:
             self.mark_spoken(params.tool_call_id)
+        self._acked_words[str(params.tool_call_id)] = words   # fc (C5, K-D): the words said for this call
+        if len(self._acked_words) > 32:
+            for old in list(self._acked_words)[:16]:
+                del self._acked_words[old]
         self._log("bridge", op="ack_spoken", call=params.tool_call_id, chars=len(words))
+
+    def early_said(self, tool_id: Any) -> str:
+        """fc (C5, contract K-D): the words already spoken for this call's say_first (said while the call was being
+        written, or by code right before it ran: :meth:`_ack_if_silent`), else ``""`` (nothing said for it: a done line
+        is said as now). A reader skips a done line that is these same words (two of Yuki's own lines compared, never
+        the user's). Any thread; never raises."""
+        key = str(tool_id or "")
+        if not key:
+            return ""
+        words = ""
+        fn = self.early_words
+        if fn is not None:
+            try:
+                words = str(fn(key) or "")
+            except Exception:  # noqa: BLE001 - nothing known: the line is said as now
+                words = ""
+        if not words:
+            words = str(self._acked_words.get(key, "") or "")
+        return " ".join(words.split())
 
     async def _relay(self, job: Job, params: Any) -> None:
         """Pass the job's items to the narrator gate (or straight to the mouth) until its final result is delivered."""
@@ -4046,6 +4077,37 @@ class VoiceBridge(QObject):
         self._arm_wait(job)
         asyncio.ensure_future(self._relay_detached(job))
         return True
+
+    #: fc (C1/C2): what the thinker is told when the talker's two replies to their words both meant to act and nothing ran.
+    LOST_NOTE = ("Yuki's voice answered these words twice and neither reply's step came through, so nothing has been "
+                 "done for them yet. Do what they asked.")
+
+    def hand_lost(self, context: Any, name: str = "", *, why: str = "broken") -> bool:
+        """fc (C1/C2, final-F open_claude: "On it." and nothing): under ``brain = "all"`` the talker answered the user's
+        words twice and neither reply's call came through (a call written that never ran, or a reply marked act with no
+        call; ``why``, a code word, for the log): nothing was done, so the thinker gets their exact words now, by code,
+        as an escalated hand's request (the commit check, the countdown and every gate of the thinker hold as for any
+        request). Their words that answer a question a job waits on go to it (:meth:`_escalate_to_answer`). ``False``:
+        no job (no conversation loop, ``one``, the legacy brain, or no words). Never raises."""
+        if self._loop is None or getattr(self, "one", False) or not self.on_brain:
+            return False
+        from types import SimpleNamespace
+
+        try:
+            params = SimpleNamespace(context=context, tool_call_id=None)
+            heard = heard_words(context, skip=self.not_heard)
+            if not heard:
+                return False
+            tool = str(name or "") or "reply"
+            if self._escalate_to_answer(params, tool, heard):
+                self._log("bridge", op="hand_lost", why=str(why or ""), answer=True)
+                return True
+            handed = self._brain_escalate(params, tool, {}, "", heard, context=self.LOST_NOTE)
+            self._log("bridge", op="hand_lost", why=str(why or ""), handed=bool(handed), tool=tool)
+            return bool(handed)
+        except Exception as exc:  # noqa: BLE001 - code's own line then
+            self._log("bridge", op="hand_lost", error=type(exc).__name__)
+            return False
 
     async def _run_held(self, call: tuple[str, dict, Any]) -> bool:
         """Do a held hand-off after all (the mouth stayed quiet twice on it): its words said by code, its job run.

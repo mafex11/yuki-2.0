@@ -478,7 +478,7 @@ window as [hwnd] app "title", what is in front, covered or playing, and the Soun
 
 When the user asks for one step that one of your hands does, on something the block shows, do it \
 yourself. An instant hand (media_key, app_volume, scroll, window, tab) is called with no words before it, \
-with its say_when_done line (the few words for once it worked, "Done, it's minimized."): the hand says that \
+with its say_when_done line (the few words for once it worked): the hand says that \
 line itself the moment its report verifies the effect. Leave say_when_done empty ("") when they can see it \
 happen and a word would add nothing, above all when they repeat a simple step (scroll, again, the next tab): \
 a person helping would just do it, and "Done." every time gets tiring fast. Say something when there is \
@@ -563,8 +563,7 @@ or is not showing. The same when they name an item right after they opened, scro
 a page ("open YouTube", "scroll down", "play make up my mind") and it is not on the items line: they mean the \
 one on that page, so screen true, and never open_url a search for it yourself.
 
-Good: user "minimize Discord", the block has [66830] Discord.exe "#general - Discord". You: \
-window(window=66830, action="minimize", say_when_done="Done, it's minimized.") alone
+A window call's action is the state their words ask the window to end in, read from their words each time.
 Good: user "pause the video", the block shows a YouTube window in front and "media: Chrome ... \
 playing (media keys act on this one)". You: media_key(key="playpause", want="paused", say_when_done="Paused.") alone
 Good: user "scroll down" with Chrome in front as [2625538]. You: scroll(window=2625538, \
@@ -1310,11 +1309,21 @@ class ReplyChannel:
         self._rep_held: list[str] = []
         self.repeat = False                # this reply was a verbatim repeat and was not said
         self.after_marker = 0              # a marker line inside a say reply stopped its speech (act / quiet)
+        #: fc (C3): the text of a reply with no marker line at all, kept in RAM only (never logged), so a rerun's second
+        #: such reply with no call can still be spoken (:attr:`unmarked_text`); at most :data:`UNMARKED_KEEP_CHARS`.
+        self._unmarked: list[str] = []
+        self._unmarked_chars = 0
 
     @property
     def unmarked(self) -> bool:
         """Text came and no marker line at all: nothing of it was spoken."""
         return self.first is None and self.scratch > 0
+
+    @property
+    def unmarked_text(self) -> str:
+        """fc (C3): the reply's own text when it had no marker line at all (:attr:`unmarked`), its lines joined, else
+        ``""``. Content, RAM only: the pipeline speaks it only for a rerun's second unmarked reply with no call."""
+        return " ".join(" ".join(self._unmarked).split()) if self.unmarked else ""
 
     @property
     def held(self) -> str:
@@ -1463,6 +1472,9 @@ class ReplyChannel:
             self.scratch += len(kept)
             if self.first is None:
                 self.before += len(kept)
+                if self._unmarked_chars < UNMARKED_KEEP_CHARS:
+                    self._unmarked.append(kept)   # fc (C3): RAM only, for a rerun's second unmarked reply
+                    self._unmarked_chars += len(kept)
 
     def _set(self, marker: str, *, inline: bool = False) -> None:
         if self.first is None:
@@ -1487,6 +1499,9 @@ class ReplyChannel:
             facts["marker_in_speech"] = self.after_marker
         return facts
 
+
+#: fc (C3): how much of a reply with no marker line :class:`ReplyChannel` keeps (characters, RAM only).
+UNMARKED_KEEP_CHARS = 1200
 
 #: V9: the repeat guard applies to a last spoken line of at least this many words (a one- or two-word "Okay." said
 #: again is not what the user heard as a repeat; the cost is a talker run to say something else).
@@ -2467,6 +2482,22 @@ MARKER_REMINDER = "[Start your reply with its marker line: say, act or quiet, al
 #: Added when the user's turn is answered again because nothing of the last reply to it was heard (v3.16).
 RERUN_NOTE = ("[Nothing of your last reply to these words reached them (it was not spoken, or not heard). Answer them "
               "now, in a few words.]")
+#: fc (C3, final-F q_discord_today): the rerun of a turn whose reply came with no marker line at all (the stream's own
+#: reading, ``ReplyChannel.unmarked``): the note states that format fact (the plain note above never said why, and the
+#: model wrote the same shape again).
+UNMARKED_RERUN_NOTE = ("[Your last reply to these words began with no marker line, so none of it was spoken: they heard "
+                       "nothing. Answer them now, in a few words: the first line of your reply is say alone (or act "
+                       "alone, with its call).]")
+#: fc (C2, final-F p1_dt_pause_video): the rerun of a turn whose reply was marked act and made no call (stream facts).
+ACT_RERUN_NOTE = ("[Your last reply to these words was marked act, but no call came with it: nothing ran and they heard "
+                  "nothing. Make the call now; if no call fits, start with say and tell them in a few words.]")
+#: fc (C1, final-F open_claude): the rerun of a turn whose reply wrote a call that never came through (its tool block
+#: was written, the runner never got it: stream facts). Its first words may have been heard already.
+BROKEN_RERUN_NOTE = ("[Your last reply to these words wrote a call that never came through: nothing ran. Any first words "
+                     "of it were heard already, so never say them again. Make that call again now (its say_first "
+                     "\"\"); if no call fits, tell them in a few words.]")
+#: fc: the rerun notes by ``state["rerun_why"]`` (the pipeline's reading of the reply that was not heard).
+RERUN_WHY_NOTES = {"unmarked": UNMARKED_RERUN_NOTE, "act": ACT_RERUN_NOTE, "broken": BROKEN_RERUN_NOTE}
 #: kMind (the claim gate): the rerun of a turn whose reply told them something was done while nothing had run for
 #: their words (that line was not said).
 CLAIM_NOTE = ("[Your last reply told them what they asked for was done or already so, but nothing ran for their words, "
@@ -2597,6 +2628,9 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
 
     voice21 (final-D S10): ``state["opened_quiet"]`` on a rerun (the quiet marker on the first words of a conversation
     they opened was waived once) gives :data:`OPENED_RERUN_NOTE` in place of :data:`RERUN_NOTE`.
+
+    fc (C1-C3): ``state["rerun_why"]`` on a rerun (``unmarked``, ``act``, ``broken``: the stream's own reading of the
+    reply that was not heard) gives that note of :data:`RERUN_WHY_NOTES` in place of :data:`RERUN_NOTE`.
     """
     state = state or {}
     keys = state.get("skill_keys") or ()
@@ -2665,7 +2699,8 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                  f"instead or new_task): {work}. {skill_guide(WORK_GUIDE, keys).strip()}]")
     if rerun:
         text += "\n" + (CLAIM_NOTE if state.get("claim") else REPEAT_NOTE if state.get("repeat")
-                        else OPENED_RERUN_NOTE if state.get("opened_quiet") else RERUN_NOTE)
+                        else OPENED_RERUN_NOTE if state.get("opened_quiet")
+                        else RERUN_WHY_NOTES.get(str(state.get("rerun_why") or ""), RERUN_NOTE))
     if state.get("scrolling"):
         # V7: a page scrolling on by itself (the keep_scrolling hand, or the thinker's scroll until stopped)
         text += (f"\n[Scrolling now: {' '.join(str(state['scrolling']).split())[:200]}. It pauses by itself while "
