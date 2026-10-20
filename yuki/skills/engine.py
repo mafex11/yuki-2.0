@@ -158,6 +158,16 @@ LINE_WHICH = "Not that one, then. Which did you mean?"
 GUESS_KEEP_S = 120.0
 #: Phase 2.3: at most this many names read on screen ride on a result's evidence for the talker.
 EVIDENCE_SEEN = 8
+#: fd (final-F D3): a rung's own word for the item it acted on or found already so, by slot (``facts_ram[ITEM_KEY]``:
+#: ``{"playlist": "ネオン"}``, RAM only): the run's trace, so a correction never plays it again.
+ITEM_KEY = "item"
+#: fd (D3, D4): the runs of the last this long are kept (RAM, this process): what each asked for and acted on, how it
+#: ended, the request it ran in, the slot it asked about.
+TRACE_KEEP_S = 120.0
+TRACE_RUNS = 8
+#: fd (final-F D2, one-brain M1): an unconfirmed result that acted with sound up gets its skill's second source read
+#: once, this long after its own check gave up, before it goes back (and before any agent round).
+UNVERIFIED_RECHECK_S = 1.0
 #: How long the pick may take (the feeds within ``youtube_feed.REQUEST_BUDGET_S``, then one small model call bounded by
 #: ``taste.CHOOSE_WAIT_S``); a late pick leaves the request to the normal way.
 CHOOSE_TIMEOUT_S = 4.5
@@ -346,6 +356,10 @@ class RunContext:
     #: its tool result and calls again: on; the voice hands until they give such a result back as a call's own shape:
     #: off, the question as before).
     form_recall: bool | None = None
+    #: fd (final-F D3): on a correction, the items it leaves out, by slot (``{"playlist": ["ネオン"]}``): what the
+    #: corrected run asked for and acted on, from the engine's own trace (:func:`_corrected`), verified or not. A driver
+    #: never measures or judges the words to mean one of them. RAM only; set by :func:`resolve_and_run`.
+    turned_down: dict[str, list[str]] = field(default_factory=dict)
 
     def game_now(self) -> str:
         """D9, read now (fails closed: a check that raised counts as a game)."""
@@ -426,6 +440,9 @@ class SkillResult:
     #: talker words that outcome itself in one short line; ``say`` stays the code's fallback line. RAM only (the
     #: values and the names read on screen are the user's).
     evidence: dict[str, Any] = field(default_factory=dict)
+    #: fd (final-F D3): the items the rungs acted on or found already so, by slot (their own word,
+    #: ``RouteResult.facts_ram[ITEM_KEY]``). RAM only.
+    items: dict[str, str] = field(default_factory=dict)
 
     @property
     def done(self) -> bool:
@@ -1359,6 +1376,20 @@ def _evidence(skill: Skill, values: Mapping[str, Any] | None, tried: Sequence[Ma
     return ev
 
 
+def _person_value(skill: Skill, values: Mapping[str, Any] | None) -> str:
+    """fd (D5): the person a run is for, as said (its person slot's value: a ``person`` slot or a text slot the
+    capability binds to a contact), ``""`` with none. RAM only."""
+    try:
+        from yuki.skills.resolve import _person_bound
+
+        for slot in skill.slots:
+            if _person_bound(skill, slot) and (values or {}).get(slot.name):
+                return shown_value(skill, slot.name, (values or {}).get(slot.name))
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def evidence_words(ev: Mapping[str, Any] | None) -> str:
     """The evidence (:func:`_evidence`) as one line for the model that words the outcome: "Evidence: asked site
     excalidraw.com; tried open_url (open_url: opened); the PC was touched; the check tab_url could_not_read
@@ -1391,8 +1422,16 @@ def evidence_words(ev: Mapping[str, Any] | None) -> str:
     # skill19: the chat opened and nothing was typed (C3), what holds the keyboard; the control's level read (O5); a
     # code-typed value given in another form than the slot takes (RC5a)
     if ev.get("not_typed") or ev.get("reason") == "not_typed":
-        parts.append("the chat opened but nothing was typed" + (f" ({ev['holder']} has the keyboard)"
-                                                                 if ev.get("holder") else ""))
+        # fd (final-F D5; live 20 Oct k_clarify_who_draft under one: "Discord is still on the Quasar40404 chat, not
+        # Hemanth's" for Hemanth's own chat, since the evidence said neither whose chat opened nor why nothing was
+        # typed): the driver's facts, as they are
+        who = ev.get("chat_open")
+        head = (f"{who}'s chat opened (the PC shows it open)" if isinstance(who, str) and who
+                else "the chat opened (the PC shows it open)" if who else "the chat opened")
+        held = (": the typing was held by Yuki's own step check, as its text is not in this request's words"
+                if ev.get("typing_held") else "")
+        parts.append(f"{head} but nothing was typed{held}" + (f" ({ev['holder']} has the keyboard)"
+                                                             if ev.get("holder") else ""))
     if isinstance(ev.get("current"), (int, float)) and not isinstance(ev.get("current"), bool):
         parts.append(f"the control reads {float(ev['current']):g}% now")
     forms = ev.get("form") if isinstance(ev.get("form"), Mapping) else {}
@@ -1516,7 +1555,151 @@ def run(resolved: Any, ctx: RunContext | None = None) -> SkillResult:
             pass
     _stamp_sources(result, resolved, state)
     _stamp_form_recall(result, ctx)
+    if isinstance(state.get("items"), dict) and not result.items:
+        result.items = dict(state["items"])
+    _note_trace(resolved, result, ctx, state)
     return result
+
+
+@dataclass
+class _Trace:
+    """fd (final-F D3, D4): one run as the engine saw it (RAM only, this process, never logged): when (monotonic), its
+    capability, the request it ran in and the user's words then (a digest), how it ended, what it asked for and what
+    its rungs acted on (entity slots, by name), what it itself left out (a correction's ``turned_down``), and the slot
+    a question of it was about."""
+
+    at: float
+    cap: str
+    request: str
+    heard: str
+    outcome: str
+    asked: dict[str, str]
+    items: dict[str, str]
+    down: dict[str, list[str]]
+    asked_slot: str = ""
+
+
+_TRACES: list[_Trace] = []
+_trace_lock = threading.Lock()
+
+
+def _heard_digest(words: Any) -> str:
+    """The user's words of a run as a digest (RAM only, never logged): whether they have spoken since. ``""`` none."""
+    import hashlib
+
+    seq = [str(w) for w in words or () if str(w or "").strip()]
+    if not seq:
+        return ""
+    return hashlib.sha256("\x1e".join(" ".join(w.split()) for w in seq).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _cap_key(skill: Any) -> str:
+    return str(getattr(skill, "capability", "") or getattr(skill, "key", "") or "")
+
+
+def _note_trace(resolved: Any, result: SkillResult, ctx: RunContext, state: Mapping[str, Any]) -> None:
+    """Keep this run's trace (:class:`_Trace`) for the next run of its capability in the same exchange. Never
+    raises."""
+    try:
+        if isinstance(resolved, Ask):
+            from yuki.skills.catalog import load
+
+            skill = load().get(str(resolved.skill or ""))
+            asked: dict[str, str] = {}
+            asked_slot = str(resolved.slot or "")
+        elif isinstance(resolved, (Plan, Handoff)):
+            skill = resolved.skill
+            asked = {s.name: " ".join(str(_entity_name(resolved.values.get(s.name))).split())
+                     for s in skill.slots if s.type == "entity" and _entity_name(resolved.values.get(s.name))}
+            asked_slot = str(state.get("asked_slot") or "")
+        else:
+            return
+        cap = _cap_key(skill)
+        if not cap:
+            return
+        down = {k: list(v) for k, v in (ctx.turned_down or {}).items() if isinstance(v, (list, tuple))}
+        entry = _Trace(time.monotonic(), cap, str(ctx.request_id or ""), _heard_digest(ctx.words),
+                       str(result.outcome or ""), asked, dict(result.items or {}), down, asked_slot)
+        with _trace_lock:
+            now = entry.at
+            _TRACES[:] = [t for t in _TRACES if now - t.at <= TRACE_KEEP_S][-(TRACE_RUNS - 1):] + [entry]
+    except Exception:  # noqa: BLE001 - nothing kept: the next run goes as given
+        pass
+
+
+def _entity_name(value: Any) -> str:
+    """An entity value's name (``{"name": ...}`` or a plain string), ``""`` none."""
+    if isinstance(value, Mapping):
+        value = value.get("name")
+    return str(value or "") if isinstance(value, str) else ""
+
+
+def _last_trace(cap: str, *, ran: bool = False) -> _Trace | None:
+    """The newest kept run of ``cap`` within :data:`TRACE_KEEP_S` (``ran``: only one that reached its rungs, never a
+    question, a hold or a refusal before anything ran), else None."""
+    now = time.monotonic()
+    with _trace_lock:
+        for t in reversed(_TRACES):
+            if t.cap == cap and now - t.at <= TRACE_KEEP_S and not (ran and t.outcome in NOT_RAN_OUTCOMES):
+                return t
+    return None
+
+
+#: fd (D3): the ends of a run that put nothing on (a question, a hold, a refusal before anything ran).
+NOT_RAN_OUTCOMES: frozenset[str] = frozenset({"asked", "held_game", "held_call", "blocked", "refused"})
+
+
+def _same_request(t: _Trace, ctx: RunContext) -> bool:
+    """Whether a kept run ran in this very request: the same request id, else (no id) the same words."""
+    if t.request and ctx.request_id:
+        return t.request == str(ctx.request_id)
+    heard = _heard_digest(ctx.words)
+    return bool(heard) and t.heard == heard
+
+
+#: fd (D4): the ends after which a run of the same capability in the same request is a fallback (another way to the
+#: same ask), never the user's own choice of means.
+MISSED_OUTCOMES: frozenset[str] = frozenset({"failed", "unverified", "handed_over", "error", "refused"})
+
+
+def _fell_back(cap: str, ctx: RunContext) -> bool:
+    """fd (final-F D4; live 20 Oct spotify_inapp_volume_down: the in-app rung's "failed", then the talker's own
+    ``control: mixer`` and "Keep this as your usual?"): whether the newest run of ``cap`` ran in this same request
+    and ended without the thing done (:data:`MISSED_OUTCOMES`): this run is its fallback. Code facts only."""
+    t = _last_trace(cap)
+    return t is not None and t.outcome in MISSED_OUTCOMES and _same_request(t, ctx)
+
+
+def _answered_slots(cap: str, ctx: RunContext) -> set[str]:
+    """fd (D4): the slot the newest run of ``cap`` asked about (a question of the resolver or a rung's, the means
+    ask), when the user has spoken since (their words changed): this run's value for it is their answer."""
+    t = _last_trace(cap)
+    if t is None or t.outcome != "asked" or not t.asked_slot:
+        return set()
+    heard = _heard_digest(ctx.words)
+    return {t.asked_slot} if heard and heard != t.heard else set()
+
+
+def _corrected(cap: str, skill: Skill) -> dict[str, list[str]]:
+    """fd (final-F D3; live 20 Oct k_playlist_not_that, both brains: "No, not this one. The other playlist." ran ネオン
+    again): what a correction leaves out, by taste slot: the newest run of ``cap`` within :data:`TRACE_KEEP_S`, the row
+    its rungs acted on or found playing (verified or not), and what it left out itself (a chain of corrections never
+    comes back round). Review M1: the value it asked for counts only when no rung recorded a row (then that name is all
+    that is known of what ran); a name asked that a rung resolved to another row is the user's words, never a row, so
+    "No, I said chill" after ネオン is resolved again with ネオン left out, never swapped away. Names in RAM only;
+    ``{}`` with none."""
+    t = _last_trace(cap, ran=True)
+    if t is None:
+        return {}
+    out: dict[str, list[str]] = {}
+    for slot in skill.slots:
+        if not slot.taste:
+            continue
+        names = [t.items.get(slot.name) or t.asked.get(slot.name, ""), *(t.down.get(slot.name) or [])]
+        kept = list(dict.fromkeys(" ".join(str(n).split()) for n in names if str(n or "").strip()))
+        if kept:
+            out[slot.name] = kept
+    return out
 
 
 def _stamp_form_recall(result: SkillResult, ctx: RunContext) -> None:
@@ -1977,6 +2160,11 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             ev["not_typed"] = True
             if not_typed.get("holder"):
                 ev["holder"] = not_typed["holder"]
+            if not_typed.get("chat_open"):
+                who = _person_value(skill, plan.values)
+                ev["chat_open"] = who or True      # fd (D5): the person's own chat, confirmed open
+            if not_typed.get("held"):
+                ev["typing_held"] = True           # fd (D5): the step check held the typing (not the user's words)
         return ev
 
     # IF-seed: the slot a rung found no item for on screen, and the names it read there (RAM only)
@@ -2027,6 +2215,11 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             res = RouteResult(ran=None, outcome="error", facts={"error_kind": type(exc).__name__})
         route_ms = round((ctx.clock() - r0) * 1000.0, 1)
         app_done = acted_app(skill, route, args, res)
+        item = res.facts_ram.get(ITEM_KEY) if isinstance(res.facts_ram, Mapping) else None
+        if isinstance(item, Mapping) and (res.ran is not False or res.already):
+            # fd (D3): what this rung acted on or found already so, by its own word (RAM): the run's trace
+            state.setdefault("items", {}).update({str(k): " ".join(str(v).split()) for k, v in item.items()
+                                                  if skill.slot(str(k)) is not None and str(v or "").strip()})
         # skill19 (C1; all-desk RC1(b), one-desk D5): what this rung measurably did to the front, whatever it declared
         # (``needs_focus``) and whatever it said it did (a ``ran=False`` that raised a window still touched the PC)
         change = measure.fold(route, front0, measure.read(), acted=res.ran is not False, app=app_done)
@@ -2085,9 +2278,12 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             acted = state["acted"] = acted or bool(res.ran)
             facts_nt = res.facts if isinstance(res.facts, Mapping) else {}
             holder = facts_nt.get("holder")
+            # fd (final-F D5): the driver's own facts on why: the chat it opened is confirmed open (``chat``), and the
+            # step check held the typing before it ran (``refused_steps``: its text was not in the request's words)
             not_typed = {"holder": str(holder)[:60] if isinstance(holder, str) and holder.strip() else None,
                          "line": res.unverified_line or res.say or res.ask or "",
-                         "app": _app_key_of(app_done)}
+                         "app": _app_key_of(app_done), "chat_open": facts_nt.get("chat") == "open",
+                         "held": facts_nt.get("refused_steps") is True}
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "not_typed"})
             last_route = route
             _ledger_try(ctx, run_key, route, None, "unverified", route_ms)
@@ -2097,6 +2293,9 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                 break        # its data says nothing may follow it once it acted: the caller takes it on (rung C)
             continue
         if res.ask:
+            asked_slot = (res.facts or {}).get("slot") if isinstance(res.facts, Mapping) else None
+            if isinstance(asked_slot, str) and skill.slot(asked_slot) is not None:
+                state["asked_slot"] = asked_slot      # fd (D4): the slot this rung's question is about (the means ask)
             _ledger_finish(ctx, run_key, outcome="asked", checked=None, route=route, ms=route_ms, app=app_done,
                            acted=acted)
             _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="asked", ms=route_ms)
@@ -2145,6 +2344,10 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
               check=(route.done.probe if route.done else "read_back"),
               result={True: "done", False: "contradicted", None: "unverified"}[waited.verdict], ms=waited.ms,
               reads=waited.reads, observed=waited.evidence)
+        if waited.verdict is None and res.ran is True and not sends:
+            second = _second_source(route, probe_ctx, waited, ctx, skill)
+            if second is not None:
+                waited = second
         if waited.verdict is True:
             # Phase 2.1/2.2: a guessed value is named (one word corrects it); a pick the caller made from the
             # candidates says its why instead
@@ -2273,6 +2476,44 @@ def _wait(check: Check | None, probe_ctx: Any, left_s: float | None, ctx: RunCon
 
     return wait(check or Check(probe="read_back", within_s=0.0), probe_ctx,
                 deadline_s=None if left_s is None else max(0.0, left_s))
+
+
+def _sound_up(evidence: Any, depth: int = 0) -> bool:
+    """Whether a check's evidence read the app sounding on this PC (``audio`` true, at any depth of an ``all`` check's
+    parts). Code facts only."""
+    if not isinstance(evidence, Mapping) or depth > 3:
+        return False
+    if evidence.get("audio") is True:
+        return True
+    return any(_sound_up(v, depth + 1) for v in evidence.values() if isinstance(v, Mapping))
+
+
+def _second_source(route: Route, probe_ctx: Any, waited: Any, ctx: RunContext, skill: Skill) -> Any:
+    """fd (final-F D2, one-brain M1; live 20 Oct: 7 of ONE's 9 closing holds followed a playlist press whose own check
+    couldn't read the row while the playlist played, and two of those rounds took the front from the video the user
+    watched): a rung that acted, whose check ended unconfirmed while the app sounded here (:func:`_sound_up`), gets its
+    skill's own second source read once (its ``recheck`` when that is no ``same_source`` read), after
+    :data:`UNVERIFIED_RECHECK_S`, before the result goes back to anyone. Its True is the run's done (code's done line,
+    code's tidy step, never a hand-off or an agent round); anything else leaves the result as it was (never a
+    contradiction from it). Logged ``done_recheck`` (``reason`` unverified). ``None``: nothing to read, or not done."""
+    recheck = route.recheck
+    if recheck is None or recheck.same_source or ctx.recheck == "off" or not _sound_up(waited.evidence):
+        return None
+    try:
+        from yuki.skills.donecheck import Waited, recheck as do_recheck
+
+        got = do_recheck(recheck, probe_ctx, after_s=min(float(recheck.after_s), UNVERIFIED_RECHECK_S))
+    except Exception:  # noqa: BLE001 - the first verdict stands
+        return None
+    _emit(ctx, "done_recheck", skill=skill.key, route=route.key, check=recheck.probe,
+          result={True: "agrees", False: "not_so", None: "unverified"}.get(got.verdict, "unverified"), ms=got.ms,
+          recheck="second_source", reason="unverified")
+    if got.verdict is not True:
+        return None
+    ev = dict(got.evidence) if isinstance(got.evidence, Mapping) else {}
+    ev["second_source"] = True
+    return Waited(True, ev, int(waited.reads or 0) + int(got.reads or 0), round(float(waited.ms or 0.0)
+                                                                               + float(got.ms or 0.0), 1))
 
 
 def _after_done(ctx: RunContext, skill: Skill, route: Route, plan: Plan, probe_ctx: Any, result: SkillResult) -> None:
@@ -3071,6 +3312,13 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     # Item 11's L2: only a grant the thinker origin's caller validated for this very step (never the voice's or a
     # card's), and only for exactly these values
     granted = granted_values(ctx.grant, slots) if ctx.origin == "thinker" else None
+    # fd (final-F D4): the slot this capability asked about moments ago, answered now (the engine's own trace)
+    try:
+        from yuki.skills.catalog import load as _load_catalog
+
+        answered = _answered_slots(_cap_key(_load_catalog().get(str(skill_key or ""))), ctx)
+    except Exception:  # noqa: BLE001 - none known: every enum value as given
+        answered = set()
 
     def go(client: Any) -> Any:
         from yuki.skills.catalog import load
@@ -3096,6 +3344,8 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
             extra["given_from"] = ctx.given_from
         if ctx.why:
             extra["own_pick"] = True        # a listed name it gave is its own pick from the candidates (a guess)
+        if answered:
+            extra["answered"] = set(answered)
         return res_mod.resolve(key, slots, words, store=_store_of(client) if client is not None else None,
                                live=live, again=again, default_step=step, disable_after=disable_after, **extra)
 
@@ -3108,6 +3358,7 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     if resolved is None:
         resolved = go(None)
     rejected = _rejected_slot(resolved) if corrects and picked is None else None
+    replaced = rejected is not None     # review L3: this request's value was already swapped (no second swap below)
     if rejected is not None:
         # Phase 2.1: "not that" to Yuki's own guess, and the caller gave that same guess again: the user's next own
         # candidate for the slot (never one guessed already), else one short question; never the same guess twice
@@ -3127,6 +3378,44 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
                 **({"earlier": [str(w) for w in earlier if w]} if earlier else {})), timeout_s=1.0) \
                 if ctx.memory is not None else None
         resolved = redo if redo is not None else Ask(resolved.skill.key, rejected, LINE_WHICH, [])
+    if isinstance(resolved, Plan):
+        cap = _cap_key(resolved.skill)
+        if resolved.ask_keep and _fell_back(cap, ctx):
+            # fd (final-F D4): this run is another way to what the same request just missed (the engine's own trace):
+            # the means it takes is the caller's fallback, never proposed as the user's usual
+            resolved.ask_keep = None
+            _emit(ctx, "skill_resolve", skill=resolved.skill.key, result="keep_held", reason="fallback",
+                  origin=ctx.origin)
+        down = _corrected(cap, resolved.skill) if corrects and picked is None else {}
+        if down:
+            # fd (final-F D3): a correction never plays the row the corrected run acted on (its own trace, verified or
+            # not) or one turned down before it: the drivers leave those out of what the words may mean
+            # (``ctx.turned_down``), and a value that IS one of them takes the user's next own candidate (their taste
+            # order), else one question. A name the user restates ("No, I said chill") is no such row (review M1)
+            ctx.turned_down = down
+            swap = next(((s, names) for s, names in down.items()
+                         if _value_id(resolved.values.get(s)) in {_value_id(n) for n in names}), None)
+            if swap is not None:
+                replaced = True
+                slot_name, names = swap
+                skip = [*dict.fromkeys(_value_id(n) for n in names), *_guessed_before(cap, slot_name)]
+                nxt = _next_own(ctx, resolved.skill, slot_name, skip)
+                _emit(ctx, "skill_resolve", skill=resolved.skill.key, result="not_that",
+                      reason="corrected_next" if nxt else "corrected_asked", guessed_slots=_slot_flags([slot_name]),
+                      origin=ctx.origin)
+                redo = None
+                if nxt:
+                    ctx.why = ""            # the caller's why was for the value the user just turned down
+                    again_slots = {**dict(slots or {}), slot_name: nxt}
+                    src = {**(dict(ctx.given_from) if isinstance(ctx.given_from, Mapping) else {}),
+                           slot_name: FROM_MENU}
+                    skill_now = resolved.skill
+                    redo = _mem(ctx.memory, "skill_resolve", lambda c: res_mod.resolve(
+                        skill_now.key, again_slots, words, store=_store_of(c) if c is not None else None, live=live,
+                        again=again, default_step=step, disable_after=disable_after, given_from=src,
+                        **({"earlier": [str(w) for w in earlier if w]} if earlier else {})), timeout_s=1.0) \
+                        if ctx.memory is not None else None
+                resolved = redo if isinstance(redo, Plan) else Ask(resolved.skill.key, slot_name, LINE_WHICH, [])
     noted = _note_false_done(resolved, ctx, corrects=bool(corrects), again=bool(again))
     handed = _dropped_handoff(resolved, slots, words, catalog.get("loaded"), ctx)
     if handed is not None:
@@ -3165,7 +3454,9 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
             "asked", "held_game", HELD_CALL, HELD_BLOCKED, "refused"):
         _note_guesses(resolved)      # Phase 2.1: "not that" next takes another, never this one again
     _withdraw_false_done(ctx, noted, result, getattr(getattr(resolved, "skill", None), "key", str(skill_key or "")))
-    other = None if picked is not None else _other_than_corrected(resolved, result, ctx, corrects=bool(corrects))
+    # review L3: a value already swapped above (the user's next own candidate) is never swapped a second time here
+    other = None if picked is not None or replaced else _other_than_corrected(resolved, result, ctx,
+                                                                               corrects=bool(corrects))
     if other is not None:
         # fSkills (live 18 Oct: "No, not this one. The other playlist" ran ネオン again, the very one just put on):
         # a backstop for a talker that re-sends the value the user just rejected. A correction whose run found the PC
@@ -3212,7 +3503,10 @@ def _other_than_corrected(resolved: Any, result: SkillResult, ctx: RunContext, *
     """fSkills: ``(slot, the next own candidate's name)`` when a correction (``corrects``) resolved to the very state
     the PC already shows (its run ``already``): the user said "not this one", so the taste slot that named it takes
     the user's next own candidate of that kind (:func:`yuki.skills.taste.top` at this hour, the current one left out;
-    else the next name :func:`yuki.skills.taste.candidates` lists). ``None`` otherwise, or with no other candidate."""
+    else the next name :func:`yuki.skills.taste.candidates` lists). ``None`` otherwise, or with no other candidate.
+    fd (final-F D3): left out too, by name: the row the run found already so (its rung's own word,
+    :attr:`SkillResult.items`: "Japanese" given, ネオン playing) and what the correction turned down
+    (``ctx.turned_down``)."""
     if not corrects or result.outcome != "already" or not isinstance(resolved, Plan) or ctx.memory is None:
         return None
     from yuki.skills import taste
@@ -3221,15 +3515,18 @@ def _other_than_corrected(resolved: Any, result: SkillResult, ctx: RunContext, *
         value = resolved.values.get(slot.name)
         if not slot.taste or not isinstance(value, Mapping):
             continue
-        now_key, now_name = str(value.get("key") or ""), " ".join(str(value.get("name") or "").split()).casefold()
+        now_key = str(value.get("key") or "")
+        gone = {" ".join(str(n).split()).casefold() for n in
+                [value.get("name"), (result.items or {}).get(slot.name), *((ctx.turned_down or {}).get(slot.name)
+                                                                          or [])] if str(n or "").strip()}
 
-        def pick(c: Any, kind: str = slot.taste) -> str | None:
+        def pick(c: Any, kind: str = slot.taste, gone: set[str] = gone, now_key: str = now_key) -> str | None:
             store = _store_of(c)
-            for t in taste.top(store, kind, n=6):
-                if t.name and t.entity_key != now_key and " ".join(t.name.split()).casefold() != now_name:
+            for t in taste.top(store, kind, n=6 + len(gone)):
+                if t.name and t.entity_key != now_key and " ".join(t.name.split()).casefold() not in gone:
                     return t.name
             for n in taste.candidates(store, kind):
-                if n and " ".join(str(n).split()).casefold() != now_name:
+                if n and " ".join(str(n).split()).casefold() not in gone:
                     return str(n)
             return None
 
@@ -3291,7 +3588,7 @@ def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = 
 
 __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_OTHER_DEVICE", "LINE_ALREADY",
            "LINE_COMMIT_USER", "TO_PLANNER", "WHY_UNVERIFIED", "WHY_DROPPED", "WHY_ERROR", "REFUSED_BY_STEPS",
-           "REPEAT_HANDOFF_S", "SETTLED_REASONS", "FORM_RECALL",
+           "REPEAT_HANDOFF_S", "SETTLED_REASONS", "FORM_RECALL", "ITEM_KEY", "TRACE_KEEP_S", "UNVERIFIED_RECHECK_S",
            "HANDOFF_ORIGINS", "FROM_UNHEARD", "FROM_GIVEN", "SEEN_MAX", "COMMIT_BY_END", "COMMIT_BY_NEED", "commit_for",
            "run_commit", "served_commit", "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult",
            "VERB_FUNCS", "open_uri", "pinned", "SEED_KEYS", "plan_seed", "run", "resolve_and_run", "run_for_voice",

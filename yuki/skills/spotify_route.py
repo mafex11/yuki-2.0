@@ -90,6 +90,9 @@ SET_FLOOR_S = 2.5
 #: A no-focus press on a Spotify that isn't in front (minimised or behind other windows): how long its row is re-read
 #: for the flip to "Pause {name}" before the press counts as not taken (row reads only; the restore rung may then run).
 FLIP_WAIT_S = 1.2
+#: fd (review M2): how long a window a restore rung found minimised is waited on to read minimised again after the
+#: front is put back (``SW_SHOWMINNOACTIVE``, posted to Spotify's thread).
+REMINIMISE_WAIT_S = 1.0
 #: How long the link route waits for the playlist page, and the search route for its box and its rows.
 PAGE_WAIT_S = 3.0
 SEARCH_WAIT_S = 1.5
@@ -292,6 +295,30 @@ class Desk:
             return "none", "", ""
         return (str(s.get("status") or "").casefold() or "unknown"), str(s.get("app_id") or ""), _track_id(s)
 
+    def spotify_track(self, pid: int | None) -> tuple[str, str, str]:
+        """fd (final-F D2): Spotify's session as ``(status, title, artist)``, the track in clear for a membership
+        check against memory (RAM only: never logged, never stored); ``("unread", "", "")`` when it can't be read."""
+        try:
+            from yuki.perception.system import media_sessions
+
+            rows = media_sessions(timeout_s=0.3)
+        except Exception:  # noqa: BLE001
+            return "unread", "", ""
+        s = _sd().spotify_session([r for r in rows or [] if isinstance(r, dict)], pid=pid or None)
+        if not s:
+            return "none", "", ""
+        return ((str(s.get("status") or "").casefold() or "unknown"), " ".join(str(s.get("title") or "").split()),
+                " ".join(str(s.get("artist") or "").split()))
+
+    def master_state(self) -> dict[str, Any] | None:
+        """fd (final-F D8): the PC's master level and mute (``{"level", "muted"}``, Core Audio, read only), or None."""
+        try:
+            from yuki.perception.audio import master_volume
+
+            return master_volume()
+        except Exception:  # noqa: BLE001
+            return None
+
     def render_active(self) -> bool | None:
         """Whether Spotify.exe has an active render session on this PC (it sounds here); None: couldn't read."""
         try:
@@ -390,6 +417,32 @@ class Desk:
         from yuki.actions import launch
 
         return launch.focus_window(int(hwnd))
+
+    def minimise_quietly(self, hwnd: int) -> bool:
+        """fd (review M2): a window this route restored, minimised again without activating anything
+        (``SW_SHOWMINNOACTIVE``: the front stays as it is), waited on (at most :data:`REMINIMISE_WAIT_S`). Guarded like
+        every window action (D17: never a game's own window; minimising a background window is allowed with one in
+        front, as ``launch.window_action`` does). False: refused, not reached, or it failed."""
+        try:
+            import ctypes
+
+            import win32con
+            import win32gui
+
+            from yuki.actions import gate
+
+            hwnd = int(hwnd)
+            if not hwnd or gate.refuse("window_minimize", hwnd=hwnd, front_ok=True) is not None:
+                return False
+            if win32gui.IsIconic(hwnd):
+                return True
+            ctypes.windll.user32.ShowWindowAsync(hwnd, win32con.SW_SHOWMINNOACTIVE)
+            until = time.monotonic() + REMINIMISE_WAIT_S
+            while not win32gui.IsIconic(hwnd) and time.monotonic() < until:
+                time.sleep(0.05)
+            return bool(win32gui.IsIconic(hwnd))
+        except Exception:  # noqa: BLE001 - left as it is
+            return False
 
     def hotkey(self, keys: list[str], hwnd: int) -> Any:
         from yuki.actions import input as keys_mod
@@ -1043,6 +1096,8 @@ def forget_warm() -> None:
         _warmed.clear()
     with _where_lock:
         _where.clear()
+    with _targets_lock:
+        _targets.clear()
     with _fed_lock:
         _fed.clear()
     with _pair_lock:
@@ -1518,6 +1573,10 @@ def _after_look(call: Any, look: Look, status: str, app_id: str, facts: dict[str
     got = _after_row(call, look, status, app_id, facts)
     if look.status != "ok" or (got.ran is False and not got.already):
         return got
+    if look.name and isinstance(got.facts_ram, dict):
+        # fd (final-F D3): the row this rung pressed, resumed or found playing, by its own name (RAM only): the
+        # engine's trace of the run, so a correction that follows never plays it again (``engine.ITEM_KEY``)
+        got.facts_ram["item"] = {PLAYLIST_SLOT: look.name}
     meant = str(look.details.get("meant") or "")
     if meant:
         # lSkills: the row the caller's name was resolved to (by measured name distance, or by what memory relates
@@ -1765,7 +1824,9 @@ def _look_named(call: Any, hwnd: int, want: str, *, learned: Mapping[str, str] |
         return look
     from yuki.skills import taste
 
-    near = taste.heard_as([n for n in look.names if n], want, loose=True)
+    down = {_fold(n) for n in _turned_down(call)}
+    # fd (final-F D3): a correction's own turned-down rows are never what its words are measured or judged to mean
+    near = taste.heard_as([n for n in look.names if n and _fold(n) not in down], want, loose=True)
     if near:
         again = _look(DESK, hwnd, near, learned=learned, press=press)
         if again.status in ("ok", "ambiguous", "no_wording"):
@@ -1783,6 +1844,14 @@ def _look_named(call: Any, hwnd: int, want: str, *, learned: Mapping[str, str] |
         again.details["meant_why"] = why
         return again
     return look
+
+
+def _turned_down(call: Any) -> tuple[str, ...]:
+    """fd (final-F D3): the playlists a correction leaves out (``RunContext.turned_down``: the corrected run's own rows,
+    by the engine's trace, verified or not), names in RAM only; ``()`` with none."""
+    got = getattr(getattr(call, "ctx", None), "turned_down", None)
+    names = got.get(PLAYLIST_SLOT) if isinstance(got, Mapping) else None
+    return tuple(" ".join(str(n).split()) for n in names or () if str(n or "").strip())
 
 
 #: lSkills: the least time left in the request for the judgement of what the words mean to be asked at all (it takes
@@ -1814,12 +1883,17 @@ def _meant_row(call: Any, want: str, seen: Any = ()) -> tuple[str, str] | None:
         return None
     from yuki.skills import engine, taste
 
-    names = [str(n) for n in (seen or ()) if n][:SEEN_MAX]
+    down = list(_turned_down(call))
+    gone = {_fold(n) for n in down}
+    names = [str(n) for n in (seen or ()) if n and _fold(n) not in gone][:SEEN_MAX]
 
     def read(client: Any) -> tuple[list[dict[str, Any]], str]:
         store = engine._store_of(client)
         last = " ".join(str(taste.said_target(store, kind, want) or "").split())
-        items = list(taste.described(store, kind, names=[last, *names] if last else names) or [])
+        if _fold(last) in gone:
+            last = ""       # fd (D3): kw3 C9's "last time" never puts back the row a correction turned down
+        items = [i for i in taste.described(store, kind, names=[last, *names] if last else names) or []
+                 if _fold(i.get("name")) not in gone]
         if last and not any(_fold(i.get("name")) == _fold(last) for i in items):
             items.append({"name": last})    # the hinted row is always one the judgement may answer
         return items, last
@@ -1831,16 +1905,20 @@ def _meant_row(call: Any, want: str, seen: Any = ()) -> tuple[str, str] | None:
         log("spotify_meaning", why="no_data", items=0)
         return None
     meant = taste.judge(want, getattr(call.ctx, "words", None) or [want], list(items), kind=kind,
-                        wait_s=min(taste.MEANING_WAIT_S, max(1.0, left - 1.0)), hint=hint or None)
+                        wait_s=min(taste.MEANING_WAIT_S, max(1.0, left - 1.0)), hint=hint or None, not_these=down)
     if meant.name and meant.why in ("name", "called", "content"):
-        log("spotify_meaning", why=meant.why, ms=meant.ms, items=len(items), picked=True)
+        log("spotify_meaning", why=meant.why, ms=meant.ms, items=len(items), picked=True, down=len(down) or None)
         return meant.name, meant.why
     if meant.why == "mood":
-        best = engine._mem(memory, "spotify_hour_taste", lambda c: taste.top(engine._store_of(c), kind, n=1),
-                           timeout_s=0.3)
-        name = best[0].name if best else ""
-        log("spotify_meaning", why="mood", ms=meant.ms, items=len(items), picked=bool(name))
-        return (name, "mood") if name else None
+        def best_left(c: Any) -> str:
+            for t in taste.top(engine._store_of(c), kind, n=1 + len(gone)):
+                if t.name and _fold(t.name) not in gone:
+                    return t.name
+            return ""
+
+        name = engine._mem(memory, "spotify_hour_taste", best_left, timeout_s=0.3) or ""
+        log("spotify_meaning", why="mood", ms=meant.ms, items=len(items), picked=bool(name), down=len(down) or None)
+        return (str(name), "mood") if name else None
     log("spotify_meaning", why=meant.why, ms=meant.ms, items=len(items), picked=False)
     return None
 
@@ -1888,6 +1966,13 @@ def play_library(call: Any) -> Any:
         return early
     state = DESK.state(win.hwnd)
     facts["state"] = state or "unknown"
+    if state == "minimised":
+        # fd (final-F D2; live 20 Oct: 7 of 7 playlist runs that started with Spotify minimised ended "couldn't
+        # confirm", and a press on a row label the window never redrew paused the playlist already playing): a
+        # minimised window's rows are not pressed here (``not_drawing``); the window-state rule's restore
+        # (:func:`play_restored`) reads and presses a drawn row, then puts the front back
+        _log_read(call, "library", state, facts, None)
+        return _rr(ran=False, outcome="not_drawing", facts=facts)
     if not _ensure_warm(DESK, win, call, facts):
         _log_read(call, "library", state, facts, None)
         _pair_unread(call, want, status)
@@ -1911,14 +1996,18 @@ def play_library(call: Any) -> Any:
         _pair_unread(call, want, status)
     if look.status in NEVER_READ:
         facts[UNREAD_FACT] = True        # skill20 (C10): the read never completed, so nothing was pressed
-    return _with_track(_after_look(call, look, status, app_id, facts), ram)
+    return _with_track(_after_look(call, look, status, app_id, facts), ram, call)
 
 
-def _with_track(got: Any, ram: Mapping[str, Any]) -> Any:
+def _with_track(got: Any, ram: Mapping[str, Any], call: Any = None) -> Any:
     """A pressing rung's result with the session's track before its press in ``facts_ram["track0"]`` (RAM only), for
-    its own check's stale-row rule (:func:`_stale_row`)."""
-    if ram.get("track") and isinstance(getattr(got, "facts_ram", None), dict):
-        got.facts_ram["track0"] = str(ram["track"])
+    its own check's stale-row rule (:func:`_stale_row`), and (fd, D2) the playlist slot's taste kind
+    (``facts_ram["taste_kind"]``) for its check's second source (:func:`_by_track`)."""
+    if isinstance(getattr(got, "facts_ram", None), dict):
+        if ram.get("track"):
+            got.facts_ram["track0"] = str(ram["track"])
+        if call is not None and (kind := _taste_kind(call)):
+            got.facts_ram["taste_kind"] = kind
     return got
 
 
@@ -1930,7 +2019,8 @@ def play_restored(call: Any) -> Any:
     if not want:
         return _rr(ran=False, outcome="no_name")
     facts: dict[str, Any] = {}
-    win, status, app_id, early = _prologue(call, facts)
+    ram: dict[str, Any] = {}      # fd (D2): the session's track before the press, for its check (RAM only)
+    win, status, app_id, early = _prologue(call, facts, ram=ram)
     if early is not None:
         return early
     state = DESK.state(win.hwnd)
@@ -1947,7 +2037,7 @@ def play_restored(call: Any) -> Any:
     if first.status == "ambiguous":
         return _ask_two(first)
     if first.status == "ok" and first.state == "pause":
-        return _after_look(call, first, status, app_id, facts)
+        return _with_track(_after_look(call, first, status, app_id, facts), ram, call)
     # the row the words were resolved to when the minimised window's read found that one, else the name asked (which
     # also finds the row a two-rows answer names: review r1 M1)
     name = _check_name(first, want) if first.status == "ok" else want
@@ -1965,13 +2055,49 @@ def play_restored(call: Any) -> Any:
         if first.details.get("meant"):
             look.details["meant"] = first.details["meant"]
             look.details["meant_why"] = first.details.get("meant_why")
+        _await_flip(call, win.hwnd, _check_name(look, name), learned, look, facts)
         _log_read(call, "restored", "front", facts, look)
         _feed_seen(call, look)
         status, app_id = DESK.spotify_status(win.pid)
-        return _after_look(call, look, status, app_id, facts)
+        return _with_track(_after_look(call, look, status, app_id, facts), ram, call)
     finally:
-        if prev and prev != win.hwnd:
-            facts["put_back"] = bool(getattr(DESK.focus(prev), "ok", False))
+        _put_back(win, prev, facts)
+
+
+def _await_flip(call: Any, hwnd: int, want: str, learned: Mapping[str, str] | None, look: Look,
+                facts: dict[str, Any]) -> None:
+    """fd (review M2): after a press on the restored (drawn) window, its row re-read until it reads "Pause {name}"
+    (row reads only, at most :data:`FLIP_WAIT_S` and the request's time left), so the label the window keeps once it
+    is minimised again is the one the press made, and the rung's own check reads it. Nothing is decided here: a row
+    still "Play {name}" is left to the check (``facts["flip"]``, as :func:`_confirm_flip` records it)."""
+    if not look.pressed or look.status != "ok":
+        return
+    clock, sleep = _clock(call), _sleeper(call)
+    until = clock() + min(FLIP_WAIT_S, _left(call))
+    seen: str | None = None
+    reads = 0
+    while seen != "pause" and clock() + POLL_S <= until:
+        sleep(POLL_S)
+        again = _look(DESK, hwnd, want, learned=learned, grid=look.where != "page", page=look.where == "page")
+        reads += 1
+        seen = again.state if again.status == "ok" and _fold(again.name) == _fold(look.name) else None
+    facts["flip"] = seen or "unread"
+    facts["flip_reads"] = reads
+
+
+def _put_back(win: Any, prev: int, facts: dict[str, Any]) -> None:
+    """A restore rung's end, whatever happened inside it: the window that was in front put back in front, then
+    (review M2) Spotify, which the rung found minimised and restored, minimised again without activating anything
+    (:meth:`Desk.minimise_quietly`), so Yuki's own act leaves the window as the user had it. Only once the front is
+    back: minimised without activation while still the active window, Spotify could keep the keyboard out of sight,
+    so with no front put back it stays restored, in plain view. ``facts["put_back"]`` and
+    ``facts["reminimised"]`` (booleans). A stand-in desk without the minimise leaves it restored."""
+    if prev and prev != win.hwnd:
+        facts["put_back"] = bool(getattr(DESK.focus(prev), "ok", False))
+    if facts.get("restored") and facts.get("put_back") is True:
+        quiet = getattr(DESK, "minimise_quietly", None)
+        if callable(quiet):
+            facts["reminimised"] = bool(quiet(win.hwnd))
 
 
 def link_for(call: Any, want: str) -> tuple[str | None, str]:
@@ -2058,7 +2184,7 @@ def play_link(call: Any) -> Any:
     if look.status not in ("ok", "ambiguous"):
         return _rr(ran=False, outcome="page_" + look.status, facts=facts)
     status, app_id = DESK.spotify_status(win.pid)
-    return _after_look(call, look, status, app_id, facts)
+    return _with_track(_after_look(call, look, status, app_id, facts), {}, call)
 
 
 def _search_job(desk: Any, hwnd: int, *, step: str, text: str = "") -> dict[str, Any]:
@@ -2265,7 +2391,7 @@ def play_launch(call: Any) -> Any:
     _log_read(call, "launch", state, facts, look)
     _feed_seen(call, look)
     status, app_id = DESK.spotify_status(win.pid)
-    return _with_track(_after_look(call, look, status, app_id, facts), ram)
+    return _with_track(_after_look(call, look, status, app_id, facts), ram, call)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2387,7 +2513,9 @@ def probe_playing_here(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, 
     is paused or stopped -> False. The row reads "Pause {name}" and Windows lists no Spotify session at all: the two
     disagree -> None. Anything unread -> None. The line said when it ends unconfirmed names what was done (a press,
     or nothing: the row already read "Pause {name}"). As the finish gate after a hand-off whose words named no row in
-    view: :func:`_handoff_verdict`."""
+    view: :func:`_handoff_verdict`. fd (D2): a press on a window that isn't drawing, which the session shows taken
+    (:func:`_stale_row`), is done when the track playing is one memory saw only under that playlist
+    (:func:`_by_track`)."""
     routed = hasattr(getattr(ctx, "result", None), "facts_ram")
     if not routed:
         # no route result: the finish gate after a hand-off (the thinker's own steps), not a rung's own check
@@ -2410,6 +2538,13 @@ def probe_playing_here(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, 
         _set_line(ctx, unconfirmed)
         return None, ev
     _set_line(ctx, unconfirmed)
+    if routed and status == "playing" and audio is True and _stale_row(ctx, look) \
+            and _by_track(ctx, _checked_name(ctx, args, look), ev):
+        # fd (final-F D2): the row can't be read (a window that isn't drawing: stale or unread), the press took (the
+        # session plays now and didn't, or plays another track) and the track playing is one memory saw only under
+        # this playlist: a measured done, said by code ("Playing X on Spotify."), never "couldn't confirm"
+        _played(ctx, look, routed=routed)
+        return True, ev
     if look.status == "ok" and look.state == "play" and status == "playing" and audio is True \
             and _stale_row(ctx, look):
         # skill19 (live 19 Oct, RC1: Spotify minimised, row pressed, the session went paused -> playing with sound here
@@ -2430,6 +2565,70 @@ def probe_playing_here(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, 
 
 #: The window states in which Spotify's Chromium window draws nothing new (its row labels go stale).
 NOT_DRAWING = ("minimised", "covered")
+
+
+def _checked_name(ctx: Any, args: Mapping[str, Any], look: Look) -> str:
+    """The playlist a check is about: the row the route reached (``facts_ram["row"]``), else the row read by that
+    name, else the name the check was written with."""
+    row = (getattr(getattr(ctx, "result", None), "facts_ram", None) or {}).get("row")
+    return " ".join(str(row or (look.name if look.status == "ok" else "") or args.get("name") or "").split())
+
+
+def _not_drawing(ctx: Any) -> bool:
+    """Whether Spotify's window isn't drawing now (:data:`NOT_DRAWING`: its rows can't be read), else, when the window
+    can't be read, as the route's own read found it (``facts["state"]``). Never raises."""
+    try:
+        win = DESK.window()
+        state = DESK.state(win.hwnd) if win is not None else None
+        if state is None:
+            state = str((getattr(getattr(ctx, "result", None), "facts", None) or {}).get("state") or "")
+        return state in NOT_DRAWING
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _by_track(ctx: Any, want: str, ev: dict[str, Any]) -> bool:
+    """fd (final-F D2; live 20 Oct: with Spotify minimised or covered its rows never repainted, so a press that put on
+    the asked playlist ended "couldn't confirm it's X" and ONE's closing hold looked and clicked again): a second
+    source for which playlist plays when its row can't be read: Spotify's session (playing, its title and artist read
+    now, RAM only) against memory's own record of the titles that played under each playlist
+    (:func:`yuki.skills.taste.track_owner`: a title seen under that playlist only). The asked row's name -> True,
+    ``ev["by"] = "track"``; anything else (unread, another playlist, unknown) -> False, never a contradiction (a track
+    may be in several). One bounded memory read per track, kept on the route's result (RAM). Never raises."""
+    try:
+        memory_call = getattr(ctx, "memory_call", None)
+        reader = getattr(DESK, "spotify_track", None)
+        if memory_call is None or not callable(reader) or not want:
+            return False
+        win = DESK.window()
+        status, title, artist = reader(win.pid if win is not None else None)
+        if status != "playing" or not title or not artist:
+            return False
+        result = getattr(ctx, "result", None)
+        ram = getattr(result, "facts_ram", None)
+        kind = str(ram.get("taste_kind") or "") if isinstance(ram, dict) else ""
+        if not kind:
+            return False
+        key = _track_id({"title": title, "artist": artist})
+        kept = ram.get("member")
+        if isinstance(kept, tuple) and len(kept) == 2 and kept[0] == key:
+            owner = str(kept[1] or "")
+        else:
+            from yuki.skills import engine, taste
+
+            got = memory_call("spotify_track_owner",
+                              lambda c: taste.track_owner(engine._store_of(c), kind, title, artist))
+            owner = str(got or "")
+            if isinstance(ram, dict) and got is not None:
+                # review L1: kept only when memory answered (a timed-out read is no answer), so the second-source
+                # re-check (engine D2(c)) is a real second try
+                ram["member"] = (key, owner)
+        if owner and _fold(owner) == _fold(want):
+            ev["by"] = "track"
+            return True
+    except Exception:  # noqa: BLE001 - unknown: the row's verdict stands
+        return False
+    return False
 
 
 def _stale_row(ctx: Any, look: Look) -> bool:
@@ -2460,7 +2659,9 @@ def _stale_row(ctx: Any, look: Look) -> bool:
 def probe_still_playing(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
     """The playlist's re-check, a few seconds after the done (D19): the session still playing, Spotify still sounding
     on this PC and the row still "Pause {name}". No new track is required (resuming the current playlist is a true
-    done, M1b). The session stopped, no sound here, or the row back to "Play {name}" -> False (a false done)."""
+    done, M1b). The session stopped, no sound here, or the row back to "Play {name}" -> False (a false done). fd (D2):
+    on a window that isn't drawing (:func:`_not_drawing`) the row is never read as "Play {name}": the session's track
+    in memory's record of that playlist (:func:`_by_track`) -> True, else None (unread)."""
     look, status, audio, ev = _playing_facts(ctx, args)
     if look is None:
         return None, ev
@@ -2468,6 +2669,18 @@ def probe_still_playing(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None,
         return False, ev
     if status == "playing" and audio is False:
         return False, ev
+    if status == "playing" and audio is True and not (look.status == "ok" and look.state == "pause") \
+            and _not_drawing(ctx):
+        # fd (final-F D2): a window that isn't drawing can't show its row: the session's track and memory's record
+        # of what plays under each playlist (:func:`_by_track`) say it, else unknown (never a false done from a label
+        # the window never repainted)
+        if _by_track(ctx, _checked_name(ctx, args, look), ev):
+            # review L2: a done the second source turned true settles the words-to-row pairing watch, as the
+            # done-check's own by-track branch does
+            _played(ctx, look, routed=hasattr(getattr(ctx, "result", None), "facts_ram"))
+            return True, ev
+        ev["reason"] = "row_stale"
+        return None, ev
     if look.status == "ok" and look.state == "play":
         return False, ev
     if look.status == "ok" and look.state == "pause" and status == "playing" and audio is True:
@@ -2582,11 +2795,76 @@ def _slider_result(look: Look, facts: dict[str, Any], *, how: str = "") -> Any:
     return _rr(ran=False, outcome="not_taken", facts=facts)
 
 
+#: fd (final-F D1): the absolute level a run's Spotify volume rung worked out from a read of a window that draws, kept
+#: for that run's later rungs (by the run's context, as :data:`_where`): they set that level, never the change again,
+#: so one "a little quieter" is one step whichever rung gets there.
+_targets: dict[int, tuple[float, float, Any]] = {}
+_targets_lock = threading.Lock()
+TARGET_KEEP_S = 10.0
+
+
+def _keep_target(call: Any, look: Look) -> None:
+    """Keep the absolute target a slider set worked out (``details["target_percent"]``) for this run's later rungs.
+    Never raises."""
+    want = (look.details or {}).get("target_percent") if look.status == "ok" else None
+    run = getattr(call, "ctx", None)
+    if not isinstance(want, (int, float)) or isinstance(want, bool) or run is None:
+        return
+    now = time.monotonic()
+    with _targets_lock:
+        for k in [k for k, (t, _v, _r) in _targets.items() if now - t >= TARGET_KEEP_S]:
+            _targets.pop(k, None)
+        try:
+            _targets[id(run)] = (now, float(want), weakref.ref(run))
+        except TypeError:   # a context that can't be weakly referenced: not kept
+            pass
+
+
+def _kept_target(call: Any) -> float | None:
+    """The absolute target an earlier rung of this very run worked out (:func:`_keep_target`), else None."""
+    run = getattr(call, "ctx", None)
+    if run is None:
+        return None
+    with _targets_lock:
+        hit = _targets.get(id(run))
+    if hit is None or time.monotonic() - hit[0] >= TARGET_KEEP_S or hit[2]() is not run:
+        return None
+    return hit[1]
+
+
+def _carried(call: Any, level: float | None, change: float | None,
+             facts: dict[str, Any]) -> tuple[float | None, float | None, bool]:
+    """``(level, change, carried)``: a change becomes the level an earlier rung of this run worked out
+    (:func:`_kept_target`), marked in ``facts["carried"]``; else the call's own amounts. Pure apart from the read."""
+    kept = _kept_target(call) if change is not None and level is None else None
+    if kept is None:
+        return level, change, False
+    facts["carried"] = "target"
+    return kept, None, True
+
+
+def _reached(got: Any, carried: bool, facts: dict[str, Any]) -> Any:
+    """A rung that read the control already at the level an earlier rung of this run set (that set landed unseen: the
+    window it read didn't draw): the run's own change, read back here, said as set (never "already"). Else ``got``."""
+    if not carried or not getattr(got, "already", False):
+        return got
+    facts["carried"] = "reached"
+    value = getattr(got, "value", None)
+    say = f"Spotify's own volume, {value:g}%." if isinstance(value, (int, float)) else None
+    return _rr(ran=True, verified=True, value=value, outcome="set", facts=facts, say=say,
+               unverified_line=LINE_VOLUME_UNCONFIRMED)
+
+
 def volume_slider(call: Any) -> Any:
     """Rung A for Spotify's own volume, no focus (H1): Slider "Change volume" inside the Now playing bar, moved by
     ``RangeValue.SetValue`` only and read back. Not while Spotify plays on another device; a cold window is warmed
     within the request's time. A mute is left to the mixer (Spotify's Mute button is a toggle whose state can't be
-    read)."""
+    read).
+
+    fd (final-F D1; live 20 Oct: a minimised Spotify's slider read back one set late, so the rung either failed a set
+    that landed, "off_target", or passed it on to be done twice): on a minimised window nothing is set here
+    (``not_drawing``), so the window-state rule's restore (:func:`volume_restored`) reads a drawn window and sets it
+    once. A target worked out here is kept for the run's later rungs (:func:`_keep_target`)."""
     level, change, mute = _amount(call.values)
     if level is None and change is None:
         if mute is not None:
@@ -2598,6 +2876,9 @@ def volume_slider(call: Any) -> Any:
         return early
     state = DESK.state(win.hwnd)
     facts["state"] = state or "unknown"
+    if state == "minimised":
+        _log_read(call, "volume", state, facts, None)
+        return _rr(ran=False, outcome="not_drawing", facts=facts)
     if not _ensure_warm(DESK, win, call, facts):
         _log_read(call, "volume", state, facts, None)
         return _rr(ran=False, outcome=_cold(facts), facts=facts)
@@ -2609,6 +2890,7 @@ def volume_slider(call: Any) -> Any:
             return against
     look = _set_slider(DESK, win.hwnd, to=level, by=change, budget_s=_left(call))
     _log_read(call, "volume", state, facts, look)
+    _keep_target(call, look)
     return _slider_result(look, facts)
 
 
@@ -2633,10 +2915,11 @@ def volume_keys(call: Any) -> Any:
     against = _level_against_change(call.values, v0, "spotify", _heard(call))      # skill19 (O5)
     if against is not None:
         return against
+    level, change, carried = _carried(call, level, change, facts)      # fd (D1): an earlier rung's target, once
     target = max(0.0, min(100.0, level if level is not None else v0 + float(change or 0.0)))
     if abs(target - v0) <= LEVEL_TOLERANCE / 2:
-        return _rr(ran=False, already=True, verified=True, value=v0, outcome="already", facts=facts,
-                   say=f"Spotify's own volume is already at {v0:g}%.")
+        return _reached(_rr(ran=False, already=True, verified=True, value=v0, outcome="already", facts=facts,
+                            say=f"Spotify's own volume is already at {v0:g}%."), carried, facts)
     sleep = _sleeper(call)
     presses, step = 0, 0.0
     out_of_time = False
@@ -2680,7 +2963,8 @@ def volume_keys(call: Any) -> Any:
 def volume_restored(call: Any) -> Any:
     """The window-state rule for Spotify's volume (focus-taking, never with a game in front): Spotify minimised and
     the no-focus rung couldn't set it -> restore Spotify, set the slider by RangeValue, put the previous window back
-    in front."""
+    in front. fd (D1): the no-focus rung sets nothing on a minimised window (``not_drawing``), so this rung's fresh
+    read of the drawn window is the only set; a target an earlier rung of the run worked out is set as that level."""
     level, change, mute = _amount(call.values)
     if level is None and change is None:
         return _rr(ran=False, outcome="mute_not_in_app" if mute is not None else "no_amount")
@@ -2710,12 +2994,13 @@ def volume_restored(call: Any) -> Any:
     try:
         if not _ensure_warm(DESK, win, call, facts, force=True):
             return _rr(ran=False, outcome=_cold(facts), facts=facts)
+        level, change, carried = _carried(call, level, change, facts)    # fd (D1): an earlier rung's target, once
         look = _set_slider(DESK, win.hwnd, to=level, by=change, budget_s=_left(call))
         _log_read(call, "volume_restored", "front", facts, look)
-        return _slider_result(look, facts)
+        _keep_target(call, look)
+        return _reached(_slider_result(look, facts), carried, facts)
     finally:
-        if prev and prev != win.hwnd:
-            facts["put_back"] = bool(getattr(DESK.focus(prev), "ok", False))
+        _put_back(win, prev, facts)     # fd (review M2): the front back, then Spotify minimised again as it was
 
 
 def _mixer_after(result: Any) -> tuple[bool, bool | None, float | None, float | None]:
@@ -2760,13 +3045,15 @@ def volume_spotify_mixer(call: Any) -> Any:
         against = _level_against_change(call.values, DESK.mixer_level(image), "spotify", _heard(call))    # skill19 (O5)
         if against is not None:
             return against
+    # fd (D1): the data says the mixer entry and the slider are one control: an earlier rung's target is set, once
+    level, change, carried = _carried(call, level, change, facts)
     result = DESK.app_volume(image, level=level, change=change, mute=None)
     ran, verified, before, after = _mixer_after(result)
     if not ran:
         return _rr(ran=False, outcome="no_session", facts=facts)
     noop = _mixer_noop(result, after, lambda v: f"Spotify's own volume is already at {v:g}% (its mixer entry).", facts)
     if noop is not None:
-        return noop
+        return _reached(noop, carried, facts)
     followed = None
     if before_slider is not None and before_slider.status == "ok" and before_slider.slider is not None \
             and before is not None and after is not None and abs(after - before) > 1e-9:
@@ -2974,8 +3261,61 @@ def window_state(app: str = "") -> str | None:
         return None
 
 
-#: The rungs (``call = "<name>"`` in the connection files).
-ROUTES: dict[str, Callable[[Any], Any]] = {
+def _master_now() -> tuple[float | None, bool | None]:
+    """The PC's master ``(level, muted)`` read now (Core Audio, read only; ``(None, None)`` unread or a stand-in desk
+    without the read). Never raises."""
+    reader = getattr(DESK, "master_state", None)
+    if not callable(reader):
+        return None, None
+    try:
+        got = reader() or {}
+    except Exception:  # noqa: BLE001
+        return None, None
+    level = got.get("level") if isinstance(got, Mapping) else None
+    muted = got.get("muted") if isinstance(got, Mapping) else None
+    return (float(level) if isinstance(level, (int, float)) and not isinstance(level, bool) else None,
+            bool(muted) if isinstance(muted, bool) else None)
+
+
+#: fd (review L5): the rungs whose own job is the PC's master (the ``target = "system"`` rung): a change of the master
+#: under them is the asked one, logged ``master_asked`` true (the harness's "unasked master change" leaves them out).
+MASTER_RUNGS: frozenset[str] = frozenset({"volume_system"})
+
+
+def _master_watched(name: str, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    """fd (final-F D8; live 20 Oct one multi_japanese_and_volume: the PC's master went from 100% to 0% and muted
+    inside the library rung's run, and no log line says when): the rung ``fn`` with the PC's master level and mute
+    read right before and right after it (read only). One content-free ``spotify_master`` line (the rung's code name,
+    the two levels as whole percents, the two mute flags, ``changed``, and ``master_asked``: the rung's own job is the
+    master, :data:`MASTER_RUNGS`) when the rung acted or the master changed under it; nothing for a rung that passed
+    on and changed nothing. The rung's result is returned as it was."""
+    asked = name in MASTER_RUNGS
+
+    def run(call: Any) -> Any:
+        before = _master_now()
+        got = fn(call)
+        try:
+            after = _master_now()
+            known = before[0] is not None and after[0] is not None
+            changed = known and (abs(float(after[0]) - float(before[0])) > 0.5 or before[1] != after[1])
+            if changed or getattr(got, "ran", None) is not False:
+                _logger(call)("spotify_master", rung=name,
+                              before=None if before[0] is None else int(round(before[0])),
+                              after=None if after[0] is None else int(round(after[0])),
+                              muted_before=before[1], muted_after=after[1],
+                              changed=bool(changed) if known else None, master_asked=asked)
+        except Exception:  # noqa: BLE001 - a log never breaks a run
+            pass
+        return got
+
+    run.__name__ = getattr(fn, "__name__", name)
+    run.__doc__ = getattr(fn, "__doc__", None)
+    run.__wrapped__ = fn  # type: ignore[attr-defined]
+    return run
+
+
+#: The rungs (``call = "<name>"`` in the connection files), each with the master watch (fd D8: :func:`_master_watched`).
+ROUTES: dict[str, Callable[[Any], Any]] = {name: _master_watched(name, fn) for name, fn in {
     "play_library": play_library,
     "play_restored": play_restored,
     "play_link": play_link,
@@ -2988,7 +3328,7 @@ ROUTES: dict[str, Callable[[Any], Any]] = {
     "volume_mixer": volume_mixer,
     "volume_system": volume_system,
     "volume_own_voice": volume_own_voice,
-}
+}.items()}
 
 #: The done-checks and re-checks (``probe = "driver"``, ``call = "<name>"``).
 PROBES: dict[str, Callable[[Any, Mapping[str, Any]], tuple[bool | None, dict[str, Any]]]] = {
