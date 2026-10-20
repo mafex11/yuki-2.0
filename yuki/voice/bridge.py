@@ -1328,6 +1328,7 @@ class VoiceBridge(QObject):
                 return 0
             with self._lock:
                 live = [j for j in self._open_sends() if only is None or int(j.job_id) in only]
+            self._router_stopped = list(live)   # integ27 fix TV1: :meth:`stopped_told` settles these when told
             for job in live:
                 job.cancel_requested = True
                 job.cancel_had_send = True
@@ -1339,6 +1340,34 @@ class VoiceBridge(QObject):
             return len(live)
         except Exception as exc:  # noqa: BLE001 - the held countdown never counts on past the end either way
             self._log("bridge_error", error=f"stop_sends: {type(exc).__name__}")
+            return 0
+
+    def stopped_told(self) -> int:
+        """integ27 fix TV1 (C4 retest under all: the router's end said "Stopped. Nothing was sent." and the stopped
+        job's own final could follow it): the router's end says the stop line itself, so the sends the last
+        :meth:`stop_sends` stopped settle as a talker's cancel that said so (:meth:`cancel_passed_on` with ``said``):
+        ``talker_cancelled``, not silent, their items at the narrator gate taken, nothing owed. :meth:`_relay_detached`
+        then drops the job's own final instead of relaying it. A send that went already is left as it is. Returns how
+        many. State only; never raises."""
+        try:
+            jobs, self._router_stopped = list(getattr(self, "_router_stopped", None) or ()), []
+            told = 0
+            for job in jobs:
+                if job.sent:
+                    continue
+                job.talker_cancelled = True
+                job.talker_silent = False
+                if self.gate is not None:
+                    for item in self.gate.take(job.token, kinds=tuple(RANKS)):
+                        if item.drop is not None:
+                            item.drop()
+                self._unowe(job)
+                told += 1
+            if told:
+                self._log("bridge", op="sends_told", n=told, by="router")
+            return told
+        except Exception as exc:  # noqa: BLE001
+            self._log("bridge_error", error=f"stopped_told: {type(exc).__name__}")
             return 0
 
     def brain_busy(self) -> bool:

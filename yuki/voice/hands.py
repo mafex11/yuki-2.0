@@ -812,8 +812,9 @@ _DIALOG_NOTE = (
 )
 #: fa review M2 (1): a tab close was pressed and the tab was not seen gone, with no window of the page's measured (a
 #: Firefox-family browser asks its "leave page" question inside its own window): told as it is, never handed on.
+#: integ27 fix H2: a whole window's close that stayed open with no reason measured too.
 _CLOSE_HELD_NOTE = (
-    "Not done: the close was pressed and the tab was not seen gone (the report says what was read); the page may be "
+    "Not done: the close was pressed and it was not seen gone (the report says what was read); it may be "
     "asking something inside its window, and that answer is theirs. Say in a few words that it did not close as far "
     "as you can tell and may be asking them something, with no call. Never answer anything in it yourself and never "
     "hand it on now."
@@ -1480,6 +1481,51 @@ def _game_trouble(facts: dict[str, Any]) -> bool:
     return facts.get("held") == "game" or facts.get("refused") == "game" or bool(facts.get("game_front"))
 
 
+def _run_windows(facts: Any) -> set[int]:
+    """integ27 fix H1: the windows a skill run measurably brought forward (the engine's ``acted_windows``, and the desk
+    scope's ``touched_windows``: the same measure). Never raises."""
+    out: set[int] = set()
+    if not isinstance(facts, dict):
+        return out
+    scope = facts.get("_desk_scope") if isinstance(facts.get("_desk_scope"), dict) else {}
+    for h in [*(facts.get("acted_windows") or ()), *(scope.get("touched_windows") or ())]:
+        try:
+            if not isinstance(h, bool) and int(h):
+                out.add(int(h))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _listed_windows(desk: Any) -> set[int] | None:
+    """integ27 fix H1: the windows a desk read (``situation.DeskState``) listed, ``None`` when it was not read or its
+    windows part failed (then nothing counts as new against it). Never raises."""
+    try:
+        if desk is None or "windows" in (getattr(desk, "errors", None) or {}):
+            return None
+        listed = {int(w.hwnd) for w in getattr(desk, "windows", None) or () if getattr(w, "hwnd", None)}
+        return listed or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _own_place(hwnd: int, tab_id: str, own: set[int], listed: set[int] | None, strips: dict[str, Any]) -> str:
+    """integ27 fix H1 (final-F integration review: a restore rung gave the front back, and the user's own tab was kept
+    as one Yuki put up): whether the tab in front after a skill run is measurably the run's own, as a code word for the
+    log: ``window`` (a window the engine measured coming forward under a rung), ``new_window`` (a window the desk
+    before the run did not list), ``new_tab`` (a tab not on that window's strip as read whole before the run: a page
+    opened in the browser already in front), else ``""``: the front given back by a rung's put-back or by code's tidy
+    step, or a window and tab that were there before, is the user's, never placed. Pure."""
+    if hwnd in own:
+        return "window"
+    if listed and hwnd not in listed:
+        return "new_window"
+    ids = (strips.get("tabs") or {}).get(hwnd) if isinstance(strips, dict) else None
+    if ids and (strips.get("complete") or {}).get(hwnd, True) and tab_id not in ids:
+        return "new_tab"
+    return ""
+
+
 def _moved_on(hands: Any, facts: dict[str, Any]) -> bool:
     """Safety timing 4: whether the user's next turn began while this act ran: the user turn now is not the one the act
     began in, or their speech began after it (``facts["_desk_turn"]``: ``(turn, when)`` from the act's own before read,
@@ -1699,6 +1745,9 @@ class Hands:
         #: a look after a later act of the same turn compares from that earliest before, so a change an earlier act made
         #: (a playlist rung that took the front, then a volume step) is never already in the before it is compared with.
         self._turn_before: dict[str, Any] | None = None
+        #: integ27 fix L1: the user turn (:meth:`_turn_now`) in which a close left its question up (``dialog_raised``,
+        #: ``close_held``): that turn's deferred end look takes no step around it.
+        self._asking_turn: tuple[int, Any] | None = None
         #: desk22 (A13): ``(turn, [way steps])``: this user turn's hands that took, as "the steps just done"
         self._way_turn: tuple[Any, list[dict[str, Any]]] | None = None
         #: fa (A2): this conversation's tab ids Yuki itself closed (a tab gone by Yuki's own close is no referent any
@@ -2932,6 +2981,11 @@ class Hands:
         if self._with_thinker():
             self._drop_deferred("handed_over")
             return
+        if getattr(self, "_asking_turn", None) is not None and self._asking_turn == self._turn_now():
+            # integ27 fix L1: a close of this turn left its question up (dialog_raised, close_held): a step now would
+            # hide it, so the end look is dropped
+            self._drop_deferred("asking")
+            return
         gate = None
         if not ordered:
             if self._hands_busy():
@@ -4053,6 +4107,10 @@ class Hands:
             self._owe_fallback(_FALLBACK_LINE["blocked"])
             await params.result_callback({"refused": report[:700], "how_to_handle_it": _BLOCKED_NOTE})
             return
+        if (facts.get("dialog_raised") or facts.get("close_held")) and not ok:
+            # integ27 fix L1: the turn's question is up: no end look of the turn takes a step around it
+            self._asking_turn = self._turn_now()
+            self._drop_deferred("asking")
         if facts.get("dialog_raised") and not ok:
             # fa (A1, final-F all k_tab_close_leave_site: the hand-off clicked "Leave" and their unsaved text was lost):
             # the close raised the page's (or the app's) own question: the hand stops, nothing goes to the thinker,
@@ -5262,8 +5320,9 @@ class Hands:
             # no referent among two tabs titled "GitHub": the tab showing in the window in front once it ran is kept
             # on its line, read off the reply's path. Integration review F1: a page opened as a new tab in the browser
             # already in front changes no measured front, so a rung's declared focus counts here too (never the bare
-            # ``acted``: a verified volume run with Chrome in front would claim the user's own tab)
-            self._place_record(record)
+            # ``acted``: a verified volume run with Chrome in front would claim the user's own tab). integ27 fix H1: and
+            # only where the front after the run is measurably the run's own (:func:`_own_place`)
+            self._place_record(record, facts, before)
         if self.on_step is not None:
             try:
                 self.on_step(name, hand_words(name, args, facts.get("app")), bool(ok and verified), first_line[:400],
@@ -5745,6 +5804,7 @@ class Hands:
             # the acting marker); the sound of the apps it names is read with it (contract C2)
             desk["before"] = self._desk_read(self._skill_apps(skill_key, slots))
             desk["turn"] = (self._turn_now(), time.monotonic())   # safety timing 4: the turn the run began in
+        strips = self._strips_before()   # integ27 fix H1: what the run's tab record is measured against (no new read)
         try:
             result = engine.resolve_and_run(skill_key, slots, words, ctx, again=bool(args.get("again")),
                                             settings=self.skill_settings, corrects=bool(args.get("corrects")),
@@ -5760,6 +5820,8 @@ class Hands:
         facts.update(more)
         facts["focus_taken"] = bool(result.focus_taken)
         facts["focus_declared"] = bool(getattr(result, "focus_declared", False))   # integration review F1
+        if strips:
+            facts["_tabs_before"] = strips   # integ27 fix H1 (RAM only, never logged)
         if desk.get("before") is not None:
             facts["_desk_before"] = desk["before"]
             facts["_desk_turn"] = desk.get("turn")
@@ -6577,6 +6639,14 @@ class Hands:
                     if dialog:
                         facts["dialog"] = dialog
                         self._note_raised(dialog, int(h))
+                    break
+                if action == "close" and not ok_one and _detail(result, "close_held") is True:
+                    # integ27 fix H2: the close was posted and the window stayed with no reason measured (Zen's or
+                    # Firefox's leave-page prompt, Win11 Notepad's save prompt: drawn inside the window): it may be
+                    # asking there, and that answer is theirs. The hand stops here, as for a raised dialog (no close
+                    # posted to the app's other windows), and ``_handle_one`` takes its close_held line, never the
+                    # thinker; under ONE ``_close_asking`` makes it asked and holds that window for the turn
+                    facts["close_held"] = True
                     break
                 if facts.get("refused") in ("game", BLOCKED_REFUSAL):
                     break   # D17: a game in front holds the rest too; so does a guard that stopped one (it would again)
@@ -7757,12 +7827,25 @@ class Hands:
                 self.log.event("hands", op=name, ledger_error=type(exc).__name__, call=params.tool_call_id)
             return None
 
-    def _place_record(self, record: Any) -> None:
+    def _place_record(self, record: Any, facts: dict[str, Any] | None = None, before: Any = None) -> None:
         """fHands: on a thread of its own (off the reply's path), the window in front and the tab it shows, kept on the
-        action log's ``record`` (:meth:`ActionLog.place`): where a skill run's page landed. Never raises."""
+        action log's ``record`` (:meth:`ActionLog.place`): where a skill run's page landed. Never raises.
+
+        integ27 fix H1 (a restore rung or code's tidy step gave the front back, and the user's own tab was kept as one
+        Yuki put up): kept only where the front after the run is measurably the run's own (:func:`_own_place`): a window
+        the engine measured coming forward under a rung (``facts["acted_windows"]``, the scope's ``touched_windows``),
+        one the desk before the run did not list (``before``, else the summary's windows kept with the run), or a tab
+        not on that window's strip as the summary read it before the run (``facts["_tabs_before"]``: a page opened as a
+        new tab in the browser already in front, integration review F1). Anything else is left unplaced."""
         place = getattr(self.actions, "place", None)
         if not callable(place):
             return
+        facts = facts if isinstance(facts, dict) else {}
+        strips = facts.get("_tabs_before") if isinstance(facts.get("_tabs_before"), dict) else {}
+        own = _run_windows(facts)
+        listed = _listed_windows(before)
+        if listed is None and strips.get("hwnds"):
+            listed = {int(h) for h in strips["hwnds"]}
 
         def run() -> None:
             try:
@@ -7773,12 +7856,34 @@ class Hands:
                     known = set(self.last.hwnds)
                 tab = self._selected_tab(hwnd) if hwnd and (hwnd not in known or self._is_browser(hwnd)) else None
                 if tab is not None and len(tab) > 3 and tab[3]:
+                    how = _own_place(int(hwnd), str(tab[3]), own, listed, strips)
+                    if self.log is not None:
+                        self.log.event("hands", op="place_record", how=how or "not_own")   # content-free
+                    if not how:
+                        return
                     place(record, hwnd, tab[3])
                     self._title_record(record, tab[1])   # fa review L1 (A2)
             except Exception:  # noqa: BLE001 - a record's place is a nicety
                 pass
 
         threading.Thread(target=run, name="yuki-hands-place", daemon=True).start()
+
+    def _strips_before(self) -> dict[str, Any]:
+        """integ27 fix H1: right before a skill run, the desk summary's own last read kept for its tab record (no new
+        read; RAM only): the windows it listed (``hwnds``), the tab ids of the strips it read (``tabs``, by window) and
+        whether each read was whole (``complete``). Only a summary read within :data:`_TABS_FRESH_S` with nothing done
+        on the desktop by Yuki since (the action log's version); ``{}`` else (then no tab counts as new)."""
+        try:
+            with self._lock:
+                snap = self.last
+            if (snap.error or not snap.hwnds or snap.version != self.actions.version
+                    or time.monotonic() - float(snap.at or 0.0) > _TABS_FRESH_S):
+                return {}
+            return {"hwnds": {int(h) for h in snap.hwnds},
+                    "tabs": {int(h): [str(i) for i in ids if i] for h, ids in dict(snap.tab_ids).items()},
+                    "complete": {int(h): bool(c) for h, c in dict(snap.tabs_complete).items()}}
+        except Exception:  # noqa: BLE001 - none kept: no tab counts as new
+            return {}
 
     def _title_record(self, record: Any, title: Any) -> None:
         """fa review L1 (A2): the title of the tab a record put up, kept on the action log (``ActionLog.titled``; a
@@ -9136,10 +9241,11 @@ class Verbs:
         return Hands._act_windows(after, d, acted, touched)
 
     def record(self, name: str, args: dict[str, Any], report: str, *, ok: bool, verified: bool | None,
-               facts: dict[str, Any], ms: float = 0.0) -> None:
+               facts: dict[str, Any], ms: float = 0.0, before: Any = None) -> None:
         """The act on the conversation's action log (what the next turn's summary says was done), the turn log's
         speech-to-action moment and the chat UI's step, as a hand keeps them. A refusal that did nothing keeps no
-        line. Never raises."""
+        line. ``before``: the act's desk before it (the runner's read), for a skill run's tab record (integ27 fix H1).
+        Never raises."""
         h = self.hands
         try:
             if not facts.get("refused") or facts.get("sent_at") is not None:
@@ -9150,8 +9256,10 @@ class Verbs:
                         and (facts.get("focus_taken") or facts.get("focus_declared"))):
                     # fa (A3, final-F one multi_open_then_close_yt_tab: ONE's run_skill records kept no tab, so "close
                     # that YouTube tab" had no referent among two): the tab a verified skill run's page landed on is
-                    # kept on its line, as the talker's own skill reply keeps it (:meth:`Hands._place_record`)
-                    h._place_record(record)
+                    # kept on its line, as the talker's own skill reply keeps it (:meth:`Hands._place_record`).
+                    # integ27 fix H1: only where the front after the run is measurably the run's own; the runner calls
+                    # this after its diff (and code's own tidy step), so a front given back is measured as the user's
+                    h._place_record(record, facts, before)
         except Exception:  # noqa: BLE001 - a record never breaks an act
             pass
         try:

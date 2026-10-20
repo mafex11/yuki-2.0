@@ -1909,7 +1909,8 @@ _days_cache: dict[tuple[str, str, str], tuple[float, dict[str, int]]] = {}
 
 
 def _days_seen(store: Any, kind: str, taste_kind: str, now: float) -> dict[str, int]:
-    """fd (final-F D6): ``{group: distinct days}``, the local dates in the last :data:`SEED_DAYS` the user had each
+    """fd (final-F D6): ``{group: distinct days}``, the user's days (integ27 fix D6: ``checkins.user_day``, 04:00 start)
+    in the last :data:`SEED_DAYS` the user had each
     candidate group on: a playlist's own media-context picks (:func:`_user_picks`: theirs, never a test's), a channel's
     watched videos (:func:`yuki.skills.youtube_feed.watched`, by the channel memory knows each video is from, outside
     the live tests' spans). Counts only, cached :data:`DAYS_TTL_S`; ``{}`` when unread. Never raises."""
@@ -1922,6 +1923,10 @@ def _days_seen(store: Any, kind: str, taste_kind: str, now: float) -> dict[str, 
     since = float(now) - SEED_DAYS * 86400.0
     dates: dict[str, set[Any]] = {}
     try:
+        # integ27 fix D6: the user's own day (04:00 start, ``checkins.user_day``, as the digest's day rule), never the
+        # calendar date: one late-night session across midnight is one day, never two
+        from yuki.memory.checkins import user_day
+
         if kind == "playlist":
             hit_cap = next(((app, end) for k, app, end in capability_kinds() if k == taste_kind), None)
             if hit_cap is not None:
@@ -1931,8 +1936,7 @@ def _days_seen(store: Any, kind: str, taste_kind: str, now: float) -> dict[str, 
                         continue
                     name = " ".join(str(store.moment_entity(m) or "").split())
                     if name:
-                        dates.setdefault(entity_key(store, taste_kind, name), set()).add(
-                            datetime.fromtimestamp(float(m["at"])).date())
+                        dates.setdefault(entity_key(store, taste_kind, name), set()).add(user_day(float(m["at"])))
         else:
             from yuki.skills import youtube_feed
 
@@ -1947,7 +1951,7 @@ def _days_seen(store: Any, kind: str, taste_kind: str, now: float) -> dict[str, 
                 for span in e.get("spans") or []:
                     start = float(span[0])
                     if not (spans and _in_spans(start, spans)):
-                        dates.setdefault(ch, set()).add(datetime.fromtimestamp(start).date())
+                        dates.setdefault(ch, set()).add(user_day(start))
     except Exception:  # noqa: BLE001 - unread: no habit is claimed from it
         return {}
     out = {k: len(v) for k, v in dates.items()}

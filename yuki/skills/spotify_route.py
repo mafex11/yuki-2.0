@@ -2091,8 +2091,19 @@ def _put_back(win: Any, prev: int, facts: dict[str, Any]) -> None:
     (:meth:`Desk.minimise_quietly`), so Yuki's own act leaves the window as the user had it. Only once the front is
     back: minimised without activation while still the active window, Spotify could keep the keyboard out of sight,
     so with no front put back it stays restored, in plain view. ``facts["put_back"]`` and
-    ``facts["reminimised"]`` (booleans). A stand-in desk without the minimise leaves it restored."""
+    ``facts["reminimised"]`` (booleans). A stand-in desk without the minimise leaves it restored.
+
+    integ27 fix L2: only while the front is still the Spotify window the rung raised (read first): a front that moved to
+    another window meanwhile (the user switched while the rung waited, D2's flip wait included) is theirs, so nothing
+    is given back or minimised (``facts["put_back"]`` ``"moved_on"``). A front that can't be read: as before."""
     if prev and prev != win.hwnd:
+        try:
+            front = int(DESK.foreground() or 0)
+        except Exception:  # noqa: BLE001 - not read: as before
+            front = 0
+        if front and front != int(win.hwnd):
+            facts["put_back"] = "moved_on"
+            return
         facts["put_back"] = bool(getattr(DESK.focus(prev), "ok", False))
     if facts.get("restored") and facts.get("put_back") is True:
         quiet = getattr(DESK, "minimise_quietly", None)

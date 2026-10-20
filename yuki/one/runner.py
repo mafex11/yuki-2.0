@@ -785,6 +785,21 @@ class CallContext:
             return None
 
 
+def _asking_now(turn: Any) -> bool:
+    """integ27 fix L1: a close of this turn left a window asking (the page's or the app's own question, measured) and
+    their words are as they were then (:attr:`RunState.held`): code takes no tidy step of its own around it (a
+    ``focus_back`` would hide the question as they are asked about it). Never raises."""
+    try:
+        state = getattr(turn, "_one_run", None)
+        held = state.held if isinstance(state, RunState) else None
+        if not held:
+            return False
+        words = tuple(getattr(turn, "words", None) or ())
+        return any(v == words for v in held.values())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _held_close(turn: Any, target: Mapping[str, Any] | None, args: Mapping[str, Any] | None = None) -> int | None:
     """integ27 (fa merge note 7): the window a step acts in (its target's ``hwnd``, else its own ``hwnd`` or ``window``)
     when a close of this turn left it asking and their words are as they were then (:attr:`RunState.held`), else
@@ -1476,8 +1491,15 @@ class Runner:
                 # fb fix (review 2, B4): an asked run is never an ok record, whatever a rung touched first (``all``'s
                 # ``as_voice``: ok = done), so the exchange floor (``_hand_marks``) never moves past their request;
                 # ``sent_at`` (the speech-to-action moment) kept as measured
-                self.verbs.record(name, resolved, report, ok=bool(ok) and result.status != ASKED, verified=verified,
-                                  facts=facts)
+                # integ27 fix H1: the act's desk before it goes with it, so a skill run's tab record is placed only
+                # where the front after it is measurably the run's own (never one a put-back or code's tidy step gave
+                # back to the user)
+                try:
+                    self.verbs.record(name, resolved, report, ok=bool(ok) and result.status != ASKED,
+                                      verified=verified, facts=facts, before=ctx.before)
+                except TypeError:   # a stand-in verbs without ``before``: the record as before
+                    self.verbs.record(name, resolved, report, ok=bool(ok) and result.status != ASKED,
+                                      verified=verified, facts=facts)
             except Exception:  # noqa: BLE001 - a record never breaks an act
                 pass
             note = getattr(turn, "note_step", None)
@@ -1678,7 +1700,9 @@ class Runner:
             mastered = self._master(d, result, turn, state, say)
             if asking:
                 if result.flagged:
-                    self._tidy_settled(result, "asking", None)   # its own tidy-up never opened; an earlier one stands
+                    # its own tidy-up never opened; integ27 fix L1: an earlier one of the turn settles with it (no code
+                    # step at the turn's end would hide the question: ``tidy_debt``, ``_tidy_by_code``)
+                    self._tidy_settled(result, "asking", turn)
             elif pending is not None:
                 self._tidy_result(pending, d, after, result, turn, state, say)
             elif ask and step is not None:
@@ -1839,6 +1863,8 @@ class Runner:
                 why = "no_step"
             elif getattr(turn, "moved_on", False):
                 why = "moved_on"   # safety timing 4: their next turn began while this act ran: never a step after it
+            elif _asking_now(turn):
+                why = "asking"     # integ27 fix L1: a close of the turn left its question up: no step around it
             else:
                 reader = getattr(self.verbs, "front_now", None) or getattr(self.verbs, "foreground", None)
                 front = reader() if callable(reader) else None
@@ -2116,6 +2142,11 @@ class Runner:
         if tidy is None or not tidy.open or tidy.acts or tidy.given or tidy.before is None:
             return None
         tidy.given = True
+        if _asking_now(turn):
+            # integ27 fix L1: a close of this turn left the page's or the app's own question up (TIDIED["asking"]):
+            # the turn's open tidy-up settles with it, no code step, no D6 line and no agent round around it
+            self._emit("one_tidy_debt", asking=True)
+            return None
         try:
             now = self._desk_read(tidy.sound_app)
             if now is None:

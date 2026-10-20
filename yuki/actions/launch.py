@@ -3934,13 +3934,16 @@ def window_action(hwnd: int, action: str) -> ActionResult:
     to save) and waits up to :data:`_CLOSE_WAIT_S` for the window to go. ``ok``
     is True only when the new state was observed, so the summary is the effect,
     not the request: "Discord.exe "..." is now minimized", or "... asked to close;
-    it is asking something first" (a dialog of its own in front), or "still open after 8 s".
+    it is asking something first" (a dialog of its own in front), or "still open after 8 s" (it may be asking
+    something inside its window).
 
     fa (A4): ``maximize``, ``restore`` and ``fullscreen`` are asks to see the window: it is brought to the front first
     (:func:`focus_window`, gated), and ``ok`` needs it in view afterwards too (in front by the one front rule, and at
     least :data:`_SHOWN_SHARE` of it seen: ``details["front"]``, ``["visible"]``, ``["behind"]``); a window left behind
     another is reported where it is, never as done. fa (A1): a close the window asks about first carries the asking
-    window's id (``details["dialog_raised"]``).
+    window's id (``details["dialog_raised"]``). integ27 fix H2: a close still open at the end of its wait with no asking
+    measured (a question drawn inside the window: the window stays enabled and owns no new one) is
+    ``details["close_held"]``, reported as possibly asking inside its window, that answer theirs (the tab hand's rule).
     """
     started = time.perf_counter()
 
@@ -4017,7 +4020,14 @@ def window_action(hwnd: int, action: str) -> ActionResult:
                 note_raised(int(details["dialog_raised"]), int(hwnd))
             return finish(False, f"{name}: asked to close; it is asking something first (a dialog of its own is in "
                                  f"front). Nothing in it was answered: what it asks is theirs to answer", details)
-        return finish(False, f"{name}: asked to close, still open after {_CLOSE_WAIT_S:g} s", details)
+        # integ27 fix H2 (Zen's or Firefox's leave-page and "Close tabs?" prompts, Win11 Notepad's save prompt: drawn
+        # inside the window, so it stays enabled and owns no new window): the close was posted and the window stayed
+        # with no reason measured. Held as the tab hand holds it (``close_held``): it may be asking inside its window,
+        # and that answer is theirs; never handed on to be finished
+        details["close_held"] = True
+        return finish(False, f"{name}: asked to close, still open after {_CLOSE_WAIT_S:g} s; the close was posted and "
+                             f"no reason was measured: it may be asking something inside its window, and that answer "
+                             f"is theirs", details)
 
     def reached() -> bool:
         iconic, zoomed = bool(win32gui.IsIconic(hwnd)), bool(_is_zoomed(hwnd))

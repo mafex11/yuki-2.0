@@ -473,11 +473,12 @@ def _check(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Sequence
     (C3) the caller's ``target`` stands, never checked against a list of words for it (the slot's menu text tells the
     caller to leave it out unless the user means one).
 
-    fd (final-F D4; live 20 Oct spotify_inapp_volume_down: after the in-app rung failed, the talker's own fallback
-    ``control: mixer`` was tagged the user's words and "Keep this as your usual?" followed): an enum option the caller
-    gives is :data:`FROM_GIVEN` (the caller's reading, valid as given) unless the user's words hold it as written
-    (:data:`FROM_WORDS`); only those may be proposed as a usual. The answer to the slot's own question is the user's
-    choice whatever its wording (``resolve(answered=...)``, the engine's own record)."""
+    integ27 fix D4 (fd's D4 tagged an enum option the user's own only when its code word stood in their words as
+    written: a literal test of their words, and uneven: "mixer" is a spoken word, "in_app" never is): an enum option
+    the caller gives is :data:`FROM_WORDS` again, as before fd. The live bug (spotify_inapp_volume_down: the talker's
+    own fallback ``control: mixer`` after the in-app rung failed, then "Keep this as your usual?") stays fixed by the
+    engine's own trace (``engine._fell_back``: a same-request fallback never asks to keep its means), and the answer
+    to the slot's own question is the user's choice (``resolve(answered=...)``, the engine's own record)."""
     if value is None or value == "":
         return False, None, ""
     t = slot.type
@@ -490,7 +491,7 @@ def _check(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Sequence
             hit = bool_option(slot.options, value)
         if hit is None:
             return False, None, ""
-        return True, hit, (FROM_WORDS if _said(hit, words) else FROM_GIVEN)
+        return True, hit, FROM_WORDS   # integ27 fix D4: never a literal test of their words
     if t == "number":
         x = _num(value)
         if x is None or (slot.min is not None and x < slot.min) or (slot.max is not None and x > slot.max):
@@ -1648,8 +1649,9 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
 
     fd (final-F D4): ``answered``, the slots whose question this capability asked moments ago and the user has spoken
     since (the engine's own run record, never the words): an enum option given for one of them is the user's own
-    choice (:data:`FROM_WORDS`), so "Keep this as your usual?" may follow, as the means question's design says; any
-    other enum option the words don't hold as written is the caller's reading (:data:`FROM_GIVEN`), never proposed.
+    choice (:data:`FROM_WORDS`), so "Keep this as your usual?" may follow, as the means question's design says.
+    integ27 fix D4: any enum option given is :data:`FROM_WORDS` (no literal test of their words); a same-request
+    fallback's means is never proposed (the engine's ``_fell_back``).
 
     lResolve: on a draft or an open (a capability that may send, on a run that doesn't: :func:`_sends`, read before
     the slot loop and checked again on its values), the caller's own wording of what to write is kept as a draft
@@ -1787,7 +1789,9 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                                     loose=bool(slot.taste))
             if ok:
                 if how == FROM_GIVEN and slot.type == "enum" and slot.name in answered:
-                    how = FROM_WORDS      # fd (D4): their answer to this slot's own question, whatever its wording
+                    # fd (D4): their answer to this slot's own question, whatever its wording (integ27 fix D4: an enum
+                    # option is the caller's ``words`` already; kept for any other ``given`` source)
+                    how = FROM_WORDS
                 value, mine = own(slot, value, menu_names, offered)
                 if mine == FROM_HEARD and how == FROM_WORDS:
                     how = FROM_HEARD      # their word, heard as one of their own things ("Lumin" -> lumen)

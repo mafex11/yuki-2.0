@@ -2581,6 +2581,16 @@ def fetch_skills_options(memory: Any, *, timeout_s: float = 0.3, now: float | No
         return []
 
 
+def rerun_note(state: dict[str, Any] | None) -> str:
+    """The note a rerun of the user's turn carries, from the pipeline's measured states (``claim``, ``repeat``,
+    ``opened_quiet``, ``rerun_why``): what :func:`volatile_block` adds with ``rerun``; integ27 fix TV3: also the ONE
+    rerun's note on the request's newest message. Never the words."""
+    state = state or {}
+    return (CLAIM_NOTE if state.get("claim") else REPEAT_NOTE if state.get("repeat")
+            else OPENED_RERUN_NOTE if state.get("opened_quiet")
+            else RERUN_WHY_NOTES.get(str(state.get("rerun_why") or ""), RERUN_NOTE))
+
+
 def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                    desk: str | None = None, call: str | None = None, heard: str | None = None,
                    named: bool = False, work: str | None = None,
@@ -2698,9 +2708,7 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += (f"\n[Your thinker now (background: for when they ask what is happening, and to choose follow_up, "
                  f"instead or new_task): {work}. {skill_guide(WORK_GUIDE, keys).strip()}]")
     if rerun:
-        text += "\n" + (CLAIM_NOTE if state.get("claim") else REPEAT_NOTE if state.get("repeat")
-                        else OPENED_RERUN_NOTE if state.get("opened_quiet")
-                        else RERUN_WHY_NOTES.get(str(state.get("rerun_why") or ""), RERUN_NOTE))
+        text += "\n" + rerun_note(state)
     if state.get("scrolling"):
         # V7: a page scrolling on by itself (the keep_scrolling hand, or the thinker's scroll until stopped)
         text += (f"\n[Scrolling now: {' '.join(str(state['scrolling']).split())[:200]}. It pauses by itself while "

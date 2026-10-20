@@ -1577,6 +1577,9 @@ class _Trace:
     items: dict[str, str]
     down: dict[str, list[str]]
     asked_slot: str = ""
+    #: integ27 fix D3: every slot value of the run as its identity (:func:`_run_ids`; ``{}`` for a question): a
+    #: correction swaps a value only in a request that is otherwise this run's own
+    ids: dict[str, str] = field(default_factory=dict)
 
 
 _TRACES: list[_Trace] = []
@@ -1601,6 +1604,7 @@ def _note_trace(resolved: Any, result: SkillResult, ctx: RunContext, state: Mapp
     """Keep this run's trace (:class:`_Trace`) for the next run of its capability in the same exchange. Never
     raises."""
     try:
+        ids: dict[str, str] = {}
         if isinstance(resolved, Ask):
             from yuki.skills.catalog import load
 
@@ -1612,6 +1616,10 @@ def _note_trace(resolved: Any, result: SkillResult, ctx: RunContext, state: Mapp
             asked = {s.name: " ".join(str(_entity_name(resolved.values.get(s.name))).split())
                      for s in skill.slots if s.type == "entity" and _entity_name(resolved.values.get(s.name))}
             asked_slot = str(state.get("asked_slot") or "")
+            try:
+                ids = _run_ids(resolved)   # integ27 fix D3
+            except Exception:  # noqa: BLE001
+                ids = {}
         else:
             return
         cap = _cap_key(skill)
@@ -1619,7 +1627,7 @@ def _note_trace(resolved: Any, result: SkillResult, ctx: RunContext, state: Mapp
             return
         down = {k: list(v) for k, v in (ctx.turned_down or {}).items() if isinstance(v, (list, tuple))}
         entry = _Trace(time.monotonic(), cap, str(ctx.request_id or ""), _heard_digest(ctx.words),
-                       str(result.outcome or ""), asked, dict(result.items or {}), down, asked_slot)
+                       str(result.outcome or ""), asked, dict(result.items or {}), down, asked_slot, ids)
         with _trace_lock:
             now = entry.at
             _TRACES[:] = [t for t in _TRACES if now - t.at <= TRACE_KEEP_S][-(TRACE_RUNS - 1):] + [entry]
@@ -1680,17 +1688,42 @@ def _answered_slots(cap: str, ctx: RunContext) -> set[str]:
     return {t.asked_slot} if heard and heard != t.heard else set()
 
 
-def _corrected(cap: str, skill: Skill) -> dict[str, list[str]]:
+#: integ27 fix D3: the ends of a run that put nothing on by its own rungs (its hand-off, a miss).
+NOTHING_ON_OUTCOMES: frozenset[str] = frozenset({"handed_over", "failed", "error", "refused"})
+
+
+def _corrected_trace(cap: str, ctx: RunContext) -> _Trace | None:
+    """integ27 fix D3: the run a correction corrects: the newest run of ``cap`` within :data:`TRACE_KEEP_S` that
+    reached its rungs (never a question, a hold or a refusal), passing over the correction's own earlier tries: a run
+    in this very request (:func:`_same_request`: ONE's second way re-runs the same input), and a correcting run that
+    put nothing on by its rungs and recorded no row (its ``down`` set, :data:`NOTHING_ON_OUTCOMES`: the voice's try
+    that the all brain's thinker now finishes in a request of its own). Such a try's ``down`` was copied from the
+    older run this returns, so a chain of corrections still adds up, and its asked name is the correction's own
+    restated value, never a row. ``None`` none."""
+    now = time.monotonic()
+    with _trace_lock:
+        traces = list(_TRACES)
+    for t in reversed(traces):
+        if t.cap != cap or now - t.at > TRACE_KEEP_S or t.outcome in NOT_RAN_OUTCOMES or _same_request(t, ctx):
+            continue
+        if t.down and not t.items and t.outcome in NOTHING_ON_OUTCOMES:
+            continue
+        return t
+    return None
+
+
+def _corrected(cap: str, skill: Skill, ctx: RunContext) -> tuple[dict[str, list[str]], _Trace | None]:
     """fd (final-F D3; live 20 Oct k_playlist_not_that, both brains: "No, not this one. The other playlist." ran ネオン
-    again): what a correction leaves out, by taste slot: the newest run of ``cap`` within :data:`TRACE_KEEP_S`, the row
-    its rungs acted on or found playing (verified or not), and what it left out itself (a chain of corrections never
-    comes back round). Review M1: the value it asked for counts only when no rung recorded a row (then that name is all
-    that is known of what ran); a name asked that a rung resolved to another row is the user's words, never a row, so
-    "No, I said chill" after ネオン is resolved again with ネオン left out, never swapped away. Names in RAM only;
-    ``{}`` with none."""
-    t = _last_trace(cap, ran=True)
+    again): what a correction leaves out, by taste slot: the run it corrects (:func:`_corrected_trace`), the row its
+    rungs acted on or found playing (verified or not), and what it left out itself (a chain of corrections never comes
+    back round). Review M1: the value it asked for counts only when no rung recorded a row (then that name is all that
+    is known of what ran); a name asked that a rung resolved to another row is the user's words, never a row, so "No, I
+    said chill" after ネオン is resolved again with ネオン left out, never swapped away. integ27 fix D3: never one of
+    the correction's own tries (:func:`_corrected_trace`). Names in RAM only; ``({}, None)`` with none; the trace goes
+    back with them (the swap's other-slot check)."""
+    t = _corrected_trace(cap, ctx)
     if t is None:
-        return {}
+        return {}, None
     out: dict[str, list[str]] = {}
     for slot in skill.slots:
         if not slot.taste:
@@ -1699,7 +1732,23 @@ def _corrected(cap: str, skill: Skill) -> dict[str, list[str]]:
         kept = list(dict.fromkeys(" ".join(str(n).split()) for n in names if str(n or "").strip()))
         if kept:
             out[slot.name] = kept
-    return out
+    return out, t
+
+
+def _otherwise_same(resolved: Plan, given: Mapping[str, Any] | None, slot: str, t: _Trace | None) -> bool:
+    """integ27 fix D3 (Phase 2.1's ``_rejected_slot`` rule for D3's swap): whether a correcting request is otherwise
+    the corrected run's own: every slot the caller gave in it, but ``slot`` and the note and choice slots, resolved to
+    the same identity as in that run (``_Trace.ids``). A correction that changed another value ("No, in Arc"; "no,
+    lower") runs as given. Identities only; never raises."""
+    if t is None:
+        return False
+    try:
+        now_ids = _run_ids(resolved)
+        keys = [str(k) for k in (given or {}) if str(k) != slot and str(k) not in NOTE_SLOTS
+                and str(k) not in CHOICE_SLOTS]
+        return all(now_ids.get(k, "") == t.ids.get(k, "") for k in keys)
+    except Exception:  # noqa: BLE001 - unsure: as given
+        return False
 
 
 def _stamp_form_recall(result: SkillResult, ctx: RunContext) -> None:
@@ -3386,15 +3435,18 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
             resolved.ask_keep = None
             _emit(ctx, "skill_resolve", skill=resolved.skill.key, result="keep_held", reason="fallback",
                   origin=ctx.origin)
-        down = _corrected(cap, resolved.skill) if corrects and picked is None else {}
+        down, corrected = _corrected(cap, resolved.skill, ctx) if corrects and picked is None else ({}, None)
         if down:
             # fd (final-F D3): a correction never plays the row the corrected run acted on (its own trace, verified or
             # not) or one turned down before it: the drivers leave those out of what the words may mean
             # (``ctx.turned_down``), and a value that IS one of them takes the user's next own candidate (their taste
-            # order), else one question. A name the user restates ("No, I said chill") is no such row (review M1)
+            # order), else one question. A name the user restates ("No, I said chill") is no such row (review M1).
+            # integ27 fix D3: only in a request that is otherwise the corrected run's own (another value changed, "No,
+            # in Arc": run as given, the old row still left out of what the words may mean)
             ctx.turned_down = down
             swap = next(((s, names) for s, names in down.items()
-                         if _value_id(resolved.values.get(s)) in {_value_id(n) for n in names}), None)
+                         if _value_id(resolved.values.get(s)) in {_value_id(n) for n in names}
+                         and _otherwise_same(resolved, slots, s, corrected)), None)
             if swap is not None:
                 replaced = True
                 slot_name, names = swap

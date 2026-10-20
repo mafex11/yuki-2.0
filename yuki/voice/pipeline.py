@@ -48,8 +48,8 @@ from yuki.voice.hands import talker_hand_tools
 from yuki.voice.recall import QUICK_MEMORY
 from yuki.voice.mouth import (
     CHECK_PROGRESS, END_CONVERSATION, GO_QUIET, HAND_OVER, HANDOFF_TOOLS, LEAN_MOUTH_PROMPT, MORE_OF_RESULT,
-    MOUTH_PROMPT, OPENED_QUIET, STAY_QUIET, TELL_YUKI, MouthMemory, ReplyChannel, mouth_system_blocks, router_on,
-    say_first_words,
+    MOUTH_PROMPT, OPENED_QUIET, RERUN_NOTE, RERUN_WHY_NOTES, STAY_QUIET, TELL_YUKI, MouthMemory, ReplyChannel,
+    mouth_system_blocks, rerun_note, router_on, say_first_words,
     talker_kind, voice_on_brain, voice_one, volatile_block, with_markers,
 )
 
@@ -496,6 +496,9 @@ class LlmCall:
     #: (an early say_first heard before a call that never came through), so ``user_turn`` is false; it still answers
     #: their words (:func:`answers_user`). Set in ``_process_context`` from the observer's rerun and the context.
     rerun_of_user: bool = False
+    #: integ27 fix TV2: this call is the reply watch's rerun (read once as it starts, ``_Hooks.rerun_now``: the
+    #: observer's rerun mark on the turn it answers, not speculative); its prompt carries the rerun's note only then
+    rerun: bool = False
 
 
 def answers_user(call: Any) -> bool:
@@ -1428,6 +1431,25 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             #: integ22 (desk22 merge note 1, D4): the names of the reply's function calls (every one, the hand-offs
             #: included), given to the hands when the reply ends, then cleared (a plain answer gives none).
             self._yuki_reply_names: tuple[str, ...] = ()
+            #: integ27 fix TV1: the router's end says code's stop line and ends the conversation: from then on nothing
+            #: the model writes is said or run (:meth:`yuki_end_mute`), and no line but that one is said.
+            self._yuki_mute = False
+            #: integ27 fix TV1: the one line the muted service still says (once), code's own stop line.
+            self._yuki_mute_allow = ""
+
+        def yuki_end_mute(self, allow: str = "") -> None:
+            """integ27 fix TV1 (C4 retest, p24_countdown_cancel: the stop line was said by code and the agent's or the
+            talker's reply to the same words came after it): the conversation ends now with code's line ``allow`` (the
+            exact words :meth:`push_frame` will see; ``""``: none) as the only thing said. The reply in flight is cut
+            the way a barge-in cuts it (its held words never said, its held calls dropped, its early hand-off start
+            void), and every later frame of the model's is dropped: its text, an early say_first, its calls (nothing
+            runs: the conversation is ending), and any other spoken line but ``allow``. Logged by the caller. State
+            only; never raises."""
+            self._yuki_mute = True
+            self._yuki_mute_allow = " ".join(str(allow or "").split())
+            self._yuki_words = None
+            self._yuki_held_calls = None
+            self._yuki_early_pending = None
 
         def _yuki_every_call(self, function_calls: Any) -> Any:
             """hotTools: the reply's every call, in the order written, where Pipecat queued only its last (its stream
@@ -1461,6 +1483,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 await super().push_frame(frame, FrameDirection.DOWNSTREAM)
 
         async def run_function_calls(self, function_calls: Any) -> None:
+            if self._yuki_mute:
+                return   # integ27 fix TV1: the conversation is ending on code's stop line: nothing more runs
             # hotTools: Pipecat hands over only the reply's last call; the ones it dropped go back in front, so
             # everything below (holds, words, the reply rule, the order gate) sees the whole reply as written
             function_calls = self._yuki_every_call(function_calls)
@@ -1520,11 +1544,20 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
         async def push_frame(self, frame: Any, direction: Any = None) -> None:
             from pipecat.frames.frames import (
                 EagerEndOfTurnCancelFrame, InterruptionFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame,
-                LLMTextFrame, UserStoppedSpeakingFrame,
+                LLMTextFrame, TTSSpeakFrame, UserStoppedSpeakingFrame,
             )
             from pipecat.processors.frame_processor import FrameDirection
 
             direction = FrameDirection.DOWNSTREAM if direction is None else direction
+            if self._yuki_mute and direction == FrameDirection.DOWNSTREAM:
+                # integ27 fix TV1: ending on code's stop line: the model's words and any other line are dropped
+                if isinstance(frame, LLMTextFrame):
+                    return
+                if isinstance(frame, TTSSpeakFrame):
+                    text = " ".join(str(getattr(frame, "text", "") or "").split())
+                    if not text or text != self._yuki_mute_allow:
+                        return
+                    self._yuki_mute_allow = ""   # said once
             if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseStartFrame):
                 # integ22 (D4): a new reply's call names start empty (a speculative reply's held calls, released after
                 # its end, never stand for the next reply)
@@ -1582,8 +1615,9 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             ids, once per reply; ``()`` for a reply whose stream was cut (no stop reason: a barge-in, a withdrawn
             speculation) or that is still speculative (its calls wait for the turn). Stream facts only."""
             call = self._yuki_call
-            if call is None or speculating or not call.tool_ids or call.stop_reason is None or call.broken:
-                return ()
+            if (call is None or speculating or not call.tool_ids or call.stop_reason is None or call.broken
+                    or self._yuki_mute):
+                return ()   # integ27 fix TV1: a reply cut by the router's told end is no lost act
             lost = tuple(i for i in call.tool_ids if i and i not in call.made_ids)
             call.broken = lost
             return lost
@@ -1611,6 +1645,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
 
             from yuki.voice.bridge import GAME_GATED_SAYS, say_waits_for_game
 
+            if self._yuki_mute:
+                return   # integ27 fix TV1: ending on code's stop line: no early words of the model's
             if name in GAME_GATED_SAYS:
                 try:
                     waits = await asyncio.to_thread(say_waits_for_game, name, early_text(args, "skill") or "")
@@ -1646,13 +1682,17 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             # fc review H1: the reply watch's rerun of their turn, when Yuki's heard words (an early say_first for a
             # call that never came through) follow theirs in the context: it still answers their words
             call.rerun_of_user = bool(not call.user_turn and hook("rerun_of_user", context, default=False))
+            # integ27 fix TV2: whether this call is the reply watch's rerun, read once now (Pipecat's start frame,
+            # pushed inside ``super()._process_context``, clears the observer's rerun mark before the params are made)
+            # and kept on the call: a speculative call on their next words never reads an older turn's rerun
+            call.rerun = bool(hook("rerun_now", call, default=False))
             call.after_tools = _trailing_tool_ids(context)
             hook("route_turn", context, call)
             one = hook("one")
             if one is not None:
                 # oVoice: the ONE turn this call belongs to, and the budget's round before every model call of it;
                 # spent (the rounds, the hard stop): code said its line and no model call is made
-                call.one_fresh = bool(answers_user(call) and hook("rerun", default=False))
+                call.one_fresh = bool(answers_user(call) and call.rerun)
                 # the gate's speculation flag is set for this inference before this method runs (process_frame)
                 call.one_eager = bool(getattr(getattr(self, "_speculation_gate", None), "is_speculating", False))
                 try:
@@ -1730,21 +1770,45 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             if channel == "marker":
                 messages = with_markers(messages)   # its earlier replies as the channel writes them (v3.16)
             current = None if getattr(self, "_yuki_warming", False) else self._yuki_call
+            # integ27 fix TV3: a rerun whose context ends with Yuki's own words (the adapter then adds a bare "." as
+            # the newest message) carries its note on that newest message, never a bare "." after the block
+            tail = self._yuki_one_tail_note(one, current, messages)
 
             def make() -> dict[str, Any]:
                 return volatile_block(
                     lookup=self._yuki_lookup, desk=self._yuki_desk, call=call, heard=hooks.heard(),
                     named=bool(hook("named", default=False)), work=None, cut=hook("cut", default=None),
                     after_goodbye=bool(hook("after_goodbye", default=False)), channel=channel,
-                    rerun=bool(hook("rerun", default=False)), state=one.state(hook("state", default=None)),
-                    talker="lean")
+                    rerun=bool(hook("rerun", default=False)) and not tail,
+                    state=one.state(hook("state", default=None)), talker="lean")
 
             block, anchor = one.volatile(current, make)
             params["messages"] = (with_volatile_at(messages, block, anchor) if anchor
                                   else with_volatile(messages, block))
+            if tail:
+                params["messages"] = with_tail_note(params["messages"], tail)
             one.thinking(params, current)
             hook("prompt_layout", current, params, block)   # fc (C7): content-free sizes and fingerprints per block
             return params
+
+        def _yuki_one_tail_note(self, one: Any, call: Any, messages: Any) -> str:
+            """integ27 fix TV3 (C1c, open_claude under one: the H1 rerun's request ended [their words + block]
+            [Yuki's heard "On it."] [the adapter's bare "."], and the agent answered the "."): the rerun note for the
+            request's newest message, else ``""``. Only when that message is the adapter's no-op user turn (Pipecat
+            adds it after the context's own newest message, Yuki's words: :func:`noop_tail`) and this call is a rerun:
+            the reply watch's rerun of their turn (``LlmCall.rerun``: the note the block would carry, from the
+            measured states) or the driver's own rerun of a result round (``OneVoice._rerun`` asked: its reason's
+            note). A context ending with a tool result gets none (design 3.3.3). Structure and code facts only."""
+            try:
+                if call is None or not noop_tail(messages) or _last_role(self._yuki_context) != "assistant":
+                    return ""
+                if getattr(call, "rerun", False):
+                    return rerun_note(one.state(hook("state", default=None)))
+                if getattr(one, "_rerun", "") == "asked":
+                    return RERUN_WHY_NOTES.get(str(getattr(one, "_rerun_why", "") or ""), RERUN_NOTE)
+            except Exception:  # noqa: BLE001 - the request as before
+                return ""
+            return ""
 
         def _sync_cancel_tools(self) -> None:
             """Pipecat's cancel tools, with the talker's own description of when to cancel (v3.9)."""
@@ -3502,15 +3566,32 @@ class _Hooks:
     def rerun(self) -> bool:
         """Whether this call answers the user's turn again because nothing of the last reply to it was heard; voice22
         (A9): or answers again the talker's run for the refusal of a quiet on their opening words that gave them
-        nothing (``Conversation._opened_answer``: its call follows that refusal's result, not their words)."""
-        turn = self.c.observer.turn
+        nothing (``Conversation._opened_answer``: its call follows that refusal's result, not their words).
+        integ27 fix TV2: the current call's own reading (:attr:`LlmCall.rerun`, :meth:`rerun_now`), ``False`` with no
+        call: never the observer's turn now (a speculative call on their next words saw the older turn's mark)."""
         call = getattr(getattr(self.c, "_llm", None), "_yuki_call", None)
-        if turn is None or not turn.rerun:
+        return bool(call is not None and getattr(call, "rerun", False))
+
+    def rerun_now(self, call: Any) -> bool:
+        """integ27 fix TV2: read once as ``call`` starts (``_process_context``): the reply watch asked for this run
+        (the observer's ``rerun_turn`` is its open turn, marked ``rerun``), it is not a speculation on their next words
+        (Flux's eager end of turn opens no observer turn), and it answers that turn: their words (``answers_user``:
+        fc review H1, Yuki's heard say_first after them too), or voice22's (A9) opened answer of a result turn. Code
+        facts only; never raises."""
+        try:
+            obs = self.c.observer
+            turn = obs.turn
+            if turn is None or not turn.rerun or getattr(obs, "rerun_turn", None) is not turn:
+                return False
+            gate = getattr(getattr(self.c, "_llm", None), "_speculation_gate", None)
+            if bool(getattr(gate, "is_speculating", False)):
+                return False
+            if turn.trigger == "user":
+                return answers_user(call)
+            opened = getattr(self.c, "_opened_answer", None)
+            return bool(callable(opened) and opened(turn))
+        except Exception:  # noqa: BLE001 - not known: no rerun note
             return False
-        if turn.trigger == "user":
-            return bool(call is None or answers_user(call))   # fc review H1: a heard say_first after their words too
-        opened = getattr(self.c, "_opened_answer", None)
-        return bool(callable(opened) and opened(turn))
 
     def rerun_of_user(self, context: Any) -> bool:
         """fc review H1: whether the call now being made is the reply watch's rerun of the user's turn although Yuki's
@@ -4468,6 +4549,48 @@ def is_thought(message: Any) -> bool:
 def strip_thoughts(messages: list[Any]) -> list[Any]:
     """``messages`` without the thinking blocks Pipecat stored (a turn's end, before any history edit)."""
     return [m for m in messages or [] if not is_thought(m)]
+
+
+def noop_tail(messages: Any) -> bool:
+    """integ27 fix TV3: whether a request's messages end with the Anthropic adapter's no-op user turn (one text part
+    ".", right after an assistant message: what Pipecat appends for a model with no assistant prefill when the context
+    ends with Yuki's own words). Structure only; never raises."""
+    try:
+        if not isinstance(messages, list) or len(messages) < 2:
+            return False
+        last, before = messages[-1], messages[-2]
+        if not (isinstance(last, dict) and last.get("role") == "user" and isinstance(before, dict)
+                and before.get("role") == "assistant"):
+            return False
+        content = last.get("content")
+        parts = [{"type": "text", "text": content}] if isinstance(content, str) else list(content or [])
+        return (len(parts) == 1 and isinstance(parts[0], dict) and parts[0].get("type") == "text"
+                and str(parts[0].get("text") or "").strip() == ".")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def with_tail_note(messages: Any, note: str) -> Any:
+    """integ27 fix TV3: the request's trailing no-op "." (:func:`noop_tail`, before a block was added to it) replaced by
+    ``note``, so the newest message the agent reads says why it runs again. Only the copy sent is changed (the context
+    stays append-only); anything else: as it was."""
+    try:
+        if not isinstance(messages, list) or not messages or not str(note or "").strip():
+            return messages
+        last = messages[-1]
+        if not (isinstance(last, dict) and last.get("role") == "user"):
+            return messages
+        content = last.get("content")
+        parts = [{"type": "text", "text": content}] if isinstance(content, str) else list(content or [])
+        for i, part in enumerate(parts):
+            if isinstance(part, dict) and part.get("type") == "text" and str(part.get("text") or "").strip() == ".":
+                parts[i] = {**part, "text": str(note)}
+                out = list(messages)
+                out[-1] = {**last, "content": parts}
+                return out
+        return messages
+    except Exception:  # noqa: BLE001
+        return messages
 
 
 def with_volatile_at(messages: Any, block: dict[str, Any], anchor: str | None) -> Any:
@@ -8589,8 +8712,13 @@ class Conversation:
         obs.fast_handled("end")
         now = time.monotonic()
         told = self._stopped_line(stopped)
+        # integ27 fix TV1: a told end owns the turn's speech before it says the line: the reply in flight on the same
+        # words (the talker's, the ONE agent's) and anything later is dropped, and under all the stopped sends settle
+        # as told (their own final is not said again)
+        dropped = self._end_told(told, stopped) if told else None
         self.log.event("router", op="end", session=self.session, call_mode=bool(self.call_app),
                        game=bool(self.game_app), sending=sending or None, told=bool(told) or None,
+                       dropped_reply=dropped or None,
                        eos_to_end_ms=round((now - turn.speech_end) * 1000) if turn is not None and turn.speech_end
                        else None)
         if told or (getattr(self, "one_driver", None) is not None and stopped):
@@ -8605,6 +8733,46 @@ class Conversation:
         self._end_cue_now()
         self.log.event("session", state="end_asked", session=self.session, waited_ms=0, by="router")
         self._set_stop("user_asked")
+
+    def _end_told(self, told: str, stopped: int) -> bool:
+        """integ27 fix TV1 (C4 retest: "Stopped. Nothing was sent." and then the agent's "Okay, I won't send it."): the
+        router's end is about to say code's stop line and end. Before it does, it owns the turn's speech: the LLM
+        service is muted (``yuki_end_mute``: the reply in flight on these words cut as a barge-in cuts it, and nothing
+        more of the model's said or run, nor any line but this one), an early hand-off start of that reply is void,
+        and under all the sends this end stopped settle as told (``VoiceBridge.stopped_told``: ``talker_cancelled``,
+        not silent, so the job's own final is neither relayed nor said by the narrator gate). Returns whether a reply
+        was being written (the log's ``dropped_reply``). State only; never raises."""
+        obs = self.observer
+        writing = bool(getattr(obs, "generating", False))
+        try:
+            from yuki.core.ownwords import strip_internal
+
+            line = strip_internal(told).strip()   # the words ``_speak_owed`` pushes
+            mute = getattr(getattr(self, "_llm", None), "yuki_end_mute", None)
+            if callable(mute):
+                mute(line)
+        except Exception as exc:  # noqa: BLE001 - the line and the end as before
+            self.log.event("router", op="end_mute_error", session=self.session, error=type(exc).__name__)
+        try:
+            drop = getattr(self.bridge, "drop_early", None)
+            if callable(drop):
+                drop()
+        except Exception:  # noqa: BLE001
+            pass
+        one = getattr(self, "one_driver", None)
+        if one is not None:
+            try:
+                one.turn_over("ended")   # its reply in flight is judged no more (no rerun, no hold, no owed line)
+            except Exception:  # noqa: BLE001
+                pass
+        if stopped and one is None:
+            try:
+                quiet = getattr(self.bridge, "stopped_told", None)
+                if callable(quiet):
+                    quiet()
+            except Exception:  # noqa: BLE001
+                pass
+        return writing
 
     def _stopped_line(self, stopped: int) -> str:
         """fc review L1: the "nothing was sent" line the router's end says before it ends, else ``""``: under one the
@@ -9262,7 +9430,12 @@ class Conversation:
         state facts only."""
         turn.gave_up = True
         self._grace_since = time.monotonic()
-        lost = turn.rerun_why in LOST_ACTS or bool(turn.broken_call)
+        # integ27 fix TV5: the rerun's own reply decides too: unmarked text with no call that the guard refused
+        # (``unmarked_refused``) meant to answer in words, so it is no lost act (code's unsaid line below, never their
+        # words to the thinker as a task); a lost act is the first reply's reason with the rerun not answering in words,
+        # or the rerun's own call broken again
+        answered = bool(getattr(turn, "unmarked_refused", False)) and not turn.broken_call
+        lost = (turn.rerun_why in LOST_ACTS and not answered) or bool(turn.broken_call)
         self.log.event("reply_watch", op="gave_up", turn=turn.n, responses=turn.responses, marker=turn.marker,
                        unmarked=turn.unmarked, tts_silent=turn.tts_silent, guarded=turn.guarded,
                        repeat=bool(getattr(turn, "repeat_dropped", False)), why=turn.rerun_why or None,
@@ -9435,7 +9608,10 @@ class Conversation:
         held = getattr(self, "_held_more", None)
         if held and self.observer.user_turns - int(getattr(self, "_held_at_turn", 0)) <= self.HELD_TURNS:
             state["held"] = held
-        turn = self.observer.turn
+        # integ27 fix TV2: the rerun's own flags ride only on the rerun's call (its own reading, ``LlmCall.rerun``),
+        # never on a later call that reads the same observer turn (a speculative call on their next words)
+        call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
+        turn = self.observer.turn if call is not None and getattr(call, "rerun", False) else None
         if turn is not None and getattr(turn, "repeat_dropped", False):
             state["repeat"] = True   # V9: the rerun is told its last reply repeated the line before
         if turn is not None and getattr(turn, "claim_rerun", False):
@@ -9660,7 +9836,17 @@ class Conversation:
             if callable(drop):
                 for call_id in ids:
                     drop(str(call_id))
-            if getattr(call, "made_ids", None) or not answers_user(call):
+            if getattr(call, "made_ids", None):
+                return
+            if not answers_user(call):
+                # integ27 fix TV4: a reply in a result round (after a look, a hand's result) whose act never came
+                # through: under all no rerun or hand-off follows it (the reply watch answers the user's own turns),
+                # so code's owed line says nothing was done (said at the next quiet moment unless words of Yuki's are
+                # heard first), as ONE's lost act does; never a say_first heard and then silence. Under one the driver
+                # reads ``call.broken`` itself (its result-round rerun)
+                if getattr(self, "one_driver", None) is None and lost_calls(call, ids):
+                    owed = self._owe_code_line(LINE_LOST_ACT, "failed")
+                    self.log.event("talker_calls", op="lost_owed", session=self.session, owed=owed)
                 return
             if not lost_calls(call, ids):
                 return   # fc review L3: only controls never came through (a quiet, an end): no act was lost
