@@ -3869,9 +3869,9 @@ def _asks_before_closing(hwnd: int) -> bool:
 
 def _asking_window(hwnd: int, before: set[int] | frozenset[int] = frozenset()) -> int:
     """fa (A1): the window a window asked to close is asking with: one it owns that was not up before the close
-    (``before``: ``tabs.owned_windows`` read right before it), in front or a user window (``tabs.raised_window``);
-    ``0`` when none is known (the close is then reported asking, as before, with no window named). Window facts only;
-    never raises."""
+    (``before``: ``tabs.windows_before`` read right before it), in front or a user window, else (review M2) one of its
+    process new and in front (``tabs.raised_window``); ``0`` when none is known (the close is then reported asking, as
+    before, with no window named: the hands stop on ``asking`` either way). Window facts only; never raises."""
     try:
         from yuki.actions.tabs import raised_window
 
@@ -3914,10 +3914,13 @@ def _in_view(hwnd: int, details: dict) -> str:
     details["front"], details["visible"] = front, (round(share, 3) if share is not None else None)
     if front and (share is None or share >= _SHOWN_SHARE):
         return ""
-    info = window_info(now) if now and now != int(hwnd) else None
-    over = f" behind {info.process_name}" if info is not None and not front else ""
-    seen = f" ({int(round((share or 0.0) * 100))}% of it visible)" if share is not None else ""
     details["behind"] = True
+    if front:
+        # fa review L2: in front by the one front rule, but too little of it is seen (another window over it)
+        return f"it is in front with only {int(round((share or 0.0) * 100))}% of it visible"
+    info = window_info(now) if now and now != int(hwnd) else None
+    over = f" behind {info.process_name}" if info is not None else ""
+    seen = f" ({int(round((share or 0.0) * 100))}% of it visible)" if share is not None else ""
     return f"it is not in view: it is{over or ' not in front'}{seen}"
 
 
@@ -3978,9 +3981,10 @@ def window_action(hwnd: int, action: str) -> ActionResult:
         return _fullscreen(hwnd, name, details, finish)
     if action == "close":
         was_cloaked = _is_cloaked(hwnd)
-        from yuki.actions.tabs import owned_windows
+        from yuki.actions.tabs import windows_before
 
-        owned_before = owned_windows(hwnd)   # fa (A1): its own windows before, so the one the close raises is told
+        # fa (A1, review M2): its own windows and its process's before, so the one the close raises is told
+        owned_before = windows_before(hwnd)
         win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
         # percFix: live 5 Oct Arc took longer than 2 s to close and was reported "still open" (it had closed a few
         # seconds later). The wait is longer now, and it ends at once on what "it is asking something" looks like:
