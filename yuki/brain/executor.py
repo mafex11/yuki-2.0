@@ -197,8 +197,14 @@ LINE_OPEN_NOT_PLAYING = "{line}, but it isn't playing."
 #: fe (E4): the replan's report of it, for the planner (code's words; ``{App}``: the browser as people say it).
 NOT_PLAYING_EXPECTED = ("what the page opened playing in {App}: it is on a site where most of their own time has media "
                         "playing, and the plan's target names the thing")
-NOT_PLAYING_SEEN = ("the page is open, but nothing plays: the look after acting measured no media start and {App} makes "
-                    "no sound. If their words asked for only the page, it is done")
+#: Review F1: a key or a click on the player toggles it, so on a player that starts late it pauses what they asked for;
+#: a player's play control is named for what pressing it does, so a step on it by the name a read shows now misses
+#: once it plays (a mismatch) instead of pausing it. ``{seconds}``: how long the sound was read (code's fact).
+NOT_PLAYING_SEEN = ("the page is open, but nothing plays: the look after acting measured no media start and {App} made "
+                    "no sound for {seconds} s. A key or a click on the player itself toggles it, so it would pause a "
+                    "player that starts late; the player's play control is named for what pressing it does, so a step "
+                    "on that control by the name a read shows now misses once it plays. If their words asked for only "
+                    "the page, it is done")
 #: fe (E4): a site is one the user plays media on when, over the last MEDIA_SITE_DAYS, at least MEDIA_SITE_SHARE of
 #: their own time with it in front had the app's media playing (the timeline's ``media_s`` against its present time,
 #: counts of their own rows), measured over at least MEDIA_SITE_MIN_S. Measured 19 Oct on a copy of their memory:
@@ -207,8 +213,11 @@ MEDIA_SITE_DAYS = 30.0
 MEDIA_SITE_SHARE = 0.5
 MEDIA_SITE_MIN_S = 10 * 60.0
 #: fe (E4): how long the browser's own sound is read before a page is said not playing (s; ``done.wait_read`` stops at
-#: the first read that hears it, so a page that starts late is never said silent).
-NOT_PLAYING_WAIT_S = 1.5
+#: the first read that hears it, so a page that starts late is never said silent). Review F1: 1.5 s was at the edge of
+#: this very site (ONE's run of k_resume_anime autoplayed ~1.4 s after its done line); an iframe player or a pre-roll
+#: starts at 2-3 s. Re-read on the page window's own UI Automation changes, and once more at the end
+#: (:meth:`Executor._not_playing`). Only a candidate pays: a page on a media site, with an item, nothing started.
+NOT_PLAYING_WAIT_S = 4.0
 #: Where a placed window went, in words: another monitor, else a half of the same one (else ``place_here``).
 TIDY_WHERE: dict[str, str] = {"other": "your other screen", "left": "the left half", "right": "the right half"}
 #: aBrain (phase 2.3; 18 Oct live A: "Opening a page in Google Chrome." and "Clicking in Google Chrome." said by code
@@ -816,8 +825,11 @@ class Executor:
         #: fe (E4): the done result whose background re-check no longer speaks (its plan went back to the planner)
         self._recheck_moot: Any = None
         #: fe (E4): the page line of a plan that went back to the planner because nothing plays ("<item> is open in
-        #: Chrome."), said first in the next plan's line as an earlier part is (:meth:`begin`); "" none
+        #: Chrome."), said first in a later plan's line as an earlier part is, while that page stands
+        #: (:meth:`_opened_line`); "" none. Its site (``donecheck.site_key``) and the plan revision that opened it.
         self._opened_said = ""
+        self._opened_site = ""
+        self._opened_rev = -1
         _warm_desk()
         self._reset_plan()
         self._skill_context()
@@ -864,11 +876,11 @@ class Executor:
         if self._result is not None and self._result.status == "mismatch":
             self.replans += 1          # a replan after a mismatch counts; one after the user's own words does not
         if self._result is not None and self._result.status != "steer":
-            self._parts_before = self._done_parts()
-            if self._opened_said and self._opened_said not in self._parts_before:
-                # fe (E4): the page the plan before opened, its check seeing it, went back only because nothing
-                # plays: the next plan's line says it first ("<item> is open in Chrome; Chrome is playing.")
-                self._parts_before.append(self._opened_said)
+            # fe (E4, review F3): the page line of a plan that went back because nothing plays is never kept here; each
+            # later plan says it only while that page stands (:meth:`_opened_line`)
+            self._parts_before = self._done_parts(opened=False)
+        if self._opened_said and self.revision != self._opened_rev and not self._opened_line():
+            self._opened_said = ""   # fe (review F3): a later plan took that page off; no plan after it says it
         self._reset_plan()
         self.revision += 1
         self.head = head
@@ -3472,10 +3484,55 @@ class Executor:
         return done.part_result(run.outcome, drafted=run.drafted, sends=sends, type_after=run.type_after,
                                 typed=run.typed, several=several)
 
-    def _done_parts(self, exclude: _SkillRun | None = None) -> list[str]:
-        """The lines of the request's ``run_skill`` parts whose own check saw them done, each once: earlier plans'
-        (kept by :meth:`begin`) and this plan's, ``exclude`` aside (the part the line itself is about)."""
+    def _moves_page(self) -> bool:
+        """fe (review F3): whether a step of this plan may take a page off its window: it opens an address, acts on a
+        tab, or closes a window (the plan's own verbs and closed values). Steps not run yet count (say less)."""
+        try:
+            from yuki.brain.plan import window_op
+        except ImportError:   # a branch without bCore's plan.py: the value as written
+            def window_op(value: Any) -> str:
+                return " ".join(str(value or "").split()).casefold()
+        for step in self.steps:
+            verb = self._verb(step)
+            if verb in ("open_url", "tab") or (verb == "window_action"
+                                               and window_op(field_of(step, "value", "")) == "close"):
+                return True
+        return False
+
+    def _opened_line(self) -> str:
+        """fe (E4, review F3): the page line of an earlier plan of this request that went back because nothing plays
+        (:meth:`_not_playing`), for this plan's line, while that page stands: this plan neither opens an address, acts
+        on a tab nor closes a window (:meth:`_moves_page`), and its own page check, if any, reads that page's site.
+        ``""`` otherwise, and in the plan that opened it (its mismatch line says it). Never raises."""
+        if not self._opened_said or self.revision == self._opened_rev:
+            return ""
+        try:
+            if self._moves_page():
+                return ""
+            probe, args, _why = done.plan_done(self.head)
+            if probe == "page_at":
+                from yuki.skills.donecheck import site_key
+
+                if args is None or site_key(args.get("site")) != self._opened_site:
+                    return ""
+        except Exception:  # noqa: BLE001 - not read: not said
+            return ""
+        return self._opened_said
+
+    def _before(self) -> list[str]:
+        """The earlier plans' done parts (:meth:`begin`), with an earlier plan's page line while it stands
+        (:meth:`_opened_line`), each once."""
         out = list(self._parts_before)
+        opened = self._opened_line()
+        if opened and opened not in out:
+            out.append(opened)
+        return out
+
+    def _done_parts(self, exclude: _SkillRun | None = None, *, opened: bool = True) -> list[str]:
+        """The lines of the request's ``run_skill`` parts whose own check saw them done, each once: earlier plans'
+        (kept by :meth:`begin`) and this plan's, ``exclude`` aside (the part the line itself is about). ``opened``: with
+        the page line of an earlier plan that went back because nothing plays, while that page stands (fe, E4)."""
+        out = self._before() if opened else list(self._parts_before)
         for run in self.skill_outcomes:
             if run is exclude:
                 continue
@@ -3493,7 +3550,7 @@ class Executor:
         whose every act step is a skill and whose ``done`` is none is decided by its parts alone (kBrain: a request of
         two parts, a playlist and a level, is one plan with a part per skill, each checked by its own skill)."""
         runs = list(self.skill_outcomes)
-        before = self._parts_before
+        before = self._before()
         probe, args, _why = done.plan_done(self.head)
         only_skills = all(self._verb(s) == "run_skill" for s in self.steps if self._verb(s) in ACT_VERBS)
         if (runs or before) and probe == done.NONE and only_skills:
@@ -3762,15 +3819,16 @@ class Executor:
             return index, words(self._open_pages.get(index)), self._open_hwnds.get(index), image, args
         return None
 
-    def _still_titled(self, hwnd: int | None, title: str) -> bool:
+    def _still_titled(self, hwnd: int | None, title: str, *, fresh: bool = False) -> bool:
         """Whether the window ``hwnd`` still shows a page of that title now: its window title (the after-look's read
-        of the desk, else the window list) holds the title as the page's own report read it (casefolded, whitespace
-        squashed). A changed tab, a page that navigated on, or a window gone: ``False``. Never raises."""
+        of the desk, else the window list; ``fresh``: the window list read now) holds the title as the page's own
+        report read it (casefolded, whitespace squashed). A changed tab, a page that navigated on, or a window gone:
+        ``False``. Never raises."""
         want = " ".join(str(title or "").split()).casefold()
         if not want or hwnd is None:
             return False
         try:
-            seen = self._after_seen.window(hwnd) if self._after_seen is not None else None
+            seen = self._after_seen.window(hwnd) if self._after_seen is not None and not fresh else None
             shown = getattr(seen, "title", None) if seen is not None else None
             if shown is None:
                 _found, entry = done.window_of(self.dispatcher, int(hwnd), lock=self._dispatch_lock)
@@ -3879,11 +3937,14 @@ class Executor:
         gets one turn to press play. Opened to be played: a pick plan (the planner's own check) whose target names the
         thing (``target.item``), its page check read the page open (:meth:`_page_opened`), and the page is on a site
         the user plays media on (:meth:`_site_plays`: their own measured time). Nothing plays: the after-look read the
-        media on both sides and no session went to playing, and the browser makes no sound (``audio_active``, read for
-        at most :data:`NOT_PLAYING_WAIT_S`, so a page that starts late is not said silent). Then, once a request (the
-        one done replan, :attr:`_done_replan`) and within the replans: a mismatch on the final check (``not_playing``)
-        with those facts and the window's view, its line :data:`LINE_OPEN_NOT_PLAYING` if the request ends there;
-        with none left, that line is the done's own at level ``likely``. ``base``: the page's open line
+        media on both sides and no session went to playing, and the browser makes no sound (``audio_active``, read on
+        the page window's own UI Automation changes and once more at the end of :data:`NOT_PLAYING_WAIT_S`, so a page
+        that starts late is not said silent), and that window still shows the page, read after the wait (review F2;
+        no window or title to read: no claim). Then, once a request (the one done replan, :attr:`_done_replan`) and
+        within the replans: a mismatch on the final check (``not_playing``) with those facts and the window's view,
+        its line :data:`LINE_OPEN_NOT_PLAYING` if the request ends there (the next plans say the page's line first
+        while that page stands, :meth:`_opened_line`); with none left, that line is the done's own at level
+        ``likely``. ``base``: the page's open line
         (:meth:`_page_named`). ``None``: nothing to do. Measured facts and the plan's own fields only; never raises."""
         found = result.done
         if not base or found is None or result.status != "done":
@@ -3900,36 +3961,61 @@ class Executor:
             page = self._page_opened(found)
             if page is None:
                 return None
-            index, _title, hwnd, image, _args = page
+            index, title, hwnd, image, args = page
             if not str(image).casefold().endswith(".exe"):
                 return None   # the browser's program isn't known: its sound can't be read
+            if hwnd is None or not title:
+                return None   # review F2: the window showing that page can't be read again, so nothing is said of it
             call = self._ran_calls.get(index)
             if self._site_plays(call.input.get("url") if call is not None else "") is not True:
                 return None
             env = done.ProbeEnv(since=self.started, dispatcher=self.dispatcher, memory=self.host.memory,
                                 lock=self._dispatch_lock)
+            began = time.monotonic()
+            # review F1: re-read on the page window's own UI Automation changes (a player that starts renames its
+            # control, its clock moves), else at done.REREAD_AT_S; stops at the first read that hears it
             sound, _evidence, reads = done.wait_read("audio_active", {"process": image}, env,
-                                                     budget_s=NOT_PLAYING_WAIT_S, cancelled=self.host.cancelled)
+                                                     budget_s=NOT_PLAYING_WAIT_S, hwnd=hwnd,
+                                                     cancelled=self.host.cancelled)
+            if sound is False:
+                # once more at the budget's end: a sound that began with no window change after it, or after the
+                # fixed moments, is heard (one read; the wait ends early on a cancel)
+                end = began + NOT_PLAYING_WAIT_S
+                while not self.host.cancelled() and time.monotonic() < end:
+                    threading.Event().wait(min(0.2, max(0.0, end - time.monotonic())))
+                if self.host.cancelled():
+                    return None
+                sound, _evidence = done.read("audio_active", {"process": image}, env)
+                reads += 1
+            waited = time.monotonic() - began
             if sound is not False:
                 self._emit_log("done_not_playing", held=False, sound=sound is True, reads=reads)
                 return None
+            if not self._still_titled(hwnd, title, fresh=True):
+                # review F2: that window no longer shows the page (a tab changed, it navigated on, it closed): no
+                # claim on it, and no view of another page handed to the planner to press play on
+                self._emit_log("done_not_playing", held=False, shown=False, reads=reads)
+                return None
+            from yuki.skills.donecheck import site_key
+
+            site = site_key(args.get("site"))
         except Exception as exc:  # noqa: BLE001 - the done stands as it read
             self._emit_log("done_not_playing", error=type(exc).__name__)
             return None
         app = util.app_name(image)
         said = LINE_OPEN_NOT_PLAYING.format(line=base.rstrip(". "))
         again = not self._done_replan and self.replans < self.max_replans and not self.host.cancelled()
-        self._emit_log("done_not_playing", held=True, replan=again, reads=reads)
+        self._emit_log("done_not_playing", held=True, replan=again, reads=reads, waited_s=round(waited, 1))
         if again:
             self._done_replan = True   # the request's one done replan, as for a done that read "not so"
             self._recheck_moot = found
-            self._opened_said = base
+            self._opened_said, self._opened_site, self._opened_rev = base, site, self.revision
             self.last_failed = {"step": None, "verb": "done", "words": "the final check", "seen": "nothing plays"}
             return RunResult("mismatch", plan_id=self.plan_id, statuses=list(self.statuses), done=found,
                              mismatch=Mismatch(step=len(self.steps) - 1, verb="done", why="not_playing",
                                                expected=NOT_PLAYING_EXPECTED.format(App=app),
-                                               seen=NOT_PLAYING_SEEN.format(App=app),
-                                               view=self._view(hwnd or self.last_act.get("hwnd"))),
+                                               seen=NOT_PLAYING_SEEN.format(App=app, seconds=f"{round(waited):d}"),
+                                               view=self._view(hwnd)),
                              line=said)
         found.line = said
         if found.level == util.VERIFIED:
