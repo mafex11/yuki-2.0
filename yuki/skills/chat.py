@@ -1206,7 +1206,9 @@ def _tidy_switch(call: RouteCall, hands: Any, data: Mapping[str, Any], run: dict
 
     gb (B2): the close key goes as the run's own undo of the field it opened (``opened``, :func:`_close_own`). gb (B3,
     contract K-S): ``run["switcher_held"]`` (bool, measured by the focus read; left out when it can't be told, or when
-    the user took over): what the shortcut opened still holds the keyboard as the run ends."""
+    the user took over): what the shortcut opened still holds the keyboard as the run ends. After a close key it is
+    told only of ``opened`` (the field measured taking the keyboard after the shortcut), never of a holder merely read
+    later (gb review F3: with the holder before the shortcut unread, that may be the app's own composer)."""
     if run.get("took_over_at"):
         run["switcher_closed"] = "theirs"
         return
@@ -1228,19 +1230,21 @@ def _tidy_switch(call: RouteCall, hands: Any, data: Mapping[str, Any], run: dict
     sent = _close_own(call, hands, data, apps=apps, key=key, field=opened)
     if sent != "sent":
         run["switcher_closed"] = sent
-        _mark_held(run, hands, held_by)
+        # gb review F3: ``switcher_held`` only from what the shortcut was measured opening (``opened``); with none seen,
+        # the holder now may be the app's own composer (the holder before the shortcut unread): left out, unknown
+        _mark_held(run, hands, opened)
         return
     deadline = call.ctx.clock() + SWITCHER_WAIT_S
     while True:
         after = _ident(_holder(hands))
         if after is not None and after != held_by:
             run["switcher_closed"] = "yes"
-            if held_by is not None:
+            if opened is not None:
                 run["switcher_held"] = False
             return
         if call.ctx.clock() + POLL_S > deadline:
             run["switcher_closed"] = "unknown" if after is None else "no"
-            if after is not None and held_by is not None:
+            if after is not None and opened is not None:
                 run["switcher_held"] = True   # measured: what it opened still holds the keyboard after its close key
             return
         call.ctx.sleep(POLL_S)
@@ -1370,11 +1374,11 @@ def _board_refresh(hwnd: int) -> bool:
 def _other_chat(store: Any, tid: int | None, ids: set[int], person_id: int | None) -> dict[str, Any]:
     """gb (B6, final-G2 R13's trigger lead: the deep link opened the right person's DM, yet the board's read named a
     thread outside the route's ids): content-free facts of that read. ``other_ids``: how many thread ids the route
-    had; ``other_thread``: ``known`` (memory has a thread for the window in front) or ``unknown``; with the person's id
-    in memory's people index, ``other_same_person``: whether that thread is on one of that same person's own routes
-    (``contacts.contacts_of_threads``: identity), and ``other_holders``: how many of their people hold a route on it.
-    Counts and booleans only. Never raises."""
-    out: dict[str, Any] = {"other_ids": len(ids), "other_thread": "unknown" if tid is None else "known"}
+    had; ``other_known``: whether memory has a thread for the window in front (a bool: gb review F4, a string here
+    would be logged as its length); with the person's id in memory's people index, ``other_same_person``: whether that
+    thread is on one of that same person's own routes (``contacts.contacts_of_threads``: identity), and
+    ``other_holders``: how many of their people hold a route on it. Counts and booleans only. Never raises."""
+    out: dict[str, Any] = {"other_ids": len(ids), "other_known": tid is not None}
     if tid is None or person_id is None:
         return out
     try:
@@ -1389,7 +1393,7 @@ def _other_chat(store: Any, tid: int | None, ids: set[int], person_id: int | Non
 
 
 #: gb (B6): the content-free facts :func:`_other_chat` adds to an ``other_chat`` read, carried to the route's facts.
-OTHER_CHAT_FACTS = ("other_ids", "other_thread", "other_same_person", "other_holders")
+OTHER_CHAT_FACTS = ("other_ids", "other_known", "other_same_person", "other_holders")
 
 
 def chat_state(store: Any, thread_ids: Sequence[int], data: Mapping[str, Any], since: float,
@@ -2093,6 +2097,7 @@ def route_switcher(call: RouteCall) -> RouteResult:
     tidy = _switch_facts(run, steps)
     stop = _stopped(run, app, acted=done > 0)
     if stop is not None:
+        # gb (K-S, review F2): the stop keeps its own outcome (the engine acts on it); ``switcher_held`` rides its facts
         stop.facts.update(tidy)
         return stop
     if run.get("switcher") == "unseen":
@@ -2157,7 +2162,10 @@ def _stop_word(run: Mapping[str, Any]) -> str:
 def _switch_outcome(run: Mapping[str, Any], word: str) -> str:
     """gb (B3, contract K-S): a switcher run that ends with what its own shortcut opened still holding the app's
     keyboard (measured, ``run["switcher_held"]``) ends ``switcher_held``, so the rungs tried (the hand-off's seed, the
-    talker's evidence) say so in code; otherwise its own word (``switcher_unseen`` / ``switcher_failed``)."""
+    talker's evidence) say so in code; otherwise its own word (``switcher_unseen`` / ``switcher_failed``). Only on
+    these two ends: a run :func:`_stopped` ended (``to_planner``, ``held_by_check``, ``taken_over``, ``refused``) and
+    the ``own_left`` path (``not_typed``) keep their own outcome, which the engine acts on, and carry the measured
+    ``facts["switcher_held"]`` alone (gb review F2): the engine copies it onto its ``tried`` entry (lane D)."""
     return "switcher_held" if run.get("switcher_held") is True else word
 
 

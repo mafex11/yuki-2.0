@@ -2022,8 +2022,11 @@ class Hands:
         * ``typed_field_held`` (bool, ``None`` unread): that field holds the keyboard now (this step's focus read);
         * ``typed_to_field`` (bool, ``None`` unknown): this step goes to a field holding Yuki's text: a key or typing
           goes where the keyboard is, a click to its own control (that field's role and name in this window); ``None``
-          for a field that couldn't be read, a focus read that failed, or another kind of step (the reader then keeps
-          today's window-wide flag).
+          for a field that couldn't be read, a focus read that failed, a keyboard holder that is no text field (a
+          focused Send button), or another kind of step (the reader then keeps today's window-wide flag). ``False``
+          means only "the keyboard is in another text field" (a key, typing) or "the click is on another control",
+          never "this step cannot submit it": Yuki's unsent text still waits in this window (an app's send key works
+          from another field), and only K-U's ``own_undo`` may take a step out of the send row.
 
         Measured identity only (the focus read's window, native window, role and name), never the user's words."""
         records = self._typed_live(hwnd)
@@ -2038,9 +2041,12 @@ class Hands:
         to: bool | None = None
         pick = known[-1]
         if tool in ("press", "hotkey", "type_text"):
+            # gb review F1: False only when another readable text field holds the keyboard; a holder that is no text
+            # field (a focused Send button) is unknown here (a key on it may submit the window's text): None, so the
+            # reader keeps the window-wide line
             if read and held is not None and held in known:
                 to, pick = True, held
-            elif read:
+            elif read and held is not None:
                 to = None if unknown else False
         elif tool == "click":
             role = " ".join(str(facts.get("role") or "").split()).casefold()
@@ -7656,10 +7662,11 @@ class Hands:
                            f"they said; if none is, call it again exactly as before. Nothing was done", shape=True,
                            reason="no_match_words")
         if within:
-            # gb (B4): no tab of theirs in the browser they named holds those words: said so, naming it; a tab of
-            # another browser is never shown in its place (it may be the very one they asked to get away from)
-            raise _Refused(f"no tab of {within}'s holds those words (only {within}'s windows were looked at, as they "
-                           f"named it); nothing was done", stale=True, reason="no_match")
+            # gb (B4): no tab of theirs in the browser the call named holds those words: said so, naming it; a tab of
+            # another browser is never shown in its place (it may be the very one they asked to get away from). gb
+            # review F5: "as the call named it", since ``app`` may be the caller's own reading, not the user's word
+            raise _Refused(f"no tab of {within}'s holds those words (only {within}'s windows were looked at, as the "
+                           f"call named it); nothing was done", stale=True, reason="no_match")
         raise _Refused("no tab's title holds those words in the windows looked at; nothing was done", stale=True,
                        reason="no_match")
 
