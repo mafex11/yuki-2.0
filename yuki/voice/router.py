@@ -16,9 +16,13 @@ never runs under ``brain = "all"`` or ``one``: ``yuki.voice.mouth.router_on``).
 **The end** (D1, 20 Oct 2026; keyword audit A1): the same call also judges whether the user is ending the conversation
 (``to = "end"``), under every brain (``Settings.voice_router_end``, :func:`ends_on`). The fast "go away" word list it
 replaces ended "stop" said about the music, and "not now" or "cancel" answering a question, with no model; the router
-judges the intent from the words, the earlier turns and the screen summary, so a dismissal still ends in ~1.5-2 s. The
-pipeline acts on it only when nothing waits for the user's words or runs for them (a task's question, a held call, a
-hand at work), and only while the talker has not begun its own reply to the same words. While a send of theirs counts
+judges the intent from the words, the earlier turns and the screen summary. The pipeline acts on it only when nothing
+waits for the user's words or runs for them (a task's question, a held call, a hand at work). gc (final-G2 C1, the
+kw1 regression p24_hinglish_garbled: the router ended a conversation silently on garbled first words, a second before
+the agent's own reply): the end of a conversation waits, bounded, for the talker's own reply to the same words and
+acts only when that reply has no words and no call but stay_quiet (two judgements agree; a dismissal ends at about
+2.5-3.5 s), never on the first words of a conversation the user opened themselves before anything of Yuki's was heard
+(S10's facts), and the router is told when Yuki has not spoken yet (:data:`FRESH_LINE`). While a send of theirs counts
 down, ``end`` also means they call it off: the send is stopped at once, nothing sent, even when the talker answered
 first or they spoke again since (a wrong stop never sends); a held countdown waits for that verdict (integ23 S1, S2).
 
@@ -69,7 +73,8 @@ screen is true when doing it needs what is inside the window in front (a video, 
 
 They end the conversation (to = end) when the whole turn sends Yuki away or signs off and asks for nothing \
 more now. Judge what they mean, never single words: what answers a question Yuki just asked is that answer (to = \
-talker), and stop, pause or off said about something playing or running is about that (a hand: talker). While a \
+talker), and stop, pause or off said about something playing or running is about that (a hand: talker). Words that \
+make no sense as heard are never an end: the talker asks what they meant. While a \
 message of theirs counts down to send, words that call it off (they do not want it sent) are an end too: nothing \
 is sent; words that change it (another person, more text) are the talker's. On a call, when words that would end \
 the conversation could be for Yuki, end: a wrong end costs them only her name, while staying listens in on the call. \
@@ -146,6 +151,9 @@ def skills_line(menu: str | None) -> str:
 #: to Yuki by name (the wake word's evidence), and a send of theirs is counting down now.
 NAMED_LINE = "[They said these words to Yuki by name.]"
 SENDING_LINE = "[A message of theirs is counting down to send right now; it goes unless it is stopped.]"
+#: gc (final-G2 C1, p24_hinglish_garbled): nothing of Yuki's has been heard in this conversation yet (measured: no word
+#: of hers left the speaker), so these are the first words she answers.
+FRESH_LINE = "[Yuki has not spoken yet in this conversation.]"
 
 
 def ends_on(settings: Any) -> bool:
@@ -156,10 +164,11 @@ def ends_on(settings: Any) -> bool:
 
 def router_request(words: str, *, history: list[tuple[str, str]] | None = None, desk: str | None = None,
                    call: str | None = None, model: str = "", skills: str | None = None, named: bool = False,
-                   sending: bool = False) -> dict[str, Any]:
+                   sending: bool = False, fresh: bool = False) -> dict[str, Any]:
     """The router's request: its prompt, the forced tool, and one user message with the turn's inputs. ``skills``:
     the talker's Skills menu this conversation (each skill's key and what it does go on a Skills line). ``named``:
-    the words were said to Yuki by name (measured); ``sending``: a send of theirs is counting down (measured)."""
+    the words were said to Yuki by name (measured); ``sending``: a send of theirs is counting down (measured);
+    ``fresh`` (gc C1): nothing of Yuki's has been heard in this conversation yet (measured)."""
     lines: list[str] = []
     line = skills_line(skills)
     if line:
@@ -168,6 +177,8 @@ def router_request(words: str, *, history: list[tuple[str, str]] | None = None, 
         lines.append(f"[They are on a voice call on {call}: most of what they say is for the people on it.]")
     if named:
         lines.append(NAMED_LINE)
+    if fresh:
+        lines.append(FRESH_LINE)
     if sending:
         lines.append(SENDING_LINE)
     past = list(history or [])[-4:]
@@ -248,5 +259,5 @@ async def decide(client: Any, request: dict[str, Any], *, timeout_s: float = DEC
     return route
 
 
-__all__ = ["DECIDE_TIMEOUT_S", "NAMED_LINE", "ROUTER_PROMPT", "ROUTES", "ROUTE_TOOL", "Route", "SENDING_LINE", "decide",
-           "ends_on", "router_request", "skills_line"]
+__all__ = ["DECIDE_TIMEOUT_S", "FRESH_LINE", "NAMED_LINE", "ROUTER_PROMPT", "ROUTES", "ROUTE_TOOL", "Route",
+           "SENDING_LINE", "decide", "ends_on", "router_request", "skills_line"]
