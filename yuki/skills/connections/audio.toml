@@ -24,7 +24,11 @@ state_reader = "spotify_route"
 [capability.volume]
 end = "volume_change"
 kind = "change"
-menu = "what plays; or a named app, PC (system), Yuki's voice (own_voice)"
+# gd D4 (final-G2 spotify_mute, both brains: "Silence Spotify for a bit" paused it in 2 of 3 runs once release 27's
+# line stopped saying what this skill changes): the end states it gives, the sound's volume, or mute (the sound off
+# while it plays on, never held still: that is the media key's pause), then whose (what plays, else a named app, the
+# PC or Yuki's own voice). Within the menu line's 140 characters (MENU_LINE_CHARS) with the change slot's form kept.
+menu = "volume or mute (plays on silent): what plays; app/system/own_voice"
 done_line = "Volume set."
 offer_class = "everyday"
 handoff = true
