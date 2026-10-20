@@ -9,37 +9,37 @@ from __future__ import annotations
 from typing import Any
 
 #: SHA-256 of the tokens.json this was generated from (line endings normalised).
-SOURCE_SHA256 = "db3f6452fbad17d978fc43605bbfdc4470d9605de62ffbdc02845cd08624a318"
+SOURCE_SHA256 = "617d1fd6f96eefbc5ccaf4ee2d07c96b8d126084a6e14cb61683318058b0d45b"
 
 #: The accent a fresh install uses (``ui.json`` ``accent``).
-DEFAULT_ACCENT = "green"
+DEFAULT_ACCENT = "orange"
 
 #: Colours: sRGB hex, or ``rgba(...)`` strings where the design carries alpha.
-COLOR: dict[str, Any] = {'bg': '#0B0B0C',
- 'panel': '#0B0B0C',
- 'raise': '#121214',
- 'raise2': '#18191B',
- 'dot': '#26292C',
- 'dotFace': '#2A2D31',
+COLOR: dict[str, Any] = {'bg': '#090705',
+ 'panel': '#090705',
+ 'raise': '#120F0C',
+ 'raise2': '#1A1613',
+ 'dot': '#292521',
+ 'dotFace': '#2F2A26',
  'lit': '#F2EFE9',
  'text': '#F2EFE9',
  'text2': '#B4B0A8',
  'text3': '#8A8780',
- 'hair': '#1E2023',
- 'hair2': '#2B2E32',
- 'mark': '#474B50',
- 'surfaceBorder': '#2A2D31',
- 'panelBorder': '#34373C',
- 'live': '#6FEBC4',
- 'liveInk': '#062419',
- 'liveDim': 'rgba(111,235,196,0.12)',
+ 'hair': '#211D1A',
+ 'hair2': '#2F2A26',
+ 'mark': '#4C4742',
+ 'surfaceBorder': '#2F2A26',
+ 'panelBorder': '#38332E',
+ 'live': '#FF6A1A',
+ 'liveInk': '#1F0D03',
+ 'liveDim': 'rgba(255,106,26,0.12)',
  'midTone': '#96938C',
- 'haloBacking': ['rgba(11,11,12,0.94) 0%', 'rgba(11,11,12,0.86) 62%', 'rgba(11,11,12,0) 100%'],
- 'contrastOnBg': {'text': '17.1:1',
-                  'text2': '9.1:1',
-                  'text3': '5.5:1',
-                  'live': '13.4:1',
-                  'liveInkOnLive': '11.4:1'},
+ 'haloBacking': ['rgba(9,7,5,0.94) 0%', 'rgba(9,7,5,0.86) 62%', 'rgba(9,7,5,0) 100%'],
+ 'contrastOnBg': {'text': '17.5:1',
+                  'text2': '9.3:1',
+                  'text3': '5.6:1',
+                  'live': '7.0:1',
+                  'liveInkOnLive': '6.6:1'},
  'rules': 'live is the only colour and only marks something live: listening, the working head, rec, needs-you, '
           'Stop. Primary keys are lit (bone), never coloured.'}
 
@@ -95,7 +95,7 @@ FIELD: dict[str, Any] = {'window': {'pitchPx': 12,
  'easeK': 0.2,
  'blendK': 0.16,
  'spriteLevels': 16,
- 'tones': {'lit': '#F2EFE9', 'live': '#6FEBC4', 'mid': '#96938C'},
+ 'tones': {'lit': '#F2EFE9', 'live': '#FF6A1A', 'mid': '#96938C'},
  'litAlpha': [0.2, 1.0],
  'settleEpsilon': 0.003,
  'states': {'listening': 'ring r=7.6 cells (+-0.3 breathing at 2.4 rad/s), live read head orbiting at 1.9 '
@@ -141,15 +141,15 @@ ISLAND: dict[str, Any] = {'heightPx': 74,
  'maxWidthPx': 760,
  'topPx': 12,
  'captionIndentPx': 162,
- 'border': '#2A2D31',
+ 'border': '#2F2A26',
  'windowSizePx': 'pill + halo: up to 760 x (pill + 172)'}
 
 #: Corner cards' geometry (px).
 CARD: dict[str, Any] = {'widthPx': 416, 'rightPx': 20, 'bottomPx': 64, 'paddingPx': [16, 18], 'cropMarkPx': 9}
 
 #: Settings > Accent: the live colour per choice (``ui.json`` ``accent``).
-ACCENTS: dict[str, Any] = {'green': {'label': 'Mint', 'live': '#6FEBC4', 'liveInk': '#062419', 'liveDim': 'rgba(111,235,196,0.12)'},
- 'orange': {'label': 'Orange', 'live': '#FFA46B', 'liveInk': '#2A1104', 'liveDim': 'rgba(255,164,107,0.12)'}}
+ACCENTS: dict[str, Any] = {'orange': {'label': 'Ember', 'live': '#FF6A1A', 'liveInk': '#1F0D03', 'liveDim': 'rgba(255,106,26,0.12)'},
+ 'green': {'label': 'Mint', 'live': '#6FEBC4', 'liveInk': '#062419', 'liveDim': 'rgba(111,235,196,0.12)'}}
 
 #: Bundled font file per family (in ``yuki/ui/fonts``).
 FONT_FILES: dict[str, Any] = {'Doto': 'Doto.ttf', 'Instrument Sans': 'InstrumentSans.ttf', 'JetBrains Mono': 'JetBrainsMono.ttf'}

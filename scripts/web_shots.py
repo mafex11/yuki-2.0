@@ -28,7 +28,7 @@ SHOTS: dict[str, str] = {
     "home-thread": "page=home&thread=1",
     "home-state-working": "page=home&state=working",
     "home-reduced": "page=home&motion=reduced",
-    "home-orange": "page=home&accent=orange&state=listening",
+    "home-mint": "page=home&accent=green&state=listening",   # (20 Oct) the other accent: ember is the default now
     "work": "page=work",
     "work-day": "page=work/day&scrub=1185",
     "me": "page=me",

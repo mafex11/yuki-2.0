@@ -60,8 +60,10 @@
       const pages = shiftTimes(F.pages, delta, '');
       const shell = shiftTimes(F.shell, delta, '');
       const chat = shiftTimes(F.chat, delta, '');
+      // (20 Oct) the accent knob also presses its swatch on Settings, so a shot of either accent shows its own choice
+      if (q.get('accent') && pages.settings && pages.settings.appearance) pages.settings.appearance.accent = q.get('accent');
       later({ kind: 'boot', source: 'fixture', shell: shell, pages: pages, chat: chat,
-        appearance: { accent: q.get('accent') || 'green', reduce_motion: q.get('motion') === 'reduced' }, engine: 'web' });
+        appearance: { accent: q.get('accent') || 'orange', reduce_motion: q.get('motion') === 'reduced' }, engine: 'web' });
       return;
     }
     if (msg.op === 'act' && msg.id) {

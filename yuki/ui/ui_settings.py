@@ -7,6 +7,10 @@ which applies a change live when the window tells it over the pipe
 newer build can share the file; the Liquid Glass keys retired on 2026-09-27
 (glass, bending, blur, transparency, light/dark, background) are ignored when
 read and dropped on the next save.
+
+The accent (20 Oct): ember orange ("orange", the website's colour) is the default; Mint ("green") was until then, and
+every install that ever saved the file wrote it, chosen or not. So a file without :data:`ACCENT_REV` reads its "green"
+as the old default and moves to ember, once: the next save writes the mark, and a Mint picked after that stays.
 """
 
 from __future__ import annotations
@@ -22,6 +26,11 @@ from yuki.ui import tokens as _tokens
 #: Keys of the retired glass Appearance settings: ignored on load, removed on save.
 RETIRED = frozenset({"glass", "bend", "blur", "transparency", "appearance", "background"})
 
+#: (20 Oct) The accent default's revision: 1 = ember is the default. A file below it (an older build's, which has no
+#: ``accent_rev``) holding "green" got that as the old default, since every save wrote it, so it reads as ember once;
+#: the next save writes this, so a Mint picked later stays. Settings made here (a new install) start at it.
+ACCENT_REV = 1
+
 
 def settings_path() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
@@ -35,7 +44,7 @@ class UiSettings:
     maximized: bool = False
     open_hotkey: str = ""               # "Open Yuki anywhere": the overlay's shortcut ("" = the built-in default)
     quiet_last: list[str] | None = None  # the quiet hours to bring back when they are turned on again
-    accent: str = "green"               # the one accent colour: "green" (olive, default) | "orange"
+    accent: str = _tokens.DEFAULT_ACCENT   # the one accent colour: "orange" (ember, the default) | "green" (mint)
     window_engine: str = "web"          # what a tray click opens: "web" (the Lattice HTML window) | "qt" (native)
     web_window: list[int] | None = None  # the HTML window's x, y, w, h (physical px) when it last closed
     web_maximized: bool = False
@@ -43,6 +52,8 @@ class UiSettings:
     #: appTakeover: how far (px) the mouse must move while Yuki works for Yuki to pause (you took over); see
     #: :data:`TAKEOVER_MOVE_LABEL`. Kept within 12..400 (``yuki.actions.leases.takeover_move_px``).
     takeover_move_px: int = 40
+    #: Which accent default this file has seen (:data:`ACCENT_REV`; a file without it is older, see the module doc).
+    accent_rev: int = ACCENT_REV
 
 
 #: The plain-words label and hint for ``takeover_move_px`` on the Settings page (appTakeover).
@@ -75,7 +86,8 @@ RECORD_LEAVE_OUT_HINT = "Nothing you do in these apps is noted."
 WINDOW_ENGINES: tuple[str, ...] = ("web", "qt")
 
 #: The accent names a settings file may hold (the one token source, ``yuki/ui/web/tokens.json`` ``accent``;
-#: "green" is the Lattice mint; the colours are in :data:`yuki.ui.window.theme.ACCENTS`).
+#: "orange" is the website's ember and the default, "green" the Lattice mint; the colours are in
+#: :data:`yuki.ui.window.theme.ACCENTS`).
 ACCENT_NAMES: tuple[str, ...] = tuple(_tokens.ACCENTS)
 
 
@@ -86,7 +98,13 @@ def _clean(raw: dict[str, Any]) -> UiSettings:
     hotkey = " ".join(str(raw.get("open_hotkey") or "").split()).lower()
     last = raw.get("quiet_last")
     last = [str(v) for v in last][:2] if isinstance(last, list) and len(last) >= 2 else None
-    accent = str(raw.get("accent") or "green").strip().lower()
+    accent = str(raw.get("accent") or _tokens.DEFAULT_ACCENT).strip().lower()
+    try:
+        rev = int(raw.get("accent_rev") or 0)
+    except (TypeError, ValueError):
+        rev = 0
+    if rev < ACCENT_REV and accent == "green":   # the old default, saved: ember now (once, see ACCENT_REV)
+        accent = _tokens.DEFAULT_ACCENT
     engine = str(raw.get("window_engine") or "web").strip().lower()
     web = raw.get("web_window")
     web = [int(v) for v in web][:4] if isinstance(web, list) and len(web) >= 4 and all(
@@ -96,9 +114,10 @@ def _clean(raw: dict[str, Any]) -> UiSettings:
     except (TypeError, ValueError):
         move = 40
     return UiSettings(bool(raw.get("reduce_motion", False)), win, bool(raw.get("maximized", False)), hotkey, last,
-                      accent if accent in ACCENT_NAMES else "green", engine if engine in WINDOW_ENGINES else "web",
+                      accent if accent in ACCENT_NAMES else _tokens.DEFAULT_ACCENT,
+                      engine if engine in WINDOW_ENGINES else "web",
                       web, bool(raw.get("web_maximized", False)), bool(raw.get("island_resting", True)),
-                      takeover_move_px=move)
+                      takeover_move_px=move, accent_rev=ACCENT_REV)
 
 
 def load(path: Path | None = None) -> UiSettings:
@@ -154,4 +173,4 @@ def reload() -> UiSettings:
     return current()
 
 
-__all__ = ["UiSettings", "RETIRED", "ACCENT_NAMES", "WINDOW_ENGINES", "settings_path", "load", "save", "update", "current", "reload", "replace"]
+__all__ = ["UiSettings", "RETIRED", "ACCENT_NAMES", "ACCENT_REV", "WINDOW_ENGINES", "settings_path", "load", "save", "update", "current", "reload", "replace"]

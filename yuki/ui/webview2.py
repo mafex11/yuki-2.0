@@ -3,7 +3,7 @@
 The Yuki window is moving to HTML (the Lattice design) rendered by the WebView2 runtime that ships with Windows
 (docs/research/revamp-2026-10-02/08-ui-inventory.md §7). This module is the whole native side of that window:
 
-* a plain Win32 window (``CreateWindowExW``) with a graphite background, so nothing flashes white;
+* a plain Win32 window (``CreateWindowExW``) with the page's umber background, so nothing flashes white;
 * the WebView2 environment and controller, made through the official ``WebView2Loader.dll`` and called through
   their COM vtables (the layouts are the ones in Microsoft's ``WebView2.h``; the indices below were read from the
   SDK's interop metadata, ``Microsoft.Web.WebView2.Core.Raw``, on 2026-10-03);
@@ -452,7 +452,12 @@ class HostOptions:
     #: The Lattice frame: no Windows title bar (the page draws its own caption buttons), the system's resize borders
     #: and shadow kept, the page's title bar answered to Windows as caption / buttons (:func:`caption_hit`).
     frameless: bool = True
-    background: tuple[int, int, int] = (0x0B, 0x0B, 0x0C)
+    #: The window's and the WebView's own background before the page paints: the page's ``--bg`` (tokens.json
+    #: ``color.bg``; 20 Oct: the website's umber #090705, was graphite #0B0B0C).
+    background: tuple[int, int, int] = (0x09, 0x07, 0x05)
+    #: Windows 11's 1 px window border (``DWMWA_BORDER_COLOR``; 20 Oct: the page's ``--hair-2``, umber, as the native
+    #: window does with its cards' line, instead of the system's grey). ``None``: the system's own.
+    border: tuple[int, int, int] | None = (0x2F, 0x2A, 0x26)
     #: The app icon (``yuki/ui/yuki.ico``, every size): the window's taskbar button and Alt+Tab, each loaded at
     #: the exact size Windows asks for at this DPI (the .ico has 16 to 64 px frames). ``None``: Windows' default.
     icon: Path | None = None
@@ -779,6 +784,10 @@ class WebView2Host:
         if self.o.placement != "offscreen" or self.o.frameless:
             dark = c_int(1)   # a dark frame (DWMWA_USE_IMMERSIVE_DARK_MODE): the border and the system menu
             ctypes.windll.dwmapi.DwmSetWindowAttribute(wintypes.HWND(self.hwnd), 20, byref(dark), 4)
+            if self.o.border is not None:   # DWMWA_BORDER_COLOR, a COLORREF (0x00BBGGRR); Windows 10 ignores it
+                br, bg_, bb = self.o.border
+                ref = c_uint(br | (bg_ << 8) | (bb << 16))
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(wintypes.HWND(self.hwnd), 34, byref(ref), 4)
         if self.o.frameless:   # the frame is recalculated with no title bar (WM_NCCALCSIZE)
             user32.SetWindowPos(wintypes.HWND(self.hwnd), None, 0, 0, 0, 0,
                                 0x0020 | 0x0001 | 0x0002 | 0x0004 | 0x0010)   # FRAMECHANGED|NOSIZE|NOMOVE|NOZORDER|NOACTIVATE

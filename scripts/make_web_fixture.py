@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from yuki.ui import policy  # noqa: E402
+from yuki.ui import tokens  # noqa: E402
 from yuki.ui import web_data as W  # noqa: E402
 
 OUT = ROOT / "yuki" / "ui" / "web" / "fixtures" / "window.js"
@@ -758,7 +759,9 @@ def build() -> dict:
         "privacy": {"paused": False, "seen_min": 642, "seen_apps": 14, "blocked_sites": 3},
         "calls": [{"app": "Signal", "decision": "always"}, {"app": "Telegram", "decision": "ask"}, {"app": "Meet", "decision": "never"}],
         "call_knobs": W.call_knobs({}),
-        "appearance": {"accent": "green", "reduce_motion": False, "accents": [{"key": "green", "label": "Mint"}, {"key": "orange", "label": "Orange"}]},
+        # (20 Oct: the accent choices and the default from the one token source, as web_data sends them)
+        "appearance": {"accent": tokens.DEFAULT_ACCENT, "reduce_motion": False,
+                       "accents": [{"key": k, "label": v["label"]} for k, v in tokens.ACCENTS.items()]},
         "takeover": W.takeover_view(40),
         # Record how I work (report 78 C0): off and locked; one app already left out
         "record": W.record_view({"trace": {"leave_out": ["Banking app"]}}, ["VS Code", "Firefox", "Signal", "Calc", "Thunderbird", "Notes"]),

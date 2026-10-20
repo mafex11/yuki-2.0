@@ -520,9 +520,10 @@
     if (!Y.S.open.has('f:' + k)) { Y.S.open.add('f:' + k); Y.renderMain(); }
     Y.focusBlock(main.querySelector(`[data-k="${CSS.escape('f:' + k)}"]`), 'day-at', 'center');
   }
-  /* an item said to me ("Yuki, add …") slides into Your list once, with a mint flash. Until it lands, the row it
-     pushes past the first 6 stands in for it, folding away as it slides in, and "Show N more" keeps its count, so
-     nothing below moves (as the mock does; second review V1) */
+  /* an item said to me ("Yuki, add …") slides into Your list once, with a flash of the live colour (20 Oct: mixed from
+     --live, so it follows the accent; it was always mint). Until it lands, the row it pushes past the first 6 stands
+     in for it, folding away as it slides in, and "Show N more" keeps its count, so nothing below moves (as the mock
+     does; second review V1) */
   const ARRIVE_MS = 420;
   function arrive(main) {
     const w = W(), list = main.querySelector('.wk-list .wrows');
@@ -549,7 +550,7 @@
       const hh = r.offsetHeight;
       r.style.overflow = 'hidden';
       r.animate([flat, { height: hh + 'px', minHeight: hh + 'px', opacity: 1 }], opts).onfinish = () => { r.style.overflow = ''; };
-      const tt = r.querySelector('.wt'); if (tt) tt.animate([{ background: 'rgba(111,235,196,.18)' }, { background: 'rgba(111,235,196,0)' }], { duration: 1800, delay: 300, easing: Y.EASE });
+      const tt = r.querySelector('.wt'); if (tt) tt.animate([{ background: 'color-mix(in srgb, var(--live) 18%, transparent)' }, { background: 'color-mix(in srgb, var(--live) 0%, transparent)' }], { duration: 1800, delay: 300, easing: Y.EASE });
     });
     peeks.forEach((pk, i) => {
       pk.style.overflow = 'hidden';

@@ -215,23 +215,24 @@ def test_the_accent_setting_is_saved_and_repaints_the_window(qapp, tmp_path):
     from yuki.ui.window.app import WindowApp
     from yuki.ui.window.theme import ACCENTS, DEFAULT_ACCENT, accent_name, theme
 
-    assert DEFAULT_ACCENT == "green" and ACCENTS == {"green": "#6FEBC4", "orange": "#FFA46B"}   # Lattice live colours
+    # (20 Oct) ember, the website's orange, is the default; Lattice's mint the other choice
+    assert DEFAULT_ACCENT == "orange" and ACCENTS == {"orange": "#FF6A1A", "green": "#6FEBC4"}
     path = tmp_path / "ui.json"
-    assert ui_settings.load(path).accent == "green"                    # the default
-    ui_settings.update(path, accent="orange")
-    assert ui_settings.load(path).accent == "orange"
-    ui_settings.update(path, accent="blue")                             # not a choice any more: back to green
+    assert ui_settings.load(path).accent == "orange"                   # the default
+    ui_settings.update(path, accent="green")
     assert ui_settings.load(path).accent == "green"
-    assert accent_name("orange") == "orange" and theme(accent="orange").accent.name() == "#ffa46b"
+    ui_settings.update(path, accent="blue")                             # not a choice any more: back to the default
+    assert ui_settings.load(path).accent == "orange"
+    assert accent_name("green") == "green" and theme(accent="green").accent.name() == "#6febc4"
     memory = MemoryClient.open(tmp_path / "memory.db")
     try:
         ctrl = WindowApp(memory, db_path=tmp_path / "memory.db", connect=False, ui_path=path)
-        ctrl.set_accent("orange")
-        assert ui_settings.load(path).accent == "orange"
-        assert ctrl.t.accent.name() == "#ffa46b" and ctrl.win.sidebar.t.accent.name() == "#ffa46b"
-        assert all(k.t.accent.name() == "#ffa46b" for k in ctrl.win.sidebar.items.values())
+        ctrl.set_accent("green")
+        assert ui_settings.load(path).accent == "green"
+        assert ctrl.t.accent.name() == "#6febc4" and ctrl.win.sidebar.t.accent.name() == "#6febc4"
+        assert all(k.t.accent.name() == "#6febc4" for k in ctrl.win.sidebar.items.values())
         ctrl.set_accent("teal")                                          # ignored
-        assert ui_settings.load(path).accent == "orange"
+        assert ui_settings.load(path).accent == "green"
         ctrl.win.close()
     finally:
         memory.close()
