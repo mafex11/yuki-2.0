@@ -620,29 +620,31 @@ def role_async_client(role: str, default: Any, settings: Any = None, *, log: Cal
                            first_event_s=TALKER_FIRST_EVENT_S if role == "talker" else None)
 
 
-def talker_price_model(settings: Any, client: Any = None) -> str:
+def talker_price_model(settings: Any, client: Any = None, model: str | None = None) -> str:
     """The model to price the talker's calls with: the routed ``provider:model`` when the talker is moved, else
-    ``Settings.voice_mouth_model`` (as before)."""
+    ``model`` (fc C6, final-F R10: the conversation's own talker model, the lean talker's or the ONE agent's Sonnet 5.5;
+    both talkers were priced at Haiku rates before), else ``Settings.voice_mouth_model`` (as before)."""
     from yuki.agent.providers.config import route
 
     r = route("talker")
     if r is None or not r.primary.model:
-        return getattr(settings, "voice_mouth_model", "")
+        return str(model or "") or getattr(settings, "voice_mouth_model", "")
     last = client.last_model() if client is not None and callable(getattr(client, "last_model", None)) else None
     return last or r.primary.name
 
 
-def price_talker_turn(settings: Any, client: Any, usage: dict[str, int]) -> float | None:
+def price_talker_turn(settings: Any, client: Any, usage: dict[str, int], *, model: str | None = None) -> float | None:
     """The cost of one voice reply turn (``usage``: the tokens Pipecat counted for it).
 
-    Talker on ``default``: ``Settings.voice_mouth_model``'s price, as before. Talker moved: each routed reply stream
-    the turn read is priced as the model that actually answered it (the user's backup included), with the adapter's
-    own token count (cached prompt tokens included) or OpenRouter's returned amount; a stream with no count of its
-    own (Claude) is priced from Pipecat's count. ``None`` when any price isn't known (never invented)."""
+    Talker on ``default``: the price of ``model``, the conversation's own talker model (fc C6), else
+    ``Settings.voice_mouth_model``'s, as before. Talker moved: each routed reply stream the turn read is priced as the
+    model that actually answered it (the user's backup included), with the adapter's own token count (cached prompt
+    tokens included) or OpenRouter's returned amount; a stream with no count of its own (Claude) is priced from
+    Pipecat's count. ``None`` when any price isn't known (never invented)."""
     take = getattr(client, "take_stream_usage", None)
     records = take() if callable(take) else []
     if not records:
-        return settings.estimate_cost(talker_price_model(settings, client), usage)
+        return settings.estimate_cost(talker_price_model(settings, client, model), usage)
     if any(tokens is None for _name, tokens, _returned in records):
         return settings.estimate_cost(records[-1][0], usage)
     total = 0.0
