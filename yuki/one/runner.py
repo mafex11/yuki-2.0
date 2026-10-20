@@ -60,6 +60,13 @@ against their names (B1), never reads "not that one" from which words they repea
 (B3). A reading no route found and no name measures goes back to the agent with what the run read
 (:data:`GUESS_BACK`): the agent asks, picks or tries again.
 
+**fb** (final-F, lane B; measured facts and the model's structured fields only): the tidy step's front is the one the
+act took (``DeskDiff.taken_front``, contract K-B: ``focus_taken``'s window, never ``focus_by_act`` alone); the tidy
+dial "off" settles a flagged result by code; code's D6 line is not said over a desk whose front moved on; an asked
+skill run that touched nothing is no act; a countdown their words changed owes ``LINE_STOPPED_SEND`` (contract K-C);
+a skill run settled ``unverified`` is no miss of the retry window (``budget``); a done line equal to the say_first
+the voice already spoke for the call is not said again (contract K-D, ``early_said``).
+
 **The turn state** (:class:`RunState` on the gate's ``Turn``): every result, the act's own windows (tidy), the lines
 said; ``private_read`` and the refusal count are the gate's and the budget's (``policy.Turn``, ``budget.TurnBudget``).
 
@@ -141,7 +148,9 @@ TIDIED: dict[str, str] = {
     "failed": "code's one undoable step to undo that side effect did not take, and code said so (said)",
     "left": "code left their windows as they are, on purpose",
     # integ22 (desk22 merge note 4b, D6): no legal step for a window flag: code said its one line about what is covered
-    "told": "no one undoable step undoes it, so code said what is covered (said) and left their windows as they are"}
+    "told": "no one undoable step undoes it, so code said what is covered (said) and left their windows as they are",
+    # fb (final-F B2): the tidy dial off: no window flag is anyone's to act on (the hands give no look at "off")
+    "off": "their settings leave their windows to them: code left them as they are, on purpose"}
 #: The name of code's own tidy step's call context: no ONE tool, so the gate judges it as an inner step (never counted
 #: on the agent's budget or refusals), at row 8 like any tidy step.
 CODE_TIDY = "tidy_by_code"
@@ -401,7 +410,7 @@ class OneResult:
                 **{f"flag_{k}": bool(v) for k, v in self.flags.items()}, "then": bool(self.then),
                 "said": bool(self.said), "heard": self.heard, "settle": self.settle, "silent": self.silent,
                 "tidy": self.tidy, "tidy_step": bool(self.tidy_step), "tidied": self.tidy_state or None,
-                "cover": bool(self.cover),
+                "cover": bool(self.cover), "owed": bool(self.owed) or None,
                 "second": self.second or None,
                 "names_match": dict(self.names_match) if self.names_match else None,
                 "countdown": self.countdown or None, "result_chars": len(self.result), "after_chars": len(self.after),
@@ -950,13 +959,18 @@ class Runner:
             name is an app, or a site when written as a host); only kinds ``app`` and ``site`` are measured (review
             H2: a channel is never one). ``None``: ``skills.names.own_entries`` without channels (contract C14,
             read-only).
+        early_said: fb (final-F B9, contract K-D, written by the voice driver): ``early_said(call_id) -> str``, the
+            words of that call's say_first actually spoken early, ``""`` when none were. A code line of the turn
+            equal to them is not said again (:meth:`run`). ``None``: the hands' ``bridge.early_said`` when there is
+            one (:meth:`_early_heard`), else every line is said as before.
     """
 
     def __init__(self, verbs: Any, *, channel: str = "voice", settings: Any = None, countdown: Any = None,
                  memory: Any = None, dispatcher: Any = None, log: Callable[..., None] | None = None,
                  speak: Callable[[str], Any] | None = None, menu: str = "", lease: bool = True,
                  lease_wait_s: float = LEASE_WAIT_S, effect_budget_s: float = reads.EFFECT_BUDGET_S,
-                 own_names: Callable[[], Sequence[Any]] | None = None) -> None:
+                 own_names: Callable[[], Sequence[Any]] | None = None,
+                 early_said: Callable[[str], Any] | None = None) -> None:
         self.verbs = verbs
         self.channel = "voice" if channel == "voice" else "typed"
         self.settings = settings if settings is not None else getattr(verbs, "settings", None)
@@ -971,6 +985,7 @@ class Runner:
         self.effect_budget_s = float(effect_budget_s)
         self._desk_shape: str | None = None   # review fix F2: the verbs' desk_read form, read once
         self.own_names = own_names
+        self.early_said = early_said
         #: One20 (S2): the window in front before the newest act that moved the front (measured by its diff) and when:
         #: a ``focus_back`` with no window and no open tidy-up goes there (``Hands._front_before``'s reach).
         self._front_kept: tuple[int, float, Any] | None = None
@@ -986,9 +1001,10 @@ class Runner:
     # -- the entry points ------------------------------------------------------------------------------------------
 
     def run(self, name: str, args: Mapping[str, Any] | None, turn: policy.Turn,
-            speak: Callable[[str], Any] | None = None) -> OneResult:
+            speak: Callable[[str], Any] | None = None, call_id: str = "") -> OneResult:
         """One call, blocking (the caller's worker thread: the verb runs here, holding the desk lease here). Never
-        raises: an error is a failure, nothing more done."""
+        raises: an error is a failure, nothing more done. ``call_id``: the model's tool call id (the voice driver
+        passes it by name), for the say_first spoken early for it (:meth:`_early_heard`)."""
         started = time.perf_counter()
         name = str(name or "")
         args = dict(args) if isinstance(args, Mapping) else {}
@@ -996,6 +1012,7 @@ class Runner:
         state = state_of(turn)
         if say is not None:
             state.speaker = say
+        early = self._early_heard(call_id, state)
         try:
             result = self._run(name, args, turn, say, state)
         except Exception as exc:  # noqa: BLE001 - fail closed
@@ -1008,11 +1025,36 @@ class Runner:
             # the turn was closed while this ran (the hard stop): its result settles silently (code said the owed line)
             result.settle, result.silent = True, True
         state.results.append(result)
-        self._emit("one_run", **result.facts(), **(budget.facts() if budget is not None else {}))
+        self._emit("one_run", **result.facts(), **(budget.facts() if budget is not None else {}),
+                   early_said=early or None)
         return result
 
+    def _early_heard(self, call_id: Any, state: RunState) -> bool:
+        """fb (final-F B9, contract K-D): the words of this call's say_first that the voice spoke early
+        (``early_said(call_id)``, the driver's record of what was actually said) are a line of Yuki's already heard
+        this turn: kept with the turn's code lines (:attr:`RunState.lines`), so :meth:`_speak` never says a done line
+        that is the same text again (``heard`` stays true: the result counts as heard). Yuki's own two lines compared
+        as text; no word of theirs is read. ``True`` when such words were kept. Never raises.
+
+        fb fix (review 1, K-D wiring): with no ``early_said`` given, the voice bridge's own reader is used (the hands'
+        ``bridge.early_said(tool_id) -> str``, lane C's); absent (typed, or before it lands): every line said as now."""
+        reader = self.early_said
+        if not callable(reader):
+            bridge = getattr(getattr(self.verbs, "hands", None), "bridge", None)
+            reader = getattr(bridge, "early_said", None)
+        if not callable(reader) or not call_id:
+            return False
+        try:
+            text = _words(reader(str(call_id)))
+        except Exception:  # noqa: BLE001 - unknown: every line is said as before
+            return False
+        if not text:
+            return False
+        state.lines.add(text.casefold())
+        return True
+
     async def arun(self, name: str, args: Mapping[str, Any] | None, turn: policy.Turn,
-                   speak: Callable[[str], Any] | None = None) -> OneResult:
+                   speak: Callable[[str], Any] | None = None, call_id: str = "") -> OneResult:
         """:meth:`run` on a worker thread (never on the event loop), the turn's calls one after another in the order
         they arrived (Pipecat starts a reply's calls side by side, in the order written; ``asyncio.Lock`` wakes its
         waiters first come, first served: the hands' order gate, ``Hands._enter_order``)."""
@@ -1021,7 +1063,7 @@ class Runner:
         if state.order is None or state.order[0] is not loop:
             state.order = (loop, asyncio.Lock())
         async with state.order[1]:
-            return await asyncio.to_thread(self.run, name, args, turn, speak)
+            return await asyncio.to_thread(self.run, name, args, turn, speak, call_id)
 
     @staticmethod
     def answer(turn: policy.Turn, yes: bool) -> None:
@@ -1284,12 +1326,20 @@ class Runner:
             if budget is not None and decision is not None and result.status != ASKED:
                 # an ask (the skill's own question, a hold with a question) is theirs to answer, not a miss: no retry
                 # window opened, the step not barred, a lasting act not stopped for it; one20: keyed on the target the
-                # gate found (the budget's step identity)
+                # gate found (the budget's step identity). fb (final-F B6): a skill run the engine settled
+                # ``unverified`` (its route acted, its check could not read the effect) is no miss of the retry
+                # window: ``unsure`` (the engine's own outcome and settled fields, code words)
+                unsure = name == "run_skill" and str(facts.get("outcome") or "") == "unverified" \
+                    and bool(facts.get("settled"))
                 budget.after_call(name, ctx.first_args or args, acts=True,
                                   ok=status in (DONE, ALREADY, NO_CHANGE, STARTING), lasting=lasting,
-                                  target=ctx.facts)
+                                  target=ctx.facts, unsure=unsure)
             try:
-                self.verbs.record(name, resolved, report, ok=bool(ok), verified=verified, facts=facts)
+                # fb fix (review 2, B4): an asked run is never an ok record, whatever a rung touched first (``all``'s
+                # ``as_voice``: ok = done), so the exchange floor (``_hand_marks``) never moves past their request;
+                # ``sent_at`` (the speech-to-action moment) kept as measured
+                self.verbs.record(name, resolved, report, ok=bool(ok) and result.status != ASKED, verified=verified,
+                                  facts=facts)
             except Exception:  # noqa: BLE001 - a record never breaks an act
                 pass
             note = getattr(turn, "note_step", None)
@@ -1306,6 +1356,15 @@ class Runner:
             note = getattr(budget, "unfinished_run", None)
             if callable(note):
                 note()
+        elif name == "run_skill" and result.status == ASKED and str(facts.get("outcome") or "") == "asked":
+            # fb (final-F B4, k_clarify_who_draft): the skill's own question with nothing on the PC touched is no act:
+            # no ``sent_at`` (``_desk_skill``), so not ``acted`` and no speech-to-action moment; on the action log as
+            # the voice hands keep it under ``all``, ``ok`` false, so the bridge's exchange floor (``_hand_marks``)
+            # never moves past their words and the answer carries the request
+            try:
+                self.verbs.record(name, resolved, report, ok=False, verified=None, facts=facts)
+            except Exception:  # noqa: BLE001 - a record never breaks a call
+                pass
         return result
 
     @staticmethod
@@ -1417,7 +1476,7 @@ class Runner:
             elif self._front_kept is not None and self._front_kept[2] is not state:
                 self._front_kept = None   # an act of a later turn that moved no front lets an older one go (as all)
             pending: dict[str, Any] | None = None
-            settled = told = False
+            settled = told = off = False
             if result.flagged and not result.tidy:
                 # a new flagged diff opens a tidy-up on its windows; a tidy step's own flagged diff never renews it
                 # (its two steps per flagged diff stay counted)
@@ -1426,9 +1485,15 @@ class Runner:
                 # tidy dial "do" code takes it itself (below, once code's cover line is said); at "ask" the agent gets
                 # it for the question only (the gate's row 8 asks before it runs)
                 step, words = self._legal_step(d, own, after, turn)
+                # fb (final-F B1): a focus_back with no window goes to the front the act took (the one front rule),
+                # when the act's own move of the front (``moved``) was not measured
+                taken = self._taken_front(d)
                 turn.flag(own=sorted(own), attention=attention, before=ctx.before, acted=acted, touched=touched,
-                          sound_app=ctx.sound_app, focus_from=moved, step=step, step_words=words, opened=opened)
-                do = util.tidy_mode(getattr(turn, "policy", None)) == util.TIDY_DO
+                          sound_app=ctx.sound_app, focus_from=moved if moved is not None else taken, step=step,
+                          step_words=words, opened=opened)
+                mode = util.tidy_mode(getattr(turn, "policy", None))
+                do = mode == util.TIDY_DO
+                off = mode == util.TIDY_OFF
                 # review F1: a move of a window the turn's acts placed or sized as asked is no side effect: code
                 # leaves it (its guard's ``asked_place``), at "ask" too (no question about it, as the planner)
                 as_asked = step is not None and step.get("action") == "place" and step.get("hwnd") in state.arranged
@@ -1439,6 +1504,11 @@ class Runner:
                     # review F4: code already decided this turn's one tidy step (taken or left): a later flagged act
                     # settles by code too, as under "all" (one look a turn), never handed to the agent
                     settled = True
+                elif off:
+                    # fb (final-F B2, p1_dt_dial_off_playlist): with the tidy dial off no window flag is anyone's to
+                    # act on (the hands give no look at "off": ``look = ... level != "off"``), so code settles it
+                    # below (``_tidy_settled``: no agent round, no tidy debt); a sound left silent stays the agent's
+                    pass
                 elif step is not None and (do or as_asked):
                     if landed or not do:
                         pending = step
@@ -1454,10 +1524,16 @@ class Runner:
             self._cover(d, result, turn, state, say)
             if pending is not None:
                 self._tidy_result(pending, d, after, result, turn, state, say)
-            elif told and self._flag_said(d, turn, state, say, result):
-                self._tidy_settled(result, "told", turn)   # the agent gets no window round for it
+            elif told:
+                # fb (final-F B3): code's D6 line only over the desk the after-read saw; their own switch: silence,
+                # and the flags settle by code all the same (left as they are, no agent round for them)
+                how = self._flag_said(d, turn, state, say, result, after=after)
+                if how:
+                    self._tidy_settled(result, "told" if how == "said" else "left", turn)
             elif settled:
                 self._tidy_settled(result, "", turn)
+            elif off and result.flagged:
+                self._tidy_settled(result, "off", turn)   # fb (B2): the dial off settles by code
         except Exception as exc:  # noqa: BLE001 - no diff: the result stands
             self._emit("one_diff_error", tool=name, error=type(exc).__name__)
 
@@ -1471,19 +1547,37 @@ class Runner:
             return None
         return None
 
+    @staticmethod
+    def _taken_front(d: Any) -> int | None:
+        """fb (final-F B1, contract K-B): the window the act took the front from, the one front rule both brains read:
+        ``DeskDiff.taken_front`` (lane A's field; ``None``: no front taken, so no step from it). On a diff without that
+        field (lane A not merged), the same rule from the diff's own measure, as the hands' look reads it
+        (``hands._look_after``: ``focus_taken`` up, its ``focus_from``), never ``focus_by_act`` alone: that reads only
+        the foreground window, while ``focus_taken`` also counts the window holding the keyboard (final-F
+        p1_spotify_down_focus_back: the front went to an unlisted Spotify window, ``focus_taken`` up, and ONE had no
+        step). Never raises (``None``)."""
+        try:
+            if hasattr(d, "taken_front"):
+                got = getattr(d, "taken_front", None)
+                return None if got is None or isinstance(got, bool) or not int(got) else int(got)
+            if dict(getattr(d, "flags", {}) or {}).get("focus_taken") and getattr(d, "focus_from", None):
+                return int(d.focus_from)
+        except (TypeError, ValueError):
+            return None
+        return None
+
     def _legal_step(self, d: Any, own: set[int], after: Any, turn: policy.Turn) -> tuple[dict[str, Any] | None, str]:
         """One20 (contract C7): ``perception.diff.tidy_step(d, acts, front, monitors)`` (lane DESK) for a
-        flagged diff: the act's own windows, the window it took the front from (``focus_taken``, as the hands' look
-        keeps ``look["front"]``) and the monitors after it; the step and its words (a ``window`` call), or
-        ``(None, "")``: none, the tidy dial off, or the helper not merged yet. Never raises."""
+        flagged diff: the act's own windows, the window it took the front from (fb, B1: :meth:`_taken_front`, the one
+        front rule, as the hands' look keeps ``look["front"]``) and the monitors after it; the step and its words (a
+        ``window`` call), or ``(None, "")``: none, the tidy dial off, or the helper not merged yet. Never raises."""
         helper = _desk_helper("tidy_step")
         if helper is None:
             return None, ""
         try:
             if util.tidy_mode(getattr(turn, "policy", None)) == util.TIDY_OFF:
                 return None, ""
-            moved = self._front_moved(d)
-            front = moved if moved is not None and dict(getattr(d, "flags", {}) or {}).get("focus_taken") else None
+            front = self._taken_front(d)
             monitors = list(getattr(after, "monitors", None) or [])
             step = helper(d, sorted(own), front, monitors)
         except Exception as exc:  # noqa: BLE001 - no step: the agent reads the After as before
@@ -1633,41 +1727,78 @@ class Runner:
         return done, said
 
     def _flag_said(self, d: Any, turn: policy.Turn, state: RunState, say: Any,
-                   result: OneResult | None = None) -> bool:
+                   result: OneResult | None = None, *, after: Any = None) -> str:
         """integ22 (desk22 merge note 4b, the user's decision D6): a window flag up with no legal tidy step
         (``diff.tidy_step`` found none: one monitor and nothing taken, a minimised window, a cover by a window that
         isn't the act's own, a pop-up) gets code's one measured line (``diff.flag_line``: "Discord is covering
         Chrome.", app names only), said like the tidy line, once a turn (:attr:`RunState.tidied`: code's one tidy-up
         decision of the turn). At the dial "do" and "ask" (no step means nothing to ask about); "off": nothing. Not
-        once their next turn began (safety timing 4) or after the hard stop. ``True`` when code said it (``result``'s
-        ``said`` gains it). Logs content-free (``one_tidy_code ... why=no_step``). Never raises."""
+        once their next turn began (safety timing 4) or after the hard stop.
+
+        fb (final-F B3, p1_dt_alt_tab_before_tidy): only over the desk the after-read (``after``) saw, and not after
+        their own switch (:meth:`_front_moved_on`): then code says nothing and leaves their windows as they are, its
+        one tidy decision of the turn all the same (``left``).
+
+        Returns ``"said"`` (``result``'s ``said`` gains the line), ``"left"`` (their desk moved on: nothing said), or
+        ``""``: nothing decided (no line, a late turn, the dial off). Logs content-free (``one_tidy_code ...
+        why=no_step`` / ``why=front_changed``). Never raises."""
         try:
             if state.tidied or util.tidy_mode(getattr(turn, "policy", None)) == util.TIDY_OFF:
-                return False
+                return ""
             if getattr(turn, "moved_on", False):
-                return False
+                return ""
             budget = getattr(turn, "budget", None)
             if budget is not None and budget.late():
-                return False
+                return ""
             helper = _desk_helper("flag_line")
             line = _words(helper(d, name=util.app_name)) if helper is not None else ""
             if not line:
-                return False
+                return ""
+            moved_on = self._front_moved_on(d, after)
+            tidy = getattr(turn, "tidy", None)
+            if moved_on:
+                state.tidied = True
+                if tidy is not None:
+                    tidy.given = True   # code decided this flagged diff's tidy-up (left): never a tidy-debt round
+                self._emit("one_tidy_code", action="", state="left", why=moved_on, ok=False, said=False)
+                return "left"
             said, _heard = self._speak(line, say, state)
             if not said:
-                return False
+                return ""
             state.tidied = True
-            tidy = getattr(turn, "tidy", None)
             if tidy is not None:
                 tidy.given = True   # code decided this flagged diff's tidy-up: never a tidy-debt round for it
             if result is not None:
                 result.said = f"{result.said} {said}".strip()
                 result.heard = True
             self._emit("one_tidy_code", action="", state="said", why="no_step", ok=True, said=True)
-            return True
+            return "said"
         except Exception as exc:  # noqa: BLE001 - nothing said: the agent reads the After as before
             self._emit("one_tidy_code", error=type(exc).__name__)
-            return False
+            return ""
+
+    def _front_moved_on(self, d: Any, after: Any) -> str:
+        """fb (final-F B3): whether their desk's front moved on from the one code's D6 line would speak about, measured
+        only: ``front_changed`` when the window in front now is not the one the after-read saw (the same test as
+        ``diff.tidy_guard``), or when the act's own diff measured the front moving during the act to a listed window
+        that is not the act's (``focus_by_act`` false: their own switch, or another app's; final-F
+        p1_dt_alt_tab_before_tidy: the after-read already showed "Focus: Chrome -> File Explorer (not from your
+        act)", so a read of the front now alone could not tell). A front that can't be read changes nothing (the D6
+        line is said, as before). ``""``: the front is as the after-read saw it. Never raises."""
+        try:
+            seen = getattr(after, "foreground", None) if after is not None else None
+            reader = getattr(self.verbs, "front_now", None) or getattr(self.verbs, "foreground", None)
+            now = reader() if callable(reader) else None
+            if now is not None and seen is not None and int(now) != int(seen):
+                return "front_changed"
+            start, end = getattr(d, "focus_from", None), getattr(d, "focus_to", None)
+            window = getattr(after, "window", None)
+            listed = callable(window) and end is not None and window(end) is not None
+            if start and end and start != end and not getattr(d, "focus_by_act", False) and listed:
+                return "front_changed"
+        except Exception:  # noqa: BLE001 - unread: as before
+            return ""
+        return ""
 
     def _cover(self, d: Any, result: OneResult, turn: policy.Turn, state: RunState, say: Any) -> None:
         """One20 (S3, contract C7): ``perception.diff.cover_line(d)``, the measured tab-cover sentence ("GitHub is up;
@@ -1685,9 +1816,10 @@ class Runner:
             return
         budget = getattr(turn, "budget", None)
         late = budget is not None and budget.late()
-        if result.status == DONE and not late and result.said:
+        if result.status == DONE and not late and (result.said or result.heard):
             # review fix: only right after a done line code said (a result with ``then`` and no done line said leaves
-            # the cover to the agent, after its own words)
+            # the cover to the agent, after its own words); fb (B9): or one already heard, not said twice (the
+            # say_first the voice spoke early for this call was the very same line)
             said, _heard = self._speak(line, say, state)
             if said:
                 result.said = f"{result.said} {said}".strip()
@@ -1739,6 +1871,12 @@ class Runner:
                 own |= {int(h) for h in self.verbs.act_windows(now, d, tidy.acted, tidy.touched) if h}
             except Exception:  # noqa: BLE001 - the flagged act's own windows as kept
                 pass
+            if util.tidy_mode(getattr(turn, "policy", None)) == util.TIDY_OFF:
+                # fb (final-F B2): the dial off: no window flag of the net diff is anyone's to act on (no round for
+                # it, as the hands give no look at "off"); only a sound left silent is the agent's
+                if not dict(d.flags).get("left_silent"):
+                    return None
+                return {"after": f"{after}\n{TIDIED['off']}".strip(), "flags": ["left_silent"]}
             step, words = self._legal_step(d, own, now, turn)
             if words:
                 tidy.step, tidy.step_words = step, words
@@ -1755,12 +1893,16 @@ class Runner:
             if words:
                 # the dial at "ask": the step for the question only (the voice driver copies ``after`` and ``flags``)
                 debt["after"] = f"{after}\n{TIDY_ASK_NOTE.format(step=words)}".strip()
-            elif self._flag_said(d, turn, state, state.speaker or self.speak):
-                # integ22 (desk22 merge note 4b, D6): no legal step for the net diff's window flag: code said its one
-                # line; nothing left for the agent unless a sound is silent
-                if not dict(d.flags).get("left_silent"):
-                    return None
-                return {"after": f"{after}\n{TIDIED['told']}".strip(), "flags": ["left_silent"]}
+            else:
+                how = self._flag_said(d, turn, state, state.speaker or self.speak, after=now)
+                if how:
+                    # integ22 (desk22 merge note 4b, D6): no legal step for the net diff's window flag: code said its
+                    # one line (fb, B3: or left their moved-on desk as it is, saying nothing); nothing left for the
+                    # agent unless a sound is silent
+                    if not dict(d.flags).get("left_silent"):
+                        return None
+                    done = "told" if how == "said" else "left"
+                    return {"after": f"{after}\n{TIDIED[done]}".strip(), "flags": ["left_silent"]}
             return debt
         except Exception as exc:  # noqa: BLE001 - no measure: code settles as before
             self._emit("one_tidy_debt_error", error=type(exc).__name__)
@@ -2530,8 +2672,11 @@ class Runner:
         swap = dict(got.swap) if getattr(got, "swap", None) else None
         note = ("they tapped another choice during the countdown; nothing was sent" if swap else
                 "they spoke during the countdown; nothing was sent: their words decide")
+        # fb (final-F B5, contract K-C, p24_countdown_cancel): nothing was sent, a code fact the user is owed: the
+        # driver says ``LINE_STOPPED_SEND`` when the turn ends with no new send and nothing of Yuki's heard (the owed
+        # ledger's own rule), as the Stop path says it now; the agent's own words or a new send call replace it
         return OneResult("run_skill", CHANGED, result=note, countdown="changed", swap=swap, decision=decision,
-                         verb="run_skill", evidence={"why": note})
+                         verb="run_skill", evidence={"why": note}, owed=LINE_STOPPED_SEND)
 
     def _grant_person(self, run_args: Mapping[str, Any], decision: Any, sk: Any, to: str) -> int | None:
         """The one person a send's grant goes to (``uia_route.grant_person`` through memory), else ``None``."""
@@ -2603,13 +2748,17 @@ class Runner:
         details = payload.get("details") if isinstance(payload.get("details"), Mapping) else {}
         verified = details.get("verified")
         refused = details.get("refused")
+        # fb (final-F B4): an ``asked`` run the engine measured touching nothing (``payload["acted"]`` not true) did
+        # nothing on the PC: no ``sent_at``, so it is no act (never on the exchange floor as a hand that acted)
+        untouched_ask = payload.get("outcome") == "asked" and payload.get("acted") is not True
         facts: dict[str, Any] = {"verified": verified if isinstance(verified, bool) else None,
                                  "outcome": str(payload.get("outcome") or ""),
                                  "done_line": str(payload.get("done_line") or ""), "skill": key,
                                  # final-B (one-voice RC E): an asked run's question as the engine's own field
                                  # (``payload["ask"]``, set by ``Dispatcher._run_skill`` for an ``asked`` outcome)
                                  "ask": str(payload.get("ask") or ""),
-                                 "sent_at": started if payload.get("outcome") not in ("refused", None) else None}
+                                 "sent_at": started if payload.get("outcome") not in ("refused", None)
+                                 and not untouched_ask else None}
         if isinstance(payload.get("focus_taken"), bool):
             facts["focus_taken"] = payload["focus_taken"]   # contract C1: measured per rung by the engine
         if isinstance(payload.get("acted"), bool):
