@@ -458,6 +458,12 @@ def _foreground_now() -> int:
 PAUSE_LIMIT_S = 600.0
 
 LINE_DECLINED = "Okay, I won't."
+#: safety27 D2: a step in a window a close of this request left asking (its own question, or a close that stayed open):
+#: that answer is theirs, so nothing more is done in it until their next words (:meth:`Executor._close_hold`).
+LINE_CLOSE_ASKING = "It may be asking you something before it closes, so I left that to you."
+#: safety27 D2: a shell command while a close of this request has something asking (it could end the app without it).
+QUESTION_SHELL_ASKING = ("Something I tried to close may be asking you a question first. Run that command anyway? It "
+                         "could close it without saving.")
 LINE_BUSY = "Something else is using the mouse and keyboard right now, so I stopped. Try again in a moment?"
 LINE_PAUSE_STOP = "Stopped. Nothing else was done."
 LINE_STOPPED_SEND = "Stopped. Nothing was sent."
@@ -714,6 +720,9 @@ class Executor:
         self.steers: list[str] = []
         self.started = time.time()
         self.started_mono = time.monotonic()
+        #: safety27 D2: how many of the request's words there were when last looked, and since when (monotonic): a
+        #: window a close of Yuki's left asking since then holds the steps in it (:meth:`_close_hold`)
+        self._words_mark: tuple[int, float] = (len(self.words), self.started_mono)
         self.lease = _Lease()
         #: A step that named no window acted on the request's origin (logged once).
         self._origin_used = False
@@ -1918,9 +1927,22 @@ class Executor:
         refused = self._who_guard(index, call, live)
         if refused is not None:
             return refused
+        asking = self._close_hold(call)
+        if asking == "window":
+            # safety27 D2 (ONE's rule): a step in a window a close of this request left asking would answer that
+            # question for them, finish the close another way or tidy around it: refused, said plainly
+            status.state, status.why = "refused", "close_asked"
+            self._trace_step(call, None, ok=False, verdict=False, why="refused: close_asked", kind="control",
+                             refused=True)
+            self._emit_log("consent", verb=call.tool, row=0, result=consent.REFUSE, why="close_asked")
+            return RunResult("refused", line=LINE_CLOSE_ASKING, final=True)
         cv = self._verdict_for(call, live)
         effect = str(getattr(cv, "effect", "") or "") if cv is not None and not getattr(cv, "failed", False) else ""
         verdict = consent.check(call, self.head, self._all_words(), live, cv)
+        if asking == "shell" and verdict.result in (consent.ALLOW, consent.ASK):
+            # safety27 D2: a command after a close of this request left something asking may end that app without
+            # its answer (Stop-Process): theirs to say, asked plainly first
+            verdict = consent.Verdict(consent.ASK, 5, "close_asking", question=QUESTION_SHELL_ASKING)
         self._emit_log("consent", verb=call.tool, row=verdict.row, result=verdict.result, why=verdict.why)
         said_yes = False
         # Item 11's L2 (review r1 L1, L2): a send's person is looked up before any question or countdown (a Stop
@@ -2008,6 +2030,25 @@ class Executor:
             # handed over, was refused or saw nothing go (a retry after "WhatsApp instead?" -> yes) never counts
             self._sent_keys.add(send_key)
         return result
+
+    def _close_hold(self, call: Call) -> str:
+        """safety27 D2 (ONE's ``_held`` rule for the planner): ``window`` when ``call`` acts in a window a close of
+        Yuki's left asking while the request's words are as they were then (``check.raised_since``: its own question
+        window, the window that owns it, or the window whose close was pressed and stayed open), ``shell`` for a
+        ``run_powershell`` step while any such window is up, else ``""``. Their next words (a steer, an answer) lift it.
+        Never raises."""
+        try:
+            count = len(self.words)
+            if count != self._words_mark[0]:
+                self._words_mark = (count, time.monotonic())
+            since = self._words_mark[1]
+            from yuki.brain.check import raised_since
+
+            if call.tool == "run_powershell":
+                return "shell" if raised_since(None, since) else ""
+            return "window" if call.hwnd and raised_since(call.hwnd, since) else ""
+        except Exception:  # noqa: BLE001 - not held: the consent rule and the commit check decide as before
+            return ""
 
     def _skill_grant(self, call: Call, verdict: consent.Verdict | None, *, person_id: int | None = None,
                      counted: bool = False) -> dict[str, Any]:

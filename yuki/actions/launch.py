@@ -3941,9 +3941,11 @@ def window_action(hwnd: int, action: str) -> ActionResult:
     (:func:`focus_window`, gated), and ``ok`` needs it in view afterwards too (in front by the one front rule, and at
     least :data:`_SHOWN_SHARE` of it seen: ``details["front"]``, ``["visible"]``, ``["behind"]``); a window left behind
     another is reported where it is, never as done. fa (A1): a close the window asks about first carries the asking
-    window's id (``details["dialog_raised"]``). integ27 fix H2: a close still open at the end of its wait with no asking
-    measured (a question drawn inside the window: the window stays enabled and owns no new one) is
-    ``details["close_held"]``, reported as possibly asking inside its window, that answer theirs (the tab hand's rule).
+    window's id (``details["dialog_raised"]``); safety27 D1: so does one whose question window came up for the close
+    without taking the front (the tab hand's measure, ``tabs.raised_window``). integ27 fix H2: a close still open at the
+    end of its wait with no asking measured (a question drawn inside the window: the window stays enabled and owns no
+    new one) is ``details["close_held"]``, reported as possibly asking inside its window, that answer theirs (the tab
+    hand's rule); safety27 D2: that window is noted for the commit check (``check.note_raised``, ``close_held``).
     """
     started = time.perf_counter()
 
@@ -4010,14 +4012,25 @@ def window_action(hwnd: int, action: str) -> ActionResult:
             time.sleep(_POLL_S)
         waited = round(time.monotonic() - (deadline - _CLOSE_WAIT_S), 1)
         details["close_waited_s"] = waited
+        from yuki.actions.tabs import note_raised
+
+        behind = 0
+        if not asking:
+            # safety27 D1 (Chrome's tab-modal "Leave site?" leaves the frame enabled; raised by a browser behind the
+            # user's window it cannot take the front): the tab hand's own measure, a window of its own that came up
+            # since the close (``tabs.raised_window``), is that question even when it is not in front
+            behind = _asking_window(hwnd, owned_before)
+            asking = bool(behind)
         if asking:
             details["asking"] = True
             # fa (A1): the window it asks with, by id (the commit check's measured fact that the close raised it)
-            details["dialog_raised"] = _asking_window(hwnd, owned_before) or None
+            details["dialog_raised"] = behind or _asking_window(hwnd, owned_before) or None
             if details["dialog_raised"]:
-                from yuki.actions.tabs import note_raised
-
                 note_raised(int(details["dialog_raised"]), int(hwnd))
+            if behind:
+                return finish(False, f"{name}: asked to close; it is asking something first, in a window of its own "
+                                     f"[{behind}] that came up for the close and may be behind the window in front. "
+                                     f"Nothing in it was answered: what it asks is theirs to answer", details)
             return finish(False, f"{name}: asked to close; it is asking something first (a dialog of its own is in "
                                  f"front). Nothing in it was answered: what it asks is theirs to answer", details)
         # integ27 fix H2 (Zen's or Firefox's leave-page and "Close tabs?" prompts, Win11 Notepad's save prompt: drawn
@@ -4025,6 +4038,9 @@ def window_action(hwnd: int, action: str) -> ActionResult:
         # with no reason measured. Held as the tab hand holds it (``close_held``): it may be asking inside its window,
         # and that answer is theirs; never handed on to be finished
         details["close_held"] = True
+        # safety27 D2: the window itself noted for the commit check (and the planner's hold) under its own code word: a
+        # step in it is judged knowing a close of Yuki's there was pressed and it stayed open
+        note_raised(int(hwnd), int(hwnd), "close_held")
         return finish(False, f"{name}: asked to close, still open after {_CLOSE_WAIT_S:g} s; the close was posted and "
                              f"no reason was measured: it may be asking something inside its window, and that answer "
                              f"is theirs", details)

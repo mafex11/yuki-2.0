@@ -75,9 +75,10 @@ saying what the step would do; otherwise "".
 When unsure, asked is false with one plain question. Words from an earlier request authorise nothing unless this \
 request's words refer back to them.
 
-A step whose line says its window came up in reply to Yuki's own step answers a new question the app asked them: \
-asked is true only when their words answer that very question. When the answer would throw away something of \
-theirs (unsaved text, a draft, a download), asked is false unless their words said to go ahead anyway.
+A step whose line says its window came up in reply to Yuki's own step, or may be asking a question inside it after \
+Yuki's own close, answers a new question the app asked them: asked is true only when their words answer that very \
+question. When the answer would throw away something of theirs (unsaved text, a draft, a download), asked is false \
+unless their words said to go ahead anyway.
 """
 
 #: The one tool (strict: every field required, nothing else allowed), forced.
@@ -140,6 +141,10 @@ def _clip(text: Any, cap: int) -> str:
 RAISED_KEEP_S = 600.0
 _raised: dict[int, tuple[int, str, float]] = {}
 _raised_lock = threading.Lock()
+#: safety27 D2: the act word for a window whose own close by Yuki was pressed and that stayed open with no window of
+#: its own measured (a question drawn inside it: Zen's leave-page prompt, Win11 Notepad's save prompt): noted on the
+#: window itself (its own owner).
+CLOSE_HELD = "close_held"
 
 
 def _window_up(hwnd: int) -> bool:
@@ -169,6 +174,30 @@ def note_raised(hwnd: Any, owner: Any = None, act: str = "close") -> None:
         _raised[key] = (own, str(act or "close")[:20], now)
 
 
+def _raised_up(key: int, since: float | None, alive: Callable[[int], bool] | None) -> list[tuple[int, int, str]]:
+    """``[(dialog, owner, act)]`` of the noted raised windows still up (``alive``), within :data:`RAISED_KEEP_S`,
+    noted at or after ``since`` (monotonic; ``None``: any), involving ``key`` (as the window or its owner; ``0``: any).
+    A noted window no longer up is dropped. Never raises."""
+    up = alive or _window_up
+    now = time.monotonic()
+    with _raised_lock:
+        items = list(_raised.items())
+    out: list[tuple[int, int, str]] = []
+    for dialog, (owner, act, at) in items:
+        if now - at > RAISED_KEEP_S or (key and key not in (dialog, owner)) or (since is not None and at < since):
+            continue
+        try:
+            live = bool(up(dialog))
+        except Exception:  # noqa: BLE001
+            live = False
+        if not live:
+            with _raised_lock:
+                _raised.pop(dialog, None)
+            continue
+        out.append((dialog, owner, act))
+    return out
+
+
 def raised_by(hwnd: Any, *, alive: Callable[[int], bool] | None = None) -> tuple[str, bool]:
     """fa (A1): ``(the act's code word, whether hwnd is the raised window itself)`` when ``hwnd`` is a window a Yuki act
     raised, or the window that owns one still up; ``("", False)`` otherwise. ``alive``: whether a window is still up
@@ -179,23 +208,21 @@ def raised_by(hwnd: Any, *, alive: Callable[[int], bool] | None = None) -> tuple
         return "", False
     if not key:
         return "", False
-    up = alive or _window_up
-    now = time.monotonic()
-    with _raised_lock:
-        items = list(_raised.items())
-    for dialog, (owner, act, at) in items:
-        if now - at > RAISED_KEEP_S or key not in (dialog, owner):
-            continue
-        try:
-            live = bool(up(dialog))
-        except Exception:  # noqa: BLE001
-            live = False
-        if not live:
-            with _raised_lock:
-                _raised.pop(dialog, None)
-            continue
+    for dialog, _owner, act in _raised_up(key, None, alive):
         return act, key == dialog
     return "", False
+
+
+def raised_since(hwnd: Any, since: float, *, alive: Callable[[int], bool] | None = None) -> str:
+    """safety27 D2: the act's code word when ``hwnd`` is a window a Yuki act raised (or that owns one, or whose own close
+    stayed open: :data:`CLOSE_HELD`) noted at or after ``since`` (monotonic) and still up; ``hwnd`` ``None`` or ``0``:
+    any such window. ``""``: none. For the planner's hold within one request's words. Never raises."""
+    try:
+        key = int(hwnd or 0)
+        got = _raised_up(key, float(since), alive)
+    except (TypeError, ValueError):
+        return ""
+    return got[0][2] if got else ""
 
 
 #: Input fields that only point at the target (ids, read numbers, the guard window): never part of a step's identity.
@@ -273,7 +300,12 @@ def step_line(call: Call, *, plan: Any = None, typed: bool = False, typed_text: 
                      (f' ("{_clip(typed_text, VALUE_CHARS)}"): this step may send it' if typed_text.strip()
                       else ": this step may send it"))
     act, itself = raised_by(call.hwnd) if call.hwnd else ("", False)
-    if act:
+    if act == CLOSE_HELD:
+        # safety27 D2: Yuki's own close of this very window (or of a tab in it) was pressed and it stayed open with no
+        # window of its own measured: it may be asking its question inside this window (measured by the hand)
+        parts.append("a close of Yuki's in this window was pressed and it stayed open: it may be asking a question "
+                     "inside it (measured)")
+    elif act:
         # fa (A1): a measured fact of the hand that acted (its window list before and after Yuki's own step): this
         # window came up in reply to that step, so what it asks is a new question for the user (the prompt's rule)
         parts.append(f"this window came up in reply to Yuki's own {act} step (measured: it was not up before it)"
@@ -643,5 +675,5 @@ def _board() -> Mapping[str, Any] | None:
         return None
 
 
-__all__ = ["CHECK_PROMPT", "CHECK_TOOL", "CheckVerdict", "CommitCheck", "OneVerdict", "memo_key", "note_raised", "one",
-           "parse", "raised_by", "request", "step_line", "words_block"]
+__all__ = ["CHECK_PROMPT", "CHECK_TOOL", "CLOSE_HELD", "CheckVerdict", "CommitCheck", "OneVerdict", "memo_key",
+           "note_raised", "one", "parse", "raised_by", "raised_since", "request", "step_line", "words_block"]

@@ -1348,6 +1348,10 @@ class ActionRecord:
     tab_id: str = ""
     #: fa review L1 (A2): the tab's title as Yuki's own act read it when it put the tab up (RAM only, never logged)
     tab_title: str = ""
+    #: safety27 T1: the act measurably made that tab (a new tab of its own: not on the window's strip read before it,
+    #: or in a window that was not there); a tab it only showed or selected (a tab show, the thinker's select, an
+    #: address "already" showing) keeps ``tab_id`` for the line's liveness only and is never a tab Yuki put up
+    put_up: bool = False
 
     def line(self, limit: int = 320, now: float | None = None) -> str:
         mark = "verified" if self.verified is True else ("failed" if not self.ok else "not verified")
@@ -1390,13 +1394,13 @@ class ActionLog:
             return self.convo
 
     def add(self, who: str, what: str, result: str, *, ok: bool, verified: bool | None, turn: Any = None,
-            hwnd: Any = None, tab_id: Any = "") -> ActionRecord:
+            hwnd: Any = None, tab_id: Any = "", put_up: bool = False) -> ActionRecord:
         try:
             handle = int(hwnd) if hwnd not in (None, "", 0) and str(hwnd).lstrip("-").isdigit() else None
         except (TypeError, ValueError):
             handle = None
         record = ActionRecord(time.time(), who, what, " ".join(str(result).split()), verified, ok, convo=self.convo,
-                              turn=turn, hwnd=handle, tab_id=str(tab_id or ""))
+                              turn=turn, hwnd=handle, tab_id=str(tab_id or ""), put_up=bool(put_up and tab_id))
         with self._lock:
             self._items.append(record)
             self.version += 1
@@ -1404,7 +1408,8 @@ class ActionLog:
 
     def place(self, record: Any, hwnd: Any, tab_id: Any) -> None:
         """fHands: what a record's effect sits on, learned after it was kept (a skill run's page: the window and tab
-        showing once it ran). Only a record without a tab of its own; never raises."""
+        showing once it ran). Only a record without a tab of its own; never raises. safety27 T1: the caller places
+        only a tab measured as the run's own (:func:`_own_place`), so a placed tab is one Yuki put up."""
         if not isinstance(record, ActionRecord) or record.tab_id:
             return
         try:
@@ -1414,6 +1419,7 @@ class ActionLog:
         with self._lock:
             record.hwnd = handle if handle else record.hwnd
             record.tab_id = str(tab_id or "")
+            record.put_up = bool(record.tab_id)
 
     def titled(self, record: Any, title: Any) -> None:
         """fa review L1 (A2): the title of the tab a record put up, as Yuki's own act read it (RAM only). Only a record
@@ -1434,8 +1440,10 @@ class ActionLog:
     def opened_tabs(self) -> list[tuple[int | None, str]]:
         """fHands: ``(hwnd, tab id)`` of this conversation's tabs that Yuki's hands or thinker put up (an opening that
         held), newest first: "it" when a tab is named after one was just opened. Within the same age window as
-        :meth:`records` (a tab put up long ago in a long conversation is no longer "the one we just opened")."""
-        return [(r.hwnd, r.tab_id) for r in reversed(self.records()) if r.tab_id and r.ok]
+        :meth:`records` (a tab put up long ago in a long conversation is no longer "the one we just opened").
+        safety27 T1: only records whose act made the tab (``put_up``); a tab Yuki only showed or selected (the user's
+        own tab brought up, an address already showing) is never one of them."""
+        return [(r.hwnd, r.tab_id) for r in reversed(self.records()) if r.tab_id and r.ok and r.put_up]
 
     def records(self, *, alive: Callable[[ActionRecord], Any] | None = None) -> list[ActionRecord]:
         """This conversation's records within :attr:`max_age_s`, oldest first; with ``alive``, those it finds gone
@@ -1509,18 +1517,26 @@ def _listed_windows(desk: Any) -> set[int] | None:
         return None
 
 
-def _own_place(hwnd: int, tab_id: str, own: set[int], listed: set[int] | None, strips: dict[str, Any]) -> str:
+def _own_place(hwnd: int, tab_id: str, own: set[int], listed: set[int] | None, strips: dict[str, Any],
+               apps: set[str] | frozenset[str] = frozenset(), app: str = "") -> str:
     """integ27 fix H1 (final-F integration review: a restore rung gave the front back, and the user's own tab was kept
     as one Yuki put up): whether the tab in front after a skill run is measurably the run's own, as a code word for the
-    log: ``window`` (a window the engine measured coming forward under a rung), ``new_window`` (a window the desk
-    before the run did not list), ``new_tab`` (a tab not on that window's strip as read whole before the run: a page
-    opened in the browser already in front), else ``""``: the front given back by a rung's put-back or by code's tidy
-    step, or a window and tab that were there before, is the user's, never placed. Pure."""
-    if hwnd in own:
-        return "window"
+    log: ``new_window`` (a window the desk before the run did not list), ``new_tab`` (a tab not on that window's strip
+    as read whole before the run: a page opened in the browser already in front), else ``""``: the front given back by
+    a rung's put-back or by code's tidy step, or a window and tab that were there before, is the user's, never placed.
+
+    safety27 T3: a tab on that window's strip as read before the run (whole or not: seen is seen) is never the run's,
+    whatever the window; a window the run only brought forward (a rung that selected their existing tab and raised the
+    browser) is no evidence of a tab of its own; and a new window or tab counts only in a window the run acted in
+    (``own``: its measured windows; or ``app``, the window's app id, among ``apps``: the apps it acted in), never one
+    the user opened meanwhile in another app's window. Pure."""
+    ids = (strips.get("tabs") or {}).get(hwnd) if isinstance(strips, dict) else None
+    if ids and tab_id in ids:
+        return ""
+    if not (hwnd in own or (app and app in (apps or ()))):
+        return ""
     if listed and hwnd not in listed:
         return "new_window"
-    ids = (strips.get("tabs") or {}).get(hwnd) if isinstance(strips, dict) else None
     if ids and (strips.get("complete") or {}).get(hwnd, True) and tab_id not in ids:
         return "new_tab"
     return ""
@@ -3937,8 +3953,10 @@ class Hands:
             # fHands (k-live-A: 43 of 58 scenarios): the ledger line is a record of what the hand did, never part of
             # the act: one that can't be kept (a stand-in log of another shape raised here, after the act, and every
             # hand came back "failed and returned no result") is logged and the hand's own result goes on
+            # safety27 T1: ``put_up`` only for a tab the hand's own act made (``tab_put_up``), never one it showed
             record = self._keep_record(params, name, args, report, ok=ok, verified=verified, turn=turn,
-                                       hwnd=facts.get("live_hwnd"), tab_id=facts.get("live_tab") or "")
+                                       hwnd=facts.get("live_hwnd"), tab_id=facts.get("live_tab") or "",
+                                       **({"put_up": True} if facts.get("tab_put_up") is True else {}))
             if facts.get("live_tab"):
                 # fa review L1 (A2): the title the hand read for the tab it put up (RAM only)
                 self._title_record(record, facts.get("live_title") or facts.get("shown"))
@@ -7134,7 +7152,7 @@ class Hands:
             int(targets[0][3])
         facts["live_hwnd"] = hwnd
         facts["app"] = self._app_at(hwnd)
-        facts["live_tab"] = tab_id
+        facts["live_tab"] = tab_id   # safety27 T1: for the line's liveness only (a tab shown is never one put up)
         facts["target"] = f'TabItem "{title[:80]}"'
         facts["shown"] = title   # sVoiceFix (F5): what the step check says is showing (RAM only, never logged)
         if args.get("_picked_of"):
@@ -7328,13 +7346,24 @@ class Hands:
                     # a close by number alone: the words that name it come first (before Yuki's own check is asked)
                     raise _Refused("give named: the user's words that name each tab to close; a tab their words do "
                                    "not name is never closed. Nothing was closed", shape=True, reason="no_words")
-                out["window"] = hwnd
-                out["_targets"] = [(n, names[n - 1], ids[n - 1] if n - 1 < len(ids) else "", hwnd) for n in wanted]
-                if action == "close" and len(out["_targets"]) == 1:
-                    # fa (A2): one tab by number: checked by identity against the tab Yuki put up there, too
-                    self._theirs_check(out["_targets"][0], words,
-                                       lambda: self._read_every_group(hwnd, self.TAB_SEARCH_BUDGET_S))
-                return out
+                targets = [(n, names[n - 1], ids[n - 1] if n - 1 < len(ids) else "", hwnd) for n in wanted]
+                live = None
+                if action == "close":
+                    # safety27 T4: the shown strip may be a moment old (the tab since navigated to another page): each
+                    # tab is read again by its identity, and closes only while it is there with a title their words
+                    # fit now (that title goes to the gate and the check); else their words decide, below
+                    live = self._read_every_group(hwnd, self.TAB_SEARCH_BUDGET_S)
+                    now = {str(getattr(t, "tab_id", "") or ""): t for t in list(getattr(live, "tabs", None) or [])}
+                    held = [now.get(str(tid)) if tid else None for _n, _t, tid, _h in targets]
+                    targets = ([(t.index, str(t.name), str(tid), hwnd) for t, (_n, _x, tid, _h) in zip(held, targets)]
+                               if all(t is not None and tabs_titled(words, [str(t.name)]) for t in held) else [])
+                if targets:
+                    out["window"] = hwnd
+                    out["_targets"] = targets
+                    if action == "close" and len(targets) == 1:
+                        # fa (A2): one tab by number: checked by identity against the tab Yuki put up there, too
+                        self._theirs_check(targets[0], words, live)
+                    return out
             # kHands (live 10 Oct, 4 of the 11 refusals): a number the strip in hand doesn't hold (the strip moved, or
             # it was never on the line shown) is no guess: their words decide, and with none it is asked again
         if not words:
@@ -7483,6 +7512,8 @@ class Hands:
         if fresh is not None:
             facts["live_tab"] = str(getattr(fresh, "tab_id", "") or "")
             facts["live_title"] = str(getattr(fresh, "name", "") or "")   # fa review L1 (RAM only)
+            # safety27 T1: a tab not on the strip read (whole) before the key: the key's own tab, so one Yuki put up
+            facts["tab_put_up"] = bool(facts["live_tab"]) and bool(getattr(before, "complete", True))
         if fresh is None:
             return ok, (f"{report}; no new tab came up in window {hwnd} within {_NEW_TAB_WAIT_S:g} s (the key may have "
                         f"opened something else, such as a command bar)"), facts
@@ -7622,6 +7653,17 @@ class Hands:
         if not url:
             raise _Refused("no address given")
         app = str(args.get("app") or "").strip() or None
+        # safety27 T2: the strips of the windows it may open in, read now (with ids), so the tab it opens is told apart
+        # from the user's own (one they click while the title is waited for is never taken as Yuki's); a web address
+        # only (a Settings page, a folder or a file opens no tab), and never with a game in front (the launch refuses
+        # it there: no strip is walked for nothing, D17)
+        try:
+            from urllib.parse import urlsplit
+
+            web = urlsplit(url).scheme.casefold() in ("http", "https", "")
+        except ValueError:
+            web = False
+        strips_before, listed = self._strips_now(app) if web and not self._game_front() else ({}, set())
         facts["sent_at"] = time.monotonic()
         # desk20 (final-D S21, browser B4: Arc through this hand took ~18 s, always unverified): the launch answers by a
         # deadline, as the web skill's rungs do (a backend that takes one: probed, never assumed)
@@ -7681,14 +7723,26 @@ class Hands:
         wait_s = min(_TITLE_WAIT_S, max(_TITLE_FLOOR_S, end - waited))
         deadline = waited + wait_s
         can_read = callable(getattr(self.backend, "read_tabs", None))
+        # safety27 T2: the tab this open made is one not on its window's strip read whole before the launch (or any
+        # tab of a window that was not there); one that was (the user's own, clicked while the title is waited for)
+        # is never its proof nor its identity. An address "already" showing made no tab: its tab is kept for the
+        # line's liveness only. A window not read before: its selected tab is the title proof as before, no identity.
+        already = details.get("page_state") == "already"
+        try:
+            known = None if already or not hwnd else strips_before.get(int(hwnd))
+            fresh = bool(not already and hwnd and listed and int(hwnd) not in listed)
+        except (TypeError, ValueError):
+            known, fresh = None, False
         stripless = False
         tab = None
+        ident, showing = "", True
+        titled_at: float | None = None
         while True:
             if not stripless:
-                tab = self._selected_tab(hwnd)
+                selected, tab, ident, showing = self._opened_tab(hwnd, known, fresh, already)
                 # desk20 (S21): a browser that draws no tab strip (Arc: "shows no tabs") is read by its main page
                 # instead (the page-only reader the rungs use), never waited on for a tab title it can't show
-                stripless = tab is None and can_read and self._no_strip(hwnd)
+                stripless = selected is None and can_read and self._no_strip(hwnd)
                 if stripless:
                     facts["by_page"] = True
             if not titled and tab is not None and tab[1] and not _is_address(tab[1]):
@@ -7697,17 +7751,29 @@ class Hands:
                 shown = self._main_page_title(hwnd, str(page.get("url") or url), deadline)
                 if shown:
                     titled, title = True, shown
-            if titled or not can_read or time.monotonic() >= deadline:
+            now = time.monotonic()
+            if not can_read or now >= deadline:
                 break
+            if titled:
+                # safety27 T2: titled by the launch's own read, its new tab not seen on the strip yet (the strip lags
+                # the page): looked for a moment more, never taken from the tab showing
+                if ident or stripless or known is None:
+                    break
+                titled_at = now if titled_at is None else titled_at
+                if now - titled_at >= _NEW_TAB_WAIT_S:
+                    break
             time.sleep(_POLL_S * 2)
         facts["title_wait_ms"] = round((time.monotonic() - waited) * 1000)
         facts["verified"] = titled
-        if tab is not None and len(tab) > 3 and tab[3]:
+        if ident and tab is not None and len(tab) > 3 and tab[3]:
             facts["live_tab"] = tab[3]
             facts["live_title"] = str(title or "") if titled else ""   # fa review L1 (RAM only, never logged)
+            facts["tab_put_up"] = ident == "own"   # safety27 T1: a tab this open made, never one already there
         # The verified facts first (they are what the action log and the thinker need), then the
         # opening's own report.
-        where = f"it is tab {tab[0]} of {tab[2]} in window {hwnd}, \"{tab[1]}\", now showing; " if tab else ""
+        where = (f"it is tab {tab[0]} of {tab[2]} in window {hwnd}, \"{tab[1]}\", "
+                 f"{'now showing' if showing else 'not the one showing now (another tab was selected since)'}; "
+                 if tab else "")
         if not tab and stripless:
             where = f"window {hwnd} (no tab strip: read by its page) shows it; "
         # (tab[3]: its identity, for the action log only)
@@ -7833,10 +7899,11 @@ class Hands:
 
         integ27 fix H1 (a restore rung or code's tidy step gave the front back, and the user's own tab was kept as one
         Yuki put up): kept only where the front after the run is measurably the run's own (:func:`_own_place`): a window
-        the engine measured coming forward under a rung (``facts["acted_windows"]``, the scope's ``touched_windows``),
-        one the desk before the run did not list (``before``, else the summary's windows kept with the run), or a tab
-        not on that window's strip as the summary read it before the run (``facts["_tabs_before"]``: a page opened as a
-        new tab in the browser already in front, integration review F1). Anything else is left unplaced."""
+        the desk before the run did not list (``before``, else the summary's windows kept with the run), or a tab not on
+        that window's strip as the summary read it before the run (``facts["_tabs_before"]``: a page opened as a new
+        tab in the browser already in front, integration review F1); safety27 T3: either only in a window the run acted
+        in (``facts["acted_windows"]``, the scope's ``touched_windows``, or a window of ``facts["acted_apps"]`` or the
+        scope's ``touched_apps``), and never a tab on that strip before. Anything else is left unplaced."""
         place = getattr(self.actions, "place", None)
         if not callable(place):
             return
@@ -7846,6 +7913,10 @@ class Hands:
         listed = _listed_windows(before)
         if listed is None and strips.get("hwnds"):
             listed = {int(h) for h in strips["hwnds"]}
+        # safety27 T3: the apps the run acted in (the engine's measured ``acted_apps``, the desk scope's touched apps)
+        scope = facts.get("_desk_scope") if isinstance(facts.get("_desk_scope"), dict) else {}
+        apps = {_app_id(a) for a in [*(facts.get("acted_apps") or ()), *(scope.get("touched_apps") or ())]
+                if isinstance(a, str) and a.strip()}
 
         def run() -> None:
             try:
@@ -7856,7 +7927,7 @@ class Hands:
                     known = set(self.last.hwnds)
                 tab = self._selected_tab(hwnd) if hwnd and (hwnd not in known or self._is_browser(hwnd)) else None
                 if tab is not None and len(tab) > 3 and tab[3]:
-                    how = _own_place(int(hwnd), str(tab[3]), own, listed, strips)
+                    how = _own_place(int(hwnd), str(tab[3]), own, listed, strips, apps, _app_id(self._app_at(hwnd)))
                     if self.log is not None:
                         self.log.event("hands", op="place_record", how=how or "not_own")   # content-free
                     if not how:
@@ -8016,6 +8087,79 @@ class Hands:
             return " ".join(str(tab[1] or "").split()) if tab is not None else ""
         except Exception:  # noqa: BLE001
             return ""
+
+    #: safety27 T2: right before an address is opened, at most this many windows it may open in have their strips read
+    #: (each within _OTHER_TABS_BUDGET_S), all within this total (s).
+    OPEN_BEFORE_WINDOWS = 4
+    OPEN_BEFORE_TOTAL_S = 0.8
+
+    def _strips_now(self, app: Any) -> tuple[dict[int, set[str]], set[int]]:
+        """safety27 T2: right before an address is opened, ``({window: the tab ids on its strip}, the windows the last
+        desk read listed)``: the strips of the windows it may open in (the browser named, ``app``; else every browser
+        of the last desk read), nearest first, read now with every group, at most :attr:`OPEN_BEFORE_WINDOWS` within
+        :attr:`OPEN_BEFORE_TOTAL_S`. Only a read that came back whole, every tab with an identity, is kept (a window
+        missing from it is not known). Never raises."""
+        out: dict[int, set[str]] = {}
+        listed: set[int] = set()
+        try:
+            with self._lock:
+                snap = self.last
+                overview = snap.overview or {}
+                listed = {int(h) for h in snap.hwnds} if not snap.error else set()
+            if not callable(getattr(self.backend, "read_tabs", None)) and not _is_real_backend(self.backend):
+                return out, listed
+            if app:
+                order = list(self._windows_of(str(app)))
+            else:
+                order = [int(w["hwnd"]) for w in overview.get("windows") or []
+                         if isinstance(w, dict) and w.get("hwnd") is not None and self._is_browser(int(w["hwnd"]))]
+            deadline = time.monotonic() + self.OPEN_BEFORE_TOTAL_S
+            for h in order[:self.OPEN_BEFORE_WINDOWS]:
+                left = deadline - time.monotonic()
+                if left <= 0.05:
+                    break
+                strip = self._read_every_group(int(h), min(_OTHER_TABS_BUDGET_S, left))
+                if strip is None or getattr(strip, "error", None) or not getattr(strip, "complete", True):
+                    continue
+                ids = [str(getattr(t, "tab_id", "") or "") for t in getattr(strip, "tabs", None) or []]
+                if all(ids):
+                    out[int(h)] = set(ids)
+        except Exception:  # noqa: BLE001 - nothing known: no tab is taken as the open's own
+            return {}, listed
+        return out, listed
+
+    def _opened_tab(self, hwnd: Any, known: set[str] | None, fresh: bool, already: bool
+                    ) -> tuple[Any, tuple[int, str, int, str] | None, str, bool]:
+        """safety27 T2: ``(the selected tab as read, the tab for the open's report, its identity's kind, whether it is
+        the one showing)`` of ``hwnd`` after an address opened there. Kind ``own``: a tab the open made (with
+        ``known``, the window's tab ids read whole before the launch: the selected tab when it is not among them, else
+        the one tab not among them; ``fresh``: the window was not there, so its tab); ``live``: the tab showing an
+        address that was ``already`` there (the line's liveness only); ``""``: no identity (a window not read before:
+        the tab showing is the title's proof only, as before; or no new tab seen). One strip read; never raises."""
+        read = getattr(self.backend, "read_tabs", None)
+        if not callable(read) or not hwnd:
+            return None, None, "", True
+        try:
+            strip = read(int(hwnd), budget_s=0.3)
+        except Exception:  # noqa: BLE001
+            return None, None, "", True
+        tabs = list(getattr(strip, "tabs", None) or [])
+        selected = getattr(strip, "selected", None)
+
+        def row(t: Any) -> tuple[int, str, int, str]:
+            return t.index, t.name, len(tabs), str(getattr(t, "tab_id", "") or "")
+
+        if known is None:
+            if selected is None:
+                return None, None, "", True
+            kind = "live" if already else ("own" if fresh and row(selected)[3] else "")
+            return selected, row(selected), kind, True
+        new = [t for t in tabs if str(getattr(t, "tab_id", "") or "") and str(t.tab_id) not in known]
+        if selected is not None and any(t is selected for t in new):
+            return selected, row(selected), "own", True
+        if len(new) == 1:
+            return selected, row(new[0]), "own", False
+        return selected, None, "", True
 
     def _selected_tab(self, hwnd: Any) -> tuple[int, str, int, str] | None:
         """``(place, name, count, identity)`` of the tab ``hwnd`` shows (identity: its UIA RuntimeId text, ``""``
@@ -9249,9 +9393,11 @@ class Verbs:
         h = self.hands
         try:
             if not facts.get("refused") or facts.get("sent_at") is not None:
+                # safety27 T1: ``put_up`` only for a tab the verb's own act made (``tab_put_up``)
                 record = h.actions.add("your hand", _what(name, args), str(report or "")[:400], ok=bool(ok),
                                        verified=verified, turn=h._call_safely(h.user_turn, None),
-                                       hwnd=facts.get("live_hwnd"), tab_id=facts.get("live_tab") or "")
+                                       hwnd=facts.get("live_hwnd"), tab_id=facts.get("live_tab") or "",
+                                       **({"put_up": True} if facts.get("tab_put_up") is True else {}))
                 if (name == SKILL_HAND and record is not None and verified is True
                         and (facts.get("focus_taken") or facts.get("focus_declared"))):
                     # fa (A3, final-F one multi_open_then_close_yt_tab: ONE's run_skill records kept no tab, so "close

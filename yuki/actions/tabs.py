@@ -441,14 +441,16 @@ def raised_window(hwnd: int, before: set[int] | frozenset[int] = frozenset()) ->
         return 0
 
 
-def note_raised(dialog: int, owner: int) -> None:
+def note_raised(dialog: int, owner: int, act: str = "close") -> None:
     """The measured fact for the commit check (``brain.check.note_raised``: ids only): ``dialog`` came up in reply to
     Yuki's own close of something in ``owner``. Written here, by the act that measured it, so every caller (the talker's
-    and ONE's hands, the thinker's tab and window tools) leaves the same fact. Never raises."""
+    and ONE's hands, the thinker's tab and window tools) leaves the same fact. safety27 D2: ``act`` ``close_held``
+    (``dialog`` == ``owner``): a close of Yuki's in that window was pressed and it stayed open with no window of its own
+    measured (it may be asking inside it). Never raises."""
     try:
         from yuki.brain.check import note_raised as keep
 
-        keep(int(dialog), int(owner), "close")
+        keep(int(dialog), int(owner), str(act or "close"))
     except Exception:  # noqa: BLE001 - the check then reads the step as before
         pass
 
@@ -1013,6 +1015,10 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
     # window of the page's measured: the page may be asking inside its own window (a Firefox-family browser draws its
     # "leave page" question there), so this is reported as it is, never finished by another hand
     details["close_held"] = bool(action == "close" and shared.get("how") and not shared.get("seen") and not dialog)
+    if details["close_held"]:
+        # safety27 D2: the window itself noted for the commit check (and the planner's hold): a step in it is judged
+        # knowing a close of Yuki's there was pressed and the tab stayed (it may be asking inside the window)
+        note_raised(int(hwnd), int(hwnd), "close_held")
     if dialog:
         # fa (A1, final-F k_tab_close_leave_site: "Leave" was then clicked for the user and their unsaved text lost):
         # the close raised the page's own question; nothing in it was answered, and that answer is theirs. Review L5:
