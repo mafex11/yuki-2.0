@@ -1,6 +1,6 @@
 """The corner cards in the Lattice design (phase E8): the base every card window shares, and the cards that are new.
 
-:class:`LatticeCard` is the design's ``.card``: 416 px wide, the field colour with a 1 px ``#2A2D31`` border and 20 px
+:class:`LatticeCard` is the design's ``.card``: 416 px wide, the field colour with a 1 px surface border and 20 px
 corners (no shadow: the design has none), 16 x 18 px padding, a header of a dot icon, a mono label and a close key;
 bottom right of the monitor in use (16 px over the taskbar, 20 px from the edge; the call consent card sits top
 right). It comes in as the design's ``cardin`` (520 ms, a 10 px rise, its ease) and leaves as its ``leave`` (420 ms,
@@ -961,10 +961,11 @@ def QGuiApplication_platform() -> str:  # noqa: N802 - a tiny helper
     return QGuiApplication.platformName()
 
 
-#: The tray menu's look (the mock's ``.traymenu``): 252 px, the field colour, a ``#34373C`` border, 12 px corners,
+#: The tray menu's look (the mock's ``.traymenu``): 252 px, the field colour, the panel border (20 Oct: from the token,
+#: umber ``#38332E``, no longer the graphite literal ``#34373C``), 12 px corners,
 #: 32 px rows with 8 px corners, hover ``raise-2``, the right-hand state in mono.
 TRAY_MENU_CSS = (
-    "QMenu {{ background: {bg}; border: 1px solid #34373C; border-radius: 12px; padding: 5px; color: {text};"
+    "QMenu {{ background: {bg}; border: 1px solid {border}; border-radius: 12px; padding: 5px; color: {text};"
     " }}"
     "QMenu::item {{ height: 32px; padding: 0 12px 0 8px; border-radius: 8px; background: transparent; }}"
     "QMenu::item:selected {{ background: {raise2}; }}"
@@ -988,7 +989,8 @@ class TrayMenu(QMenu):
         self.setMinimumWidth(252)
         self.setFont(L.ui_font(13))
         self.setStyleSheet(TRAY_MENU_CSS.format(bg=L.css(L.BG), text=L.css(L.TEXT), text3=L.css(L.TEXT3),
-                                                raise2=L.css(L.RAISE2), hair=L.css(L.HAIR)))
+                                                raise2=L.css(L.RAISE2), hair=L.css(L.HAIR),
+                                                border=L.css(L.PANEL_BORDER)))
         self._words: dict[int, str] = {}
 
     @staticmethod

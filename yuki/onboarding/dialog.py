@@ -10,12 +10,12 @@ Every write goes through a parameter (``env``, ``local_dir``, ``memory_dir``) so
 tests and trial runs point at scratch locations. Slow work (the key test, the
 download) runs on plain threads and reports back through queued Qt signals.
 
-The look comes from the Lattice kit (:mod:`yuki.ui.lattice`, painting from the one token source): the graphite
-field, bone text, and one live colour (the user's accent, mint by default) only for live things (the current step,
-a key that tested fine, the download's head, keyboard focus). Primary keys are lit bone with dark ink. Content sits
-in crop-marked clearings (no cards, no shadows); the face is the brand mark in the header; the steps are a
-dot-matrix track, the step number is Doto and the download runs along a row of dots. Errors are said in words, in
-the brightest ink, never in red.
+The look comes from the Lattice kit (:mod:`yuki.ui.lattice`, painting from the one token source): the umber
+field, bone text, and one live colour (the user's accent, ember orange by default since 20 Oct) only for live things
+(the current step, a key that tested fine, the download's head, keyboard focus). Primary keys are lit bone with dark
+ink. Content sits in crop-marked clearings (no cards, no shadows); the face is the brand mark in the header; the
+steps are a dot-matrix track, the step number is Doto and the download runs along a row of dots. Errors are said in
+words, in the brightest ink, never in red.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ from yuki.ui import lattice as L
 from yuki.ui import tokens as _tokens
 
 # -- look (Lattice: the one token source, yuki/ui/web/tokens.json via yuki.ui.tokens and the yuki.ui.lattice kit) ---
-# The wizard runs before any ui.json exists, so the live colour is normally the default accent (mint); L.live()
+# The wizard runs before any ui.json exists, so the live colour is normally the default accent (ember); L.live()
 # follows the user's accent when one is set (a second run after a key was removed).
 
 _C = _tokens.COLOR

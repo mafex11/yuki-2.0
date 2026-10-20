@@ -332,7 +332,7 @@ def test_the_tray_faces_follow_the_mocks_grids(qapp):
     r20 = tray_face_image("resting", 20)
     assert _lit(r20, 6, 6) > 200 and _lit(r20, 5, 5) < 255                            # a 3 px round dot
     c24 = tray_face_image("call", 24)
-    assert c24.pixelColor(22, 2).green() > 200                                        # the mint rec badge
+    assert c24.pixelColor(22, 2).red() > 200 and c24.pixelColor(22, 2).blue() < 60    # the ember rec badge (20 Oct)
     off = tray_face_image("off", 16)
     assert _lit(off, 13, 0) > 0 and _lit(off, 14, 1) == 0                             # a hollow ring
     light = tray_face_image("resting", 16, theme="light")

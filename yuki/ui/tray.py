@@ -3,21 +3,22 @@ short menu.
 
 **The icon** is the island's face cut down to a 5 x 5 dot grid (the mock's "Tray face grids"): the same square eyes
 two dots wide, whose height is the expression, and the same mouth row; shut eyes sit where open eyes sit under a dim
-lid; a dot tucked into the top-right corner adds the call (mint) or off (hollow) state. Hand-tuned per size, in whole
+lid; a dot tucked into the top-right corner adds the call (ember) or off (hollow) state. Hand-tuned per size, in whole
 pixels: 16 px = 3 px pitch and 2 px dots, 20 px = 4 px pitch and 3 px round dots, 24 px = 5 px pitch and 4 px round
 dots (32 px = 6 px pitch, 5 px dots). Hearing, speaking and working swap 4 frames; the others stay still. Colours
-follow the taskbar's light or dark theme.
+follow the taskbar's light or dark theme. (20 Oct: the website's umber and ember orange. The accent here is ember
+whatever the Accent setting says: the tray never followed the setting, it wears the default's colour.)
 
 =============  ==========================================================
 resting        calm open eyes, a soft mouth: say "Yuki"
-listening      tall eyes, a small mint mouth
+listening      tall eyes, a small ember mouth
 hearing        tall eyes, the mouth widens and narrows (4 x 190 ms)
 speaking       calm eyes, one mouth that opens and closes (4 x 225 ms)
 working        eyes under a dim lid, the mouth is the step bar (4 x 300 ms)
-needs-you      raised eyes, a mint "o" mouth
+needs-you      raised eyes, an ember "o" mouth
 stopped        squeezed "> <" eyes: voice stopped
 call-ask       shut eyes, a soft mouth, no rec dot (the consent card waits)
-call           shut eyes, a soft mouth, the mint rec dot (the call is recorded: what is kept, in the card)
+call           shut eyes, a soft mouth, the ember rec dot (the call is recorded: what is kept, in the card)
 off            the whole face dim, a hollow corner ring: not listening
 game           shut eyes, no mouth; the rec dot only while a call or the game's voice chat records
 =============  ==========================================================
@@ -52,7 +53,7 @@ _TALL = [_E2, _E2, _E2]
 _OPEN = [_NO, _E2, _E2, _NO]
 
 #: The mock's "Tray face grids": per state, its frames (5 rows of 5 cells each) and the ms per frame (0: still).
-#: ``X`` lit (text colour), ``d`` the same dimmed, ``M`` mint, ``m`` mint at 50 %, ``.`` nothing.
+#: ``X`` lit (text colour), ``d`` the same dimmed, ``M`` the accent (ember), ``m`` the accent at 50 %, ``.`` nothing.
 TRAY_FACES: dict[str, tuple[list[list[str]], int]] = {
     "resting": ([[*_OPEN, ".ddd."]], 0),
     "listening": ([[*_TALL, _NO, ".mMm."]], 0),
@@ -76,8 +77,14 @@ TRAY_GRID: dict[int, tuple[int, int, int, tuple[int, int, int]]] = {
     64: (12, 9, 4, (50, 2, 12)),
 }
 
-#: Theme colours: (lit, mint, dim share) on a dark and on a light taskbar.
-TRAY_INK: dict[str, tuple[str, str, float]] = {"dark": ("#F2EFE9", "#6FEBC4", 0.62), "light": ("#1B1B1B", "#0B8A66", 0.5)}
+#: Theme colours: (lit, accent, dim share) on a dark and on a light taskbar. (20 Oct, the website's palette: on a
+#: dark bar bone and ember ``#FF6A1A``, 5.7:1 on Windows' dark taskbar ``#202020``; on a light bar umber ink
+#: ``#1F1B18`` (the nearest umber step to the old ``#1B1B1B``) and the ember ramp's darker step ``#C65518``, 4.0:1 on
+#: ``#F3F3F3`` and 3.8:1 on ``#EEEEEE``, where ember itself is 2.5:1. Was mint ``#6FEBC4`` / ``#0B8A66``.)
+TRAY_INK: dict[str, tuple[str, str, float]] = {"dark": ("#F2EFE9", "#FF6A1A", 0.62), "light": ("#1F1B18", "#C65518", 0.5)}
+#: The unlit dots the 64 px check view draws: the umber dot-face step ``#2F2A26`` on a dark bar, the website's bone
+#: tint for off dots ``#D9D5CC`` on a light one (20 Oct; were ``#2A2D31`` / ``#D6D6D6``).
+TRAY_GHOST: dict[str, str] = {"dark": "#2F2A26", "light": "#D9D5CC"}
 
 
 def tray_badge(state: str, *, recording: bool = False) -> str:
@@ -114,7 +121,7 @@ def tray_face_image(state: str, size: int = 16, frame: int = 0, theme: str = "da
     rows = frames[frame % len(frames)]
     if badge is None:
         badge = tray_badge(state)
-    lit_hex, mint_hex, dim = TRAY_INK.get(theme, TRAY_INK["dark"])
+    lit_hex, acc_hex, dim = TRAY_INK.get(theme, TRAY_INK["dark"])
     px = int(round(size * dpr))
     img = QImage(px, px, QImage.Format.Format_ARGB32_Premultiplied)
     img.fill(0)
@@ -123,7 +130,7 @@ def tray_face_image(state: str, size: int = 16, frame: int = 0, theme: str = "da
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setPen(Qt.PenStyle.NoPen)
     if size >= 64:                       # the board's check view also draws the unlit dots
-        ghost = QColor("#D6D6D6" if theme == "light" else "#2A2D31")
+        ghost = QColor(TRAY_GHOST["light" if theme == "light" else "dark"])
         painter.setBrush(ghost)
         r = d * 0.42 / 2
         for j in range(5):
@@ -133,7 +140,7 @@ def tray_face_image(state: str, size: int = 16, frame: int = 0, theme: str = "da
         for i, ch in enumerate(row):
             if ch == ".":
                 continue
-            c = QColor(mint_hex if ch in ("M", "m") else lit_hex)
+            c = QColor(acc_hex if ch in ("M", "m") else lit_hex)
             if ch == "d":
                 c.setAlphaF(dim)
             elif ch == "m":
@@ -145,7 +152,7 @@ def tray_face_image(state: str, size: int = 16, frame: int = 0, theme: str = "da
             else:
                 painter.drawEllipse(QRectF(x, y, d, d))
     if badge == "rec":
-        painter.setBrush(QColor(mint_hex))
+        painter.setBrush(QColor(acc_hex))
         if bs < 4:
             painter.drawRoundedRect(QRectF(bx, by, bs, bs), 1, 1)
         else:

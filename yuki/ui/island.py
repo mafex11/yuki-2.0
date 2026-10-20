@@ -1321,8 +1321,10 @@ class RunCard(QWidget):
 
 
 class Panel(QWidget):
-    """The island's body: the field colour, a 1 px ``#2A2D31`` border, 22 px corners (20 expanded, 13 mini). The
-    resting pill is the design's ``.island.mini.resting``: ``rgba(11,11,12,.86)`` with a ``#222428`` border."""
+    """The island's body: the field colour, a 1 px surface border, 22 px corners (20 expanded, 13 mini). The
+    resting pill is the design's ``.island.mini.resting``: the field at .86 with a dimmer border. (20 Oct, umber: the
+    field ``#090705``, so ``rgba(9,7,5,.86)``; the surface border ``#2F2A26``; the resting border the dot step
+    ``#292521``, the nearest umber step to the graphite ``#222428`` it replaces.)"""
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
@@ -1336,15 +1338,17 @@ class Panel(QWidget):
         path = QPainterPath()
         rad = min(self.radius, r.height() / 2, r.width() / 2)
         path.addRoundedRect(r, rad - 0.5, rad - 0.5)
-        p.fillPath(path, QColor(11, 11, 12, 219) if self.resting else L.BG)
-        p.setPen(QPen(QColor("#222428") if self.resting else L.BORDER, 1.0))
+        rest = QColor(L.BG)
+        rest.setAlpha(219)   # (20 Oct) .86 of the field token, no literal: umber rgba(9,7,5,.86)
+        p.fillPath(path, rest if self.resting else L.BG)
+        p.setPen(QPen(L.DOT if self.resting else L.BORDER, 1.0))
         p.drawPath(path)
         p.end()
 
 
 class RecDot(QWidget):
-    """The island's still mint rec dot (the design's ``.recmark .recdot.still``, 7 px): the call is recorded. The
-    call's timer lives only in the tray's hover card (3 Oct, item 20)."""
+    """The island's still rec dot in the live colour (the design's ``.recmark .recdot.still``, 7 px): the call is
+    recorded. The call's timer lives only in the tray's hover card (3 Oct, item 20)."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)

@@ -2,7 +2,8 @@
 
 The logo is one parameter, ``mark`` in ``packaging/icon/icon.json`` (a mark id or number from the logo gallery,
 ``docs/ui-mockups/revamp-2026-10/logo``, for example ``planet`` or ``06a``), with its colour set ``ramp`` (``mint``,
-``night`` or ``bang``). While ``mark`` is empty (no logo picked yet) the current ``yuki.ico`` is kept as it is.
+``night`` or ``bang``; the Y also has ``ember``, the website's colours and the one built since 20 Oct). While ``mark``
+is empty (no logo picked yet) the current ``yuki.ico`` is kept as it is.
 
 Once a mark is picked:
 
@@ -22,16 +23,19 @@ own source of truth, ``packaging/icon/badge/yuki-icon-grids.json`` (every dot of
    canvas, the way its ``export/yuki-icon-<size>.png`` were made, so the frames match them byte for byte).
 2. A build packs the committed frames into ``yuki.ico`` unchanged (no browser, no Node, no gallery).
 
-**The Y** (``mark`` ``y``, the user's pick of 4 Oct: one bold Y in round dots, a mint dot at its joint) is a grid mark
-like the badge, with no gallery behind it: its hand-tuned layout per size is ``packaging/icon/y/y_grids.py``, which
-``--export`` writes to ``packaging/icon/y/yuki-icon-grids.json`` before drawing the frames into
+**The Y** (``mark`` ``y``, the user's pick of 4 Oct: one bold Y in round dots, an accent dot at its joint) is a grid
+mark like the badge, with no gallery behind it: its hand-tuned layout per size is ``packaging/icon/y/y_grids.py``,
+which ``--export`` writes to ``packaging/icon/y/yuki-icon-grids.json`` before drawing the frames into
 ``packaging/icon/y-<ramp>/<size>.png`` the same way. The badge's files stay; ``mark`` picks which one is built.
+(20 Oct: the built set is ``ember``, the website's umber tile and ember joint like its favicon, frames in
+``packaging/icon/y-ember/``; the 4 Oct mint frames stay in ``packaging/icon/y-mint/``.)
 
 Every build also copies the icon to ``yuki/ui/yuki.ico``, the copy the app itself loads (the window's title bar and
 taskbar button; :mod:`yuki.ui.webview2`).
 
 ``--installer-images`` draws the installer's wizard images (``packaging/installer/``) from the startup splash's still
-frame (``yuki/ui/web/planet-splash.js``) in the same headless browser, at each size Inno Setup picks from per DPI.
+frame (``yuki/ui/web/planet-splash.js``) in the same headless browser, at each size Inno Setup picks from per DPI,
+in :data:`INSTALLER_PALETTE` (20 Oct: the website's umber and ember, whatever colours the splash itself wears).
 
 ``--mark`` / ``--ramp`` override icon.json for one run; ``--out`` writes elsewhere (a preview).
 """
@@ -78,6 +82,15 @@ WIZARD_SMALL = {58: 2, 77: 3, 97: 3, 124: 4}
 WIZARD_WIN = 214.0
 SPLASH_PITCH = 5.2               # planet-splash.js P: the field's dot pitch in layout px
 PLANET_CENTRE = (260.0, 113.6)   # planet-splash.js: column 50, row round(57 * 0.36) of the 5.2 px field
+#: (20 Oct) The wizard images in the website's palette (yuki-website public/css/base.css, js/dotkit.js), laid over the
+#: splash's own colours in the drawing page only (``render.js`` ``repaint``): the dot engine's tile, base, off and
+#: edge colours as umber steps, the colour set's ramp as the ember dot ramp (dim to bright: its 4th step is the
+#: accent, the dot over the i; its 6th the bone of the name), and the umber ground.
+INSTALLER_PALETTE = {
+    "bg": "#090705",
+    "col": {"BASE": "#292521", "OFF": "#2F2A26", "TILE": "#090705", "EDGE": "#2F2A26"},
+    "ramp": ["#5A2E15", "#8D4017", "#C65518", "#FF6A1A", "#F7BA96", "#F2EFE9"],
+}
 
 
 def is_badge(mark: str) -> bool:
@@ -334,13 +347,13 @@ def installer_images(out_dir: Path = INSTALLER_DIR, browser: str | None = None) 
              for w, h in WIZARD]
     specs += [{"file": f"wizard-small-{s}.bmp", "w": s, "h": s, "win": s * SPLASH_PITCH / px, "cx": PLANET_CENTRE[0],
                "cy": PLANET_CENTRE[1], "text": False} for s, px in WIZARD_SMALL.items()]
-    res = browser_run({"kind": "installer", "images": specs, "set": "mint"},
+    res = browser_run({"kind": "installer", "images": specs, "set": "mint", "palette": INSTALLER_PALETTE},
                       [WEB_DIR / "dots.js", WEB_DIR / "planet-splash.js"], browser)
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for spec in specs:
         im = Image.open(io.BytesIO(_png(res[spec["file"]]))).convert("RGBA")
-        flat = Image.new("RGB", im.size, (0x0B, 0x0B, 0x0C))
+        flat = Image.new("RGB", im.size, tuple(int(INSTALLER_PALETTE["bg"][i:i + 2], 16) for i in (1, 3, 5)))
         flat.paste(im, mask=im.getchannel("A"))
         path = out_dir / spec["file"]
         flat.save(path, format="BMP")
@@ -402,7 +415,7 @@ def legacy_glyph(out: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--mark", help="a mark id or number from the logo gallery (overrides icon.json)")
-    ap.add_argument("--ramp", help="the colour set: mint | night | bang (overrides icon.json)")
+    ap.add_argument("--ramp", help="the colour set: ember (the Y) | mint | night | bang (overrides icon.json)")
     ap.add_argument("--export", action="store_true",
                     help="export the mark (gallery marks: SVGs, Node; the badge and the Y: their grids, then frames in a headless browser)")
     ap.add_argument("--installer-images", action="store_true",

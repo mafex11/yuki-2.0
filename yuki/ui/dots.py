@@ -4,8 +4,8 @@ Same constants, easing and timings as the design (``docs/ui-mockups/revamp-2026-
 the numbers are also in ``yuki/ui/web/tokens.json`` ``face`` / ``field``):
 
 * **The face** (:class:`FaceModel`, :class:`FaceWidget`): a 17 x 7 grid, every expression a pure function of time.
-  Off cells stay visible (``#2A2D31``, radius 0.16 pitch); lit cells attack fast and release slowly (0.6 / 0.17 per
-  frame), leaving a short phosphor trail. It blinks every 3.8-7 s (held 0.14 s), only while its eyes are open.
+  Off cells stay visible (the ``dotFace`` token, umber ``#2F2A26`` since 20 Oct; radius 0.16 pitch); lit cells
+  attack fast and release slowly (0.6 / 0.17 per frame), leaving a short phosphor trail. It blinks every 3.8-7 s (held 0.14 s), only while its eyes are open.
 * **The halo** (:class:`HaloModel`, :class:`HaloWidget`): a bounded 560 x 170 box of 10 px cells under the island;
   an ellipse whose dots shrink toward its edge, on a soft dark backing, holding one figure per live state (a ring,
   a voice field, comets, the steps so far as segments (no total), a sine ribbon, ripples, a dotted line, a stamped check). Cells ease

@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.ui.window.actions import NOOP, Actions
 from yuki.ui.window.data import SettingsView
-from yuki.ui.window.theme import ACCENT_LABELS, PAGE_PAD, Theme
+from yuki.ui.window.theme import ACCENT_LABELS, DEFAULT_ACCENT, PAGE_PAD, Theme
 from yuki.ui.window.widgets import (
     Button,
     Card,
@@ -43,7 +43,8 @@ DEFAULT_OPEN_HOTKEY = "alt+shift"
 #: Quiet-hour choices, every half hour.
 TIMES = tuple(f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30))
 
-#: The accent choices as the Settings page words them (``tokens.json`` ``accent``: "green" is Lattice's mint).
+#: The accent choices as the Settings page words them (``tokens.json`` ``accent``: "orange" is the website's ember,
+#: the default since 20 Oct; "green" is Lattice's mint).
 ACCENT_WORDS = dict(ACCENT_LABELS)
 
 
@@ -181,9 +182,11 @@ def build(t: Theme, v: SettingsView, *, advanced: bool = False, act: Actions = N
     motion.toggled.connect(act.set_reduce_motion)
     general.body.addWidget(SettingRow(t, "pause", "Reduce motion", "No sliding or fading: things just appear, and the "
                                       "waves hold still.", motion))
-    accent = Segmented(t, tuple(ACCENT_WORDS.values()),
-                       ACCENT_WORDS.get(getattr(ui, "accent", "green"), ACCENT_WORDS["green"]), small=True)
-    accent.changed.connect(lambda word: act.set_accent({w: k for k, w in ACCENT_WORDS.items()}.get(word, "green")))
+    # (20 Oct) a missing or unknown accent reads as the default (ember), no longer a hard-coded "green"
+    chosen = ACCENT_WORDS.get(getattr(ui, "accent", DEFAULT_ACCENT), ACCENT_WORDS[DEFAULT_ACCENT])
+    accent = Segmented(t, tuple(ACCENT_WORDS.values()), chosen, small=True)
+    names = {w: k for k, w in ACCENT_WORDS.items()}
+    accent.changed.connect(lambda word: act.set_accent(names.get(word, DEFAULT_ACCENT)))
     general.body.addWidget(SettingRow(t, "palette", "Accent", "The one colour Yuki uses, only for something live: "
                                       "listening, working, recording, Stop.", accent))
     general.setParent(grid)

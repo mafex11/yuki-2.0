@@ -3,7 +3,8 @@
 Everything here paints from the one token source (:mod:`yuki.ui.tokens`, generated from ``yuki/ui/web/tokens.json``)
 and copies the Lattice design's CSS and ``field.js`` constants (``docs/ui-mockups/revamp-2026-10/3-lattice``, gitignored):
 
-* colours (the graphite field, bone text, the one live colour that follows the user's accent);
+* colours (the umber field, bone text, the one live colour that follows the user's accent; 20 Oct: the website's
+  umber blacks and ember orange replaced the graphite field and mint);
 * type: Instrument Sans for the UI, JetBrains Mono for labels and times, Doto (``ROND`` 100) for timers and counters;
 * motion: the design's ease ``cubic-bezier(.2,.7,.1,1)``, its durations, the 30 fps cap, the 1.5 DPR cap and
   "reduce motion" (the app's setting or Windows' own "Show animations" switch: one still frame, no blinks);
@@ -58,12 +59,16 @@ TEXT3 = qcolor(_C["text3"])
 HAIR = qcolor(_C["hair"])
 HAIR2 = qcolor(_C["hair2"])
 MARK = qcolor(_C["mark"])
-BORDER = qcolor(_C["surfaceBorder"])          # #2A2D31: the island, the cards
-PANEL_BORDER = qcolor(_C["panelBorder"])      # #34373C: toasts, the hover card
+BORDER = qcolor(_C["surfaceBorder"])          # umber #2F2A26: the island, the cards
+PANEL_BORDER = qcolor(_C["panelBorder"])      # umber #38332E (the website's --edge): toasts, the hover card
 MID = qcolor(_C["midTone"])
-#: Hover border of a key (the design's ``#3A3E43``) and the ask bar's border (``#2E3135``): literal in its CSS.
-KEY_HOVER_BORDER = QColor("#3A3E43")
-ASKBAR_BORDER = QColor("#2E3135")
+#: Hover border of a key: literal in the design's CSS, no token of its own. (20 Oct: the website's --edge-2
+#: ``#3E3934``, the umber step for the graphite design's ``#3A3E43``.)
+KEY_HOVER_BORDER = QColor("#3E3934")
+#: The ask bar's border. (20 Oct: the website's --edge, the border of its floating panels: the run card, the ask bar,
+#: the thread; so the panel border token. The graphite design's ``#2E3135`` had no umber step of its own, and
+#: ``#38332E`` is the nearest by lightness too.)
+ASKBAR_BORDER = qcolor(_C["panelBorder"])
 
 
 def _accent() -> dict[str, Any]:
@@ -77,7 +82,8 @@ def _accent() -> dict[str, Any]:
 
 
 def live() -> QColor:
-    """The one live colour (the user's accent; mint by default): listening, the working head, rec, needs-you, Stop."""
+    """The one live colour (the user's accent; ember orange by default since 20 Oct, mint the other choice):
+    listening, the working head, rec, needs-you, Stop."""
     return qcolor(_accent()["live"])
 
 
@@ -86,7 +92,8 @@ def live_ink() -> QColor:
 
 
 def live_alpha(alpha: float) -> QColor:
-    """The live colour at ``alpha`` (the design's ``rgba(111,235,196,.45)`` borders and its ``.12`` fill)."""
+    """The live colour at ``alpha``: the design's ``.45`` borders and its ``.12`` fill (ember: ``rgba(255,106,26,.45)``
+    and ``rgba(255,106,26,.12)``)."""
     c = live()
     c.setAlphaF(alpha)
     return c
