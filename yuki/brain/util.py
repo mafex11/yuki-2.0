@@ -468,10 +468,10 @@ def media_effect(changes: Any, windows: Any) -> bool:
     ``paused -> playing`` in that very window): whether the after-diff's media changes (``perception.diff.DeskDiff
     .media_changes``: ``{"hwnd", "from", "to", "track", ...}``) hold a measured transition in one of the windows the
     act acted on (``windows``: their hwnds). A status change (paused -> playing, playing -> paused, none -> playing) or
-    a new track, in a session mapped to that window by its id: the act's own visible effect. Window identity and the media
-    session's own state only, never a title or a word. The copied ``_EFFECT_FACTS`` above stays a verbatim copy of
-    ``agent/loop.py`` until bPrune (no action report carries a media fact): callers that read the desk before and after
-    an act (ONE's runner; the brain executor's after-look) ask this instead. Never raises."""
+    a new track, in a session mapped to that window by its id: the act's own visible effect. Window identity and the
+    media session's own state only, never a title or a word. The copied ``_EFFECT_FACTS`` above stays a verbatim copy
+    of ``agent/loop.py`` until bPrune (no action report carries a media fact): callers that read the desk before and
+    after an act (ONE's runner; the brain executor's after-look) ask this instead. Never raises."""
     try:
         wanted = set()
         for hwnd in windows or ():

@@ -4446,7 +4446,8 @@ ONE_STOPPED_QUIET = ("Not quiet: their words stopped the message that was counti
 #: _follow_on``: stream facts), with no call, game or dictation and nothing heard this turn, is refused once with this.
 #: A second quiet is final.
 ONE_FOLLOW_QUIET = ("Not quiet: their words follow your own line, and nothing has answered them yet. Answer in a few "
-                    "words; only if they plainly spoke to someone else, stay_quiet again.")
+                    "words; only if they plainly spoke to someone else, stay_quiet again; if they sent you away or "
+                    "signed off, end_conversation with say_first \"\", alone.")
 
 
 def _code_word(why: str) -> dict[str, Any]:
@@ -6507,11 +6508,15 @@ class OneVoice:
         """gc (final-G2 C2): this user turn's words follow Yuki's own line. Words of Yuki's left the speaker in this
         conversation (:meth:`heard_now`) before this turn began and nothing of hers since (:meth:`heard_this_turn`),
         their words began within ``Conversation.EXCHANGE_LIVE_S`` of that line, no other words of theirs reached her
-        in between (``recent_heard``), no call is live, no full-screen game is in front, and no dictation was measured
-        while they spoke. Stream and state facts only, never the words. Never raises (unsure: not a follow-on)."""
+        in between (``recent_heard``), no call is live, no full-screen game is in front (``game_app`` too, with focus
+        mode off), and no dictation was measured while they spoke. gc review M1 (the 3 Oct V2 lesson, bridge.py's
+        "go away"): not when the router's own decision on these same words is already an end that may still act
+        (``Conversation._route_said_end``: its structured output): the quiet then stands, the two judgements agree and
+        the router's end acts; with its verdict not in yet, refused as before. Stream and state facts and the router's
+        structured output only, never the words. Never raises (unsure: not a follow-on)."""
         try:
             c = self.c
-            if getattr(c, "call_app", None) or getattr(c, "focus", None):
+            if getattr(c, "call_app", None) or getattr(c, "focus", None) or getattr(c, "game_app", None):
                 return False
             heard = float(self._heard_at or 0.0)
             if heard <= 0.0 or self.heard_this_turn():
@@ -6522,6 +6527,9 @@ class OneVoice:
                 return False
             if any(heard < float(at) < start for at, _words in list(getattr(obs, "recent_heard", ()) or ())):
                 return False
+            said_end = getattr(c, "_route_said_end", None)
+            if callable(said_end) and said_end(start):
+                return False   # gc review M1: the router judged these words an end; its end acts on the quiet
             dictating = getattr(c, "_dictating_now", None)
             return not (callable(dictating) and dictating() is not None)
         except Exception:  # noqa: BLE001
@@ -8814,11 +8822,12 @@ class Conversation:
         goodbye, the end cue only, unless :meth:`_route_end_block` says why not (then the talker's own judgement
         stands: its end_conversation ends it). gc (final-G2 C1): with no send stopped and no stop line owed, the end
         first waits, bounded, for the talker's own reply to the same words (:meth:`_route_end_reply`). ``start``: the
-        start of speech of the words judged. ``state``: the decision's own (:meth:`_route_turn`). integ23 S2: a
-        decision asked while an "all" send counted down (``stop``) stops that send even when they spoke again since (logged ``late``; only the sends open when it was asked,
-        ``sends``; under one their final words end the countdown themselves), and when newer words voided its end
-        part (:meth:`_cancel_route`), the stop is all it does. Measured states only, never the words; logged
-        content-free."""
+        start of speech of the words judged. ``state``: the decision's own (:meth:`_route_turn`); an end skipped marks
+        it ``skipped`` (gc review M1: :meth:`_route_said_end` then reads it as no end). integ23 S2: a decision asked
+        while an "all" send counted down (``stop``) stops that send even when they spoke again since (logged ``late``;
+        only the sends open when it was asked, ``sends``; under one their final words end the countdown themselves),
+        and when newer words voided its end part (:meth:`_cancel_route`), the stop is all it does. Measured states
+        only, never the words; logged content-free."""
         sends = state.get("sends") if state else None
         stop_part = bool(state and state.get("stop") and sends)
         llm = getattr(self, "_llm", None)
@@ -8827,7 +8836,7 @@ class Conversation:
             if state is not None and not state.get("ends"):
                 break   # newer words voided its end: these were final (a withdrawn eager turn cancels it whole)
             if waited >= self.ROUTE_END_WAIT_S:
-                self.log.event("router", op="end_skipped", session=self.session, why="unconfirmed")
+                self._end_skipped(state, "unconfirmed")
                 return
             await asyncio.sleep(0.02)
             waited += 0.02
@@ -8846,11 +8855,11 @@ class Conversation:
             # call but stay_quiet (:meth:`_route_end_reply`): two judgements agree
             why = await self._route_end_reply(start, state)
             if why:
-                self.log.event("router", op="end_skipped", session=self.session, why=why)
+                self._end_skipped(state, why)
                 return
         why = self._route_end_block(start, sending=sending)
         if why:
-            self.log.event("router", op="end_skipped", session=self.session, why=why)
+            self._end_skipped(state, why)
             return
         turn = obs.turn
         obs.fast_handled("end")
@@ -8877,6 +8886,29 @@ class Conversation:
         self._end_cue_now()
         self.log.event("session", state="end_asked", session=self.session, waited_ms=0, by="router")
         self._set_stop("user_asked")
+
+    def _end_skipped(self, state: dict[str, Any] | None, why: str) -> None:
+        """The router's end did not act (``why``, a code word): logged content-free, and the decision's state marked
+        ``skipped`` so :meth:`_route_said_end` no longer reads it as an end that may act (gc review M1). State only."""
+        if isinstance(state, dict):
+            state["skipped"] = True
+        self.log.event("router", op="end_skipped", session=self.session, why=why)
+
+    def _route_said_end(self, start: float) -> bool:
+        """gc review M1 (the 3 Oct V2 lesson: "go away" got a quiet, its refusal reran the talker and it said it was
+        still there): the router's own decision on the words whose speech began at ``start`` is in, is an end of the
+        conversation (``to == "end"``), and that end may still act: not voided by newer words (``ends``), not skipped
+        (:meth:`_end_skipped`), and still this conversation's current decision (:meth:`_cancel_route` clears it).
+        The ONE driver's follow-on refusal (``OneVoice._follow_on``) then lets a lone quiet on those words stand, so
+        :meth:`_route_end_reply` sees the two judgements agree. The router model's structured output and stream facts
+        only, never the words. Never raises (unsure: ``False``)."""
+        try:
+            state = getattr(self, "_route_state", None)
+            if not isinstance(state, dict) or state.get("to") != "end" or not state.get("ends") or state.get("skipped"):
+                return False
+            return bool(start) and float(state.get("start") or 0.0) == float(start)
+        except Exception:  # noqa: BLE001
+            return False
 
     def _end_told(self, told: str, stopped: int) -> bool:
         """integ27 fix TV1 (C4 retest: "Stopped. Nothing was sent." and then the agent's "Okay, I won't send it."): the
@@ -8980,7 +9012,10 @@ class Conversation:
     #: gc (final-G2 C1): the router's end of a conversation waits at most this long (s, from its decision) for the
     #: talker's own reply to the same words (the talker's first token is ~1.5 s after their words, the router's ~1.0 s),
     #: and once that reply ended, this long more for its calls to settle (a quiet refused once starts another run).
+    #: gc review L2 (G2 measured a 4.2 s first-token spike): while that reply is being written (the observer's
+    #: ``generating``) or settling, the wait runs on to :data:`ROUTE_END_REPLY_MAX_S` instead.
     ROUTE_END_REPLY_S = 4.0
+    ROUTE_END_REPLY_MAX_S = 8.0
     ROUTE_END_SETTLE_S = 0.35
 
     async def _route_end_reply(self, start: float, state: dict[str, Any] | None = None) -> str:
@@ -8991,7 +9026,9 @@ class Conversation:
         word: the block's reason as soon as one holds (they spoke again, the reply has words or a call, a new run of it
         began), ``quiet_refused`` (its quiet on these words was refused once, S10 on any path or the ONE driver's:
         another run answers them), ``voided`` (newer words voided the decision's end) or ``no_reply`` (no reply in
-        time: the talker's own judgement stands, the conversation stays open). Stream facts only; never raises."""
+        time: the talker's own judgement stands, the conversation stays open). gc review L2: a reply being written or
+        settling when :data:`ROUTE_END_REPLY_S` runs out is waited for up to :data:`ROUTE_END_REPLY_MAX_S`. Stream
+        facts only; never raises."""
         obs = self.observer
         step = 0.05
         waited = 0.0
@@ -9016,7 +9053,11 @@ class Conversation:
                 else:
                     ended_at = None
                 if waited >= self.ROUTE_END_REPLY_S:
-                    return "no_reply"
+                    # gc review L2: a reply for these words begun (the observer's ``generating``) or settling is waited
+                    # for on, bounded; none begun: the talker's own judgement stands
+                    begun = bool(getattr(obs, "generating", False)) or ended_at is not None
+                    if not begun or waited >= self.ROUTE_END_REPLY_MAX_S:
+                        return "no_reply"
                 await asyncio.sleep(step)
                 waited += step
         except asyncio.CancelledError:
@@ -9778,8 +9819,8 @@ class Conversation:
         if not marks:
             self._hand_told = False   # the stretch of hand work is over: the next one may get its line
             return
-        if self._hand_told or self.dormant or self._stop.is_set() or self.call_app or self.focus:
-            return
+        if self._hand_told or self.dormant or self._stop.is_set() or self.call_app or self.focus or self.game_app:
+            return   # gc review L1: a full-screen game in front with focus mode off is still a game
         since = min(marks)
         if now - since < self.HAND_STILL_S or self._quiet_for() < self.HAND_STILL_QUIET_S:
             return
