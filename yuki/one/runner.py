@@ -961,7 +961,8 @@ class Runner:
             read-only).
         early_said: fb (final-F B9, contract K-D, written by the voice driver): ``early_said(call_id) -> str``, the
             words of that call's say_first actually spoken early, ``""`` when none were. A code line of the turn
-            equal to them is not said again (:meth:`run`). ``None``: every line is said as before.
+            equal to them is not said again (:meth:`run`). ``None``: the hands' ``bridge.early_said`` when there is
+            one (:meth:`_early_heard`), else every line is said as before.
     """
 
     def __init__(self, verbs: Any, *, channel: str = "voice", settings: Any = None, countdown: Any = None,
@@ -1033,8 +1034,14 @@ class Runner:
         (``early_said(call_id)``, the driver's record of what was actually said) are a line of Yuki's already heard
         this turn: kept with the turn's code lines (:attr:`RunState.lines`), so :meth:`_speak` never says a done line
         that is the same text again (``heard`` stays true: the result counts as heard). Yuki's own two lines compared
-        as text; no word of theirs is read. ``True`` when such words were kept. Never raises."""
+        as text; no word of theirs is read. ``True`` when such words were kept. Never raises.
+
+        fb fix (review 1, K-D wiring): with no ``early_said`` given, the voice bridge's own reader is used (the hands'
+        ``bridge.early_said(tool_id) -> str``, lane C's); absent (typed, or before it lands): every line said as now."""
         reader = self.early_said
+        if not callable(reader):
+            bridge = getattr(getattr(self.verbs, "hands", None), "bridge", None)
+            reader = getattr(bridge, "early_said", None)
         if not callable(reader) or not call_id:
             return False
         try:
@@ -1328,7 +1335,11 @@ class Runner:
                                   ok=status in (DONE, ALREADY, NO_CHANGE, STARTING), lasting=lasting,
                                   target=ctx.facts, unsure=unsure)
             try:
-                self.verbs.record(name, resolved, report, ok=bool(ok), verified=verified, facts=facts)
+                # fb fix (review 2, B4): an asked run is never an ok record, whatever a rung touched first (``all``'s
+                # ``as_voice``: ok = done), so the exchange floor (``_hand_marks``) never moves past their request;
+                # ``sent_at`` (the speech-to-action moment) kept as measured
+                self.verbs.record(name, resolved, report, ok=bool(ok) and result.status != ASKED, verified=verified,
+                                  facts=facts)
             except Exception:  # noqa: BLE001 - a record never breaks an act
                 pass
             note = getattr(turn, "note_step", None)
