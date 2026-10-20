@@ -996,9 +996,11 @@ def _own_visit(store: Any, site: str, page: str, value: str) -> bool | None:
     """fd (final-F D7; live 20 Oct youtube_channel_deji_arc: Yuki's own test opens of "@Deezy" made it one of the
     user's channels "as written", so "Deezy" -> Deji never swapped): whether the user ever had this channel up
     themselves, by memory's own visit attribution: a ``page`` moment of its page (the moments' key of ``site`` and the
-    value) or, for the channels :mod:`yuki.skills.youtube_feed` attributes videos to, of one of its videos, made by
-    the user (``by`` user: a visit begun while Yuki acted is Yuki's) and outside the live tests' spans. True / False
-    (every visit read was Yuki's or a test's) / None (no visit read: unknown, so "as written" stands). Never raises."""
+    value) or, for the channels :mod:`yuki.skills.youtube_feed` attributes videos to, of one of its videos, that is
+    one of the user's own picks by taste's own rule (review L4: :func:`yuki.skills.taste._user_picks`: their own
+    visit, or a run of Yuki's whose values came from their words; never inside a live test's span, never a skill they
+    marked Not mine). True / False (every visit read was Yuki's own pick or a test's) / None (no visit read: unknown,
+    so "as written" stands). Never raises."""
     try:
         from yuki.memory.moments import entity_key as moment_key
         from yuki.skills import taste, youtube_feed
@@ -1012,15 +1014,16 @@ def _own_visit(store: Any, site: str, page: str, value: str) -> bool | None:
         if not keys:
             return None
         ordered = sorted(keys)
-        rows = store._query(f"SELECT at, by FROM moments WHERE kind = 'page' AND entity_key IN "
+        rows = store._query(f"SELECT id, at, by, request_id FROM moments WHERE kind = 'page' AND entity_key IN "
                             f"({','.join('?' * len(ordered))})", ordered)
+        if not rows:
+            return None
+        visits = [{"id": i, "at": float(at or 0.0), "by": str(by or "user"), "request_id": rid}
+                  for i, at, by, rid in rows]
+        users = taste._user_picks(store, min(v["at"] for v in visits))
+        return any(users(v) for v in visits)
     except Exception:  # noqa: BLE001
         return None
-    if not rows:
-        return None
-    spans = taste._test_spans(store)
-    return any(str(by or "user") == "user" and not (spans and taste._in_spans(float(at or 0.0), spans))
-               for at, by in rows)
 
 
 def own_url(url: Any, *, store: Any = None, miss: dict[str, Any] | None = None) -> dict[str, Any] | None:

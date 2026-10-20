@@ -1682,9 +1682,12 @@ def _answered_slots(cap: str, ctx: RunContext) -> set[str]:
 
 def _corrected(cap: str, skill: Skill) -> dict[str, list[str]]:
     """fd (final-F D3; live 20 Oct k_playlist_not_that, both brains: "No, not this one. The other playlist." ran ネオン
-    again): what a correction leaves out, by taste slot: the newest run of ``cap`` within :data:`TRACE_KEEP_S`, what
-    it asked for and what its rungs acted on or found playing (verified or not), and what it left out itself (a chain
-    of corrections never comes back round). Names in RAM only; ``{}`` with none."""
+    again): what a correction leaves out, by taste slot: the newest run of ``cap`` within :data:`TRACE_KEEP_S`, the row
+    its rungs acted on or found playing (verified or not), and what it left out itself (a chain of corrections never
+    comes back round). Review M1: the value it asked for counts only when no rung recorded a row (then that name is all
+    that is known of what ran); a name asked that a rung resolved to another row is the user's words, never a row, so
+    "No, I said chill" after ネオン is resolved again with ネオン left out, never swapped away. Names in RAM only;
+    ``{}`` with none."""
     t = _last_trace(cap, ran=True)
     if t is None:
         return {}
@@ -1692,7 +1695,7 @@ def _corrected(cap: str, skill: Skill) -> dict[str, list[str]]:
     for slot in skill.slots:
         if not slot.taste:
             continue
-        names = [t.asked.get(slot.name, ""), t.items.get(slot.name, ""), *(t.down.get(slot.name) or [])]
+        names = [t.items.get(slot.name) or t.asked.get(slot.name, ""), *(t.down.get(slot.name) or [])]
         kept = list(dict.fromkeys(" ".join(str(n).split()) for n in names if str(n or "").strip()))
         if kept:
             out[slot.name] = kept
@@ -3355,6 +3358,7 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     if resolved is None:
         resolved = go(None)
     rejected = _rejected_slot(resolved) if corrects and picked is None else None
+    replaced = rejected is not None     # review L3: this request's value was already swapped (no second swap below)
     if rejected is not None:
         # Phase 2.1: "not that" to Yuki's own guess, and the caller gave that same guess again: the user's next own
         # candidate for the slot (never one guessed already), else one short question; never the same guess twice
@@ -3384,13 +3388,15 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
                   origin=ctx.origin)
         down = _corrected(cap, resolved.skill) if corrects and picked is None else {}
         if down:
-            # fd (final-F D3): a correction never plays what the corrected run asked for or acted on (its own trace,
-            # verified or not): the drivers leave those out of what the words may mean (``ctx.turned_down``), and a
-            # value that IS one of them takes the user's next own candidate (their taste order), else one question
+            # fd (final-F D3): a correction never plays the row the corrected run acted on (its own trace, verified or
+            # not) or one turned down before it: the drivers leave those out of what the words may mean
+            # (``ctx.turned_down``), and a value that IS one of them takes the user's next own candidate (their taste
+            # order), else one question. A name the user restates ("No, I said chill") is no such row (review M1)
             ctx.turned_down = down
             swap = next(((s, names) for s, names in down.items()
                          if _value_id(resolved.values.get(s)) in {_value_id(n) for n in names}), None)
             if swap is not None:
+                replaced = True
                 slot_name, names = swap
                 skip = [*dict.fromkeys(_value_id(n) for n in names), *_guessed_before(cap, slot_name)]
                 nxt = _next_own(ctx, resolved.skill, slot_name, skip)
@@ -3448,7 +3454,9 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
             "asked", "held_game", HELD_CALL, HELD_BLOCKED, "refused"):
         _note_guesses(resolved)      # Phase 2.1: "not that" next takes another, never this one again
     _withdraw_false_done(ctx, noted, result, getattr(getattr(resolved, "skill", None), "key", str(skill_key or "")))
-    other = None if picked is not None else _other_than_corrected(resolved, result, ctx, corrects=bool(corrects))
+    # review L3: a value already swapped above (the user's next own candidate) is never swapped a second time here
+    other = None if picked is not None or replaced else _other_than_corrected(resolved, result, ctx,
+                                                                               corrects=bool(corrects))
     if other is not None:
         # fSkills (live 18 Oct: "No, not this one. The other playlist" ran ネオン again, the very one just put on):
         # a backstop for a talker that re-sends the value the user just rejected. A correction whose run found the PC

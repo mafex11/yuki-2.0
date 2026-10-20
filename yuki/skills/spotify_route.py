@@ -90,6 +90,9 @@ SET_FLOOR_S = 2.5
 #: A no-focus press on a Spotify that isn't in front (minimised or behind other windows): how long its row is re-read
 #: for the flip to "Pause {name}" before the press counts as not taken (row reads only; the restore rung may then run).
 FLIP_WAIT_S = 1.2
+#: fd (review M2): how long a window a restore rung found minimised is waited on to read minimised again after the
+#: front is put back (``SW_SHOWMINNOACTIVE``, posted to Spotify's thread).
+REMINIMISE_WAIT_S = 1.0
 #: How long the link route waits for the playlist page, and the search route for its box and its rows.
 PAGE_WAIT_S = 3.0
 SEARCH_WAIT_S = 1.5
@@ -414,6 +417,32 @@ class Desk:
         from yuki.actions import launch
 
         return launch.focus_window(int(hwnd))
+
+    def minimise_quietly(self, hwnd: int) -> bool:
+        """fd (review M2): a window this route restored, minimised again without activating anything
+        (``SW_SHOWMINNOACTIVE``: the front stays as it is), waited on (at most :data:`REMINIMISE_WAIT_S`). Guarded like
+        every window action (D17: never a game's own window; minimising a background window is allowed with one in
+        front, as ``launch.window_action`` does). False: refused, not reached, or it failed."""
+        try:
+            import ctypes
+
+            import win32con
+            import win32gui
+
+            from yuki.actions import gate
+
+            hwnd = int(hwnd)
+            if not hwnd or gate.refuse("window_minimize", hwnd=hwnd, front_ok=True) is not None:
+                return False
+            if win32gui.IsIconic(hwnd):
+                return True
+            ctypes.windll.user32.ShowWindowAsync(hwnd, win32con.SW_SHOWMINNOACTIVE)
+            until = time.monotonic() + REMINIMISE_WAIT_S
+            while not win32gui.IsIconic(hwnd) and time.monotonic() < until:
+                time.sleep(0.05)
+            return bool(win32gui.IsIconic(hwnd))
+        except Exception:  # noqa: BLE001 - left as it is
+            return False
 
     def hotkey(self, keys: list[str], hwnd: int) -> Any:
         from yuki.actions import input as keys_mod
@@ -2026,13 +2055,49 @@ def play_restored(call: Any) -> Any:
         if first.details.get("meant"):
             look.details["meant"] = first.details["meant"]
             look.details["meant_why"] = first.details.get("meant_why")
+        _await_flip(call, win.hwnd, _check_name(look, name), learned, look, facts)
         _log_read(call, "restored", "front", facts, look)
         _feed_seen(call, look)
         status, app_id = DESK.spotify_status(win.pid)
         return _with_track(_after_look(call, look, status, app_id, facts), ram, call)
     finally:
-        if prev and prev != win.hwnd:
-            facts["put_back"] = bool(getattr(DESK.focus(prev), "ok", False))
+        _put_back(win, prev, facts)
+
+
+def _await_flip(call: Any, hwnd: int, want: str, learned: Mapping[str, str] | None, look: Look,
+                facts: dict[str, Any]) -> None:
+    """fd (review M2): after a press on the restored (drawn) window, its row re-read until it reads "Pause {name}"
+    (row reads only, at most :data:`FLIP_WAIT_S` and the request's time left), so the label the window keeps once it
+    is minimised again is the one the press made, and the rung's own check reads it. Nothing is decided here: a row
+    still "Play {name}" is left to the check (``facts["flip"]``, as :func:`_confirm_flip` records it)."""
+    if not look.pressed or look.status != "ok":
+        return
+    clock, sleep = _clock(call), _sleeper(call)
+    until = clock() + min(FLIP_WAIT_S, _left(call))
+    seen: str | None = None
+    reads = 0
+    while seen != "pause" and clock() + POLL_S <= until:
+        sleep(POLL_S)
+        again = _look(DESK, hwnd, want, learned=learned, grid=look.where != "page", page=look.where == "page")
+        reads += 1
+        seen = again.state if again.status == "ok" and _fold(again.name) == _fold(look.name) else None
+    facts["flip"] = seen or "unread"
+    facts["flip_reads"] = reads
+
+
+def _put_back(win: Any, prev: int, facts: dict[str, Any]) -> None:
+    """A restore rung's end, whatever happened inside it: the window that was in front put back in front, then
+    (review M2) Spotify, which the rung found minimised and restored, minimised again without activating anything
+    (:meth:`Desk.minimise_quietly`), so Yuki's own act leaves the window as the user had it. Only once the front is
+    back: minimised without activation while still the active window, Spotify could keep the keyboard out of sight,
+    so with no front put back it stays restored, in plain view. ``facts["put_back"]`` and
+    ``facts["reminimised"]`` (booleans). A stand-in desk without the minimise leaves it restored."""
+    if prev and prev != win.hwnd:
+        facts["put_back"] = bool(getattr(DESK.focus(prev), "ok", False))
+    if facts.get("restored") and facts.get("put_back") is True:
+        quiet = getattr(DESK, "minimise_quietly", None)
+        if callable(quiet):
+            facts["reminimised"] = bool(quiet(win.hwnd))
 
 
 def link_for(call: Any, want: str) -> tuple[str | None, str]:
@@ -2554,7 +2619,9 @@ def _by_track(ctx: Any, want: str, ev: dict[str, Any]) -> bool:
             got = memory_call("spotify_track_owner",
                               lambda c: taste.track_owner(engine._store_of(c), kind, title, artist))
             owner = str(got or "")
-            if isinstance(ram, dict):
+            if isinstance(ram, dict) and got is not None:
+                # review L1: kept only when memory answered (a timed-out read is no answer), so the second-source
+                # re-check (engine D2(c)) is a real second try
                 ram["member"] = (key, owner)
         if owner and _fold(owner) == _fold(want):
             ev["by"] = "track"
@@ -2608,6 +2675,9 @@ def probe_still_playing(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None,
         # of what plays under each playlist (:func:`_by_track`) say it, else unknown (never a false done from a label
         # the window never repainted)
         if _by_track(ctx, _checked_name(ctx, args, look), ev):
+            # review L2: a done the second source turned true settles the words-to-row pairing watch, as the
+            # done-check's own by-track branch does
+            _played(ctx, look, routed=hasattr(getattr(ctx, "result", None), "facts_ram"))
             return True, ev
         ev["reason"] = "row_stale"
         return None, ev
@@ -2930,8 +3000,7 @@ def volume_restored(call: Any) -> Any:
         _keep_target(call, look)
         return _reached(_slider_result(look, facts), carried, facts)
     finally:
-        if prev and prev != win.hwnd:
-            facts["put_back"] = bool(getattr(DESK.focus(prev), "ok", False))
+        _put_back(win, prev, facts)     # fd (review M2): the front back, then Spotify minimised again as it was
 
 
 def _mixer_after(result: Any) -> tuple[bool, bool | None, float | None, float | None]:
@@ -3208,12 +3277,20 @@ def _master_now() -> tuple[float | None, bool | None]:
             bool(muted) if isinstance(muted, bool) else None)
 
 
+#: fd (review L5): the rungs whose own job is the PC's master (the ``target = "system"`` rung): a change of the master
+#: under them is the asked one, logged ``master_asked`` true (the harness's "unasked master change" leaves them out).
+MASTER_RUNGS: frozenset[str] = frozenset({"volume_system"})
+
+
 def _master_watched(name: str, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
     """fd (final-F D8; live 20 Oct one multi_japanese_and_volume: the PC's master went from 100% to 0% and muted
     inside the library rung's run, and no log line says when): the rung ``fn`` with the PC's master level and mute
     read right before and right after it (read only). One content-free ``spotify_master`` line (the rung's code name,
-    the two levels as whole percents, the two mute flags, ``changed``) when the rung acted or the master changed under
-    it; nothing for a rung that passed on and changed nothing. The rung's result is returned as it was."""
+    the two levels as whole percents, the two mute flags, ``changed``, and ``master_asked``: the rung's own job is the
+    master, :data:`MASTER_RUNGS`) when the rung acted or the master changed under it; nothing for a rung that passed
+    on and changed nothing. The rung's result is returned as it was."""
+    asked = name in MASTER_RUNGS
+
     def run(call: Any) -> Any:
         before = _master_now()
         got = fn(call)
@@ -3226,7 +3303,7 @@ def _master_watched(name: str, fn: Callable[[Any], Any]) -> Callable[[Any], Any]
                               before=None if before[0] is None else int(round(before[0])),
                               after=None if after[0] is None else int(round(after[0])),
                               muted_before=before[1], muted_after=after[1],
-                              changed=bool(changed) if known else None)
+                              changed=bool(changed) if known else None, master_asked=asked)
         except Exception:  # noqa: BLE001 - a log never breaks a run
             pass
         return got
