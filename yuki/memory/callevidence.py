@@ -158,6 +158,9 @@ SITES_RETRY_S = 60.0
 SITES_STATE_KEY = "call_evidence:sites"
 #: A calling site's tab is read again at most this often per window and site (s).
 TAB_READ_GAP_S = 600.0
+#: integ29 (S1): a window back on its calling site after another page may show a new tab of it (a meeting link opened
+#: beside the site's home), so its strip is read again then, inside the gap, at most once per this many seconds.
+TAB_REREAD_S = 10.0
 #: morning21 (A6): the microphone holders the call worker last handed :meth:`CallEvidence.judge` stand for "now" this
 #: long (s; the worker passes every ``poll_s``, 5 s by default, and passes nobody while nobody holds it and no call is
 #: open): a calling tab's state is read from them (:meth:`CallEvidence.site_call_state`).
@@ -1389,6 +1392,8 @@ class SiteTabs:
         #: When each (hwnd, service) was last read, and whether its selected tab was identified then.
         self._read_at: dict[tuple[int, str], float] = {}
         self._known: dict[int, bool] = {}
+        #: integ29 (S1): each window's last noted page (True: its calling site's).
+        self._paged: dict[int, bool] = {}
         self.counters = {"sightings": 0, "calling": 0, "reads": 0, "identified": 0, "empty": 0, "census": 0}
         if board is not None and evidence is not None and hasattr(board, "calling_state_fn"):
             # morning21 (A6, K1): the board asks each calling tab's call state of the call evidence at snapshot time
@@ -1451,11 +1456,14 @@ class SiteTabs:
                 self._note_page(hwnd, False, now)
                 return
             self.counters["calling"] += 1
+            with self._lock:
+                back = self._paged.get(hwnd) is False   # integ29 (S1): another page was noted since: maybe a new tab
             self._note_page(hwnd, True, now)
             process = str(screen.get("process") or "").strip().casefold()
             with self._lock:
                 last = self._read_at.get((hwnd, service))
-                if last is not None and now - last < self.gap_s:
+                gap = min(self.gap_s, TAB_REREAD_S) if back else self.gap_s
+                if last is not None and now - last < gap:
                     due = False
                 else:
                     due = True
@@ -1471,6 +1479,11 @@ class SiteTabs:
     def _note_page(self, hwnd: int, calling: bool, at: float) -> None:
         """morning21 (A6): the board's note of the page ``hwnd`` shows now (:meth:`yuki.memory.now.NowBoard.note_page`;
         it keeps it only for a window with a calling tab). Never raises."""
+        if hwnd:
+            with self._lock:
+                if len(self._paged) > 64:
+                    self._paged.clear()
+                self._paged[int(hwnd)] = bool(calling)
         note = getattr(self._board, "note_page", None) if self._board is not None else None
         if not hwnd or not callable(note):
             return

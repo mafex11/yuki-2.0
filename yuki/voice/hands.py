@@ -6116,7 +6116,7 @@ class Hands:
                       "nothing was done.")
         facts.update(self._keep_from_run(skill_key, result))
         # review r1 L4: the preference side (a bounded memory call) runs after the line is said (_handle_skill)
-        facts["_prefs"] = (skill_key, dict(args), dict(slots), result, previous, list(words))
+        facts["_prefs"] = (skill_key, dict(args), dict(slots), result, previous, list(words), self._earlier_steps())
         if result.outcome not in ("refused",):
             self.last_skill = {"skill": skill_key, "values": dict(result.values or {}),
                                "outcome": str(facts.get("outcome") or result.outcome),
@@ -6286,23 +6286,52 @@ class Hands:
             self.pending_keep = None   # a newer run: an older question lapses
         return out
 
+    @staticmethod
+    def _earlier_steps() -> list[dict[str, Any]]:
+        """integ29 (F3): Yuki's own act steps of the newest request before this run (``brain.executor.last_steps``
+        within ``prefs.CORRECTION_S``: this conversation's hands', or the thinker's), read right after the run and
+        before this turn's steps replace them. ``[]`` when none. Never raises."""
+        try:
+            from yuki.brain.executor import last_steps
+            from yuki.skills.prefs import CORRECTION_S
+
+            got = last_steps(CORRECTION_S) or {}
+            return [dict(s) for s in got.get("steps") or () if isinstance(s, dict)]
+        except Exception:  # noqa: BLE001
+            return []
+
     def _learn_from_run(self, skill_key: str, args: dict[str, Any], slots: dict[str, Any], result: Any,
-                        previous: dict[str, Any] | None, words: list[str]) -> dict[str, Any]:
+                        previous: dict[str, Any] | None, words: list[str],
+                        earlier: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """The preference side of a run (S4.2, S4.3), in one bounded memory call, after its line was said: a
         correction naming another option writes corrected / rejected; a usual three later choices went against gets
-        its one "still your usual?" card. Content-free counts back."""
+        its one "still your usual?" card. integ29 (F3): a checked run whose app means came from their words right
+        after Yuki's own earlier act on the same thing in another app (``earlier``: :meth:`_earlier_steps`) is their
+        correction too (``prefs.note_switch``, as the planner's executor keeps it), when the talker's ``corrects``
+        flag wrote none. Content-free counts back."""
         out: dict[str, Any] = {}
         memory = self.skill_memory if self.skill_memory is not None else self.memory
         corrects = bool(args.get("corrects"))
         if memory is not None and result.outcome not in ("refused", "asked"):
             quote = " / ".join(words[-2:])[:300] or None
+            steps = [dict(s) for s in earlier or () if isinstance(s, dict)] if result.done else []
 
             def go(client: Any) -> Any:
-                from yuki.skills.prefs import after_voice_run
+                from yuki.skills.prefs import after_voice_run, note_switch
 
-                return after_voice_run(getattr(client, "store", client), skill_key, values=dict(result.values or {}),
-                                       previous=(previous or {}).get("values"), run_key=result.run_key,
-                                       given=list(slots), corrects=corrects, quote=quote)
+                store = getattr(client, "store", client)
+                got = after_voice_run(store, skill_key, values=dict(result.values or {}),
+                                      previous=(previous or {}).get("values"), run_key=result.run_key,
+                                      given=list(slots), corrects=corrects, quote=quote)
+                if steps and isinstance(got, dict) and not got.get("corrected"):
+                    from yuki.skills.catalog import load
+
+                    sk = load().get(skill_key)
+                    switched = note_switch(store, sk, values=dict(result.values or {}), previous=steps,
+                                           run_key=result.run_key, quote=quote) if sk is not None else []
+                    if switched:
+                        got = {**got, "corrected": list(switched)}
+                return got
 
             got = self._memory_call(memory, "skill_prefs", go)
             if isinstance(got, dict):
@@ -9711,7 +9740,11 @@ class Verbs:
             if off:
                 raise _Refused(f"Act is switched off for {off} in Yuki's settings; nothing was done", act_off=off)
             if name == "click":
-                verb, payload = "click", {"element": int(ident), "expect_hwnd": hwnd}
+                # integ29 (F2): ONE's click by [id] carries toggle_to too (the dispatcher's toggle path: read live,
+                # clicked only when not there, read back)
+                want = str(args.get("toggle_to") or "").strip().casefold()
+                verb, payload = "click", {"element": int(ident), "expect_hwnd": hwnd,
+                                          **({"toggle_to": want} if want in ("on", "off") else {})}
             elif name == "type":
                 text = str(args.get("text") or "")
                 if not text.strip():
@@ -9738,6 +9771,12 @@ class Verbs:
             facts["refused"] = "game" if refused == "game" else True
         if verb == "type_text" and typed_none(outcome):
             facts["typed_any"] = False   # integ22 (one22 merge note 2): no character went out: no unsent mark
+        if verb == "click" and payload.get("toggle_to"):
+            facts["toggle_to"] = payload["toggle_to"]
+            details = getattr(outcome, "details", None) or {}
+            for key, fact in (("state_before", "toggle_before"), ("state_after", "toggle_after")):
+                if isinstance(details, dict) and isinstance(details.get(key), str) and details[key].isalpha():
+                    facts[fact] = details[key][:12]   # a code word (on / off), never a name
         return bool(outcome.ok), f"{outcome.summary} ({why})", facts
 
     def _type_enter(self, args: dict[str, Any], hand_id: str | None) -> tuple[bool, str, dict[str, Any]]:

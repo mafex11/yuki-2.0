@@ -18,8 +18,10 @@ hosts = ["meet.google.com"]
 # browser, after it launched the browser the meeting tab lives in and no tab of it came back).
 home = "https://meet.google.com/"
 
-# The controls that join the meeting, by (role, name) as Meet draws them, per display language. A click on one is a
-# join (refused: the user clicks Join), whatever the words asked; one Meet draws under another name is left to the
+# The controls that join the meeting, by (role, name) as Meet draws them, per display language. A click on one on
+# Meet's own page shown now (a window holding Meet's tab, the Now board's calling tab) is a join (refused: the user
+# clicks Join), whatever the words asked; ordinary pages draw "Join now" and "Rejoin" too, so elsewhere these names are
+# no join (integ29 S5: yuki.brain.consent.page_join_controls). One Meet draws under another name is left to the
 # commit check, which sees the meeting page's call state. Besides Join now and Ask to join, the pre-join page draws
 # Switch here and Join here too (the user is in the call on another device), its other ways to join (Companion mode,
 # a phone for audio) and Present (it joins and presents); Rejoin after leaving. Names to confirm live
@@ -28,8 +30,8 @@ home = "https://meet.google.com/"
 join = [["Button", "Join now"], ["Button", "Ask to join"], ["Button", "Switch here"], ["Button", "Join here too"],
         ["Button", "Rejoin"], ["Button", "Use Companion mode"], ["MenuItem", "Use Companion mode"],
         ["Button", "Join and use a phone for audio"], ["MenuItem", "Join and use a phone for audio"]]
-# Join controls under a name other apps draw too (a deck's "Present" button elsewhere joins nothing): a join only in a
-# window that holds this site's tab (the Now board's calling tab).
+# Join controls under a name other apps draw too (a deck's "Present" button elsewhere joins nothing): matched like
+# `join` above, only on this site's page shown now (kept apart as the names least like a join anywhere else).
 join_in_page = [["Button", "Present"]]
 
 # Meet's own keys for its device toggles (Google's Meet keyboard shortcuts: Ctrl+D the microphone, Ctrl+E the

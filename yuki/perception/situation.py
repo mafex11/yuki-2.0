@@ -38,8 +38,9 @@ Public API::
     front_window(raw=None) -> (hwnd, how)          # fa (A5): the window in front now, by the one front rule
     front_rule(raw, keyboard, root_owner, listed, popup) -> (hwnd, how)   # pure: that rule
 
-morning21 (lane B, contract K3): a monitor is said by its place and its own model name ("Monitor 1 (second, VG271U,
-2560x1440; screen off)"): the ``[n]`` id is the hands' only, never words to say; "screen off" only from the display
+morning21 (lane B, contract K3): a monitor is said by its place and its own model name ("[m1] second monitor (VG271U,
+2560x1440; screen off)"): the ``[n]`` and ``[mN]`` ids are the hands' only, never words to say (integ29 LD3: no
+"Monitor 1" a planner's question would copy, said by code word for word); "screen off" only from the display
 driver's own recent read. The notification area's icons are one line ("In the tray: Twinkle Tray (monitor app),
 Steam; hidden icons: ..."), from the last tray read (``windows.tray_icons``; nothing is read for a desk).
 
@@ -813,22 +814,24 @@ def _items(state: DeskState, *, planner: bool, cap: int, said: int, short: bool,
     if not state.windows:
         add(0, "head", "Desk now: no windows open.")
     else:
-        add(0, "head", "Desk now ([n] = window id):" if short else
-            "Desk now (each monitor's windows top first; [n] is the window id for your hands):")
+        add(0, "head", "Desk now ([n] = window id, [mN] = monitor number N):" if short else
+            "Desk now (each monitor's windows top first; [n] is the window id and [mN] monitor number N, for your "
+            "hands):")
     shown = [w for w in state.windows if not w.minimized]
     for m in state.monitors:
         width, height = m.rect[2] - m.rect[0], m.rect[3] - m.rect[1]
         # morning21 B3 (contract K3): its place and its own model name, the words to say it by ("second, VG271U");
         # the index is the hands' id only. "screen off" only from the display driver's own recent read
         role = m.role or ("main" if m.primary else "")
-        bits = [b for b in (role if multi else "", m.label, f"{width}x{height}") if b]
+        bits = [b for b in (m.label, f"{width}x{height}") if b]
         if planner:
             bits.append(f"@{m.rect[0]},{m.rect[1]}")
             if m.work != m.rect:
                 bits.append(f"work area {m.work[2] - m.work[0]}x{m.work[3] - m.work[1]}")
         group = f"m{m.index}"
         power = "; screen off" if m.power == "off" else ""
-        add(0, group, f"Monitor {m.index} ({', '.join(bits)}{power}):")
+        said = f"{role} monitor" if role and multi else "monitor"
+        add(0, group, f"[m{m.index}] {said} ({', '.join(bits)}{power}):")
         mine = [w for w in shown if w.monitor == m.index]
         if not mine:
             add(0, group, "nothing open")

@@ -99,8 +99,8 @@ _OWN_STEP = {"type": "boolean", "description": "true: your own step to read or c
 WINDOW_TOOL = _tool(
     "window",
     "A window, read back: focus, minimize, maximize, fullscreen, restore, close (only when they asked; named: their "
-    "words), move (to monitor; how), focus_back (the front back to what it was before your last act), undo (your last "
-    "move or focus_back). By [hwnd] or app as they named it (minimize, close: all its windows). Not a tab; a message "
+    "words), move (to monitor; how), focus_back (the front as before your last act), undo (your last move or "
+    "focus_back). By [hwnd] or app as they named it (minimize, close: all its windows). Not a tab; a message "
     "in a chat is run_skill message.",
     {"window": _WINDOW,
      "app": {"type": "string"},
@@ -144,17 +144,17 @@ OPEN_APP_TOOL = _tool(
 
 CLICK_TOOL = _tool(
     "click",
-    "Click one item: its number on the items line, or its [id] from look window. Refused if the window changed since. "
-    "Verified when the page, focus or window visibly changes.",
+    "Click one item: its number on the items line, or its [id] from look window; toggle_to: an on/off control's "
+    "wanted state. Refused if the window changed since. Verified when the page, focus or window visibly changes.",
     {"window": _WINDOW, "item": {"type": "integer"}, "id": {"type": "integer"},
+     "toggle_to": {"type": "string", "enum": ["on", "off"]},
      "say_when_done": _DONE, "then": _THEN},
     ["window", "then"])
 
 TYPE_TOOL = _tool(
     "type",
-    "Type exact text into the field that has the keyboard (or a field's [id] from look window); never in a chat "
-    "(refused there): a message or draft is run_skill message. enter: press Enter after it. Verified by reading the "
-    "field back.",
+    "Type exact text into the field that has the keyboard (or a field's [id] from look window); never in a chat: a "
+    "message or draft is run_skill message. enter: press Enter after it. Verified by reading the field back.",
     {"window": _WINDOW, "text": {"type": "string"}, "id": {"type": "integer"}, "enter": {"type": "boolean"},
      "say_when_done": _DONE, "then": _THEN},
     ["window", "text", "then"])
@@ -197,8 +197,8 @@ MEDIA_KEY_TOOL = _tool(
 
 APP_VOLUME_TOOL = _tool(
     "app_volume",
-    "ONE app's own mixer volume (the app as the Sound line names it); nothing on screen is touched. change: points "
-    "(-20), or level 0-100; mute true silences that app alone (it plays on). Verified by reading it back.",
+    "ONE app's own mixer volume (the app as the Sound line names it). change: points (-20), or level 0-100; mute "
+    "true silences that app alone (it plays on). Verified by reading it back.",
     {"app": {"type": "string"}, "change": {"type": "integer"}, "level": {"type": "integer"},
      "mute": {"type": "boolean"},
      "say_when_done": _DONE, "then": _THEN},
@@ -271,7 +271,7 @@ ASK_USER_ONE_TOOL = _from_anthropic(ASK_USER_TOOL)
 #: ``quick_memory``).
 MEMORY_ONE_TOOL = _from_anthropic(
     MEMORY_TOOL,
-    description="Memory of the user beyond quick_memory, dated, with sources. recall: facts for query (since, until). "
+    description="Memory of the user beyond quick_memory, dated. recall: facts for query (since, until). "
                 "activity: time per app, site or page (group_by). calls; call_timeline: one call (call, words). "
                 "threads: their work. before: what came before a moment (at, event, minutes). links. people: a "
                 "person (name). skills.")
@@ -437,6 +437,9 @@ def as_verb(name: str, args: Mapping[str, Any] | None, *, tab_names: Sequence[st
             out["element"] = args.get("id")
         if args.get("item") is not None:
             out["item"] = args.get("item")
+        want = str(args.get("toggle_to") or "").strip().casefold()
+        if want in ("on", "off"):
+            out["toggle_to"] = want   # integ29 (F2): the gate sees the wanted state, as the talker's click carries it
         return "click", out
     if name == "type":
         out = {"hwnd": w, "text": str(args.get("text") or "")}

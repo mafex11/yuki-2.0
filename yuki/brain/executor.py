@@ -271,8 +271,11 @@ def _warm_desk() -> None:
 # ---------------------------------------------------------------------------------------------------------------------
 
 #: morning21 C10: how long after an act in a meeting page's window (the user not in the call) the join after-check
-#: looks (s), and what Yuki says at once when a join followed (K1 ``call_state``).
-JOIN_CHECK_S = 3.0
+#: looks (s), how often it reads the call state meanwhile (integ29 F4: a join reaches ``in_call`` only on the call
+#: worker's pass, every 5 s with its sound read cached about 4 s, as the talker's own watch polls), and what Yuki says
+#: at once when a join followed (K1 ``call_state``).
+JOIN_CHECK_S = 12.0
+JOIN_CHECK_POLL_S = 1.5
 LINE_JOINED_AFTER = "Heads up: that put you in the call in {app}. I didn't mean to join it."
 #: How far the memory process's clock and ours may differ when a call's start is compared with an act's (s; K1's own
 #: ``joined_since`` tolerance).
@@ -2432,9 +2435,9 @@ class Executor:
 
     def _join_watch(self, call: Call, since: float) -> None:
         """morning21 C10 (K1 ``call_state``): after an act in a meeting page's window while the user was not in the
-        call, look once :data:`JOIN_CHECK_S` later whether that window's call state is now ``in_call``, begun at or
-        after the act (:func:`_joined_after`); if so, say it at once (:data:`LINE_JOINED_AFTER`: a step joined that
-        nobody asked to join). A microphone onset alone is no join here (fix round, review L-1: K1 ``joined_since``
+        call, read that window's call state every :data:`JOIN_CHECK_POLL_S` for :data:`JOIN_CHECK_S` until it reads
+        ``in_call``, begun at or after the act (:func:`_joined_after`); if so, say it at once
+        (:data:`LINE_JOINED_AFTER`: a step joined that nobody asked to join). A microphone onset alone is no join here (fix round, review L-1: K1 ``joined_since``
         also counts one, and a toggle Yuki itself turned on in a pre-join page would read as a join). One short-lived
         thread; logged content-free. Never raises."""
         hwnd = int(call.hwnd or 0)
@@ -2442,13 +2445,16 @@ class Executor:
         app = app if app and app != "It" else "the browser"
 
         def job() -> None:
-            threading.Event().wait(JOIN_CHECK_S)
-            try:
-                from yuki.memory import now as _now
+            joined: bool | None = None
+            end = time.monotonic() + JOIN_CHECK_S
+            tick = threading.Event()
+            while joined is not True and not tick.wait(JOIN_CHECK_POLL_S) and time.monotonic() <= end:
+                try:
+                    from yuki.memory import now as _now
 
-                joined = _joined_after(_now.call_state(_board(), hwnd), float(since))
-            except Exception:  # noqa: BLE001 - can't tell: nothing said
-                joined = None
+                    joined = _joined_after(_now.call_state(_board(), hwnd), float(since))
+                except Exception:  # noqa: BLE001 - can't tell: read again, nothing said for it
+                    joined = None
             self._emit_log("brain_join_after_act", verb=call.tool, joined=joined is True)
             if joined is not True:
                 return

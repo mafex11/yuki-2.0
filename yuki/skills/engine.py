@@ -2231,6 +2231,26 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             _emit(ctx, "skill_resolve", skill=skill.key, result="handed_over", reason="repeat", origin=ctx.origin)
             return _handoff(skill, plan.values, plan.filled, before, ctx, started, why=why, run_key=None,
                             routes=list(plan.routes), unconfirmed=True, missing=missing, seen=seen, repeat=True)
+    # integ29 (LD1, live row m21_twinkle_means): a means given in another form than it takes (display's "Twinkle Tray"
+    # for windows | app) was dropped by the resolver, and a route for "no means chosen" would take that for none and
+    # swap their told means for another silently. Before any rung: the first slip of a request goes back to the caller
+    # to call once more in the stated form (A19), else the slot's own question. Code types and the slot's role only.
+    means_forms = {k: v for k, v in _code_slot_forms(skill, plan.dropped).items()
+                   if getattr(skill.slot(k), "role", "") == "means"}
+    if means_forms:
+        if _first_form_slip(ctx, skill.key, means_forms):
+            _emit(ctx, "skill_resolve", skill=skill.key, result="asked", slot_source="ask", reason="form_recall",
+                  dropped_slots=_slot_flags(list(means_forms)))
+            return _simple(skill.key, "asked", ctx, started, ask="", options=[], say="",
+                           evidence={"acted": False, "reason": "form", "form": means_forms, FORM_RECALL: True})
+        means_slot = skill.slot(next(iter(means_forms)))
+        question = str(getattr(means_slot, "ask", "") or "") or f"Which {means_slot.name}?"
+        state["asked_slot"] = means_slot.name      # fd (D4): the means ask, as a rung's
+        _emit(ctx, "skill_resolve", skill=skill.key, result="asked", slot_source="ask", reason="form",
+              dropped_slots=_slot_flags(list(means_forms)))
+        return _simple(skill.key, "asked", ctx, started, ask=question, options=list(means_slot.options or ()),
+                       say=question, evidence={"acted": False, "reason": "asked", "fallback_line": question,
+                                               "form": means_forms})
     t0 = time.time()
     run_app = _first_app(skill, plan.routes, plan.values)
     run_key = _ledger_start(ctx, skill, plan.values, plan.filled, t0, app=run_app)
@@ -2436,22 +2456,23 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             # calls again, as the resolver's A19 recall does; else the question's report names the forms
             ram = res.facts_ram if isinstance(res.facts_ram, Mapping) else {}
             forms_ram = ram.get("form")
-            forms: dict[str, str] = {}
+            # integ29 (LD2): its own name, so the plan's dropped forms the evidence() closure reads stay bound
+            ram_forms: dict[str, str] = {}
             if isinstance(forms_ram, Mapping) and forms_ram and all(skill.slot(str(k)) is not None for k in forms_ram):
-                forms = {str(k): str(v) for k, v in forms_ram.items()}
+                ram_forms = {str(k): str(v) for k, v in forms_ram.items()}
             _ledger_finish(ctx, run_key, outcome="asked", checked=None, route=route, ms=route_ms, app=app_done,
                            acted=acted)
-            if forms and not acted and _first_form_slip(ctx, skill.key, forms):
+            if ram_forms and not acted and _first_form_slip(ctx, skill.key, ram_forms):
                 _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="asked",
                       reason="form_recall", ms=route_ms, observed=res.facts)
                 return _simple(skill.key, "asked", ctx, started, ask="", options=[], say="", run_key=run_key,
                                route=route.key, tried=tried,
-                               evidence={"acted": False, "reason": "form", "form": forms, FORM_RECALL: True})
+                               evidence={"acted": False, "reason": "form", "form": ram_forms, FORM_RECALL: True})
             _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="asked", ms=route_ms,
                   observed=res.facts)   # integ28 fix F2: held_by_check / taken_over / act_off ends' facts
-            asked_ev = evidence(route=route, reason=res.outcome or "asked", line=res.ask)
-            if forms:
-                asked_ev["form"] = forms
+            asked_ev = evidence(route=route, reason=res.outcome or "asked", line=res.ask)   # the plan's dropped forms
+            if ram_forms:
+                asked_ev["form"] = {**(asked_ev.get("form") or {}), **ram_forms}
             current = (res.facts or {}).get("current") if isinstance(res.facts, Mapping) else None
             if isinstance(current, (int, float)) and not isinstance(current, bool):
                 asked_ev["current"] = float(current)    # skill19 (O5): the control's level as the rung read it

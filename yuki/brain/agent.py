@@ -2119,9 +2119,9 @@ class Brain:
         found = getattr(got, "done", None)
         base: dict[str, Any] = {
             "statuses": [_step_status(s) for s in raw], "reads": reads,
-            # morning21 C5: a command the commit check judged to change nothing is a read, never an act
-            "acted": any(getattr(s, "tool", "") and getattr(s, "verb", "") in ACT_VERBS and not shell_read(s)
-                         for s in raw),
+            # integ29 (S8): a command counts as acted whatever effect the check gave it ("none" also means it only
+            # opened or moved something); what it printed goes back through shell_ending (C5)
+            "acted": any(getattr(s, "tool", "") and getattr(s, "verb", "") in ACT_VERBS for s in raw),
             "verdict": getattr(found, "verdict", None) if found is not None else None,
             "probe": str(getattr(found, "probe", "") or "") if found is not None else "",
             "line": str(getattr(got, "line", "") or ""), "check_calls": checks,
@@ -2304,9 +2304,6 @@ class Brain:
                 state.held = (line, outcome) if state.acted else None
                 self.logger.log("brain_look_only", n=state.look_backs, reads=len(result.reads),
                                 probe=result.probe or None, acted=state.acted)
-                if any(shell_read(s) for s in result.statuses):
-                    # morning21 C5: a command that only read: its output goes back like a look's
-                    self.logger.log("brain_read_back", why="effect_none", reads=len(result.reads))
                 conv.add_user([tool_result(tool_id, look_report(result, plan)), *extra, *self._steer_turn(host)])
                 return False
             if (status == "unconfirmed" and result.unconfirmed_skill and not state.retried_unconfirmed
@@ -3379,14 +3376,13 @@ def question_part_report(plan: Plan | None, line: str) -> str:
 
 def look_only(plan: Plan | None, result: ExecResult) -> bool:
     """An act plan whose every step only reads (look, memory, fetch, wait), so nothing of it acted (sBrainFix, F9): its
-    check reading nothing is not the end of the request. morning21 C5: a ``run_powershell`` the commit check judged
-    ``effect none`` (:func:`shell_read`) is such a read: what it printed goes back to the planner (21 Oct: "which
-    brightness app is in my taskbar" ended "Worked on your PC" and the script's findings were thrown away). Code facts
-    only (the closed verb lists, the step states, the check's effect word)."""
+    check reading nothing is not the end of the request. A ``run_powershell`` is never such a read, whatever effect
+    the commit check gave it (integ29 S8: its ``none`` also means it only opened or moved something): what it printed
+    goes back through :func:`shell_ending` (morning21 C5), with code's line held. Code facts only (the closed verb
+    lists, the step states)."""
     if plan is None or plan.kind != "act" or not plan.steps or plan.skill:
         return False
-    reads = {s.index for s in result.statuses if shell_read(s)}
-    return all(s.verb not in ACT_VERBS or i in reads for i, s in enumerate(plan.steps)) and not _acted(result)
+    return all(s.verb not in ACT_VERBS for s in plan.steps) and not _acted(result)
 
 
 def shell_ending(plan: Plan | None, result: ExecResult, status: str) -> bool:
@@ -3465,16 +3461,16 @@ def close_parts(plan: Plan | None, state: _State, result: ExecResult | None = No
 
 def _acted(result: ExecResult) -> bool:
     """Whether a plan's run did something on the PC: the executor says so, or an act step's status shows it ran (so a
-    model's text after non-committing steps is never taken as the final word). morning21 C5: a command the commit
-    check judged to change nothing (:func:`shell_read`) is a read here, never an act."""
-    return bool(result.acted) or any(s.verb in ACT_VERBS and s.state in ACTED_STATES and not shell_read(s)
-                                     for s in result.statuses)
+    model's text after non-committing steps is never taken as the final word). integ29 (S8): a command the commit
+    check judged ``effect none`` still acted (it may have opened or moved something); its output goes back through
+    :func:`shell_ending`."""
+    return bool(result.acted) or any(s.verb in ACT_VERBS and s.state in ACTED_STATES for s in result.statuses)
 
 
 def shell_read(status: Any) -> bool:
-    """morning21 C5: a ``run_powershell`` step that ran and that the commit check judged ``effect none`` (it only
-    reads): its output is what it was for, so it goes back to the planner like a look's. Code facts only (the verb, the
-    step's state, the check's effect word)."""
+    """morning21 C5: a ``run_powershell`` step that ran and that the commit check judged ``effect none``. integ29 (S8):
+    no longer counted as a read (``none`` also means it only opened or moved something): kept for callers that log it.
+    Code facts only (the verb, the step's state, the check's effect word)."""
     return (str(getattr(status, "verb", "") or "") == "run_powershell" and str(getattr(status, "state", "")) == "ok"
             and str(getattr(status, "effect", "") or "") == "none")
 

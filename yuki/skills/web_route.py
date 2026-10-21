@@ -735,13 +735,17 @@ def _census_restored(call: RouteCall, store: Any, service: str, key: str,
     return census, windows
 
 
-def _home_in(call: RouteCall, key: str, service: str, words: Mapping[str, str], facts: dict[str, Any]) -> RouteResult:
+def _home_in(call: RouteCall, key: str, service: str, words: Mapping[str, str], facts: dict[str, Any], *,
+             link: str = "") -> RouteResult:
     """morning21 (A1): the launched browser brought no tab of the site back: the calling site's front page (its
     ``[call] home``, ``yuki/connect/sites``; the account's meetings are listed there) opens in that same browser, as a
-    launch argument (nothing typed). No front page in the data: said plainly. Never another browser."""
+    launch argument (nothing typed). No front page in the data: said plainly. Never another browser. integ29 (F5):
+    ``link``, the link the user told once: it opens instead, in that same browser (the told-link rung would open it
+    in the means slot's browser, maybe another one)."""
     from yuki.memory.now import calling_site
 
-    home = str(calling_site(service).get("home") or "").strip()
+    told = "://" in link and " " not in link
+    home = link.strip() if told else str(calling_site(service).get("home") or "").strip()
     if "://" not in home:
         return _say(LINE_TAB_NONE_LAUNCHED.format(**words), "no_tab", ran=True, **facts)
     if kind := _refused("open_url"):
@@ -751,9 +755,11 @@ def _home_in(call: RouteCall, key: str, service: str, words: Mapping[str, str], 
         return RouteResult(ran=True, held=kind, outcome="refused", facts=facts, app=key)
     seen = _launch_seen(result)
     _log_open(call, "protocol", seen, "already" if seen["already"] else "page" if seen["verified"] else "unread")
-    facts.update(home=True)
-    return RouteResult(ran=True, outcome="home_opened", app=key, verified=bool(seen["verified"] or seen["already"]),
-                       say=LINE_HOME_UP.format(**words), facts=facts,
+    facts.update(home=not told, link=told)
+    # ``home`` in RAM: an address opened in the browser this rung launched (its done-check reads that browser in front)
+    return RouteResult(ran=True, outcome="link_opened" if told else "home_opened", app=key,
+                       verified=bool(seen["verified"] or seen["already"]),
+                       say=(LINE_TAB_UP_LAUNCHED if told else LINE_HOME_UP).format(**words), facts=facts,
                        facts_ram={"process": key, "service": service, "home": True})
 
 
@@ -818,12 +824,14 @@ def route_site_tab(call: RouteCall) -> RouteResult:
         # there. Never "no tab", never a question missing it, never the told link (a second tab)
         return _say(LINE_TAB_PARTIAL.format(**words), "strip_partial", ran=launched, **facts)
     if decision == "none" or not chosen:
-        if link:
-            # the told-link rung opens it in the means browser (running now, when this rung launched it: an undoable
-            # launch, so this rung still counts as not run and the next one goes)
-            return RouteResult(ran=False, outcome="no_tab", facts=facts, app=process or None)
         if launched:
-            return _home_in(call, process, service, words, facts)
+            # integ29 (F5): in the browser this rung launched, the told link (else the site's front page) opens here,
+            # never in the means slot's browser the told-link rung would pick (A1: never another browser)
+            return _home_in(call, process, service, words, facts,
+                            link=str(values.get("link") or "").strip() if link else "")
+        if link:
+            # the told-link rung opens it in the means browser
+            return RouteResult(ran=False, outcome="no_tab", facts=facts, app=process or None)
         return _say(LINE_TAB_NONE.format(**words), "no_tab", **facts)
     if decision == "ask":
         tied = sorted(chosen, key=_strip_order)[:len(ORDINALS)]

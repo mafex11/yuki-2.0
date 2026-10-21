@@ -979,11 +979,35 @@ class MemoryClient:
         app = app_key(app)
         vec = self._embed(text)
         supersedes = self.store.knowhow_duplicate(app, text, vec, KNOWHOW_DUPLICATE_COSINE)
+        if supersedes is not None and self._fresh_way_held(supersedes, text):
+            supersedes = None
         model = getattr(self._embedder, "model_name", None) if vec is not None else None
         return self.store.add_knowhow(
             app, text, source_request=source_request, vector=vec, embed_model=model, supersedes=supersedes,
             origin=str(origin or "agent"),
         )
+
+    def _fresh_way_held(self, kid: int, text: str) -> bool:
+        """integ29 (S2, the D8 hold of :meth:`yuki.memory.conversations.ConversationWorker.fresh_way` for every caller):
+        whether the current entry ``kid`` a new know-how entry would supersede is a way to follow (``WAY_ORIGINS``)
+        written at most ``FRESH_ITEM_S`` ago, its text not the same as ``text``. A misheard "don't use X" reads as close
+        to "use X" as a restatement does, so it is then written beside that way, which stays in force; a confirmed
+        reversal supersedes it in the worker's pass or when said again later. Logged ``knowhow_held`` with the id only.
+        ``False`` when it can't be read."""
+        try:
+            from yuki.memory.conversations import FRESH_ITEM_S, WAY_ORIGINS
+
+            rows = self.store._query("SELECT * FROM knowhow WHERE id = ? AND valid_to IS NULL", (int(kid),))
+            if not rows or str(rows[0]["origin"] or "") not in WAY_ORIGINS:
+                return False
+            if time.time() - float(rows[0]["valid_from"]) > FRESH_ITEM_S:
+                return False
+            if self.store._knowhow(rows[0]).text.casefold() == (text or "").casefold():
+                return False   # a pure restatement: it supersedes, never a duplicate beside it
+        except Exception:  # noqa: BLE001
+            return False
+        self._skills_log("knowhow_held", knowhow=int(kid))
+        return True
 
     # -- recall ------------------------------------------------------------
 
@@ -4945,7 +4969,8 @@ class MemoryClient:
 
     def set_skills_log(self, log: Any) -> None:
         """Where the catalog tells what it skipped (``log(type, **fields)``, content-free: ``connection_error`` with
-        the file and a code word, ``learned_error`` with the row id and a code word). The process that owns a log
+        the file and a code word, ``learned_error`` with the row id and a code word; integ29 S2: ``knowhow_held`` with
+        the know-how id, :meth:`remember_how`'s hold). The process that owns a log
         (the tray's UI log, the memory service's) sets it once; without one nothing is told."""
         self._skills_log_fn = log if callable(log) else None
 

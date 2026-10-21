@@ -1073,6 +1073,13 @@ def _run(call: Any, via: str) -> Any:
         gone = next(c for c in changes if c.why == "no_handle")
         return _rr(ran=False, ask=ASK_DETACHED.format(name=_cap(gone.name)), outcome="detached",
                    facts={"slot": "target"})
+    if power == "off" and result.ran is False and not result.already:
+        # integ29 (S6): an off that reached no monitor (no 0xD6, DDC/CI off, a built-in panel) ends here, said plainly:
+        # never handed on to steps, whose off (SC_MONITORPOWER) would turn every screen off, the one the off question
+        # judged would stay on too
+        _done, line = _line(changes, app)
+        return _rr(ran=False, stop=True, outcome=result.outcome or "not_reached", say=line or None,
+                   facts=result.facts)
     return result
 
 
