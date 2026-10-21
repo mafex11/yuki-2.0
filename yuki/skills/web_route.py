@@ -1430,7 +1430,7 @@ def site_file(site_word: Any) -> str:
 
 
 def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words: Sequence[str], *,
-              now: float | None = None) -> tuple[str | None, str | None, str]:
+              now: float | None = None, miss: dict[str, Any] | None = None) -> tuple[str | None, str | None, str]:
     """fSkills (live 18 Oct: the talker gave ``page = "Deji"`` for "Deezy's YouTube channel" and ``page = "MBL
     channel"`` for the user's NDL; both pages were dropped and YouTube's front page opened, or nothing): a site page's
     kind and value as the site's data and the user's own names read them: ``(page kind, item, how)``.
@@ -1448,9 +1448,20 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
     kw3 (C4, 20 Oct): the caller's own value is what is resolved; a name of theirs found elsewhere in the turn (the
     old ``taste.heard_in``, or a raw substring of a turn) never replaces it.
 
+    gd D5 (final-G2 youtube_channel_deji_arc, both brains: "Deezy" stayed "theirs as written" and Deji was never
+    measured): fd D7's own-visit rule here too, as in :func:`yuki.skills.names.own_url`: a name that is theirs as
+    written only through pages Yuki or a live test opened (:func:`yuki.skills.names.own_visit` False: every visit memory
+    holds of it was Yuki's own pick or a test's) is none of theirs, so the value is heard against their other names.
+    ``miss`` (a dict the caller passes) gets ``"why"`` when a given name stayed as given: ``no_entries`` (no names of
+    that page kind), ``not_own`` (the as-written name was dropped by that rule and none other matched), ``below_bar``
+    (none sounds like it), ``unheard`` (one sounds like it, but the user's words don't hold it by sound), ``error``;
+    code words only, for the content-free ``skill_resolve`` line.
+
     Never raises."""
+    box = miss if isinstance(miss, dict) else {}
     try:
         from yuki.connect.templates import site as site_data
+        from yuki.skills import names as N
         from yuki.skills import taste
 
         name = site_file(site_word)
@@ -1463,14 +1474,24 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
         kinds = [(kind, str(pk)) for kind, site, pk, _var in taste.site_kinds() if site == name] if said else []
         for kind, pk in kinds:
             names = [n for n in taste.candidates(store, kind, now=now) if n]
+            if not names:
+                box.setdefault("why", "no_entries")
+                continue
             exact = next((n for n in names if _words(n).casefold() == said.casefold()), None)
             if exact is not None:
-                return pk, exact, "listed"
+                if N.own_visit(store, name, pk, exact) is not False:
+                    return pk, exact, "listed"
+                # gd D5 (fd D7's rule): theirs "as written" only through Yuki's or a test's own opens: heard against
+                # their other names instead
+                names = [n for n in names if _words(n).casefold() != said.casefold()]
+                box["why"] = "not_own"
             # the caller's value heard as one of their names (its sound, never a span of the turn); the user's words
             # holding that name by sound too keeps a model's rewrite from being swapped for one of theirs
-            alike = taste.heard_as(names, said, loose=True)
+            alike = taste.heard_as(names, said, loose=True) if names else None
             if alike and any(taste.heard_as([alike], str(w), loose=True) for w in words if w):
+                box.pop("why", None)
                 return pk, alike, "heard"
+            box.setdefault("why", "unheard" if alike else "below_bar")
         if page not in pages or (not item and "{" in pages[page]):
             # no page kind, or one whose address needs a value none came with: nothing changed (the resolver checks
             # the page as given, and drops it unless the words hold it: the site's front page)
@@ -1478,6 +1499,7 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
         # none of their names: a page kind given stays (its item is checked by the resolver as given)
         return page, None, "kind"
     except Exception:  # noqa: BLE001 - nothing changed
+        box["why"] = "error"
         return None, None, ""
 
 

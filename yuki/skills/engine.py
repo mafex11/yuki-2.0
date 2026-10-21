@@ -148,8 +148,9 @@ CHOICE_SLOTS: tuple[str, ...] = ("choose", "context")
 #: Phase 2.1/2.2: the run's own notes a caller may add (at the top of ``run_skill``'s arguments, or inside its slots
 #: when the skill has no slot of that name; :func:`note_args`): ``why``, a pick's code-made why that the caller passes
 #: back from the candidates it chose from (said in the done line, ``resolve.WHY_LINE``), and ``from``, the caller's
-#: word for where a value it gave came from (``resolve.CALLER_SOURCES``: card / screen / menu / reading; one word, or a
-#: slot -> word map). Never a skill's own slots: taken out before the resolver.
+#: word for where a value it gave came from (``resolve.CALLER_SOURCES``: card / screen / menu / reading; gd D1, contract
+#: K-H: ``heard``, read from a misheard word of theirs, ``resolve.CALLER_HEARD``; one word, or a slot -> word map).
+#: Never a skill's own slots: taken out before the resolver.
 NOTE_SLOTS: tuple[str, ...] = ("why", "from")
 #: Phase 2.1: "not that" right after a guess (the caller's correction giving that same guessed value again) never runs
 #: it again: the next of the user's own candidates runs, else this question (rule 149: one line, one other way).
@@ -360,6 +361,10 @@ class RunContext:
     #: corrected run asked for and acted on, from the engine's own trace (:func:`_corrected`), verified or not. A driver
     #: never measures or judges the words to mean one of them. RAM only; set by :func:`resolve_and_run`.
     turned_down: dict[str, list[str]] = field(default_factory=dict)
+    #: gd D2 (final-G2 k_spotify_louder): the caller's ``corrects`` flag for this run (the user corrected the skill's
+    #: last run), so a driver that learns from a run never keeps a correction's words as the name of the row it played
+    #: (those words name what the user just rejected). Set by :func:`resolve_and_run`. RAM only.
+    corrects: bool = False
 
     def game_now(self) -> str:
         """D9, read now (fails closed: a check that raised counts as a game)."""
@@ -2128,7 +2133,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                   dropped_slots=_slot_flags(list(forms)))
             return _simple(resolved.skill, "asked", ctx, started, ask="", options=[], say="",
                            evidence={"acted": False, "reason": "form", "form": forms, FORM_RECALL: True})
-        _emit(ctx, "skill_resolve", skill=resolved.skill, result="asked", slot_source="ask")
+        _emit(ctx, "skill_resolve", skill=resolved.skill, result="asked", slot_source="ask",
+              **_person_fields(getattr(resolved, "person", None)))
         asked_ev: dict[str, Any] = {"acted": False, "reason": "asked", "fallback_line": resolved.question}
         if forms:
             asked_ev["form"] = forms      # skill19 (RC5a): a dropped code-typed value is never dropped silently
@@ -2182,7 +2188,9 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
           dropped=len(plan.dropped), dropped_slots=_slot_flags(plan.dropped), skipped=len(plan.skipped),
           source=sorted(set(sources.values())) or None, guessed_slots=_slot_flags(guessed), origin=ctx.origin,
           reordered=True if planned != in_file else None, rested=rested or None,
-          **_measured_fields(getattr(plan, "measured", None)))
+          **_measured_fields(getattr(plan, "measured", None)),
+          **_names_fields(getattr(plan, "names_how", None), getattr(plan, "names_miss", None)),
+          **_person_fields(getattr(plan, "person", None)))
     deadline = started + float(ctx.budget_s)
     tried: list[dict[str, Any]] = []
     measure = _Measure(ctx, skill, plan.values)
@@ -2632,6 +2640,50 @@ def _measured_fields(measured: Any) -> dict[str, Any]:
                 "names_sites": sum(1 for v in got.values() if v.get("kind") == SITE) or None,
                 "names_score": round(min(scores), 3) if scores else None,
                 "names_margin": round(min(margins), 3) if margins else None}
+    except Exception:  # noqa: BLE001 - a log field never breaks a run
+        return {}
+
+
+def _names_fields(how: Any, miss: Any) -> dict[str, Any]:
+    """gd D5 (final-G2 youtube_channel_deji_arc: why "Deezy" never became their Deji was unmeasured): the names rules'
+    code words for the content-free ``skill_resolve`` line (:attr:`yuki.skills.resolve.Plan.names_how` /
+    ``names_miss``), as flags the log keeps (``{"caller": true}``, as ``guessed_slots``): ``names_how`` how a given name
+    was resolved (``value``, ``caller``, ``listed``, ``heard``, ``kind``), ``names_miss`` why one stayed as given
+    (``resolve.NAMES_MISS_WORDS``) and ``names_miss_slots`` which slots (schema names only). Never a value or a name;
+    ``{}`` for none; never raises."""
+    try:
+        out: dict[str, Any] = {}
+        hows = _slot_flags(sorted({str(v) for v in dict(how or {}).values()}))
+        if hows:
+            out["names_how"] = hows
+        misses = {str(k): str(v) for k, v in dict(miss or {}).items()}
+        words = _slot_flags(sorted(set(misses.values())))
+        if words:
+            out["names_miss"] = words
+            out["names_miss_slots"] = _slot_flags(sorted(misses))
+        return out
+    except Exception:  # noqa: BLE001 - a log field never breaks a run
+        return {}
+
+
+def _person_fields(person: Any) -> dict[str, Any]:
+    """gd D6 (the R13 trigger lead: the right person resolved, yet the chat driver read the window's thread as outside
+    their threads): a person slot's resolution for the content-free ``skill_resolve`` line
+    (:attr:`yuki.skills.resolve.Plan.person`), one nested record the log keeps as is: ``source`` and ``how`` (code
+    words, the log's enum fields), ``people`` (the people the name names), ``dms`` (their direct-message routes) and
+    ``threads`` (those routes' thread ids), counts only. Never a name; ``{}`` for none; never raises."""
+    try:
+        got = dict(person or {})
+        rec: dict[str, Any] = {}
+        for key in ("source", "how"):
+            word = str(got.get(key) or "")
+            if word and _SLOT_NAME.fullmatch(word):
+                rec[key] = word
+        for key in ("people", "dms", "threads"):
+            n = got.get(key)
+            if isinstance(n, int) and not isinstance(n, bool):
+                rec[key] = n
+        return {"person": rec} if rec else {}
     except Exception:  # noqa: BLE001 - a log field never breaks a run
         return {}
 
@@ -3332,6 +3384,8 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     # Phase 2.1/2.2 (review M1): the caller's notes (``why``, ``from``) leave the slots on every path (the voice's
     # hands, a card, the thinker), the context's own (a caller that read them from its arguments) first
     ctx.why, ctx.given_from, slots = note_args(str(skill_key or ""), {"why": ctx.why, "from": ctx.given_from}, slots)
+    # gd D2: the drivers read whether this run is a correction (a correction's words never teach a row's name)
+    ctx.corrects = bool(corrects)
     if live is None:
         from yuki.skills.catalog import load
 

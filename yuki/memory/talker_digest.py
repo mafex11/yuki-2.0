@@ -53,6 +53,13 @@ CHATS_N = 4
 #: Per taste kind: the entities shown (most picked first) and the words the user called each by.
 USUAL_N = 4
 SAID_N = 2
+#: gd D2 (final-G2 k_spotify_louder: a correction's words were paired with Yuki's alternative and the next
+#: conversation's digest told both talkers ``lumen (they've called it "Japanese")``, so "Play the Japanese playlist"
+#: was sent as lumen): a pairing is shown only once it has settled, at least the pairing watch's span after it was made
+#: (``yuki.skills.spotify_route.PAIR_WATCH_S``: the exchange in which a correction of theirs still takes it back), so
+#: what the digest calls their word for a row is one that stood through its exchange, never one a correction may still
+#: drop. The drivers write pairings only from the user's own words (never a guess fill, never a correction's words).
+SAID_SETTLE_S = 120.0
 #: A taste's peak hours: the hours within this share of its busiest hour, merged into at most this many ranges.
 PEAK_SHARE = 0.6
 PEAK_RANGES = 2
@@ -420,12 +427,50 @@ def _peaks(weekday: list[float], weekend: list[float]) -> list[tuple[int, int]]:
     return [(a % 24, b % 24) for a, b in ranges[:PEAK_RANGES]]
 
 
+def _settled_said(store: Any, kind: str, now: float) -> dict[str, list[str]]:
+    """gd D2: the words paired with each entity of ``kind`` (``yuki.skills.taste.note`` ``said_as``: the
+    ``<kind>@said`` rows, words and target decrypted in RAM), newest first, keyed by the target's folded name, only the
+    pairings that have settled (made at least :data:`SAID_SETTLE_S` before ``now``). One read per kind. Never raises
+    (``{}``)."""
+    try:
+        from yuki.skills import taste
+
+        rows = store._query("SELECT name_ciphertext, ref_ciphertext, last_at FROM tastes WHERE kind = ? "
+                            "ORDER BY last_at DESC, id DESC", (taste.said_kind(kind),))
+    except Exception:  # noqa: BLE001
+        return {}
+    settle = settle_s()
+    out: dict[str, list[str]] = {}
+    for words_ct, target_ct, last_at in rows:
+        try:
+            if float(last_at or 0.0) > now - settle or not target_ct:
+                continue
+            words = " ".join(str(store._dec(words_ct) or "").split())
+            target = taste._norm(store._dec(target_ct))
+        except Exception:  # noqa: BLE001 - a row the key can't read is skipped
+            continue
+        if words and target:
+            out.setdefault(target, []).append(words)
+    return out
+
+
+def settle_s() -> float:
+    """The span a pairing settles in: the pairing watch's own (``spotify_route.PAIR_WATCH_S``), else
+    :data:`SAID_SETTLE_S`."""
+    try:
+        from yuki.skills.spotify_route import PAIR_WATCH_S
+
+        return max(float(PAIR_WATCH_S), 0.0)
+    except Exception:  # noqa: BLE001
+        return SAID_SETTLE_S
+
+
 def usuals(store: Any, now: float) -> list[dict[str, Any]]:
     """What the user picks most of each taste kind memory keeps (kinds from the data: their Spotify playlists, the
     YouTube channels they watch, ...): ``[{"kind", "items": [{"name", "n", "peaks", "said"}], "now"}]``. ``n``: the
     decayed count of picks; ``peaks``: the hours they pick it most; ``said``: the words they called it by when those
-    named no playlist and it then played (``yuki.skills.taste.note`` ``said_as``); ``now``: the one picked most at
-    this hour. Never raises (``[]``)."""
+    named no playlist and it then played (``yuki.skills.taste.note`` ``said_as``), gd D2: only pairings that have
+    settled (:func:`_settled_said`); ``now``: the one picked most at this hour. Never raises (``[]``)."""
     try:
         from yuki.skills import taste
 
@@ -443,11 +488,12 @@ def usuals(store: Any, now: float) -> list[dict[str, Any]]:
             rows.sort(key=lambda t: (-t.n_obs, t.entity_key))
             hists = {str(r[0]): (taste._hist(r[1]), taste._hist(r[2])) for r in store._query(
                 "SELECT entity_key, hist_weekday, hist_weekend FROM tastes WHERE kind = ?", (kind,))}
+            said = _settled_said(store, kind, now)
             items = []
             for t in rows[:USUAL_N]:
                 wd, we = hists.get(t.entity_key, ([0.0] * 24, [0.0] * 24))
                 items.append({"name": t.name, "n": round(t.n_obs, 1), "peaks": _peaks(wd, we),
-                              "said": taste.said_words(store, kind, t.name)[:SAID_N]})
+                              "said": said.get(taste._norm(t.name), [])[:SAID_N]})
             out.append({"kind": kind, "items": items, "now": at_hour})
         except Exception:  # noqa: BLE001 - that kind is left out
             continue
