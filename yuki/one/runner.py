@@ -144,7 +144,7 @@ LINE_NOT_ONE = "Not done: Yuki's ONE brain is not switched on here, so nothing w
 #: A drafted message whose chat Yuki couldn't see open (``executor.LINE_CHAT_UNCONFIRMED``).
 LINE_CHAT_UNCONFIRMED = "I couldn't confirm the chat is open, so I didn't type anything."
 #: The skill engine's outcomes after which a send did not go (``executor.NOT_SENT_OUTCOMES``).
-NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "held_call", "failed"})
+NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "held_call", "failed", "not_done"})
 #: tidy21 (the user's decision 1, 19 Oct): under the tidy dial "do" code takes the flagged diff's one legal undoable
 #: step itself (:meth:`Runner._tidy_by_code`) and says its line; the result tells the agent what code did
 #: (:data:`TIDIED`), never asks it to take the step (one20's "take it" note is gone, so it can't happen twice). With
@@ -228,7 +228,8 @@ LINE_WAY_FAILED = "Not kept: memory didn't take it; say so in a few words."
 #: not read as "not kept").
 WAY_WRITE_S = 3.0
 #: One20 (final-D S5): the engine's outcomes after which a run handed back with its request still open.
-OPEN_OUTCOMES = frozenset({"handed_over", "failed"})
+#: morning21 (ma note 7): a not-done skill (a code-word precondition stop, ``engine.NOT_DONE``) is a part left open.
+OPEN_OUTCOMES = frozenset({"handed_over", "failed", "not_done"})
 #: The engine's hand-off reasons after which nothing may run again (it may have acted, or a step was the user's):
 #: ``engine.WHY_UNVERIFIED``, ``engine.WHY_ERROR``, ``engine.TO_PLANNER``, ``engine.WHY_DROPPED``.
 NO_SECOND_RUN = frozenset({"unverified", "error", "to_planner", "dropped"})
@@ -348,6 +349,18 @@ def _words(value: Any) -> str:
     return " ".join(str(value or "").split())
 
 
+def _code_word(value: Any, limit: int = 20) -> str:
+    """gc (C8): a code word another lane's code gave (letters, digits and underscores, ASCII, at most ``limit``) as it
+    is, for a content-free log line; anything else (or nothing): ``""``. A shape test on code's string, never words."""
+    text = value if isinstance(value, str) else ""
+    return text if text and len(text) <= limit and text.isascii() and text.replace("_", "").isalnum() else ""
+
+
+#: gc (final-G2 C6): the ONE input acts whose own report watches only focus, window and page (a click, a key): a
+#: measured media transition in the window they acted on is their visible effect (``util.media_effect``).
+INPUT_ACTS: frozenset[str] = frozenset({"click", "keys", "hotkey", "press"})
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # The result
 # ---------------------------------------------------------------------------------------------------------------------
@@ -408,6 +421,13 @@ class OneResult:
     #: names21 (merge note 5): an ``open_app`` whose launch took a misheard name for one of the user's own apps or
     #: sites: the measure's content-free facts (kind, how, score, margin, source), for the log line only.
     names_match: Mapping[str, Any] | None = None
+    #: gc (final-G2 C8, youtube_channel_deji_arc: why a heard address stayed as given was unmeasured under one): the
+    #: names measure's miss code word (``names.MISS_WORDS``, the verb's ``names_miss``), for the log line only.
+    names_miss: str = ""
+    #: gc (final-G2 C6, k_resume_anime): an input act its own report could not verify whose after-diff measured its
+    #: effect in the very window it acted on (``util.media_effect``): ``"media"``; for the voice driver's claim gate
+    #: only (``OneVoice.acted``), never the status, the settle rule or what the agent reads (it reads After itself).
+    effect: str = ""
 
     @property
     def refused(self) -> bool:
@@ -470,6 +490,7 @@ class OneResult:
                 "cover": bool(self.cover), "owed": bool(self.owed) or None,
                 "second": self.second or None,
                 "names_match": dict(self.names_match) if self.names_match else None,
+                "names_miss": self.names_miss or None, "effect": self.effect or None,
                 "countdown": self.countdown or None, "result_chars": len(self.result), "after_chars": len(self.after),
                 "evidence": len(self.evidence), "ms": round(self.ms, 1)}
 
@@ -875,7 +896,27 @@ def skill_step(hands: Any, tool: str, tool_input: Mapping[str, Any], target: Map
             if not getattr(gated, "allowed", False):
                 return gated
         return None
+    _own_undo(hands, tool, tool_input, facts)
     return _own_run_step(ctx, tool, tool_input, facts, earlier, force=force)
+
+
+def _own_undo(hands: Any, tool: str, tool_input: Mapping[str, Any], facts: dict[str, Any]) -> None:
+    """integ28 (ga merge note 4, gb merge note 4; ONE parity for gb's contract K-U): a key step on the hands' own
+    skill path that is the run's declared own close of what its own shortcut opened, measured at this step while that
+    very field holds the keyboard (``Hands.own_undo_now``: its own focus read; ``False`` at once when the run declared
+    none), goes to the gate as ``facts["own_undo"]``: ``check.one`` takes it as the run's own undo (row 6, after the
+    game gate and the Act switch, never sent to the commit check). Keys only; any doubt leaves the facts as they are.
+    Never raises."""
+    if tool not in ("press", "hotkey") or facts.get("own_undo") is True:
+        return
+    measure = getattr(hands, "own_undo_now", None)
+    if not callable(measure):
+        return
+    try:
+        if measure(tool, dict(tool_input or {}), facts) is True:
+            facts["own_undo"] = True
+    except Exception:  # noqa: BLE001 - unsure: not the run's own undo (the gate as before)
+        pass
 
 
 def _skill_app(sk: Any, slots: Mapping[str, Any], app: str) -> str:
@@ -1448,6 +1489,7 @@ class Runner:
                            decision=decision, verb=verb, tidy=bool(getattr(decision, "tidy", False)))
         if isinstance(facts.get("names_match"), Mapping):
             result.names_match = dict(facts["names_match"])   # names21 (merge note 5): the launch's measure, logged
+        result.names_miss = _code_word(facts.get("names_miss"))   # gc (C8): why a heard name stayed as given, logged
         if asked:
             result.question = str(facts.get("_asked") or "")
         elif asking:
@@ -1633,6 +1675,14 @@ class Runner:
             result.flagged = bool(d.any_flag)
             if not d.empty:
                 result.after = desk_diff.render(d, max_chars=AFTER_CHARS)
+            if name in INPUT_ACTS and result.status == NOT_CONFIRMED and result.verified is None:
+                # gc (final-G2 C6, k_resume_anime): a click or key its own report could not verify, whose after-diff
+                # measured a media transition in the very window it acted on (hwnd identity): its visible effect, for
+                # the voice's claim gate (the status and the settle rule stay as they are)
+                windows = [h for h in acted if isinstance(h, int) and not isinstance(h, bool)]
+                windows += [_hwnd_of(facts.get("live_hwnd")), _hwnd_of(resolved.get("window"))]
+                if util.media_effect(getattr(d, "media_changes", None), [h for h in windows if h]):
+                    result.effect = "media"
             moved = self._front_moved(d)
             if moved is not None:
                 self._front_kept = (moved, time.monotonic(), state)   # one20 (S2): a later focus_back's window

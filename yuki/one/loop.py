@@ -460,8 +460,11 @@ class OneAgent(Brain):
         os_, bs = OneSettings.read(self.settings), BrainSettings.read(self.settings)
         names = list(getattr(self.settings, "user_names", []) or [])
         card = read_card(self.memory)
-        brief, rules = read_profile_parts(self.memory)
-        profile = profile_text(names=names, brief=None if card else brief, rules=rules, limit=bs.profile_chars)
+        # integ29 (mc merge note M6): the resources too, as the request's ``gather`` reads them (the same bytes as
+        # its breakpoint 2, so the warm-up's cache holds when the user has told Yuki of a thing of theirs)
+        brief, rules, resources = read_profile_parts(self.memory, with_resources=True)
+        profile = profile_text(names=names, brief=None if card else brief, rules=rules, limit=bs.profile_chars,
+                               resources=resources)
         _menu, lines, _ids = read_menu(self.memory, self.settings, limit=bs.menu_chars)
         menu, keys = typed_menu(lines)
         effort = bs.effort_of("typed")[0]

@@ -117,6 +117,18 @@ LINE_PLAY_STALE = "Spotify's playing now, but its window didn't update, so I cou
 LINE_ALREADY_UNCONFIRMED = "Spotify shows it as already playing, but I couldn't confirm that, so I left it."
 LINE_VOLUME_UNCONFIRMED = "I moved it, but I couldn't confirm the new level."
 LINE_KEYS_SHORT = "I moved Spotify's volume to {now:g}%, but ran out of time before {target:g}%."
+#: gd D3 (final-G2 kw_offer_then_yes t1: "Putting on your workout playlist." then "Playing lumen on Spotify.", as if
+#: they had a workout playlist): the line said when the row that plays was reached by meaning for a name no row in view
+#: is called (the run's own fact ``meant_why``: ``mood`` the hour's usual, ``content`` the judgement's closest fit by
+#: what plays in it), so it names the substitute and why and an early line never stands uncorrected. integ28 fix
+#: skills-words-1: worded from that measured fact only ("I couldn't see"): a row out of view may still be called so.
+#: A name heard as a row's (``heard``), one the words name or were paired with (``name``, ``called``) plays as asked:
+#: the plain line. Never on a correction (its words name what was rejected; the plain line names the row that plays).
+INSTEAD_WHY: dict[str, str] = {"mood": ", your usual now", "content": ", the closest fit"}
+LINE_INSTEAD = "I couldn't see a playlist called {asked}, so I put on {name}{why}."
+LINE_INSTEAD_ALREADY = "I couldn't see a playlist called {asked}; {name}{why} is already playing."
+#: The name asked, as said in that line, at most this long (cut at a word).
+INSTEAD_ASKED_CHARS = 40
 
 #: Route variants whose ``game_states`` say where the no-focus Spotify rungs were proven (the doctor's line).
 PROVEN_ROUTES = (("volume", "spotify_in_app"), ("spotify.playlist", "library"))
@@ -1188,6 +1200,10 @@ def _other_device(facts: dict[str, Any], *, volume: bool = False) -> Any:
 #     description of the user's playlists before the hand-off (:func:`_meant_row`: taste.described + taste.judge, a
 #     small model, with the pairing of (3) as a hint; a mood takes the hour's usual), and a row this rung plays for
 #     them is watched like a hand-off's, so its own check keeps the words as another name of it: a hint next time.
+# (6) gd D2 (final-G2): a correction (the caller's ``corrects``) never pairs its words with the row it plays (they name
+#     what the user just rejected); its hand-off watch learns nothing (``learn`` False), kept only so the finish gate
+#     can tell the new row; within the watch's span it drops what the run it corrects taught (:func:`_drop_corrected`).
+#     Only a row the user's own words name ("no, ネオン", or words of theirs paired with it) still settles the watch.
 # No mapping is written here, and nothing polls: the watch is a note in RAM that those checks read.
 
 #: Names already kept as taste by this process, per taste kind (folded; RAM): a read with nothing new writes nothing.
@@ -1266,10 +1282,18 @@ def _pair_start(call: Any, asked: str, before: str | None, status: str) -> None:
     """Start (or restart) the one playlist watch: these words named no row (or nothing could be read), so the playlist
     the hand-off job then puts on within :data:`PAIR_WATCH_S` is what they meant. ``before``: the row playing at that
     read (it playing on is nothing the job did); ``status``: the session then. With no row read as playing, only an
-    idle session (:data:`IDLE_STATES`) is watched. Never for an eval run, without memory or a taste kind."""
+    idle session (:data:`IDLE_STATES`) is watched. Never for an eval run, without memory or a taste kind.
+
+    gd D2: a correction's words name what the user just rejected, so the row the hand-off job puts on for them is
+    Yuki's pick: the run it corrects unlearns its pairing first (:func:`_drop_corrected`), and the watch is opened as
+    one that learns nothing (``learn=False``: :func:`_pair_settle` keeps no name). It is still opened (review gd M1):
+    it is the hand-off finish gate's only proof that the row then playing is new (:func:`_handoff_verdict`)."""
     learns = _learns(call)
     if learns is None or not asked:
         return
+    corrects = _corrects(call)
+    if corrects:
+        _drop_corrected(call)
     log = _logger(call)
     if before is None and status not in IDLE_STATES:
         # something plays (or the session couldn't be read) and no row said which: a row seen playing later can't be
@@ -1277,19 +1301,22 @@ def _pair_start(call: Any, asked: str, before: str | None, status: str) -> None:
         _pair_end(None, "")
         log("spotify_pair", outcome="not_watched", session=status if str(status).isalpha() else "unknown")
         return
-    _pair_open(asked, before, memory=learns[0], kind=learns[1], log=log)
-    log("spotify_pair", outcome="watching", before_known=before is not None)
+    _pair_open(asked, before, memory=learns[0], kind=learns[1], log=log, learn=not corrects)
+    log("spotify_pair", outcome="watching", before_known=before is not None, learn=not corrects)
 
 
-def _pair_open(asked: str, before: str | None, *, memory: Any, kind: str, log: Callable[..., None]) -> int:
+def _pair_open(asked: str, before: str | None, *, memory: Any, kind: str, log: Callable[..., None],
+               learn: bool = True) -> int:
     """The watch for ``asked`` (replacing any), RAM only; its generation back. Nothing polls: the hand-off job's
-    finish gate (:func:`_handoff_verdict`) and a rung's own check of a same-exchange press (:func:`_played`) read it."""
+    finish gate (:func:`_handoff_verdict`) and a rung's own check of a same-exchange press (:func:`_played`) read it.
+    ``learn`` False (gd D2, a correction's watch): it still tells a new row from the one before, but settling on one
+    keeps no name (:func:`_pair_settle`); a reopen (:func:`_pair_reopen`) keeps the flag."""
     with _pair_lock:
         _pair_gen[0] += 1
         gen = _pair_gen[0]
         _pair.clear()
         _pair.update(gen=gen, asked=asked, before=before, settled=None, until=time.monotonic() + PAIR_WATCH_S,
-                     memory=memory, kind=kind, log=log)
+                     memory=memory, kind=kind, log=log, learn=bool(learn))
     return gen
 
 
@@ -1438,14 +1465,18 @@ def _pair_settle(name: str, *, gen: int, own: bool) -> None:
     hour, the words an encrypted pairing keyed by their digest; the newest pairing of the same words wins), off the
     check's clock. Only a row PLAN.md D1 lets keep a name (``own``: a Library row whose owner parsed and isn't Spotify;
     review r1 L1): any other (Spotify's own, an unparsed owner, a page header) is kept nowhere (``not_kept``). Once per
-    watch; the watch keeps the row it settled on until its time is up (the finish gate may ask again). Content-free
-    log."""
+    watch; the watch keeps the row it settled on until its time is up (the finish gate may ask again). A watch that
+    learns nothing (``learn`` False, a correction's: gd D2) records the row it settled on and keeps no name
+    (``not_kept``, ``corrects``). Content-free log."""
     with _pair_lock:
         if not _pair or _pair.get("gen") != gen or _pair.get("settled") is not None:
             return
         _pair["settled"] = name
         p = dict(_pair)
     log = p.get("log") or (lambda *_a, **_k: None)
+    if not p.get("learn", True):
+        log("spotify_pair", outcome="not_kept", corrects=True)
+        return
     if _fold(name) == _fold(p.get("asked")):
         log("spotify_pair", outcome="same_name")
         return
@@ -1542,6 +1573,72 @@ def _said_doubt(row: str, words: str | None = None) -> None:
     threading.Thread(target=job, name="yuki-spotify-unsay", daemon=True).start()
 
 
+def _corrects(call: Any) -> bool:
+    """gd D2: whether this run corrects the skill's last run: the caller's ``corrects`` flag
+    (:attr:`yuki.skills.engine.RunContext.corrects`) or the rows the correction turned down (``turned_down``, fd D3)."""
+    return bool(getattr(getattr(call, "ctx", None), "corrects", False)) or bool(_turned_down(call))
+
+
+def _drop_corrected(call: Any) -> None:
+    """gd D2 (final-G2 k_spotify_louder, both brains: "No, not this one. The other playlist." ran ``{playlist:
+    "Japanese", corrects: true}``, the judgement put lumen on, those words were kept as lumen's name, the digest told
+    both talkers ``lumen (they've called it "Japanese")`` and the next "Play the Japanese playlist" played lumen): a
+    correction never pairs its words with the row it plays, and within the watch's span (:data:`PAIR_WATCH_S`) it drops
+    what the run it corrects taught, whatever the correction's words: the pairing of the words a meant or
+    pairing-reached play was played for (``_said_play``) and the row the watch settled on (``_pair``, unless it was a
+    correction's own watch that learned nothing); the watch ends (a later finish gate settles nothing; a correction
+    that hands over opens its own watch that learns nothing: :func:`_pair_start`). The safe direction: a pairing
+    dropped costs one more judgement, a wrong one kept plays the wrong playlist every time. Off the request's clock;
+    content-free log (``spotify_pair`` ``outcome=corrected``, then ``unlearned`` / ``unlearn_none`` per pairing).
+    Never for an eval run."""
+    learns = _learns(call)
+    if learns is None:
+        return
+    now = time.monotonic()
+    with _pair_lock:
+        sp = dict(_said_play)
+        _said_play.clear()
+        p = dict(_pair)
+        if _pair:
+            _pair.clear()
+            _pair_gen[0] += 1
+    drops: list[tuple[str, str]] = []
+    if sp and now <= float(sp.get("until") or 0.0) and sp.get("row") and sp.get("words"):
+        drops.append((str(sp["row"]), str(sp["words"])))
+    # a watch that learned nothing (a correction's own, ``learn`` False) taught no pairing to drop
+    if p and p.get("learn", True) and now <= float(p.get("until") or 0.0) and p.get("settled") and p.get("asked") \
+            and _fold(p["settled"]) != _fold(p["asked"]):
+        drops.append((str(p["settled"]), str(p["asked"])))
+    drops = list({(_fold(r), _fold(w)): (r, w) for r, w in drops}.values())
+    log = _logger(call)
+    log("spotify_pair", outcome="corrected", drops=len(drops))
+    memory, kind = learns
+    for row, words in drops:
+        def job(row: str = row, words: str = words) -> None:
+            from yuki.skills import engine
+            from yuki.skills.taste import unsay
+
+            gone = engine._mem(memory, "spotify_unsay",
+                               lambda c: unsay(engine._store_of(c), kind, row, words=words), timeout_s=1.0)
+            log("spotify_pair", outcome="unlearned" if gone else "unlearn_none")
+
+        threading.Thread(target=job, name="yuki-spotify-unsay", daemon=True).start()
+
+
+def _instead_line(asked: str, name: str, why: str, *, already: bool) -> str:
+    """gd D3: :data:`LINE_INSTEAD` (or :data:`LINE_INSTEAD_ALREADY`) for the name asked, the row that plays and how it
+    was reached (:data:`INSTEAD_WHY`); the name asked cut at a word to :data:`INSTEAD_ASKED_CHARS`."""
+    said = " ".join(str(asked or "").split())
+    if len(said) > INSTEAD_ASKED_CHARS:
+        said = said[:INSTEAD_ASKED_CHARS].rsplit(" ", 1)[0] or said[:INSTEAD_ASKED_CHARS]
+    tail = INSTEAD_WHY.get(why, "")
+    if already:
+        # the why sits inside the sentence there: "lumen, your usual now, is already playing"
+        return LINE_INSTEAD_ALREADY.format(asked=said, name=" ".join(str(name or "").split()),
+                                           why=tail + "," if tail else "")
+    return LINE_INSTEAD.format(asked=said, name=" ".join(str(name or "").split()), why=tail)
+
+
 def _missing(call: Any, look: Look, facts: dict[str, Any], status: str) -> Any:
     """Rows read and none has the name asked (``not_in_view``): couldn't run, with what the hand-off needs (fix-plan
     IF-seed): ``facts["missing"]`` (the slot, a code word) and ``facts_ram["seen"]`` (the names read, at most
@@ -1585,9 +1682,21 @@ def _after_look(call: Any, look: Look, status: str, app_id: str, facts: dict[str
         # (taste.note said_as: kw3 C9, a hint the next judgement of "anime playlist" reads, never a lookup). A mood is
         # never kept: the hour decides it each time
         got.facts_ram["row"] = look.name
-        got.facts["how"] = str(look.details.get("meant_why") or "")    # heard / name / called / content / mood
+        why = str(look.details.get("meant_why") or "")
+        got.facts["how"] = why    # heard / name / called / content / mood
+        corrected = _corrects(call)
+        if why in INSTEAD_WHY and not corrected and got.say:
+            # gd D3: no row in view is called what they asked; the line names the substitute and why (the run's own
+            # facts; integ28 fix skills-words-1: "couldn't see", never "no playlist": a row out of view may be it)
+            got.say = _instead_line(meant, look.name, why, already=bool(got.already))
         learns = _learns(call)
         if learns is None:
+            return got
+        if corrected:
+            # gd D2 (final-G2 k_spotify_louder): a correction's words ("Japanese", given with corrects) name the row the
+            # user just rejected, and the row the judgement put on instead is Yuki's pick: never kept as their name.
+            # The pairing the corrected run taught within its watch is dropped too
+            _drop_corrected(call)
             return got
         _said_doubt(look.name, meant)
         # skill20 (final-D P1): words that are Yuki's own guess (the caller's reading, its pick) are never kept as the
@@ -1606,10 +1715,22 @@ def _after_look(call: Any, look: Look, status: str, app_id: str, facts: dict[str
         return got
     if _learns(call) is None:
         return got                       # an eval run (or no memory): no watch, pairing or doubt is touched
+    said: str | None = None
+    if _corrects(call) and not _words_hold(getattr(call.ctx, "words", None), look.name):
+        # gd D2 (final-D k_playlist_not_that: "the other playlist" ran with the caller's pick, and the watch settled the
+        # user's earlier words on it): a correction whose row their own words don't name is Yuki's pick, so it pairs
+        # nothing, and the corrected run's pairing is dropped. A row they named themselves ("no, ネオン"), or through
+        # words of theirs already paired with it ("no, the Japanese one" given as ネオン: review gd L2, the same
+        # bounded read as below), still settles the watch's words on it below (their own words: the newest pick wins),
+        # and the play is remembered as reached through that pairing, so a further correction can drop it
+        said = _said_from(call, look)
+        if not said:
+            _drop_corrected(call)
+            return got
     gen = _pair_request(call, look.name, acted=got.ran is not False and not got.already)
     if gen is not None:
         got.facts_ram["pair"] = {"gen": gen, "row": look.name, "own": _own(look)}
-    words = _said_from(call, look)
+    words = said or _said_from(call, look)
     _said_doubt(look.name, words or _playlist_name(call.values))
     if words:
         got.facts["said_as"] = True      # the row these words were paired with (content-free flag)
@@ -2464,7 +2585,8 @@ def _handoff_verdict(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, di
     with no name (the hand-off dropped it), or with that name. Which playlist shows playing (:func:`playing_row`),
     Spotify's session and its sound here: a row the watch for these words judges new (:func:`_pair_judge`: not the one
     playing when the words named no row; the paused one resumed counts) -> True, the words are kept as its other name
-    (:func:`_pair_settle`, only for a row D1 lets keep a name) and a pairing it contradicts is dropped
+    (:func:`_pair_settle`, only for a row D1 lets keep a name, and never on a correction's watch, which learns nothing:
+    gd D2) and a pairing it contradicts is dropped
     (:func:`_said_doubt`). Nothing playing and the session paused or stopped -> False. No watch to tell which was
     started after the hand-off, an old row, or no sound here -> None (never a false done). ``None`` back: a row named
     in view, checked the usual way."""
@@ -3357,7 +3479,8 @@ NO_FOCUS_ROUTES: tuple[str, ...] = ("play_library", "play_search", "volume_slide
 
 __all__ = [
     "ASK_AMOUNT", "CONNECTION_FILE", "DESK", "Desk", "KEYS_MAX", "LINE_OTHER", "LINE_OTHER_AFTER", "LINE_OTHER_VOLUME",
-    "IDLE_STATES", "LINE_PLAY_UNCONFIRMED", "Look", "NO_FOCUS_ROUTES", "PAIR_WATCH_S", "PLAYLIST_SLOT",
+    "IDLE_STATES", "INSTEAD_WHY", "LINE_INSTEAD", "LINE_INSTEAD_ALREADY", "LINE_PLAY_UNCONFIRMED", "Look",
+    "NO_FOCUS_ROUTES", "PAIR_WATCH_S", "PLAYLIST_SLOT",
     "POLL_S", "PROBES", "REQUEST_WARM_S", "ROUTES", "SEEN_MAX", "THIS_PC_S", "app_key", "extra_control", "forget_warm",
     "link_for", "look_page", "look_row", "look_slider", "mixer_linked", "playing_of", "playing_row", "proven",
     "spotify_data", "where_playing", "window_state",

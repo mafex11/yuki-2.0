@@ -148,8 +148,9 @@ CHOICE_SLOTS: tuple[str, ...] = ("choose", "context")
 #: Phase 2.1/2.2: the run's own notes a caller may add (at the top of ``run_skill``'s arguments, or inside its slots
 #: when the skill has no slot of that name; :func:`note_args`): ``why``, a pick's code-made why that the caller passes
 #: back from the candidates it chose from (said in the done line, ``resolve.WHY_LINE``), and ``from``, the caller's
-#: word for where a value it gave came from (``resolve.CALLER_SOURCES``: card / screen / menu / reading; one word, or a
-#: slot -> word map). Never a skill's own slots: taken out before the resolver.
+#: word for where a value it gave came from (``resolve.CALLER_SOURCES``: card / screen / menu / reading; gd D1, contract
+#: K-H: ``heard``, read from a misheard word of theirs, ``resolve.CALLER_HEARD``; one word, or a slot -> word map).
+#: Never a skill's own slots: taken out before the resolver.
 NOTE_SLOTS: tuple[str, ...] = ("why", "from")
 #: Phase 2.1: "not that" right after a guess (the caller's correction giving that same guessed value again) never runs
 #: it again: the next of the user's own candidates runs, else this question (rule 149: one line, one other way).
@@ -179,6 +180,11 @@ HELD_CALL = "held_call"
 #: :data:`LINE_BLOCKED_PARTWAY` once a rung acted), never the game line, never the next rung, never handed over (the
 #: thinker would be stopped the same way).
 HELD_BLOCKED = "blocked"
+#: morning21 (A2): the run's outcome after a rung's code-word stop (``RouteResult.stop``: a precondition met, said
+#: plainly): not done, nothing done, never a question to the user ("Ask them: Zen isn't open" on 21 Oct made the
+#: planner drop the meeting part). The report names the code word and the app it needed; the ledger keeps a refusal
+#: (never counted against the rung).
+NOT_DONE = "not_done"
 LINE_BLOCKED = "Something on the PC stopped me there, so nothing was done."
 LINE_BLOCKED_PARTWAY = "Something on the PC stopped me partway, so I left it there."
 #: At most this many names a route read on screen ride on a seed (``seen``, RAM only), each at most this long.
@@ -198,6 +204,9 @@ _SLOT_NAME = re.compile(r"[a-z_][a-z0-9_]{0,40}")
 COMMIT_BY_END: dict[str, str] = {
     "call_join": "user", "game_voice": "user", "message_sent": "words", "volume_change": "none",
     "media_context": "none", "page": "none", "site_front": "none", "media_play": "none",
+    # morning21 (mb note 1): a monitor's brightness or power, read back; its own off question (only screen, a game or
+    # a call shown) is the display driver's, so the run itself commits nothing
+    "display_change": "none",
 }
 #: The end kinds whose commit depends on what serves them (PLAN D24, lSplit review r1 L2): a join of a chat app's voice
 #: channel (the serve needs ``chat_voice``) is the user's own "join X" (rule 8, Q3), so ``words``, where a calling
@@ -284,6 +293,11 @@ class RouteResult:
     #: The app the verb acted on (a driver says it: Spotify, Discord, the mixer's ``master``), when the route's own
     #: arguments don't name it; D18 matches a moment's app with it (``skill_runs.app``).
     app: str | None = None
+    #: morning21 (A2): a code-word stop said plainly, never a question: nothing was done and nothing more is tried,
+    #: for a precondition the rung met (``outcome``: its code word; ``say``: its plain line; ``app``: the app it
+    #: needed, when one). The run ends :data:`NOT_DONE` (never "Ask them:"); ``ask`` stays for real questions (options
+    #: or a slot).
+    stop: bool = False
 
 
 @dataclass
@@ -360,6 +374,10 @@ class RunContext:
     #: corrected run asked for and acted on, from the engine's own trace (:func:`_corrected`), verified or not. A driver
     #: never measures or judges the words to mean one of them. RAM only; set by :func:`resolve_and_run`.
     turned_down: dict[str, list[str]] = field(default_factory=dict)
+    #: gd D2 (final-G2 k_spotify_louder): the caller's ``corrects`` flag for this run (the user corrected the skill's
+    #: last run), so a driver that learns from a run never keeps a correction's words as the name of the row it played
+    #: (those words name what the user just rejected). Set by :func:`resolve_and_run`. RAM only.
+    corrects: bool = False
 
     def game_now(self) -> str:
         """D9, read now (fails closed: a check that raised counts as a game)."""
@@ -431,8 +449,11 @@ class SkillResult:
     fill_sources: dict[str, str] = field(default_factory=dict)
     unread: list[str] = field(default_factory=list)
     #: Why a run was refused before anything ran (the resolver's code word: ``unknown_skill``, ``skills_off``, ...),
-    #: or ``repeat`` on a hand-off that ran no rung because the same thing ran unconfirmed moments ago.
+    #: or ``repeat`` on a hand-off that ran no rung because the same thing ran unconfirmed moments ago; on a
+    #: :data:`NOT_DONE` end, the rung's own code word (``not_opened``, ``no_tab``, ...).
     why: str = ""
+    #: morning21 (A2): on a :data:`NOT_DONE` end, the app key the stopped rung needed (``RouteResult.app``), when one.
+    needs_app: str = ""
     #: Phase 2.1: the values Yuki guessed (the caller's reading, a listed name, one of their known things), each
     #: ``{"slot", "value" (as said), "from" (resolve.GUESS_SOURCES)}``: the done line names them; RAM only.
     guessed: list[dict[str, Any]] = field(default_factory=list)
@@ -486,6 +507,12 @@ class SkillResult:
                 given = _forms_given(forms)
                 return f"Ask them: {self.ask}\n{given}: pass it in that form when their words give it."
             return f"Ask them: {self.ask}"
+        if self.outcome == NOT_DONE:
+            # morning21 (A2): a precondition the rung met, said plainly; the code word and the app it needed (a code
+            # fact the caller may repair: open that app, then run it again), never "Ask them:"
+            needs = f"; needs {self.needs_app}" if self.needs_app else ""
+            done = "it acted partway (see the line)" if self.acted else "nothing was done"
+            return f"Not done ({self.why or 'stopped'}{needs}): {done}. Say: {self.say}"
         if self.outcome == "held_game":
             return f"Held: a game is in front, nothing was sent. Say: {self.say}"
         if self.outcome == HELD_CALL:
@@ -552,7 +579,11 @@ class SkillResult:
                  "handoff_skill": self.handoff, "skill": self.skill, "outcome": self.outcome, "route": self.route,
                  "run_key": self.run_key,
                  "settled": self.outcome in ("held_game", HELD_CALL, HELD_BLOCKED, "other_device", "unverified",
-                                             "asked", "already")}
+                                             "asked", "already", NOT_DONE)}
+        if self.outcome == NOT_DONE:
+            facts["stop_why"] = self.why          # morning21 (A2): the rung's code word (content-free)
+            if self.needs_app:
+                facts["needs_app"] = self.needs_app
         # Phase 2.1 / 2.3 (RAM only): the guesses the done line names, and on any other end the evidence the talker
         # words it from (``say`` is the code's fallback line)
         if self.guessed:
@@ -1348,7 +1379,9 @@ def _evidence(skill: Skill, values: Mapping[str, Any] | None, tried: Sequence[Ma
             ev["asked"] = asked
         if sources:
             ev["from"] = {str(k): str(v) for k, v in sources.items()}
-        steps = [{"route": t.get("route"), "via": t.get("via"), "outcome": t.get("outcome")}
+        steps = [{"route": t.get("route"), "via": t.get("via"), "outcome": t.get("outcome"),
+                  # integ28 (gb merge note 6, K-S): the switcher it opened still holds the keyboard (measured)
+                  **({"switcher_held": True} if t.get("switcher_held") is True else {})}
                  for t in tried or () if isinstance(t, Mapping)]
         if route is not None and not any(s.get("route") == route.key for s in steps):
             steps.append({"route": route.key, "via": route.via, "outcome": "acted"})
@@ -1405,6 +1438,9 @@ def evidence_words(ev: Mapping[str, Any] | None) -> str:
     tried = [t for t in ev.get("tried") or [] if isinstance(t, Mapping)]
     if tried:
         parts.append("tried " + ", ".join(f"{t.get('route')} ({t.get('via')}: {t.get('outcome')})" for t in tried))
+    if any(t.get("switcher_held") is True for t in tried):
+        # integ28 (gb merge note 6, K-S): measured at the rung's end, never inferred from its outcome word
+        parts.append("the switcher it opened still holds the keyboard (measured)")
     parts.append("the PC was touched" if ev.get("acted") else "nothing on the PC was touched")
     check = ev.get("check") if isinstance(ev.get("check"), Mapping) else None
     if check:
@@ -1467,7 +1503,10 @@ def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], t
     slots = {k: {"value": v, "from": filled.get(k, "")} for k, v in canonical(values).items()}
     out = {"key": skill.key, "app": skill.app, "goal": skill.menu, "slots": slots,
            "done_words": fill(skill.done_line, shown) or "", "done": _done_spec(skill, values, routes, drop=drop),
-           "tried": [{"rung": t.get("rung"), "via": t.get("via"), "why": t.get("outcome")} for t in tried][:4],
+           "tried": [{"rung": t.get("rung"), "via": t.get("via"), "why": t.get("outcome"),
+                      # integ28 (gb merge note 6, K-S): the switcher's measured hold, within PINNED_CHARS
+                      **({"switcher_held": t["switcher_held"]} if isinstance(t.get("switcher_held"), bool) else {})}
+                     for t in tried][:4],
            "why": why}
     # ``partial``: a value only the slot's default gave is no answer to the send condition (left out: it counts as met)
     basis = {k: v for k, v in values.items() if filled.get(k) != "default"} if partial else values
@@ -1484,6 +1523,10 @@ def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], t
     # rendered block, which never shows it, keeps its size); x5Fallback: ``seen`` likewise (the frame gives it its own
     # room, ``yuki.agent.frame.SEEN_CHARS``)
     out["skill"] = skill.key
+    if any(isinstance(t, Mapping) and t.get("switcher_held") is True for t in tried):
+        # integ28 (gb merge note 6, K-S): the seed's own fact too, added after the size fit as ``skill`` is, so the fit
+        # dropping the last tried item (the rung that left it) never loses it; ``executor.switcher_held`` reads it
+        out["switcher_held"] = True
     names = _seen_names(seen)
     if names:
         out["seen"] = names
@@ -1492,9 +1535,9 @@ def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], t
 
 #: The keys of a plan seed the brain reads (``yuki.brain.context.seed_block``: skill, goal, slots, done, tried, and
 #: x5Fallback's missing and seen; ``yuki.brain.done.seed_done``: done, done_words, baseline; the executor's run row:
-#: key).
+#: key). integ28 (gb merge note 6, K-S): ``switcher_held``, read by ``executor.switcher_held`` and ``seed_block``.
 SEED_KEYS: tuple[str, ...] = ("skill", "key", "app", "goal", "slots", "done", "done_words", "tried", "why", "sends",
-                              "baseline", "missing", "seen")
+                              "baseline", "missing", "seen", "switcher_held")
 
 
 def plan_seed(pin: Any) -> dict[str, Any] | None:
@@ -1654,7 +1697,7 @@ def _last_trace(cap: str, *, ran: bool = False) -> _Trace | None:
 
 
 #: fd (D3): the ends of a run that put nothing on (a question, a hold, a refusal before anything ran).
-NOT_RAN_OUTCOMES: frozenset[str] = frozenset({"asked", "held_game", "held_call", "blocked", "refused"})
+NOT_RAN_OUTCOMES: frozenset[str] = frozenset({"asked", "held_game", "held_call", "blocked", "refused", NOT_DONE})
 
 
 def _same_request(t: _Trace, ctx: RunContext) -> bool:
@@ -1855,6 +1898,27 @@ def _not_typed(res: RouteResult) -> bool:
     if str(facts.get("why") or "") == "not_typed":
         return True
     return str(res.outcome or "") == "not_typed" and res.ran is not False and bool(res.ask)
+
+
+#: integ28 (gb merge note 6, contract K-S): the most characters a rung's ``stopped`` code word keeps on its tried entry.
+STOPPED_CHARS = 24
+
+
+def _switch_tried(res: RouteResult) -> dict[str, Any]:
+    """integ28 (gb merge note 6, contract K-S, reader side; final-G2 R13): a chat switcher rung's measured
+    ``switcher_held`` (a bool: what its own shortcut opened still holds the keyboard as it ends; absent = unknown) and
+    why it stopped before its last step (``stopped``, a code word), copied from its facts onto its ``tried`` entry. The
+    switcher writes them on its facts only on the to_planner, held, taken-over, refused and not_typed ends (its outcome
+    word stays the one the engine acts on), so without this the hand-off's seed and the talker's evidence never carry
+    them there. Code facts only; ``{}`` for none."""
+    facts = res.facts if isinstance(res.facts, Mapping) else {}
+    out: dict[str, Any] = {}
+    if isinstance(facts.get("switcher_held"), bool):
+        out["switcher_held"] = facts["switcher_held"]
+    word = facts.get("stopped")
+    if isinstance(word, str) and word.strip():
+        out["stopped"] = word.strip()[:STOPPED_CHARS]
+    return out
 
 
 #: The slot types whose given value code checks with no words (an option, a number, a signed change, a switch).
@@ -2128,7 +2192,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                   dropped_slots=_slot_flags(list(forms)))
             return _simple(resolved.skill, "asked", ctx, started, ask="", options=[], say="",
                            evidence={"acted": False, "reason": "form", "form": forms, FORM_RECALL: True})
-        _emit(ctx, "skill_resolve", skill=resolved.skill, result="asked", slot_source="ask")
+        _emit(ctx, "skill_resolve", skill=resolved.skill, result="asked", slot_source="ask",
+              **_person_fields(getattr(resolved, "person", None)))
         asked_ev: dict[str, Any] = {"acted": False, "reason": "asked", "fallback_line": resolved.question}
         if forms:
             asked_ev["form"] = forms      # skill19 (RC5a): a dropped code-typed value is never dropped silently
@@ -2166,6 +2231,26 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             _emit(ctx, "skill_resolve", skill=skill.key, result="handed_over", reason="repeat", origin=ctx.origin)
             return _handoff(skill, plan.values, plan.filled, before, ctx, started, why=why, run_key=None,
                             routes=list(plan.routes), unconfirmed=True, missing=missing, seen=seen, repeat=True)
+    # integ29 (LD1, live row m21_twinkle_means): a means given in another form than it takes (display's "Twinkle Tray"
+    # for windows | app) was dropped by the resolver, and a route for "no means chosen" would take that for none and
+    # swap their told means for another silently. Before any rung: the first slip of a request goes back to the caller
+    # to call once more in the stated form (A19), else the slot's own question. Code types and the slot's role only.
+    means_forms = {k: v for k, v in _code_slot_forms(skill, plan.dropped).items()
+                   if getattr(skill.slot(k), "role", "") == "means"}
+    if means_forms:
+        if _first_form_slip(ctx, skill.key, means_forms):
+            _emit(ctx, "skill_resolve", skill=skill.key, result="asked", slot_source="ask", reason="form_recall",
+                  dropped_slots=_slot_flags(list(means_forms)))
+            return _simple(skill.key, "asked", ctx, started, ask="", options=[], say="",
+                           evidence={"acted": False, "reason": "form", "form": means_forms, FORM_RECALL: True})
+        means_slot = skill.slot(next(iter(means_forms)))
+        question = str(getattr(means_slot, "ask", "") or "") or f"Which {means_slot.name}?"
+        state["asked_slot"] = means_slot.name      # fd (D4): the means ask, as a rung's
+        _emit(ctx, "skill_resolve", skill=skill.key, result="asked", slot_source="ask", reason="form",
+              dropped_slots=_slot_flags(list(means_forms)))
+        return _simple(skill.key, "asked", ctx, started, ask=question, options=list(means_slot.options or ()),
+                       say=question, evidence={"acted": False, "reason": "asked", "fallback_line": question,
+                                               "form": means_forms})
     t0 = time.time()
     run_app = _first_app(skill, plan.routes, plan.values)
     run_key = _ledger_start(ctx, skill, plan.values, plan.filled, t0, app=run_app)
@@ -2182,7 +2267,9 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
           dropped=len(plan.dropped), dropped_slots=_slot_flags(plan.dropped), skipped=len(plan.skipped),
           source=sorted(set(sources.values())) or None, guessed_slots=_slot_flags(guessed), origin=ctx.origin,
           reordered=True if planned != in_file else None, rested=rested or None,
-          **_measured_fields(getattr(plan, "measured", None)))
+          **_measured_fields(getattr(plan, "measured", None)),
+          **_names_fields(getattr(plan, "names_how", None), getattr(plan, "names_miss", None)),
+          **_person_fields(getattr(plan, "person", None)))
     deadline = started + float(ctx.budget_s)
     tried: list[dict[str, Any]] = []
     measure = _Measure(ctx, skill, plan.values)
@@ -2295,7 +2382,7 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
         if res.held:
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "held_game"})
             _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="held_game",
-                  ms=route_ms)
+                  ms=route_ms, observed=res.facts)   # integ28 fix F2: the stop end's own facts (content-free)
             if res.ran:
                 acted = state["acted"] = True
                 if sends or not route.retry_after_acting:
@@ -2310,10 +2397,11 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             # no plan behind it, before that step ran: never "exactly this?" and never the next rung (it would reach
             # the same step); rung C, the plan seed, where the planner's consent rule and send checks decide
             acted = acted or bool(res.ran)
-            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": TO_PLANNER})
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": TO_PLANNER,
+                          **_switch_tried(res)})   # integ28 (gb merge note 6, K-S)
             _ledger_try(ctx, run_key, route, None, "refused", route_ms)
             _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result=TO_PLANNER,
-                  ms=route_ms)
+                  ms=route_ms, observed=res.facts)   # integ28 fix F2: K-S switcher_held / B3 stopped reach the log
             return _to_planner(skill, plan, tried, ctx, started, run_key=run_key, acted=acted, missing=missing,
                                seen=seen, evidence=evidence(route=route, reason=TO_PLANNER))
         if _not_typed(res):
@@ -2333,7 +2421,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                          "line": res.unverified_line or res.say or res.ask or "",
                          "app": _app_key_of(app_done), "chat_open": facts_nt.get("chat") == "open",
                          "held": facts_nt.get("refused_steps") is True}
-            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "not_typed"})
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "not_typed",
+                          **_switch_tried(res)})   # integ28 (gb merge note 6, K-S)
             last_route = route
             _ledger_try(ctx, run_key, route, None, "unverified", route_ms)
             _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="not_typed",
@@ -2341,14 +2430,49 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             if not route.retry_after_acting:
                 break        # its data says nothing may follow it once it acted: the caller takes it on (rung C)
             continue
+        if res.stop:
+            # morning21 (A2): a code-word stop (a precondition the rung met: a browser that wouldn't open, a strip
+            # it couldn't read, no tab of the site), said plainly: not done, never "Ask them:" (21 Oct: "Ask them: Zen
+            # isn't open" made the planner drop the meeting part and the talker offer another browser), never the
+            # next rung, never counted against this one
+            acted = state["acted"] = acted or bool(res.ran)
+            line = " ".join(str(res.say or res.ask or "").split()) or LINE_FAILED
+            needs = _app_key_of(res.app) if res.app else ""
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": res.outcome or "stop"})
+            _ledger_finish(ctx, run_key, outcome="refused", checked=None, route=route, ms=route_ms, app=app_done,
+                           acted=acted)
+            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result=res.outcome or "stop",
+                  ms=route_ms, observed=res.facts)
+            return _simple(skill.key, NOT_DONE, ctx, started, say=line, run_key=run_key, route=route.key, tried=tried,
+                           why=str(res.outcome or "stop")[:40], needs_app=needs, focus_taken=focus_taken,
+                           evidence=evidence(route=route, reason=res.outcome or "stop", line=line))
         if res.ask:
             asked_slot = (res.facts or {}).get("slot") if isinstance(res.facts, Mapping) else None
             if isinstance(asked_slot, str) and skill.slot(asked_slot) is not None:
                 state["asked_slot"] = asked_slot      # fd (D4): the slot this rung's question is about (the means ask)
+            # integ29 (mb merge note 12; review M2, m21_bright_both_up_back): the rung's question may carry, in RAM, the
+            # forms of the slots it asks about (``facts_ram["form"]``: the display driver's "which monitor" when a
+            # target names none). The first such slip of a request that touched nothing goes back to a caller that
+            # calls again, as the resolver's A19 recall does; else the question's report names the forms
+            ram = res.facts_ram if isinstance(res.facts_ram, Mapping) else {}
+            forms_ram = ram.get("form")
+            # integ29 (LD2): its own name, so the plan's dropped forms the evidence() closure reads stay bound
+            ram_forms: dict[str, str] = {}
+            if isinstance(forms_ram, Mapping) and forms_ram and all(skill.slot(str(k)) is not None for k in forms_ram):
+                ram_forms = {str(k): str(v) for k, v in forms_ram.items()}
             _ledger_finish(ctx, run_key, outcome="asked", checked=None, route=route, ms=route_ms, app=app_done,
                            acted=acted)
-            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="asked", ms=route_ms)
-            asked_ev = evidence(route=route, reason=res.outcome or "asked", line=res.ask)
+            if ram_forms and not acted and _first_form_slip(ctx, skill.key, ram_forms):
+                _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="asked",
+                      reason="form_recall", ms=route_ms, observed=res.facts)
+                return _simple(skill.key, "asked", ctx, started, ask="", options=[], say="", run_key=run_key,
+                               route=route.key, tried=tried,
+                               evidence={"acted": False, "reason": "form", "form": ram_forms, FORM_RECALL: True})
+            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="asked", ms=route_ms,
+                  observed=res.facts)   # integ28 fix F2: held_by_check / taken_over / act_off ends' facts
+            asked_ev = evidence(route=route, reason=res.outcome or "asked", line=res.ask)   # the plan's dropped forms
+            if ram_forms:
+                asked_ev["form"] = {**(asked_ev.get("form") or {}), **ram_forms}
             current = (res.facts or {}).get("current") if isinstance(res.facts, Mapping) else None
             if isinstance(current, (int, float)) and not isinstance(current, bool):
                 asked_ev["current"] = float(current)    # skill19 (O5): the control's level as the rung read it
@@ -2374,7 +2498,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                 return _simple(skill.key, "already", ctx, started, verified=True, done_line=line, say=line,
                                run_key=run_key, route=route.key, tried=tried, values=dict(plan.values))
         if res.ran is False:
-            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": res.outcome or "no"})
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": res.outcome or "no",
+                          **_switch_tried(res)})   # integ28 (gb merge note 6, K-S)
             if isinstance(res.facts, Mapping) and res.facts.get(UNREAD) is True:
                 tried[-1][UNREAD] = True      # skill20 (C10): it never read what it needed; nothing was pressed there
             unsure = isinstance(res.facts, Mapping) and res.facts.get("not_run") == NOT_RUN_UNSURE
@@ -2632,6 +2757,50 @@ def _measured_fields(measured: Any) -> dict[str, Any]:
                 "names_sites": sum(1 for v in got.values() if v.get("kind") == SITE) or None,
                 "names_score": round(min(scores), 3) if scores else None,
                 "names_margin": round(min(margins), 3) if margins else None}
+    except Exception:  # noqa: BLE001 - a log field never breaks a run
+        return {}
+
+
+def _names_fields(how: Any, miss: Any) -> dict[str, Any]:
+    """gd D5 (final-G2 youtube_channel_deji_arc: why "Deezy" never became their Deji was unmeasured): the names rules'
+    code words for the content-free ``skill_resolve`` line (:attr:`yuki.skills.resolve.Plan.names_how` /
+    ``names_miss``), as flags the log keeps (``{"caller": true}``, as ``guessed_slots``): ``names_how`` how a given name
+    was resolved (``value``, ``caller``, ``listed``, ``heard``, ``kind``), ``names_miss`` why one stayed as given
+    (``resolve.NAMES_MISS_WORDS``) and ``names_miss_slots`` which slots (schema names only). Never a value or a name;
+    ``{}`` for none; never raises."""
+    try:
+        out: dict[str, Any] = {}
+        hows = _slot_flags(sorted({str(v) for v in dict(how or {}).values()}))
+        if hows:
+            out["names_how"] = hows
+        misses = {str(k): str(v) for k, v in dict(miss or {}).items()}
+        words = _slot_flags(sorted(set(misses.values())))
+        if words:
+            out["names_miss"] = words
+            out["names_miss_slots"] = _slot_flags(sorted(misses))
+        return out
+    except Exception:  # noqa: BLE001 - a log field never breaks a run
+        return {}
+
+
+def _person_fields(person: Any) -> dict[str, Any]:
+    """gd D6 (the R13 trigger lead: the right person resolved, yet the chat driver read the window's thread as outside
+    their threads): a person slot's resolution for the content-free ``skill_resolve`` line
+    (:attr:`yuki.skills.resolve.Plan.person`), one nested record the log keeps as is: ``source`` and ``how`` (code
+    words, the log's enum fields), ``people`` (the people the name names), ``dms`` (their direct-message routes) and
+    ``threads`` (those routes' thread ids), counts only. Never a name; ``{}`` for none; never raises."""
+    try:
+        got = dict(person or {})
+        rec: dict[str, Any] = {}
+        for key in ("source", "how"):
+            word = str(got.get(key) or "")
+            if word and _SLOT_NAME.fullmatch(word):
+                rec[key] = word
+        for key in ("people", "dms", "threads"):
+            n = got.get(key)
+            if isinstance(n, int) and not isinstance(n, bool):
+                rec[key] = n
+        return {"person": rec} if rec else {}
     except Exception:  # noqa: BLE001 - a log field never breaks a run
         return {}
 
@@ -3332,6 +3501,8 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     # Phase 2.1/2.2 (review M1): the caller's notes (``why``, ``from``) leave the slots on every path (the voice's
     # hands, a card, the thinker), the context's own (a caller that read them from its arguments) first
     ctx.why, ctx.given_from, slots = note_args(str(skill_key or ""), {"why": ctx.why, "from": ctx.given_from}, slots)
+    # gd D2: the drivers read whether this run is a correction (a correction's words never teach a row's name)
+    ctx.corrects = bool(corrects)
     if live is None:
         from yuki.skills.catalog import load
 

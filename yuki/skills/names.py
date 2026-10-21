@@ -1026,6 +1026,15 @@ def _own_visit(store: Any, site: str, page: str, value: str) -> bool | None:
         return None
 
 
+def own_visit(store: Any, site: str, page: str, value: str) -> bool | None:
+    """gd D5: :func:`_own_visit` for the skill path (:func:`yuki.skills.web_route.site_page`'s exact match): whether the
+    user ever had the page of ``value`` up themselves. True / False (only Yuki's or a test's opens) / None (unknown: "as
+    written" stands). Never raises."""
+    if store is None or not str(value or "").strip():
+        return None
+    return _own_visit(store, str(site or ""), str(page or ""), str(value).lstrip("@"))
+
+
 def own_url(url: Any, *, store: Any = None, miss: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """skill22 (A6; final-D youtube_channel_deji_arc: "Pull up Deezy's YouTube channel in Ark." became a raw
     ``open_url`` of ``https://www.youtube.com/@Deezy``, a stranger's page, since skill19's heard match runs only inside
@@ -1189,5 +1198,5 @@ __all__ = ["APP", "BAR", "TURN_BAR", "BROWSER_MIN_SITES", "CHANNEL", "CHANNEL_SW
            "RUNNING", "SHORT_BAR", "SITE", "SITE_MIN_VISITS", "START", "TAIL_HEAD", "TAIL_MIN_LETTERS", "TASTE",
            "TIMELINE", "best_match", "channel_url", "is_site", "literal", "own_channel_entries", "own_channels_written",
            "own_entries",
-           "own_names", "own_site_entries", "own_url", "same_group", "score", "site_browser", "site_url", "sites_of",
-           "sound_code", "start_names"]
+           "own_names", "own_site_entries", "own_url", "own_visit", "same_group", "score", "site_browser", "site_url",
+           "sites_of", "sound_code", "start_names"]

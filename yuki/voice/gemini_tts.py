@@ -680,8 +680,13 @@ def service_class() -> type:
                             checked = True
                             guard = self._yuki_guard
                             blocks = getattr(guard, "blocks", None)   # Yuki's internal words: dropped in shadow too
-                            if getattr(guard, "shadow", False) and not (callable(blocks) and blocks(piece.verdict)):
+                            if getattr(guard, "shadow", False) and not reply.tainted \
+                                    and not (callable(blocks) and blocks(piece.verdict)):
                                 # v3.16, the marker channel: the verdict is logged when it comes; nothing waits.
+                                # gc (final-G2 C5, k_resume_anime: a caught claim's next clause was heard alone, "from
+                                # around 5:44 where you left off"): a reply one of whose pieces was caught (a claim,
+                                # Yuki's own words, a stale line) drops its later pieces in shadow mode too (below:
+                                # ``drop_rest``), so no reply is heard with a hole in it and the owed line is code's
                                 guard.observe(piece.verdict, strip_tags(piece.text))
                             else:
                                 if reply.tainted and callable(getattr(guard, "drop_rest", None)):

@@ -958,7 +958,8 @@ class MemoryClient:
         scored.sort(key=lambda s: -s[0])
         return [self._format_knowhow(k.app, k.text) for _s, k in scored[:limit]]
 
-    def remember_how(self, app: str | None, text: str, source_request: str | None = None) -> int:
+    def remember_how(self, app: str | None, text: str, source_request: str | None = None, *,
+                     origin: str = "agent") -> int:
         """Store a procedure that worked (after a successful task); returns its id.
 
         ``app`` is the process name of the app it applies to ("arc.exe"; stored
@@ -967,7 +968,9 @@ class MemoryClient:
         ``source_request`` the user request it came from. If a current entry for
         the same app says the same thing (embedding cosine >= 0.85, or identical
         text), that entry is superseded (its ``valid_to`` set, history kept)
-        instead of piling up near-duplicates.
+        instead of piling up near-duplicates. ``origin``: who it came from (``agent`` by default; integ29, mc merge
+        note M1: the brain's ``remember`` kind ``how`` passes ``taught``, a way the user told Yuki, so the next
+        request's how-block shows it as taught at once).
         """
         text = secret_filter.redact_text((text or "").strip())
         source_request = secret_filter.redact_text(source_request) if source_request else source_request
@@ -976,11 +979,35 @@ class MemoryClient:
         app = app_key(app)
         vec = self._embed(text)
         supersedes = self.store.knowhow_duplicate(app, text, vec, KNOWHOW_DUPLICATE_COSINE)
+        if supersedes is not None and self._fresh_way_held(supersedes, text):
+            supersedes = None
         model = getattr(self._embedder, "model_name", None) if vec is not None else None
         return self.store.add_knowhow(
             app, text, source_request=source_request, vector=vec, embed_model=model, supersedes=supersedes,
-            origin="agent",
+            origin=str(origin or "agent"),
         )
+
+    def _fresh_way_held(self, kid: int, text: str) -> bool:
+        """integ29 (S2, the D8 hold of :meth:`yuki.memory.conversations.ConversationWorker.fresh_way` for every caller):
+        whether the current entry ``kid`` a new know-how entry would supersede is a way to follow (``WAY_ORIGINS``)
+        written at most ``FRESH_ITEM_S`` ago, its text not the same as ``text``. A misheard "don't use X" reads as close
+        to "use X" as a restatement does, so it is then written beside that way, which stays in force; a confirmed
+        reversal supersedes it in the worker's pass or when said again later. Logged ``knowhow_held`` with the id only.
+        ``False`` when it can't be read."""
+        try:
+            from yuki.memory.conversations import FRESH_ITEM_S, WAY_ORIGINS
+
+            rows = self.store._query("SELECT * FROM knowhow WHERE id = ? AND valid_to IS NULL", (int(kid),))
+            if not rows or str(rows[0]["origin"] or "") not in WAY_ORIGINS:
+                return False
+            if time.time() - float(rows[0]["valid_from"]) > FRESH_ITEM_S:
+                return False
+            if self.store._knowhow(rows[0]).text.casefold() == (text or "").casefold():
+                return False   # a pure restatement: it supersedes, never a duplicate beside it
+        except Exception:  # noqa: BLE001
+            return False
+        self._skills_log("knowhow_held", knowhow=int(kid))
+        return True
 
     # -- recall ------------------------------------------------------------
 
@@ -4942,7 +4969,8 @@ class MemoryClient:
 
     def set_skills_log(self, log: Any) -> None:
         """Where the catalog tells what it skipped (``log(type, **fields)``, content-free: ``connection_error`` with
-        the file and a code word, ``learned_error`` with the row id and a code word). The process that owns a log
+        the file and a code word, ``learned_error`` with the row id and a code word; integ29 S2: ``knowhow_held`` with
+        the know-how id, :meth:`remember_how`'s hold). The process that owns a log
         (the tray's UI log, the memory service's) sets it once; without one nothing is told."""
         self._skills_log_fn = log if callable(log) else None
 

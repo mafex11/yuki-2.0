@@ -73,13 +73,15 @@ def probe_args_text() -> str:
     planner writes ``done.args`` / ``expect.args`` with the names the done-check reads (``done.PROBE_ARGS``)."""
     parts = []
     for name, (required, optional) in _done.PROBE_ARGS.items():
-        if name in ENGINE_ONLY_PROBES:
+        # morning21: a send's check (message_sent) is never a plan's pick (``done.PICK_PROBES``: the message
+        # capability's own check reads it), so its arguments are not listed; their room went to the display probe
+        if name in ENGINE_ONLY_PROBES or name not in _done.PICK_PROBES:
             continue
         names = [*required, *(f"{o}?" for o in optional)]
         if name == "window_state":
             names = [n if n != "state" else "state=" + "|".join(_done.WINDOW_STATES) for n in names]
         parts.append(f"{name} {','.join(names)}")
-    return "done/expect args, JSON string (? optional): " + "; ".join(parts)
+    return "done/expect args (JSON; ? optional): " + "; ".join(parts)
 
 #: What ``look`` reads (a step's value, the ``look`` tool's ``what``) and the windows it needs.
 LOOK_WHATS: tuple[str, ...] = ("desktop", "window", "page", "tabs", "focus", "clipboard", "system")
@@ -132,6 +134,11 @@ CLICK_BUTTONS: tuple[str, ...] = ("left", "right", "middle", "double")
 MEMORY_KINDS: tuple[str, ...] = (
     "recall", "activity", "calls", "call_timeline", "threads", "before", "links", "people", "skills",
 )
+#: morning21 C2: the planner's memory kinds: the shared ones (``tools.MEMORY_TOOL``, which the ONE agent's tool block
+#: reuses, stays as it was) and ``knowhow``, how things are done on this PC (the ways they taught Yuki, what worked,
+#: what failed), read by the brain itself (``yuki.brain.tools.run_knowhow``: the standalone tool and the executor's
+#: memory step), never MemoryAccess's tool.
+BRAIN_MEMORY_KINDS: tuple[str, ...] = (*MEMORY_KINDS, "knowhow")
 
 #: How each verb's fields are read (the executor's contract; the tool description says it in short). ``open_url``'s
 #: window is the browser it opens in (the executor hands that window's app to the tool: x10, Item 9's side): a step
@@ -230,9 +237,11 @@ def plan_schema() -> dict[str, Any]:
         "properties": {
             "commit": {"type": "string", "enum": list(COMMITS)},
             "quote": _nullable("string", "Their exact words asking for it."),
-            "to": _nullable("string", "The person or channel (one of their ways: the place they named)."),
-            # sBrainFix (F1c): their own words, never translated or restyled (the core prompt says it in full)
-            "text": _nullable("string", "The message, in their words."),
+            "to": _nullable("string", "Person or channel (their way: the place named)."),
+            # sBrainFix (F1c): their own words, never translated or restyled. morning21: the core prompt says it in
+            # full ("text the message in the words and language they used now ... never translated or restyled"), so
+            # this field's description gave its room to the know-how kinds and the display probe
+            "text": _nullable("string"),
         },
     }
     element = {
@@ -254,7 +263,9 @@ def plan_schema() -> dict[str, Any]:
         "required": ["verb", "window", "element", "value", "submit", "expect"],
         "properties": {
             "verb": {"type": "string", "enum": list(VERBS)},
-            "window": _nullable("string", "An hwnd or title."),
+            # morning21: no description (the core says "window: an hwnd from the desk"): its room went to the know-how
+            # kinds and the display probe within the 8,000-character tool block
+            "window": _nullable("string"),
             "element": element,
             "value": _nullable("string"),
             "submit": {"type": "boolean"},
@@ -1164,8 +1175,9 @@ def _check_verb(step: Step, header: Plan, checks: Checks, prior: Sequence[Step],
             errors.append(f"{where}look {text} needs window")
     if verb == "memory":
         data = _json_object(value)
-        if data is None or data.get("kind") not in MEMORY_KINDS:
-            errors.append(f"{where}memory value must be a JSON object with kind one of: {', '.join(MEMORY_KINDS)}")
+        if data is None or data.get("kind") not in BRAIN_MEMORY_KINDS:
+            errors.append(f"{where}memory value must be a JSON object with kind one of: "
+                          f"{', '.join(BRAIN_MEMORY_KINDS)}")
     if verb == "run_skill":
         data = _json_object(value) if value else {}
         call = step.skill_call(header.skill)
@@ -1407,6 +1419,9 @@ class StepStatus:
     state: str = "not_run"
     #: What showed or why, in plain words or code words (no window text beyond the executor's capped diff).
     note: str = ""
+    #: morning21 C5: the commit check's effect word for the step (``yuki.brain.consent.EFFECTS``: ``none`` for a step
+    #: that changes nothing), ``""`` when it was not judged.
+    effect: str = ""
 
 
 @dataclass
@@ -1456,7 +1471,8 @@ __all__ = [
     "ACT_VERBS", "READ_VERBS", "KEEP_VERBS", "VERBS", "KINDS", "COMMITS", "SKILL_PROBES", "GENERIC_PROBES", "PROBES",
     "PROBE_ARGS",
     "ENGINE_ONLY_PROBES", "LOOK_WHATS", "WINDOW_ACTIONS", "PLACE_ACTION", "PLACE_ACTIONS", "PLACE_HOWS", "TIDY_ACTIONS",
-    "WINDOWLESS_ACTIONS", "place_spec", "window_op", "TAB_ACTIONS", "MEMORY_KINDS", "VERB_FIELDS", "PLAN_TOOL",
+    "WINDOWLESS_ACTIONS", "place_spec", "window_op", "TAB_ACTIONS", "MEMORY_KINDS", "BRAIN_MEMORY_KINDS",
+    "VERB_FIELDS", "PLAN_TOOL",
     "STEPS_ROUTE", "SKILL_ROUTE_PREFIX", "MAX_STEPS", "plan_schema", "Target", "Consent", "Probe", "Element", "Step",
     "Plan", "PlanError", "Checks", "required_probe", "parse_header", "parse_step", "validate_plan", "finish_plan",
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",

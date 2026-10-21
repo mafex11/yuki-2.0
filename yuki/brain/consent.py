@@ -25,11 +25,22 @@ applies decides:
    applies each rung's own game rule (a no-focus rung, the mixer or the media session, may run mid-game).
 2. The step's app has its "Act" switch off, or one of its kinds is "just suggest" (``util.PolicyReader``,
    ``util.acts_in_app``, ``util.app_off_line``, ``util.suggest_only``): **refuse**.
-3. **Join** (H3): a may-commit step in a window the Now board lists in ``calling_tabs``; a click whose (role, name) is
-   a capability's declared join control (catalog data, ``[chat] labels.*.join_voice``: identity, never keywords); or
-   the commit check says ``effect = join``: **refuse** (bring the window forward, "you click Join"). The one
-   exception: a ``run_skill`` of a capability whose commit word (phase L's D24 table, ``Skill.commit``) is ``words``,
-   on the user's plain words (the commit check's ``asked``; decision 7).
+3. **Join** (H3; morning21 A4: the step is judged, never the window). A step is a join when (i) its target is a
+   declared join control by (role, name) identity: a click on it, or Enter/Space (or typing that submits) with the
+   focus read on it (catalog data: chat apps' ``[chat] labels.*.join_voice`` anywhere; calling sites'
+   ``[call.labels.*] join`` and ``join_in_page``, ``yuki/connect/sites``, only on that site's page shown now: names
+   ordinary pages draw too, such as "Join now" or Meet's "Present"; identity, never keywords); (ii) the commit check
+   says ``effect = join``; or (iii) it
+   runs a capability that joins: **refuse** as final (bring the window forward, "you click Join"). The one exception:
+   a ``run_skill`` of a capability whose commit word (phase L's D24 table, ``Skill.commit``) is ``words``, on the
+   user's plain words (the commit check's ``asked``; decision 7). (iv) Fail-closed only: in a window whose calling
+   site's tab is the page it shows now (the Now board's ``calling_tabs`` entry, its tab's RuntimeId read again at the
+   step), a step whose target can't be identified (a click with no control named by the read, Enter/Space or a
+   submit with no focus read) or whose commit check failed: **refuse**, not final: the planner gets
+   :data:`LINE_JOIN_UNIDENTIFIED` (act on the control the read names; a toggle takes ``toggle_to``). Every other step
+   in that window goes on to rows 4-6 (the 21 Oct pre-join page's "Turn off microphone" was refused as a "join" for
+   the window alone, and the user heard "you click Join"). A calling tab open behind another tab is not the page
+   shown.
 4. **Send**: the step sends for certain (:func:`sends_now`: a click on a control that is not a button, menu item or
    split button while Yuki's typed text waits in that window; typing with Enter or a line break where Enter sends a
    message: a chat's window, :func:`chat_window`, by its program among a chat app's connection data (``[chat]
@@ -112,13 +123,27 @@ ALLOW, ASK, REFUSE, DRAFT = "allow", "ask", "refuse", "draft"
 RESULTS: tuple[str, ...] = (ALLOW, ASK, REFUSE, DRAFT)
 #: The plan's declared commit (``consent.commit``, §2.2).
 COMMITS: tuple[str, ...] = ("none", "send", "join", "lasting")
-#: The commit check's effects (§2.6); every one but ``none`` is lasting.
-EFFECTS: tuple[str, ...] = ("none", "send", "join", "delete", "close", "buy", "setting", "other")
+#: The commit check's effects (§2.6); every one but ``none`` is lasting. ``later`` (A2, Z7): the step leaves something
+#: acting on its own after it returns (a hidden process, a watcher, a job, a scheduled task), refused as final whatever
+#: ``asked`` says.
+EFFECTS: tuple[str, ...] = ("none", "send", "join", "delete", "close", "buy", "setting", "later", "other")
 
 #: What the user is told (code lines; voice-shaped).
 LINE_GAME = "You're in a game: after the round?"
 LINE_JOIN = "{app} is in front: you click Join."
 LINE_JOIN_PLAIN = "You click Join."
+#: morning21 (A5): row 3's fail-closed refusal (iv), for the planner (not final, never said): the step's target in a
+#: meeting page in front can't be told from its Join.
+LINE_JOIN_UNIDENTIFIED = ("on this window's {service} page this step's target can't be identified (no control the "
+                          "read names, or a key with no focus read), so it could be its Join, which is the user's own "
+                          "click: act on the control the read names (its role and name); a toggle (a microphone, a "
+                          "camera) takes toggle_to on or off; a key only with the focus read on a named control")
+#: integ29 (S3, A7's second rung in code): a calling site's own device key on its page shown now, with no state of
+#: that device measured by the hand just before (planner-facing, not final).
+LINE_DEVICE_KEY = ("not pressed: on this window's {service} page this key flips the {device} whatever its state "
+                   "(against its state it turns the {device} on; outside the page it bookmarks the page): act on the "
+                   "page's own {device} toggle by the control the read names, with toggle_to (read first, clicked "
+                   "only if not there already); the key only with the {device}'s state read by the hand")
 LINE_UNDECLARED_SEND = ("that step would send something the plan did not declare as a send: send only through the "
                         "message capability with commit send, or leave it as a draft")
 #: The same refusal for typing with Enter (``submit`` or a line break) in a chat app's window or where Yuki's typed text
@@ -132,6 +157,9 @@ LINE_TYPED_ENTER = ("typing with Enter here sends what is typed (a chat app's wi
 LINE_LINE_BREAK = ("a line break in the typed text presses Enter, which may send or run it, and the commit check can't "
                    "see it: type the text without the line break and set submit (that Enter is checked), or press "
                    "Enter as its own step")
+#: A2 (Z7): a step that would leave something acting on its own after it returns (the commit check's ``later`` effect).
+#: Refused as final in both brains, whatever their words asked for: Yuki acts only while it works on the request.
+LINE_LATER = "I can't wait for that and do it later; want it now?"
 LINE_NOT_CAPABILITY = "send through the message capability"
 LINE_RECIPIENT = "the step sends to someone other than the plan's recipient"
 #: Planner-facing refusals of a declared send (code facts the planner can fix).
@@ -195,9 +223,11 @@ PLAIN_WHY: dict[str, str] = {
     "game": "a game is in front",
     "act_off": "Act is switched off for that app",
     "suggest": "your settings say only suggest for that",
-    "join_window": "joining is your click",
     "join_control": "joining is your click",
     "join_effect": "joining is your click",
+    "join_skill": "joining is your click",
+    "join_unidentified": "I couldn't tell that control from the meeting's Join button",
+    "device_key": "that key flips it either way, and I couldn't read whether it was on",
     # sBrainFix (F1d): true whether or not their words asked for the send (the refusal is about the way, never about
     # what they asked: on 10 Oct and in the 16 Oct simulation this was said right after they said yes to the send)
     "undeclared_send": "that step could have sent it outside the chat app's own way",
@@ -230,7 +260,10 @@ ADDRESS_TRAITS = Traits(("click_type", "open_apps"), "input")
 class Call:
     """One act step as it will run: the Dispatcher tool (the plan's verb) and its input, and the code facts of its
     target read just before (``role`` and ``name``: the element as the window's read shows it, never the plan's word
-    for it; ``app``: the target window's process)."""
+    for it; ``app``: the target window's process). ``facts`` (integ29 S3): what a hand measured for a key on a calling
+    site's device (:func:`device_key`): ``toggle_state`` (``on`` / ``off``, that device's in-page control read just
+    before), ``toggle_to`` (the state wanted) and ``focus_in_page`` (True: the focus read shows the keyboard inside the
+    page document); none of them from the model."""
 
     tool: str
     input: dict[str, Any]
@@ -240,6 +273,7 @@ class Call:
     title: str = ""
     role: str = ""
     name: str = ""
+    facts: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -257,7 +291,11 @@ class Live:
     address each window shows (the Now board's ``windows[].url`` by hwnd), for a caller that read the board already;
     ``None``: :func:`window_page` reads the board itself when a step needs it (typing with Enter outside a chat app's
     program). ``kinds``: the same for the extraction's kind of each window (``windows[].kind``: ``conversation`` for
-    a chat), read by :func:`window_kind`."""
+    a chat), read by :func:`window_kind`. ``own_undo`` (final-G2 R13, A6; gb's contract K-U): the hand measured this
+    key step as the run's own close of what its own shortcut opened, while that very field holds the keyboard
+    (``Hands.own_undo``): undoable, row 6 after rows 1-2, never sent to the commit check as a possible send.
+    ``calling_tabs`` (morning21 A4): the Now board's ``calling_tabs`` entries by hwnd, for a caller that read the board
+    already; ``None``: row 3 reads the board itself when a step needs it (:func:`calling_tab_now`)."""
 
     game: str | None = ""
     calling: frozenset[int] = frozenset()
@@ -270,6 +308,18 @@ class Live:
     now: float = field(default_factory=time.time)
     pages: Mapping[int, str] | None = None
     kinds: Mapping[int, str] | None = None
+    own_undo: bool = False
+    calling_tabs: Mapping[int, Mapping[str, Any]] | None = None
+
+
+#: A6 (K-U): the steps a run's own undo can be (a key: the app's own close key for what the run's shortcut opened).
+_OWN_UNDO_TOOLS = frozenset({"press", "hotkey"})
+
+
+def own_undo(call: Call, live: Live) -> bool:
+    """A6 (final-G2 R13; gb's contract K-U): this key step is the run's own undo, measured by the hand that runs it
+    (:attr:`Live.own_undo`). Identity facts only."""
+    return bool(live.own_undo) and call.tool in _OWN_UNDO_TOOLS
 
 
 @dataclass(frozen=True)
@@ -1172,6 +1222,246 @@ def is_join_control(call: Call, live: Live) -> bool:
     return (call.role.casefold(), words(call.name).casefold()) in live.join_controls
 
 
+#: morning21 (A4): the keys that press whatever control holds the keyboard (a focused Join button joins on either),
+#: pyautogui's names and its aliases for them. Machine key names, never the user's words.
+ACTIVATION_KEYS: frozenset[str] = frozenset({"enter", "return", "space", "spacebar"})
+
+
+#: integ29 (S7): a key name the input layer can't name (:func:`_key_names`); counted as one that presses (fail closed).
+UNKNOWN_KEY = "?"
+
+
+def _fold_key(key: Any) -> str:
+    """integ29 (S7): one key name as the press will send it: the input layer's own fold
+    (``yuki.actions.input.normalize_key``: case, ``_``, ``-`` and spaces, its aliases such as ``spacebar``), casefolded;
+    :data:`UNKNOWN_KEY` when it names no key."""
+    if str(key) == " ":
+        return "space"
+    try:
+        from yuki.actions.input import normalize_key
+
+        got = normalize_key(str(key))
+    except Exception:  # noqa: BLE001 - no input layer here: the old fold, with _ and - too
+        got = "".join(str(key).replace("_", "").replace("-", "").split()) or None
+    return str(got).casefold() if got else UNKNOWN_KEY
+
+
+def _key_names(call: Call) -> list[str]:
+    inp = call.input or {}
+    if call.tool == "press":
+        raw = [inp.get("key")]
+    elif call.tool in ("hotkey", "set_slider"):
+        raw = list(inp.get("keys") or []) if isinstance(inp.get("keys"), list) else []
+    else:
+        return []
+    return [_fold_key(k) for k in raw if k is not None]
+
+
+def activates(call: Call) -> bool:
+    """morning21 (A4): the step presses the control that holds the keyboard: Enter or Space (alone or in a combination),
+    or typing that submits (``press_enter``, a line break). Tool metadata and key names only (integ29 S7: folded as the
+    press folds them; a name no key answers to counts as pressing, fail closed)."""
+    if call.tool == "type_text":
+        return _line_break_submit(call) or (call.input or {}).get("press_enter") is True
+    return any(k in ACTIVATION_KEYS or k == UNKNOWN_KEY for k in _key_names(call))
+
+
+def join_target(call: Call, live: Live) -> bool:
+    """morning21 (A4 i): the step's target is a declared join control (:attr:`Live.join_controls`, by (role, name)
+    identity; a name read with no role matches a control declared by that name): a click on it, or a key or a submit
+    that presses it while it holds the keyboard (the focus read the step carries). Review M2, integ29 S5: a calling
+    site's join controls ("Join now", "Rejoin", Meet's "Present": names ordinary pages draw too) only on that site's
+    page shown now (:func:`calling_tab_now`; unknown counts as shown), that site's own when the board knows its
+    service (:func:`page_join_controls`)."""
+    name = words(call.name).casefold()
+    if not name or not (call.tool == "click" or activates(call)):
+        return False
+    role = words(call.role).casefold()
+
+    def declared(controls: frozenset[tuple[str, str]]) -> bool:
+        return (role, name) in controls if role else any(n == name for _r, n in controls)
+
+    if declared(live.join_controls):
+        return True
+    if not declared(page_join_controls()) or not calling_tab_now(call.hwnd, live):
+        return False
+    return declared(page_join_controls(calling_service(call.hwnd, live)))
+
+
+#: review M2: every calling site's join controls, read once per process (data files ship with the build); integ29 S5:
+#: and each site's own, by its service (casefolded).
+_page_joins: frozenset[tuple[str, str]] | None = None
+_page_joins_of: dict[str, frozenset[tuple[str, str]]] = {}
+
+
+def _site_joins(site: Mapping[str, Any]) -> frozenset[tuple[str, str]]:
+    """One calling site's ``[call.labels.<language>]`` ``join`` and ``join_in_page`` pairs, casefolded."""
+    out: set[tuple[str, str]] = set()
+    for table in (site.get("labels") or {}).values():
+        for name in ("join", "join_in_page"):
+            for pair in (table.get(name) if isinstance(table, Mapping) else None) or []:
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2 and words(pair[1]):
+                    out.add((words(pair[0]).casefold(), words(pair[1]).casefold()))
+    return frozenset(out)
+
+
+def page_join_controls(service: Any = "") -> frozenset[tuple[str, str]]:
+    """Review M2, integ29 S5: the calling sites' join controls (``[call.labels.<language>] join`` and ``join_in_page``,
+    :func:`yuki.memory.now.site_join_controls`), casefolded: a join only on that site's page shown now
+    (:func:`join_target`), never on an ordinary page that draws "Join now". ``service``: the window's calling service
+    (the board's): that site's own; unknown, or a site declaring none: every calling site's (fail closed). Data, read
+    once; never raises."""
+    global _page_joins
+    want = words(service).casefold()
+    if want:
+        got = _page_joins_of.get(want)
+        if got is None:
+            try:
+                from yuki.memory.now import calling_site
+
+                got = _site_joins(calling_site(want))
+            except Exception:  # noqa: BLE001
+                got = frozenset()
+            if len(_page_joins_of) > 32:
+                _page_joins_of.clear()
+            _page_joins_of[want] = got
+        if got:
+            return got
+    if _page_joins is None:
+        try:
+            from yuki.memory.now import site_join_controls
+
+            _page_joins = frozenset(site_join_controls()) | frozenset(site_join_controls(in_page=True))
+        except Exception:  # noqa: BLE001 - no data: the other row-3 tests still hold
+            return frozenset()
+    return _page_joins
+
+
+def device_key(call: Call, live: Live) -> str:
+    """integ29 (S3): the device a key step flips by a calling site's own declared keys (``[call.keys]``, each
+    list-valued entry: Meet's ``microphone = ["ctrl", "d"]``), folded as the press folds them, in a window with a
+    calling tab (:attr:`Live.calling`): the data's name for it (``microphone``), else ``""``. The window's service's
+    keys when the board knows it, else every calling site's (fail closed). Site data and key names only, never the
+    user's words."""
+    if call.tool not in ("hotkey", "press") or not call.hwnd:
+        return ""
+    key = _hwnd_key(call.hwnd)
+    if key is None or key not in live.calling:
+        return ""
+    names = sorted(_key_names(call))
+    if not names:
+        return ""
+    try:
+        from yuki.memory.now import calling_site, calling_sites
+
+        site = calling_site(calling_service(call.hwnd, live))
+        tables = [site.get("keys")] if site.get("keys") else [s.get("keys") for s in calling_sites()]
+    except Exception:  # noqa: BLE001 - no data: rows 3-6 as before
+        return ""
+    for data in tables:
+        for what, combo in (data.items() if isinstance(data, Mapping) else ()):
+            if isinstance(combo, (list, tuple)) and combo and sorted(_fold_key(k) for k in combo) == names:
+                return str(what)
+    return ""
+
+
+def device_state_read(call: Call) -> bool:
+    """integ29 (S3): the hand measured what a device key needs (:attr:`Call.facts`): that device's in-page state just
+    before, a wanted state it is not in already, and the keyboard inside the page document."""
+    facts = call.facts or {}
+    state = str(facts.get("toggle_state") or "").casefold()
+    want = str(facts.get("toggle_to") or (call.input or {}).get("toggle_to") or "").casefold()
+    return state in ("on", "off") and want in ("on", "off") and state != want and facts.get("focus_in_page") is True
+
+
+def unidentified_target(call: Call) -> bool:
+    """morning21 (A4 iv): what the step acts on can't be told from a Join: a click on no control the read names (a
+    point), or a key or a submit that presses whatever holds the keyboard with no focus read naming it."""
+    if call.tool == "click":
+        return not words(call.name)
+    return activates(call) and not words(call.name)
+
+
+#: The Now board's calling tabs a row-3 check read itself: ``{hwnd: (monotonic, entry or None)}``, kept
+#: :data:`PAGE_TTL_S`.
+_calling_read: dict[int, tuple[float, Mapping[str, Any] | None]] = {}
+
+
+def _calling_entry(key: int, live: Live) -> Mapping[str, Any] | None:
+    """The Now board's ``calling_tabs`` entry for one window: the caller's (:attr:`Live.calling_tabs`), else read now
+    (50 ms at most, kept briefly). ``None``: not known."""
+    if live.calling_tabs is not None:
+        try:
+            got = live.calling_tabs.get(key) or live.calling_tabs.get(str(key))  # type: ignore[call-overload]
+            return got if isinstance(got, Mapping) else None
+        except Exception:  # noqa: BLE001
+            return None
+    now = time.monotonic()
+    hit = _calling_read.get(key)
+    if hit is not None and now - hit[0] <= PAGE_TTL_S:
+        return hit[1]
+    entry: Mapping[str, Any] | None = None
+    try:
+        from yuki.memory.now import shared_client
+
+        client = shared_client()
+        board = client.now(wait_s=0.05) if client is not None else None
+        got = ((board or {}).get("calling_tabs") or {}).get(str(key))
+        entry = got if isinstance(got, Mapping) else None
+    except Exception:  # noqa: BLE001 - no board: not known
+        entry = None
+    if len(_calling_read) > 64:
+        _calling_read.clear()
+    _calling_read[key] = (now, entry)
+    return entry
+
+
+def _shown_tabs(hwnd: int) -> list[str] | None:
+    """The RuntimeIds of the tabs ``hwnd``'s strip shows selected now (every group; read live, bounded), ``None``: the
+    strip couldn't be read."""
+    try:
+        from yuki.skills.web_route import _selected_tabs
+
+        return _selected_tabs(int(hwnd))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def calling_tab_now(hwnd: Any, live: Live) -> bool:
+    """morning21 (A4 iv, A6): the window ``hwnd`` shows its calling site's page now: it is in :attr:`Live.calling`
+    and either the window's strip, read again now, shows the board's calling tab (by RuntimeId) selected, or the
+    board's last sighting of the window says it is showing (``selected`` not False). The strip read only confirms
+    "showing", never overrides the board: the tab id is refreshed at most every TAB_READ_GAP_S, so a newer meeting
+    tab in the same window would read as "not this tab" (integ29 S1/F1). Unknown is shown (fail closed). Never
+    raises."""
+    key = _hwnd_key(hwnd)
+    if key is None or key not in live.calling:
+        return False
+    try:
+        entry = _calling_entry(key, live)
+        if entry is None:
+            return True
+        tab = words(entry.get("tab_id"))
+        if tab:
+            shown = _shown_tabs(key)
+            if shown and tab in shown:
+                return True
+        return entry.get("selected") is not False
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def calling_service(hwnd: Any, live: Live) -> str:
+    """The calling site's service in window ``hwnd`` (the board's entry), ``""`` when not known."""
+    key = _hwnd_key(hwnd)
+    if key is None:
+        return ""
+    try:
+        return words((_calling_entry(key, live) or {}).get("service"))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def policy_holds(call: Call, live: Live, traits: Traits | None = None) -> bool:
     """One of the step's kinds (``traits``, default :func:`traits_of`) is held below "do it and tell me" by the user's
     autonomy settings (``ask`` or ``show_plan``): the commit check must find their words asked for it, as the judge did
@@ -1187,8 +1477,10 @@ def policy_holds(call: Call, live: Live, traits: Traits | None = None) -> bool:
 def may_commit(call: Call, live: Live, plan: Any = None) -> bool:
     """Whether the step could send, delete, buy, close, join or otherwise last (§2.5 rows 3-5): its traits destroy or
     reach, it clicks a declared join control, it is a ``run_skill`` that sends or joins, or the user's policy holds one
-    of its kinds. These are the steps the commit check sees."""
+    of its kinds. These are the steps the commit check sees. A run's own undo (:func:`own_undo`) is not one."""
     if call.tool in ("look", "memory", "wait"):
+        return False
+    if own_undo(call, live):
         return False
     if call.tool == "run_skill":
         key, slots = skill_input(call, plan)
@@ -1198,7 +1490,10 @@ def may_commit(call: Call, live: Live, plan: Any = None) -> bool:
         # an address typed with Enter outside any chat: it opens a page (only a policy holding its kinds checks it)
         return policy_holds(call, live, ADDRESS_TRAITS)
     t = traits_of(call, live)
-    return t.destroys or t.reaches or is_join_control(call, live) or policy_holds(call, live)
+    # morning21 (A4 i): a declared join control by identity, a name read with no role included; integ29 (S3): a calling
+    # site's own device key is never undoable (it flips a device in a meeting)
+    return t.destroys or t.reaches or join_target(call, live) or policy_holds(call, live) \
+        or bool(device_key(call, live))
 
 
 def takes_screen(call: Call) -> bool:
@@ -1247,7 +1542,9 @@ def calling_windows(board: Mapping[str, Any] | None) -> frozenset[int]:
 
 def join_controls() -> frozenset[tuple[str, str]]:
     """The join controls capabilities declare (``[chat] labels.<language>.join_voice = [role, name]`` in each chat
-    app's connection file), casefolded. Data, read through ``yuki.skills.chat``; never raises."""
+    app's connection file), casefolded: a join in any window. Calling sites' (``[call.labels.<language>] join``, names
+    ordinary pages draw too: "Join now", "Rejoin") count only on that site's page shown now (integ29 S5:
+    :func:`page_join_controls`, :func:`join_target`). Data; never raises."""
     out: set[tuple[str, str]] = set()
     try:
         from yuki.skills.chat import app_data, chat_apps
@@ -1257,7 +1554,7 @@ def join_controls() -> frozenset[tuple[str, str]]:
                 pair = table.get("join_voice") if isinstance(table, Mapping) else None
                 if isinstance(pair, (list, tuple)) and len(pair) >= 2:
                     out.add((str(pair[0]).casefold(), words(pair[1]).casefold()))
-    except Exception:  # noqa: BLE001 - no data: rows 3a and 3c still hold
+    except Exception:  # noqa: BLE001 - no data: rows 3 (ii)-(iv) still hold
         pass
     return frozenset(out)
 
@@ -1381,6 +1678,27 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
     if gate is not None:
         return gate
 
+    # A6 (final-G2 R13; K-U): the run's own close of what its own shortcut opened, measured while that very field
+    # holds the keyboard (the hand sets it only then): its own undo, row 6, after the game gate and the Act switch.
+    # Never a send by code nor by the commit check: Yuki's unsent text there is the run's own, and it stays unsent.
+    if own_undo(step, live):
+        return Verdict(ALLOW, 6, "own_undo")
+
+    # integ29 (S3, A7's second rung in code): a calling site's own device key (Meet's Ctrl+D) flips the device whatever
+    # its state, so on that site's page shown now it is pressed only with the device's state measured by the hand just
+    # before (and a wanted state it is not in), the keyboard inside the page; else refused, not final: the planner acts
+    # on the page's own toggle with toggle_to. Never row 6's undoable class.
+    device = device_key(step, live)
+    if device and calling_tab_now(step.hwnd, live) and not device_state_read(step):
+        service = calling_service(step.hwnd, live) or "meeting"
+        return Verdict(REFUSE, 3, "device_key", line=LINE_DEVICE_KEY.format(service=service, device=device))
+
+    # A2 (Z7): a step that leaves something acting on its own after it returns (a hidden process, a watcher, a job, a
+    # scheduled task: the check's `later` effect, judged from the whole step) is refused as final, whatever `asked`
+    # says. The user's words ask for a result, never for an unattended mechanism; code offers to do it now instead.
+    if effect == "later" and not failed:
+        return Verdict(REFUSE, 5, "later", line=LINE_LATER, final=True)
+
     sk = None
     if step.tool == "run_skill":
         key, slots = skill_input(step, plan)
@@ -1393,21 +1711,28 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
         return Verdict(REFUSE, 4, "declared_draft",
                        line=LINE_DECLARED_DRAFT.format(slots=", ".join(send_slots(sk)) or "send"))
 
-    # undoable (row 6): nothing it does lasts, so it is allowed and said after (P1.5)
+    # undoable (row 6): nothing it does lasts, so it is allowed and said after (P1.5); morning21 (A4 iv): unless it
+    # acts on a point or a key with nothing named, on a meeting page in front (a point can't be told from its Join)
     if not committing:
+        if not nav and unidentified_target(step) and calling_tab_now(step.hwnd, live):
+            return _join_unidentified(step, live)
         return Verdict(ALLOW, 6, UNDOABLE)
 
-    # lasting (rows 3-5). Row 3: joins are the user's click
-    joining = (bool(step.hwnd) and int(step.hwnd) in live.calling) or is_join_control(step, live) \
-        or effect == "join" or (sk is not None and skill_joins(sk))
-    if joining:
+    # lasting (rows 3-5). Row 3: joins are the user's click, judged by the step, never the window (morning21 A4):
+    # (i) a declared join control, (ii) the commit check's join, (iii) a capability that joins
+    why = ("join_control" if join_target(step, live) else "join_effect" if effect == "join"
+           else "join_skill" if sk is not None and skill_joins(sk) else "")
+    if why:
         if sk is not None and skill_commit(sk) == "words" and asked and effect in ("join", "none", ""):
             return Verdict(ALLOW, 3, "join_words")
         app = util.app_name(step.app) if step.app else ""
-        why = ("join_window" if step.hwnd and int(step.hwnd) in live.calling
-               else "join_control" if is_join_control(step, live) else "join_effect")
+        # A5: the user's own click, said as such only for a real join (i-iii)
         return Verdict(REFUSE, 3, why, line=LINE_JOIN.format(app=app) if step.app else LINE_JOIN_PLAIN, final=True,
                        focus=int(step.hwnd) if step.hwnd else None)
+    # (iv) fail-closed only: on a meeting page in front, a target that can't be identified, or a step the commit check
+    # couldn't judge (a join control under a name no data holds); everything else goes on to rows 4-6
+    if not nav and (unidentified_target(step) or failed) and calling_tab_now(step.hwnd, live):
+        return _join_unidentified(step, live)
 
     # row 4: sends (typing with Enter outside a chat goes to the commit check: row 5, or back here on its "send")
     by_code = sends_now(step, live, traits) or (sk is not None and skill_sends(sk, slots))
@@ -1432,6 +1757,13 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
         return Verdict(ALLOW, 5, "asked")
     question = words(getattr(cv, "question", "")) or failed_question(step)
     return Verdict(ASK, 5, "lasting", question=question)
+
+
+def _join_unidentified(step: Call, live: Live) -> Verdict:
+    """morning21 (A4 iv, A5): row 3's fail-closed refusal: not final (the planner routes around it by the control the
+    read names), never "you click Join", nothing brought forward."""
+    service = calling_service(step.hwnd, live) or "meeting"
+    return Verdict(REFUSE, 3, "join_unidentified", line=LINE_JOIN_UNIDENTIFIED.format(service=service))
 
 
 def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str], live: Live, sk: Any, asked: bool,
@@ -1574,11 +1906,15 @@ def after_ask(verdict: Verdict) -> Verdict:
 
 __all__ = ["UNDOABLE",
            "ALLOW", "ASK", "CHAT_KIND", "COMMITS", "DRAFT", "EFFECTS", "LINE_ASK_SEND", "LINE_DRAFTED", "LINE_GAME",
+           "LINE_JOIN", "LINE_JOIN_UNIDENTIFIED", "LINE_LATER", "ACTIVATION_KEYS", "activates", "calling_service",
+           "LINE_DEVICE_KEY", "device_key", "device_state_read",
+           "calling_tab_now", "join_target", "unidentified_target",
            "NAME_GAP", "PLAIN_WHY", "REFUSE", "RESULTS", "SAID_SHARE", "SAID_SPAN", "Call", "Live", "Verdict",
            "after_ask", "ask_send_question", "spoken_name", "calling_windows", "chat_window", "check", "draft_slots",
            "failed_question", "field_of", "game_holds", "game_now", "in_words", "is_join_control", "join_controls",
-           "may_commit", "maybe_send_question", "near_duplicate", "person_slot", "plain_why", "plan_consent",
-           "policy_holds",
+           "page_join_controls",
+           "may_commit", "maybe_send_question", "near_duplicate", "own_undo", "person_slot", "plain_why",
+           "plan_consent", "policy_holds",
            "quote_in_words", "quote_turns", "said_share", "screen_gate", "send_slots", "sends_now", "skill_commit",
            "skill_input", "skill_joins", "skill_sends", "step_traits", "takes_screen", "text_slot", "traits_of",
            "typed_address", "navigates", "waiting_text", "window_kind", "window_page"]

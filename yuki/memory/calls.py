@@ -1867,6 +1867,9 @@ class CallWorker:
         self._held: set[str] = set()
         #: The microphone holders of the last read, by app key; the keys last written to HOLDERS_STATE.
         self._holders: dict[str, Holder] = {}
+        #: morning21 A9 (review H1): the call evidence's lobbies of this poll, by app key (a hold that saw a calling
+        #: site and ended unjoined: Meet lets the microphone go at a join made with it off), each its last Holder.
+        self._lobby: dict[str, Holder] = {}
         self._holders_written: list[str] | None = None
         self._camera: tuple[Holder, ...] = ()
         self.headphones_fn = headphones_fn
@@ -2220,25 +2223,40 @@ class CallWorker:
         self._gaming = None
         game_key = self.game.key if self.game is not None else None
         evidence = self.evidence
+        lobby: list[Holder] = []
         if evidence is not None:
             evidence.fresh_s = cfg.evidence_fresh_s
+            if hasattr(evidence, "lobby_apps"):
+                # morning21 A9 (review H1): a calling site's sighting starts a call only at the user's measured join
+                # (the pre-join page is no call), and a join made with the microphone off is measured on the lobby the
+                # hold left (its sound), so the call starts there, not at the next hold
+                evidence.join_gate = True
+                try:
+                    lobby = [h for h in evidence.lobby_apps(self._held, now) if h.key and h.key != game_key]
+                except Exception as exc:
+                    self._log("error", where="calls.lobby", error=f"{type(exc).__name__}: {exc}")
+                    lobby = []
+        self._lobby = {h.key: h for h in lobby}
         # the holders' screens, and the open call's even while its app has let go (a "you left" screen ends it);
         # never the open game's (its screens are not a call's, and judging them costs a model call each)
         judge_for: list[Any] = [h for h in mic if h.key and h.key != game_key]
         act = self.active
         if act is not None and act.key not in self._held:
             judge_for.append(act.holder or act.key)
-        if evidence is not None and judge_for:
+        if evidence is not None and (judge_for or lobby):
             try:
-                evidence.judge(judge_for)
+                if lobby:
+                    evidence.judge(judge_for, lobby=lobby)
+                else:
+                    evidence.judge(judge_for)
             except Exception as exc:
                 self._log("error", where="calls.evidence", error=f"{type(exc).__name__}: {exc}")
         out: list[tuple[str, str, str | None, str]] = []
-        for h in mic:
+        for h in [*mic, *lobby]:
             key = h.key
             if not key:
                 continue
-            if key not in cfg.apps:
+            if key not in cfg.apps and key not in self._lobby:
                 front = self._front_now()
                 if front and h.matches(exe=str(front.get("exe") or "")):
                     gaming, facts = gaming_with_voice(h, fullscreen=True, shows_page=False, camera=snap.camera,
@@ -2259,8 +2277,8 @@ class CallWorker:
                     state, service = evidence.state(h, h.since, now)
                 except Exception:
                     state, service = None, ""
-            if key not in cfg.apps and state is None:
-                continue
+            if (key not in cfg.apps or key in self._lobby) and state is None:
+                continue   # a lobby starts a call only from its measured join, never as one of the user's own apps
             if state is None:
                 via = "mic"
             else:
@@ -2557,16 +2575,23 @@ class CallWorker:
         else:
             status, consent, by = "asking", None, None
         holder = self._holders.get(key)
+        held = holder is not None
         hold_since = holder.since if holder is not None else None
+        if holder is None:
+            # morning21 A9 (review H1): a join made with the microphone off, started from its lobby: that hold's Holder
+            # (the app's sound keeps the call alive, CallLife's site_sound), not held
+            holder = self._lobby.get(key)
         call_id = self.store.start_call(app=name, process=key, via=via, service=service, at=now, status=status,
                                         consent=consent, consent_by=by, output_form_factor=facts.get("form_factor"),
                                         output_device=facts.get("device"), headphones=ok, hold_since=hold_since)
         act = _Active(call_id, key, name, via, service, now, now, status=status, headphones=ok, holder=holder,
-                      held=holder is not None, alive_written=now)
-        act.life = CallLife(cfg, now=now, hold_since=hold_since, held=holder is not None)
+                      held=held, alive_written=now)
+        # a call started from its lobby has let go already: its release grace runs from its start, then its sound
+        act.life = CallLife(cfg, now=now, hold_since=hold_since, held=held, last_held_at=now)
         self._log("call_detected", call_id=call_id, app=name, process=key, via=via, service=service,
                   headphones=ok, form_factor=facts.get("form_factor"), asked=status == "asking" and consent is None,
-                  hold_since=hold_since, hold_age_s=None if hold_since is None else round(now - hold_since, 1))
+                  hold_since=hold_since, hold_age_s=None if hold_since is None else round(now - hold_since, 1),
+                  held=held)
         if consent is not None or by == "quiet":
             self._log("call_consent", call_id=call_id, app=name, answer=consent or "none", by=by)
         self._tell_ui()

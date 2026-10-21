@@ -18,7 +18,9 @@ here keeps what was said or shown. The vocabulary is closed (:data:`MOMENT_KINDS
 * ``page`` - a page visit that reached ``[moments] page_dwell_s`` or matched a site's URL template (the template's
   value, a video id or a channel handle, encrypted; else the timeline's own page key as the digest);
 * ``volume_change`` - a level moved and stayed (fed by the volume watcher and the Spotify slider read);
-* ``message_sent`` - a message by the user appeared in a chat (the ``messages`` rows, ``is_me``, first seen).
+* ``message_sent`` - a message by the user appeared in a chat (the ``messages`` rows, ``is_me``, first seen);
+* ``display_change`` - a monitor's brightness or screen power changed (morning21 B9: the end Yuki's display runs
+  reach, read back over DDC/CI; nothing writes the user's own display changes yet, so it is neither live nor derived).
 
 Two classes. **Derived** kinds (``call_join``, ``game_voice``, ``page``, ``message_sent``) come from rows that already
 exist (``calls``, ``timeline``, ``messages``) through :class:`Extractor`, which reads past a cursor per source; they
@@ -78,6 +80,7 @@ from yuki.memory.store import app_key
 #: The closed vocabulary of state changes (D1). ``sit_down`` and ``app_front`` are deferred (rebuildable later).
 MOMENT_KINDS: tuple[str, ...] = (
     "call_join", "game_voice", "site_front", "media_play", "media_context", "page", "volume_change", "message_sent",
+    "display_change",
 )
 #: Kinds computed from existing rows (rebuildable) and the sources they come from. ``timeline_host``: a host-scope page
 #: visit (RULE_VERSION 3, phase L design §3.3), apart from ``timeline`` so a page and its host visit can share a first row.
@@ -107,7 +110,7 @@ VISIT_GAP_S = 5.0
 #: D18: a moment of a run's app and kind counts as Yuki's up to this long after the run finished (s).
 ATTRIBUTION_LAG_S: dict[str, float] = {
     "media_play": 20.0, "media_context": 20.0, "volume_change": 3.0, "site_front": 3.0, "call_join": 60.0,
-    "message_sent": 120.0, "page": 20.0,
+    "message_sent": 120.0, "page": 20.0, "display_change": 3.0,
 }
 #: The derived refresh runs at most this often (s) unless nudged; the retention pass this often.
 PRUNE_EVERY_S = 6 * 3600.0
@@ -122,7 +125,8 @@ LEARN_EVERY_S = 600.0
 LEARN_IDLE_S = 120.0
 #: The moment kinds an occasion can end on (``yuki.skills.connection.SERVE_ENDS``): a refresh or a flush that wrote one
 #: makes the learner's incremental pass due.
-LEARN_END_KINDS: tuple[str, ...] = ("call_join", "page", "message_sent", "media_context", "volume_change")
+LEARN_END_KINDS: tuple[str, ...] = ("call_join", "page", "message_sent", "media_context", "volume_change",
+                                     "display_change")
 
 
 @dataclass(frozen=True)

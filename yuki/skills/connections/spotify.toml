@@ -43,6 +43,10 @@ mixer_moves_slider = false
 end = "media_context"
 kind = "change"
 menu = "play a playlist, album or liked songs from Your Library by name, or Yuki's pick (choose=true, context)"
+# The driver says its own line (spotify_route): this one, or, when no row in view is called the name asked and the row
+# that plays was reached by meaning (the run's fact how = mood or content, never on a correction), a line that names
+# the substitute and why (gd D3: spotify_route.LINE_INSTEAD, "I couldn't see a playlist called workout, so I put on
+# lumen, your usual now.").
 done_line = "Playing {playlist.name} on Spotify."
 offer_class = "everyday"
 handoff = true

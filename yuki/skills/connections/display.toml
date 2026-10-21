@@ -1,0 +1,125 @@
+# display: a monitor's brightness and its screen's power (morning21 lane B: B1, B4-B6; the user's decision of 21 Oct,
+# "Direct + knows Twinkle"). A capability: what any user's PC can do. Which monitor app the user uses, and their usual
+# levels, are told or learned, never written here.
+#
+# Zero setup (D0): Windows' own DDC/CI (dxva2: VCP 0x10 brightness, 0xD6 power) reaches every external monitor that
+# answers on its cable, and WMI a built-in panel; nothing to install, no account. Every change is read back from the
+# monitor itself, per monitor ("both" means both: the done line names each one, and one that didn't take is named).
+# The driver is yuki/skills/display_route.py. A monitor app (Twinkle Tray) is one more means: its command line is app
+# data in yuki/connect/sites/<app>.toml ([app] controls = "monitors"), run by the driver, judged by the same DDC read
+# (the app is the hand, the monitor is the judge).
+#
+# The means slot ships no default (design §5): the user's words ("use Twinkle Tray") or their usual (preference
+# display:means, "Keep this as your usual?" after a verified run) pick the app; with neither, Windows' own control runs
+# (the route that always exists). A told app that can't be reached is said and asked about, never swapped for
+# Windows' control silently: the windows routes run only for means "windows" or no means at all.
+#
+# Turning a screen off asks first only when it is the only screen on, or shows a game or a call (the user's decision):
+# the question names it, and the answer comes back as the anyway slot (honoured only as the answer to that question,
+# the engine's own record). Turning one on and brightness never ask. Brightness and the DDC power commands take no
+# focus and send no input, so the windows routes run with a game in front too; a monitor app is a program started,
+# so its route never does.
+
+[connection]
+app = "display"
+
+[capability.display]
+end = "display_change"
+kind = "change"
+# One neutral line within MENU_LINE_CHARS with its slots (the slots' forms give way first): what it reaches and the
+# target's form, the monitor's place or its own name as the desk says it (never the desk's index); left out, every
+# monitor (a value the user's words don't hold is named in the done line as a guess, so "both" is no value).
+menu = "monitor brightness or screen on/off; target main/second/its name, none = all"
+done_line = "The monitor is set."
+offer_class = "everyday"
+handoff = true
+serves = [{ end = "display_change", target = "*" }]
+bind = { level = "value", means = "means" }
+
+# Which monitor: its place (main, second, ...) or its own name from the desk (VG271U; a misheard name is matched by its
+# spelling against the monitors' own names; "all" is taken too). Left out: every monitor ("on" wakes the ones that are
+# off; "off" of every screen always asks first).
+[[capability.display.slot]]
+name = "target"
+type = "text"
+role = "fill"
+ask = "Which monitor?"
+
+[[capability.display.slot]]
+name = "level"
+type = "number"
+role = "fill"
+min = 0
+max = 100
+
+[[capability.display.slot]]
+name = "change"
+type = "points"
+role = "fill"
+
+[[capability.display.slot]]
+name = "power"
+type = "enum"
+role = "fill"
+options = ["on", "off"]
+
+# The means: Windows' own control, or the user's monitor app (found from the app data files, installed or running).
+[[capability.display.slot]]
+name = "means"
+type = "enum"
+role = "means"
+options = ["windows", "app"]
+ask = "Windows' own control, or your monitor app?"
+
+# The user's yes (true) or no (false) to "turn it off anyway?" (the only screen on, or a game or call on it). Never
+# guessed: honoured only as the answer to that question.
+[[capability.display.slot]]
+name = "anyway"
+type = "bool"
+role = "fill"
+
+# -- the user's monitor app (means = app) -------------------------------------------------------------------------------
+# Its own command line from its data file, one monitor at a time by that monitor's own id (never by its place in the
+# app's list), then read back over DDC/CI. Not running or not installed: said and asked (start it, or Windows' own
+# control?), never swapped silently. A program started, so never with a game in front.
+[[capability.display.route]]
+rung = "A"
+variant = "app"
+via = "driver"
+driver = "display_route"
+call = "route_app"
+needs_focus = false
+game = "never"
+when = { slot = "means", in = ["app"] }
+retry_after_acting = false
+done = { probe = "read_back" }
+recheck = { probe = "driver", driver = "display_route", call = "still", after_s = 3, same_source = true }
+
+# -- Windows' own control: DDC/CI for an external monitor, WMI for a built-in panel ------------------------------------
+# The route that always exists. Two entries, one way: for means "windows", and for no means chosen (a when-condition
+# reads one value; neither runs for a told app). No focus, no input: runs with a game in front.
+[[capability.display.route]]
+rung = "A"
+variant = "windows"
+via = "driver"
+driver = "display_route"
+call = "route_windows"
+needs_focus = false
+game = "always"
+when = { slot = "means", in = ["windows"] }
+retry_after_acting = false
+done = { probe = "read_back" }
+recheck = { probe = "driver", driver = "display_route", call = "still", after_s = 3, same_source = true }
+
+[[capability.display.route]]
+rung = "A"
+variant = "windows_unchosen"
+via = "driver"
+driver = "display_route"
+call = "route_windows"
+needs_focus = false
+game = "always"
+when = { slot = "means", present = false }
+retry_after_acting = false
+done = { probe = "read_back" }
+recheck = { probe = "driver", driver = "display_route", call = "still", after_s = 3, same_source = true }

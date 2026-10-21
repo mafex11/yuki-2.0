@@ -333,7 +333,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "run_powershell",
         "label": "Running a command",
-        "description": "Run a PowerShell command on this PC; stdout, stderr and the exit code come back.",
+        "description": ("Run a PowerShell command on this PC; stdout, stderr and the exit code come back. The command "
+                        "must finish within this step: never leave a process, watcher, job or scheduled task running "
+                        "to act on its own afterward. Do the thing now, or say plainly it would have to wait and "
+                        "offer to do it now instead."),
         "input_schema": _obj({"command": {"type": "string"}}, ["command"]),
     },
     {
@@ -782,7 +785,8 @@ OP_TRAITS: dict[tuple[str, str], Traits] = {
 
 #: Facts of a call's input or target that make an otherwise quiet call one that can destroy or reach someone (review
 #: 34: H2, M1, M2). Kept out of :data:`OP_TRAITS` so the tools' schemas (the ``risk`` field) do not change.
-#: ``open_url`` of anything but an http(s) address: a file or a scheme handler runs through its default program.
+#: ``open_url`` of anything but an http(s) address: a file or a scheme handler runs through its default program; and
+#: (integ28 fix S1) ``launch_app`` with such an argument: it runs through that app.
 LOCAL_TARGET_TRAITS = Traits(("open_apps",), "focus", destroys=True, reaches=True)
 #: A click on a control whose UIA role commits something (Send, Delete, Sign out, Approve, Buy are buttons and menu
 #: items): it can close, delete or send like a key can.
@@ -814,6 +818,15 @@ def _web_address(url: Any) -> bool:
         return False
 
 
+def _local_args(args: Any) -> list[str]:
+    """integ28 fix S1: the arguments of a ``launch_app`` call that are no http(s) address (a file, a folder, a switch,
+    a script: what the program runs or opens), whitespace-only ones left out; ``[]`` when there are none or ``args``
+    is no list. Shape facts only (the scheme parsed), never words."""
+    if not isinstance(args, list):
+        return []
+    return [str(a) for a in args if str(a).strip() and not _web_address(a)]
+
+
 def _skill_sends(tool_input: dict[str, Any] | None) -> bool:
     """Phase S (review L3): whether a ``run_skill`` call may send something to other people, from the skill's own data
     (``sends`` / ``sends_when`` in its connection file; :func:`yuki.skills.connection.sends_with`), never from slot
@@ -834,8 +847,9 @@ def _skill_sends(tool_input: dict[str, Any] | None) -> bool:
 
 def tool_traits(name: str, tool_input: dict[str, Any] | None = None) -> Traits:
     """The traits of one call: its operation's, else its tool's, else none (a read, a note, a memory tool). Text with
-    a line break types as Enter, so it submits like ``press_enter``; ``open_url`` of a file or a non-web scheme runs
-    something (both facts of the input itself)."""
+    a line break types as Enter, so it submits like ``press_enter``; ``open_url`` of a file or a non-web scheme, and
+    ``launch_app`` with an argument that is no web address (integ28 fix S1), run something (facts of the input
+    itself)."""
     tool_input = tool_input or {}
     op = None
     if name in ("window_action", "tab"):
@@ -843,6 +857,10 @@ def tool_traits(name: str, tool_input: dict[str, Any] | None = None) -> Traits:
     elif name == "type_text" and (tool_input.get("press_enter") is True or _line_break_in(tool_input.get("text"))):
         op = "submit"
     elif name == "open_url" and not _web_address(tool_input.get("url")):
+        return LOCAL_TARGET_TRAITS
+    elif name == "launch_app" and _local_args(tool_input.get("args")):
+        # integ28 fix S1 (Z7 by another verb): a file, a switch or a script in an app's command line runs through that
+        # program, as open_url's (review 34 H2): the commit check sees it (and can judge its ``later``)
         return LOCAL_TARGET_TRAITS
     elif name == "set_slider" and tool_input.get("keys"):
         # vfix3 review F1: the shortcut set_slider presses is a key combination like any hotkey (alt+f4 closes, enter
@@ -1618,7 +1636,9 @@ class Backend(Protocol):
         dx: int = 0,
         expect_hwnd: int | None = None,
     ) -> Any: ...
-    def run_powershell(self, command: str, *, timeout_s: float = 20.0) -> Any: ...
+    # ``reap`` is optional (A3: the shell's backstop for a command the model wrote); a backend without it runs the
+    # command as before (``Dispatcher._do_run_powershell`` reads the signature).
+    def run_powershell(self, command: str, *, timeout_s: float = 20.0, reap: bool = False) -> Any: ...
     def open_url(self, url: str, *, app: str | None = None) -> Any: ...
     # Optional (the voice's hands, yuki.voice.hands): minimize / maximize / restore / close /
     # focus one window, verified. A backend without it simply has no such hand.
@@ -4774,12 +4794,13 @@ class Dispatcher:
                                     "refused": "act_off"})
 
     def _do_run_powershell(self, tool_input: dict[str, Any]) -> ToolOutcome:
-        return self._from_action(
-            "run_powershell",
-            self.backend.run_powershell(
-                self._need_str(tool_input, "command"), timeout_s=self.tool_timeout_s
-            ),
-        )
+        run = self.backend.run_powershell
+        command = self._need_str(tool_input, "command")
+        if _takes_keyword(run, "reap"):
+            # A3 (Z7, review H1): a command the model wrote gets the shell's measured backstop (what it leaves running
+            # unseen is ended); code's own commands (launch.py) never do. A backend without it runs as before.
+            return self._from_action("run_powershell", run(command, timeout_s=self.tool_timeout_s, reap=True))
+        return self._from_action("run_powershell", run(command, timeout_s=self.tool_timeout_s))
 
     def _do_hover(self, tool_input: dict[str, Any]) -> ToolOutcome:
         x, y, guard, label = self._point(tool_input)
@@ -5347,6 +5368,18 @@ def _png_size(png: bytes) -> tuple[int, int] | None:
     width = int.from_bytes(png[16:20], "big")
     height = int.from_bytes(png[20:24], "big")
     return (width, height) if width and height else None
+
+
+def _takes_keyword(fn: Any, name: str) -> bool:
+    """Whether callable ``fn`` accepts keyword ``name`` (by name, or through ``**kwargs``): a backend's optional
+    argument is passed only to a backend that has it. False when its signature can't be read."""
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _plain(value: Any) -> Any:

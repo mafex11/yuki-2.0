@@ -165,12 +165,14 @@ SLOT_ROLES: tuple[str, ...] = ("key", "fill", "means")
 MEANS_FILLS: tuple[str, ...] = ("prefs", "driver")
 
 #: D1's moment vocabulary (``yuki.memory.moments.MOMENT_KINDS``; a test keeps the two equal): what a capability's
-#: ``end`` proves.
+#: ``end`` proves. morning21 B9: ``display_change``, a monitor's brightness or screen power changed (the display
+#: capability's end; its runs are occasions of that kind).
 END_KINDS: tuple[str, ...] = ("call_join", "game_voice", "site_front", "media_play", "media_context", "page",
-                              "volume_change", "message_sent")
+                              "volume_change", "message_sent", "display_change")
 #: The end kinds an occasion can end on (design §3.1): ``site_front``, ``media_play`` and ``game_voice`` never are
 #: (a glance is never the meeting; a new title is often autoplay), so a capability never serves them.
-SERVE_ENDS: tuple[str, ...] = ("call_join", "page", "message_sent", "media_context", "volume_change")
+SERVE_ENDS: tuple[str, ...] = ("call_join", "page", "message_sent", "media_context", "volume_change",
+                               "display_change")
 #: What an occasion's end reaches (design §4.1): its target kind. ``*``: any.
 TARGET_KINDS: tuple[str, ...] = ("call", "chat", "page", "playlist", "level", "video", "*")
 #: The driver data an occasion's app or service must have for a capability to serve it (design §4.1; the learner

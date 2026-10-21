@@ -104,6 +104,7 @@ LINE_TIDY_ASK: dict[str, str] = {"place": "Should I move {app} to your other scr
 #: Row 4's refusals in the words the ONE agent writes (``run_skill``'s ``consent``), by consent's code word.
 ONE_LINES: dict[str, str] = {
     "undeclared_send": LINE_CHAT_SEND,
+    "later": rule.LINE_LATER,
     "not_capability": "Not done: messages go only through run_skill message with consent; nothing was sent.",
     "recipient": "Not sent: consent.to must name whom it goes to.",
     "recipient_slot": "Not sent: the skill's person and consent.to name different people; make them the same person.",

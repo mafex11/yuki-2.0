@@ -3094,8 +3094,21 @@ class DeskHands:
             from yuki.brain import consent
 
             role, name = str(facts.get("role") or ""), _words(facts.get("name"))
-            if (role.casefold(), name.casefold()) in consent.join_controls():
+            pair = (role.casefold(), name.casefold())
+            if pair in consent.join_controls():
                 return "join"
+            if pair in consent.page_join_controls():
+                # integ29 (S5): a calling site's join names only on that site's page shown now (consent.join_target)
+                try:
+                    from yuki.brain.check import _board
+
+                    hwnd = facts.get("hwnd")
+                    live = consent.Live(calling=consent.calling_windows(_board()))
+                    if consent.calling_tab_now(hwnd, live) and pair in consent.page_join_controls(
+                            consent.calling_service(hwnd, live)):
+                        return "join"
+                except Exception:  # noqa: BLE001 - not known: not the capability's own join
+                    return None
         return None
 
     # -- the check -----------------------------------------------------------------------------------------------------

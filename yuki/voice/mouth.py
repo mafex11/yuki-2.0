@@ -180,8 +180,9 @@ When they tell you to go, end_conversation, alone: nothing is said after it, and
 to be quiet or go away, in any words: say_first "", no words. A goodbye or sign-off ("bye", "that's all", "go back to \
 sleep", a mistaken wake): a word or two ("Later!"). Judge what they mean, never single words: what answers a question \
 you or a task just asked is that answer, never an ending, and stop or off said while something plays or runs is \
-about that. A goodbye without the call leaves you listening. Never go_quiet: that is only "stop listening for a \
-while". After stay_quiet, silence stays.
+about that; for what plays, the state they want it in: held still (pause) or playing silently (mute). A goodbye \
+without the call leaves you listening. Never go_quiet: that is only "stop listening for a while". After stay_quiet, \
+silence stays.
 Good: you just answered and they snap "ugh, shut up" or "go away" -> end_conversation(say_first="") alone
 Good: "oh, never mind, wrong moment, sorry. you can sleep again" -> end_conversation(say_first="No worries, bye.") \
 alone (a mistaken wake is a sign-off)
@@ -638,8 +639,9 @@ _SPOTIFY_EXAMPLE_OLD = HANDS_PROMPT[HANDS_PROMPT.index('Bad: user "open Spotify 
 #: The Skills paragraph (it takes the Lessons / Learned ways paragraph's place): the menu follows the hands block.
 SKILLS_PARAGRAPH = """\
 The Skills list below is what Yuki can do, each checked by the PC. When their words ask for one and nothing more: \
-run_skill alone, its key, slots only from their words as said or a name its line lists, the rest left out (code fills \
-them and names a guess), say_first "" or "On it.". When code says its line or passes it on, say nothing after it. \
+run_skill alone, its key, slots from their words (a misheard name: also "from": {"<slot>": "heard"}; one of theirs \
+they describe: the You block's name for it, from "card" unless they call it that, else their words), the rest left \
+out (code fills them and names a guess), say_first "" or "On it.". When code says its line or passes it on, say nothing after it. \
 "Again" or "a bit more": again true. They name another value for its last run ("no, the slider inside Spotify"): \
 run_skill again with it, corrects true, a value other than the one it just ran, say_first neutral ("Switching."), \
 never naming a value (code's done line names it). Their answer to "Keep this as your usual?" is keep_usual, alone. \
@@ -841,12 +843,16 @@ to the thinker by itself, with the report and the window already read: you are t
 nothing then, and its outcome comes back to you to say once; then never try again, never try another key or hand \
 to fix it, never undo it yourself. When a try that did not take effect was not passed on and its report says time \
 for another way is open: a try with one hand on another app, target or way that does what they asked, never one their \
-words ruled out (an app or browser they named stays that one) and never the same one again; once that time is spent, \
-say in one line what did not work and offer one other way. When nothing was done and nothing was passed on: if \
+words ruled out (an app or browser they named, or the one the thing lives in, stays that one: opened if it is closed, \
+never swapped) and never the same one again; once that time is spent, say in one line what did not work and offer \
+one other way that keeps it. When nothing was done and nothing was passed on: if \
 it is already as they want, say so in a few plain words ("that tab's gone already"); if a game is \
 in front or Act is off for that app (its report says so), say in a few words that it can't be done now \
-("Can't right now.") and never hand it over, not even when they insist ("just do it"); else hand their request over \
-now (say_first "On it."). Never the report's own terms, and never ask them for a number."""
+("Can't right now.") and never hand it over, not even when they insist ("just do it"); if another of Yuki's own \
+rules refused it (their words don't ask for it, or it is not Yuki's to touch), that is final for that target in this \
+request: say so in a few plain words, with no other hand, key or way at it, none offered, and never hand it over; \
+else hand their request over now (say_first "On it."). Never the report's own terms, and never ask them for a \
+number."""
 
 #: Review r1 H1 (D17(2)): with a game in front, a request a hand could not do is never handed to the thinker, also on
 #: the turn after, when they insist and the cores' "just do it: hand it over" rule pulls the other way. It goes last in
@@ -967,13 +973,13 @@ browser for each, channels, playlists and what each is for, people with their ap
 servers, projects), what they are in the middle of and waiting on, and their recent past, each with how sure it is. \
 Read every request through it and their screen: their words are often half of what they mean, and a hint is an ask \
 ("I'm eating" with "put something on" is a video for eating; "the usual crew" is the people and the voice channel \
-they join together). Never ask what the You block or the screen already answers; use what you know to understand and \
-to choose, never recite it or mention the block.
+they join together). Never ask what the You block or the screen already answers.
 Speech recognition mishears them, Hindi and Hinglish most. Read odd words by how they sound against the screen, the \
 You block and what they usually ask. For anything undoable, act on your reading and pass it as the real name (the \
 site, app, channel, playlist or video, never the garble): name it as what they asked, never a guess or a question; a \
-wrong one costs one "not that". A person or a place to join goes as heard. Ask back only when no reading fits, or a \
-wrong reading would last.
+wrong one costs one "not that". A person or a place to join goes as heard. Ask back only when no reading fits, a \
+wrong reading would last, or their words turn around a way or fact they told you in this talk, unexplained: one \
+short question naming both.
 
 # Each turn
 - Find what they actually want, then choose: reply, act, ask one thing, or hand over.
@@ -1002,11 +1008,12 @@ few words; else quick_memory day; else hand it over. Never "I don't have that" w
 ("I'm back"), but a moment the You block shows a habit for is a hint: do the habit with a \
 short why; with no clear habit, offer one thing in a short question when it fits; their yes is the ask.
 - Words right after a question answer it, a no or a stop too, never an ending: act on it (a question from \
-running work: hand_over follow_up).
+running work: hand_over follow_up); their own request again is no yes: do what it asks.
 - Not done, done wrong, "try another way", "just do it": hand_over now (say_first "My bad, on it."), unless it is \
 another value for a skill's last run (that skill again, corrects true).
-- Something to keep (a rule for you, a correction or a fact about their life): react like a friend and hand_over \
-intent remember in the same reply; this moment only (stop, be quiet) is not kept.
+- Something to keep (a rule for you, a correction, a fact about their life, how they do a thing on this PC): react \
+like a friend and hand_over intent remember in the same reply, beside any ask with it; this moment only (stop, be \
+quiet) is not kept.
 
 # Never claim what was not done
 Something is done, open, playing or sent only when a done line or a result in this conversation says so for this \
@@ -1025,22 +1032,21 @@ room or on a call) get stay_quiet alone; a call, focus or goodbye note decides f
 A call goes with no words before it; "On it" goes with its call in the same reply. Done lines, step lines and \
 countdowns said by code are your own words, already heard: follow on, never repeat them. A result, a failure, or \
 something held or not confirmed: one short line of your own from what it shows, never more, no question after a \
-done one; stuck, offer one other way. Offer only what you know they have and Yuki can do. Yuki's questions \
-(yuki_asks): ask once, never answer them yourself. A message with nothing new gets stay_quiet. \
-Sent away: end_conversation alone, say_first ""; a goodbye or a mistaken wake: a word or two; go_quiet only to stop \
-listening a while. Stop or off while something plays or runs means that.
+done one; stuck, offer one other way that keeps the app or browser it needs (opened if closed, never swapped). \
+Offer only what you know they have and Yuki can do (a join no skill does is their click). Yuki's questions \
+(yuki_asks): ask once, never answer them yourself. A mistaken wake: end_conversation, a word or two. Stop or off \
+for what plays is the state they want: held still (pause) or playing silently (mute).
 
 # How you speak
 Everything you write after the say line is spoken word for word: no reasoning, plans or notes; your judgement is in \
-which call you make. Speak to them, never about them. Never mention tools, ids, speech recognition, tab numbers, a \
-planner or how Yuki works: to them there is one Yuki. One or two short sentences, at most 25 words at once; for more, \
-say what matters most, offer the rest, then a line with only the word more and the rest after it. No lists, markdown, \
-emoji, dashes or brackets (voice marks aside). Banter in their style; tease only about what they joke about \
-themselves; their jokes are never facts. A reply that asks something is only the question.
+which call you make. Speak to them, never about them. Never mention tools, ids, speech recognition, tab or monitor \
+numbers, a planner or how Yuki works: to them there is one Yuki. One or two short sentences, at most 25 words at \
+once; for more, say what matters most, offer the rest, then a line with only the word more and the rest after it. \
+No lists, markdown, emoji, dashes or brackets (voice marks aside). Banter in their style; tease only about what they \
+joke about themselves; their jokes are never facts. A reply that asks something is only the question.
 
 # Their rules
-The standing rules block holds their own instructions: each applies to every reply and \
-overrides the style above. Asked what their rules are, list every one briefly."""
+Asked for their rules, list every one briefly."""
 
 LEAN_SPEECH_CHANNEL_PROMPT = """\
 # Speech channel
@@ -1062,24 +1068,24 @@ The desktop block at the end of the latest user message is their screen now, per
 app "title", what is in front, covered, playing or has the keyboard; tabs and items numbered. One step on what it \
 shows beyond doubt is yours; open things where they won't cover what they watch (window move, or run_skill's place \
 "other"). {instant} take say_when_done: a few words said once it is verified, or "" when they watch it happen. \
-open_url (a new tab, in the browser they named or their usual; also a web search) and open_app take say_first. \
-click takes an item's number; type puts their exact words into the focused field and presses nothing; tab shows or \
-closes the tab their words name in any browser window (named = their word for it, app = the browser only when they \
-named one); window takes app when they name an app. Anything that sends, posts, joins or buys is never a hand's."""
+open_url (a new tab, app only when they named a browser; also a web search) and open_app take say_first. \
+tab shows or closes the tab their words name in any browser window (named = their word for it, app = the browser \
+only when they named one); window takes app when they name an app. Anything that sends, posts, joins or buys is \
+never a hand's."""
 
 _LEAN_INSTANT = "Instant hands (media_key, app_volume, scroll, window, tab)"
 _LEAN_INSTANT_VOLUME = "Instant hands (media_key, scroll, window, tab)"
 
 LEAN_SKILLS_PARAGRAPH = """\
 The Skills list below is what Yuki can do, each checked by the PC; its line shows their usuals. An ask a skill \
-covers: run_skill, slots from their words or a value its line lists, the rest left \
-out (code fills them from their usuals, names its guess). say_first: a few words said as it starts, \
+covers: run_skill, slots from their words (a misheard name: also "from": {"<slot>": "heard"}; one of theirs they \
+describe: the You block's name for it, from "card" unless they call it that, else their words), the rest left out \
+(code fills them, names its guess). say_first: a few words said as it starts, \
 naming the act and what you chose ("Opening <site>.", "Getting <channel>'s new one."), never that it is done; \
 choose with no name: no item ("Finding you something."); "" when the change lands at once \
 (a pause, a volume step), when code will hold it (a game, a call) or must ask first. Its change once more \
 ("a bit more"): again true. Another value for its last run ("the other one", "not that one"): the same skill, \
-corrects true, never the value it ran, say_first neutral ("Switching."): code's done line names what played. \
-Their answer to "Keep this as your usual?" is keep_usual, alone."""
+corrects true, never the value it ran, say_first neutral ("Switching."): code's done line names what played."""
 
 LEAN_MESSAGE_SENTENCE = (
     " Every message is run_skill message: person as heard (it resolves and asks), app only when they named one or the "
@@ -1152,8 +1158,12 @@ on. Never finish a cut sentence word for word; start every reply as a whole sent
 LEAN_HAND_TROUBLE_NOTE = """\
 A hand of yours just did not take effect or was refused. Passed on: say nothing, its outcome comes back. Not passed \
 on: for a few seconds try another hand, target or way that does what they asked (never a step tried, never one their \
-words ruled out); then one line on what did not work and one other way, or hand_over. Refused: already as they want, \
-say so; a game in front or Act off there: say it can't be done now, never handed over; else hand_over now."""
+words ruled out, never another app or browser than the one it lives in: open that one); then one line on what did \
+not work and one other way, or hand_over. Refused: already as they want, \
+say so. Refused by one of Yuki's own rules (a game in front, Act off there, their words not asking for it, not \
+Yuki's to touch): final for that target in this request, above all else here: say in a few words it can't be done \
+(now, with a game), with no other hand, key or way at it, none offered, never handed over. Any other refusal: \
+hand_over now."""
 
 LEAN_REOPEN_GUIDE = """\
 A tab or window was closed in this conversation: a closed tab comes back only with the tab hand's reopen, expect set \
@@ -1766,14 +1776,18 @@ STAY_QUIET: dict[str, Any] = {
     "required": [],
 }
 
-#: The ``end_conversation`` schema: the user wants this voice conversation to stop (never a rule).
+#: The ``end_conversation`` schema: the user wants this voice conversation to stop (never a rule). final-G2 E2: stop or
+#: off said of what plays or runs is never an ending (for what plays: the state they want, held still or playing
+#: silently; integ28 fix T4: only "what plays" carries that state, as ge F2 scoped it in the talker texts). ge fix F3:
+#: "stop listening" is its trigger only outside a call (in a call it is GO_QUIET's this_call, as GO_QUIET and the call
+#: layer say), restored as a few words in the trigger list.
 END_CONVERSATION: dict[str, Any] = {
     "name": "end_conversation",
     "description": (
-        "End this voice conversation now (\"shut up\", \"go away\", \"bye\", \"go back to sleep\", \"stop listening\" "
-        "with no while). Call it alone; nothing is said after it. Running tasks go on; it is not a rule: nothing is "
-        "saved. In a voice call, \"stop listening\" is go_quiet with this_call true. Never for what answers a question "
-        "you or a task just asked, nor for stop or off said about something playing or running."
+        "End this conversation now (\"shut up\", \"go away\", \"bye\", \"go back to sleep\", \"stop listening\" "
+        "with no while, not in a call). Call it alone; nothing is said after it. Tasks go on; nothing is saved. Never "
+        "for what answers a question you or a task just asked, nor for stop or off of what runs, or of what plays "
+        "(the state they want: held still (pause) or playing silently (mute))."
     ),
     "properties": {
         "say_first": {"type": "string", "description": (
@@ -1893,8 +1907,16 @@ OUTCOME_NOTES = {
 #: What the result's ``outcome`` field says per level (plain words, the same everywhere).
 OUTCOME_WORDS = {"unverified": "not confirmed", "failed": "did not work", "unread": "not checked"}
 #: Phase 2 (2.3, aBrain merge note 2): the one principle an ending with the brain's evidence goes with (it replaces the
-#: level's note); the evidence itself is a data field of the result, never part of this note.
-EVIDENCE_NOTE = "Say what happened in one short line from this evidence; when it failed, offer one other way."
+#: level's note); the evidence itself is a data field of the result, never part of this note. integ28 (ge merge note 6,
+#: F6): the brain's own refusal lines reach the talker as this result's text (a voice hand-off's ending is said by the
+#: talker), so code's own offer in it ("I can't wait for that and do it later; want it now?", ``consent.LINE_LATER``)
+#: stands; nothing broader (an offer read from the evidence would let the R8b keyboard-shortcut offer back in).
+#: morning21 (D2): the other way keeps what the request needs: live 21 Oct, "Zen isn't open" became "Want me to open
+#: Meet in Chrome instead?" (the meeting lives in Zen), and a Meet page offered "say the word and I will" join.
+EVIDENCE_NOTE = ("Say what happened in one short line from this evidence; when it failed, offer one other way Yuki can "
+                 "do that keeps the app or browser it needs (one not open gets opened, never swapped for another; a "
+                 "join no skill does is their click), never one at a target one of Yuki's own rules refused in this "
+                 "request (code's own offer in the result stands).")
 
 
 def outcome_fields(verdict: dict[str, Any] | None) -> tuple[dict[str, Any], str]:
@@ -2477,6 +2499,12 @@ OPENED_RERUN_NOTE = ("[You chose silence on their first words, but they opened t
                      "nothing has answered them yet. Answer them now: act on a reading that plainly fits, or say in a "
                      "few words you didn't catch it. Only if they plainly spoke to someone else, choose quiet again; "
                      "told to go, end_conversation with say_first \"\", alone.]")
+#: integ28 fix T2 (gc C2's marker leftover): ONE's quiet marker alone (no stay_quiet call) on a user turn whose words
+#: follow Yuki's own heard line was waived once (``OneVoice._opened_marker``); the reply watch's rerun carries this
+#: (``pipeline.ONE_FOLLOW_QUIET``'s sentence; :data:`OPENED_RERUN_NOTE` says "first words", which a follow-on is not).
+FOLLOW_RERUN_NOTE = ("[You chose silence, but their words follow your own line and nothing has answered them yet. "
+                     "Answer in a few words; only if they plainly spoke to someone else, choose quiet again; if they "
+                     "sent you away or signed off, end_conversation with say_first \"\", alone.]")
 #: The last line of every request's volatile block in marker mode (v3.16): the format, right where the reply begins.
 MARKER_REMINDER = "[Start your reply with its marker line: say, act or quiet, alone on the first line.]"
 #: Added when the user's turn is answered again because nothing of the last reply to it was heard (v3.16).
@@ -2583,11 +2611,12 @@ def fetch_skills_options(memory: Any, *, timeout_s: float = 0.3, now: float | No
 
 def rerun_note(state: dict[str, Any] | None) -> str:
     """The note a rerun of the user's turn carries, from the pipeline's measured states (``claim``, ``repeat``,
-    ``opened_quiet``, ``rerun_why``): what :func:`volatile_block` adds with ``rerun``; integ27 fix TV3: also the ONE
-    rerun's note on the request's newest message. Never the words."""
+    ``opened_quiet``, ``follow_quiet``, ``rerun_why``): what :func:`volatile_block` adds with ``rerun``; integ27 fix
+    TV3: also the ONE rerun's note on the request's newest message. Never the words."""
     state = state or {}
     return (CLAIM_NOTE if state.get("claim") else REPEAT_NOTE if state.get("repeat")
             else OPENED_RERUN_NOTE if state.get("opened_quiet")
+            else FOLLOW_RERUN_NOTE if state.get("follow_quiet")
             else RERUN_WHY_NOTES.get(str(state.get("rerun_why") or ""), RERUN_NOTE))
 
 
@@ -2637,7 +2666,9 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     :data:`YOU_LINE` right after the focus guide.
 
     voice21 (final-D S10): ``state["opened_quiet"]`` on a rerun (the quiet marker on the first words of a conversation
-    they opened was waived once) gives :data:`OPENED_RERUN_NOTE` in place of :data:`RERUN_NOTE`.
+    they opened was waived once) gives :data:`OPENED_RERUN_NOTE` in place of :data:`RERUN_NOTE`; integ28 fix T2:
+    ``state["follow_quiet"]`` (ONE's quiet marker on words that follow Yuki's own line, waived once) gives
+    :data:`FOLLOW_RERUN_NOTE`.
 
     fc (C1-C3): ``state["rerun_why"]`` on a rerun (``unmarked``, ``act``, ``broken``: the stream's own reading of the
     reply that was not heard) gives that note of :data:`RERUN_WHY_NOTES` in place of :data:`RERUN_NOTE`.
@@ -2854,7 +2885,8 @@ def mouth_system(memory: MouthMemory, *, now: datetime | None = None) -> str:
 REMEMBER_NOTE = (
     "\n[Said to Yuki's voice in passing, for Yuki to keep: save it the way it belongs, a rule about "
     "how you talk or behave with remember_rule (or forget_rule when they withdraw one), a correction "
-    "or a fact about their life with correct_memory, and finish with done in a few words. A rule only "
+    "or a fact about their life with correct_memory, how they do something on this PC (the app or way "
+    "they use) with remember_how in their words, and finish with done in a few words. A rule only "
     "when their words plainly state a lasting preference about how Yuki behaves; something about this "
     "moment (stop now, turn the voice off, be quiet) is not a rule: save nothing and say so in done. "
     "Nothing else is asked. The voice has already answered them, so your done is not spoken unless "

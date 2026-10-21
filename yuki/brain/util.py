@@ -463,6 +463,45 @@ CONTAINER_SHARE = 0.4
 finish_gate = sys.modules[__name__]
 
 
+def media_effect(changes: Any, windows: Any) -> bool:
+    """gc (final-G2 C6, k_resume_anime: a click on a video player read "not confirmed" while its own after-diff showed
+    ``paused -> playing`` in that very window): whether the after-diff's media changes (``perception.diff.DeskDiff
+    .media_changes``: ``{"hwnd", "from", "to", "track", ...}``) hold a measured transition in one of the windows the
+    act acted on (``windows``: their hwnds). A status change (paused -> playing, playing -> paused, none -> playing) or
+    a new track, in a session mapped to that window by its id: the act's own visible effect. Window identity and the
+    media session's own state only, never a title or a word. The copied ``_EFFECT_FACTS`` above stays a verbatim copy
+    of ``agent/loop.py`` until bPrune (no action report carries a media fact): callers that read the desk before and
+    after an act (ONE's runner; the brain executor's after-look) ask this instead. Never raises."""
+    try:
+        wanted = set()
+        for hwnd in windows or ():
+            if isinstance(hwnd, bool):
+                continue
+            try:
+                value = int(hwnd)
+            except (TypeError, ValueError):
+                continue
+            if value:
+                wanted.add(value)
+        if not wanted:
+            return False
+        for change in changes or ():
+            if not isinstance(change, dict):
+                continue
+            hwnd = change.get("hwnd")
+            try:
+                same = hwnd is not None and not isinstance(hwnd, bool) and int(hwnd) in wanted
+            except (TypeError, ValueError):
+                same = False
+            if not same:
+                continue
+            if str(change.get("from") or "") != str(change.get("to") or "") or bool(change.get("track")):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 - unreadable: no effect measured
+        return False
+
+
 def load_skills(*, store: Any = None) -> Any:
     """The skill catalog (critique M6): ``yuki.skills.catalog.load()`` when phase L's catalog is installed (``store``
     passed on when given), else ``yuki.skills.connection.load()``. Returns a ``connection.Loaded`` either way
@@ -509,8 +548,8 @@ def skill(key: Any) -> Any:
 __all__ = ["TIDY_ASK", "TIDY_DO", "TIDY_OFF", "tidy_mode",
            "ANSWER", "CONTAINER_SHARE", "EXPECTED_UNVERIFIABLE", "KIND_WORDS", "LEVELS", "LEVEL_LABELS", "LEVEL_WORDS",
            "LIKELY", "LINE_FAILED", "LINE_NOTHING_DONE", "LINE_NOT_CHECKED", "LINE_PARTIAL", "LINE_SEND_UNCONFIRMED",
-           "LINE_UNREAD", "LINE_UNVERIFIED", "PAGE_SCROLL_UNVERIFIABLE", "POLICY_CEILINGS", "POLICY_DEFAULTS",
-           "PolicyReader", "SAYABLE", "SIMILAR", "STABLE_CACHE_CONTROL", "CONTRADICTED", "EXPECTED", "FAILED",
-           "UNVERIFIED", "VERIFIED", "action_verdict", "acts_in_app", "app_name", "app_names", "app_off_line",
-           "app_switched_off", "clean_apps", "clean_levels", "load_skills", "policy_path", "sayable", "similar",
-           "skill", "suggest_only"]
+           "LINE_UNREAD", "LINE_UNVERIFIED", "PAGE_SCROLL_UNVERIFIABLE", "POLICY_CEILINGS",
+           "POLICY_DEFAULTS", "PolicyReader", "SAYABLE", "SIMILAR", "STABLE_CACHE_CONTROL", "CONTRADICTED", "EXPECTED",
+           "FAILED", "UNVERIFIED", "VERIFIED", "action_verdict", "acts_in_app", "app_name", "app_names", "app_off_line",
+           "app_switched_off", "clean_apps", "clean_levels", "load_skills", "media_effect", "policy_path", "sayable",
+           "similar", "skill", "suggest_only"]

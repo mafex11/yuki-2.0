@@ -65,8 +65,10 @@ from yuki.memory.testtag import sql_real_run as _real_run, sql_real_session as _
 from yuki.memory.testtag import sql_real_skill_run as _real_skill_run
 from yuki.skills.learn.group import step_token
 
-#: The end kinds (``yuki.skills.connection.SERVE_ENDS``).
-END_KINDS: tuple[str, ...] = ("call_join", "page", "message_sent", "media_context", "volume_change")
+#: The end kinds (``yuki.skills.connection.SERVE_ENDS``). morning21 B9: ``display_change`` (a monitor's brightness or
+#: screen power): the display capability's runs are asked occasions of it (their skill runs' end kind); the user's own
+#: changes need a moment writer first (deferred), so none of theirs is read yet.
+END_KINDS: tuple[str, ...] = ("call_join", "page", "message_sent", "media_context", "volume_change", "display_change")
 VISIT_GAP_S = 10.0
 VISIT_TOLERANCE_S = 5.0
 VISIT_BEFORE_S = 120.0
@@ -87,8 +89,8 @@ KEEP_DAYS = 90.0
 #: The ``runs`` step kinds that act on the desktop (D18): reads (looking at a window, the situation) never do.
 ACTING_KINDS: tuple[str, ...] = ("action", "control")
 #: The end kinds an acting step that kept no app may have made in any app (a media key, a control-lane step: review r2
-#: L2). A false drop costs one occasion.
-NO_APP_KINDS: tuple[str, ...] = ("media_context", "volume_change", "message_sent")
+#: L2; morning21 B9: a command run on the PC that set a monitor). A false drop costs one occasion.
+NO_APP_KINDS: tuple[str, ...] = ("media_context", "volume_change", "message_sent", "display_change")
 #: A playlist read showing the playlist the app's previous read showed, less than this before its start, is listening
 #: that goes on (a resume), never a new start: the routine miner's own onset gap, so one start is one onset.
 RESUME_GAP_S = 2 * 3600.0

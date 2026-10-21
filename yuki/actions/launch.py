@@ -108,7 +108,13 @@ brought back when launched without arguments: its own hidden main window is
 shown, or, when it has none, a new window is asked for the way the Start menu
 would start it (``ActivateApplication`` for a packaged app, its program run
 again for a desktop app), and the summary says "Arc was running in the
-background with no window; opened a new window".
+background with no window; opened a new window".  morning21 B8: when no window
+comes, the app keeps no main-style window of its own hidden, and it has its own
+icon in the notification area (``windows.tray_icons``: its program in the
+shell's record of the icons, or the icon's name being the app's), it is a
+**tray app**: ``ok=True`` with
+``details["tray_app"]`` and a summary that says so ("no window by design ...
+its own window or panel opens from that icon"), never a mismatch to retry.
 
 **After the window shows up** it is brought to the foreground exactly as
 :func:`focus_window` does and waited on until it accepts input: launching an app
@@ -1931,6 +1937,35 @@ def _open_new_window(chosen: dict[str, str], identity: _AppIdentity, budget_s: f
     return None, "shell:AppsFolder", error
 
 
+#: morning21 B8: how long a launch waits for a fresh read of the notification area when it needs one (s).
+TRAY_WAIT_S = 0.8
+#: The summary of a running app with no window and a tray icon of its own: its design, never a failed launch.
+TRAY_APP_LINE = ("{lead}; it is a tray app: no window by design. It runs in the notification area (its tray icon "
+                 "\"{icon}\"), and its own window or panel opens from that icon")
+
+
+def _tray_icon_of(chosen: dict[str, str], pids: set[int]) -> str:
+    """morning21 B8: the name of the app's own icon in the notification area (``""`` none): an icon whose program is
+    one the app runs as (the shell's record of it), else one whose name is the app's Start menu name
+    (:func:`_names_agree`). OS facts and names only (``windows.tray_icons``, read fresh within
+    :data:`TRAY_WAIT_S`). Never raises."""
+    try:
+        from yuki.perception.windows import _facts_for, tray_icons
+
+        icons = tray_icons(wait_s=TRAY_WAIT_S, max_age_s=10.0)
+        images = {os.path.basename(_facts_for(pid)[1]).casefold() for pid in pids if _facts_for(pid)[1]}
+        for icon in icons:
+            if icon.image and icon.image.casefold() in images:
+                return icon.name
+        name = str(chosen.get("name") or "")
+        for icon in icons:
+            if name and _names_agree(frozenset({_squash(icon.name)}), name):
+                return icon.name
+    except Exception:  # noqa: BLE001 - no tray read: said as before
+        return ""
+    return ""
+
+
 def _spawned_by(pid: int, running: set[int]) -> bool:
     """Whether ``pid`` was started (at any depth) by one of ``running`` - appOpen final check V1-riot: the running
     instance brought up its own interface in a new child process (the Riot Client's window, a child of the running
@@ -2016,6 +2051,17 @@ def _restore_background_app(
         for other in appeared
     ]
     if hwnd is None:
+        # review L1: the shell keeps a record for every program that ever had a tray icon, so a windowed app that
+        # keeps its own main window hidden (Discord, Steam closed to the tray: measured above, ``kept_hidden``, or the
+        # hidden window that wouldn't show) is never called a tray app; only one with no such window of its own is
+        own_window = bool(kept_hidden) or bool(hidden_hwnd)
+        icon = "" if own_window else _tray_icon_of(chosen, set(running) | identity.running_pids())
+        if icon:
+            # morning21 B8 (live 21 Oct: "launch Twinkle Tray" mismatched twice and was tried again): a running app
+            # with no window of its own and an icon in the notification area is a tray app; no window is its design,
+            # so the launch did what can be done (it runs) and is never a mismatch to retry
+            details.update(tray_app=True, window_reason="tray app: no window by design")
+            return True, TRAY_APP_LINE.format(lead=lead, icon=icon)
         return False, (
             f"{lead}; asked it for a new window ({via}) but none appeared within "
             f"{timeout_s:g}s - it is still running with no window"
@@ -3507,6 +3553,11 @@ def _no_window_outcome(
             program = os.path.basename(sorted(identity.exe_paths or [""])[0]) or "the program that shows it"
             return f"{lead}; {program}, which shows it, is shared with other windows, and no new window of it came"
         if pids:
+            icon = _tray_icon_of(chosen, set(pids))
+            if icon:
+                # morning21 B8: started (or handed over) and running in the tray with no window: its design
+                details.update(tray_app=True, window_reason="tray app: no window by design")
+                return TRAY_APP_LINE.format(lead=lead, icon=icon)
             return (
                 f"{lead}; it is running (pid {', '.join(str(p) for p in sorted(pids)[:6])}) "
                 f"but has no window a user could switch to, shown or hidden"
@@ -4474,7 +4525,18 @@ def app_window(app: str, *, deadline: float | None = None) -> tuple[int | None, 
     return (int(got), "launched") if started.ok and got else (None, "none")
 
 
-def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: ActionResult) -> ActionResult | None:
+#: gb (B6, final-G2 kw_chrome_crashing_youtube: a cold Arc kept its blank new-tab view and no address-bar step followed,
+#: with nothing to say why): the code words ``details["bar_why"]`` carries on an ``open_url`` result whose address bar
+#: did not open the page: why :func:`_address_bar_open` did not apply (``no_app``: no such Start menu app;
+#: ``unconfirmable``: its identity can't be confirmed; ``not_browser``: not a browser by machine data; ``no_window``: no
+#: window of it came up; ``gate``: a game in front or another guard refused the focus), that it was never called for
+#: (``not_called``: the hand-off's own facts didn't call for it; ``carried``: a guard stopped the hand-off; ``tried``:
+#: it was typed first already), or how it ended (its ``bar_stage``); ``unknown`` when none was given. Content-free.
+BAR_WHY = ("no_app", "unconfirmable", "not_browser", "no_window", "gate", "not_called", "carried", "tried", "unknown")
+
+
+def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: ActionResult,
+                      why: dict | None = None) -> ActionResult | None:
     """lSkills (live 17 Oct: every Arc open failed, then Yuki said "Arc isn't installed" or opened the page in Chrome):
     the address typed into the browser's own address bar, in its own window, after the address handed to it as a launch
     argument didn't open (``handed``: ``page_unchanged``, or a start that failed while the app runs). ``None`` when the
@@ -4490,7 +4552,14 @@ def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: 
     (:func:`yuki.skills.web_route.frame_field`: never a page's own box, so never a send) the address is typed and read
     back (no Enter on an address that didn't arrive whole), an inline completion after it deleted, and Enter
     navigates. Done only when one of its windows newly shows a page at the address (:func:`_await_page`). Every key
-    goes through Yuki's guarded input (nothing with a game in front: D17)."""
+    goes through Yuki's guarded input (nothing with a game in front: D17).
+
+    gb (B6): ``why`` (a dict) gets the code word for a ``None`` (``"why"``: one of :data:`BAR_WHY`), never content."""
+    def no(word: str) -> None:
+        if why is not None:
+            why["why"] = word
+        return None
+
     started = time.perf_counter()
     end = time.monotonic() + _BAR_FLOOR_S
     if deadline is not None:
@@ -4501,10 +4570,12 @@ def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: 
     except Exception:  # noqa: BLE001
         chosen = None
     if chosen is None:
-        return None
+        return no("no_app")
     identity = _identity_for(chosen, {"exe": hd.get("exe")} if hd.get("exe") else None)
-    if not identity.confirmable or not _takes_addresses(chosen, identity, target, hd):
-        return None
+    if not identity.confirmable:
+        return no("unconfirmable")
+    if not _takes_addresses(chosen, identity, target, hd):
+        return no("not_browser")
     details: dict = {"url": target, "name": chosen["name"], "appid": chosen["appid"], "via": "address_bar",
                      "via_word": "address_bar", "page_targets": [target], "launched": bool(hd.get("launched")),
                      "handoff": {k: hd.get(k) for k in ("via", "via_word", "reason", "page_state", "launched",
@@ -4532,12 +4603,14 @@ def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: 
         except Exception:  # noqa: BLE001
             up = None
         got = (up.details or {}).get("hwnd") if up is not None and up.ok else None
-        if not got or _gate.carried(up.details):
-            return None
+        if up is not None and _gate.carried(up.details):
+            return no("gate")
+        if not got:
+            return no("no_window")
         hwnd, how = int(got), "launched"
     details["bar_window"] = how
     if _gate.refuse("focus", hwnd=hwnd) is not None:
-        return None
+        return no("gate")
     pid = _window_pid(hwnd)
     befores = _pages_before(identity, min(_PAGE_BEFORE_S, max(0.2, 0.25 * (end - time.monotonic()))))
     details["before_pages"] = [{"hwnd": h, "url": u} for h, u in befores.items()]
@@ -4811,6 +4884,8 @@ def _open_url(
             _note_ignored(appid, False)
             return launched
         if _gate.carried(ld) or typed_first is not None:
+            # gb (B6): why no address bar follows here (a guard stopped the hand-off, or it was typed first already)
+            ld["bar_why"] = "carried" if _gate.carried(ld) else "tried"
             return launched
         same = ld.get("reason") == "page_unchanged" and ld.get("page_state") == "same"
         # review r1 L1: another page showing ("other") is an ignored hand-off only in a packaged browser or one whose
@@ -4831,15 +4906,21 @@ def _open_url(
                  and ld.get("via") in ("AppExecutionAlias", "ActivateApplication"))
         failed_start = not ld.get("launched") and bool(ld.get("protocol_refused") or ld.get("launch_error"))
         if not (ignored or blank_page or failed_start or (blank and ld.get("page_verified") is not True)):
+            if ld.get("page_verified") is not True:
+                ld["bar_why"] = "not_called"   # gb (B6): the hand-off's own facts didn't call for the address bar
             return launched
-        typed = _address_bar_open(app, address, deadline=deadline, handed=launched)
+        bar_no: dict = {}
+        typed = _address_bar_open(app, address, deadline=deadline, handed=launched, why=bar_no)
         if typed is None:
+            # gb (B6): why the address bar didn't apply (a code word of :data:`BAR_WHY`)
+            ld["bar_why"] = str(bar_no.get("why") or "unknown")
             return launched
         typed.details["url"] = target
         if typed.ok:
             return typed
         # neither got there: the hand-off's facts first (what it did), then what the address bar did
         launched.details["address_bar"] = {k: typed.details.get(k) for k in ("bar_stage", "bar_window", "bar_field")}
+        launched.details["bar_why"] = str(typed.details.get("bar_stage") or "unknown")   # gb (B6): how it ended
         return ActionResult(ok=False, summary=f"{launched.summary}; then {typed.summary}", details=launched.details,
                             elapsed_ms=launched.elapsed_ms + typed.elapsed_ms)
 

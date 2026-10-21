@@ -2698,10 +2698,13 @@ class VoiceBridge(QObject):
         return max(pool, key=lambda j: j.started_at) if pool else None
 
     def _follow_up_target(self, besides: Job | None = None) -> Job | None:
-        """The most recent unfinished voice job, the one waiting for an answer first (``besides``: not that one)."""
+        """The most recent unfinished voice job, the one waiting for an answer first (``besides``: not that one). A
+        remember job is never one (integ29, md merge note 2b: its note says nothing else is asked, so a follow_up in
+        the same reply as a remember would be lost there; as :meth:`_same_turn_job`)."""
         with self._lock:
             live = [j for j in list(self._jobs.values()) + list(self._unsubmitted.values())
-                    if j.source == "voice" and j.state in OPEN_STATES and j is not besides and not j.unadopted]
+                    if j.source == "voice" and j.state in OPEN_STATES and j is not besides and not j.unadopted
+                    and not j.remember]
         if not live:
             return None
         waiting = [j for j in live if j.state == WAITING]
@@ -5095,7 +5098,8 @@ class VoiceBridge(QObject):
 #: bTalk: the labelled note a spoken request to keep goes with (design 3: the talker's ``remember`` intent; never
 #: steered in as the user's words).
 REMEMBER_CONTEXT = ("Yuki's voice took these words as something to keep: a rule about how Yuki talks or behaves, a "
-                    "correction of something Yuki got wrong about them, or a fact about their life. Keep it with "
+                    "correction of something Yuki got wrong about them, a fact about their life, or how they do "
+                    "something on this PC (the app or way they use). Keep it with "
                     "remember when it is one (something about this moment only is not kept). Nothing else is asked, "
                     "and the voice has already answered them, so the answer is not spoken unless keeping it failed.")
 #: bTalk: the note a late addition (words said after the request's last step) goes with.
