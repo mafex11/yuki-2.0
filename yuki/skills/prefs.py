@@ -37,8 +37,8 @@ before it; the best is kept when it beats "most used" by 5 points, else "most us
   one question. Only a named alternative is a preference negative (redteam D14): a cancel, slowness or a bad click
   counts against the route (``skill_runs``), never here.
 * **A correction that came as a new request** (morning21 C8: the planner's capability run whose app means slot came
-  from their words right after Yuki acted in another app of that kind): :func:`note_switch` writes the same
-  ``corrected`` / ``rejected`` pair (``yuki.brain.executor``'s caller).
+  from their words right after Yuki opened the same thing, a page of the run's own site, in another app):
+  :func:`note_switch` writes the same ``corrected`` / ``rejected`` pair (``yuki.brain.executor``'s caller).
 * **Conversation memory**: the extractor's ``usual`` field picks one entry of :func:`usual_choices` (a closed list in
   our own ``<pref slot>=<option>`` format, read by :func:`parse_choice`, never matched against words); code proposes it
   (:func:`propose`, a ``said`` event) and asks once on a question card (origin ``usual``, :func:`usual_question`); the
@@ -47,6 +47,7 @@ before it; the best is kept when it beats "most used" by 5 points, else "most us
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -369,54 +370,132 @@ def _app_option(store: Any, slot_key: str, value: Any) -> str | None:
         return " ".join(str(value).split()).casefold() or None
 
 
-def _kept_option(store: Any, slot_key: str, option: str) -> bool:
-    """Whether ``option`` is already one of the slot's options (any scope): a measured sign it is the same kind of
-    means (a browser for a browser slot). Never raises."""
-    base = slot_key.split("@", 1)[0]
-    try:
-        return bool(store._query("SELECT 1 FROM prefs WHERE (slot = ? OR slot LIKE ?) AND option = ? LIMIT 1",
-                                 (base, base + "@%", option)))
-    except Exception:  # noqa: BLE001
-        return False
-
-
 #: morning21 C8: the step a correction follows opened an address in its app (a page goes where pages open: that app is
 #: the same kind of means as a browser slot's), a code fact of Yuki's own step.
 ADDRESS_VERBS = frozenset({"open_url"})
+#: Where memory keeps the calling-site judge's verdicts per shipped host (``yuki.memory.callevidence.SITES_STATE_KEY``:
+#: ``{"verdicts": {host: [calling, service]}}``), read as data by :func:`scope_hosts`.
+SITE_VERDICTS_KEY = "call_evidence:sites"
 
 
-def note_switch(store: Any, skill: Any, *, values: dict[str, Any], previous_app: Any, previous_verb: str = "",
-                run_key: str | None, quote: str | None = None, at: float | None = None) -> list[dict[str, Any]]:
-    """morning21 C8: a correction that came as a new request, not the talker's ``corrects`` flag: Yuki acted on
-    something in ``previous_app`` (its newest earlier step, in this conversation), then the user's words named another
-    app and a capability ran with it (21 Oct: Meet opened in Chrome, "the link in Zen browser", ``browser.site_tab``
-    ran with browser Zen from their words, and nothing was kept).
+def _page_host(url: Any) -> str:
+    """A page address's host (or a host as given), casefolded, without a leading ``www.``; ``""`` when it has none.
+    A fixed format, never words. Never raises."""
+    text = " ".join(str(url or "").split())
+    if not text:
+        return ""
+    try:
+        from urllib.parse import urlsplit
 
-    For each app-typed means slot that reads a preference and whose value came from the user's words this run
-    (``skill_runs.filled`` of ``run_key``: ``words``) and names another app than ``previous_app``: ``corrected`` (+3)
-    for the option they named and ``rejected`` for the one Yuki used, under the slot's preference key for these values
-    (its scope filled from them), as :func:`note_correction` writes. Only when the app Yuki used is that kind of means:
-    an option the slot already keeps (:func:`_kept_option`), or one Yuki opened an address in
-    (:data:`ADDRESS_VERBS`). Content-free result (preference keys and option codes). Never raises."""
+        host = (urlsplit(text if "://" in text else "https://" + text).hostname or "").casefold()
+    except Exception:  # noqa: BLE001
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def scope_hosts(store: Any, value: Any) -> set[str]:
+    """The hosts of the thing a preference scope names (morning21 C8, fix round review M-3), as data: the value itself
+    when it is written as a domain; the site files (``yuki/connect/sites``) whose name is its scope identity
+    (``connection.scope_value``) or whose ``[call] service`` is it (case and spacing aside), their ``[site]`` and
+    ``[call]`` hosts; and the hosts memory's own calling-site judge gave it as the service of
+    (:data:`SITE_VERDICTS_KEY`). Casefolded, without ``www.``; empty when the thing has no known host. Never raises."""
+    text = " ".join(str(value or "").split())
+    if not text:
+        return set()
+    folded = text.casefold()
+    out: set[str] = set()
+
+    def add(host: Any) -> None:
+        got = _page_host(host)
+        if got:
+            out.add(got)
+
+    ident = folded
+    try:
+        from yuki.skills.connection import domain_like, scope_value
+
+        ident = scope_value(text) or folded
+        if domain_like(folded):
+            add(folded)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from yuki.connect.templates import site, sites
+
+        for name in sites():
+            data = site(name)
+            call = data.get("call") if isinstance(data.get("call"), dict) else {}
+            service = " ".join(str(call.get("service") or "").split()).casefold()
+            if name != ident and service != folded:
+                continue
+            for host in [*((data.get("site") or {}).get("hosts") or []), *(call.get("hosts") or [])]:
+                add(host)
+    except Exception:  # noqa: BLE001 - no site data: memory's verdicts may still say
+        pass
+    try:
+        reader = getattr(store, "nudge_state", None)
+        raw = reader(SITE_VERDICTS_KEY) if callable(reader) else None
+        data = json.loads(raw) if raw else None
+        verdicts = data.get("verdicts") if isinstance(data, dict) else None
+        for entry, item in (verdicts.items() if isinstance(verdicts, dict) else ()):
+            if (isinstance(item, list) and len(item) > 1 and item[0]
+                    and " ".join(str(item[1]).split()).casefold() == folded):
+                add(entry)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _on_hosts(url: Any, hosts: set[str]) -> bool:
+    """Whether a page address is on one of ``hosts`` (the host itself or a subdomain of it)."""
+    host = _page_host(url)
+    return bool(host) and any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def note_switch(store: Any, skill: Any, *, values: dict[str, Any], previous: Any, run_key: str | None,
+                quote: str | None = None, at: float | None = None) -> list[dict[str, Any]]:
+    """morning21 C8: a correction that came as a new request, not the talker's ``corrects`` flag: Yuki acted on the
+    same thing in another app (its own earlier steps, in this conversation), then the user's words named another app
+    and a capability ran with it (21 Oct: Meet opened in Chrome, "the link in Zen browser", ``browser.site_tab`` ran with
+    browser Zen from their words, and nothing was kept).
+
+    ``previous``: Yuki's own earlier steps (the executor's ``last_steps``), oldest first, each ``{"verb", "app",
+    "value"}``. For each app-typed means slot that reads a preference, is scoped (``scope``) and whose value came from
+    the user's words this run (``skill_runs.filled`` of ``run_key``: ``words``): the newest earlier step that opened an
+    address (:data:`ADDRESS_VERBS`) on the scope's own hosts (:func:`scope_hosts`: the same thing, fix round review
+    M-3) is the act corrected, when it was in another app. Then ``corrected`` (+3) for the option they named and
+    ``rejected`` for the one Yuki used, under the slot's preference key for these values, as :func:`note_correction`
+    writes. No such step (another site, a thing with no known host, an unscoped slot): nothing. Content-free result
+    (preference keys and option codes). Never raises."""
     at = time.time() if at is None else float(at)
     out: list[dict[str, Any]] = []
     try:
+        steps = [s for s in previous or () if isinstance(s, dict) and str(s.get("verb") or "") in ADDRESS_VERBS
+                 and " ".join(str(s.get("app") or "").split()) and s.get("value")]
+        if not steps:
+            return out
         sources = run_sources(store, run_key)
         if not sources:
             return out
         for slot in getattr(skill, "slots", ()) or ():
-            if not getattr(slot, "pref", "") or getattr(slot, "role", "") != "means" or getattr(slot, "type", "") \
-                    != "app" or sources.get(slot.name) != "words":
+            if (not getattr(slot, "pref", "") or getattr(slot, "role", "") != "means"
+                    or getattr(slot, "type", "") != "app" or sources.get(slot.name) != "words"
+                    or not getattr(slot, "scope", "")):
                 continue
             value = values.get(slot.name)
-            if not isinstance(value, str) or not value.strip() or _app_names(value) & _app_names(previous_app):
+            if not isinstance(value, str) or not value.strip():
+                continue
+            hosts = scope_hosts(store, values.get(slot.scope))
+            earlier = next((s for s in reversed(steps) if _on_hosts(s.get("value"), hosts)), None) if hosts else None
+            if earlier is None:
+                continue
+            previous_app = " ".join(str(earlier.get("app") or "").split())
+            if _app_names(value) & _app_names(previous_app):
                 continue
             key = slot.pref_key(skill.key, values)
             new = _app_option(store, key, value)
             old = _app_option(store, key, previous_app)
             if not new or not old or new == old:
-                continue
-            if str(previous_verb or "") not in ADDRESS_VERBS and not _kept_option(store, key, old):
                 continue
             source = f"correction:{run_key}"
             if record(store, key, new, "corrected", quote=quote, source=source, at=at) is None:

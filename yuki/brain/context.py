@@ -311,8 +311,9 @@ def _clock(at: Any) -> str:
 
 def call_lines(payload: Any, board: Any = None) -> str:
     """morning21 C10: :data:`CALLS_LABEL` and one line per calling window on the Now ``board`` (read now when not
-    given), through K1's ``call_state(board, hwnd)`` (``getattr``: no line before lane A's now.py lands). ``""`` when
-    no window holds a calling site's tab. Code facts only; never raises."""
+    given) that is on the desk (``payload``'s windows: fix round, review L-2), through K1's ``call_state(board,
+    hwnd)`` (``getattr``: no line before lane A's now.py lands). ``""`` when no window on the desk holds a calling
+    site's tab. Code facts only; never raises."""
     try:
         from yuki.memory import now as _now
 
@@ -330,10 +331,14 @@ def call_lines(payload: Any, board: Any = None) -> str:
         from yuki.brain.util import app_name
 
         rows: list[str] = []
-        for key in list(tabs)[:CALL_LINES_MAX]:
+        for key in list(tabs):
+            if len(rows) >= CALL_LINES_MAX:
+                break
             if not str(key).isdigit():
                 continue
             hwnd = int(key)
+            if hwnd not in apps:
+                continue   # fix round (review L-2): a window no longer on the desk (K1 keeps it a while) gets no line
             try:
                 got = state_of(board, hwnd)
             except Exception:  # noqa: BLE001 - that window's state can't be said

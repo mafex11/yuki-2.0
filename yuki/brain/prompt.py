@@ -28,17 +28,17 @@ except Exception:  # noqa: BLE001 - bExec's util.py not merged yet
     CACHE_CONTROL: dict[str, str] = {"type": "ephemeral", "ttl": "1h"}
 
 CORE_PROMPT = """\
-You are Yuki, the assistant built into the user's PC: you do their everyday things on it and answer from the \
-screen and memory, only through tools.
+You are Yuki, the assistant built into the user's PC: you do their things on it and answer from screen and \
+memory, only through tools.
 
 Knowing them
 - Read their words through the you-card: what they're doing now and usually do at this hour, their things and \
 usuals. A hint, a short name or "the usual" means what the card makes most likely. Spoken words come by \
 speech-to-text: a name naming nothing of theirs was misheard (word breaks, first sounds lost): take the open window \
-or thing of theirs it sounds closest to. Words reversing what they just told Yuki, with no reason given, may be \
-misheard too: kind ask, one short question naming both. What the screen shows now beats the usual.
-- A way they taught Yuki (this talk, their things, the how-block) comes first. Can't reach it: say which part, ask \
-them to show it once; never switch ways silently.
+or thing of theirs it sounds closest to. Words reversing a way or rule they just gave Yuki, with no reason \
+given, may be misheard too: kind ask, one short question naming both. What the screen shows now beats the usual.
+- A way they told Yuki to use (this talk, their rules) comes first, else Yuki's own. Can't reach it: say \
+which part, ask to be shown once; never switch ways silently.
 - A pick left to you ("a video I'd like", "put something on", even from a page they name; or the talker's reading \
 says choose) is yours. A video, a playlist or a YouTube channel: run its capability (web.open_video, \
 spotify.playlist, web.open_page) with slots {"choose": true, "context": "<their words>"} and the card's fitting pick \
@@ -143,10 +143,14 @@ NO_RULES = "(No standing rules yet.)"
 MENU_LABEL = "[Menu: the user's skills and the capabilities (route skill:<id>)]"
 NO_MENU = "(No skills are loaded: route steps.)"
 NO_PROFILE = "(Nothing about the user yet.)"
+#: The least room "who they are" keeps in the profile (the brief, when the you-card missed its wait, is cut to this).
+BRIEF_FLOOR = 200
 #: morning21 C1: the user's own things and tools as they told Yuki (memory's ``resource`` group: sites, accounts,
-#: links, the app they use for something), under their own label, between who they are and the rules.
+#: links, the app they use for something), under their own label, between who they are and the rules. Known, not an
+#: order (fix round, review L-3): a tool of theirs is the way only when they tell Yuki to use it (the core's told-way
+#: principle), so "Twinkle Tray controls my monitors" never makes it the default over Yuki's own monitor control.
 RESOURCES_LABEL = ("[Their own things and tools, as they told Yuki (sites, accounts, links, the apps they use for "
-                   "what): use them as told]")
+                   "what)]")
 
 
 def _clip(text: str, limit: int) -> str:
@@ -187,17 +191,30 @@ def _resources_block(resources: Sequence[str] | None, room: int) -> str:
 def profile_text(*, names: Sequence[str] | None, brief: str | None, rules: Sequence[str] | None,
                  limit: int = 3000, resources: Sequence[str] | None = None) -> str:
     """Breakpoint 2: who the user is, their own things (``resources``: morning21 C1) and their standing rules, at most
-    ``limit`` characters. The rules are never cut for the profile: the brief gives way first, then their things (the
-    oldest first). ``rules``: one line each (``None``: memory could not say)."""
+    ``limit`` characters. The rules are never cut for the profile: the brief gives way first (down to its floor of
+    :data:`BRIEF_FLOOR` characters), then their things (the oldest first). ``rules``: one line each (``None``: memory
+    could not say)."""
     rule_lines = [" ".join(str(r).split()) for r in (rules or ()) if str(r).strip()]
     rules_body = "\n".join(rule_lines) if rule_lines else NO_RULES
     rules_block = f"{RULES_LABEL}\n{rules_body}" if rules is not None else ""
     ident = identity_line(names)
-    things = _resources_block(resources, limit - len(rules_block) - len(PROFILE_LABEL) - len(ident) - 8)
     who = "\n".join(p for p in (ident, (brief or "").strip()) if p) or NO_PROFILE
-    room = max(200, limit - len(rules_block) - (len(things) + 2 if things else 0) - len(PROFILE_LABEL) - 4)
-    profile = f"{PROFILE_LABEL}\n{_clip(who, room)}"
-    text = "\n\n".join(p for p in (profile, things, rules_block) if p)
+    # fix round (review M-1): their things are sized after the room "who" is sure to take (the identity line, or the
+    # brief's floor and the clip's "\n…" when the card missed and the brief stands in), so they never push the rules out
+    floor = max(len(ident), min(len(who), BRIEF_FLOOR + 2))
+    things = _resources_block(resources, limit - len(rules_block) - len(PROFILE_LABEL) - floor - 8)
+    room = max(BRIEF_FLOOR, limit - len(rules_block) - (len(things) + 2 if things else 0) - len(PROFILE_LABEL) - 4)
+    said = _clip(who, room)
+    text = "\n\n".join(p for p in (f"{PROFILE_LABEL}\n{said}", things, rules_block) if p)
+    if len(text) > limit and len(said) > BRIEF_FLOOR:
+        # the brief gives way before any rule: its clip's "\n…" can run up to 2 past its room, which cut the newest
+        # rule (fix round, review M-1); the same bytes as before whenever the whole fitted
+        said = _clip(who, max(BRIEF_FLOOR, limit - (len(text) - len(said)) - 2))
+        text = "\n\n".join(p for p in (f"{PROFILE_LABEL}\n{said}", things, rules_block) if p)
+    if things and len(text) > limit:
+        # then their things, the oldest dropped until the whole fits
+        things = _resources_block(resources, len(things) - (len(text) - limit))
+        text = "\n\n".join(p for p in (f"{PROFILE_LABEL}\n{said}", things, rules_block) if p)
     return _clip(text, limit) if len(text) > limit else text
 
 

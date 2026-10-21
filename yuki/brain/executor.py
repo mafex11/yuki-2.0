@@ -266,18 +266,37 @@ def _warm_desk() -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# morning21 C9 and C10: a capability's means steps, and the join after-check
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: morning21 C10: how long after an act in a meeting page's window (the user not in the call) the join after-check
+#: looks (s), and what Yuki says at once when a join followed (K1 ``call_state``).
+JOIN_CHECK_S = 3.0
+LINE_JOINED_AFTER = "Heads up: that put you in the call in {app}. I didn't mean to join it."
+#: How far the memory process's clock and ours may differ when a call's start is compared with an act's (s; K1's own
+#: ``joined_since`` tolerance).
+JOIN_CLOCK_S = 2.0
+#: morning21 C9: the verbs that may be a capability's means (opening or bringing forward the app a later ``run_skill``
+#: of the same plan ran in: :meth:`Executor._means_steps`), never a part of the request by themselves then.
+MEANS_VERBS: frozenset[str] = frozenset({"launch_app", "focus_window"})
+
+
+def _joined_after(state: Any, t0: float) -> bool:
+    """morning21 C10 (fix round, review L-1): whether a K1 ``call_state`` reads the user in the call (``in_call``,
+    measured by the call evidence), begun at or after ``t0`` (wall clock, less :data:`JOIN_CLOCK_S`). A microphone
+    onset alone is not a join (a pre-join page's preview, or a toggle Yuki itself turned on). Pure."""
+    if not isinstance(state, Mapping) or str(state.get("state") or "") != "in_call":
+        return False
+    since = state.get("since")
+    return isinstance(since, (int, float)) and not isinstance(since, bool) and float(since) >= float(t0) - JOIN_CLOCK_S
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # desk22 (A13, contract C13): "remember how I do this": a told way kept at once from the steps a request just ran
 # ---------------------------------------------------------------------------------------------------------------------
 
 #: The verbs a told way may be built from (desk acts, our own verb names): a skill run, a read, a volume, a script
 #: or a clipboard write is no part of a way's recorded path.
-#: morning21 C10: how long after an act in a meeting page's window (the user not in the call) the join after-check
-#: looks (s), and what Yuki says at once when a join followed (K1 ``joined_since``).
-JOIN_CHECK_S = 3.0
-LINE_JOINED_AFTER = "Heads up: that put you in the call in {app}. I didn't mean to join it."
-#: morning21 C9: the verbs that may be a capability's means (opening or bringing forward the app a later ``run_skill``
-#: of the same plan ran in: :meth:`Executor._means_steps`), never a part of the request by themselves then.
-MEANS_VERBS: frozenset[str] = frozenset({"launch_app", "focus_window"})
 WAY_VERBS: frozenset[str] = frozenset({"launch_app", "focus_window", "open_url", "window_action", "tab", "click",
                                        "type_text", "hotkey", "press", "scroll", "set_slider"})
 #: How long the newest request's steps stay what "the steps just done" means (s), and the most kept.
@@ -2394,7 +2413,7 @@ class Executor:
             from yuki.memory import now as _now
 
             state_of = getattr(_now, "call_state", None)
-            if not callable(state_of) or not callable(getattr(_now, "joined_since", None)):
+            if not callable(state_of):
                 return None
             board = getattr(self, "_last_board", None)
             got = state_of(board, int(call.hwnd)) if isinstance(board, Mapping) else None
@@ -2405,10 +2424,12 @@ class Executor:
         return None
 
     def _join_watch(self, call: Call, since: float) -> None:
-        """morning21 C10 (K1 ``joined_since``): after an act in a meeting page's window while the user was not in the
-        call, look once :data:`JOIN_CHECK_S` later whether a join of that service followed (its call-join moment or a
-        microphone onset, as K1 reads them); if so, say it at once (:data:`LINE_JOINED_AFTER`: a step joined that
-        nobody asked to join). One short-lived thread; logged content-free. Never raises."""
+        """morning21 C10 (K1 ``call_state``): after an act in a meeting page's window while the user was not in the
+        call, look once :data:`JOIN_CHECK_S` later whether that window's call state is now ``in_call``, begun at or
+        after the act (:func:`_joined_after`); if so, say it at once (:data:`LINE_JOINED_AFTER`: a step joined that
+        nobody asked to join). A microphone onset alone is no join here (fix round, review L-1: K1 ``joined_since``
+        also counts one, and a toggle Yuki itself turned on in a pre-join page would read as a join). One short-lived
+        thread; logged content-free. Never raises."""
         hwnd = int(call.hwnd or 0)
         app = util.app_name(call.app) if call.app else "the browser"
         app = app if app and app != "It" else "the browser"
@@ -2418,7 +2439,7 @@ class Executor:
             try:
                 from yuki.memory import now as _now
 
-                joined = _now.joined_since(_board(), hwnd, float(since))
+                joined = _joined_after(_now.call_state(_board(), hwnd), float(since))
             except Exception:  # noqa: BLE001 - can't tell: nothing said
                 joined = None
             self._emit_log("brain_join_after_act", verb=call.tool, joined=joined is True)
@@ -2440,22 +2461,22 @@ class Executor:
             pass
 
     def _note_switch(self, call: Call) -> None:
-        """morning21 C8: a capability run whose app means slot came from their words, right after Yuki's own newest
-        earlier act (:func:`last_steps`, within ``prefs.CORRECTION_S``: this conversation) was in another app of that
-        kind, is their correction of that act: ``prefs.note_switch`` writes ``corrected`` for the app they named and
-        ``rejected`` for the one Yuki used, under the capability's preference key for these values (the run's own
-        ``skill_runs`` row, found by this request's id, says the slot came from their words). On a short-lived thread
-        (one bounded memory call), logged content-free (``pref_write source=correction``). Never raises."""
+        """morning21 C8: a capability run whose app means slot came from their words, right after Yuki's own earlier
+        act on the same thing (:func:`last_steps`, within ``prefs.CORRECTION_S``: this conversation; an address it
+        opened on the run's own site, fix round review M-3) was in another app, is their correction of that act:
+        ``prefs.note_switch`` writes ``corrected`` for the app they named and ``rejected`` for the one Yuki used, under
+        the capability's preference key for these values (the run's own ``skill_runs`` row, found by this request's id,
+        says the slot came from their words). On a short-lived thread (one bounded memory call), logged content-free
+        (``pref_write source=correction``). Never raises."""
         try:
             from yuki.brain.plan import skill_family
             from yuki.skills import prefs
 
             previous = last_steps(prefs.CORRECTION_S)
-            steps = [s for s in (previous or {}).get("steps") or () if isinstance(s, Mapping)]
-            app = _way_app(steps)
-            if not app:
-                return
-            verb = next((str(s.get("verb") or "") for s in reversed(steps) if words(s.get("app"))), "")
+            steps = [dict(s) for s in (previous or {}).get("steps") or () if isinstance(s, Mapping)]
+            if not any(str(s.get("verb") or "") in prefs.ADDRESS_VERBS and words(s.get("app")) and s.get("value")
+                       for s in steps):
+                return   # no page Yuki opened in an app: nothing it did can be the same thing
             key, slots = consent.skill_input(call, self.head)
             sk = util.skill(key)
             if sk is None or not any(getattr(s, "role", "") == "means" and getattr(s, "type", "") == "app"
@@ -2478,8 +2499,7 @@ class Executor:
                                                                      or skill_family(r[1]) == family)), None)
                 if not run_key:
                     return []
-                return prefs.note_switch(store, sk, values=values, previous_app=app, previous_verb=verb,
-                                         run_key=run_key, quote=quote)
+                return prefs.note_switch(store, sk, values=values, previous=steps, run_key=run_key, quote=quote)
 
             def job() -> None:
                 try:

@@ -50,17 +50,18 @@ LOOK_TOOL: dict[str, Any] = {
 MEMORY_TOOL: dict[str, Any] = {
     "name": "memory",
     "description": (
-        "Memory, dated, with sources. recall: facts matching query (since, until; with_time_use). "
+        "Memory of the user, dated, with sources. recall: facts matching query (since, until; with_time_use). "
         "activity: time per app, site or page (group_by) in since..until. calls: calls and voice chats; "
         "call_timeline: one call (call:16) in timed stretches, words for exact words, who spoke. threads: their work "
         "threads (action, query, thread). before: what came before a moment or break (at, event, minutes). links: "
-        "pages open and links shared. people: a person (name), where they talk, the user's last messages."
+        "pages open and links shared. people: a person (name), where they talk, the user's last messages to them. "
+        "skills: what Yuki can do."
     ),
     "input_schema": _obj(
         {
             "kind": {"type": "string", "enum": list(MEMORY_KINDS)},
             "query": {"type": "string"},
-            "since": {"type": "string", "description": "Local ISO date or time."},
+            "since": {"type": "string", "description": "Local ISO date or date-time."},
             "until": {"type": "string"},
             "app": {"type": "string"},
             "with_time_use": {"type": "boolean"},
@@ -83,7 +84,8 @@ MEMORY_TOOL: dict[str, Any] = {
 
 FETCH_TOOL: dict[str, Any] = {
     "name": "fetch",
-    "description": "Read a web page (url) or a text file on this PC (path, from start_line) in the background.",
+    "description": "Read a web page (url) or a text file on this PC (path, from start_line) in the background; "
+                   "nothing opens.",
     "input_schema": _obj({"url": {"type": "string"}, "path": {"type": "string"},
                           "start_line": {"type": "integer"}}),
 }
@@ -108,7 +110,7 @@ BRAIN_REMEMBER_KINDS: dict[str, str] = {**REMEMBER_KINDS, "how": "remember_how"}
 REMEMBER_TOOL: dict[str, Any] = {
     "name": "remember",
     "description": (
-        "Keep what they said, in their words. rule: a standing instruction (text). forget_rule: drop one (text: "
+        "Keep what the user said, in their words. rule: a standing instruction (text). forget_rule: drop one (text: "
         "its id). correct: their correction of a fact. todo: action add|done|not_needed|wrong|list, text, due. watch: "
         "action add|list|cancel, condition, quote (their exact words), repeat, days, request. answer: their reply to "
         "Yuki's question (question, outcome, answer exactly). usual: text slot=option from the skill's result, answer "
@@ -134,27 +136,42 @@ REMEMBER_TOOL: dict[str, Any] = {
 }
 
 
-def _brain_tool(tool: Mapping[str, Any], *, kinds: Any, sentence: str,
-                extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """morning21 C2/C4: a shared tool as the planner's block carries it: its ``kind`` enum ``kinds``, ``sentence``
-    after its description, ``extra`` properties after ``text`` (or at the end). The shared one is never changed."""
+def _brain_tool(tool: Mapping[str, Any], *, kinds: Any = None, sentence: str = "", description: str | None = None,
+                fields: Mapping[str, Any] | None = None, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """morning21 C2/C4: a shared tool as the planner's block carries it: ``description`` in place of its own (fix
+    round, review L-4: the planner's shorter text, so the shared one the ONE agent reuses keeps its words), then
+    ``sentence``; its ``kind`` enum ``kinds``; ``fields`` replacing those properties' specs; ``extra`` properties
+    after ``text`` (or at the end). The shared one is never changed."""
     schema = dict(tool["input_schema"])
     props: dict[str, Any] = {}
     for name, spec in dict(schema["properties"]).items():
-        props[name] = {**spec, "enum": list(kinds)} if name == "kind" else spec
+        spec = dict((fields or {}).get(name) or spec)
+        props[name] = {**spec, "enum": list(kinds)} if name == "kind" and kinds is not None else spec
         if name == "text" and extra:
             props.update(extra)
     if extra and "text" not in props:
         props.update(extra)
-    return {**dict(tool), "description": f"{tool['description']} {sentence}",
-            "input_schema": {**schema, "properties": props}}
+    text = " ".join(p for p in (str(tool["description"] if description is None else description), sentence) if p)
+    return {**dict(tool), "description": text, "input_schema": {**schema, "properties": props}}
 
 
-#: The planner's ``memory`` (morning21 C2: and ``knowhow``) and ``remember`` (C4: and ``how``) tools.
+#: The planner's ``memory`` (morning21 C2: and ``knowhow``), ``fetch`` and ``remember`` (C4: and ``how``) tools, their
+#: descriptions shortened for the room within :data:`SCHEMA_CHARS` (the menu block says what Yuki can do).
 BRAIN_MEMORY_TOOL: dict[str, Any] = _brain_tool(
-    MEMORY_TOOL, kinds=BRAIN_MEMORY_KINDS, sentence="knowhow: how it's done on this PC (query, app).")
+    MEMORY_TOOL, kinds=BRAIN_MEMORY_KINDS, sentence="knowhow: how it's done on this PC (query, app).",
+    description="Memory, dated, with sources. recall: facts matching query (since, until; with_time_use). "
+                "activity: time per app, site or page (group_by) in since..until. calls: calls and voice chats; "
+                "call_timeline: one call (call:16) in timed stretches, words for exact words, who spoke. threads: "
+                "their work threads (action, query, thread). before: what came before a moment or break (at, event, "
+                "minutes). links: pages open and links shared. people: a person (name), where they talk, the user's "
+                "last messages.",
+    fields={"since": {"type": "string", "description": "Local ISO date or time."}})
+BRAIN_FETCH_TOOL: dict[str, Any] = _brain_tool(
+    FETCH_TOOL, description="Read a web page (url) or a text file on this PC (path, from start_line) in the "
+                            "background.")
 BRAIN_REMEMBER_TOOL: dict[str, Any] = _brain_tool(
     REMEMBER_TOOL, kinds=BRAIN_REMEMBER_KINDS, sentence="how: how they do something on this PC (text, app).",
+    description=str(REMEMBER_TOOL["description"]).replace("Keep what the user said,", "Keep what they said,", 1),
     extra={"app": {"type": "string"}})
 
 #: The six tool names, in block order (the order is part of the cached prefix).
@@ -174,7 +191,7 @@ def plan_tool() -> dict[str, Any]:
 def tool_params(*, streamed: bool, eager: bool = True) -> list[dict[str, Any]]:
     """The ``tools`` parameter: the six tools, in a fixed order. ``eager_input_streaming`` on every tool only when the
     call is streamed and ``eager`` (a non-streamed call never carries it: design 10.2)."""
-    tools = [plan_tool(), dict(LOOK_TOOL), dict(BRAIN_MEMORY_TOOL), dict(FETCH_TOOL), dict(ASK_USER_TOOL),
+    tools = [plan_tool(), dict(LOOK_TOOL), dict(BRAIN_MEMORY_TOOL), dict(BRAIN_FETCH_TOOL), dict(ASK_USER_TOOL),
              dict(BRAIN_REMEMBER_TOOL)]
     if streamed and eager:
         for tool in tools:

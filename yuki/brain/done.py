@@ -40,6 +40,7 @@ at two fixed moments, never a polling loop, never past the budget (1.5 s for a s
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -707,12 +708,17 @@ def _power_word(value: Any) -> str:
 
 
 def _level(value: Any) -> float | None:
+    """A level as a number (0-100), a trailing percent sign allowed (a format, ``"50%"``); ``None`` when it isn't
+    one."""
     if isinstance(value, bool) or value is None:
         return None
+    if isinstance(value, str):
+        value = value.strip().removesuffix("%").strip()
     try:
-        return float(value)
+        got = float(value)
     except (TypeError, ValueError):
         return None
+    return got if math.isfinite(got) else None
 
 
 def _monitor_said(row: Mapping[str, Any], *, brightness: bool, power: bool) -> str:
@@ -734,10 +740,18 @@ def probe_display(args: dict[str, Any], env: ProbeEnv) -> tuple[bool | None, dic
     monitor control through lane B's ``yuki.skills.display_route.read(target)`` (contract K2: one dict per monitor
     the target names, ``name, role, brightness, power, ok, why``). ``monitor``: the target as the plan names it (a
     name, ``main``, ``second``, ``all``), resolved by the driver. True when every monitor read is as asked; False when
-    one that answered is not; ``None`` when none could be read (or the driver is not there). With neither brightness
+    one that answered is not; ``None`` when none could be read (or the driver is not there), or when a brightness or
+    power is given in a form it can't read (``bad_args``: never "any monitor that answers"). With neither brightness
     nor power given, a monitor that answers counts. Evidence: counts, and the monitors as read for the line (RAM
     only). Never raises."""
     del env
+    want_level = _level(args.get("brightness"))
+    want_power = _power_word(args.get("power")) if args.get("power") not in (None, "") else ""
+    if (args.get("brightness") not in (None, "") and want_level is None) or (args.get("power") not in (None, "")
+                                                                            and not want_power):
+        # fix round (review M-2): a level or a power state given in a form this probe can't read is never "any
+        # monitor that answers": unread, so the request is not reported done on a read that checked nothing asked
+        return None, {"status": "bad_args"}
     try:
         from yuki.skills import display_route  # type: ignore[attr-defined]
 
@@ -753,8 +767,6 @@ def probe_display(args: dict[str, Any], env: ProbeEnv) -> tuple[bool | None, dic
         return None, {"status": "error", "error_kind": type(exc).__name__}
     if not rows:
         return None, {"status": "no_monitor"}
-    want_level = _level(args.get("brightness"))
-    want_power = _power_word(args.get("power")) if args.get("power") not in (None, "") else ""
     tolerance = _level(args.get("tolerance"))
     tolerance = DISPLAY_TOLERANCE if tolerance is None else abs(tolerance)
     verdicts: list[bool | None] = []
