@@ -222,9 +222,13 @@ _PLACE = {"type": "string", "description": "\"other\" or a monitor's number, for
 #: ``run_skill``'s slots (the talker's words, shorter: picks are the prompt's). final-G2 E1 (contract K-H, writer side):
 #: a real name the model read from a misheard word of theirs carries the run's note ``from`` as a slot -> ``heard`` map
 #: inside the slots (``skills.engine.note_args`` takes it out for every origin; ONE's runner passes only ``slots`` on, so
-#: a top-level ``from`` would be lost); a pick for what they only described carries none and stays code's guess.
-_SLOTS = {"type": "object", "description": "From their words (a misheard name: also \"from\": {\"<slot>\": \"heard\"}); "
-                                           "a pick left to you: choose true, context; the rest left out."}
+#: a top-level ``from`` would be lost). A name the model chose for what they only described is tagged ``card`` in the
+#: same map (ge fix F1): untagged, a name the slot's menu lists reads as their own word (``resolve.py`` step 1,
+#: ``FROM_MENU`` -> ``FROM_WORDS``); tagged, ``_given_source`` makes it ``FROM_CARD``, a guess the done line names.
+#: "The rest left out" is ONE's Skills paragraph's own words (``one/prompt.py``), so it is not repeated here.
+_SLOTS = {"type": "object", "description": "From their words (a misheard name: also \"from\": {\"<slot>\": \"heard\"}; "
+                                           "a name you chose for a description: \"card\"); a pick left to you: "
+                                           "choose true, context."}
 
 KEEP_USUAL_TOOL = _tool("keep_usual", "Their answer to \"Keep this as your usual?\".",
                         {"answer": {"type": "string", "enum": ["yes", "just_this_time"]}}, ["answer"])

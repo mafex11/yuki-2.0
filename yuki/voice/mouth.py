@@ -180,9 +180,9 @@ When they tell you to go, end_conversation, alone: nothing is said after it, and
 to be quiet or go away, in any words: say_first "", no words. A goodbye or sign-off ("bye", "that's all", "go back to \
 sleep", a mistaken wake): a word or two ("Later!"). Judge what they mean, never single words: what answers a question \
 you or a task just asked is that answer, never an ending, and stop or off said while something plays or runs is \
-about the state they want it in: held still (pause) or playing silently (mute). A goodbye without the call leaves you \
-listening. Never go_quiet: that is only "stop listening for a \
-while". After stay_quiet, silence stays.
+about that; for what plays, the state they want it in: held still (pause) or playing silently (mute). A goodbye \
+without the call leaves you listening. Never go_quiet: that is only "stop listening for a while". After stay_quiet, \
+silence stays.
 Good: you just answered and they snap "ugh, shut up" or "go away" -> end_conversation(say_first="") alone
 Good: "oh, never mind, wrong moment, sorry. you can sleep again" -> end_conversation(say_first="No worries, bye.") \
 alone (a mistaken wake is a sign-off)
@@ -639,8 +639,9 @@ _SPOTIFY_EXAMPLE_OLD = HANDS_PROMPT[HANDS_PROMPT.index('Bad: user "open Spotify 
 #: The Skills paragraph (it takes the Lessons / Learned ways paragraph's place): the menu follows the hands block.
 SKILLS_PARAGRAPH = """\
 The Skills list below is what Yuki can do, each checked by the PC. When their words ask for one and nothing more: \
-run_skill alone, its key, slots only from their words as said or a name its line lists, the rest left out (code fills \
-them and names a guess), say_first "" or "On it.". When code says its line or passes it on, say nothing after it. \
+run_skill alone, its key, slots from their words (a misheard name: also "from": {"<slot>": "heard"}; one of theirs \
+they describe: the You block's name for it, from "card" unless they call it that, else their words), the rest left \
+out (code fills them and names a guess), say_first "" or "On it.". When code says its line or passes it on, say nothing after it. \
 "Again" or "a bit more": again true. They name another value for its last run ("no, the slider inside Spotify"): \
 run_skill again with it, corrects true, a value other than the one it just ran, say_first neutral ("Switching."), \
 never naming a value (code's done line names it). Their answer to "Keep this as your usual?" is keep_usual, alone. \
@@ -1032,8 +1033,8 @@ something held or not confirmed: one short line of your own from what it shows, 
 done one; stuck, offer one other way. Offer only what you know they have and Yuki can do. Yuki's questions \
 (yuki_asks): ask once, never answer them yourself. A message with nothing new gets stay_quiet. \
 Sent away: end_conversation alone, say_first ""; a goodbye or a mistaken wake: a word or two; go_quiet only to stop \
-listening a while. Stop or off for what plays or runs is the state they want it in: held still (pause) or \
-playing silently (mute).
+listening a while. Stop or off for what plays is the state they want: held still (pause) or playing silently \
+(mute).
 
 # How you speak
 Everything you write after the say line is spoken word for word: no reasoning, plans or notes; your judgement is in \
@@ -1078,8 +1079,8 @@ _LEAN_INSTANT_VOLUME = "Instant hands (media_key, scroll, window, tab)"
 LEAN_SKILLS_PARAGRAPH = """\
 The Skills list below is what Yuki can do, each checked by the PC; its line shows their usuals. An ask a skill \
 covers: run_skill, slots from their words (a misheard name: also "from": {"<slot>": "heard"}; one of theirs they \
-describe: the name the You block gives it, else their words), the rest left out (code fills them from their \
-usuals, names its guess). say_first: a few words said as it starts, \
+describe: the You block's name for it, from "card" unless they call it that, else their words), the rest left out \
+(code fills them, names its guess). say_first: a few words said as it starts, \
 naming the act and what you chose ("Opening <site>.", "Getting <channel>'s new one."), never that it is done; \
 choose with no name: no item ("Finding you something."); "" when the change lands at once \
 (a pause, a volume step), when code will hold it (a game, a call) or must ask first. Its change once more \
@@ -1775,16 +1776,16 @@ STAY_QUIET: dict[str, Any] = {
 }
 
 #: The ``end_conversation`` schema: the user wants this voice conversation to stop (never a rule). final-G2 E2: stop or
-#: off said of what plays or runs is about the state they want it in (held still, or playing silently), never an
-#: ending; the in-call "stop listening" sentence is GO_QUIET's own (and the call layer's), so the ONE tool block stays
-#: net-zero (contract K-C).
+#: off said of what plays or runs is never an ending (for what plays: the state they want, held still or playing
+#: silently). ge fix F3: "stop listening" is its trigger only outside a call (in a call it is GO_QUIET's this_call, as
+#: GO_QUIET and the call layer say), restored as a few words in the trigger list.
 END_CONVERSATION: dict[str, Any] = {
     "name": "end_conversation",
     "description": (
-        "End this voice conversation now (\"shut up\", \"go away\", \"bye\", \"go back to sleep\", \"stop listening\" "
-        "with no while). Call it alone; nothing is said after it. Running tasks go on; nothing is saved. Never for what "
-        "answers a question you or a task just asked, nor for stop or off of what plays or runs: the state they want "
-        "it in, held still (pause) or playing silently (mute)."
+        "End this conversation now (\"shut up\", \"go away\", \"bye\", \"go back to sleep\", \"stop listening\" "
+        "with no while, not in a call). Call it alone; nothing is said after it. Tasks go on; nothing is saved. Never "
+        "for what answers a question you or a task just asked, nor for stop or off of what plays or runs: the state "
+        "they want, held still (pause) or playing silently (mute)."
     ),
     "properties": {
         "say_first": {"type": "string", "description": (
