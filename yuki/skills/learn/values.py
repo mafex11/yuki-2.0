@@ -4,7 +4,7 @@ A capability's occasions make ONE learned record per capability (its ``<capabili
 user used in its value slot (the sites they open, the meeting services whose tab they bring forward, the playlists
 they play) are data on that record, never skills of their own. Each value carries:
 
-* ``id`` - a keyed digest of the value (stable across passes; the Playbook's handle; never the value itself);
+* ``id`` - a keyed digest of the value (stable across passes; never the value itself);
 * ``slot`` / ``value`` / ``label`` / ``name`` - the slot it fills, the value as the occasions carried it, its label
   from data (a site's dominant host, else the value: what a request passes for it) and its name (the label, or the
   user's Rename);
@@ -38,7 +38,7 @@ Public::
     known(store, capability=None, *, now=None) -> {cap: [value dicts]}   # RAM-cached by the learned + prefs version
     with_prefs(store, {cap: [values]}) -> same, a preference slot's usual from the preference
     ranked(values, now) -> [value dicts]                          # recency-weighted, this hour first
-    mark(store, capability, value_id, action, words="") -> dict   # the Playbook's Rename / Not mine / This is work
+    mark(store, capability, value_id, action, words="") -> dict   # Rename / Not mine / This is work
     routine_value(store, key) / routine_slots(store, key) / routine_offerable(value) / value_onsets(store, key, ...)
 """
 
@@ -62,7 +62,7 @@ USUAL_SHARE = 0.7
 MAX_VALUES = 60
 #: Recency half-life for ranking (days).
 HALF_LIFE_DAYS = 10.0
-#: The marks the user can set (the Playbook).
+#: The marks a value can carry (set from the Playbook before 21 Oct; still honoured).
 MARKS = ("not_mine",)
 #: A value's fields that are the user's say (or the naming call's work verdict): kept in the record's ``marks``.
 MARK_FIELDS = ("name", "named_by", "everyday", "mark")
@@ -333,8 +333,8 @@ def known(store: Any, capability: str | None = None, *, now: float | None = None
 
 
 def all_values(store: Any, capability: str | None = None) -> dict[str, list[dict[str, Any]]]:
-    """Every value as stored, the marked ones too (the Playbook shows and un-marks them), a preference slot's
-    ``usual`` read from the preference (:func:`with_prefs`). Never raises."""
+    """Every value as stored, the marked ones too, a preference slot's ``usual`` read from the preference
+    (:func:`with_prefs`). Never raises."""
     try:
         return with_prefs(store, {
             cap_key: [v for v in spec.get("values") or [] if isinstance(v, dict) and v.get("id")]
@@ -344,10 +344,10 @@ def all_values(store: Any, capability: str | None = None) -> dict[str, list[dict
 
 
 def mark(store: Any, capability: str, vid: str, action: str, words: str = "") -> dict[str, Any]:
-    """The user's say over one value (the Playbook): ``rename`` (``words`` become its name, kept by every later pass),
-    ``not_mine`` (left off the menu, cards and the you-card), ``work`` (``everyday`` False: resolved on request, never
-    offered), ``everyday`` (``everyday`` True), ``restore`` (the mark lifted). One write on the record's spec. Never
-    raises."""
+    """The user's say over one value (no window button since 21 Oct): ``rename`` (``words`` become its name, kept by
+    every later pass), ``not_mine`` (left off the menu, cards and the you-card), ``work`` (``everyday`` False: resolved
+    on request, never offered), ``everyday`` (``everyday`` True), ``restore`` (the mark lifted). One write on the
+    record's spec. Never raises."""
     action = str(action or "").strip()
     if action not in ("rename", "not_mine", "work", "everyday", "restore"):
         return {"ok": False, "error": "That isn't something the Playbook can do to a thing of yours."}
