@@ -1,15 +1,13 @@
-/* Playbook buttons (audit 17 Oct; pages/playbook.js draws the rows): on a thing of yours (a site, a tab, a playlist:
-   ref value:<capability>:<id>) Rename, Not mine / Restore, This is work / Not work; on a way of yours (ref skill:<id>)
-   Rename and Delete (verb forget). Delete on a way is final, so it waits 10 s for an Undo (as Forget does elsewhere);
-   Not mine on a thing is undone with Restore, so it acts at once. Every choice goes to memory's own skill_edit through
-   Python (the button as `verb`); nothing here edits memory. */
+/* Playbook buttons (audit 17 Oct; pages/playbook.js draws the rows): on a way of yours (ref skill:<id>) Rename and
+   Delete (verb forget). Delete is final, so it waits 10 s for an Undo (as Forget does elsewhere). Your own things
+   (sites, tabs, playlists) have no buttons here any more: the page no longer lists them (21 Oct, your ask). Every
+   choice goes to memory's own skill_edit through Python (the button as `verb`); nothing here edits memory. */
 (function () {
   'use strict';
   const Y = window.Yk, { h, ic, key } = Y;
   const UNDO_S = 10;
 
   const rowOf = (t) => t.closest('[data-thing]');
-  const isValue = (row) => String(row.dataset.ref || '').startsWith('value:');
   function act(row, verb, words) {
     return Y.act('skill_edit', { ref: row.dataset.ref, verb, words: words || '' });
   }
@@ -54,12 +52,6 @@
     });
   };
 
-  /* a thing's marks: at once (Restore / Not work undo them) */
-  const mark = (verb, words) => (t) => { const row = rowOf(t); if (row) act(row, verb).then((r) => done(row, r, words)); };
-  Y.actions['thing-work'] = mark('work', 'Marked as work: Yuki does it when you ask, and never offers it.');
-  Y.actions['thing-everyday'] = mark('everyday', 'Not work: Yuki may offer it at your usual time.');
-  Y.actions['thing-restore'] = mark('restore', 'Back in: it’s yours again.');
-
   /* a final choice on a learned row (a way): after 10 s for an Undo, then memory's skill_edit with `verb` */
   function later(row, verb, words) {
     let n = UNDO_S;
@@ -77,15 +69,9 @@
     }, 1000);
   }
 
-  /* Not mine: a thing at once (Restore undoes it); a way after 10 s for an Undo (final) */
-  Y.actions['thing-notmine'] = (t) => {
-    const row = rowOf(t); if (!row || row.__forget || row.classList.contains('editing')) return;
-    if (isValue(row)) { act(row, 'not_mine').then((r) => done(row, r, 'Not yours: left out. Restore brings it back.')); return; }
-    later(row, 'not_mine', 'Not yours: I’ll leave it out.');
-  };
   /* Delete a way of yours: after 10 s for an Undo; the learner never brings it back */
   Y.actions['thing-delete'] = (t) => {
-    const row = rowOf(t); if (!row || row.__forget || row.classList.contains('editing') || isValue(row)) return;
+    const row = rowOf(t); if (!row || row.__forget || row.classList.contains('editing')) return;
     later(row, 'forget', 'Deleting this way: Yuki won’t learn it again.');
   };
   Y.actions['thing-undo'] = (t) => {

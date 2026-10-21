@@ -108,7 +108,7 @@ Practice memory (migration 29, yuki.memory.practice; its learners were retired b
     memory.workflows() -> dict                           # practice ways for the run card's chips
     memory.workflow_edit(ref, "save" | "edit" | "disable" | "enable" | "forget", words="") -> dict
     memory.playbook() -> dict                            # the window's Playbook page (audit 17 Oct)
-    memory.skill_edit("value:<cap>:<id>" | "skill:N", action, words="") -> dict   # the Playbook's buttons
+    memory.skill_edit("skill:N", action, words="") -> dict   # the Playbook's buttons (a way's Rename / Delete)
     memory.you_card(purpose="talker" | "planner" | "judge") -> str   # what Yuki knows about the user (contract C1)
     memory.run_ledger(since=None, until=None) -> list[dict]   # what Yuki did: requests and their acting steps
 
@@ -4692,9 +4692,9 @@ class MemoryClient:
 
     def playbook(self) -> dict:
         """The Yuki window's Playbook page (audit 17 Oct; :func:`yuki.skills.playbook.page`): ``can_do`` (the
-        capabilities, one line each, with how often the user used each), ``things`` (what Yuki knows the user uses, by
-        kind: each value with how often, when and in which app, and the taste names read-only), ``routines`` (with
-        the card each leads to) and ``ways`` (the user's own ways, contract C4). Never raises."""
+        capabilities, one line each, with how often the user used each), ``routines`` (with the card each leads to)
+        and ``ways`` (the user's own ways, contract C4). The user's own things (sites, playlists, channels) are not on
+        it (21 Oct, the user's ask): they stay Yuki's internal understanding. Never raises."""
         from yuki.skills.playbook import page
 
         try:
@@ -4703,11 +4703,10 @@ class MemoryClient:
             return {"available": False, "error": type(exc).__name__}
 
     def skill_edit(self, ref: Any, action: str, words: str = "") -> dict:
-        """The user's say on the Playbook page (:func:`yuki.skills.playbook.skill_edit`): on a thing of theirs
-        (``value:<capability>:<id>``) ``rename``, ``not_mine``, ``work`` (never offered), ``everyday`` or ``restore``;
-        on a learned row (``skill:N``: a way of theirs, a routine's anchor) ``rename``, ``forget`` or ``not_mine``. One
-        small write, never a model call and never a hand edit; the catalog and the menu follow on their next load.
-        Never raises."""
+        """The user's say on the Playbook page (:func:`yuki.skills.playbook.skill_edit`): on a learned row
+        (``skill:N``: a way of theirs, a routine's anchor) ``rename``, ``forget`` or ``not_mine``; any other ref is
+        refused in plain words. One small write, never a model call and never a hand edit; the catalog and the menu
+        follow on their next load. Never raises."""
         from yuki.skills.playbook import skill_edit
 
         try:

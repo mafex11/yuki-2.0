@@ -1428,7 +1428,7 @@ class WebWindow:
         # a one-call test. Written here (ai.json, the DPAPI key file): no tray needed, every process follows
         "ai_role": "a_ai_role", "ai_key": "a_ai_key", "ai_custom": "a_ai_custom", "ai_models": "a_ai_models",
         "ai_test": "a_ai_test",
-        # the Playbook: the user's say on a thing of theirs or a learned row (Rename, Not mine, work, everyday, Restore)
+        # the Playbook: the user's say on a learned row, a way of theirs (Rename, Delete)
         "skill_edit": "a_skill_edit",
         # the card judge (jSwitch merge note): a Today line's Open / Not useful, and Settings' card kinds
         "digest_line": "a_digest_line", "card_kind": "a_card_kind",
@@ -1843,11 +1843,11 @@ class WebWindow:
                 "queued": bool(result.get("queued"))}
 
     def a_skill_edit(self, m: dict[str, Any]) -> dict[str, Any]:
-        """Playbook: the user's say on a thing of theirs (Rename / Not mine / This is work / Not work / Restore) or on a
-        learned row (Rename / Forget this / Not mine), through memory's own ``skill_edit`` (one write on its row, no
-        model). The page sends the button as ``verb``."""
+        """Playbook: the user's say on a learned row, a way of theirs (Rename, or Delete as ``forget``; ``not_mine`` as
+        memory takes it), through memory's own ``skill_edit`` (one write on its row, no model). The page sends the
+        button as ``verb``. The user's own things have no buttons any more (21 Oct): the page no longer lists them."""
         verb = str(m.get("verb") or "")
-        if verb not in ("rename", "forget", "not_mine", "work", "everyday", "restore"):
+        if verb not in ("rename", "forget", "not_mine"):
             return {"ok": False, "error": "Unknown choice."}
         r = self._memory_op("skill_edit")(str(m.get("ref") or ""), verb,
                                           " ".join(str(m.get("words") or "").split())) or {}

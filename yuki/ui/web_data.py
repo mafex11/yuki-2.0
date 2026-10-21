@@ -1804,9 +1804,10 @@ SHOWN_KINDS = ("procedure", "habit", "style", "question")
 
 def build_playbook(memory: Any) -> dict[str, Any]:
     """The Playbook page (audit 17 Oct, learning.md §9.4): memory's ``playbook()`` (``yuki.skills.playbook.page``):
-    what Yuki can do (``can_do``), what it knows the user uses (``things``, by kind, with Rename / Not mine / This is
-    work), the routines with the card each leads to (``routines``), the user's own ways (``ways``); then the standing
-    rules and requests. The old practice sections (procedures, proposals, lessons) are gone from the page."""
+    what Yuki can do (``can_do``), the routines with the card each leads to (``routines``), the user's own ways
+    (``ways``); then the standing rules and requests. The user's own things (sites, playlists, channels) are not sent
+    (21 Oct, the user's ask): they stay Yuki's internal understanding. The old practice sections (procedures,
+    proposals, lessons) are gone from the page."""
     playbook = getattr(memory, "playbook", None)
     pb = _safe(playbook, {}) if callable(playbook) else {}
     pb = pb if isinstance(pb, dict) else {}
@@ -1817,8 +1818,8 @@ def build_playbook(memory: Any) -> dict[str, Any]:
         if text:
             standing.append({"ref": r.get("ref"), "text": text, "since": short_day(epoch_of(r.get("created_at")))})
     return {"available": bool(pb.get("available")), "can_do": list(pb.get("can_do") or []),
-            "things": list(pb.get("things") or []), "routines": list(pb.get("routines") or []),
-            "ways": list(pb.get("ways") or []), "rules": rules, "standing": standing}
+            "routines": list(pb.get("routines") or []), "ways": list(pb.get("ways") or []), "rules": rules,
+            "standing": standing}
 
 
 # -- Activity ------------------------------------------------------------------------------------------------------
@@ -2465,7 +2466,7 @@ PAGE_TABLES: dict[str, tuple[str, ...]] = {
     "work": ("timeline", *TODO_TABLES, "work_items", "messages"),
     "day": ("timeline", "calls"),
     "me": ("contacts", "portraits", "portrait_facts", "conversation_facts", "journal"),
-    "playbook": ("skills", "routines", "tastes", "standing_requests", "conversation_facts"),
+    "playbook": ("skills", "routines", "standing_requests", "conversation_facts"),
     "activity": ("runs", "nudges", "todos", "calls", "timeline"),
     "shell": ("questions",),
 }

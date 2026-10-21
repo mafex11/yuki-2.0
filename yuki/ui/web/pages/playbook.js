@@ -1,12 +1,11 @@
-/* Playbook (audit 17 Oct, learning.md §9.4): what Yuki can do, what it knows you use, your routines, your own ways,
-   then your standing rules. Four sections from memory's playbook() (yuki.skills.playbook.page), said plainly:
+/* Playbook (audit 17 Oct, learning.md §9.4): what Yuki has learned about how you do things. Three sections from
+   memory's playbook() (yuki.skills.playbook.page), said plainly, then your standing rules:
    - What Yuki can do: the built-in skills, one line each, with how often you used each;
-   - What Yuki knows you use: your things by kind (sites, meeting tabs, playlists...), each with how often, when and
-     which app, and Rename / Not mine / This is work (Not work on a work one); the channels and playlists you pick
-     are listed read-only;
    - Your routines: when, how sure, and the card each leads to;
-   - Your own ways: the multi-step things Yuki learned from you, with how it learned each, your things in it (your
-     projects) and Rename / Delete (gone for good); never offered; a plain empty state until then.
+   - Your own ways: the multi-step things Yuki learned from you, with how it learned each and Rename / Delete (gone
+     for good); never offered; a plain empty state until then.
+   Your own things (the sites, tabs, playlists and channels you use, a way's projects) are not listed (21 Oct, your
+   ask): they are Yuki's own understanding of you, kept in memory for it to reason with, not a catalog to look through.
    The buttons live in pages/skills.js and go to memory's own skill_edit through Python; nothing here edits memory.
    The old practice sections (procedures, proposals, lessons) are gone from the page. */
 (function () {
@@ -18,29 +17,6 @@
       h('div', { class: 'c1', text: c.line }), c.used ? h('div', { class: 'c2', text: c.used }) : null);
   }
 
-  function thingRow(t, editable) {
-    const meta = [t.seen, t.when ? 'mostly ' + t.when : '', t.app ? 'in ' + t.app : '', t.last ? 'last ' + t.last : '']
-      .filter(Boolean).join(' · ');
-    const tags = [t.work ? 'work: never offered' : '', t.not_mine ? 'not yours: left out' : '', t.your_name ? 'your name' : '']
-      .filter(Boolean).join(' · ');
-    return h('div', { class: 'proc2' + (t.not_mine ? ' off' : ''), data: editable ? { thing: '', ref: t.ref, name: t.name } : { k: 'n:' + t.name } },
-      h('h4', { text: t.name }),
-      meta ? h('div', { class: 'when', text: meta }) : null,
-      tags ? h('div', { class: 'pmeta' }, h('span', { text: tags })) : null,
-      editable ? h('div', { class: 'acts inline' },
-        key('Rename', { cls: 'xs', data: { do: 'thing-rename' }, title: 'Call it what you call it' }),
-        t.not_mine ? key('Restore', { cls: 'xs ghost', data: { do: 'thing-restore' }, title: 'It is yours after all' })
-          : key('Not mine', { cls: 'xs ghost', data: { do: 'thing-notmine' }, title: 'Leave it out' }),
-        t.work ? key('Not work', { cls: 'xs ghost', data: { do: 'thing-everyday' }, title: 'Yuki may offer it' })
-          : key('This is work', { cls: 'xs ghost', data: { do: 'thing-work' }, title: 'Only when you ask; never offered' })) : null);
-  }
-
-  function thingGroup(g) {
-    const items = g.items || [];
-    return Y.k(Y.sec(g.title, items.length, h('div', { class: 'procs' }, items.map((t) => thingRow(t, !!g.editable))),
-      g.editable ? null : Y.rightLabel('what you pick')), 'things:' + g.key);
-  }
-
   function routineRow(r) {
     return h('div', { class: 'proc2' + (r.state === 'active' ? '' : ' off'), data: { k: 'r:' + r.title + r.when } },
       h('h4', { text: r.title }),
@@ -50,12 +26,10 @@
   }
 
   function wayRow(w) {
-    const things = w.things || [];
     return h('div', { class: 'proc2', data: { thing: '', ref: w.ref, name: w.name } },
       h('h4', null, w.name, w.app ? h('span', { class: 't3', text: ' · in ' + w.app }) : null,
         w.your_name ? h('span', { class: 't3', text: ' · your name' }) : null),
       [w.seen, w.used].filter(Boolean).length ? h('div', { class: 'when', text: [w.seen, w.used].filter(Boolean).join(' · ') }) : null,
-      things.length ? h('div', { class: 'when t2', text: (w.things_title || 'Yours in it') + ': ' + things.join(', ') }) : null,
       h('div', { class: 'acts inline' },
         key('Rename', { cls: 'xs', data: { do: 'thing-rename' }, title: 'Call it what you call it' }),
         key('Delete', { cls: 'xs ghost', data: { do: 'thing-delete' }, title: 'Forget this way for good' })));
@@ -68,17 +42,16 @@
   }
 
   function build(d) {
-    const caps = d.can_do || [], groups = d.things || [], rts = d.routines || [], ways = d.ways || [];
+    const caps = d.can_do || [], rts = d.routines || [], ways = d.ways || [];
     const rules = (d.rules || []).concat((d.standing || []).map((s) => Object.assign({ kind: 'standing' }, s)));
-    const nThings = groups.filter((g) => g.editable).reduce((n, g) => n + (g.items || []).length, 0);
-    const meta = [h('span', { text: 'What Yuki knows about how you do things' }),
-      h('span', null, h('b', { text: nThings }), nThings === 1 ? ' thing of yours, ' : ' things of yours, ',
-        h('b', { text: rts.length }), rts.length === 1 ? ' routine, ' : ' routines, ', h('b', { text: ways.length }),
-        ways.length === 1 ? ' way of yours' : ' ways of yours')];
+    // the figure: everything on the page that is yours (routines, ways, rules), not the built-in skills
+    const nLearned = rts.length + ways.length + rules.length;
+    const meta = [h('span', { text: 'What Yuki has learned about how you do things' }),
+      h('span', null, h('b', { text: rts.length }), rts.length === 1 ? ' routine, ' : ' routines, ',
+        h('b', { text: ways.length }), ways.length === 1 ? ' way of yours, ' : ' ways of yours, ',
+        h('b', { text: rules.length }), rules.length === 1 ? ' standing rule' : ' standing rules')];
     const can = Y.sec('What Yuki can do', caps.length, caps.length ? caps.map(capRow)
       : Y.empty('Nothing loaded yet.'), Y.rightLabel('built in, for anyone'));
-    const know = groups.length ? groups.map(thingGroup)
-      : [Y.sec('What Yuki knows you use', 0, Y.empty('Nothing yet. The sites, playlists and tabs you use on 2 different days land here, with when and in which app.'))];
     const routines = Y.sec('Your routines', rts.length, rts.length ? h('div', { class: 'procs' }, rts.map(routineRow))
       : Y.empty('None yet. When you do the same thing at about the same time on most days, it lands here with the card it leads to.'));
     const own = Y.sec('Your own ways', ways.length, ways.length ? h('div', { class: 'procs' }, ways.map(wayRow))
@@ -86,11 +59,10 @@
     const rulesSec = Y.sec('Standing rules', rules.length, rules.length ? rules.map(ruleRow)
       : Y.empty('No rules yet. Say “always…” or “never…” and it lands here.'));
     // data-k: the blocks' keys for the live patch (app.js patchInto)
-    return [Y.k(Y.head('Playbook', meta, Y.numFig(nThings, nThings === 1 ? 'thing' : 'things')), 'head'),
+    return [Y.k(Y.head('Playbook', meta, Y.numFig(nLearned, 'learned from you')), 'head'),
       Y.k(h('div', { class: 'grid2 pb-grid' },
         h('div', { class: 'col', data: { k: 'left' } }, Y.k(can, 'can')),
         h('div', { class: 'col', data: { k: 'right' } }, Y.k(routines, 'routines'), Y.k(rulesSec, 'rules'))), 'grid'),
-      Y.k(h('div', null, Y.k(h('div', { class: 'sec-h' }, h('div', { class: 'label' }, ic('dash'), 'What Yuki knows you use')), 'know-h'), know), 'know'),
       Y.k(own, 'ways')];
   }
 
