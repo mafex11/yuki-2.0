@@ -112,8 +112,10 @@ ALLOW, ASK, REFUSE, DRAFT = "allow", "ask", "refuse", "draft"
 RESULTS: tuple[str, ...] = (ALLOW, ASK, REFUSE, DRAFT)
 #: The plan's declared commit (``consent.commit``, §2.2).
 COMMITS: tuple[str, ...] = ("none", "send", "join", "lasting")
-#: The commit check's effects (§2.6); every one but ``none`` is lasting.
-EFFECTS: tuple[str, ...] = ("none", "send", "join", "delete", "close", "buy", "setting", "other")
+#: The commit check's effects (§2.6); every one but ``none`` is lasting. ``later`` (A2, Z7): the step leaves something
+#: acting on its own after it returns (a hidden process, a watcher, a job, a scheduled task), refused as final whatever
+#: ``asked`` says.
+EFFECTS: tuple[str, ...] = ("none", "send", "join", "delete", "close", "buy", "setting", "later", "other")
 
 #: What the user is told (code lines; voice-shaped).
 LINE_GAME = "You're in a game: after the round?"
@@ -132,6 +134,9 @@ LINE_TYPED_ENTER = ("typing with Enter here sends what is typed (a chat app's wi
 LINE_LINE_BREAK = ("a line break in the typed text presses Enter, which may send or run it, and the commit check can't "
                    "see it: type the text without the line break and set submit (that Enter is checked), or press "
                    "Enter as its own step")
+#: A2 (Z7): a step that would leave something acting on its own after it returns (the commit check's ``later`` effect).
+#: Refused as final in both brains, whatever their words asked for: Yuki acts only while it works on the request.
+LINE_LATER = "I can't wait for that and do it later; want it now?"
 LINE_NOT_CAPABILITY = "send through the message capability"
 LINE_RECIPIENT = "the step sends to someone other than the plan's recipient"
 #: Planner-facing refusals of a declared send (code facts the planner can fix).
@@ -257,7 +262,9 @@ class Live:
     address each window shows (the Now board's ``windows[].url`` by hwnd), for a caller that read the board already;
     ``None``: :func:`window_page` reads the board itself when a step needs it (typing with Enter outside a chat app's
     program). ``kinds``: the same for the extraction's kind of each window (``windows[].kind``: ``conversation`` for
-    a chat), read by :func:`window_kind`."""
+    a chat), read by :func:`window_kind`. ``own_undo`` (final-G2 R13, A6; gb's contract K-U): the hand measured this
+    key step as the run's own close of what its own shortcut opened, while that very field holds the keyboard
+    (``Hands.own_undo``): undoable, row 6 after rows 1-2, never sent to the commit check as a possible send."""
 
     game: str | None = ""
     calling: frozenset[int] = frozenset()
@@ -270,6 +277,17 @@ class Live:
     now: float = field(default_factory=time.time)
     pages: Mapping[int, str] | None = None
     kinds: Mapping[int, str] | None = None
+    own_undo: bool = False
+
+
+#: A6 (K-U): the steps a run's own undo can be (a key: the app's own close key for what the run's shortcut opened).
+_OWN_UNDO_TOOLS = frozenset({"press", "hotkey"})
+
+
+def own_undo(call: Call, live: Live) -> bool:
+    """A6 (final-G2 R13; gb's contract K-U): this key step is the run's own undo, measured by the hand that runs it
+    (:attr:`Live.own_undo`). Identity facts only."""
+    return bool(live.own_undo) and call.tool in _OWN_UNDO_TOOLS
 
 
 @dataclass(frozen=True)
@@ -1187,8 +1205,10 @@ def policy_holds(call: Call, live: Live, traits: Traits | None = None) -> bool:
 def may_commit(call: Call, live: Live, plan: Any = None) -> bool:
     """Whether the step could send, delete, buy, close, join or otherwise last (§2.5 rows 3-5): its traits destroy or
     reach, it clicks a declared join control, it is a ``run_skill`` that sends or joins, or the user's policy holds one
-    of its kinds. These are the steps the commit check sees."""
+    of its kinds. These are the steps the commit check sees. A run's own undo (:func:`own_undo`) is not one."""
     if call.tool in ("look", "memory", "wait"):
+        return False
+    if own_undo(call, live):
         return False
     if call.tool == "run_skill":
         key, slots = skill_input(call, plan)
@@ -1380,6 +1400,18 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
     gate = _rows_1_2(step, live, traits)
     if gate is not None:
         return gate
+
+    # A6 (final-G2 R13; K-U): the run's own close of what its own shortcut opened, measured while that very field
+    # holds the keyboard (the hand sets it only then): its own undo, row 6, after the game gate and the Act switch.
+    # Never a send by code nor by the commit check: Yuki's unsent text there is the run's own, and it stays unsent.
+    if own_undo(step, live):
+        return Verdict(ALLOW, 6, "own_undo")
+
+    # A2 (Z7): a step that leaves something acting on its own after it returns (a hidden process, a watcher, a job, a
+    # scheduled task: the check's `later` effect, judged from the whole step) is refused as final, whatever `asked`
+    # says. The user's words ask for a result, never for an unattended mechanism; code offers to do it now instead.
+    if effect == "later" and not failed:
+        return Verdict(REFUSE, 5, "later", line=LINE_LATER, final=True)
 
     sk = None
     if step.tool == "run_skill":
@@ -1574,11 +1606,12 @@ def after_ask(verdict: Verdict) -> Verdict:
 
 __all__ = ["UNDOABLE",
            "ALLOW", "ASK", "CHAT_KIND", "COMMITS", "DRAFT", "EFFECTS", "LINE_ASK_SEND", "LINE_DRAFTED", "LINE_GAME",
+           "LINE_LATER",
            "NAME_GAP", "PLAIN_WHY", "REFUSE", "RESULTS", "SAID_SHARE", "SAID_SPAN", "Call", "Live", "Verdict",
            "after_ask", "ask_send_question", "spoken_name", "calling_windows", "chat_window", "check", "draft_slots",
            "failed_question", "field_of", "game_holds", "game_now", "in_words", "is_join_control", "join_controls",
-           "may_commit", "maybe_send_question", "near_duplicate", "person_slot", "plain_why", "plan_consent",
-           "policy_holds",
+           "may_commit", "maybe_send_question", "near_duplicate", "own_undo", "person_slot", "plain_why",
+           "plan_consent", "policy_holds",
            "quote_in_words", "quote_turns", "said_share", "screen_gate", "send_slots", "sends_now", "skill_commit",
            "skill_input", "skill_joins", "skill_sends", "step_traits", "takes_screen", "text_slot", "traits_of",
            "typed_address", "navigates", "waiting_text", "window_kind", "window_page"]

@@ -63,7 +63,9 @@ For each step, by its number:
 send: a message, post, reply or submission reaches other people or a chat thread. join: it joins a call, a meeting \
 or a voice channel. \
 delete: something is removed or overwritten. close: a window, tab, app or session ends. buy: money is spent. \
-setting: a setting or a state of theirs changes (muting is one). other: any other lasting effect, or you can't tell.
+setting: a setting or a state of theirs changes (muting is one). \
+later: the step leaves something on the PC that keeps acting on its own after it returns (a background process, a \
+watcher, a job, a scheduled task, an event subscription). other: any other lasting effect, or you can't tell.
 - asked: true only when their words ask for that very effect. Asking for a result does not ask for every lasting \
 step on the way: lowering a volume is not muting it. A send is asked when they tell Yuki to send it, or to \
 message, tell, ask or reply to someone with what to say in their words. Naming only the person, asking for a draft, \
@@ -229,19 +231,83 @@ def raised_since(hwnd: Any, since: float, *, alive: Callable[[int], bool] | None
 _POINTERS = frozenset({"element", "read", "expect_hwnd", "hwnd", "x", "y"})
 
 
-def memo_key(call: Call, *, typed: bool = False) -> str:
+def memo_key(call: Call, *, typed: bool = False, field: str = "") -> str:
     """A step's identity for the memo: its window, verb, element role and name, a digest of its other input, and
-    whether Yuki's unsent text waits in that window (a key or click there may send it: never the same step)."""
+    whether Yuki's unsent text waits in that window (a key or click there may send it: never the same step), with
+    ``field`` (A5: gb's measured field facts, :func:`_field_tag`) when there are any."""
     rest = {k: v for k, v in (call.input or {}).items() if k not in _POINTERS}
     digest = hashlib.sha1(json.dumps(rest, sort_keys=True, default=str).encode("utf-8", "replace")).hexdigest()[:12]
     # fa (A1): a window Yuki's own step raised over it (or that is that window) is another step than before it came up
     raised = bool(raised_by(call.hwnd)[0]) if call.hwnd else False
-    return json.dumps([int(call.hwnd or 0), call.tool, call.role.casefold(), _clip(call.name, NAME_CHARS).casefold(),
-                       digest, bool(typed), raised], ensure_ascii=False)
+    key = [int(call.hwnd or 0), call.tool, call.role.casefold(), _clip(call.name, NAME_CHARS).casefold(), digest,
+           bool(typed), raised]
+    if typed and field:
+        key.append(field)
+    return json.dumps(key, ensure_ascii=False)
 
 
 #: The steps a waiting unsent text changes: a click, or a key (Enter, ctrl+Enter, a slider's keys) may send it.
 _TYPED_MATTERS = frozenset({"click", "press", "hotkey", "set_slider"})
+
+
+def shell_chars() -> int:
+    """A1 (Z7, review L1): the most characters of a ``run_powershell`` command (whitespace runs folded) that are run
+    and shown to this check whole: ONE's ``one.tools.SHELL_CHARS`` (read, never moved), the one cap both brains share.
+    The brain executor refuses a longer command before any check, as ONE's gate does; :func:`step_line` shows a
+    command up to it, so the check never judges a cut command. :data:`VALUE_CHARS` when ONE's tools can't be read."""
+    try:
+        from yuki.one.tools import SHELL_CHARS
+
+        return int(SHELL_CHARS)
+    except Exception:  # noqa: BLE001 - the shared cap unreadable: this check's own clip
+        return VALUE_CHARS
+
+
+def typed_field(target: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """gb's contract K-T as the step line reads it (A5, final-G2 R13): from the facts a hand gave for a step
+    (``typed_field`` ``{"window", "native", "role", "name"}``, ``typed_field_held``, ``typed_to_field``), the field
+    Yuki's unsent text waits in and whether this step goes to it, measured by that hand's focus read. ``None`` when
+    the facts are absent or ``typed_to_field`` is unknown: the step line then says what it says today (the window-wide
+    line). Facts only, never words."""
+    if not isinstance(target, Mapping):
+        return None
+    field = target.get("typed_field")
+    to = target.get("typed_to_field")
+    if not isinstance(field, Mapping) or not isinstance(to, bool):
+        return None
+    held = target.get("typed_field_held")
+    return {"role": " ".join(str(field.get("role") or "").split()),
+            "name": " ".join(str(field.get("name") or "").split()),
+            "to": to, "held": held if isinstance(held, bool) else None}
+
+
+def _field_tag(field: Mapping[str, Any] | None) -> str:
+    """The memo's part for :func:`typed_field`'s facts (``""``: none): a verdict given for one field fact never
+    stands for another."""
+    if not field:
+        return ""
+    return f"to={field.get('to')};held={field.get('held')}"
+
+
+def _typed_line(call: Call, typed_text: str, field: Mapping[str, Any] | None) -> str:
+    """The step line's part for Yuki's unsent text waiting in the step's window. With gb's measured field facts
+    (:func:`typed_field`): where it waits and whether this step goes there, stated as measured, never the asserted
+    "this step may send it" (the check judges that from the step). Without them: today's window-wide line."""
+    said = f' ("{_clip(typed_text, VALUE_CHARS)}")' if typed_text.strip() else ""
+    if not field:
+        return f"text Yuki typed and has not sent is waiting in this window{said}: this step may send it"
+    where = (f'{field.get("role") or "a field"} "{_clip(field.get("name"), NAME_CHARS)}" (its name: text the app '
+             f'wrote)' if field.get("name") else f'a {field.get("role") or "text"} field without a name')
+    line = f"text Yuki typed and has not sent{said} waits in this window's {where}"
+    if field.get("to"):
+        # a fact for the check to weigh, not a verdict: whether this step submits there is its to judge from the step
+        return line + "; this step goes to that field (measured): if it submits there, that text goes with it"
+    if call.tool == "click":
+        held = field.get("held")
+        return line + "; this click is on another control (measured)" + (
+            "" if held is None else "; that field holds the keyboard (measured)" if held
+            else "; that field does not hold the keyboard (measured)")
+    return line + "; another text field holds the keyboard, and this step goes there (measured)"
 
 
 def _pending(typed_pending: Mapping[int, str] | frozenset[int] | set[int]) -> dict[int, str]:
@@ -251,10 +317,12 @@ def _pending(typed_pending: Mapping[int, str] | frozenset[int] | set[int]) -> di
     return {int(h): "" for h in typed_pending or () if h}
 
 
-def step_line(call: Call, *, plan: Any = None, typed: bool = False, typed_text: str = "") -> str:
+def step_line(call: Call, *, plan: Any = None, typed: bool = False, typed_text: str = "",
+              field: Mapping[str, Any] | None = None) -> str:
     """One step as the check reads it: the verb, the app, the window's title, the element's role and name, the keys,
     a send's text and recipient, a shell's command, a non-web address, a close, and, for a click or a key, the text
-    Yuki typed there and has not sent (``typed``, ``typed_text``). Plain facts; app-written text is marked as such."""
+    Yuki typed there and has not sent (``typed``, ``typed_text``; ``field``: gb's measured facts of the field it waits
+    in and whether this step goes there, :func:`typed_field`). Plain facts; app-written text is marked as such."""
     parts = [call.tool]
     inp = call.input or {}
     if call.tool == "run_skill":
@@ -288,7 +356,9 @@ def step_line(call: Call, *, plan: Any = None, typed: bool = False, typed_text: 
         parts.append(f'types "{_clip(inp.get("text"), VALUE_CHARS)}"' + (" and presses Enter" if inp.get("press_enter")
                                                                           else ""))
     elif call.tool == "run_powershell":
-        parts.append(f'command (Yuki wrote it) "{_clip(inp.get("command"), VALUE_CHARS)}"')
+        # A1 (Z7, review L1): both brains refuse a command over the shared cap (:func:`shell_chars`) before any check,
+        # and it is shown here up to that same cap, so the check only ever judges a whole command
+        parts.append(f'command (Yuki wrote it) "{_clip(inp.get("command"), max(VALUE_CHARS, shell_chars()))}"')
     elif call.tool in ("open_url", "fetch_url"):
         parts.append(f'address "{_clip(inp.get("url"), 200)}"')
         if call.tool == "fetch_url":
@@ -296,9 +366,7 @@ def step_line(call: Call, *, plan: Any = None, typed: bool = False, typed_text: 
     elif call.tool in ("window_action", "tab"):
         parts.append(f'action {_clip(inp.get("action"), 20)}')
     if typed and call.tool in _TYPED_MATTERS and (call.tool != "set_slider" or isinstance(inp.get("keys"), list)):
-        parts.append("text Yuki typed and has not sent is waiting in this window" +
-                     (f' ("{_clip(typed_text, VALUE_CHARS)}"): this step may send it' if typed_text.strip()
-                      else ": this step may send it"))
+        parts.append(_typed_line(call, typed_text, field))
     act, itself = raised_by(call.hwnd) if call.hwnd else ("", False)
     if act == CLOSE_HELD:
         # safety27 D2: Yuki's own close of this very window (or of a tab in it) was pressed and it stayed open with no
@@ -402,13 +470,15 @@ class CommitCheck:
             return c
         return c() if callable(c) else c
 
-    def cached(self, call: Call, *, typed: bool = False, words: Sequence[str] | None = None) -> CheckVerdict | None:
+    def cached(self, call: Call, *, typed: bool = False, words: Sequence[str] | None = None,
+               field: Mapping[str, Any] | None = None) -> CheckVerdict | None:
         """The memo's verdict for this very step on this very window (with Yuki's unsent text waiting there or not,
-        ``typed``), or ``None``. ``words``: the user's words now (a memo from other words is dropped first)."""
+        ``typed``, and gb's field facts, ``field``), or ``None``. ``words``: the user's words now (a memo from other
+        words is dropped first)."""
         if words is not None:
             self._sync_words(words)
         with self._lock:
-            got = self.memo.get(memo_key(call, typed=typed))
+            got = self.memo.get(memo_key(call, typed=typed, field=_field_tag(field)))
         if got is None or (got.hwnd or 0) != int(call.hwnd or 0):
             return None
         return CheckVerdict(i=call.index, effect=got.effect, asked=got.asked, question=got.question, source="memo",
@@ -416,14 +486,18 @@ class CommitCheck:
 
     def run(self, user_words: Sequence[str], calls: Sequence[Call], *, earlier: Sequence[str] = (),
             plan: Any = None, typed_pending: Mapping[int, str] | frozenset[int] = frozenset(),
-            typed_by_step: Mapping[int, str] | None = None) -> dict[int, CheckVerdict]:
+            typed_by_step: Mapping[int, str] | None = None,
+            typed_fields: Mapping[int, Mapping[str, Any]] | None = None) -> dict[int, CheckVerdict]:
         """Verdicts for ``calls`` (by ``call.index``): the memo's, then one model call for the rest. Never raises; a
         step with no verdict comes back ``failed``. ``typed_pending``: windows where Yuki's typed text waits now,
         with the text when known (a click or a key there can send it: said on its line). ``typed_by_step``: instead,
         per step (by ``call.index``), the unsent text in its window at that step's own moment (a plan's batch: a
-        step before the typing and one after it in the same window differ); a step not in it has none."""
+        step before the typing and one after it in the same window differ); a step not in it has none.
+        ``typed_fields``: per step, gb's measured facts of the field that text waits in (:func:`typed_field`, A5);
+        a step without them gets today's window-wide line."""
         self._sync_words(user_words)
         pending = _pending(typed_pending)
+        fields = dict(typed_fields or {})
 
         def typed_text(c: Call) -> str | None:
             if typed_by_step is not None:
@@ -434,10 +508,13 @@ class CommitCheck:
         def typed_in(c: Call) -> bool:
             return typed_text(c) is not None
 
+        def field_of(c: Call) -> Mapping[str, Any] | None:
+            return fields.get(c.index) if typed_in(c) else None
+
         out: dict[int, CheckVerdict] = {}
         todo: list[Call] = []
         for call in calls:
-            hit = self.cached(call, typed=typed_in(call))
+            hit = self.cached(call, typed=typed_in(call), field=field_of(call))
             if hit is not None:
                 out[call.index] = hit
             else:
@@ -446,7 +523,7 @@ class CommitCheck:
             return out
         started = time.perf_counter()
         numbered = list(enumerate(todo, 1))
-        lines = [(n, step_line(c, plan=plan, typed=typed_in(c), typed_text=typed_text(c) or ""))
+        lines = [(n, step_line(c, plan=plan, typed=typed_in(c), typed_text=typed_text(c) or "", field=field_of(c)))
                  for n, c in numbered]
         got, usage, error = self._ask(list(user_words), lines, earlier)
         ms = round((time.perf_counter() - started) * 1000, 1)
@@ -460,7 +537,7 @@ class CommitCheck:
                 verdict = CheckVerdict(i=call.index, effect=v.effect, asked=v.asked, question=v.question,
                                        hwnd=call.hwnd)
                 with self._lock:
-                    self.memo[memo_key(call, typed=typed_in(call))] = verdict
+                    self.memo[memo_key(call, typed=typed_in(call), field=_field_tag(field_of(call)))] = verdict
                 effects[v.effect] = effects.get(v.effect, 0) + 1
                 asks += int(not v.asked)
             out[call.index] = verdict
@@ -602,7 +679,13 @@ def one(name: str, tool_input: Mapping[str, Any], target: Mapping[str, Any] | No
     declared it (an allowed send comes back with ``countdown``; a draft as ``decision="draft"`` with ``draft_input`` /
     ``type_after``), and nothing is handed over. ``recent``: the user's own last messages to the person the send names
     (``{"text", "at"}``: row 4's near-duplicate ask). ``people_in``: memory's people index (row 4's recipient checks).
-    ``target["typed_text"]``: the text Yuki typed in that window and has not sent, when known (a question shows it)."""
+    ``target["typed_text"]``: the text Yuki typed in that window and has not sent, when known (a question shows it).
+
+    final-G2 R13 (A5, A6; gb's contracts, each absent is today's behaviour exactly): ``target["typed_field"]`` /
+    ``typed_field_held`` / ``typed_to_field`` (K-T): the field Yuki's text waits in and whether this step goes there,
+    stated on the check's step line (:func:`typed_field`). ``target["own_undo"] is True`` (K-U, set by the hand only
+    when measured): a key step that is the run's own close of what its own shortcut opened, while that field still
+    holds the keyboard: undoable (row 6, after rows 1-2), never sent to the commit check."""
     declared = consent
     try:
         target = dict(target or {})
@@ -622,13 +705,15 @@ def one(name: str, tool_input: Mapping[str, Any], target: Mapping[str, Any] | No
                     typed_pending=typed,
                     reads=frozenset({"file"}) if target.get("files_read") else frozenset(),
                     join_controls=_rule.join_controls(), policy=policy,
-                    recent=tuple(recent or ()), people_in=people_in)
+                    recent=tuple(recent or ()), people_in=people_in,
+                    own_undo=target.get("own_undo") is True)
         plan = _declared(declared) if declared is not None else None
         cv = None
         if _rule.may_commit(call, live, plan):
             checker = checker or CommitCheck(client, settings, log)
+            field = typed_field(target)
             cv = checker.run(list(words), [call], earlier=earlier, plan=plan,
-                             typed_pending=live.typed_pending).get(0)
+                             typed_pending=live.typed_pending, typed_fields={0: field} if field else None).get(0)
         v = _rule.check(call, plan, list(words), live, cv)
     except Exception as exc:  # noqa: BLE001 - fail closed
         return OneVerdict(False, "ask_user", why=f"the check could not run ({type(exc).__name__})", source="error")
@@ -676,4 +761,5 @@ def _board() -> Mapping[str, Any] | None:
 
 
 __all__ = ["CHECK_PROMPT", "CHECK_TOOL", "CLOSE_HELD", "CheckVerdict", "CommitCheck", "OneVerdict", "memo_key",
-           "note_raised", "one", "parse", "raised_by", "raised_since", "request", "step_line", "words_block"]
+           "note_raised", "one", "parse", "raised_by", "raised_since", "request", "shell_chars", "step_line",
+           "typed_field", "words_block"]

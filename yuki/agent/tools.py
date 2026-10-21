@@ -333,7 +333,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "run_powershell",
         "label": "Running a command",
-        "description": "Run a PowerShell command on this PC; stdout, stderr and the exit code come back.",
+        "description": ("Run a PowerShell command on this PC; stdout, stderr and the exit code come back. The command "
+                        "must finish within this step: never leave a process, watcher, job or scheduled task running "
+                        "to act on its own afterward. Do the thing now, or say plainly it would have to wait and "
+                        "offer to do it now instead."),
         "input_schema": _obj({"command": {"type": "string"}}, ["command"]),
     },
     {
@@ -1618,7 +1621,9 @@ class Backend(Protocol):
         dx: int = 0,
         expect_hwnd: int | None = None,
     ) -> Any: ...
-    def run_powershell(self, command: str, *, timeout_s: float = 20.0) -> Any: ...
+    # ``reap`` is optional (A3: the shell's backstop for a command the model wrote); a backend without it runs the
+    # command as before (``Dispatcher._do_run_powershell`` reads the signature).
+    def run_powershell(self, command: str, *, timeout_s: float = 20.0, reap: bool = False) -> Any: ...
     def open_url(self, url: str, *, app: str | None = None) -> Any: ...
     # Optional (the voice's hands, yuki.voice.hands): minimize / maximize / restore / close /
     # focus one window, verified. A backend without it simply has no such hand.
@@ -4774,12 +4779,13 @@ class Dispatcher:
                                     "refused": "act_off"})
 
     def _do_run_powershell(self, tool_input: dict[str, Any]) -> ToolOutcome:
-        return self._from_action(
-            "run_powershell",
-            self.backend.run_powershell(
-                self._need_str(tool_input, "command"), timeout_s=self.tool_timeout_s
-            ),
-        )
+        run = self.backend.run_powershell
+        command = self._need_str(tool_input, "command")
+        if _takes_keyword(run, "reap"):
+            # A3 (Z7, review H1): a command the model wrote gets the shell's measured backstop (what it leaves running
+            # unseen is ended); code's own commands (launch.py) never do. A backend without it runs as before.
+            return self._from_action("run_powershell", run(command, timeout_s=self.tool_timeout_s, reap=True))
+        return self._from_action("run_powershell", run(command, timeout_s=self.tool_timeout_s))
 
     def _do_hover(self, tool_input: dict[str, Any]) -> ToolOutcome:
         x, y, guard, label = self._point(tool_input)
@@ -5347,6 +5353,18 @@ def _png_size(png: bytes) -> tuple[int, int] | None:
     width = int.from_bytes(png[16:20], "big")
     height = int.from_bytes(png[20:24], "big")
     return (width, height) if width and height else None
+
+
+def _takes_keyword(fn: Any, name: str) -> bool:
+    """Whether callable ``fn`` accepts keyword ``name`` (by name, or through ``**kwargs``): a backend's optional
+    argument is passed only to a backend that has it. False when its signature can't be read."""
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _plain(value: Any) -> Any:
