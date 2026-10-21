@@ -1,14 +1,18 @@
-# browser.site_tab: a site's tab that is already open comes forward in its browser; the user does the act themselves
-# (a meeting tab: they click Join) (phase L design §6, §4.3; PLAN.md D3, D8, D17, D19, D24). A capability: what any
-# user's browser can do. Which site's tab the user brings up, in which browser and when, are learned (moments of kind
-# call_join, the tab identities memory keeps), never written here.
+# browser.site_tab: a site's tab comes forward in the browser it lives in, opening that browser if it is closed; the
+# user does the act themselves (a meeting tab: they click Join) (phase L design §6, §4.3; PLAN.md D3, D8, D17, D19,
+# D24; morning21 A1: on 21 Oct "Zen isn't open, so there's no Google Meet tab" ended the morning meeting). A
+# capability: what any user's browser can do. Which site's tab the user brings up, in which browser and when, are
+# learned (moments of kind call_join, the tab identities memory keeps), never written here.
 #
 # The tab is found by identity only, never by its title: the RuntimeId, name digests and pinned place memory learned on
 # every sighting of the site (nudge_state['site_tabs:<service>'], yuki.memory.callevidence.SiteTabs), through the tab
-# census (yuki.perception.tabs) of the browser it was seen in. Selecting the tab is a UI Automation pattern call (no
-# key, no pointer); bringing the browser forward is the guarded focus_window. If the strip can't be read, Yuki says so
-# and does nothing. Never with a game in front ("after the round?"), never handed to the thinker (it would only
-# search), never a click on Join: the join is the user's (commit = "user", wont = ["join"]).
+# census (yuki.perception.tabs) of the browser it was seen in. That browser closed: it is launched by its app key (no
+# address, undoable, never with a game in front, never another browser) and its restored tabs read; no tab back: the
+# told link, else the calling site's front page in that same browser ([call] home in yuki/connect/sites). Selecting
+# the tab is a UI Automation pattern call (no key, no pointer); bringing the browser forward is the guarded
+# focus_window. If the strip can't be read, Yuki says so and does nothing. Never with a game in front ("after the
+# round?"), never handed to the thinker (it would only search), never a click on Join: the join is the user's (commit
+# = "user", wont = ["join"]).
 #
 # Zero setup (D0): the browser's own window and tabs; no calendar, nothing to connect.
 
@@ -18,7 +22,7 @@ app = "browser"
 [capability."browser.site_tab"]
 end = "site_front"
 kind = "open"
-menu = "bring forward a site's tab already open in a browser (a meeting: they click Join)"
+menu = "bring forward a site's tab in its browser, opening that browser if it's closed (a meeting: they click Join)"
 done_line = "{service} is up."
 offer_class = "logistics"
 commit = "user"
@@ -63,7 +67,8 @@ type = "text"
 role = "fill"
 told = true
 
-# Rung A: the tab census, select the tab by identity, then bring its browser forward (yuki/skills/web_route.py).
+# Rung A: the tab census, select the tab by identity, then bring its browser forward (yuki/skills/web_route.py); that
+# browser closed, it is launched first and its restored strip read (morning21 A1).
 [[capability."browser.site_tab".route]]
 rung = "A"
 variant = "census"
@@ -81,8 +86,8 @@ done = { probe = "driver", driver = "web_route", call = "site_tab_shown", within
 # source that tells the site's tab from any other tab; review r1 L2)
 recheck = { probe = "driver", driver = "web_route", call = "site_front", service = "{service}", after_s = 3 }
 
-# Rung A, second: no tab of the site open and a told link -> open it in the means browser (launch arguments, nothing
-# typed).
+# Rung A, second: no tab of the site open (also after rung A launched its browser) and a told link -> open it in the
+# means browser (launch arguments, nothing typed).
 [[capability."browser.site_tab".route]]
 rung = "A"
 variant = "told_link"

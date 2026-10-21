@@ -59,9 +59,17 @@ privacy file itself, never from a visit:
   never sent anywhere.
 
 A sighting of a calling site during the hold is site evidence: it **starts** a call (``fresh`` / ``stale`` like a
-screen; a lobby holds the microphone too, so a false start costs at most the Ask card, which still decides any
-recording, and the standing answer is the service's, never the browser's), unless a newer readable screen of the
-same app and site was judged not in a call (Teams' readable pre-join lobby after its blocked join link). A site
+screen; the standing answer is the service's, never the browser's) once the user **joined** it, unless a newer
+readable screen of the same app and site was judged not in a call (Teams' readable pre-join lobby after its blocked
+join link). morning21 (A9; the user's decision of 21 Oct: "the pre-join page is not a call, recording waits for the
+real join"): a pre-join page holds the microphone for its preview, so the sighting alone no longer starts a call (on
+21 Oct the Meet lobby was call 148, nine minutes before the real join: recording, the Ask card and the voice's call
+mode all ran on the lobby). The join is measured, never read off the page (it stays unread): the site's app plays
+sound during this hold after the sighting (a joined call's audio; a pre-join page plays none), read from Core Audio's
+render sessions (state only, :attr:`CallEvidence.sound_fn`) at each pass of the call worker while a sighting waits
+for it (:meth:`CallEvidence.judge`). Known limits: a browser already playing other sound (a video in another tab)
+marks the join at once, the old false start; a join made with the microphone off holds no microphone, so no call
+starts until it is held again (the call worker only starts calls from microphone holders). A site
 call's life (:attr:`Life.site`, :class:`yuki.memory.calls.CallLife`): while the app holds the microphone it goes
 on, unless readable screens of the same site persistently say otherwise, or the app's newest frame is another page
 judged not in a call and the site has not been seen for ``screen_alive_s`` (one glance at a meeting page during a
@@ -79,7 +87,11 @@ list not judged yet is judged once on a short-lived thread, and the answer is No
 **The Meet tab** (:class:`SiteTabs`, PLAN.md D8): on a sighting of a calling site, the selected tab of that window is
 read as identities (its RuntimeId with the browser's pid, a keyed digest of its name, its place outside the main
 strip; :func:`yuki.memory.extract.uia.tab_identities`) at most once per 10 min per window and site, kept in
-``nudge_state['site_tabs:<service>']``, and served on the Now board (``calling_tabs``). The census
+``nudge_state['site_tabs:<service>']``, and served on the Now board (``calling_tabs``). morning21 (A6): every sighting
+of such a window says whether the calling page is the one it shows now (``selected``: another page seen there is not
+it), and the board asks the call evidence for each calling tab's call state at snapshot time
+(:meth:`CallEvidence.site_call_state`: ``lobby`` while its app holds the microphone unjoined, ``in_call`` once the join
+was measured, else ``none``; contract K1, :func:`yuki.memory.now.call_state`). The census
 (:meth:`SiteTabs.census`) finds the tab again in every window of the browser when an offer is due. Content-free logs
 (``tab_strip``, ``tab_census``): group sizes, counts, ms, reason codes, never a tab name.
 
@@ -140,6 +152,10 @@ SITES_RETRY_S = 60.0
 SITES_STATE_KEY = "call_evidence:sites"
 #: A calling site's tab is read again at most this often per window and site (s).
 TAB_READ_GAP_S = 600.0
+#: morning21 (A6): the microphone holders the call worker last handed :meth:`CallEvidence.judge` stand for "now" this
+#: long (s; the worker passes every ``poll_s``, 5 s by default, and passes nobody while nobody holds it and no call is
+#: open): a calling tab's state is read from them (:meth:`CallEvidence.site_call_state`).
+HOLDERS_FRESH_S = 15.0
 
 #: The judge's three answers.
 IN_CALL, NOT_IN_CALL, UNCLEAR = "in_call", "not_in_call", "unclear"
@@ -376,6 +392,12 @@ class Life:
     away_at: float | None = None
 
 
+def now_fresh(at: float, now: float | None = None) -> bool:
+    """morning21 (A6): whether the call worker's last pass (``at``, wall clock) still stands for now
+    (:data:`HOLDERS_FRESH_S`)."""
+    return (time.time() if now is None else float(now)) - float(at) <= HOLDERS_FRESH_S
+
+
 def _digest(title: str, host: str | None, controls: Iterable[str]) -> str:
     raw = json.dumps([title, host or "", list(controls)], ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
@@ -456,7 +478,23 @@ class CallEvidence:
         self.rejudge_s = float(rejudge_s)
         #: When the model last judged a screen of each (app key, host) (monotonic).
         self._judged_at: dict[tuple[str, str | None], float] = {}
-        self.counters = {"seen": 0, "judged": 0, "cached": 0, "errors": 0, "sites_seen": 0, "sites_judged": 0}
+        #: morning21 (A9): per (app key, host) of a calling site whose page is never read, when its join was measured
+        #: (its app played sound after a sighting, during a microphone hold): only a joined site starts a call.
+        self._site_joined: dict[tuple[str, str], float] = {}
+        #: morning21 (A6): the apps the call worker last handed :meth:`judge` (``{app key: hold start, or None for the
+        #: open call's app passed while it let go}``) and when (wall clock).
+        self._holders_seen: dict[str, float | None] = {}
+        self._holders_at = float("-inf")
+        #: ... and since when each has been in every pass without a break (wall clock): a join measured in that stretch
+        #: holds through Meet's mute and unmute (a new hold of the same call).
+        self._present_since: dict[str, float] = {}
+        #: ``(holder) -> bool``: the holder's app has an active output stream now (Core Audio render sessions, state
+        #: only). The call worker may set its own (one shared cache); ``None``: a reader of this object's own
+        #: (:meth:`_plays`).
+        self.sound_fn: Callable[[Any], bool] | None = None
+        self._sound_reader: Any = None
+        self.counters = {"seen": 0, "judged": 0, "cached": 0, "errors": 0, "sites_seen": 0, "sites_judged": 0,
+                         "site_joins": 0}
         self.cost_usd = 0.0
 
     # -- input (the watcher's worker thread) -------------------------------------------------
@@ -526,12 +564,27 @@ class CallEvidence:
         ``negatives``: the reliable not-in-call sights of readable pages of the same app and site captured after
         the sighting (no in-call frame of it since; review F2): such a hit can no longer start a call, and a call
         it started ends on a persistent run of them, like a screen's."""
+        return [(at, h, service, negs) for at, _k, h, service, negs in self._site_hits_keyed(holder)]
+
+    def _site_hits_keyed(self, holder: Any) -> list[tuple[float, str, str, str, tuple[float, ...]]]:
+        """:meth:`_site_hits` with each hit's app key: ``(last sighting, app key, host, service, negatives)`` (under the
+        lock)."""
         out = []
         for (k, h), at in self._sites.items():
             verdict = self._site_verdicts.get(h)
             if verdict is not None and verdict[0] and self._matches(holder, k):
-                out.append((at, h, verdict[1], tuple(t for t in self._negs.get((k, h), ()) if t > at)))
+                out.append((at, k, h, verdict[1], tuple(t for t in self._negs.get((k, h), ()) if t > at)))
         return out
+
+    def _joined_at(self, key: str, host: str, floor: float) -> float | None:
+        """morning21 (A9): when the join of this site was measured during the hold that began at ``floor``, or in the
+        unbroken stretch of the call worker's passes this app is in (a join holds through Meet's mute and unmute: a new
+        hold of the same call) (under the lock); ``None``: not joined in either."""
+        at = self._site_joined.get((key, host))
+        present = self._present_since.get(key)
+        if present is not None and now_fresh(self._holders_at):
+            floor = min(floor, present - HOLD_TOLERANCE_S)
+        return at if at is not None and at >= floor else None
 
     def _away_at(self, holder: Any, site_at: float, site_host: str) -> float | None:
         """Capture time of the app's newest frame when it is a readable page of another site, judged reliably not
@@ -612,6 +665,7 @@ class CallEvidence:
         Returns how many verdicts were applied. A verdict already known for the same content costs nothing.
         """
         holders = [h for h in holders if h]
+        self._note_holders(holders)
         if not holders:
             return 0
         with self._lock:
@@ -651,7 +705,83 @@ class CallEvidence:
                 self._log("call_evidence_judged", applied=not superseded, ms=ms, cost_usd=round(cost, 6), **fields)
             if not superseded:
                 applied += 1
-        return applied + self._judge_sites(holders)
+        sites = self._judge_sites(holders)
+        self._measure_joins(holders)
+        return applied + sites
+
+    def _note_holders(self, holders: list[Any]) -> None:
+        """morning21 (A6): the apps the call worker hands this pass (the microphone holders, and the open call's app
+        while it let go: its key), with each hold's start, for :meth:`site_call_state`."""
+        seen: dict[str, float | None] = {}
+        for h in holders:
+            if isinstance(h, str):
+                seen.setdefault(h.casefold(), None)
+                continue
+            key = str(getattr(h, "key", "") or "")
+            if not key:
+                continue
+            try:
+                since = float(getattr(h, "since", 0.0) or 0.0) or None
+            except (TypeError, ValueError):
+                since = None
+            if seen.get(key) is None:
+                seen[key] = since
+        now = time.time()
+        with self._lock:
+            unbroken = now - self._holders_at <= HOLDERS_FRESH_S
+            self._present_since = {k: (self._present_since.get(k, now) if unbroken else now) for k in seen}
+            for k, since in seen.items():
+                if since is not None and since < self._present_since[k]:
+                    self._present_since[k] = since   # the hold began before this pass saw it
+            self._holders_seen = seen
+            self._holders_at = now
+
+    def _measure_joins(self, holders: list[Any]) -> None:
+        """morning21 (A9): for each microphone holder with a sighting of a calling site during its hold that no join
+        was measured for yet (a pre-join page, or a call joined moments ago), the join is measured once more: its app
+        plays sound now (:meth:`_plays`; a pre-join page plays none, a joined call's audio does). Logged
+        ``call_evidence_site_join`` (app key and the reason code only). Never raises."""
+        for h in holders:
+            if isinstance(h, str):
+                continue
+            try:
+                since = float(getattr(h, "since", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if since <= 0.0:
+                continue
+            floor = since - HOLD_TOLERANCE_S
+            with self._lock:
+                waiting = [(k, host) for at, k, host, _service, negs in self._site_hits_keyed(h)
+                           if at >= floor and not negs and self._joined_at(k, host, floor) is None]
+            if not waiting or not self._plays(h):
+                continue
+            now = time.time()
+            with self._lock:
+                for where in waiting:
+                    self._site_joined[where] = now
+                self.counters["site_joins"] += 1
+                if len(self._site_joined) > MAX_SITES:   # bounded: forget the oldest joins
+                    for old in sorted(self._site_joined, key=self._site_joined.__getitem__)[: MAX_SITES // 2]:
+                        self._site_joined.pop(old, None)
+            self._log("call_evidence_site_join", app=waiting[0][0], sites=len(waiting), by="sound")
+
+    def _plays(self, holder: Any) -> bool:
+        """Whether the holder's app has an active output stream now (:attr:`sound_fn`, else this object's own reader of
+        Core Audio's render sessions: state only, cached a few seconds). False when it can't be read."""
+        try:
+            fn = self.sound_fn
+            if fn is None:
+                if self._sound_reader is None:
+                    from yuki.memory.avsignals import AvSignals
+
+                    # the render sessions only: no microphone or camera read, no change watch (the worker has those)
+                    self._sound_reader = AvSignals(frozenset(), mic_fn=list, camera_fn=list, watch=False)
+                reader = self._sound_reader
+                return bool(reader.playing([holder]))
+            return bool(fn(holder))
+        except Exception:  # noqa: BLE001 - unknown: not joined yet (the next pass reads again)
+            return False
 
     def _meeting_rules(self) -> Any:
         """The privacy file's ``[meetings]`` table (:class:`yuki.memory.timeline.MeetingRules`: the user's
@@ -980,7 +1110,8 @@ class CallEvidence:
         product name from the verdict ("" when unknown). A call already going on is kept by
         :meth:`life` (no "newer than the hold" test: a re-grab of the microphone is the same call).
         A sighting of a calling site whose page is never read, during this hold, counts the same way
-        (``service`` from the site verdict, else its host).
+        (``service`` from the site verdict, else its host) once the user joined it (morning21 A9: its join measured
+        during this hold, :meth:`_measure_joins`; a pre-join page alone is no call).
         """
         if not holder:
             return None, ""
@@ -989,8 +1120,10 @@ class CallEvidence:
         with self._lock:
             found = [(at, service) for (k, h), (at, service, _o) in self._evidence.items()
                      if self._matches(holder, k) and self._live((k, h)) and at >= floor]
-            found += [(at, service or host) for at, host, service, negs in self._site_hits(holder)
-                      if at >= floor and not negs]
+            for at, k, host, service, negs in self._site_hits_keyed(holder):
+                joined = self._joined_at(k, host, floor)
+                if at >= floor and not negs and joined is not None:
+                    found.append((max(at, joined), service or host))
         if not found:
             return None, ""
         at, service = max(found)
@@ -1059,11 +1192,43 @@ class CallEvidence:
             for where in [w for w in self._sites if w[0] == key.casefold()]:
                 self._sites.pop(where, None)
                 self._site_pending.discard(where)
+            for where in [w for w in self._site_joined if w[0] == key.casefold()]:
+                self._site_joined.pop(where, None)
+
+    def site_call_state(self, key: str, service: str, now: float | None = None) -> dict[str, Any]:
+        """morning21 (A6, K1): the call state of a calling site's tab, by its browser's app key and its service (the
+        product name of the site verdicts): ``{"state", "state_since", "mic_since"}``. ``in_call``: a join of one of
+        that service's sites was measured in this app while the call worker has passed it without a break (holding
+        the microphone, or as the open call's app while it let go: Meet's mute), since then; ``lobby``: the app holds
+        the microphone and no join was measured in that stretch (a pre-join page's preview), since the hold began;
+        ``none``: the call worker passed no such app lately (:data:`HOLDERS_FRESH_S`). Content-free; never raises."""
+        empty = {"state": "none", "state_since": None, "mic_since": None}
+        try:
+            now = time.time() if now is None else float(now)
+            key = str(key or "").strip().casefold()
+            want = " ".join(str(service or "").split()).casefold()
+            with self._lock:
+                if not key or now - self._holders_at > HOLDERS_FRESH_S or key not in self._holders_seen:
+                    return empty
+                since = self._holders_seen[key]
+                present = self._present_since.get(key, now)
+                hosts = [h for h, (calling, svc) in self._site_verdicts.items()
+                         if calling and (not want or " ".join(str(svc or "").split()).casefold() == want)]
+                joins = [self._site_joined[(key, h)] for h in hosts if (key, h) in self._site_joined]
+            joined = max(joins) if joins else None
+            if joined is not None and joined >= present - HOLD_TOLERANCE_S:
+                return {"state": "in_call", "state_since": joined, "mic_since": since}
+            if since is not None:
+                return {"state": "lobby", "state_since": since, "mic_since": since}
+            return empty
+        except Exception:  # noqa: BLE001
+            return empty
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {**self.counters, "screens": len(self._screens), "evidence": len(self._evidence),
                     "sites": len(self._sites), "calling_sites": sum(1 for v in self._site_verdicts.values() if v[0]),
+                    "site_joined": len(self._site_joined),
                     "contradicted": sum(1 for w in self._evidence if self._negs.get(w)),
                     "cost_usd": round(self.cost_usd, 5)}
 
@@ -1115,6 +1280,24 @@ class SiteTabs:
         self._read_at: dict[tuple[int, str], float] = {}
         self._known: dict[int, bool] = {}
         self.counters = {"sightings": 0, "calling": 0, "reads": 0, "identified": 0, "empty": 0, "census": 0}
+        if board is not None and evidence is not None and hasattr(board, "calling_state_fn"):
+            # morning21 (A6, K1): the board asks each calling tab's call state of the call evidence at snapshot time
+            board.calling_state_fn = self.call_states
+
+    def call_states(self, tabs: dict[int, dict[str, Any]]) -> dict[int, dict[str, Any]]:
+        """morning21 (A6, K1): ``{hwnd: {"state", "state_since", "mic_since"}}`` for the board's calling tabs
+        (``{hwnd: entry}``), by each tab's browser and service (:meth:`CallEvidence.site_call_state`). Never raises."""
+        out: dict[int, dict[str, Any]] = {}
+        fn = getattr(self._evidence, "site_call_state", None)
+        if not callable(fn):
+            return out
+        now = self._clock()
+        for hwnd, entry in (tabs or {}).items():
+            try:
+                out[int(hwnd)] = fn(str(entry.get("process") or ""), str(entry.get("service") or ""), now)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
 
     @staticmethod
     def state_key(service: str) -> str:
@@ -1142,19 +1325,24 @@ class SiteTabs:
             return bool(self._known.get(int(hwnd)))
 
     def seen(self, screen: dict[str, Any]) -> None:
-        """The watcher's ``on_screen`` hook. Cheap unless a read is due; never raises."""
+        """The watcher's ``on_screen`` hook. Cheap unless a read is due; never raises. morning21 (A6): every sighting
+        of a window tells the board which page it shows now (its calling site's, or another one), so a calling tab
+        open behind another tab is not the page in front (``selected``)."""
         try:
+            hwnd = int(screen.get("hwnd") or 0)
+            now = float(screen.get("at") or self._clock())
             if not screen.get("blocked"):
+                self._note_page(hwnd, False, now)   # a readable page: never a calling site's (those are blocked)
                 return
             self.counters["sightings"] += 1
             host = str(screen.get("host") or "").strip().casefold()
             service = self._evidence.calling_service(host) if host and self._evidence is not None else None
             if not service:
+                self._note_page(hwnd, False, now)
                 return
             self.counters["calling"] += 1
-            hwnd = int(screen.get("hwnd") or 0)
+            self._note_page(hwnd, True, now)
             process = str(screen.get("process") or "").strip().casefold()
-            now = float(screen.get("at") or self._clock())
             with self._lock:
                 last = self._read_at.get((hwnd, service))
                 if last is not None and now - last < self.gap_s:
@@ -1169,6 +1357,17 @@ class SiteTabs:
                 self._read(hwnd, process, service, now)
         except Exception as exc:  # noqa: BLE001 - the Meet tab never breaks capture
             self._log("tab_strip", status="error", error=type(exc).__name__)
+
+    def _note_page(self, hwnd: int, calling: bool, at: float) -> None:
+        """morning21 (A6): the board's note of the page ``hwnd`` shows now (:meth:`yuki.memory.now.NowBoard.note_page`;
+        it keeps it only for a window with a calling tab). Never raises."""
+        note = getattr(self._board, "note_page", None) if self._board is not None else None
+        if not hwnd or not callable(note):
+            return
+        try:
+            note(int(hwnd), bool(calling), float(at))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _read(self, hwnd: int, process: str, service: str, now: float) -> None:
         reader = self._reader

@@ -29,7 +29,11 @@ what is on screen the instant a request starts, with how old each read is.
 * Live facts for the skills' resolver and done-checks (PLAN.md D8, D9, F5.4), one snapshot:
   ``calling_tabs`` (per window, the calling site's tab identified by
   :class:`yuki.memory.callevidence.SiteTabs`: process, service, its RuntimeId, the
-  keyed digest of its name, its group place; never the name), ``game_front`` (is a
+  keyed digest of its name, its group place; never the name; morning21 A6: whether that
+  tab is the page the window shows now, ``selected``, from every sighting of the window,
+  and the call state, ``state`` lobby / in_call / none with ``state_since`` and
+  ``mic_since``, asked of the call evidence at snapshot time: read through K1,
+  :func:`call_state` and :func:`joined_since`), ``game_front`` (is a
   game in front, with when it was last known: the game gate's answer) and
   ``signals`` (content-free: the app keys holding the microphone, the app keys
   playing media).  Subscribers of the layout (:meth:`NowBoard.subscribe_layout`)
@@ -56,7 +60,7 @@ import os
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -141,6 +145,11 @@ class NowBoard:
         self.version = 0
         #: Per window: the calling site's tab as identified (content-free but for the keyed name digest).
         self._calling_tabs: dict[int, dict[str, Any]] = {}
+        #: morning21 (A6, K1): ``(tabs) -> {hwnd: {"state", "state_since", "mic_since"}}`` for the calling tabs
+        #: (``tabs``: ``{hwnd: entry}``), asked at snapshot time outside the lock when given
+        #: (:class:`yuki.memory.callevidence.SiteTabs` wires it to the call evidence's measured lobby / join); else
+        #: no tab carries a call state.
+        self.calling_state_fn: Callable[[dict[int, dict[str, Any]]], dict[int, dict[str, Any]]] | None = None
         #: Is a game in front (None: not known) and when that was last set; ``game_front_fn`` (the game gate's
         #: ``front_game``), when given, is asked at snapshot time instead.
         self._game_front: bool | None = None
@@ -188,14 +197,32 @@ class NowBoard:
 
     def set_calling_tab(self, hwnd: int, info: dict[str, Any]) -> None:
         """A calling site's tab in ``hwnd`` as identified (:class:`yuki.memory.callevidence.SiteTabs`):
-        ``{process, service, tab_id, name_digest, group, index, seen_at, known}``; never a name."""
+        ``{process, service, tab_id, name_digest, group, index, seen_at, known}``; never a name. A read of it is a
+        sighting of that very page, so it is the page the window shows (``selected``) as of ``seen_at``."""
         with self._lock:
-            self._calling_tabs[int(hwnd)] = dict(info)
+            entry = {**dict(info)}
+            entry.setdefault("selected", True)
+            entry.setdefault("page_at", entry.get("seen_at"))
+            self._calling_tabs[int(hwnd)] = entry
             if len(self._calling_tabs) > MAX_WINDOWS:
                 oldest = sorted(self._calling_tabs, key=lambda h: float(self._calling_tabs[h].get("seen_at") or 0))
                 for h in oldest[: len(self._calling_tabs) - MAX_WINDOWS]:
                     self._calling_tabs.pop(h, None)
             self.version += 1
+
+    def note_page(self, hwnd: int, calling: bool, at: float) -> None:
+        """morning21 (A6): a sighting of the page ``hwnd`` shows now (the watcher's ``on_screen``, through
+        :meth:`yuki.memory.callevidence.SiteTabs.seen`): ``calling`` the window's calling site's page (its tab is the
+        one selected), else another page of that window (the calling tab is open but not the one showing). Only a
+        window with a calling tab is noted; a newer note wins. Content-free (a flag and a time)."""
+        with self._lock:
+            tab = self._calling_tabs.get(int(hwnd))
+            if tab is None or float(at) < float(tab.get("page_at") or 0.0):
+                return
+            if tab.get("selected") is not bool(calling):
+                tab["selected"] = bool(calling)
+                self.version += 1
+            tab["page_at"] = float(at)
 
     def set_game_front(self, front: bool | None, at: float | None = None) -> None:
         """Whether a game is in front now (the game gate's on_change), with when."""
@@ -328,6 +355,18 @@ class NowBoard:
             game_front, game_front_at = self._game_front, self._game_front_at
             signals = dict(self._signals)
             game_front_fn, signals_fn = self.game_front_fn, self.signals_fn
+            calling_state_fn = self.calling_state_fn
+        if calling_state_fn is not None and calling_tabs:
+            # morning21 (A6, K1): each calling tab's call state, measured by the call evidence (outside the lock: it
+            # takes the evidence's own); unknown (an error, no answer for a tab): no state, read as "none"
+            try:
+                states = calling_state_fn({int(h): dict(v) for h, v in calling_tabs.items()}) or {}
+            except Exception:  # noqa: BLE001 - no state: the tabs as they are
+                states = {}
+            for h, got in states.items():
+                entry = calling_tabs.get(str(h))
+                if entry is not None and isinstance(got, dict):
+                    entry.update({k: got.get(k) for k in ("state", "state_since", "mic_since")})
         game_front_name: str | None = None
         if game_front_fn is not None:
             try:
@@ -508,6 +547,8 @@ def format_now(
             lines.append(head + (f": controls {', '.join(_one(c, 40) for c in controls[:12])}" if controls else ""))
     if len(windows) > max_windows:
         lines.append(f"- and {len(windows) - max_windows} more visible window(s) not shown")
+    # morning21 (A6): a calling site's page in a window, with whether the user is in its call (measured)
+    lines.extend(f"- {line}" for line in calling_lines(board))
     for p in list(board.get("popups") or [])[-max_popups:]:
         at = p.get("at")
         when = datetime.fromtimestamp(float(at)).strftime("%H:%M:%S") if at else "?"
@@ -517,6 +558,150 @@ def format_now(
     if focus_line:
         lines.append(focus_line)
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Calls on the board (morning21 A6, contract K1)
+# ---------------------------------------------------------------------------
+
+#: K1: a calling tab's call state. ``lobby``: its app holds the microphone and the user has not joined (a pre-join
+#: page's preview); ``in_call``: the call evidence measured the join (the site's app played the call's sound during
+#: this hold) and the call goes on; ``none``: neither (a front page, a meeting left, a pre-join page with the microphone
+#: off).
+CALL_STATES: tuple[str, ...] = ("lobby", "in_call", "none")
+
+
+def _calling_entry(board: Mapping[str, Any] | None, hwnd: Any) -> dict[str, Any] | None:
+    try:
+        key = str(int(hwnd))
+    except (TypeError, ValueError):
+        return None
+    entry = ((board or {}).get("calling_tabs") or {}).get(key)
+    return entry if isinstance(entry, dict) else None
+
+
+def call_state(board: Mapping[str, Any] | None, hwnd: Any) -> dict[str, Any] | None:
+    """K1: the calling site's tab in window ``hwnd`` as the board has it, or ``None`` (no calling tab there):
+    ``{"service", "selected", "state", "since", "app", "mic_since"}``. ``selected``: that tab is the page the window
+    showed at its last sighting (``True`` when not known: fail closed for the join rule); ``state``: one of
+    :data:`CALL_STATES` (``none`` when not known); ``since``: when that state began (wall clock; ``None`` for
+    ``none``); ``app``: the browser's app key; ``mic_since``: when its microphone hold began, when it holds one.
+    Content-free. Never raises."""
+    try:
+        entry = _calling_entry(board, hwnd)
+        if entry is None:
+            return None
+        state = entry.get("state") if entry.get("state") in CALL_STATES else "none"
+        since = entry.get("state_since") if state != "none" else None
+        mic = entry.get("mic_since")
+        return {"service": " ".join(str(entry.get("service") or "").split()),
+                "selected": entry.get("selected") is not False, "state": state,
+                "since": float(since) if isinstance(since, (int, float)) else None,
+                "app": str(entry.get("process") or ""),
+                "mic_since": float(mic) if isinstance(mic, (int, float)) else None}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def joined_since(board: Mapping[str, Any] | None, hwnd: Any, t0: float, *, tolerance_s: float = 2.0) -> bool:
+    """K1: whether the call evidence measured a join of the calling site in window ``hwnd`` at or after ``t0`` (wall
+    clock), or its app's microphone hold began then (an onset: a page that took the microphone). ``tolerance_s``: the
+    clocks of the two processes. Never raises."""
+    got = call_state(board, hwnd)
+    if got is None:
+        return False
+    floor = float(t0) - float(tolerance_s)
+    if got["state"] == "in_call" and got["since"] is not None and got["since"] >= floor:
+        return True
+    return got["mic_since"] is not None and got["mic_since"] >= floor
+
+
+def calling_sites() -> list[dict[str, Any]]:
+    """The calling sites' data (``yuki/connect/sites/*.toml`` ``[call]`` tables, each with its file's ``name``): facts
+    true for every user of that site (its service, hosts, front page, join controls, device keys). ``[]`` when none
+    can be read. Never raises."""
+    try:
+        from yuki.connect.templates import site, sites
+
+        out = []
+        for name in sites():
+            table = site(name).get("call")
+            if isinstance(table, dict) and table.get("service"):
+                out.append({**table, "name": name})
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def calling_site(service: Any) -> dict[str, Any]:
+    """The ``[call]`` data of the calling site whose service is ``service`` (the product name, case aside), else
+    ``{}``."""
+    want = " ".join(str(service or "").split()).casefold()
+    if not want:
+        return {}
+    return next((s for s in calling_sites()
+                 if " ".join(str(s.get("service") or "").split()).casefold() == want), {})
+
+
+def site_join_controls() -> frozenset[tuple[str, str]]:
+    """Every calling site's declared join controls (``[call.labels.<language>] join = [[role, name], ...]``),
+    casefolded. Data; never raises."""
+    out: set[tuple[str, str]] = set()
+    for s in calling_sites():
+        for table in (s.get("labels") or {}).values():
+            for pair in (table.get("join") if isinstance(table, dict) else None) or []:
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2 and str(pair[1]).strip():
+                    out.add((" ".join(str(pair[0]).split()).casefold(), " ".join(str(pair[1]).split()).casefold()))
+    return frozenset(out)
+
+
+def _keys_words(keys: Any) -> str:
+    """A site's declared device keys as words: ``"microphone Ctrl+D, camera Ctrl+E"`` (``""``: none)."""
+    if not isinstance(keys, dict):
+        return ""
+    parts = []
+    for what, combo in keys.items():
+        if isinstance(combo, (list, tuple)) and combo:
+            parts.append(f"{what} " + "+".join(str(k).strip().title() for k in combo if str(k).strip()))
+    return ", ".join(parts)
+
+
+def calling_lines(board: Mapping[str, Any] | None) -> list[str]:
+    """One line per window on screen with a calling site's page (K1, measured): which app and service, whether that
+    page is the tab showing, whether the user is in its call (a pre-join page holding the microphone is not), and the
+    site's own device keys from its data. ``[]`` with none. Content-free but for the service's name and the window's
+    app. Never raises."""
+    try:
+        windows = {int(w.get("hwnd") or 0): w for w in (board or {}).get("windows") or [] if isinstance(w, dict)}
+        out = []
+        for key in sorted(((board or {}).get("calling_tabs") or {}), key=str):
+            try:
+                hwnd = int(key)
+            except (TypeError, ValueError):
+                continue
+            w = windows.get(hwnd)
+            got = call_state(board, hwnd)
+            if w is None or got is None:
+                continue
+            app = str(w.get("app") or w.get("process") or got["app"] or "the browser")
+            service = got["service"] or "a calling site"
+            tab = "" if got["selected"] else " (open in another tab; not the page showing)"
+            if got["state"] == "in_call":
+                at = datetime.fromtimestamp(got["since"]).strftime("%H:%M") if got["since"] else ""
+                state = f"the user is in its call{' since ' + at if at else ''} (measured)"
+            elif got["state"] == "lobby":
+                state = ("the user is NOT in its call: a pre-join page holding the microphone for its preview "
+                         "(measured); joining is the user's own click")
+            else:
+                state = "the user is not in a call there (measured)"
+            line = f"[{hwnd}] {app} has a {service} page{tab}: {state}"
+            keys = _keys_words(calling_site(service).get("keys"))
+            if keys:
+                line += f"; {service}'s own keys: {keys} (each flips it: read its state before and after)"
+            out.append(line)
+        return out
+    except Exception:  # noqa: BLE001
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -1117,6 +1302,8 @@ def board_front_source(client_fn: Callable[[], Any] | None = None, *, max_age_s:
     return source
 
 
-__all__ = ["APP_DATA_READERS", "FRONT_SOURCE_REUSE_S", "NamedEvent", "NowBoard", "NowClient", "NowServer", "NowTiming",
+__all__ = ["APP_DATA_READERS", "CALL_STATES", "FRONT_SOURCE_REUSE_S", "NamedEvent", "NowBoard", "NowClient",
+           "NowServer", "NowTiming", "call_state", "calling_lines", "calling_site", "calling_sites", "joined_since",
+           "site_join_controls",
            "YOU_READERS", "YOU_SECTIONS", "app_data_for", "board_front_source", "format_now", "game_in_front", "gist_of",
            "own_client", "pipe_name", "shared_client", "timing_of", "wait_any", "you_event_name"]

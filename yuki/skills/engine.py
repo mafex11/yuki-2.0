@@ -180,6 +180,11 @@ HELD_CALL = "held_call"
 #: :data:`LINE_BLOCKED_PARTWAY` once a rung acted), never the game line, never the next rung, never handed over (the
 #: thinker would be stopped the same way).
 HELD_BLOCKED = "blocked"
+#: morning21 (A2): the run's outcome after a rung's code-word stop (``RouteResult.stop``: a precondition met, said
+#: plainly): not done, nothing done, never a question to the user ("Ask them: Zen isn't open" on 21 Oct made the
+#: planner drop the meeting part). The report names the code word and the app it needed; the ledger keeps a refusal
+#: (never counted against the rung).
+NOT_DONE = "not_done"
 LINE_BLOCKED = "Something on the PC stopped me there, so nothing was done."
 LINE_BLOCKED_PARTWAY = "Something on the PC stopped me partway, so I left it there."
 #: At most this many names a route read on screen ride on a seed (``seen``, RAM only), each at most this long.
@@ -285,6 +290,11 @@ class RouteResult:
     #: The app the verb acted on (a driver says it: Spotify, Discord, the mixer's ``master``), when the route's own
     #: arguments don't name it; D18 matches a moment's app with it (``skill_runs.app``).
     app: str | None = None
+    #: morning21 (A2): a code-word stop said plainly, never a question: nothing was done and nothing more is tried,
+    #: for a precondition the rung met (``outcome``: its code word; ``say``: its plain line; ``app``: the app it
+    #: needed, when one). The run ends :data:`NOT_DONE` (never "Ask them:"); ``ask`` stays for real questions (options
+    #: or a slot).
+    stop: bool = False
 
 
 @dataclass
@@ -436,8 +446,11 @@ class SkillResult:
     fill_sources: dict[str, str] = field(default_factory=dict)
     unread: list[str] = field(default_factory=list)
     #: Why a run was refused before anything ran (the resolver's code word: ``unknown_skill``, ``skills_off``, ...),
-    #: or ``repeat`` on a hand-off that ran no rung because the same thing ran unconfirmed moments ago.
+    #: or ``repeat`` on a hand-off that ran no rung because the same thing ran unconfirmed moments ago; on a
+    #: :data:`NOT_DONE` end, the rung's own code word (``not_opened``, ``no_tab``, ...).
     why: str = ""
+    #: morning21 (A2): on a :data:`NOT_DONE` end, the app key the stopped rung needed (``RouteResult.app``), when one.
+    needs_app: str = ""
     #: Phase 2.1: the values Yuki guessed (the caller's reading, a listed name, one of their known things), each
     #: ``{"slot", "value" (as said), "from" (resolve.GUESS_SOURCES)}``: the done line names them; RAM only.
     guessed: list[dict[str, Any]] = field(default_factory=list)
@@ -491,6 +504,12 @@ class SkillResult:
                 given = _forms_given(forms)
                 return f"Ask them: {self.ask}\n{given}: pass it in that form when their words give it."
             return f"Ask them: {self.ask}"
+        if self.outcome == NOT_DONE:
+            # morning21 (A2): a precondition the rung met, said plainly; the code word and the app it needed (a code
+            # fact the caller may repair: open that app, then run it again), never "Ask them:"
+            needs = f"; needs {self.needs_app}" if self.needs_app else ""
+            done = "it acted partway (see the line)" if self.acted else "nothing was done"
+            return f"Not done ({self.why or 'stopped'}{needs}): {done}. Say: {self.say}"
         if self.outcome == "held_game":
             return f"Held: a game is in front, nothing was sent. Say: {self.say}"
         if self.outcome == HELD_CALL:
@@ -557,7 +576,11 @@ class SkillResult:
                  "handoff_skill": self.handoff, "skill": self.skill, "outcome": self.outcome, "route": self.route,
                  "run_key": self.run_key,
                  "settled": self.outcome in ("held_game", HELD_CALL, HELD_BLOCKED, "other_device", "unverified",
-                                             "asked", "already")}
+                                             "asked", "already", NOT_DONE)}
+        if self.outcome == NOT_DONE:
+            facts["stop_why"] = self.why          # morning21 (A2): the rung's code word (content-free)
+            if self.needs_app:
+                facts["needs_app"] = self.needs_app
         # Phase 2.1 / 2.3 (RAM only): the guesses the done line names, and on any other end the evidence the talker
         # words it from (``say`` is the code's fallback line)
         if self.guessed:
@@ -1671,7 +1694,7 @@ def _last_trace(cap: str, *, ran: bool = False) -> _Trace | None:
 
 
 #: fd (D3): the ends of a run that put nothing on (a question, a hold, a refusal before anything ran).
-NOT_RAN_OUTCOMES: frozenset[str] = frozenset({"asked", "held_game", "held_call", "blocked", "refused"})
+NOT_RAN_OUTCOMES: frozenset[str] = frozenset({"asked", "held_game", "held_call", "blocked", "refused", NOT_DONE})
 
 
 def _same_request(t: _Trace, ctx: RunContext) -> bool:
@@ -2384,6 +2407,22 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             if not route.retry_after_acting:
                 break        # its data says nothing may follow it once it acted: the caller takes it on (rung C)
             continue
+        if res.stop:
+            # morning21 (A2): a code-word stop (a precondition the rung met: a browser that wouldn't open, a strip
+            # it couldn't read, no tab of the site), said plainly: not done, never "Ask them:" (21 Oct: "Ask them: Zen
+            # isn't open" made the planner drop the meeting part and the talker offer another browser), never the
+            # next rung, never counted against this one
+            acted = state["acted"] = acted or bool(res.ran)
+            line = " ".join(str(res.say or res.ask or "").split()) or LINE_FAILED
+            needs = _app_key_of(res.app) if res.app else ""
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": res.outcome or "stop"})
+            _ledger_finish(ctx, run_key, outcome="refused", checked=None, route=route, ms=route_ms, app=app_done,
+                           acted=acted)
+            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result=res.outcome or "stop",
+                  ms=route_ms, observed=res.facts)
+            return _simple(skill.key, NOT_DONE, ctx, started, say=line, run_key=run_key, route=route.key, tried=tried,
+                           why=str(res.outcome or "stop")[:40], needs_app=needs, focus_taken=focus_taken,
+                           evidence=evidence(route=route, reason=res.outcome or "stop", line=line))
         if res.ask:
             asked_slot = (res.facts or {}).get("slot") if isinstance(res.facts, Mapping) else None
             if isinstance(asked_slot, str) and skill.slot(asked_slot) is not None:

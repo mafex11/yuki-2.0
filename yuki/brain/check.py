@@ -15,7 +15,9 @@ measured fact more, when a hand measured it: the step's window came up in reply 
 site?" after Yuki's tab close: :func:`note_raised`, from the hand's own window list before and after its act), or such
 a window is up over the step's window. The prompt's principle: answering that window's question is a new decision of
 the user's, and an answer that throws away something of theirs needs their words to go ahead. The model judges it;
-no button's words are read by code.
+no button's words are read by code. morning21 (A6, F4): one more when the step's window shows a calling site's page
+(the Now board's K1, :func:`call_note`): which site, whether that page is the tab showing, and whether the user is in
+its call (a pre-join page is not), so a join is judged with the page's state in view.
 
 **What it returns.** One strict tool, forced (Haiku without thinking takes a forced ``tool_choice``):
 ``verdicts: [{i, effect: none|send|join|delete|close|buy|setting|other, asked, question}]``. The prompt is generic (no
@@ -334,12 +336,13 @@ def _pending(typed_pending: Mapping[int, str] | frozenset[int] | set[int]) -> di
 
 
 def step_line(call: Call, *, plan: Any = None, typed: bool = False, typed_text: str = "",
-              field: Mapping[str, Any] | None = None) -> str:
+              field: Mapping[str, Any] | None = None, call_state: str = "") -> str:
     """One step as the check reads it: the verb, the app, the window's title, the element's role and name, the keys,
     a send's text and recipient, a shell's command, an app's arguments (integ28 fix S1), a non-web address, a close,
     and, for a click or a key, the text
     Yuki typed there and has not sent (``typed``, ``typed_text``; ``field``: gb's measured facts of the field it waits
-    in and whether this step goes there, :func:`typed_field`). Plain facts; app-written text is marked as such."""
+    in and whether this step goes there, :func:`typed_field`). ``call_state`` (morning21 A6): :func:`call_note`'s
+    measured fact of a calling site's page in the step's window. Plain facts; app-written text is marked as such."""
     parts = [call.tool]
     inp = call.input or {}
     if call.tool == "run_skill":
@@ -391,6 +394,8 @@ def step_line(call: Call, *, plan: Any = None, typed: bool = False, typed_text: 
         parts.append(f'action {_clip(inp.get("action"), 20)}')
     if typed and call.tool in _TYPED_MATTERS and (call.tool != "set_slider" or isinstance(inp.get("keys"), list)):
         parts.append(_typed_line(call, typed_text, field))
+    if call_state:
+        parts.append(call_state)
     act, itself = raised_by(call.hwnd) if call.hwnd else ("", False)
     if act == CLOSE_HELD:
         # safety27 D2: Yuki's own close of this very window (or of a tab in it) was pressed and it stayed open with no
@@ -547,7 +552,9 @@ class CommitCheck:
             return out
         started = time.perf_counter()
         numbered = list(enumerate(todo, 1))
-        lines = [(n, step_line(c, plan=plan, typed=typed_in(c), typed_text=typed_text(c) or "", field=field_of(c)))
+        notes = _call_notes(todo)
+        lines = [(n, step_line(c, plan=plan, typed=typed_in(c), typed_text=typed_text(c) or "", field=field_of(c),
+                               call_state=notes.get(int(c.hwnd or 0), "")))
                  for n, c in numbered]
         got, usage, error = self._ask(list(user_words), lines, earlier)
         ms = round((time.perf_counter() - started) * 1000, 1)
@@ -730,7 +737,8 @@ def one(name: str, tool_input: Mapping[str, Any], target: Mapping[str, Any] | No
                     reads=frozenset({"file"}) if target.get("files_read") else frozenset(),
                     join_controls=_rule.join_controls(), policy=policy,
                     recent=tuple(recent or ()), people_in=people_in,
-                    own_undo=target.get("own_undo") is True)
+                    own_undo=target.get("own_undo") is True,
+                    calling_tabs=_calling_tabs(board))
         plan = _declared(declared) if declared is not None else None
         cv = None
         if _rule.may_commit(call, live, plan):
@@ -773,6 +781,59 @@ def _declared(declaration: Mapping[str, Any]) -> dict[str, Any]:
                         "quote": declaration.get("quote") or ""}}
 
 
+def _calling_tabs(board: Mapping[str, Any] | None) -> dict[int, Mapping[str, Any]] | None:
+    """morning21 (A4): the board's ``calling_tabs`` entries by hwnd for the consent rule's row 3 (``None`` without a
+    board: the rule reads it itself when a step needs it)."""
+    if board is None:
+        return None
+    out: dict[int, Mapping[str, Any]] = {}
+    for key, entry in (board.get("calling_tabs") or {}).items():
+        try:
+            if isinstance(entry, Mapping):
+                out[int(key)] = entry
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _call_notes(calls: Sequence[Call]) -> dict[int, str]:
+    """morning21 (A6): :func:`call_note` per window of these steps that shows a calling site's page (the Now board read
+    once, only when a step has a window). ``{}`` when none or no board. Never raises."""
+    hwnds = {int(c.hwnd) for c in calls if c.hwnd}
+    if not hwnds:
+        return {}
+    try:
+        from yuki.memory.now import call_state
+
+        board = _board()
+        if not board or not board.get("calling_tabs"):
+            return {}
+        out = {}
+        for hwnd in hwnds:
+            note = call_note(call_state(board, hwnd))
+            if note:
+                out[hwnd] = note
+        return out
+    except Exception:  # noqa: BLE001 - no note: the step lines as before
+        return {}
+
+
+def call_note(state: Mapping[str, Any] | None) -> str:
+    """morning21 (A6, F4): a measured fact for a step's line when its window shows a calling site's page (K1,
+    :func:`yuki.memory.now.call_state`): the site, whether that page is the tab showing, and whether the user is in its
+    call; ``""`` otherwise. The check judges join risk with it; it is never an instruction."""
+    if not state:
+        return ""
+    service = " ".join(str(state.get("service") or "").split()) or "a calling site"
+    if not state.get("selected", True):
+        return f"this window also has a {service} page open in another tab, not the one showing (measured)"
+    if state.get("state") == "in_call":
+        return f"this window shows a {service} page and the user is in its call (measured)"
+    if state.get("state") == "lobby":
+        return f"this window shows a {service} pre-join page: the user is NOT in its call (measured)"
+    return f"this window shows a {service} page and the user is not in a call there (measured)"
+
+
 def _board() -> Mapping[str, Any] | None:
     """The Now board, if the memory service answers within 50 ms."""
     try:
@@ -784,6 +845,7 @@ def _board() -> Mapping[str, Any] | None:
         return None
 
 
-__all__ = ["CHECK_PROMPT", "CHECK_TOOL", "CLOSE_HELD", "CheckVerdict", "CommitCheck", "OneVerdict", "memo_key",
+__all__ = ["CHECK_PROMPT", "CHECK_TOOL", "CLOSE_HELD", "CheckVerdict", "CommitCheck", "OneVerdict", "call_note",
+           "memo_key",
            "note_raised", "one", "parse", "raised_by", "raised_since", "request", "shell_chars", "step_line",
            "typed_field", "words_block"]
