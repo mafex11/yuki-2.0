@@ -1520,6 +1520,16 @@ def _person_plan(skill: Skill, values: Mapping[str, Any], origin: Mapping[str, s
         return {}
 
 
+def _person_asked(skill: Skill, slot: Slot, dropped: Sequence[str]) -> dict[str, Any]:
+    """gd D6 (review gd L6): :attr:`Ask.person` for a slot's own question: when the slot asked is a person slot whose
+    given name was dropped, the record :func:`_person_plan` gives that case (``{source: "", how: "dropped"}``); ``{}``
+    for any other question (nobody gave a name, or not a person slot). Content-free; never raises."""
+    try:
+        return {"source": "", "how": "dropped"} if slot.name in dropped and _person_bound(skill, slot) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _known_app(slot: Slot, text: str, *, store: Any, until: float | None) -> str:
     """The key of the app ``text`` names when the PC knows that app (one of the slot's options, a chat app's
     connection data, or a program the user's timeline shows: :func:`app_identity`), else ``""`` ("music" names no app:
@@ -2184,7 +2194,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
         # asked instead, with the slot dropped, so the engine can hand a value its caller gave to the thinker
         # (fix-plan IF-handoff), which does it by steps where the send rule judges the wording
         if slot.name in dropped and slot.type == "text" and slot.role == "fill" and slot.default is not None:
-            return Ask(skill.key, slot.name, slot.ask or f"Which {slot.name}?", [], dropped=list(dropped))
+            return Ask(skill.key, slot.name, slot.ask or f"Which {slot.name}?", [], dropped=list(dropped),
+                       person=_person_asked(skill, slot, dropped))
         # FILL_ORDER "default" (a learned skill's bound value is its slot's default)
         if slot.default is not None:
             values[slot.name], filled[slot.name] = slot.default, "default"
@@ -2192,8 +2203,9 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 named.append(slot.name)
             continue
         if slot.required:
+            # gd D6 (review gd L6): a person slot whose given name was dropped asks its own question with the record
             return Ask(skill.key, slot.name, slot.ask or f"Which {slot.name}?", list(slot.options),
-                       dropped=list(dropped))
+                       dropped=list(dropped), person=_person_asked(skill, slot, dropped))
     if relaxed:
         from yuki.skills.connection import sends_with
 

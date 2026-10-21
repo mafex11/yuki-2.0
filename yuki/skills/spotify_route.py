@@ -1200,8 +1200,9 @@ def _other_device(facts: dict[str, Any], *, volume: bool = False) -> Any:
 #     small model, with the pairing of (3) as a hint; a mood takes the hour's usual), and a row this rung plays for
 #     them is watched like a hand-off's, so its own check keeps the words as another name of it: a hint next time.
 # (6) gd D2 (final-G2): a correction (the caller's ``corrects``) never pairs its words with the row it plays (they name
-#     what the user just rejected) and starts no watch; within the watch's span it drops what the run it corrects
-#     taught (:func:`_drop_corrected`). Only a row the user's own words name ("no, ネオン") still settles the watch.
+#     what the user just rejected); its hand-off watch learns nothing (``learn`` False), kept only so the finish gate
+#     can tell the new row; within the watch's span it drops what the run it corrects taught (:func:`_drop_corrected`).
+#     Only a row the user's own words name ("no, ネオン", or words of theirs paired with it) still settles the watch.
 # No mapping is written here, and nothing polls: the watch is a note in RAM that those checks read.
 
 #: Names already kept as taste by this process, per taste kind (folded; RAM): a read with nothing new writes nothing.
@@ -1280,15 +1281,18 @@ def _pair_start(call: Any, asked: str, before: str | None, status: str) -> None:
     """Start (or restart) the one playlist watch: these words named no row (or nothing could be read), so the playlist
     the hand-off job then puts on within :data:`PAIR_WATCH_S` is what they meant. ``before``: the row playing at that
     read (it playing on is nothing the job did); ``status``: the session then. With no row read as playing, only an
-    idle session (:data:`IDLE_STATES`) is watched. Never for an eval run, without memory or a taste kind."""
+    idle session (:data:`IDLE_STATES`) is watched. Never for an eval run, without memory or a taste kind.
+
+    gd D2: a correction's words name what the user just rejected, so the row the hand-off job puts on for them is
+    Yuki's pick: the run it corrects unlearns its pairing first (:func:`_drop_corrected`), and the watch is opened as
+    one that learns nothing (``learn=False``: :func:`_pair_settle` keeps no name). It is still opened (review gd M1):
+    it is the hand-off finish gate's only proof that the row then playing is new (:func:`_handoff_verdict`)."""
     learns = _learns(call)
     if learns is None or not asked:
         return
-    if _corrects(call):
-        # gd D2: a correction's words name what the user just rejected: no watch learns what they meant (the hand-off
-        # job's row would be Yuki's pick for them), and the run it corrects unlearns its pairing
+    corrects = _corrects(call)
+    if corrects:
         _drop_corrected(call)
-        return
     log = _logger(call)
     if before is None and status not in IDLE_STATES:
         # something plays (or the session couldn't be read) and no row said which: a row seen playing later can't be
@@ -1296,19 +1300,22 @@ def _pair_start(call: Any, asked: str, before: str | None, status: str) -> None:
         _pair_end(None, "")
         log("spotify_pair", outcome="not_watched", session=status if str(status).isalpha() else "unknown")
         return
-    _pair_open(asked, before, memory=learns[0], kind=learns[1], log=log)
-    log("spotify_pair", outcome="watching", before_known=before is not None)
+    _pair_open(asked, before, memory=learns[0], kind=learns[1], log=log, learn=not corrects)
+    log("spotify_pair", outcome="watching", before_known=before is not None, learn=not corrects)
 
 
-def _pair_open(asked: str, before: str | None, *, memory: Any, kind: str, log: Callable[..., None]) -> int:
+def _pair_open(asked: str, before: str | None, *, memory: Any, kind: str, log: Callable[..., None],
+               learn: bool = True) -> int:
     """The watch for ``asked`` (replacing any), RAM only; its generation back. Nothing polls: the hand-off job's
-    finish gate (:func:`_handoff_verdict`) and a rung's own check of a same-exchange press (:func:`_played`) read it."""
+    finish gate (:func:`_handoff_verdict`) and a rung's own check of a same-exchange press (:func:`_played`) read it.
+    ``learn`` False (gd D2, a correction's watch): it still tells a new row from the one before, but settling on one
+    keeps no name (:func:`_pair_settle`); a reopen (:func:`_pair_reopen`) keeps the flag."""
     with _pair_lock:
         _pair_gen[0] += 1
         gen = _pair_gen[0]
         _pair.clear()
         _pair.update(gen=gen, asked=asked, before=before, settled=None, until=time.monotonic() + PAIR_WATCH_S,
-                     memory=memory, kind=kind, log=log)
+                     memory=memory, kind=kind, log=log, learn=bool(learn))
     return gen
 
 
@@ -1457,14 +1464,18 @@ def _pair_settle(name: str, *, gen: int, own: bool) -> None:
     hour, the words an encrypted pairing keyed by their digest; the newest pairing of the same words wins), off the
     check's clock. Only a row PLAN.md D1 lets keep a name (``own``: a Library row whose owner parsed and isn't Spotify;
     review r1 L1): any other (Spotify's own, an unparsed owner, a page header) is kept nowhere (``not_kept``). Once per
-    watch; the watch keeps the row it settled on until its time is up (the finish gate may ask again). Content-free
-    log."""
+    watch; the watch keeps the row it settled on until its time is up (the finish gate may ask again). A watch that
+    learns nothing (``learn`` False, a correction's: gd D2) records the row it settled on and keeps no name
+    (``not_kept``, ``corrects``). Content-free log."""
     with _pair_lock:
         if not _pair or _pair.get("gen") != gen or _pair.get("settled") is not None:
             return
         _pair["settled"] = name
         p = dict(_pair)
     log = p.get("log") or (lambda *_a, **_k: None)
+    if not p.get("learn", True):
+        log("spotify_pair", outcome="not_kept", corrects=True)
+        return
     if _fold(name) == _fold(p.get("asked")):
         log("spotify_pair", outcome="same_name")
         return
@@ -1573,10 +1584,12 @@ def _drop_corrected(call: Any) -> None:
     both talkers ``lumen (they've called it "Japanese")`` and the next "Play the Japanese playlist" played lumen): a
     correction never pairs its words with the row it plays, and within the watch's span (:data:`PAIR_WATCH_S`) it drops
     what the run it corrects taught, whatever the correction's words: the pairing of the words a meant or
-    pairing-reached play was played for (``_said_play``) and the row the watch settled on (``_pair``); the watch ends
-    (a later finish gate settles nothing). The safe direction: a pairing dropped costs one more judgement, a wrong one
-    kept plays the wrong playlist every time. Off the request's clock; content-free log (``spotify_pair``
-    ``outcome=corrected``, then ``unlearned`` / ``unlearn_none`` per pairing). Never for an eval run."""
+    pairing-reached play was played for (``_said_play``) and the row the watch settled on (``_pair``, unless it was a
+    correction's own watch that learned nothing); the watch ends (a later finish gate settles nothing; a correction
+    that hands over opens its own watch that learns nothing: :func:`_pair_start`). The safe direction: a pairing
+    dropped costs one more judgement, a wrong one kept plays the wrong playlist every time. Off the request's clock;
+    content-free log (``spotify_pair`` ``outcome=corrected``, then ``unlearned`` / ``unlearn_none`` per pairing).
+    Never for an eval run."""
     learns = _learns(call)
     if learns is None:
         return
@@ -1591,8 +1604,9 @@ def _drop_corrected(call: Any) -> None:
     drops: list[tuple[str, str]] = []
     if sp and now <= float(sp.get("until") or 0.0) and sp.get("row") and sp.get("words"):
         drops.append((str(sp["row"]), str(sp["words"])))
-    if p and now <= float(p.get("until") or 0.0) and p.get("settled") and p.get("asked") and \
-            _fold(p["settled"]) != _fold(p["asked"]):
+    # a watch that learned nothing (a correction's own, ``learn`` False) taught no pairing to drop
+    if p and p.get("learn", True) and now <= float(p.get("until") or 0.0) and p.get("settled") and p.get("asked") \
+            and _fold(p["settled"]) != _fold(p["asked"]):
         drops.append((str(p["settled"]), str(p["asked"])))
     drops = list({(_fold(r), _fold(w)): (r, w) for r, w in drops}.values())
     log = _logger(call)
@@ -1699,17 +1713,22 @@ def _after_look(call: Any, look: Look, status: str, app_id: str, facts: dict[str
         return got
     if _learns(call) is None:
         return got                       # an eval run (or no memory): no watch, pairing or doubt is touched
+    said: str | None = None
     if _corrects(call) and not _words_hold(getattr(call.ctx, "words", None), look.name):
         # gd D2 (final-D k_playlist_not_that: "the other playlist" ran with the caller's pick, and the watch settled the
         # user's earlier words on it): a correction whose row their own words don't name is Yuki's pick, so it pairs
-        # nothing, and the corrected run's pairing is dropped. A row they named themselves ("no, ネオン") still settles
-        # the watch's words on it below (their own words: the newest pick wins)
-        _drop_corrected(call)
-        return got
+        # nothing, and the corrected run's pairing is dropped. A row they named themselves ("no, ネオン"), or through
+        # words of theirs already paired with it ("no, the Japanese one" given as ネオン: review gd L2, the same
+        # bounded read as below), still settles the watch's words on it below (their own words: the newest pick wins),
+        # and the play is remembered as reached through that pairing, so a further correction can drop it
+        said = _said_from(call, look)
+        if not said:
+            _drop_corrected(call)
+            return got
     gen = _pair_request(call, look.name, acted=got.ran is not False and not got.already)
     if gen is not None:
         got.facts_ram["pair"] = {"gen": gen, "row": look.name, "own": _own(look)}
-    words = _said_from(call, look)
+    words = said or _said_from(call, look)
     _said_doubt(look.name, words or _playlist_name(call.values))
     if words:
         got.facts["said_as"] = True      # the row these words were paired with (content-free flag)
@@ -2564,7 +2583,8 @@ def _handoff_verdict(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, di
     with no name (the hand-off dropped it), or with that name. Which playlist shows playing (:func:`playing_row`),
     Spotify's session and its sound here: a row the watch for these words judges new (:func:`_pair_judge`: not the one
     playing when the words named no row; the paused one resumed counts) -> True, the words are kept as its other name
-    (:func:`_pair_settle`, only for a row D1 lets keep a name) and a pairing it contradicts is dropped
+    (:func:`_pair_settle`, only for a row D1 lets keep a name, and never on a correction's watch, which learns nothing:
+    gd D2) and a pairing it contradicts is dropped
     (:func:`_said_doubt`). Nothing playing and the session paused or stopped -> False. No watch to tell which was
     started after the hand-off, an old row, or no sound here -> None (never a false done). ``None`` back: a row named
     in view, checked the usual way."""
