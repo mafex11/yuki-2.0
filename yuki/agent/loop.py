@@ -3050,6 +3050,20 @@ class Agent:
         """
         if name not in ACTION_TOOL_NAMES:
             return "run", None
+        if name == "run_powershell":
+            # integ28 fix S4 (A1 on this loop's path too: under "all" it drives while the brain can't be made): a
+            # command longer than the cap both brains share (``check.shell_chars``: ONE's ``SHELL_CHARS``, whitespace
+            # runs folded, the same measure) is refused before any judge, as the executor and ONE's gate refuse it
+            try:
+                from yuki.brain.check import shell_chars
+                from yuki.one.policy import LINE_SHELL_LONG
+
+                cap = int(shell_chars())
+                line = LINE_SHELL_LONG.format(n=cap)
+            except Exception:  # noqa: BLE001 - the shared cap unreadable: this loop's own judge decides, as before
+                cap, line = 0, ""
+            if cap and len(" ".join(str(tool_input.get("command") or "").split())) > cap:
+                return "refuse", line
         risk = tool_input.get(RISK_FIELD)
         if risk is None:
             if name == "run_powershell":

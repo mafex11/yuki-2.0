@@ -2108,6 +2108,9 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             if reading is not None:
                 src = _given_source(given_from, slot.name)
                 theirs = False
+                # integ28 fix skills-words-3: theirs by identity (the caller's own value), as K-H accepts ``heard``;
+                # code's own sound remap of that value is theirs only as a named guess
+                same = True
                 if heard_app is not None:
                     src, theirs = FROM_HEARD, True
                 elif skill.bind.get(slot.name) == SITE_BIND:
@@ -2131,14 +2134,16 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                     # (``own``: :func:`yuki.skills.taste.heard_as` on the value); kw3 (C4): never replaced by a name
                     # found elsewhere in the turn
                     reading, mine = own(slot, reading, menu_names, offered)
-                    theirs = bool(mine)
+                    theirs, same = bool(mine), mine != FROM_HEARD
                 if not src and _caller_heard(given_from, slot.name):
                     # gd D1 (kw3 C5 regression, final-G2 p24_misheard_excalidraw: "Excalidraw.com is up in Google
                     # Chrome, if that's what you meant."): the caller read this value from a misheard word of theirs
                     # (contract K-H). On this undoable run, for a slot that is no person (``undoable``), a value that
                     # is by identity one of their own known sites, apps or things is theirs, heard: no hedge (the
-                    # user's 19 Oct decision). Any other value keeps its guess tag and is named, as before
-                    if theirs or (slot.type == "app" and _own_app(reading, store=store, until=until)):
+                    # user's 19 Oct decision). Any other value keeps its guess tag and is named, as before. integ28 fix
+                    # skills-words-3: an entity value code only remapped by sound (``own``'s FROM_HEARD: the words were
+                    # already measured not to hold that row) is no identity: it stays a named guess (FROM_CARD)
+                    if (theirs and same) or (slot.type == "app" and _own_app(reading, store=store, until=until)):
                         src = FROM_HEARD
                         names_how.setdefault(slot.name, NAMES_HOW_CALLER)
                         names_miss.pop(slot.name, None)

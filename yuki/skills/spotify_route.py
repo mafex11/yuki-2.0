@@ -118,14 +118,15 @@ LINE_ALREADY_UNCONFIRMED = "Spotify shows it as already playing, but I couldn't 
 LINE_VOLUME_UNCONFIRMED = "I moved it, but I couldn't confirm the new level."
 LINE_KEYS_SHORT = "I moved Spotify's volume to {now:g}%, but ran out of time before {target:g}%."
 #: gd D3 (final-G2 kw_offer_then_yes t1: "Putting on your workout playlist." then "Playing lumen on Spotify.", as if
-#: they had a workout playlist): the line said when the row that plays was reached by meaning for a name no row is
-#: called (the run's own fact ``meant_why``: ``mood`` the hour's usual, ``content`` the judgement's closest fit by what
-#: plays in it), so it names the substitute and why and an early line never stands uncorrected. A name heard as a row's
-#: (``heard``), one the words name or were paired with (``name``, ``called``) plays as asked: the plain line. Never on a
-#: correction (its words name what was rejected; the plain line names the row that plays).
+#: they had a workout playlist): the line said when the row that plays was reached by meaning for a name no row in view
+#: is called (the run's own fact ``meant_why``: ``mood`` the hour's usual, ``content`` the judgement's closest fit by
+#: what plays in it), so it names the substitute and why and an early line never stands uncorrected. integ28 fix
+#: skills-words-1: worded from that measured fact only ("I couldn't see"): a row out of view may still be called so.
+#: A name heard as a row's (``heard``), one the words name or were paired with (``name``, ``called``) plays as asked:
+#: the plain line. Never on a correction (its words name what was rejected; the plain line names the row that plays).
 INSTEAD_WHY: dict[str, str] = {"mood": ", your usual now", "content": ", the closest fit"}
-LINE_INSTEAD = "No playlist called {asked}, so I put on {name}{why}."
-LINE_INSTEAD_ALREADY = "No playlist called {asked}; {name}{why} is already playing."
+LINE_INSTEAD = "I couldn't see a playlist called {asked}, so I put on {name}{why}."
+LINE_INSTEAD_ALREADY = "I couldn't see a playlist called {asked}; {name}{why} is already playing."
 #: The name asked, as said in that line, at most this long (cut at a word).
 INSTEAD_ASKED_CHARS = 40
 
@@ -1685,7 +1686,8 @@ def _after_look(call: Any, look: Look, status: str, app_id: str, facts: dict[str
         got.facts["how"] = why    # heard / name / called / content / mood
         corrected = _corrects(call)
         if why in INSTEAD_WHY and not corrected and got.say:
-            # gd D3: no row is called what they asked; the line names the substitute and why (the run's own facts)
+            # gd D3: no row in view is called what they asked; the line names the substitute and why (the run's own
+            # facts; integ28 fix skills-words-1: "couldn't see", never "no playlist": a row out of view may be it)
             got.say = _instead_line(meant, look.name, why, already=bool(got.already))
         learns = _learns(call)
         if learns is None:

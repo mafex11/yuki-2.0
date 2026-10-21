@@ -209,7 +209,10 @@ def _stamp(store: Any) -> tuple[Any, ...]:
     try:
         row = store._query(
             "SELECT (SELECT count(*) || ':' || coalesce(max(updated_at), 0) FROM skills WHERE origin != 'capability'),"
-            " (SELECT coalesce(max(updated_at), 0) FROM routines), (SELECT coalesce(max(updated_at), 0) FROM tastes),"
+            " (SELECT coalesce(max(updated_at), 0) FROM routines),"
+            # integ28 fix skills-words-2: the row count too, so an unsay (a DELETE of a row that is not the newest)
+            # changes the stamp
+            " (SELECT count(*) || ':' || coalesce(max(updated_at), 0) FROM tastes),"
             " (SELECT coalesce(max(updated_at), 0) FROM prefs), (SELECT coalesce(max(updated_at), 0) FROM contacts),"
             " (SELECT coalesce(max(id), 0) FROM portraits), (SELECT coalesce(max(updated_at), 0) FROM day_digests),"
             " (SELECT coalesce(max(updated_at), 0) FROM nudge_state WHERE name = ?)", (desk_key,))
@@ -709,8 +712,12 @@ def _things(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, wide:
         out += _list(2, "YouTube channels they watch (most watched first): ", _channels(store, now, CHANNELS_N[i]),
                      min_n=3)
         bits = []
+        # integ28 fix skills-words-2 (gd D2's settle rule, here too): "they call it" shows only pairings that have
+        # settled (``talker_digest._settled_said``), never one a correction may still drop; E3 reads this line
+        settled = _settled_called(store, "spotify_playlist", now)
         for d in taste.described(store, "spotify_playlist", now=now, limit=PLAYLISTS_N[i])[:PLAYLISTS_N[i]]:
-            called = [c for c in (d.get("called") or []) if c][:2]
+            ok = settled.get(taste._norm(d.get("name")), ())
+            called = [c for c in (d.get("called") or []) if c and c in ok][:2]
             plays = d.get("plays")
             meaning = _meaning(store, "playlist", d.get("name"))
             bits.append((_with(_clip(d.get("name"), 28), meaning,
@@ -724,6 +731,18 @@ def _things(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, wide:
     out += _way_things(store, ways, WAY_THINGS_N[i])
     out += _list(3, "Usual means: ", ((x, MEANT) for x in _usuals(store, 4 if not wide else 8)), sep="; ")
     return out
+
+
+def _settled_called(store: Any, kind: str, now: float) -> dict[str, list[str]]:
+    """integ28 fix skills-words-2: the words paired with each entity of ``kind`` that have settled (gd D2:
+    ``talker_digest._settled_said``, keyed by the target's folded name), so the card's "they call it" never shows a
+    pairing made a moment ago (a correction may still drop it). ``{}`` when it can't be read. Never raises."""
+    try:
+        from yuki.memory.talker_digest import _settled_said
+
+        return _settled_said(store, kind, float(now))
+    except Exception:  # noqa: BLE001 - nothing shown as theirs
+        return {}
 
 
 def _browsers(store: Any, vals: dict[str, list[dict[str, Any]]], names: dict[str, str]) -> list[list[Any]]:

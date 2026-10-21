@@ -1777,15 +1777,16 @@ STAY_QUIET: dict[str, Any] = {
 
 #: The ``end_conversation`` schema: the user wants this voice conversation to stop (never a rule). final-G2 E2: stop or
 #: off said of what plays or runs is never an ending (for what plays: the state they want, held still or playing
-#: silently). ge fix F3: "stop listening" is its trigger only outside a call (in a call it is GO_QUIET's this_call, as
-#: GO_QUIET and the call layer say), restored as a few words in the trigger list.
+#: silently; integ28 fix T4: only "what plays" carries that state, as ge F2 scoped it in the talker texts). ge fix F3:
+#: "stop listening" is its trigger only outside a call (in a call it is GO_QUIET's this_call, as GO_QUIET and the call
+#: layer say), restored as a few words in the trigger list.
 END_CONVERSATION: dict[str, Any] = {
     "name": "end_conversation",
     "description": (
         "End this conversation now (\"shut up\", \"go away\", \"bye\", \"go back to sleep\", \"stop listening\" "
         "with no while, not in a call). Call it alone; nothing is said after it. Tasks go on; nothing is saved. Never "
-        "for what answers a question you or a task just asked, nor for stop or off of what plays or runs: the state "
-        "they want, held still (pause) or playing silently (mute)."
+        "for what answers a question you or a task just asked, nor for stop or off of what runs, or of what plays "
+        "(the state they want: held still (pause) or playing silently (mute))."
     ),
     "properties": {
         "say_first": {"type": "string", "description": (
@@ -2493,6 +2494,12 @@ OPENED_RERUN_NOTE = ("[You chose silence on their first words, but they opened t
                      "nothing has answered them yet. Answer them now: act on a reading that plainly fits, or say in a "
                      "few words you didn't catch it. Only if they plainly spoke to someone else, choose quiet again; "
                      "told to go, end_conversation with say_first \"\", alone.]")
+#: integ28 fix T2 (gc C2's marker leftover): ONE's quiet marker alone (no stay_quiet call) on a user turn whose words
+#: follow Yuki's own heard line was waived once (``OneVoice._opened_marker``); the reply watch's rerun carries this
+#: (``pipeline.ONE_FOLLOW_QUIET``'s sentence; :data:`OPENED_RERUN_NOTE` says "first words", which a follow-on is not).
+FOLLOW_RERUN_NOTE = ("[You chose silence, but their words follow your own line and nothing has answered them yet. "
+                     "Answer in a few words; only if they plainly spoke to someone else, choose quiet again; if they "
+                     "sent you away or signed off, end_conversation with say_first \"\", alone.]")
 #: The last line of every request's volatile block in marker mode (v3.16): the format, right where the reply begins.
 MARKER_REMINDER = "[Start your reply with its marker line: say, act or quiet, alone on the first line.]"
 #: Added when the user's turn is answered again because nothing of the last reply to it was heard (v3.16).
@@ -2599,11 +2606,12 @@ def fetch_skills_options(memory: Any, *, timeout_s: float = 0.3, now: float | No
 
 def rerun_note(state: dict[str, Any] | None) -> str:
     """The note a rerun of the user's turn carries, from the pipeline's measured states (``claim``, ``repeat``,
-    ``opened_quiet``, ``rerun_why``): what :func:`volatile_block` adds with ``rerun``; integ27 fix TV3: also the ONE
-    rerun's note on the request's newest message. Never the words."""
+    ``opened_quiet``, ``follow_quiet``, ``rerun_why``): what :func:`volatile_block` adds with ``rerun``; integ27 fix
+    TV3: also the ONE rerun's note on the request's newest message. Never the words."""
     state = state or {}
     return (CLAIM_NOTE if state.get("claim") else REPEAT_NOTE if state.get("repeat")
             else OPENED_RERUN_NOTE if state.get("opened_quiet")
+            else FOLLOW_RERUN_NOTE if state.get("follow_quiet")
             else RERUN_WHY_NOTES.get(str(state.get("rerun_why") or ""), RERUN_NOTE))
 
 
@@ -2653,7 +2661,9 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     :data:`YOU_LINE` right after the focus guide.
 
     voice21 (final-D S10): ``state["opened_quiet"]`` on a rerun (the quiet marker on the first words of a conversation
-    they opened was waived once) gives :data:`OPENED_RERUN_NOTE` in place of :data:`RERUN_NOTE`.
+    they opened was waived once) gives :data:`OPENED_RERUN_NOTE` in place of :data:`RERUN_NOTE`; integ28 fix T2:
+    ``state["follow_quiet"]`` (ONE's quiet marker on words that follow Yuki's own line, waived once) gives
+    :data:`FOLLOW_RERUN_NOTE`.
 
     fc (C1-C3): ``state["rerun_why"]`` on a rerun (``unmarked``, ``act``, ``broken``: the stream's own reading of the
     reply that was not heard) gives that note of :data:`RERUN_WHY_NOTES` in place of :data:`RERUN_NOTE`.

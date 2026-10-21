@@ -7787,6 +7787,23 @@ class Hands:
         for _n, title, tab_id, hwnd in targets:   # each in its own window (every: kHands r1 L10)
             result = act(int(hwnd), tab_id, "close")
             good = bool(getattr(result, "ok", False)) and bool(_detail(result, "verified"))
+            kind = _detail(result, "refused")
+            rung = _detail(result, "keys_rung")
+            off = rung.get("act_off") if isinstance(rung, dict) else None
+            if not good and (kind in ("game", BLOCKED_REFUSAL) or off):
+                # integ28 fix F1 (gh README §4 note 1): a gate refused the close key (the game gate, the live guard's
+                # block, or Act off for that browser): the hand stops here in Yuki's refused shape, as ``_report`` maps
+                # it for the window verbs, so both brains read a refusal (final for that target), never a plain failure
+                if off:
+                    facts["act_off"] = str(off)
+                else:
+                    facts["refused"] = "game" if kind == "game" else BLOCKED_REFUSAL
+                    if kind == "game":
+                        facts["game_front"] = True
+                failed.append(title)
+                lines.append(str(getattr(result, "summary", "")))
+                facts["action_ms"] = round(float(getattr(result, "elapsed_ms", 0.0) or 0.0))
+                break
             dialog = _detail(result, "dialog_raised") if not good else None
             if isinstance(dialog, int) and not isinstance(dialog, bool) and dialog:
                 # fa (A1): the close raised the page's own question ("Leave site?"), measured by the tab hand (a window

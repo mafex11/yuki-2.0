@@ -86,9 +86,9 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from yuki.agent.tools import _is_own_window, sends_for_certain, tool_traits
+from yuki.agent.tools import _is_own_window, _local_args, sends_for_certain, tool_traits
 from yuki.brain import consent, done, util
-from yuki.brain.check import CheckVerdict, CommitCheck, shell_chars
+from yuki.brain.check import CheckVerdict, CommitCheck, launch_args, shell_chars
 from yuki.brain.consent import Call, Live, field_of, words
 from yuki.log.events import Paused, Say, SendPending, ToolCall, ToolResult
 
@@ -470,6 +470,10 @@ QUESTION_SHELL_ASKING = ("Something I tried to close may be asking you a questio
 #: offer to do it now (A4: a step ends inside its own run).
 LINE_SHELL_LONG = ("the command is longer than the check reads whole, so it was not run: split it into shorter "
                    "commands (the session keeps variables), or say what it would do and offer to do it now")
+#: integ28 fix S1: the same for an app started with arguments Yuki wrote (``launch_app`` with ``args`` that are no web
+#: address) whose command line is longer than the check reads whole (planner-facing, non-final).
+LINE_ARGS_LONG = ("the app's arguments are longer than the check reads whole, so it was not started: open it without "
+                  "them, or say what it would do and offer to do it now")
 LINE_BUSY = "Something else is using the mouse and keyboard right now, so I stopped. Try again in a moment?"
 LINE_PAUSE_STOP = "Stopped. Nothing else was done."
 LINE_STOPPED_SEND = "Stopped. Nothing was sent."
@@ -1781,9 +1785,8 @@ class Executor:
             call = self._predicted(i, step, payload)
             if call is None:
                 continue
-            if call.tool == "run_powershell" and \
-                    len(" ".join(str(call.input.get("command") or "").split())) > self._shell_chars():
-                continue   # A1 (Z7): refused whole at run time; never shown to the check cut
+            if self._too_long(call):
+                continue   # A1 (Z7; integ28 fix S1: an app's arguments too): refused whole at run time; never shown cut
             live = Live(typed_pending=frozenset(typed), reads=frozenset(reads), join_controls=self.join_controls)
             if consent.may_commit(call, live, self.head):
                 calls.append(call)
@@ -1950,8 +1953,7 @@ class Executor:
             bounded = self._tidy_gate(index, call)
             if bounded is not None:
                 return bounded
-        if call.tool == "run_powershell" and \
-                len(" ".join(str(call.input.get("command") or "").split())) > self._shell_chars():
+        if self._too_long(call):
             # A1 (Z7): a command the commit check could only see cut is refused in the executor first, the same
             # measured length ONE refuses (one/policy.py:790-795); the check then only ever judges whole commands.
             # Not final (parity with ONE): it comes back to the planner to route around with shorter commands or to
@@ -1960,7 +1962,8 @@ class Executor:
             self._trace_step(call, None, ok=False, verdict=False, why="refused: shell_long", kind="control",
                              refused=True)
             self._emit_log("consent", verb=call.tool, row=0, result=consent.REFUSE, why="shell_long")
-            return self._mismatch_result(index, "shell_long", refused=True, seen=LINE_SHELL_LONG)
+            return self._mismatch_result(index, "shell_long", refused=True,
+                                         seen=LINE_SHELL_LONG if call.tool == "run_powershell" else LINE_ARGS_LONG)
         live = self._live(call)
         refused = self._who_guard(index, call, live)
         if refused is None:
@@ -2078,6 +2081,17 @@ class Executor:
         the check's step line clips a command at that same cap). A command over it is refused here, so a cut command
         never reaches the check."""
         return int(shell_chars())
+
+    def _too_long(self, call: Call) -> bool:
+        """A1 (Z7): a step the commit check could only see cut: a ``run_powershell`` command (whitespace runs folded)
+        or, integ28 fix S1, a ``launch_app`` whose arguments hold something other than a web address (a file, a switch,
+        a script: ``tools._local_args``) with its command line (``check.launch_args``, as the step line shows it)
+        longer than :meth:`_shell_chars`. Measured lengths only."""
+        if call.tool == "run_powershell":
+            return len(" ".join(str(call.input.get("command") or "").split())) > self._shell_chars()
+        if call.tool == "launch_app" and _local_args(call.input.get("args")):
+            return len(launch_args(call.input)) > self._shell_chars()
+        return False
 
     def _close_hold(self, call: Call) -> str:
         """safety27 D2 (ONE's ``_held`` rule for the planner): ``window`` when ``call`` acts in a window a close of

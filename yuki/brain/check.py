@@ -263,6 +263,19 @@ def shell_chars() -> int:
         return VALUE_CHARS
 
 
+def launch_args(tool_input: Mapping[str, Any] | None) -> str:
+    """integ28 fix S1: a ``launch_app`` call's arguments as one command line (``subprocess.list2cmdline``, the form
+    Windows passes them in), whitespace runs folded as :func:`_clip` folds them; ``""`` when it has none. The step
+    line shows it and the executor measures it against :func:`shell_chars`, so the check never judges cut arguments."""
+    args = (tool_input or {}).get("args")
+    if not isinstance(args, list):
+        return ""
+    import subprocess
+
+    kept = [str(a) for a in args if str(a).strip()]
+    return " ".join(subprocess.list2cmdline(kept).split()) if kept else ""
+
+
 def typed_field(target: Mapping[str, Any] | None) -> dict[str, Any] | None:
     """gb's contract K-T as the step line reads it (A5, final-G2 R13): from the facts a hand gave for a step
     (``typed_field`` ``{"window", "native", "role", "name"}``, ``typed_field_held``, ``typed_to_field``), the field
@@ -307,7 +320,10 @@ def _typed_line(call: Call, typed_text: str, field: Mapping[str, Any] | None) ->
         return line + "; this click is on another control (measured)" + (
             "" if held is None else "; that field holds the keyboard (measured)" if held
             else "; that field does not hold the keyboard (measured)")
-    return line + "; another text field holds the keyboard, and this step goes there (measured)"
+    # integ28 fix S2 (gb merge note 1): "the keyboard is in another text field", never "goes elsewhere": an app's send
+    # key (Ctrl+Enter from a mail's subject) still sends the text that waits, so that cue stays for the check
+    return (line + "; the keyboard is in another text field (measured); a send key of this app may still send the "
+                   "text that waits in this window")
 
 
 def _pending(typed_pending: Mapping[int, str] | frozenset[int] | set[int]) -> dict[int, str]:
@@ -320,7 +336,8 @@ def _pending(typed_pending: Mapping[int, str] | frozenset[int] | set[int]) -> di
 def step_line(call: Call, *, plan: Any = None, typed: bool = False, typed_text: str = "",
               field: Mapping[str, Any] | None = None) -> str:
     """One step as the check reads it: the verb, the app, the window's title, the element's role and name, the keys,
-    a send's text and recipient, a shell's command, a non-web address, a close, and, for a click or a key, the text
+    a send's text and recipient, a shell's command, an app's arguments (integ28 fix S1), a non-web address, a close,
+    and, for a click or a key, the text
     Yuki typed there and has not sent (``typed``, ``typed_text``; ``field``: gb's measured facts of the field it waits
     in and whether this step goes there, :func:`typed_field`). Plain facts; app-written text is marked as such."""
     parts = [call.tool]
@@ -359,6 +376,13 @@ def step_line(call: Call, *, plan: Any = None, typed: bool = False, typed_text: 
         # A1 (Z7, review L1): both brains refuse a command over the shared cap (:func:`shell_chars`) before any check,
         # and it is shown here up to that same cap, so the check only ever judges a whole command
         parts.append(f'command (Yuki wrote it) "{_clip(inp.get("command"), max(VALUE_CHARS, shell_chars()))}"')
+    elif call.tool == "launch_app":
+        # integ28 fix S1: an app started with arguments Yuki wrote (a file, a switch, a script) is judged on its whole
+        # command line, shown up to the shell's cap as a command is (the executor refuses longer ones first)
+        parts.append(f'app "{_clip(inp.get("query"), NAME_CHARS)}"')
+        line = launch_args(inp)
+        if line:
+            parts.append(f'arguments (Yuki wrote them) "{_clip(line, max(VALUE_CHARS, shell_chars()))}"')
     elif call.tool in ("open_url", "fetch_url"):
         parts.append(f'address "{_clip(inp.get("url"), 200)}"')
         if call.tool == "fetch_url":

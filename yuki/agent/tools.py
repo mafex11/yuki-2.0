@@ -785,7 +785,8 @@ OP_TRAITS: dict[tuple[str, str], Traits] = {
 
 #: Facts of a call's input or target that make an otherwise quiet call one that can destroy or reach someone (review
 #: 34: H2, M1, M2). Kept out of :data:`OP_TRAITS` so the tools' schemas (the ``risk`` field) do not change.
-#: ``open_url`` of anything but an http(s) address: a file or a scheme handler runs through its default program.
+#: ``open_url`` of anything but an http(s) address: a file or a scheme handler runs through its default program; and
+#: (integ28 fix S1) ``launch_app`` with such an argument: it runs through that app.
 LOCAL_TARGET_TRAITS = Traits(("open_apps",), "focus", destroys=True, reaches=True)
 #: A click on a control whose UIA role commits something (Send, Delete, Sign out, Approve, Buy are buttons and menu
 #: items): it can close, delete or send like a key can.
@@ -817,6 +818,15 @@ def _web_address(url: Any) -> bool:
         return False
 
 
+def _local_args(args: Any) -> list[str]:
+    """integ28 fix S1: the arguments of a ``launch_app`` call that are no http(s) address (a file, a folder, a switch,
+    a script: what the program runs or opens), whitespace-only ones left out; ``[]`` when there are none or ``args``
+    is no list. Shape facts only (the scheme parsed), never words."""
+    if not isinstance(args, list):
+        return []
+    return [str(a) for a in args if str(a).strip() and not _web_address(a)]
+
+
 def _skill_sends(tool_input: dict[str, Any] | None) -> bool:
     """Phase S (review L3): whether a ``run_skill`` call may send something to other people, from the skill's own data
     (``sends`` / ``sends_when`` in its connection file; :func:`yuki.skills.connection.sends_with`), never from slot
@@ -837,8 +847,9 @@ def _skill_sends(tool_input: dict[str, Any] | None) -> bool:
 
 def tool_traits(name: str, tool_input: dict[str, Any] | None = None) -> Traits:
     """The traits of one call: its operation's, else its tool's, else none (a read, a note, a memory tool). Text with
-    a line break types as Enter, so it submits like ``press_enter``; ``open_url`` of a file or a non-web scheme runs
-    something (both facts of the input itself)."""
+    a line break types as Enter, so it submits like ``press_enter``; ``open_url`` of a file or a non-web scheme, and
+    ``launch_app`` with an argument that is no web address (integ28 fix S1), run something (facts of the input
+    itself)."""
     tool_input = tool_input or {}
     op = None
     if name in ("window_action", "tab"):
@@ -846,6 +857,10 @@ def tool_traits(name: str, tool_input: dict[str, Any] | None = None) -> Traits:
     elif name == "type_text" and (tool_input.get("press_enter") is True or _line_break_in(tool_input.get("text"))):
         op = "submit"
     elif name == "open_url" and not _web_address(tool_input.get("url")):
+        return LOCAL_TARGET_TRAITS
+    elif name == "launch_app" and _local_args(tool_input.get("args")):
+        # integ28 fix S1 (Z7 by another verb): a file, a switch or a script in an app's command line runs through that
+        # program, as open_url's (review 34 H2): the commit check sees it (and can judge its ``later``)
         return LOCAL_TARGET_TRAITS
     elif name == "set_slider" and tool_input.get("keys"):
         # vfix3 review F1: the shortcut set_slider presses is a key combination like any hotkey (alt+f4 closes, enter

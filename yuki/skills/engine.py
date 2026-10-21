@@ -2336,7 +2336,7 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
         if res.held:
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "held_game"})
             _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="held_game",
-                  ms=route_ms)
+                  ms=route_ms, observed=res.facts)   # integ28 fix F2: the stop end's own facts (content-free)
             if res.ran:
                 acted = state["acted"] = True
                 if sends or not route.retry_after_acting:
@@ -2355,7 +2355,7 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                           **_switch_tried(res)})   # integ28 (gb merge note 6, K-S)
             _ledger_try(ctx, run_key, route, None, "refused", route_ms)
             _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result=TO_PLANNER,
-                  ms=route_ms)
+                  ms=route_ms, observed=res.facts)   # integ28 fix F2: K-S switcher_held / B3 stopped reach the log
             return _to_planner(skill, plan, tried, ctx, started, run_key=run_key, acted=acted, missing=missing,
                                seen=seen, evidence=evidence(route=route, reason=TO_PLANNER))
         if _not_typed(res):
@@ -2390,7 +2390,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                 state["asked_slot"] = asked_slot      # fd (D4): the slot this rung's question is about (the means ask)
             _ledger_finish(ctx, run_key, outcome="asked", checked=None, route=route, ms=route_ms, app=app_done,
                            acted=acted)
-            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="asked", ms=route_ms)
+            _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="asked", ms=route_ms,
+                  observed=res.facts)   # integ28 fix F2: held_by_check / taken_over / act_off ends' facts
             asked_ev = evidence(route=route, reason=res.outcome or "asked", line=res.ask)
             current = (res.facts or {}).get("current") if isinstance(res.facts, Mapping) else None
             if isinstance(current, (int, float)) and not isinstance(current, bool):
