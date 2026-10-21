@@ -109,9 +109,10 @@ shown, or, when it has none, a new window is asked for the way the Start menu
 would start it (``ActivateApplication`` for a packaged app, its program run
 again for a desktop app), and the summary says "Arc was running in the
 background with no window; opened a new window".  morning21 B8: when no window
-comes and the app has its own icon in the notification area
-(``windows.tray_icons``: its program in the shell's record of the icons, or the
-icon's name being the app's), it is a **tray app**: ``ok=True`` with
+comes, the app keeps no main-style window of its own hidden, and it has its own
+icon in the notification area (``windows.tray_icons``: its program in the
+shell's record of the icons, or the icon's name being the app's), it is a
+**tray app**: ``ok=True`` with
 ``details["tray_app"]`` and a summary that says so ("no window by design ...
 its own window or panel opens from that icon"), never a mismatch to retry.
 
@@ -2050,7 +2051,11 @@ def _restore_background_app(
         for other in appeared
     ]
     if hwnd is None:
-        icon = _tray_icon_of(chosen, set(running) | identity.running_pids())
+        # review L1: the shell keeps a record for every program that ever had a tray icon, so a windowed app that
+        # keeps its own main window hidden (Discord, Steam closed to the tray: measured above, ``kept_hidden``, or the
+        # hidden window that wouldn't show) is never called a tray app; only one with no such window of its own is
+        own_window = bool(kept_hidden) or bool(hidden_hwnd)
+        icon = "" if own_window else _tray_icon_of(chosen, set(running) | identity.running_pids())
         if icon:
             # morning21 B8 (live 21 Oct: "launch Twinkle Tray" mismatched twice and was tried again): a running app
             # with no window of its own and an icon in the notification area is a tray app; no window is its design,

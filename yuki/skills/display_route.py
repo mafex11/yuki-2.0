@@ -32,15 +32,19 @@ running when its command line needs it running: said and asked ("start it, or Wi
 for Windows' control silently.
 
 **Turning a screen off asks first** only when it is the only screen on, or shows a game or a call (the user's
-decision): the question names the monitor and why, and the answer comes back as the ``anyway`` slot, honoured only as
-the answer to that very question (the engine's own record, ``engine._answered_slots``), never as a value a caller
-guessed.
+decision; any window of a game on it, not only the one in front), or when the target named several monitors by its
+parts: the question names the monitors and why, and the answer comes back as the ``anyway`` slot, honoured only as
+the answer to that very question (the engine's own record, ``engine._answered_slots``) and only for the very
+monitors it named (kept in RAM for :data:`ASKED_OFF_S`), never as a value a caller guessed.
 
 Targets (the ``target`` slot, the model's value): ``all``; a place (``main``, ``second``, ... as the desk says it);
-the desk's own ``Monitor <n>``; a monitor's own name or Plug and Play id, whole or its start ("VG"); a misheard
-initialism one letter off a name's letters ("PG" for the VG271U), only when exactly one name is that close; its
-connector word ("HDMI"). Spelling and data only, never a list of words. Left out: every monitor ("on" wakes the ones
-that are off; "off" of every screen is asked first, as the only screen on).
+a monitor's own name or Plug and Play id, whole or its start ("VG"); its connector word ("HDMI"), when only one
+monitor has it; every monitor any of these names (never one of them alone); else a misheard initialism one letter
+off a name's letters ("PG" for the VG271U), only when the value is that one short word or writes it in capitals ("PG
+monitor"; never a lower-case "or" inside a phrase) and exactly one name is that close. Never the desk's ``Monitor <n>`` (the hands' id). Spelling and data only, never a list of words. A
+value that names no monitor is asked about ("Which monitor: ..., or both?", ``all`` among the options) with the forms
+the slot takes beside it (``facts_ram["form"]``, for a caller that calls again). Left out: every monitor ("on" wakes
+the ones that are off; "off" of every screen is asked first, as the only screen on).
 
 Logs (content-free; ``yuki.log.events``' vocabulary): ``display stage=read|set|power route=ddc|wmi|app
 verdict=held|stale|none monitors=<n> ok=<n> ms=<ms>`` (the plan's ``op`` and ``readback`` under the log's own enum
@@ -53,6 +57,7 @@ Public API::
     set_brightness(screens, *, level=None, change=None, app=None) -> list[Change]
     set_power(screens, state, *, app=None) -> list[Change]
     pick(value, screens) -> Picked                      # a target slot's value -> the monitors it names
+    target_form(screens) -> str                         # the forms the target slot takes now
     monitor_apps() -> list[MonitorApp]                  # the monitor apps the app data describes, as found now
     ROUTES = {"route_windows", "route_app"}; PROBES = {"still"}
 """
@@ -103,11 +108,17 @@ ANYWAY_SLOT = "anyway"
 
 ASK_WHAT = "Brighter, dimmer, a level, or the screen on or off?"
 ASK_WHICH = "Which monitor: {names}?"
+#: The option of ASK_WHICH that is every monitor (the slot's own form; said "both" or "all of them").
+ALL = "all"
 ASK_ONLY_SCREEN = "{name} is the only screen on, so you'd see nothing. Turn it off anyway?"
 ASK_EVERY_SCREEN = "That turns off every screen, so you'd see nothing. Turn them off anyway?"
 ASK_UNSURE_SCREEN = "I can't tell whether another screen is on. Turn {name} off anyway?"
 ASK_GAME = "{name} is showing your game. Turn it off anyway?"
 ASK_CALL = "{name} is showing your call. Turn it off anyway?"
+ASK_UNSURE_SHOWN = "I can't tell what {name} is showing. Turn it off anyway?"
+ASK_SEVERAL = "That turns off {name}. Turn them off?"
+#: A turn-off question's monitors are kept this long (s, RAM only): an ``anyway`` yes counts for those monitors only.
+ASKED_OFF_S = 120.0
 ASK_DETACHED = ("{name} isn't connected to Windows right now (switched fully off), so I can't reach it. Could you "
                 "press its power button?")
 ASK_ONLY_ONE = ("I can see only one monitor connected to Windows, {name}; the other may be switched fully off. Could "
@@ -124,6 +135,9 @@ WHY_WORDS: dict[str, str] = {
 }
 
 _bus = threading.Lock()
+#: fix L5: ``{capability: (the monitors the last turn-off question named, by key; monotonic time asked)}``. RAM only.
+_asked_off: dict[str, tuple[frozenset[str], float]] = {}
+_asked_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -171,11 +185,14 @@ def monitors() -> list[Screen]:
 @dataclass(frozen=True)
 class Picked:
     """What a target names: the monitors (``screens``), or why none (``why``: ``none`` nothing given, ``unknown``
-    nothing matched, ``detached`` a monitor this process saw that Windows no longer lists, named in ``name``)."""
+    nothing matched, ``detached`` a monitor this process saw that Windows no longer lists, named in ``name``).
+    ``several``: the value named more than one monitor by its parts (never ``all``): each is taken, and turning them
+    off asks first (fix M1: a role and a name that disagree are never settled by one of them alone)."""
 
     screens: tuple[Screen, ...] = ()
     why: str = ""
     name: str = ""
+    several: bool = False
 
 
 def _squash(text: Any) -> str:
@@ -207,25 +224,46 @@ def _one_off(a: str, b: str) -> bool:
 
 
 def _named(text: str, names: Sequence[tuple[str, str]]) -> list[str]:
-    """The keys of ``names`` (``(key, label or pnp)``) that ``text`` names by spelling: the whole name or id; a word
-    of it that starts the name (2 characters or more: "VG" of VG271U); else a short all-letter word one letter off one
-    of a name's letter runs (a misheard initialism), only when exactly one name is that close."""
+    """The keys of ``names`` (``(key, label or pnp)``) that ``text`` names by spelling: the whole name or id, else a
+    word of it that starts a name (2 characters or more: "VG" of VG271U)."""
     squashed = _squash(text)
     words = _tokens(text)
     whole = [k for k, n in names if _squash(n) and _squash(n) == squashed]
     if whole:
         return list(dict.fromkeys(whole))
     starts = [k for k, n in names if _squash(n) and any(len(w) >= 2 and _squash(n).startswith(w) for w in words)]
-    if starts:
-        return list(dict.fromkeys(starts))
-    near = [k for k, n in names for w in words if w.isalpha() and 2 <= len(w) <= 4
-            and any(_one_off(w, run) for run in _letter_runs(n))]
-    near = list(dict.fromkeys(near))
+    return list(dict.fromkeys(starts))
+
+
+def _near(value: Any, names: Sequence[tuple[str, str]]) -> list[str]:
+    """A misheard initialism: the key of the one name with a letter run one letter off a short all-letter word of
+    ``value`` ("PG" for the VG271U), only when exactly one name is that close. Fix L2: the word is the value on its
+    own, or written in capitals as an initialism is ("PG monitor"); never a lower-case short word inside a phrase
+    ("main or second": "or" against the "QR" of 24HC1QR). Spelling only. ``[]`` otherwise."""
+    words = [t for t in "".join(ch if ch.isalnum() else " " for ch in str(value or "")).split() if t]
+    short = [w.casefold() for w in words if w.isalpha() and 2 <= len(w) <= 4 and (len(words) == 1 or w.isupper())]
+    near = list(dict.fromkeys(k for k, n in names for w in short if any(_one_off(w, run) for run in _letter_runs(n))))
     return near if len(near) == 1 else []
 
 
+def _has_run(words: Sequence[str], run: Sequence[str]) -> bool:
+    """Whether ``run`` (a role's or a connector's own words: "second", "usb c") stands whole and in order in
+    ``words``."""
+    n = len(run)
+    return n > 0 and any(list(words[i:i + n]) == list(run) for i in range(len(words) - n + 1))
+
+
+def _ident(s: Screen) -> str:
+    return s.key or str(s.index)
+
+
 def pick(value: Any, screens: Sequence[Screen]) -> Picked:
-    """The monitors a ``target`` value names (see the module docstring). Spelling and data only."""
+    """The monitors a ``target`` value names (see the module docstring). Spelling and data only.
+
+    Fix M1: its place, its own name or id, and its connector are read together, and every monitor any of them names
+    is taken (``several`` when that is more than one): "VG and main" is both, never the place alone. A connector
+    word two monitors share names neither of them. Fix L3: the desk's ``Monitor <n>`` (the hands' id, counted from
+    0 where Windows' Settings counts from 1) is no form of it: such a value names nothing and is asked about."""
     text = " ".join(str(value or "").split()).casefold()
     if not text:
         return Picked(why="none")
@@ -233,22 +271,16 @@ def pick(value: Any, screens: Sequence[Screen]) -> Picked:
     if text == "all":
         return Picked(tuple(listed))
     words = _tokens(text)
-    if len(words) == 2 and words[0] == "monitor" and words[1].isdigit():
-        hit = [s for s in listed if s.index == int(words[1])]
-        if hit:
-            return Picked(tuple(hit))
-    by_role = [s for s in listed if s.role and s.role.casefold() in words]
-    if len(by_role) == 1:
-        return Picked(tuple(by_role))
-    names = [(s.key or str(s.index), s.label) for s in listed if s.label] + \
-            [(s.key or str(s.index), s.pnp) for s in listed if s.pnp]
-    keys = _named(text, names)
-    hit = [s for s in listed if (s.key or str(s.index)) in keys]
+    names = [(_ident(s), s.label) for s in listed if s.label] + [(_ident(s), s.pnp) for s in listed if s.pnp]
+    by_connector = [s for s in listed if s.connector and _has_run(words, _tokens(s.connector))]
+    keys = ({_ident(s) for s in listed if s.role and _has_run(words, _tokens(s.role))}
+            | set(_named(text, names))
+            | ({_ident(s) for s in by_connector} if len(by_connector) == 1 else set()))
+    if not keys:
+        keys = set(_near(value, names))
+    hit = tuple(s for s in listed if _ident(s) in keys)
     if hit:
-        return Picked(tuple(hit))
-    by_connector = [s for s in listed if s.connector and s.connector.casefold() in words]
-    if len(by_connector) == 1:
-        return Picked(tuple(by_connector))
+        return Picked(hit, several=len(hit) > 1)
     try:
         from yuki.perception.windows import seen_monitors
 
@@ -256,10 +288,17 @@ def pick(value: Any, screens: Sequence[Screen]) -> Picked:
         gone = [(k, label or pnp) for k, (label, pnp) in seen_monitors().items() if k not in attached and (label or pnp)]
     except Exception:  # noqa: BLE001
         gone = []
-    away = _named(text, gone)
+    away = _named(text, gone) or _near(value, gone)
     if len(away) == 1:
         return Picked(why="detached", name=next(n for k, n in gone if k == away[0]))
     return Picked(why="unknown")
+
+
+def target_form(screens: Sequence[Screen]) -> str:
+    """The forms the ``target`` slot takes, from the monitors now (fix M2: handed back to a caller whose value named
+    none): each place, each own name, ``all``, or left out. Data only."""
+    parts = [s.role for s in screens if s.role] + [s.label for s in screens if s.label]
+    return " | ".join([*dict.fromkeys(parts), "all"]) + "; or left out (every monitor)"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -775,8 +814,11 @@ def _number(value: Any) -> float | None:
     return x if x == x else None
 
 
-def _names(screens: Sequence[Screen]) -> str:
+def _which(screens: Sequence[Screen]) -> str:
+    """ASK_WHICH's choices: each monitor by name, then every monitor ("both" of two, "all of them")."""
     said = [s.said for s in screens]
+    if len(said) > 1:
+        said.append("both" if len(said) == 2 else "all of them")
     return said[0] if len(said) == 1 else ", ".join(said[:-1]) + " or " + said[-1]
 
 
@@ -794,15 +836,43 @@ def _monitor_of(hwnd: int) -> int:
         return 0
 
 
-def _off_question(call: Any, chosen: Sequence[Screen], screens: Sequence[Screen]) -> str | None:
+def _asked_keys(cap: str) -> frozenset[str] | None:
+    """The monitors this capability's last turn-off question named (by key), within :data:`ASKED_OFF_S`; else
+    ``None``."""
+    with _asked_lock:
+        hit = _asked_off.get(cap)
+    if hit is None or time.monotonic() - hit[1] > ASKED_OFF_S:
+        return None
+    return hit[0]
+
+
+def _off_question(call: Any, chosen: Sequence[Screen], screens: Sequence[Screen], *,
+                  several: bool = False) -> str | None:
     """The question before turning ``chosen`` off (the user's decision: only when no other screen would stay on, or
-    one of them shows a game or a call), or ``None`` when it may go ahead. The ``anyway`` slot is their yes only when
-    it answers this capability's own question of moments ago (the engine's record), never a value a caller guessed."""
+    one of them shows a game or a call; and when the target named several monitors by its parts), or ``None`` when it
+    may go ahead. The ``anyway`` slot is their yes only when it answers this capability's own question of moments ago
+    (the engine's record) about these very monitors (fix L5: the question's monitors, kept in RAM), never a value a
+    caller guessed and never a yes about another monitor."""
     from yuki.skills import engine
 
     cap = str(getattr(call.skill, "capability", "") or getattr(call.skill, "key", "") or "")
-    if call.values.get(ANYWAY_SLOT) is True and ANYWAY_SLOT in engine._answered_slots(cap, call.ctx):
+    keys = frozenset(_ident(s) for s in chosen)
+    if (call.values.get(ANYWAY_SLOT) is True and ANYWAY_SLOT in engine._answered_slots(cap, call.ctx)
+            and _asked_keys(cap) == keys):
         return None
+    question = _off_reason(call, chosen, screens, several=several)
+    if question is not None:
+        with _asked_lock:
+            _asked_off[cap] = (keys, time.monotonic())
+    return question
+
+
+def _off_reason(call: Any, chosen: Sequence[Screen], screens: Sequence[Screen], *, several: bool) -> str | None:
+    """:func:`_off_question`'s checks, in order: the only screen on; a game on a chosen monitor (the one in front, and
+    fix M3: any window of a game shown there, by ``gamegate.window_game``, a measured fact); a call shown there; several
+    monitors named. A check that can't read asks (fails closed), never with a claim the read doesn't hold."""
+    from yuki.skills import engine
+
     said = [s.said for s in chosen]
     names = said[0] if len(said) == 1 else ", ".join(said[:-1]) + " and " + said[-1]
     handles = {s.handle for s in chosen if s.handle}
@@ -814,7 +884,17 @@ def _off_question(call: Any, chosen: Sequence[Screen], screens: Sequence[Screen]
         # the others read off, or can't be read: never a claim the read doesn't hold
         return ASK_ONLY_SCREEN.format(name=_cap(names)) if all(p is not None for p in powers) \
             else ASK_UNSURE_SCREEN.format(name=names)
+    unsure = ASK_UNSURE_SHOWN.format(name=names)
+    try:
+        from yuki.perception.windows import list_windows
+
+        # the windows shown on a chosen monitor (one whose monitor can't be told counts as there: fails closed)
+        shown = [w for w in list_windows() if not w.is_minimized and _monitor_of(w.hwnd) in (handles | {0})]
+    except Exception:  # noqa: BLE001 - can't tell what shows there: asked
+        return unsure
     game = call.ctx.game_now()
+    if game == "unknown":
+        return unsure
     if game:
         try:
             import win32gui
@@ -822,8 +902,15 @@ def _off_question(call: Any, chosen: Sequence[Screen], screens: Sequence[Screen]
             front = int(win32gui.GetForegroundWindow() or 0)
         except Exception:  # noqa: BLE001
             front = 0
-        if game == "unknown" or not front or _monitor_of(front) in handles:
+        if not front or _monitor_of(front) in handles:
             return ASK_GAME.format(name=_cap(names))
+    try:
+        from yuki.memory.gamegate import window_game
+
+        if any(window_game(int(w.hwnd)) for w in shown):
+            return ASK_GAME.format(name=_cap(names))
+    except Exception:  # noqa: BLE001 - a game check that raised: asked
+        return unsure
     try:
         from yuki.skills.chat import _current_calls
 
@@ -833,27 +920,28 @@ def _off_question(call: Any, chosen: Sequence[Screen], screens: Sequence[Screen]
     if calls is None:
         if engine._in_call(call.ctx.hands, call.ctx.memory):
             return ASK_CALL.format(name=_cap(names))   # a call is live and where it shows can't be told
-        return None
-    if calls:
+    elif calls:
         try:
             from yuki.memory.store import app_key
-            from yuki.perception.windows import list_windows
 
-            for w in list_windows():
-                if app_key(w.process_name) in set(calls) and not w.is_minimized and _monitor_of(w.hwnd) in handles:
-                    return ASK_CALL.format(name=_cap(names))
+            if any(app_key(w.process_name) in set(calls) for w in shown):
+                return ASK_CALL.format(name=_cap(names))
         except Exception:  # noqa: BLE001 - can't tell where the call shows: asked
-            return ASK_CALL.format(name=_cap(names))
+            return unsure
+    if several and len(chosen) > 1:
+        return ASK_SEVERAL.format(name=names)
     return None
 
 
 def _line(changes: Sequence[Change], app: MonitorApp | None) -> tuple[str, str]:
     """``(done line, line when not all took)``: each monitor named with its read-back."""
     def took(c: Change) -> str:
+        already = " already" if c.why == "already" else ""
         if c.what == "power":
-            return f"{c.name} is {'on' if c.after == POWER_ON or (c.after is None and c.want == POWER_ON) else 'off'}"
+            on = c.after == POWER_ON or (c.after is None and c.want == POWER_ON)
+            return f"{c.name} is{already} {'on' if on else 'off'}"
         level = c.after if c.after is not None else c.want
-        return f"{c.name} at {level:g}%"
+        return f"{c.name} {'is already ' if already else ''}at {level:g}%"
 
     def missed(c: Change) -> str:
         after = f"{c.after:g}%" if c.what == "brightness" and c.after is not None else "the same"
@@ -873,12 +961,16 @@ def _line(changes: Sequence[Change], app: MonitorApp | None) -> tuple[str, str]:
     return done, _cap(f"{head}; {tail}." if head else f"{tail}.")
 
 
+#: A change's ``why`` when its monitor wasn't reached at all (nothing written to it).
+UNREACHED = ("no_handle", "no_ddc", "no_power", "no_off")
+
+
 def _finish(call: Any, changes: list[Change], *, op: str, via: str, app: MonitorApp | None, started: float) -> Any:
     """The route's result from the per-monitor changes: done (each read back), already, partly done, or nothing
     reached (the next rung, or the hand-off). Logs one content-free ``display`` line."""
     from yuki.skills.engine import _emit
 
-    acted = [c for c in changes if c.why not in ("no_handle", "no_ddc", "no_power", "no_off", "already")]
+    acted = [c for c in changes if c.why not in (*UNREACHED, "already")]
     held = all(c.ok is True for c in changes) and bool(changes)
     stale = any(c.why in ("readback_stale", "no_readback") for c in changes)
     verdict = "held" if held else "stale" if stale else "none"
@@ -890,10 +982,15 @@ def _finish(call: Any, changes: list[Change], *, op: str, via: str, app: Monitor
     ram = {"display": [c for c in changes if c.ok is True and c.why != "already"]}
     first = next((c.after for c in changes if c.what == "brightness" and c.after is not None), None)
     if held and not acted:
-        line = _cap(done.replace(" at ", " is already at ").replace(" is on", " is already on")
-                    .replace(" is off", " is already off"))
-        return _rr(ran=False, already=True, verified=True, outcome="already", say=line, facts=facts, facts_ram=ram,
+        return _rr(ran=False, already=True, verified=True, outcome="already", say=done, facts=facts, facts_ram=ram,
                    value=first)
+    if not acted and any(c.why == "already" for c in changes) and not any(c.why == "no_handle" for c in changes):
+        # fix L4: one monitor already so and the rest not reachable over their cable: nothing was written, and both
+        # are said ("24HC1QR is already at 80%; the VG271U doesn't take commands over its cable"). As a no-op that
+        # can't be confirmed whole, the run stops here (``ran=None`` with ``already``: the engine's settled end),
+        # never handed on to steps. A monitor Windows no longer lists is asked about instead (``_run``)
+        return _rr(ran=None, already=True, verified=None, outcome="partly_already", unverified_line=partly,
+                   facts=facts, value=first)
     if not acted:
         return _rr(ran=False, outcome=next((c.why for c in changes), "") or "not_reached", facts=facts)
     if held:
@@ -925,8 +1022,12 @@ def _run(call: Any, via: str) -> Any:
         if power == "on" and len(screens) == 1:
             return _rr(ran=False, ask=ASK_ONLY_ONE.format(name=screens[0].said), outcome="only_one",
                        facts={"slot": "target"})
-        return _rr(ran=False, ask=ASK_WHICH.format(names=_names(screens)), options=[s.said for s in screens],
-                   outcome="ask_which", facts={"slot": "target"})
+        # fix M2: every monitor is one of the answers ("both" -> the slot's ``all``), and the forms the slot takes
+        # ride beside the question in RAM (``facts_ram["form"]``) for a caller that calls once more with one of them
+        # (engine merge note 12: a value that names no monitor is the caller's slip the first time, skill22 A19)
+        options = [s.said for s in screens] + ([ALL] if len(screens) > 1 else [])
+        return _rr(ran=False, ask=ASK_WHICH.format(names=_which(screens)), options=options, outcome="ask_which",
+                   facts={"slot": "target"}, facts_ram={"form": {"target": target_form(screens)}})
     # left out: every monitor (an off of every screen is asked first, below)
     chosen = list(picked.screens) if picked.why != "none" else list(screens)
     app: MonitorApp | None = None
@@ -951,7 +1052,7 @@ def _run(call: Any, via: str) -> Any:
 
             return _rr(ran=False, ask=LINE_ACT_OFF.format(app=app.name), outcome="act_off")
     if power == "off":
-        question = _off_question(call, chosen, screens)
+        question = _off_question(call, chosen, screens, several=picked.several)
         if question is not None:
             return _rr(ran=False, ask=question, outcome="ask_off", facts={"slot": ANYWAY_SLOT})
     changes: list[Change] = []
@@ -968,7 +1069,7 @@ def _run(call: Any, via: str) -> Any:
                    facts={"slot": "means"})
     result = _finish(call, changes, op=op, via="app" if app is not None else _via_word(changes), app=app,
                      started=started)
-    if not result.ran and not result.already and any(c.why == "no_handle" for c in changes):
+    if result.ran is False and not result.already and any(c.why == "no_handle" for c in changes):
         gone = next(c for c in changes if c.why == "no_handle")
         return _rr(ran=False, ask=ASK_DETACHED.format(name=_cap(gone.name)), outcome="detached",
                    facts={"slot": "target"})
@@ -1029,4 +1130,4 @@ PROBES: dict[str, Callable[[Any, Mapping[str, Any]], tuple[bool | None, dict[str
 
 __all__ = ["APP", "ANYWAY_SLOT", "Change", "MonitorApp", "PROBES", "Picked", "POWER_OFF", "POWER_ON", "ROUTES",
            "Screen", "VCP_BRIGHTNESS", "VCP_POWER", "monitor_apps", "monitors", "pick", "probe_still", "read",
-           "route_app", "route_windows", "set_brightness", "set_power"]
+           "route_app", "route_windows", "set_brightness", "set_power", "target_form"]
