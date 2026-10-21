@@ -643,20 +643,23 @@ def calling_site(service: Any) -> dict[str, Any]:
                  if " ".join(str(s.get("service") or "").split()).casefold() == want), {})
 
 
-def site_join_controls() -> frozenset[tuple[str, str]]:
+def site_join_controls(*, in_page: bool = False) -> frozenset[tuple[str, str]]:
     """Every calling site's declared join controls (``[call.labels.<language>] join = [[role, name], ...]``),
-    casefolded. Data; never raises."""
+    casefolded. ``in_page`` (review M2): those declared ``join_in_page`` instead: names other apps draw too (Meet's
+    "Present"), a join only in a window holding that site's tab. Data; never raises."""
     out: set[tuple[str, str]] = set()
+    field = "join_in_page" if in_page else "join"
     for s in calling_sites():
         for table in (s.get("labels") or {}).values():
-            for pair in (table.get("join") if isinstance(table, dict) else None) or []:
+            for pair in (table.get(field) if isinstance(table, dict) else None) or []:
                 if isinstance(pair, (list, tuple)) and len(pair) >= 2 and str(pair[1]).strip():
                     out.add((" ".join(str(pair[0]).split()).casefold(), " ".join(str(pair[1]).split()).casefold()))
     return frozenset(out)
 
 
 def _keys_words(keys: Any) -> str:
-    """A site's declared device keys as words: ``"microphone Ctrl+D, camera Ctrl+E"`` (``""``: none)."""
+    """A site's declared device keys as words: ``"microphone Ctrl+D, camera Ctrl+E"`` (``""``: none; the table's other
+    fields, ``toggles`` and ``when``, are no keys)."""
     if not isinstance(keys, dict):
         return ""
     parts = []
@@ -690,14 +693,20 @@ def calling_lines(board: Mapping[str, Any] | None) -> list[str]:
                 at = datetime.fromtimestamp(got["since"]).strftime("%H:%M") if got["since"] else ""
                 state = f"the user is in its call{' since ' + at if at else ''} (measured)"
             elif got["state"] == "lobby":
-                state = ("the user is NOT in its call: a pre-join page holding the microphone for its preview "
-                         "(measured); joining is the user's own click")
+                held = " holding the microphone for its preview" if got["mic_since"] is not None else ""
+                state = (f"the user is NOT in its call: a pre-join page{held} (measured); joining is the user's own "
+                         "click")
             else:
                 state = "the user is not in a call there (measured)"
             line = f"[{hwnd}] {app} has a {service} page{tab}: {state}"
-            keys = _keys_words(calling_site(service).get("keys"))
+            data = calling_site(service).get("keys")
+            keys = _keys_words(data)
             if keys:
-                line += f"; {service}'s own keys: {keys} (each flips it: read its state before and after)"
+                # review L2: the data's own condition for them (outside the page Ctrl+D bookmarks it)
+                how = ["each flips it: read its state before and after"] if data.get("toggles") else []
+                when = " ".join(str(data.get("when") or "").split())
+                how += [when] if when else []
+                line += f"; {service}'s own keys: {keys}" + (f" ({'; '.join(how)})" if how else "")
             out.append(line)
         return out
     except Exception:  # noqa: BLE001

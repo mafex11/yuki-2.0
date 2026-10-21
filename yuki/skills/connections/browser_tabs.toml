@@ -7,8 +7,9 @@
 # The tab is found by identity only, never by its title: the RuntimeId, name digests and pinned place memory learned on
 # every sighting of the site (nudge_state['site_tabs:<service>'], yuki.memory.callevidence.SiteTabs), through the tab
 # census (yuki.perception.tabs) of the browser it was seen in. That browser closed: it is launched by its app key (no
-# address, undoable, never with a game in front, never another browser) and its restored tabs read; no tab back: the
-# told link, else the calling site's front page in that same browser ([call] home in yuki/connect/sites). Selecting
+# address, undoable, never with a game in front, never another browser) and its restored tabs read (a started browser
+# still opening after the launch wait is said so and never started twice); no tab back: the told link, else the
+# calling site's front page in that same browser ([call] home in yuki/connect/sites). Selecting
 # the tab is a UI Automation pattern call (no key, no pointer); bringing the browser forward is the guarded
 # focus_window. If the strip can't be read, Yuki says so and does nothing. Never with a game in front ("after the
 # round?"), never handed to the thinker (it would only search), never a click on Join: the join is the user's (commit

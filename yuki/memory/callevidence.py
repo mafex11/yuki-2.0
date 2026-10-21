@@ -59,17 +59,23 @@ privacy file itself, never from a visit:
   never sent anywhere.
 
 A sighting of a calling site during the hold is site evidence: it **starts** a call (``fresh`` / ``stale`` like a
-screen; the standing answer is the service's, never the browser's) once the user **joined** it, unless a newer
-readable screen of the same app and site was judged not in a call (Teams' readable pre-join lobby after its blocked
-join link). morning21 (A9; the user's decision of 21 Oct: "the pre-join page is not a call, recording waits for the
-real join"): a pre-join page holds the microphone for its preview, so the sighting alone no longer starts a call (on
-21 Oct the Meet lobby was call 148, nine minutes before the real join: recording, the Ask card and the voice's call
-mode all ran on the lobby). The join is measured, never read off the page (it stays unread): the site's app plays
-sound during this hold after the sighting (a joined call's audio; a pre-join page plays none), read from Core Audio's
-render sessions (state only, :attr:`CallEvidence.sound_fn`) at each pass of the call worker while a sighting waits
-for it (:meth:`CallEvidence.judge`). Known limits: a browser already playing other sound (a video in another tab)
-marks the join at once, the old false start; a join made with the microphone off holds no microphone, so no call
-starts until it is held again (the call worker only starts calls from microphone holders). A site
+screen; the standing answer is the service's, never the browser's), unless a newer readable screen of the same app and
+site was judged not in a call (Teams' readable pre-join lobby after its blocked join link). morning21 (A9; the user's
+decision of 21 Oct: "the pre-join page is not a call, recording waits for the real join"): a pre-join page holds the
+microphone for its preview, so with the **join gate** on (:attr:`CallEvidence.join_gate`) the sighting alone no
+longer starts a call, only the user's measured **join** of it does (on 21 Oct the Meet lobby was call 148, nine
+minutes before the real join: recording, the Ask card and the voice's call mode all ran on the lobby). The join is
+measured, never read off the page (it stays unread): the site's app plays sound after the sighting (a joined call's
+audio; a pre-join page plays none), read from Core Audio's render sessions (state only, :attr:`CallEvidence.sound_fn`)
+at each pass of the call worker while a sighting waits for it (:meth:`CallEvidence.judge`), during the hold, or after
+it (review H1): a hold that saw a calling site and ended with no join measured leaves its app a **lobby** for
+:data:`LOBBY_KEEP_S` (:meth:`CallEvidence.lobby_apps`), because Meet lets the microphone go at a join made with it off
+(21 Oct: the hold ended at the join at 08:54:01, the call's sound played at 08:55:32 and the next hold began at
+09:01:16) and on its pre-join page when the user turns it off there. A lobby's join is measured by its sound alone
+while its app shows no other page since the sighting, and the call worker starts the call from it. The gate is the
+call worker's to turn on, once it hands :meth:`CallEvidence.judge` its lobbies; until then a sighting during the hold
+starts a call as before (a join with the microphone off would otherwise start nothing). Known limit: a browser
+already playing other sound (a video in another tab) marks the join at once, the old false start. A site
 call's life (:attr:`Life.site`, :class:`yuki.memory.calls.CallLife`): while the app holds the microphone it goes
 on, unless readable screens of the same site persistently say otherwise, or the app's newest frame is another page
 judged not in a call and the site has not been seen for ``screen_alive_s`` (one glance at a meeting page during a
@@ -90,8 +96,8 @@ strip; :func:`yuki.memory.extract.uia.tab_identities`) at most once per 10 min p
 ``nudge_state['site_tabs:<service>']``, and served on the Now board (``calling_tabs``). morning21 (A6): every sighting
 of such a window says whether the calling page is the one it shows now (``selected``: another page seen there is not
 it), and the board asks the call evidence for each calling tab's call state at snapshot time
-(:meth:`CallEvidence.site_call_state`: ``lobby`` while its app holds the microphone unjoined, ``in_call`` once the join
-was measured, else ``none``; contract K1, :func:`yuki.memory.now.call_state`). The census
+(:meth:`CallEvidence.site_call_state`: ``lobby`` while its app holds the microphone unjoined or is a lobby,
+``in_call`` once the join was measured, else ``none``; contract K1, :func:`yuki.memory.now.call_state`). The census
 (:meth:`SiteTabs.census`) finds the tab again in every window of the browser when an offer is due. Content-free logs
 (``tab_strip``, ``tab_census``): group sizes, counts, ms, reason codes, never a tab name.
 
@@ -156,6 +162,11 @@ TAB_READ_GAP_S = 600.0
 #: long (s; the worker passes every ``poll_s``, 5 s by default, and passes nobody while nobody holds it and no call is
 #: open): a calling tab's state is read from them (:meth:`CallEvidence.site_call_state`).
 HOLDERS_FRESH_S = 15.0
+#: morning21 (A9, review H1): a microphone hold that saw a calling site and ended with no join measured leaves its app a
+#: lobby this long after it ended (s): its join is still measured by its sound with no hold (Meet lets the microphone
+#: go at a join made with it off, and on the pre-join page when the user turns it off there). Bounded: a sound later
+#: than this is no join of that page.
+LOBBY_KEEP_S = 600.0
 
 #: The judge's three answers.
 IN_CALL, NOT_IN_CALL, UNCLEAR = "in_call", "not_in_call", "unclear"
@@ -493,8 +504,17 @@ class CallEvidence:
         #: (:meth:`_plays`).
         self.sound_fn: Callable[[Any], bool] | None = None
         self._sound_reader: Any = None
+        #: review H1: the latest Holder of each app the call worker handed :meth:`judge` (its key, its hold's start), and
+        #: the apps whose hold ended unjoined after a calling-site sighting: ``{app key: (that Holder, when it ended)}``
+        #: (:meth:`lobby_apps`).
+        self._last_holds: dict[str, Any] = {}
+        self._lobbies: dict[str, tuple[Any, float]] = {}
+        #: review H1: the join gate. On, a calling site's sighting starts a call only once its join was measured
+        #: (:meth:`state`); the call worker turns it on when it hands :meth:`judge` its lobbies (a join with the
+        #: microphone off is then measured and started from the lobby). Off: a sighting during the hold starts a call.
+        self.join_gate = False
         self.counters = {"seen": 0, "judged": 0, "cached": 0, "errors": 0, "sites_seen": 0, "sites_judged": 0,
-                         "site_joins": 0}
+                         "site_joins": 0, "lobbies": 0}
         self.cost_usd = 0.0
 
     # -- input (the watcher's worker thread) -------------------------------------------------
@@ -659,14 +679,19 @@ class CallEvidence:
         except Exception:  # noqa: BLE001
             return False
 
-    def judge(self, holders: Iterable[Any]) -> int:
+    def judge(self, holders: Iterable[Any], lobby: Iterable[Any] = ()) -> int:
         """Judge the unjudged latest screens of these apps (the microphone holders now: keys or ``Holder``).
 
         Returns how many verdicts were applied. A verdict already known for the same content costs nothing.
+        ``lobby`` (review H1): :meth:`lobby_apps`' Holders this pass: no screen of theirs is judged (no model call), only
+        their join is measured (:meth:`_measure_joins`).
         """
         holders = [h for h in holders if h]
+        lobby = [h for h in (lobby or ()) if h and not isinstance(h, str)]
         self._note_holders(holders)
         if not holders:
+            if lobby:
+                self._measure_joins([], lobby)
             return 0
         with self._lock:
             todo = [self._screens[w] for w in list(self._pending)
@@ -706,7 +731,7 @@ class CallEvidence:
             if not superseded:
                 applied += 1
         sites = self._judge_sites(holders)
-        self._measure_joins(holders)
+        self._measure_joins(holders, lobby)
         return applied + sites
 
     def _note_holders(self, holders: list[Any]) -> None:
@@ -735,13 +760,77 @@ class CallEvidence:
                     self._present_since[k] = since   # the hold began before this pass saw it
             self._holders_seen = seen
             self._holders_at = now
+            for h in holders:   # review H1: each app's latest hold, for lobby_apps
+                key = "" if isinstance(h, str) else str(getattr(h, "key", "") or "")
+                if key:
+                    self._last_holds[key] = h
 
-    def _measure_joins(self, holders: list[Any]) -> None:
+    def lobby_apps(self, held: Iterable[str] = (), now: float | None = None) -> list[Any]:
+        """review H1 (morning21 A9): the apps whose microphone hold saw a calling site and ended with no join measured,
+        at most :data:`LOBBY_KEEP_S` ago: each one's Holder of that hold (its key; ``since``: the hold's start), for the
+        call worker to hand :meth:`judge` as ``lobby`` (their join is measured by sound with no hold) and to start a
+        call from once :meth:`state` says joined. ``held``: the app keys holding the microphone now (a hold that goes
+        on is no lobby; one held again leaves the lobby to its new hold's rules). A lobby goes once joined, held again,
+        forgotten or too old. Logged ``call_evidence_lobby`` (app key only). Never raises."""
+        try:
+            now = time.time() if now is None else float(now)
+            held_keys = {str(k).casefold() for k in held or () if k}
+            out: list[Any] = []
+            new: list[str] = []
+            with self._lock:
+                for key, h in list(self._last_holds.items()):
+                    if key in held_keys:
+                        continue
+                    self._last_holds.pop(key, None)   # its hold ended (or it was the open call's app): looked at once
+                    if key not in self._lobbies and self._unjoined_sighting(h):
+                        self._lobbies[key] = (h, now)
+                        new.append(key)
+                for key, (h, ended) in list(self._lobbies.items()):
+                    if key in held_keys or now - ended > LOBBY_KEEP_S or not self._unjoined_sighting(h):
+                        self._lobbies.pop(key, None)
+                        continue
+                    out.append(h)
+                self.counters["lobbies"] += len(new)
+            for key in new:
+                self._log("call_evidence_lobby", app=key)
+            return out
+        except Exception:  # noqa: BLE001 - no lobby: a join with the microphone off waits for the next hold
+            return []
+
+    def _unjoined_sighting(self, holder: Any) -> bool:
+        """review H1: the holder's hold (from its ``since``) saw a calling site, not contradicted, whose join was not
+        measured (under the lock)."""
+        try:
+            since = float(getattr(holder, "since", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if since <= 0.0:
+            return False
+        floor = since - HOLD_TOLERANCE_S
+        return any(at >= floor and not negs and self._joined_at(k, host, floor) is None
+                   for at, k, host, _service, negs in self._site_hits_keyed(holder))
+
+    def _elsewhere(self, holder: Any, key: str, host: str) -> bool:
+        """review H1: the app showed another page (a readable one, or another unread site) after its last sighting of
+        ``host``: a lobby's sound is then no measure of that page's join (a video in another tab) (under the lock)."""
+        site_at = self._sites.get((key, host))
+        if site_at is None:
+            return True
+        if any(s.at > site_at for w, s in self._screens.items() if self._matches(holder, w[0])):
+            return True
+        return any(at > site_at for (k, h), at in self._sites.items() if h != host and self._matches(holder, k))
+
+    def _measure_joins(self, holders: list[Any], lobby: Iterable[Any] = ()) -> None:
         """morning21 (A9): for each microphone holder with a sighting of a calling site during its hold that no join
         was measured for yet (a pre-join page, or a call joined moments ago), the join is measured once more: its app
-        plays sound now (:meth:`_plays`; a pre-join page plays none, a joined call's audio does). Logged
-        ``call_evidence_site_join`` (app key and the reason code only). Never raises."""
-        for h in holders:
+        plays sound now (:meth:`_plays`; a pre-join page plays none, a joined call's audio does). Review H1: the same for
+        each lobby (:meth:`lobby_apps`: the hold ended unjoined; Meet's join with the microphone off), only while its app
+        showed no other page since the sighting (:meth:`_elsewhere`). Logged ``call_evidence_site_join`` (app key, the
+        reason code, whether the hold went on). Never raises."""
+        passed = {str(getattr(h, "key", "") or "") for h in holders if not isinstance(h, str)}
+        todo = [(h, True) for h in holders] + [(h, False) for h in lobby
+                                                if str(getattr(h, "key", "") or "") not in passed]
+        for h, holding in todo:
             if isinstance(h, str):
                 continue
             try:
@@ -753,7 +842,8 @@ class CallEvidence:
             floor = since - HOLD_TOLERANCE_S
             with self._lock:
                 waiting = [(k, host) for at, k, host, _service, negs in self._site_hits_keyed(h)
-                           if at >= floor and not negs and self._joined_at(k, host, floor) is None]
+                           if at >= floor and not negs and self._joined_at(k, host, floor) is None
+                           and (holding or not self._elsewhere(h, k, host))]
             if not waiting or not self._plays(h):
                 continue
             now = time.time()
@@ -764,7 +854,7 @@ class CallEvidence:
                 if len(self._site_joined) > MAX_SITES:   # bounded: forget the oldest joins
                     for old in sorted(self._site_joined, key=self._site_joined.__getitem__)[: MAX_SITES // 2]:
                         self._site_joined.pop(old, None)
-            self._log("call_evidence_site_join", app=waiting[0][0], sites=len(waiting), by="sound")
+            self._log("call_evidence_site_join", app=waiting[0][0], sites=len(waiting), by="sound", held=holding)
 
     def _plays(self, holder: Any) -> bool:
         """Whether the holder's app has an active output stream now (:attr:`sound_fn`, else this object's own reader of
@@ -1110,8 +1200,9 @@ class CallEvidence:
         product name from the verdict ("" when unknown). A call already going on is kept by
         :meth:`life` (no "newer than the hold" test: a re-grab of the microphone is the same call).
         A sighting of a calling site whose page is never read, during this hold, counts the same way
-        (``service`` from the site verdict, else its host) once the user joined it (morning21 A9: its join measured
-        during this hold, :meth:`_measure_joins`; a pre-join page alone is no call).
+        (``service`` from the site verdict, else its host); with the join gate on (:attr:`join_gate`) only once the
+        user joined it (morning21 A9: its join measured during this hold or, for a lobby's Holder, after it,
+        :meth:`_measure_joins`; a pre-join page alone is no call).
         """
         if not holder:
             return None, ""
@@ -1121,8 +1212,13 @@ class CallEvidence:
             found = [(at, service) for (k, h), (at, service, _o) in self._evidence.items()
                      if self._matches(holder, k) and self._live((k, h)) and at >= floor]
             for at, k, host, service, negs in self._site_hits_keyed(holder):
+                if at < floor or negs:
+                    continue
+                if not self.join_gate:
+                    found.append((at, service or host))   # the gate off: the sighting during the hold, as before
+                    continue
                 joined = self._joined_at(k, host, floor)
-                if at >= floor and not negs and joined is not None:
+                if joined is not None:
                     found.append((max(at, joined), service or host))
         if not found:
             return None, ""
@@ -1194,32 +1290,45 @@ class CallEvidence:
                 self._site_pending.discard(where)
             for where in [w for w in self._site_joined if w[0] == key.casefold()]:
                 self._site_joined.pop(where, None)
+            self._lobbies.pop(key.casefold(), None)
+            self._last_holds.pop(key.casefold(), None)
 
     def site_call_state(self, key: str, service: str, now: float | None = None) -> dict[str, Any]:
         """morning21 (A6, K1): the call state of a calling site's tab, by its browser's app key and its service (the
         product name of the site verdicts): ``{"state", "state_since", "mic_since"}``. ``in_call``: a join of one of
         that service's sites was measured in this app while the call worker has passed it without a break (holding
         the microphone, or as the open call's app while it let go: Meet's mute), since then; ``lobby``: the app holds
-        the microphone and no join was measured in that stretch (a pre-join page's preview), since the hold began;
-        ``none``: the call worker passed no such app lately (:data:`HOLDERS_FRESH_S`). Content-free; never raises."""
+        the microphone and no join was measured in that stretch (a pre-join page's preview), since the hold began, or
+        it is a lobby whose hold ended unjoined (review H1, :meth:`lobby_apps`: the user turned the microphone off on the
+        pre-join page; ``mic_since`` None); ``none``: the call worker passed no such app lately
+        (:data:`HOLDERS_FRESH_S`). Content-free; never raises."""
         empty = {"state": "none", "state_since": None, "mic_since": None}
         try:
             now = time.time() if now is None else float(now)
             key = str(key or "").strip().casefold()
             want = " ".join(str(service or "").split()).casefold()
+            if not key:
+                return empty
             with self._lock:
-                if not key or now - self._holders_at > HOLDERS_FRESH_S or key not in self._holders_seen:
-                    return empty
-                since = self._holders_seen[key]
+                passed = now - self._holders_at <= HOLDERS_FRESH_S and key in self._holders_seen
+                since = self._holders_seen.get(key) if passed else None
                 present = self._present_since.get(key, now)
+                lobby = self._lobbies.get(key)
                 hosts = [h for h, (calling, svc) in self._site_verdicts.items()
                          if calling and (not want or " ".join(str(svc or "").split()).casefold() == want)]
                 joins = [self._site_joined[(key, h)] for h in hosts if (key, h) in self._site_joined]
             joined = max(joins) if joins else None
-            if joined is not None and joined >= present - HOLD_TOLERANCE_S:
-                return {"state": "in_call", "state_since": joined, "mic_since": since}
-            if since is not None:
-                return {"state": "lobby", "state_since": since, "mic_since": since}
+            if passed:
+                if joined is not None and joined >= present - HOLD_TOLERANCE_S:
+                    return {"state": "in_call", "state_since": joined, "mic_since": since}
+                if since is not None:
+                    return {"state": "lobby", "state_since": since, "mic_since": since}
+                return empty
+            if lobby is not None and now - lobby[1] <= LOBBY_KEEP_S:
+                start = float(getattr(lobby[0], "since", 0.0) or 0.0) or None
+                if joined is not None and start is not None and joined >= start - HOLD_TOLERANCE_S:
+                    return {"state": "in_call", "state_since": joined, "mic_since": None}
+                return {"state": "lobby", "state_since": start, "mic_since": None}
             return empty
         except Exception:  # noqa: BLE001
             return empty
@@ -1228,7 +1337,8 @@ class CallEvidence:
         with self._lock:
             return {**self.counters, "screens": len(self._screens), "evidence": len(self._evidence),
                     "sites": len(self._sites), "calling_sites": sum(1 for v in self._site_verdicts.values() if v[0]),
-                    "site_joined": len(self._site_joined),
+                    "site_joined": len(self._site_joined), "lobby_now": len(self._lobbies),
+                    "join_gate": bool(self.join_gate),
                     "contradicted": sum(1 for w in self._evidence if self._negs.get(w)),
                     "cost_usd": round(self.cost_usd, 5)}
 

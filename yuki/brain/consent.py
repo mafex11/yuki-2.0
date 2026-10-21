@@ -28,7 +28,8 @@ applies decides:
 3. **Join** (H3; morning21 A4: the step is judged, never the window). A step is a join when (i) its target is a
    declared join control by (role, name) identity: a click on it, or Enter/Space (or typing that submits) with the
    focus read on it (catalog data: chat apps' ``[chat] labels.*.join_voice`` and calling sites' ``[call.labels.*]
-   join``, ``yuki/connect/sites``; identity, never keywords); (ii) the commit check says ``effect = join``; or (iii) it
+   join``, ``yuki/connect/sites``, and on that site's page shown now its ``join_in_page``, a name other apps draw too
+   such as Meet's "Present"; identity, never keywords); (ii) the commit check says ``effect = join``; or (iii) it
    runs a capability that joins: **refuse** as final (bring the window forward, "you click Join"). The one exception:
    a ``run_skill`` of a capability whose commit word (phase L's D24 table, ``Skill.commit``) is ``words``, on the
    user's plain words (the commit check's ``asked``; decision 7). (iv) Fail-closed only: in a window whose calling
@@ -1236,14 +1237,40 @@ def activates(call: Call) -> bool:
 def join_target(call: Call, live: Live) -> bool:
     """morning21 (A4 i): the step's target is a declared join control (:attr:`Live.join_controls`, by (role, name)
     identity; a name read with no role matches a control declared by that name): a click on it, or a key or a submit
-    that presses it while it holds the keyboard (the focus read the step carries)."""
+    that presses it while it holds the keyboard (the focus read the step carries). Review M2: on a calling site's page
+    shown now (:func:`calling_tab_now`; unknown counts as shown), also the sites' join controls under names other apps
+    draw too (:func:`page_join_controls`: Meet's "Present")."""
     name = words(call.name).casefold()
     if not name or not (call.tool == "click" or activates(call)):
         return False
     role = words(call.role).casefold()
-    if role:
-        return (role, name) in live.join_controls
-    return any(n == name for _r, n in live.join_controls)
+
+    def declared(controls: frozenset[tuple[str, str]]) -> bool:
+        return (role, name) in controls if role else any(n == name for _r, n in controls)
+
+    if declared(live.join_controls):
+        return True
+    page = page_join_controls()
+    return bool(page) and declared(page) and calling_tab_now(call.hwnd, live)
+
+
+#: review M2: the calling sites' in-page join controls, read once per process (data files ship with the build).
+_page_joins: frozenset[tuple[str, str]] | None = None
+
+
+def page_join_controls() -> frozenset[tuple[str, str]]:
+    """review M2: the calling sites' join controls declared ``[call.labels.<language>] join_in_page`` (a name other
+    apps draw too, a join only on that site's page: :func:`yuki.memory.now.site_join_controls`), casefolded. Data,
+    read once; never raises."""
+    global _page_joins
+    if _page_joins is None:
+        try:
+            from yuki.memory.now import site_join_controls
+
+            _page_joins = frozenset(site_join_controls(in_page=True))
+        except Exception:  # noqa: BLE001 - no data: the other row-3 tests still hold
+            return frozenset()
+    return _page_joins
 
 
 def unidentified_target(call: Call) -> bool:
@@ -1775,6 +1802,7 @@ __all__ = ["UNDOABLE",
            "NAME_GAP", "PLAIN_WHY", "REFUSE", "RESULTS", "SAID_SHARE", "SAID_SPAN", "Call", "Live", "Verdict",
            "after_ask", "ask_send_question", "spoken_name", "calling_windows", "chat_window", "check", "draft_slots",
            "failed_question", "field_of", "game_holds", "game_now", "in_words", "is_join_control", "join_controls",
+           "page_join_controls",
            "may_commit", "maybe_send_question", "near_duplicate", "own_undo", "person_slot", "plain_why",
            "plan_consent", "policy_holds",
            "quote_in_words", "quote_turns", "said_share", "screen_gate", "send_slots", "sends_now", "skill_commit",

@@ -28,11 +28,13 @@ said: identity of names, never meaning). Then:
   (:func:`probe_site_tab_shown`);
 * morning21 (A1; 21 Oct: "Zen isn't open, so there's no Google Meet tab" ended the morning meeting, then Meet's home
   page opened in Chrome): the browser the tab lives in has no window: it is launched by its app key (no address,
-  undoable, never with a game in front: :func:`_launch_browser`), its windows waited for within the request's time,
-  and its strip read again until the session restore brings the tab back (:func:`_census_restored`); then as above.
-  No tab back: the told link (the next rung), else the calling site's front page in that same browser
-  (:func:`_home_in`, its ``[call] home``). Never another browser; a launch that fails is a plain not-done
-  (``not_opened``). Every stop here is a code-word stop said plainly (``RouteResult.stop``), never a question.
+  undoable, never with a game in front: :func:`_launch_browser`), its windows waited for (a started browser for its
+  whole :data:`LAUNCH_WINDOW_S`, past the request's budget), and its strip read again until the session restore brings
+  the tab back (:func:`_census_restored`); then as above. No tab back: the told link (the next rung), else the calling
+  site's front page in that same browser (:func:`_home_in`, its ``[call] home``). Never another browser; a launch that
+  fails is a plain not-done (``not_opened``), a started browser with no window yet another (``still_opening``: it
+  acted, so nothing launches it again). Every stop here is a code-word stop said plainly (``RouteResult.stop``), never
+  a question.
 
 **web.open_page / web.open_video** (:func:`route_open_page`, :func:`route_open_video`). The address comes from the
 site files (``yuki/connect/sites/*.toml``: a site's front page, or a page kind's template with the item's value) or,
@@ -119,6 +121,9 @@ LINE_TAB_UNKNOWN = "I don't know your {service} tab yet. Bring it up once and I'
 LINE_BROWSER_CLOSED = "{browser} isn't open, so there's no {service} tab to bring up."
 #: morning21 (A1): the browser the tab lives in was closed and Yuki launched it.
 LINE_BROWSER_NOT_OPENED = "{browser} wouldn't open, so your {service} tab isn't up."
+#: review M1: Yuki started it and its window hasn't come up within :data:`LAUNCH_WINDOW_S` (a cold start restoring many
+#: tabs): not a failure, and not a reason to start it again.
+LINE_BROWSER_STARTING = "I started {browser}, but it's still opening, so your {service} tab isn't up yet."
 LINE_TAB_UP_LAUNCHED = "I opened {browser}: {service} is up in it."
 LINE_HOME_UP = "I opened {browser}, but your {service} tab didn't come back, so {service}'s front page is up in it."
 LINE_TAB_NONE_LAUNCHED = "I opened {browser}, but your {service} tab didn't come back in it."
@@ -172,9 +177,11 @@ FRONT_READ_S = 0.5
 #: rung spent (the request's 5 s is a p90 target, and the engine lets an acted rung's check run past it too): with less,
 #: a browser that did open the page could not be seen doing it.
 OPEN_FLOOR_S = 3.0
-#: morning21 (A1): a launched browser's first window is waited for at most this long (s; never past the request's time
-#: left, at least :data:`OPEN_FLOOR_S`), then its strip is read again every :data:`RESTORE_POLL_S` until the site's tab
-#: is back (its session restore) or :data:`RESTORE_WAIT_S` is up.
+#: morning21 (A1): a launched browser's first window is waited for at most this long (s). Review M1: once the launch
+#: reports the browser started, the whole of it, whatever the request's budget says (the request's 5 s is a p90 target,
+#: the engine lets an acted rung run past it, and a cold Zen restoring 15 tabs takes longer); a launch that started
+#: nothing waits only within the request's time left (at least :data:`OPEN_FLOOR_S`). Then its strip is read again
+#: every :data:`RESTORE_POLL_S` until the site's tab is back (its session restore) or :data:`RESTORE_WAIT_S` is up.
 LAUNCH_WINDOW_S = 12.0
 RESTORE_WAIT_S = 4.0
 RESTORE_POLL_S = 0.5
@@ -675,18 +682,21 @@ def _say(line: str, outcome: str, *, app: str | None = None, ran: bool = False, 
     return RouteResult(ran=ran, say=line, outcome=outcome, facts=facts, app=app or None, stop=True)
 
 
-def _launch_browser(call: RouteCall, key: str) -> list[tuple[int, int]] | RouteResult:
+def _launch_browser(call: RouteCall, key: str) -> tuple[list[tuple[int, int]], bool] | RouteResult:
     """morning21 (A1): the browser the site's tab lives in (app key ``key``) has no window: it is started by its Start
     menu name with no address (``launch.launch_app``: undoable; refused with a game in front, D17) and its windows are
-    waited for within the request's time left. Its windows (top first; ``[]``: it didn't open), or the hold to return
-    (a game in front, or another guard). Never another browser."""
+    waited for. ``(its windows, top first, or [] when none came up; whether the launch started it)``, or the hold to
+    return (a game in front, or another guard). Never another browser. Review M1: a launch that started the browser
+    waits for its window up to :data:`LAUNCH_WINDOW_S` whatever the request's budget says; one that started nothing
+    only within the request's time left."""
     from yuki.actions import launch
 
     if kind := _refused("launch"):
         return RouteResult(ran=False, held=kind, outcome="refused")
     _claim_app(call, key)
-    wait_s = min(LAUNCH_WINDOW_S, max(OPEN_FLOOR_S, _launch_deadline(call) - time.monotonic()))
-    deadline = time.monotonic() + wait_s
+    t0 = time.monotonic()
+    wait_s = min(LAUNCH_WINDOW_S, max(OPEN_FLOOR_S, _launch_deadline(call) - t0))
+    deadline = t0 + wait_s
     try:
         result = launch.launch_app(_browser_title(key) or key, timeout_s=wait_s, content_timeout_s=0.0,
                                    deadline=deadline)
@@ -695,22 +705,27 @@ def _launch_browser(call: RouteCall, key: str) -> list[tuple[int, int]] | RouteR
         result = None
     if kind := _held_by_game(result):
         return RouteResult(ran=False, held=kind, outcome="refused")
+    details = getattr(result, "details", None) if result is not None else None
+    ok = bool(getattr(result, "ok", False))
+    started = ok or bool(isinstance(details, Mapping) and details.get("launched"))
+    if started:
+        deadline = max(deadline, t0 + LAUNCH_WINDOW_S)   # review M1: it is starting: its window is waited for
     windows = _app_windows(key)
     while not windows and time.monotonic() < deadline:
         time.sleep(0.25)
         windows = _app_windows(key)
-    details = getattr(result, "details", None) if result is not None else None
-    _log(call.ctx)("route_launch", app=key, ok=bool(getattr(result, "ok", False)), windows=len(windows),
-                   launched=bool(isinstance(details, Mapping) and details.get("launched")))
-    return windows
+    _log(call.ctx)("route_launch", app=key, ok=ok, windows=len(windows), launched=started,
+                   ms=round((time.monotonic() - t0) * 1000.0))
+    return windows, started
 
 
 def _census_restored(call: RouteCall, store: Any, service: str, key: str,
                      windows: list[tuple[int, int]]) -> tuple[dict[str, Any], list[tuple[int, int]]]:
     """morning21 (A1): the census in a browser this run just launched, read again every :data:`RESTORE_POLL_S` until
-    the site's tab is back on its strip (its session restore) or :data:`RESTORE_WAIT_S` is up (never past the
-    request's time left): ``(census, the windows it read)``."""
-    deadline = min(time.monotonic() + RESTORE_WAIT_S, _launch_deadline(call))
+    the site's tab is back on its strip (its session restore) or :data:`RESTORE_WAIT_S` is up: ``(census, the windows
+    it read)``. Review M1: the whole wait, whatever the request's budget says (the launch acted; a strip read too soon
+    would open the front page beside the tab the restore is still bringing back)."""
+    deadline = time.monotonic() + RESTORE_WAIT_S
     census = _census(store, service, windows, _log(call.ctx))
     while (not census.get("tabs") or str(census.get("decision") or "none") == "none") \
             and time.monotonic() + RESTORE_POLL_S < deadline:
@@ -747,8 +762,9 @@ def route_site_tab(call: RouteCall) -> RouteResult:
     identity, the browser brought forward (see the module docstring). With no tab of the site and a told link, it
     passes to the told-link rung; with no readable strip it does nothing and says so. morning21 (A1): that browser
     closed, it is launched first (no address; never another browser) and its restored tabs read; a failed launch is a
-    plain not-done (``not_opened``); no tab back after the launch and no told link: the calling site's front page opens
-    in that browser."""
+    plain not-done (``not_opened``), a started browser whose window hasn't come up yet another (``still_opening``,
+    acted: review M1); no tab back after the launch and no told link: the calling site's front page opens in that
+    browser."""
     a, values = call.args, call.values
     link = bool(values.get("link"))
     store = _store(call.ctx)
@@ -772,10 +788,17 @@ def route_site_tab(call: RouteCall) -> RouteResult:
         got = _launch_browser(call, process)
         if isinstance(got, RouteResult):
             return got
-        if not got:
+        opened, started = got
+        if not opened and started:
+            # review M1: the launch started it and its window is still to come: acted (ran), no app it "needs" (the
+            # caller must not start it again: a second start of a Firefox-family browser mid-start brings "already
+            # running" or an extra window), and a line that doesn't call it a failure
+            return _say(LINE_BROWSER_STARTING.format(**words), "still_opening", ran=True, launched=True,
+                        browser=process)
+        if not opened:
             return _say(LINE_BROWSER_NOT_OPENED.format(**words), "not_opened", app=process, launched=False,
                         browser=process)
-        windows, launched = got, True
+        windows, launched = opened, True
     if launched:
         census, windows = _census_restored(call, store, service, process, windows)
     else:

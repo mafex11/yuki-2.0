@@ -20,16 +20,25 @@ home = "https://meet.google.com/"
 
 # The controls that join the meeting, by (role, name) as Meet draws them, per display language. A click on one is a
 # join (refused: the user clicks Join), whatever the words asked; one Meet draws under another name is left to the
-# commit check, which sees the meeting page's call state.
+# commit check, which sees the meeting page's call state. Besides Join now and Ask to join, the pre-join page draws
+# Switch here and Join here too (the user is in the call on another device), its other ways to join (Companion mode,
+# a phone for audio) and Present (it joins and presents); Rejoin after leaving. Names to confirm live
+# (m21_meet_join_still_refused): Companion mode's and the phone's, and which role each is drawn with.
 [call.labels.en]
-join = [["Button", "Join now"], ["Button", "Ask to join"], ["Button", "Switch here"], ["Button", "Rejoin"]]
+join = [["Button", "Join now"], ["Button", "Ask to join"], ["Button", "Switch here"], ["Button", "Join here too"],
+        ["Button", "Rejoin"], ["Button", "Use Companion mode"], ["MenuItem", "Use Companion mode"],
+        ["Button", "Join and use a phone for audio"], ["MenuItem", "Join and use a phone for audio"]]
+# Join controls under a name other apps draw too (a deck's "Present" button elsewhere joins nothing): a join only in a
+# window that holds this site's tab (the Now board's calling tab).
+join_in_page = [["Button", "Present"]]
 
 # Meet's own keys for its device toggles (Google's Meet keyboard shortcuts: Ctrl+D the microphone, Ctrl+E the
 # camera). Each flips the device (toggles = true): pressed against the wrong state it turns it on. A second rung only,
 # when the in-page toggle can't be acted on: the device's state read from the page before and after, and only while
 # the focus read shows the keyboard inside the page itself (outside it, Ctrl+D bookmarks the page in a Firefox-family
-# browser). None of them joins.
+# browser). None of them joins. `when` is that condition as the desks say it (yuki.memory.now.calling_lines).
 [call.keys]
 microphone = ["ctrl", "d"]
 camera = ["ctrl", "e"]
 toggles = true
+when = "only when the page's own toggle can't be acted on, and only with the keyboard inside the page: outside it, Ctrl+D bookmarks the page"
