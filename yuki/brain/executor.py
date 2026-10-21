@@ -88,7 +88,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from yuki.agent.tools import _is_own_window, sends_for_certain, tool_traits
 from yuki.brain import consent, done, util
-from yuki.brain.check import CheckVerdict, CommitCheck
+from yuki.brain.check import CheckVerdict, CommitCheck, shell_chars
 from yuki.brain.consent import Call, Live, field_of, words
 from yuki.log.events import Paused, Say, SendPending, ToolCall, ToolResult
 
@@ -505,6 +505,18 @@ HINT_WHO_UNHEARD = ("It didn't run: whom it goes to isn't in their words as hear
 HINT_WHO_FIRST = ("not typed: whom this message goes to isn't settled (its capability asked or couldn't place the "
                   "person), so nothing is typed into whichever chat is open. Ask them whom (a plan kind ask), then run "
                   "the message capability with that person.")
+#: A8 (final-G2 R13; ONE's one20 rule, ``one/policy.py`` ``chat_type``): the planner's own typing into a chat app's
+#: window that no message capability of this request opened (code's words, planner-facing; never said).
+HINT_CHAT_TYPE = ("not typed: this window is a chat's, and no message capability of this request opened this chat; "
+                  "text for a person goes only through run_skill message (it opens their chat, asks whom when it "
+                  "can't tell, and leaves a draft). If that can't run in this request, say so plainly. Nothing was "
+                  "typed.")
+#: A7 (final-G2 R13; gb's contract K-S): a skill hand-off whose run ended with the switcher its own shortcut opened
+#: still holding the keyboard (measured at the run's end), told to the planner first so its first step closes it.
+SWITCHER_HELD = "switcher_held"
+LINE_SWITCHER_HELD = ("the switcher this skill's run opened was left holding the keyboard (measured at its end): look, "
+                      "and close it first with its own close key if it is still open, before any other step in that "
+                      "window")
 #: The step a gate stopped, in words (the closed act verbs; anything else: "there").
 STOPPED_WHAT: dict[str, str] = {
     "launch_app": "opening the app", "focus_window": "bringing that window forward", "open_url": "opening the page",
@@ -600,8 +612,10 @@ class Mismatch:
 #: who it is for, another way, after the round): a request that ends on one waits for the user's answer, so their
 #: next words carry it (``outcome["awaits"]``, read by the voice's exchange). Identity of code's own words (which line
 #: it chose), never a reading of the user's or a model's words. A skill's own question (``LINE_SKILL_ASK`` with the
-#: engine's ``ask``) is marked where it is made.
-ASKING_LINES: frozenset[str] = frozenset({LINE_BUSY, LINE_WHO, LINE_SKILL_HANDED, LINE_SKILL_FAILED, consent.LINE_GAME})
+#: engine's ``ask``) is marked where it is made. ``consent.LINE_LATER`` (A2, review M4: "...; want it now?") is code's
+#: own offer, so the "yes" to doing it now is heard.
+ASKING_LINES: frozenset[str] = frozenset({LINE_BUSY, LINE_WHO, LINE_SKILL_HANDED, LINE_SKILL_FAILED, consent.LINE_GAME,
+                                          consent.LINE_LATER})
 
 
 @dataclass
@@ -741,6 +755,10 @@ class Executor:
         self.trace: list[dict[str, Any]] = []
         self.numbers: set[int] = set()
         self.typed_pending: dict[int, str] = {}
+        #: A8 (final-G2 R13; ONE's one20 ``chats_opened``): the chat windows a message capability of this request
+        #: opened (its own check saw it done, that app's window in front): the planner's own typing there is allowed;
+        #: in any other chat window it is refused toward run_skill message (:meth:`_chat_type_guard`).
+        self._chats_opened: set[int] = set()
         self.reads_seen: set[str] = set()
         self.last_failed: dict[str, Any] | None = None
         self.last_act: dict[str, Any] = {}
@@ -1945,6 +1963,8 @@ class Executor:
             return self._mismatch_result(index, "shell_long", refused=True, seen=LINE_SHELL_LONG)
         live = self._live(call)
         refused = self._who_guard(index, call, live)
+        if refused is None:
+            refused = self._chat_type_guard(index, call, live)   # A8
         if refused is not None:
             return refused
         asking = self._close_hold(call)
@@ -2053,17 +2073,11 @@ class Executor:
 
     @staticmethod
     def _shell_chars() -> int:
-        """A1 (Z7): the most characters of a run_powershell command the commit check is shown whole, shared with ONE
-        (``one.tools.SHELL_CHARS``; read the constant, never moved). A command over it is refused in the executor, so
-        a cut command never reaches the check. Falls back to the check's own clip when ONE's tools can't be read."""
-        try:
-            from yuki.one.tools import SHELL_CHARS
-
-            return int(SHELL_CHARS)
-        except Exception:  # noqa: BLE001 - the shared cap unreadable: the check's own clip length
-            from yuki.brain.check import VALUE_CHARS
-
-            return int(VALUE_CHARS)
+        """A1 (Z7): the most characters of a run_powershell command run and shown to the commit check whole: the one
+        cap both brains share (``check.shell_chars``: ONE's ``one.tools.SHELL_CHARS``, read, never moved; review L1:
+        the check's step line clips a command at that same cap). A command over it is refused here, so a cut command
+        never reaches the check."""
+        return int(shell_chars())
 
     def _close_hold(self, call: Call) -> str:
         """safety27 D2 (ONE's ``_held`` rule for the planner): ``window`` when ``call`` acts in a window a close of
@@ -2240,6 +2254,8 @@ class Executor:
             self._desk_note(call, outcome)
         self._note_numbers(call, outcome)
         self._names_log(call, outcome)
+        if call.tool == "run_powershell":
+            self._shell_log(outcome)
         self._read_cache.pop(int(call.hwnd or 0), None)
         if call.tool == "open_url" and _web_host(call.input.get("url")):
             # the browser a later page_at reads: the one this address went to by name; one that went to Windows'
@@ -2287,6 +2303,9 @@ class Executor:
             self.skill_outcomes.append(_SkillRun(index, outcome, key, slots))
             self._skill_key = str(payload.get("skill") or key or "") or None
             sk = util.skill(key)
+            if verdict is True and sk is not None and (getattr(sk, "sends", False)
+                                                      or consent.skill_sends(sk, slots, partial=True)):
+                self._note_chat(outcome, key, slots)   # A8: the chat this request's message capability opened
             if consent.skill_sends(sk, slots, partial=False):   # what ran sends for sure (an allowed send fills it)
                 send_state = "confirmed" if verdict is True else "unconfirmed"
                 text = words(slots.get(consent.text_slot(sk))) if consent.text_slot(sk) else ""
@@ -2364,7 +2383,12 @@ class Executor:
         if state == "handed_over" and isinstance(payload.get("handoff"), dict):
             status.state, status.why = "failed", "handed_over"
             self.seed = dict(payload["handoff"])
-            return self._mismatch_result(index, "handed_over", seen=str(outcome.summary or ""), call=call,
+            seen = str(outcome.summary or "")
+            if switcher_held(payload["handoff"]):
+                # A7 (K-S): first in what the planner reads (never cut by the mismatch's cap), so its first step closes
+                # the switcher its run left holding the keyboard
+                seen = f"{LINE_SWITCHER_HELD}.\n{seen}".strip()
+            return self._mismatch_result(index, "handed_over", seen=seen, call=call,
                                          seed=dict(payload["handoff"]), line=_handed_line(payload["handoff"]))
         if state == "asked":
             status.state, status.why = "failed", "asked"
@@ -2420,6 +2444,38 @@ class Executor:
             self._emit_log("brain_who", how="replan", own=False)
             return self._mismatch_result(index, "who_open", seen=HINT_WHO_UNHEARD, call=call, line=LINE_WHO)
         return None
+
+    def _note_chat(self, outcome: Any, key: str, slots: Mapping[str, Any]) -> None:
+        """A8: after a message capability's verified run, the window in front when it is that capability's app (by its
+        connection data's programs, :meth:`_skill_windows`; a data that names no program notes nothing): the chat it
+        opened. Never raises."""
+        try:
+            front, _entry, fits, _listed = self._skill_windows(outcome, key, slots)
+        except Exception:  # noqa: BLE001
+            return
+        if front and fits is True:
+            self._chats_opened.add(int(front))
+
+    def _chat_type_guard(self, index: int, call: Call, live: consent.Live) -> RunResult | None:
+        """A8 (final-G2 R13; ONE's one20 rule, ``one/policy.py`` ``chat_type``): the planner's own typing into a chat
+        app's window (``consent.chat_window``, the same structural test; unknown counts as a chat) that no message
+        capability of this request opened puts words in front of a person nobody settled: refused back to the planner
+        (not final), toward ``run_skill message``. A game in front or an app's Act switch decides first (the consent
+        rule's rows 1-2, as ONE's gate). Code's own typing (a draft's wording once its capability saw the chat open,
+        :meth:`_run_draft`) never comes here. ``None``: the step goes on."""
+        if call.tool != "type_text" or (call.hwnd and int(call.hwnd) in self._chats_opened):
+            return None
+        try:
+            chat = consent.chat_window(call, live)
+        except Exception:  # noqa: BLE001 - can't tell: as a chat (fail closed)
+            chat = None
+        if chat is False or consent.screen_gate(call, live) is not None:
+            return None   # not a chat's window; or rows 1-2 refuse it as final in the consent rule just after
+        status = self.statuses[index]
+        status.state, status.why = "refused", "chat_type"
+        self._trace_step(call, None, ok=False, verdict=False, why="refused: chat_type", kind="control", refused=True)
+        self._emit_log("consent", verb=call.tool, row=4, result=consent.REFUSE, why="chat_type")
+        return self._mismatch_result(index, "chat_type", refused=True, seen=HINT_CHAT_TYPE)
 
     def _who_guard(self, index: int, call: Call, live: consent.Live) -> RunResult | None:
         """jBrain (fMsg B1): while whom a message goes to is open in this request (:meth:`_who_result`), a typing step
@@ -4247,6 +4303,20 @@ class Executor:
             pass
         return about
 
+    def _shell_log(self, outcome: Any) -> None:
+        """A3 (Z7, review L3): the shell backstop's content-free line, when it ended something a ``run_powershell``
+        command left running unseen (``left_running``: a count) or had to restart the shell (``reset``); never the
+        command or its output. Never raises."""
+        try:
+            payload = outcome.payload if isinstance(getattr(outcome, "payload", None), Mapping) else {}
+            details = payload.get("details") if isinstance(payload.get("details"), Mapping) else {}
+            left = int(details.get("left_running") or 0)
+            reset = details.get("shell_reset") is True
+        except Exception:  # noqa: BLE001
+            return
+        if left or reset:
+            self._emit_log("shell_backstop", left_running=left, reset=reset)
+
     def _names_log(self, call: Call, outcome: Any) -> None:
         """names21 (merge note 5): a ``launch_app`` that took a misheard name for one of the user's own apps or sites
         (its result's ``details["names_match"]``, which the Dispatcher's outcome carries as it came) logs the measure,
@@ -4947,6 +5017,22 @@ _ACTED_WHYS = frozenset({"unverified", "error"})
 _TO_PLANNER = "to_planner"
 
 
+def switcher_held(seed: Mapping[str, Any] | None) -> bool:
+    """A7 (final-G2 R13; gb's contract K-S, reader): whether a skill hand-off's seed says the switcher its run opened
+    was left holding the keyboard: its own ``switcher_held`` fact, or a tried rung whose outcome code word is
+    ``switcher_held`` (the engine copies each rung's outcome into the seed's ``tried[].why``, its evidence's
+    ``tried[].outcome``). Code words only; absent means no seed line. Never raises."""
+    try:
+        if not isinstance(seed, Mapping):
+            return False
+        if seed.get(SWITCHER_HELD) is True:
+            return True
+        return any(isinstance(t, Mapping) and SWITCHER_HELD in (t.get("why"), t.get("outcome"))
+                   for t in seed.get("tried") or ())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _handed_line(seed: Mapping[str, Any]) -> str:
     """The plain line for a ``run_skill`` hand-off, by the seed's ``why`` (a code word the engine sets): it stopped
     before a step that sends or joins, it acted and the result is unknown, or its routes didn't get there (or it
@@ -5045,4 +5131,5 @@ def _board() -> Mapping[str, Any] | None:
 
 
 __all__ = ["ACT_VERBS", "ANSWER_MODEL_CALLS", "ANSWER_SECONDS", "ACT_MODEL_CALLS", "ELEMENT_VERBS", "Executor",
-           "LOOK_TOOLS", "MAX_REPLANS", "Mismatch", "READ_VERBS", "RunResult", "StepStatus", "VERBS"]
+           "LINE_SWITCHER_HELD", "LOOK_TOOLS", "MAX_REPLANS", "Mismatch", "READ_VERBS", "RunResult", "StepStatus",
+           "VERBS", "switcher_held"]
