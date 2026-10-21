@@ -1353,7 +1353,9 @@ def _evidence(skill: Skill, values: Mapping[str, Any] | None, tried: Sequence[Ma
             ev["asked"] = asked
         if sources:
             ev["from"] = {str(k): str(v) for k, v in sources.items()}
-        steps = [{"route": t.get("route"), "via": t.get("via"), "outcome": t.get("outcome")}
+        steps = [{"route": t.get("route"), "via": t.get("via"), "outcome": t.get("outcome"),
+                  # integ28 (gb merge note 6, K-S): the switcher it opened still holds the keyboard (measured)
+                  **({"switcher_held": True} if t.get("switcher_held") is True else {})}
                  for t in tried or () if isinstance(t, Mapping)]
         if route is not None and not any(s.get("route") == route.key for s in steps):
             steps.append({"route": route.key, "via": route.via, "outcome": "acted"})
@@ -1410,6 +1412,9 @@ def evidence_words(ev: Mapping[str, Any] | None) -> str:
     tried = [t for t in ev.get("tried") or [] if isinstance(t, Mapping)]
     if tried:
         parts.append("tried " + ", ".join(f"{t.get('route')} ({t.get('via')}: {t.get('outcome')})" for t in tried))
+    if any(t.get("switcher_held") is True for t in tried):
+        # integ28 (gb merge note 6, K-S): measured at the rung's end, never inferred from its outcome word
+        parts.append("the switcher it opened still holds the keyboard (measured)")
     parts.append("the PC was touched" if ev.get("acted") else "nothing on the PC was touched")
     check = ev.get("check") if isinstance(ev.get("check"), Mapping) else None
     if check:
@@ -1472,7 +1477,10 @@ def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], t
     slots = {k: {"value": v, "from": filled.get(k, "")} for k, v in canonical(values).items()}
     out = {"key": skill.key, "app": skill.app, "goal": skill.menu, "slots": slots,
            "done_words": fill(skill.done_line, shown) or "", "done": _done_spec(skill, values, routes, drop=drop),
-           "tried": [{"rung": t.get("rung"), "via": t.get("via"), "why": t.get("outcome")} for t in tried][:4],
+           "tried": [{"rung": t.get("rung"), "via": t.get("via"), "why": t.get("outcome"),
+                      # integ28 (gb merge note 6, K-S): the switcher's measured hold, within PINNED_CHARS
+                      **({"switcher_held": t["switcher_held"]} if isinstance(t.get("switcher_held"), bool) else {})}
+                     for t in tried][:4],
            "why": why}
     # ``partial``: a value only the slot's default gave is no answer to the send condition (left out: it counts as met)
     basis = {k: v for k, v in values.items() if filled.get(k) != "default"} if partial else values
@@ -1489,6 +1497,10 @@ def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], t
     # rendered block, which never shows it, keeps its size); x5Fallback: ``seen`` likewise (the frame gives it its own
     # room, ``yuki.agent.frame.SEEN_CHARS``)
     out["skill"] = skill.key
+    if any(isinstance(t, Mapping) and t.get("switcher_held") is True for t in tried):
+        # integ28 (gb merge note 6, K-S): the seed's own fact too, added after the size fit as ``skill`` is, so the fit
+        # dropping the last tried item (the rung that left it) never loses it; ``executor.switcher_held`` reads it
+        out["switcher_held"] = True
     names = _seen_names(seen)
     if names:
         out["seen"] = names
@@ -1497,9 +1509,9 @@ def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], t
 
 #: The keys of a plan seed the brain reads (``yuki.brain.context.seed_block``: skill, goal, slots, done, tried, and
 #: x5Fallback's missing and seen; ``yuki.brain.done.seed_done``: done, done_words, baseline; the executor's run row:
-#: key).
+#: key). integ28 (gb merge note 6, K-S): ``switcher_held``, read by ``executor.switcher_held`` and ``seed_block``.
 SEED_KEYS: tuple[str, ...] = ("skill", "key", "app", "goal", "slots", "done", "done_words", "tried", "why", "sends",
-                              "baseline", "missing", "seen")
+                              "baseline", "missing", "seen", "switcher_held")
 
 
 def plan_seed(pin: Any) -> dict[str, Any] | None:
@@ -1860,6 +1872,27 @@ def _not_typed(res: RouteResult) -> bool:
     if str(facts.get("why") or "") == "not_typed":
         return True
     return str(res.outcome or "") == "not_typed" and res.ran is not False and bool(res.ask)
+
+
+#: integ28 (gb merge note 6, contract K-S): the most characters a rung's ``stopped`` code word keeps on its tried entry.
+STOPPED_CHARS = 24
+
+
+def _switch_tried(res: RouteResult) -> dict[str, Any]:
+    """integ28 (gb merge note 6, contract K-S, reader side; final-G2 R13): a chat switcher rung's measured
+    ``switcher_held`` (a bool: what its own shortcut opened still holds the keyboard as it ends; absent = unknown) and
+    why it stopped before its last step (``stopped``, a code word), copied from its facts onto its ``tried`` entry. The
+    switcher writes them on its facts only on the to_planner, held, taken-over, refused and not_typed ends (its outcome
+    word stays the one the engine acts on), so without this the hand-off's seed and the talker's evidence never carry
+    them there. Code facts only; ``{}`` for none."""
+    facts = res.facts if isinstance(res.facts, Mapping) else {}
+    out: dict[str, Any] = {}
+    if isinstance(facts.get("switcher_held"), bool):
+        out["switcher_held"] = facts["switcher_held"]
+    word = facts.get("stopped")
+    if isinstance(word, str) and word.strip():
+        out["stopped"] = word.strip()[:STOPPED_CHARS]
+    return out
 
 
 #: The slot types whose given value code checks with no words (an option, a number, a signed change, a switch).
@@ -2318,7 +2351,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             # no plan behind it, before that step ran: never "exactly this?" and never the next rung (it would reach
             # the same step); rung C, the plan seed, where the planner's consent rule and send checks decide
             acted = acted or bool(res.ran)
-            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": TO_PLANNER})
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": TO_PLANNER,
+                          **_switch_tried(res)})   # integ28 (gb merge note 6, K-S)
             _ledger_try(ctx, run_key, route, None, "refused", route_ms)
             _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result=TO_PLANNER,
                   ms=route_ms)
@@ -2341,7 +2375,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                          "line": res.unverified_line or res.say or res.ask or "",
                          "app": _app_key_of(app_done), "chat_open": facts_nt.get("chat") == "open",
                          "held": facts_nt.get("refused_steps") is True}
-            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "not_typed"})
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "not_typed",
+                          **_switch_tried(res)})   # integ28 (gb merge note 6, K-S)
             last_route = route
             _ledger_try(ctx, run_key, route, None, "unverified", route_ms)
             _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="not_typed",
@@ -2382,7 +2417,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                 return _simple(skill.key, "already", ctx, started, verified=True, done_line=line, say=line,
                                run_key=run_key, route=route.key, tried=tried, values=dict(plan.values))
         if res.ran is False:
-            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": res.outcome or "no"})
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": res.outcome or "no",
+                          **_switch_tried(res)})   # integ28 (gb merge note 6, K-S)
             if isinstance(res.facts, Mapping) and res.facts.get(UNREAD) is True:
                 tried[-1][UNREAD] = True      # skill20 (C10): it never read what it needed; nothing was pressed there
             unsure = isinstance(res.facts, Mapping) and res.facts.get("not_run") == NOT_RUN_UNSURE

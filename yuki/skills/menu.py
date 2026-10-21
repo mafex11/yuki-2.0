@@ -368,10 +368,15 @@ def talker_tool(keys: list[str] | tuple[str, ...]) -> dict[str, Any]:
         "properties": {
             "say_first": {"type": "string", "description": "Written first: words said as it starts, or \"\"."},
             "skill": {"type": "string", "enum": list(keys)},
-            "slots": {"type": "object", "description": "From their words or a listed value; a pick left to Yuki: "
-                                                       "choose true, context (their words, what they are doing), a "
-                                                       "fitting You block pick by name; leave the rest out (Yuki "
-                                                       "fills them)."},
+            # integ28 (ge merge note 4; K-H, E1/E3): the lean paragraph's tags, and a listed value only when their
+            # words name it (never for a description). ONE's schema overrides ``slots`` (``one.tools._SLOTS``)
+            "slots": {"type": "object", "description": "From their words (a misheard name: also \"from\": "
+                                                       "{\"<slot>\": \"heard\"}; one of theirs they describe: the You "
+                                                       "block's name for it, from \"card\" unless they call it that, "
+                                                       "else their words) or a listed value their words name; a pick "
+                                                       "left to Yuki: choose true, context (their words, what they "
+                                                       "are doing), a fitting You block pick by name; leave the rest "
+                                                       "out (Yuki fills them)."},
             "again": {"type": "boolean", "description": "They asked for the same again (\"a bit more\")."},
             "corrects": {"type": "boolean", "description": "They corrected the last run of this skill."},
         },
@@ -379,11 +384,15 @@ def talker_tool(keys: list[str] | tuple[str, ...]) -> dict[str, Any]:
     }
 
 
-#: The thinker's tool's fixed head (its menu follows).
+#: The thinker's tool's fixed head (its menu follows). integ28 (ge merge note 4; K-H): the ``heard`` and ``card`` tags
+#: (``engine.note_args`` takes ``from`` out of the slots for every origin), and a listed name only when their words
+#: name it.
 THINKER_HEAD = ("Run a skill: a built-in way to do something on this PC (\"theirs\" after a line lists the user's "
                 "own values for it, best first, to match their words), or a way of the user's own (an app.way line: "
                 "run app.way with its way value). It takes the route that works on this PC, checked by the PC before "
-                "it counts as done. Give slots only from their words or a name listed; leave the rest out (Yuki fills "
+                "it counts as done. Give slots only from their words (a misheard name: also \"from\": {\"<slot>\": "
+                "\"heard\"} in slots; one of theirs they describe: its name listed, from \"card\" unless they call it "
+                "that, else their words) or a name listed that their words name; leave the rest out (Yuki fills "
                 "them from their usuals). When they leave the choice to Yuki: choose: true and context: their words. "
                 "Done only when its check saw the result. Skills:")
 

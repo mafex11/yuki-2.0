@@ -895,7 +895,27 @@ def skill_step(hands: Any, tool: str, tool_input: Mapping[str, Any], target: Map
             if not getattr(gated, "allowed", False):
                 return gated
         return None
+    _own_undo(hands, tool, tool_input, facts)
     return _own_run_step(ctx, tool, tool_input, facts, earlier, force=force)
+
+
+def _own_undo(hands: Any, tool: str, tool_input: Mapping[str, Any], facts: dict[str, Any]) -> None:
+    """integ28 (ga merge note 4, gb merge note 4; ONE parity for gb's contract K-U): a key step on the hands' own
+    skill path that is the run's declared own close of what its own shortcut opened, measured at this step while that
+    very field holds the keyboard (``Hands.own_undo_now``: its own focus read; ``False`` at once when the run declared
+    none), goes to the gate as ``facts["own_undo"]``: ``check.one`` takes it as the run's own undo (row 6, after the
+    game gate and the Act switch, never sent to the commit check). Keys only; any doubt leaves the facts as they are.
+    Never raises."""
+    if tool not in ("press", "hotkey") or facts.get("own_undo") is True:
+        return
+    measure = getattr(hands, "own_undo_now", None)
+    if not callable(measure):
+        return
+    try:
+        if measure(tool, dict(tool_input or {}), facts) is True:
+            facts["own_undo"] = True
+    except Exception:  # noqa: BLE001 - unsure: not the run's own undo (the gate as before)
+        pass
 
 
 def _skill_app(sk: Any, slots: Mapping[str, Any], app: str) -> str:

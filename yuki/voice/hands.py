@@ -4927,9 +4927,15 @@ class Hands:
                 # ("lumen" for "Lumin", "3AM" for "something chill") read as a part not done 7 of 16, the call's own
                 # 0 of 8; a call that gave only a browser needs the run's site ("Open Excalidraw", talker run 17 Oct)
                 skill = " ".join(str(args.get("skill") or "").split()).split("#", 1)[0][:40]
+                try:
+                    from yuki.skills.engine import NOTE_SLOTS as notes
+                except Exception:  # noqa: BLE001
+                    notes = ("why", "from")
+                # integ28 (ge merge note 5, F5): the run's own notes (``why``, the K-H ``from`` map) are no values: they
+                # never take part of the 160-character values clip
                 values = {**(args.get("_values") if isinstance(args.get("_values"), dict) else {}),
                           **{k: v for k, v in (args.get("slots") if isinstance(args.get("slots"), dict) else {}).items()
-                             if v not in (None, "", [], {})}}
+                             if v not in (None, "", [], {}) and k not in notes}}
                 vals = ", ".join(f"{k} {' '.join(str(v).split())[:40]}" for k, v in (values or {}).items()
                                  if v not in (None, "", [], {}) and not str(k).startswith("_"))[:160] \
                     if isinstance(values, dict) else ""
@@ -9598,7 +9604,29 @@ class Verbs:
         facts["read"] = True
         if not outcome.ok:
             facts["verified"] = False
+        self._shell_backstop(outcome, facts)
         return bool(outcome.ok), text, facts
+
+    def _shell_backstop(self, outcome: Any, facts: dict[str, Any]) -> None:
+        """integ28 (ga merge note 3; A3, review L3's ONE side): the shell backstop's measured facts from the result's
+        details (``left_running``: how many processes the command left running unseen that were ended; ``shell_reset``:
+        the shell had to restart) on the verb's facts, as a count and a bool, and the same content-free
+        ``shell_backstop`` line the brain executor logs (``executor._shell_log``), when either is set. Never the
+        command or its output. Never raises."""
+        try:
+            payload = outcome.payload if isinstance(getattr(outcome, "payload", None), dict) else {}
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            left = int(details.get("left_running") or 0)
+            reset = details.get("shell_reset") is True
+        except Exception:  # noqa: BLE001
+            return
+        facts["left_running"], facts["shell_reset"] = left, reset
+        log = getattr(self.hands, "log", None)
+        if (left or reset) and log is not None:
+            try:
+                log.event("shell_backstop", left_running=left, reset=reset)
+            except Exception:  # noqa: BLE001 - a log line never breaks a verb
+                pass
 
     # -- what the runner says and keeps ----------------------------------------------------------------------------
 

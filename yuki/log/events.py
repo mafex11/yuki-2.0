@@ -316,11 +316,14 @@ RESULT_WORD_TYPES: frozenset[str] = frozenset({
 #: writes a tool's input, so only fields whose values are a fixed vocabulary (a button, a direction, a pattern, a
 #: role, a state); never ``name``, ``title``, ``text``, ``path`` or ``app``, and never the free-form ones (``why``,
 #: ``reason``, ``source``, ``decision``, ``by``): there a single word can be a person's name or the user's words.
+#: integ28 (gb merge note 8, final-G2 R13): ``stopped`` and ``switcher_closed``, the chat switcher run's own code words
+#: (``skills.chat._stop_word``, ``_tidy_switch``) in a ``route_try``'s observed facts; :func:`_code_word` still guards
+#: each value, so anything that is not a code word stays its length.
 NESTED_FIELDS: frozenset[str] = frozenset({
     "level", "verdict", "verdict_class", "status", "send", "step_level", "result_kind", "pattern", "patterns",
     "control_type", "button", "direction", "how", "lease", "window_state", "phase", "stage", "class",
     "kind", "state", "mode", "via", "role", "roles", "hidden_roles", "flags", "op", "tool", "lane", "outcome",
-    "type", "error_kind",
+    "type", "error_kind", "stopped", "switcher_closed",
 })
 #: Phase F (fPrivacy): top-level fields whose value is a structure Yuki fills from the user's world (a skill's slots,
 #: a check's observed facts): shaped like a tool's input (:func:`_shape`: only :data:`NESTED_FIELDS` code words,

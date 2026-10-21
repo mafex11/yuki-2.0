@@ -5021,13 +5021,18 @@ def switcher_held(seed: Mapping[str, Any] | None) -> bool:
     """A7 (final-G2 R13; gb's contract K-S, reader): whether a skill hand-off's seed says the switcher its run opened
     was left holding the keyboard: its own ``switcher_held`` fact, or a tried rung whose outcome code word is
     ``switcher_held`` (the engine copies each rung's outcome into the seed's ``tried[].why``, its evidence's
-    ``tried[].outcome``). Code words only; absent means no seed line. Never raises."""
+    ``tried[].outcome``). Code words only; absent means no seed line. Never raises.
+
+    integ28 (gb merge notes 3 and 6): the explicit measured fact the engine now copies onto a tried entry
+    (``tried[].switcher_held is True``) counts too: on the to_planner, held, taken-over, refused and not_typed paths
+    the outcome word stays the stop's own and only that fact says the switcher still holds the keyboard."""
     try:
         if not isinstance(seed, Mapping):
             return False
         if seed.get(SWITCHER_HELD) is True:
             return True
-        return any(isinstance(t, Mapping) and SWITCHER_HELD in (t.get("why"), t.get("outcome"))
+        return any(isinstance(t, Mapping) and (SWITCHER_HELD in (t.get("why"), t.get("outcome"))
+                                               or t.get(SWITCHER_HELD) is True)
                    for t in seed.get("tried") or ())
     except Exception:  # noqa: BLE001
         return False

@@ -1955,7 +1955,16 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                     # a listed name the words don't hold is Yuki's guess only when the caller says so (Phase 2.2: its
                     # own pick from the candidates, passed with their why, or a ``given_from`` word); otherwise the
                     # user pointed at it ("the second one", "my chill one"): their own ask, as before
-                    how = _given_source(given_from, slot.name) or (FROM_MENU if own_pick else FROM_WORDS)
+                    src = _given_source(given_from, slot.name)
+                    if not src and _caller_heard(given_from, slot.name) and not lasting \
+                            and not _person_bound(skill, slot):
+                        # integ28 (ge merge note 1, contract K-H; gd D1): a listed name (one of their own, by
+                        # identity) the caller read from a misheard word of theirs, on an undoable run, for no
+                        # person: their word, heard (no hedge). ``card`` stays a named guess (``_given_source``)
+                        how = FROM_HEARD
+                        names_how.setdefault(slot.name, NAMES_HOW_CALLER)
+                    else:
+                        how = src or (FROM_MENU if own_pick else FROM_WORDS)
                 literal = isinstance(value, str) and _words(value).casefold() == _words(given[slot.name]).casefold()
                 if _person_bound(skill, slot):
                     # gd D6: their words hold the name as written, or name that person by a heard form (names_person)

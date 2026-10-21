@@ -101,6 +101,13 @@ SEED_COMMIT_LABEL = ("[A skill stopped before a step that would send or join (no
 #: the draft's line when that probe saw the text typed in (``agent.LINE_DRAFTED``), so the planner says no line.
 SEED_DRAFT_LINE = ("A message done by steps is typed, never sent: leave it as a draft. Its done: field_holds of the "
                    "message box with the text typed (not none: the skill's check below reads a send).")
+#: integ28 (ga merge note 2b; A8, ONE's one20 rule): the planner's own typing into a chat app's window that no message
+#: capability of this request opened is refused by code (``executor.HINT_CHAT_TYPE``), so a draft by steps never goes
+#: there: text for a person goes only through the message capability (:data:`SEED_DRAFT_BARRED` when this seed bars a
+#: skill in the request: if that is the message capability, Yuki says plainly it couldn't open the chat).
+SEED_DRAFT_CHAT = ("In a chat app's window nothing is typed by steps: text for a person goes only through the message "
+                   "capability.")
+SEED_DRAFT_BARRED = " When that is the skill barred above, say plainly Yuki couldn't open the chat."
 #: The most names a seed's ``seen`` list shows (IF-seed: up to 40, kept in RAM only), and their room in characters.
 SEEN_MAX = 40
 SEEN_CHARS = 700
@@ -953,6 +960,21 @@ def seed_memory_text(hint: Mapping[str, Any] | None, *, nonce: str = "") -> str:
     return line + "\n" + fence(listed, source=f"the {missing} names memory ties to their words", nonce=nonce or "seed")
 
 
+def _switcher_held_line(seed: Mapping[str, Any]) -> str:
+    """integ28 (ga merge note 2a; A7, gb's contract K-S): the executor's own line (``executor.LINE_SWITCHER_HELD``) as a
+    sentence when the seed says the switcher its skill's run opened was left holding the keyboard
+    (``executor.switcher_held``: measured facts and code words only), else ``""``. Never raises."""
+    try:
+        from yuki.brain.executor import LINE_SWITCHER_HELD, switcher_held
+
+        if not switcher_held(seed):
+            return ""
+        line = LINE_SWITCHER_HELD.strip()
+        return (line[:1].upper() + line[1:]).rstrip(".") + "."
+    except Exception:  # noqa: BLE001 - no line: the seed as before
+        return ""
+
+
 def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "",
                hint: Mapping[str, Any] | None = None) -> str:
     """A skill's plan seed (rung C): goal, slot values, its fixed done check, what was tried (code data), and, when the
@@ -962,7 +984,8 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "",
     redo nothing after one that acted unconfirmed; check the values after one that dropped a misheard value), or with
     the consent a send or a join needs when the skill stopped for one (:data:`yuki.brain.plan.SEED_RERUN_OK`). A skill
     that sends, done by steps, is left as a draft, checked by its own probe and never by the skill's send check
-    (:data:`SEED_DRAFT_LINE`)."""
+    (:data:`SEED_DRAFT_LINE`), never by steps in a chat app's window (:data:`SEED_DRAFT_CHAT`, integ28). A run that
+    left its switcher holding the keyboard says so under the label (:func:`_switcher_held_line`, integ28)."""
     if not seed:
         return ""
     keep = {k: seed.get(k) for k in ("skill", "goal", "slots", "done", "tried", "missing") if seed.get(k) is not None}
@@ -980,13 +1003,20 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "",
         # draft line says what its done is
         label = label.replace(f" {SEED_DONE}", "")
     text = f"{label}\n{clip(body, limit)}"
+    held = _switcher_held_line(seed)
+    if held:
+        # integ28 (ga merge note 2a; A7, gb's K-S): the voice -> brain hand-off's first planner turn reads it too (the
+        # executor's in-request mismatch line never reaches that turn), right under the label, before the body's data
+        text = f"{label}\n{held}\n{clip(body, limit)}"
     family = skill_family(seed.get("skill") or seed.get("key"))
-    if family and not rerun:
+    barred = bool(family and not rerun)
+    if barred:
         # the id itself (a catalog key, code data): a plan that routes it, or any learned form of it, is refused
         text += (f"\nNot in this request, not even with other values: {family} or a learned form of it (no "
                  f"skill:{family} route, no run_skill of it).")
     if draft:
-        text += "\n" + SEED_DRAFT_LINE
+        # integ28 (ga merge note 2b): a chat app's window takes no typing by steps (A8's code refusal)
+        text += "\n" + SEED_DRAFT_LINE + " " + SEED_DRAFT_CHAT + (SEED_DRAFT_BARRED if barred else "")
     missing = one_line(seed.get("missing"), 40) if isinstance(seed.get("missing"), str) and not who else ""
     if missing:
         # sBrainFix (review r1 L2): the pick is made, not asked (16 Oct B08: "Which one's your Japanese playlist?"

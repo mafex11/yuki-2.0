@@ -1905,9 +1905,12 @@ OUTCOME_NOTES = {
 #: What the result's ``outcome`` field says per level (plain words, the same everywhere).
 OUTCOME_WORDS = {"unverified": "not confirmed", "failed": "did not work", "unread": "not checked"}
 #: Phase 2 (2.3, aBrain merge note 2): the one principle an ending with the brain's evidence goes with (it replaces the
-#: level's note); the evidence itself is a data field of the result, never part of this note.
+#: level's note); the evidence itself is a data field of the result, never part of this note. integ28 (ge merge note 6,
+#: F6): the brain's own refusal lines reach the talker as this result's text (a voice hand-off's ending is said by the
+#: talker), so code's own offer in it ("I can't wait for that and do it later; want it now?", ``consent.LINE_LATER``)
+#: stands; nothing broader (an offer read from the evidence would let the R8b keyboard-shortcut offer back in).
 EVIDENCE_NOTE = ("Say what happened in one short line from this evidence; when it failed, offer one other way, never one "
-                 "at a target one of Yuki's own rules refused in this request.")
+                 "at a target one of Yuki's own rules refused in this request (code's own offer in the result stands).")
 
 
 def outcome_fields(verdict: dict[str, Any] | None) -> tuple[dict[str, Any], str]:
