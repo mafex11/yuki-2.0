@@ -5115,11 +5115,10 @@ _STAMP_SQL: dict[str, str] = {
     # Needs your reply clears when your reply is captured (a newer message in that chat)
     "messages": "SELECT max(id) FROM messages",
     "playbooks": "SELECT max(id), max(updated_at) FROM playbooks",
-    # the Playbook's things and ways (audit 17 Oct): a learned record or way written, renamed or marked
+    # the Playbook's ways (audit 17 Oct): a learned record or way written, renamed or deleted
     "skills": "SELECT max(id), max(updated_at) FROM skills WHERE origin != 'capability'",
-    # the Playbook's routines and the taste names it lists (audit 17 Oct)
+    # the Playbook's routines (audit 17 Oct; no page lists the taste names since 21 Oct, so tastes has no stamp)
     "routines": "SELECT max(id), max(updated_at) FROM routines",
-    "tastes": "SELECT max(id), max(updated_at) FROM tastes",
     "standing_requests": "SELECT max(id), max(updated_at) FROM standing_requests",
     "knowhow": "SELECT max(id), max(valid_to) FROM knowhow",
     "runs": "SELECT max(id) FROM runs",
