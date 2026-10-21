@@ -599,17 +599,32 @@ class OwedLedger:
 
         Only when nothing else is being said or written, the user has been quiet a moment, and the talker's run
         for it has ended without being heard (or chose silence, or never came within :attr:`RUN_WAIT_S`).
+        morning21 (A11; 21 Oct: a refusal's line was first heard 37.7 s after its job, the user talking in a call
+        meanwhile): an item whose talker run chose silence or only wrote a call that was passed (``quiet``), never yet
+        said, is due at the first moment nothing is being said or written, without the quiet wait.
         """
-        if busy or quiet_for < self.QUIET_S:
+        if busy:
             return None
         for item in self.pending:
             if now < item.next_at:
+                continue
+            if quiet_for < self.QUIET_S and not (item.quiet and item.spoken_at is None):
                 continue
             run_over = (item.spoken_at is not None or item.quiet or last_response_end > item.at
                         or now - item.at >= self.RUN_WAIT_S)
             if run_over:
                 return item
         return None
+
+    def mark_quiet(self, token: int) -> bool:
+        """morning21 (A10): one owed item no talker run will word (a line of code's own, said at once): due at the next
+        moment nothing is said or written (:meth:`due`). ``False`` when it is not owed."""
+        for item in self.pending:
+            if item.token == token and item.spoken_at is None:
+                item.quiet = True
+                self._log(op="quiet_marked", job=token, kind=item.kind)
+                return True
+        return False
 
     def attempt(self, item: Owed, now: float) -> str:
         """Record the next try for ``item``: ``"code"`` (say it by code now) or ``"pill"`` (show it with a sound)."""

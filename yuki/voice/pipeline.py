@@ -10574,7 +10574,8 @@ class Conversation:
 
         Normal mode: after :meth:`idle_limit` of nobody speaking (longer while a task runs, up
         to ``voice_hold_max_s``). Call mode: ``voice_call_idle_s`` after the last exchange with
-        Yuki, however much the user goes on talking to the people on the call.
+        Yuki or the end of her own speech (morning21 A9), however much the user goes on talking to
+        the people on the call.
 
         v3.16 (04 F1, F3, F4): never while the user's newest turn has had no audible answer (it is answered again
         first), while a held hand waits for their answer or an outcome is still owed (then the hold limit applies),
@@ -10602,8 +10603,11 @@ class Conversation:
             if self.call_app:
                 busy = (obs.bot_speaking or obs.generating or obs.owes_reply or unanswered or self._user_voiced(now)
                         or now - obs.last_response_end < self.CALL_TOOL_START_S)
-                window = max(x for x in (self.stt_ready_at, obs.last_exchange, self.started_at, self._grace_since)
-                             if x is not None)
+                # morning21 (A9; 21 Oct: the conversation closed 0.68 s after Yuki's own 10.5 s question, so no answer
+                # could be heard): the call idle counts from the end of Yuki's own speech too (its last reply stream and
+                # its voice going quiet)
+                window = max(x for x in (self.stt_ready_at, obs.last_exchange, self.started_at, self._grace_since,
+                                         obs.last_response_end, obs.last_bot_stop) if x is not None)
                 limit = s.voice_hold_max_s if owed else s.voice_call_idle_s
                 if obs.user_speaking and not owed:
                     limit += self.CALL_SPEECH_GRACE_S

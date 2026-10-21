@@ -1,0 +1,44 @@
+# Google Meet as data (morning21 lane A, A4 and A7): facts true for every Meet user, never this user's habits. Which
+# browser and account they meet in, when and with whom are learned (the calls table, the tab identities memory keeps,
+# the timeline), never written here.
+#
+# Meet's pages stay unread by memory (the privacy file blocks meet.google.com): nothing here is read from the user's
+# screen. Everything is under [call], a calling site's facts: no [site] hosts or [pages], so the URL templates, the
+# moments and the taste kinds (yuki.connect.templates' readers) treat its pages exactly as before. The join controls
+# feed the consent rule's row 3 (yuki.brain.consent: a click on one, or Enter/Space while one holds the keyboard, is a
+# join, the user's own click); the keys are Meet's own documented shortcuts, a second rung only (the in-page control
+# first).
+
+[call]
+# The product name the calling-site judge gives the site (yuki.memory.callevidence's site verdicts): the calling tab's
+# service on the Now board, matched to this file by it (yuki.memory.now.calling_site).
+service = "Google Meet"
+hosts = ["meet.google.com"]
+# The site's front page: where the signed-in account's meetings are listed (browser.site_tab's fallback, in the same
+# browser, after it launched the browser the meeting tab lives in and no tab of it came back).
+home = "https://meet.google.com/"
+
+# The controls that join the meeting, by (role, name) as Meet draws them, per display language. A click on one is a
+# join (refused: the user clicks Join), whatever the words asked; one Meet draws under another name is left to the
+# commit check, which sees the meeting page's call state. Besides Join now and Ask to join, the pre-join page draws
+# Switch here and Join here too (the user is in the call on another device), its other ways to join (Companion mode,
+# a phone for audio) and Present (it joins and presents); Rejoin after leaving. Names to confirm live
+# (m21_meet_join_still_refused): Companion mode's and the phone's, and which role each is drawn with.
+[call.labels.en]
+join = [["Button", "Join now"], ["Button", "Ask to join"], ["Button", "Switch here"], ["Button", "Join here too"],
+        ["Button", "Rejoin"], ["Button", "Use Companion mode"], ["MenuItem", "Use Companion mode"],
+        ["Button", "Join and use a phone for audio"], ["MenuItem", "Join and use a phone for audio"]]
+# Join controls under a name other apps draw too (a deck's "Present" button elsewhere joins nothing): a join only in a
+# window that holds this site's tab (the Now board's calling tab).
+join_in_page = [["Button", "Present"]]
+
+# Meet's own keys for its device toggles (Google's Meet keyboard shortcuts: Ctrl+D the microphone, Ctrl+E the
+# camera). Each flips the device (toggles = true): pressed against the wrong state it turns it on. A second rung only,
+# when the in-page toggle can't be acted on: the device's state read from the page before and after, and only while
+# the focus read shows the keyboard inside the page itself (outside it, Ctrl+D bookmarks the page in a Firefox-family
+# browser). None of them joins. `when` is that condition as the desks say it (yuki.memory.now.calling_lines).
+[call.keys]
+microphone = ["ctrl", "d"]
+camera = ["ctrl", "e"]
+toggles = true
+when = "only when the page's own toggle can't be acted on, and only with the keyboard inside the page: outside it, Ctrl+D bookmarks the page"

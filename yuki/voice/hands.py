@@ -954,14 +954,15 @@ HAND_TOOLS: list[dict[str, Any]] = [
     {
         "name": "open_url",
         "description": (
-            "Your hand: open an address in the app they named or their default browser (a new tab of its own: never "
-            "press a new-tab key first), or a Windows address (ms-settings:bluetooth). Verified once at the address "
-            "and titled, or its window in front (seconds)."
+            "Your hand: open an address in a new tab of its own (never press a new-tab key first), or a Windows "
+            "address (ms-settings:bluetooth). With no app, code opens a site where its visits live (its browser), "
+            "else in the default browser. Verified once at the address and titled, or its window in front (seconds)."
         ),
         "properties": {
             "say_first": _SAY_FIRST,
             "url": {"type": "string", "description": "The full address."},
-            "app": {"type": "string", "description": "Optional: the app, as the Start menu names it."},
+            "app": {"type": "string", "description": "Only a browser or app their words named, as the Start menu "
+                                                     "names it; else leave it out."},
             "then": _THEN,
             "say_when_done": _DONE_LINE,
         },
@@ -987,6 +988,10 @@ HAND_TOOLS: list[dict[str, Any]] = [
             "window": _WINDOW,
             "item": {"type": "integer", "description": "Its number on the items line."},
             "named": {"type": "string", "description": "Their own words naming it."},
+            # morning21 (A8): an on/off control is read live, clicked only when not there, read back
+            "toggle_to": {"type": "string", "enum": ["on", "off"],
+                          "description": "An on/off control (a microphone, a camera, a switch): the state they want; "
+                                         "clicked only if it is not there already, then read back."},
             "say_when_done": _DONE_LINE,
         },
         "required": ["window", "item"],
@@ -2202,8 +2207,11 @@ class Hands:
             self._note_typed(hwnd, typing_into)
         if self.log is not None:
             # gb (B1, B2): the field facts as booleans only (never the field's name or role)
+            code = getattr(verdict, "code", None)
             self.log.event("consent", who="voice_hand", tool=tool, allowed=bool(getattr(verdict, "allowed", False)),
                            row=getattr(verdict, "row", None), source=getattr(verdict, "source", None),
+                           # morning21 (A4): the rule's code word (join_control / join_unidentified ...), a code only
+                           why=code if isinstance(code, str) and code.replace("_", "").isalpha() else None,
                            handover=bool(getattr(verdict, "handover", False)), typed=bool(facts.get("typed_pending")),
                            typed_held=facts.get("typed_field_held"), typed_to=facts.get("typed_to_field"),
                            own_undo=bool(facts.get("own_undo")), role_read=bool(facts.get("role")),
@@ -2522,6 +2530,8 @@ class Hands:
                     if snap.foreground is not None:
                         snap.hwnds.add(snap.foreground)   # a popup in front (no user window) is clickable too (F1)
             parts.extend(self._extra_lines(snap, board))   # F1: popups and other visible windows
+            # morning21 (A6): a calling site's page on screen, and whether the user is in its call (K1, measured)
+            parts.extend(f"Meeting page: {line}." for line in self._calling_lines(board))
             focus = self._focus_line(snap.foreground)
             if focus:
                 parts.append(focus)
@@ -3897,6 +3907,7 @@ class Hands:
                                              properties=FunctionCallResultProperties(run_llm=False))
                 if not in_look:
                     self._follow_planned(name, args)   # review r1 L2: the job that has their request hears of it
+                    self._quiet_result_run()
                 return
             # phase 2 (2.3): the talker acted on an outcome it was given: its fallback goes once this call's outcome
             # is known (review r1 M4: a call not tried keeps it owed)
@@ -3913,6 +3924,22 @@ class Hands:
                 await self._tidy_deferred("settled", ordered=True)
         finally:
             self._leave_order(gate)
+
+    def _quiet_result_run(self) -> None:
+        """morning21 (A11; 21 Oct: a refusal's line was first heard 37.7 s after its job ended, because the talker's
+        result turn only wrote a call that was passed): a call passed on a run that was no reply to the user's words
+        (a result turn) says nothing, so the outcome it owed is due at once (the ledger's ``quiet_run``: no quiet wait
+        after the run, never over Yuki's own speech). Never raises."""
+        try:
+            bridge = self.bridge
+            by_user = getattr(bridge, "user_turn", None) if bridge is not None else None
+            if by_user is None or bool(by_user()):
+                return
+            ledger = getattr(bridge, "ledger", None)
+            if ledger is not None and ledger.pending and ledger.quiet_run() and self.log is not None:
+                self.log.event("hands", order_passed_quiet=True)
+        except Exception:  # noqa: BLE001
+            pass
 
     @staticmethod
     def _track_settle(params: Any) -> dict[str, bool] | None:
@@ -4054,6 +4081,12 @@ class Hands:
             # opened (code's line), never the words as heard in the model's line written before the act
             line = self._code_line(name, args, facts)
             coded = bool(line)
+        chosen = _chosen_browser(facts) if confirmed and name == "open_url" else ""
+        if chosen and chosen.casefold() not in " ".join(line.casefold().split()):
+            # morning21 (A3): code chose the browser (where the site lives): said by code's line naming it, never a
+            # line written before the act that names none or another
+            line = self._code_line(name, args, facts)
+            coded = bool(line)
         focus_line = " ".join(str(facts.get("focus_line") or "").split())
         if confirmed and line and focus_line and ((name == "window" and op == "focus")
                                                   or (name == "tab" and facts.get("app_other"))):
@@ -4164,9 +4197,15 @@ class Hands:
                            **({"names_miss": facts["names_miss"]} if isinstance(facts.get("names_miss"), str) else {}),
                            # gb (B6): why the address bar did not open it (a code word)
                            **({"bar_why": facts["bar_why"]} if isinstance(facts.get("bar_why"), str) else {}),
+                           # morning21 (A3, A8): where the browser came from, a toggle's wanted and read states
+                           **{k: facts[k] for k in _CODE_WORD_FACTS if isinstance(facts.get(k), str)},
                            **{k: v for k, v in facts.items()
                               if (isinstance(v, (int, float, bool)) or v is None)
                               and k not in ("question", "request_id", "refused_why", "refused_at")})
+        if ok and isinstance(facts.get("_meeting_watch"), tuple):
+            # morning21 (A10): an act on a calling site's page the user is not in the call of: a join (or the page
+            # taking the microphone) right after it is said at once
+            self._watch_join(*facts["_meeting_watch"])
         # v3.18: every hand that acted is kept as a run trace in memory (off the loop, in order)
         if name == SKILL_HAND:
             pass   # a skill run keeps its own ledger (yuki.skills.engine); the old learned-way trace is deleted
@@ -4658,7 +4697,7 @@ class Hands:
     #: their line (:data:`SKILL_SAID_PLAIN`) is said by code only when no fallback may go (a skill that may already have
     #: sent or joined, data that never hands over, a real question, no thinker to take it).
     SKILL_SAID = ("held_game", "held_call", "other_device")
-    SKILL_SAID_PLAIN = ("unverified", "failed", "asked", "refused", "error", "blocked")
+    SKILL_SAID_PLAIN = ("unverified", "failed", "asked", "refused", "error", "blocked", "not_done")
     #: x3 (3c): the outcomes that fall back to the normal way (look at the screen, click, type) when they may.
     SKILL_FALLBACK = ("handed_over", "unverified", "failed", "asked", "refused", "error", "timeout")
     #: x3 (3d): a run_skill still running after this long (s) counts as not finished (far past any designed run).
@@ -4899,7 +4938,8 @@ class Hands:
                     app = ""
             url = " ".join(str(args.get("url") or "").split())[:160]
             if name == "open_url":
-                where = " ".join(str(args.get("app") or "").split())[:40] or "the browser"
+                where = (" ".join(str(args.get("app") or "").split())[:40] or _chosen_browser(facts)
+                         or "the browser")
                 named = _opened_name(facts)
                 if named and (facts or {}).get("names_match", {}).get("kind") == "channel":
                     return f"opened their channel {named} in {where}"   # integ22 fix names-2: what opened
@@ -5089,6 +5129,9 @@ class Hands:
                 named = _opened_name(facts)
                 if named and (facts or {}).get("names_match", {}).get("kind") == "channel":
                     return f"Opened {named}'s channel."
+                chosen = _chosen_browser(facts)
+                if chosen:
+                    return f"It's up in {chosen}."   # morning21 (A3): code chose it: named, one word corrects it
                 return "It's up."   # verified at the address and titled (never silent after "On it.")
             if name == "open_app":
                 # names21 (the user's decision 3): a misheard name taken as one of their own apps or sites is named as
@@ -6929,6 +6972,93 @@ class Hands:
             return ok, report, facts
         raise _Refused(f"no hand called {name!r}")
 
+    @staticmethod
+    def _calling_lines(board: dict[str, Any] | None) -> list[str]:
+        """morning21 (A6): :func:`yuki.memory.now.calling_lines` for the talker's desk (``[]`` without a board)."""
+        if not board:
+            return []
+        try:
+            from yuki.memory.now import calling_lines
+
+            return calling_lines(board)
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _note_meeting_act(self, hwnd: Any, facts: dict[str, Any]) -> None:
+        """morning21 (A10): this hand is about to act in a window with a calling site's page whose user is not in its
+        call (the board's K1, :func:`yuki.memory.now.call_state`): noted on ``facts`` (``_meeting_watch``: the window
+        and the wall-clock time, RAM only, never logged), so a join right after the act is said at once
+        (:meth:`_watch_join`). Never raises."""
+        try:
+            from yuki.memory.now import call_state
+
+            state = call_state(self._now_board(), hwnd)
+            if state is not None and state.get("state") != "in_call":
+                facts["_meeting_watch"] = (int(hwnd), time.time(), state.get("state") == "lobby")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _watch_join(self, hwnd: int, t0: float, lobby: bool = False) -> None:
+        """morning21 (A10, F6): after an act on a calling site's page the user was not in the call of, the board is read
+        for :data:`JOIN_WATCH_S`: a join measured since the act (K1 ``joined_since``), or the page newly taking the
+        microphone (not on a pre-join page that held it already), is said at once by code (:data:`LINE_JOINED_AFTER`,
+        :data:`LINE_MIC_AFTER`: the owed ledger, due without the quiet wait). Off the loop, one light read a poll; a
+        newer watch replaces it. Logged ``hands op=join_watch`` with the code word only. Never raises."""
+        previous = getattr(self, "_join_stop", None)
+        if previous is not None:
+            previous.set()
+        stop = threading.Event()
+        self._join_stop = stop
+
+        def run() -> None:
+            try:
+                from yuki.memory.now import call_state, joined_since
+
+                end = time.monotonic() + JOIN_WATCH_S
+                while not stop.wait(JOIN_WATCH_POLL_S) and time.monotonic() < end:
+                    board = self._now_board()
+                    if not joined_since(board, hwnd, t0):
+                        continue
+                    state = call_state(board, hwnd) or {}
+                    joined = state.get("state") == "in_call"
+                    if not joined and lobby:
+                        continue   # the pre-join page held the microphone before (its preview): no news
+                    self._say_owed_now(LINE_JOINED_AFTER if joined else LINE_MIC_AFTER)
+                    if self.log is not None:
+                        self.log.event("hands", op="join_watch", seen="join" if joined else "mic")
+                    return
+            except Exception as exc:  # noqa: BLE001 - a watch never breaks a hand
+                if self.log is not None:
+                    self.log.event("hands", op="join_watch", error=type(exc).__name__)
+
+        threading.Thread(target=run, name="yuki-join-watch", daemon=True).start()
+
+    def _say_owed_now(self, line: str) -> None:
+        """A line of code's said at the next moment nothing else is said (the owed ledger, marked due at once: no quiet
+        wait, :meth:`yuki.voice.narrator.OwedLedger.mark_quiet`). Never raises."""
+        owe = getattr(self.bridge, "owe_line", None) if self.bridge is not None else None
+        if not callable(owe):
+            return
+
+        def put() -> None:
+            try:
+                token = owe(line, "done")
+                ledger = getattr(self.bridge, "ledger", None)
+                mark = getattr(ledger, "mark_quiet", None)
+                if token is not None and callable(mark):
+                    mark(token)
+            except Exception:  # noqa: BLE001
+                pass
+
+        loop = getattr(self.bridge, "_loop", None)
+        try:
+            if loop is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(put)   # the ledger lives on the voice loop
+                return
+        except Exception:  # noqa: BLE001 - then here
+            pass
+        put()
+
     def _now_board(self) -> dict[str, Any] | None:
         """Memory's Now picture (:attr:`now_source`), or ``None`` (no source, no service, no answer in time)."""
         source = self.now_source
@@ -7199,7 +7329,20 @@ class Hands:
             raise self._held_refusal(verdict)
         lead = self._front(hwnd)
         facts["sent_at"] = time.monotonic()
-        outcome = self._dispatcher.dispatch("click", {"element": item["id"], "read": items.read, "expect_hwnd": hwnd})
+        payload: dict[str, Any] = {"element": item["id"], "read": items.read, "expect_hwnd": hwnd}
+        want = str(args.get("toggle_to") or "").strip().casefold()
+        if want in ("on", "off"):
+            # morning21 (A8): the dispatcher's toggle path (agent/tools ``_click_toggle``): the control's state read
+            # live, clicked only when it is not there, read back; a control with no on/off of its own is clicked once
+            payload["toggle_to"] = want
+            facts["toggle_to"] = want
+        self._note_meeting_act(hwnd, facts)
+        outcome = self._dispatcher.dispatch("click", payload)
+        details = getattr(outcome, "details", None) or {}
+        if isinstance(details, dict) and want:
+            for key, fact in (("state_before", "toggle_before"), ("state_after", "toggle_after")):
+                if isinstance(details.get(key), str) and details[key].isalpha():
+                    facts[fact] = details[key][:12]   # a code word (on / off), never a name
         from yuki.agent.loop import action_verdict
 
         verified, why = action_verdict("click", outcome)
@@ -7912,6 +8055,18 @@ class Hands:
             web = urlsplit(url).scheme.casefold() in ("http", "https", "")
         except ValueError:
             web = False
+        if web:
+            # morning21 (A3, K5; 21 Oct: Meet's home page opened in Chrome, where none of the user's 78 Meet visits
+            # were): a browser the caller gave stands (kw3: their words named it); none given, the site opens where its
+            # own visits live (``names.site_browser``: the share rule, 0.8 of at least 3 of the user's visits), else
+            # Windows' default handler. Named in the done line when code chose it
+            facts["browser_from"] = "given" if app else "default"
+            if app is None:
+                site = self._site_browser(url) if heard else ""
+                if site:
+                    app = site
+                    facts["browser_from"] = "site"
+                    facts["browser_name"] = site[:40]   # RAM: the done line's words, never logged
         strips_before, listed = self._strips_now(app) if web and not self._game_front() else ({}, set())
         facts["sent_at"] = time.monotonic()
         # desk20 (final-D S21, browser B4: Arc through this hand took ~18 s, always unverified): the launch answers by a
@@ -8033,6 +8188,20 @@ class Hands:
         state = (f"the page has its title (\"{title}\"): loaded" if titled
                  else f"after {wait_s:g} s the page still has no title: not loaded yet")
         return ok, f"opened {url}: {where}{state}. ({report})", facts
+
+    def _site_browser(self, url: str) -> str:
+        """morning21 (A3): the browser the address's site lives in, as Windows names it (``names.site_browser``: the
+        share of the user's own visits of that host, 0.8 of at least 3; their pages only, never Yuki's opens), ``""``
+        when none is (the default handler). A bounded memory read, off the loop. Never raises."""
+        try:
+            from urllib.parse import urlsplit
+
+            from yuki.skills.names import site_browser
+
+            host = (urlsplit(url if "//" in url else "https://" + url).hostname or "").casefold()
+            return " ".join(str(site_browser(host) or "").split()) if host else ""
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _no_strip(self, hwnd: Any) -> bool:
         """desk20 (S21): whether ``hwnd``'s strip was read and holds no tab at all (a browser that draws none: Arc), as
@@ -9205,6 +9374,29 @@ class _ResolveWait:
 
             self.slow = True
             return Refused(self._skill_key, "memory_slow")
+
+
+def _chosen_browser(facts: dict[str, Any] | None) -> str:
+    """morning21 (A3): the browser code chose for an address (the site's measured browser, ``browser_from`` site), as
+    Windows names it, else ``""``. Never raises."""
+    try:
+        if (facts or {}).get("browser_from") != "site":
+            return ""
+        return " ".join(str((facts or {}).get("browser_name") or "").split())[:40]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+#: morning21 (A3, A8): string facts that are code words, logged on the hands' line (never a name or an address).
+_CODE_WORD_FACTS: tuple[str, ...] = ("browser_from", "toggle_to", "toggle_before", "toggle_after")
+#: morning21 (A10): after an act on a calling site's page the user is not in the call of, the board is read for a
+#: join (or the page taking the microphone) every :data:`JOIN_WATCH_POLL_S` for :data:`JOIN_WATCH_S` (the call
+#: worker's pass is every 5 s, its sound read cached 4 s).
+JOIN_WATCH_S = 12.0
+JOIN_WATCH_POLL_S = 1.5
+#: What is said at once when such a join was measured, or when only the microphone was taken (code's lines).
+LINE_JOINED_AFTER = "Heads up: you're in the call now."
+LINE_MIC_AFTER = "Heads up: the meeting page has your microphone now."
 
 
 def _opened_name(facts: dict[str, Any] | None) -> str:
