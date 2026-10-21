@@ -144,7 +144,7 @@ LINE_NOT_ONE = "Not done: Yuki's ONE brain is not switched on here, so nothing w
 #: A drafted message whose chat Yuki couldn't see open (``executor.LINE_CHAT_UNCONFIRMED``).
 LINE_CHAT_UNCONFIRMED = "I couldn't confirm the chat is open, so I didn't type anything."
 #: The skill engine's outcomes after which a send did not go (``executor.NOT_SENT_OUTCOMES``).
-NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "held_call", "failed"})
+NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "held_call", "failed", "not_done"})
 #: tidy21 (the user's decision 1, 19 Oct): under the tidy dial "do" code takes the flagged diff's one legal undoable
 #: step itself (:meth:`Runner._tidy_by_code`) and says its line; the result tells the agent what code did
 #: (:data:`TIDIED`), never asks it to take the step (one20's "take it" note is gone, so it can't happen twice). With
@@ -228,7 +228,8 @@ LINE_WAY_FAILED = "Not kept: memory didn't take it; say so in a few words."
 #: not read as "not kept").
 WAY_WRITE_S = 3.0
 #: One20 (final-D S5): the engine's outcomes after which a run handed back with its request still open.
-OPEN_OUTCOMES = frozenset({"handed_over", "failed"})
+#: morning21 (ma note 7): a not-done skill (a code-word precondition stop, ``engine.NOT_DONE``) is a part left open.
+OPEN_OUTCOMES = frozenset({"handed_over", "failed", "not_done"})
 #: The engine's hand-off reasons after which nothing may run again (it may have acted, or a step was the user's):
 #: ``engine.WHY_UNVERIFIED``, ``engine.WHY_ERROR``, ``engine.TO_PLANNER``, ``engine.WHY_DROPPED``.
 NO_SECOND_RUN = frozenset({"unverified", "error", "to_planner", "dropped"})

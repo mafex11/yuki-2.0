@@ -958,7 +958,8 @@ class MemoryClient:
         scored.sort(key=lambda s: -s[0])
         return [self._format_knowhow(k.app, k.text) for _s, k in scored[:limit]]
 
-    def remember_how(self, app: str | None, text: str, source_request: str | None = None) -> int:
+    def remember_how(self, app: str | None, text: str, source_request: str | None = None, *,
+                     origin: str = "agent") -> int:
         """Store a procedure that worked (after a successful task); returns its id.
 
         ``app`` is the process name of the app it applies to ("arc.exe"; stored
@@ -967,7 +968,9 @@ class MemoryClient:
         ``source_request`` the user request it came from. If a current entry for
         the same app says the same thing (embedding cosine >= 0.85, or identical
         text), that entry is superseded (its ``valid_to`` set, history kept)
-        instead of piling up near-duplicates.
+        instead of piling up near-duplicates. ``origin``: who it came from (``agent`` by default; integ29, mc merge
+        note M1: the brain's ``remember`` kind ``how`` passes ``taught``, a way the user told Yuki, so the next
+        request's how-block shows it as taught at once).
         """
         text = secret_filter.redact_text((text or "").strip())
         source_request = secret_filter.redact_text(source_request) if source_request else source_request
@@ -979,7 +982,7 @@ class MemoryClient:
         model = getattr(self._embedder, "model_name", None) if vec is not None else None
         return self.store.add_knowhow(
             app, text, source_request=source_request, vector=vec, embed_model=model, supersedes=supersedes,
-            origin="agent",
+            origin=str(origin or "agent"),
         )
 
     # -- recall ------------------------------------------------------------

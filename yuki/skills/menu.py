@@ -47,6 +47,9 @@ PLANNER = "planner"
 AUDIENCES: tuple[str, ...] = (TALKER, THINKER, PLANNER)
 #: A capability line's own room for the user's values (contract C5), on top of its words (MENU_LINE_CHARS).
 VALUES_CHARS = 640
+#: morning21 (mb note 3): the values' room gives way in steps this fine (VALUES_CHARS down to none), so a menu one
+#: capability line longer keeps what still fits of the user's values, never all or none of them.
+VALUES_STEP = 20
 #: Values named per capability at most; names per entity slot or site page kind at most.
 VALUES_N = 16
 NAMES_N = 5
@@ -143,6 +146,11 @@ def values_part(skill: Skill, store: Any, *, now: float | None = None, rank: str
     (contract C5; their usual means when one is shared by most: "usually in Chrome", others named per value; a work
     value marked), each entity slot's taste names (``[playlist: a | b]``), and for a capability that opens site pages,
     each site page kind's taste names ("site youtube page handle item: Sidemen | NDL"). Never raises."""
+    return _fit_parts(_value_parts(skill, store, now=now, rank=rank), chars)
+
+
+def _value_parts(skill: Skill, store: Any, *, now: float | None = None, rank: str = "hour") -> list[str]:
+    """:func:`values_part`'s parts, whole (memory's reads; the room is :func:`_fit_parts`'s). Never raises."""
     from collections import Counter
 
     try:
@@ -209,6 +217,11 @@ def values_part(skill: Skill, store: Any, *, now: float | None = None, rank: str
                     parts.append(f"site {site} page {page} item: {' | '.join(got)}")
     except Exception:  # noqa: BLE001
         pass
+    return parts
+
+
+def _fit_parts(parts: list[str], chars: int) -> str:
+    """:func:`_value_parts`' parts in at most ``chars`` (``""`` when none)."""
     if not parts:
         return ""
     # each part keeps a share of the budget (the learner's values the most), so one long list never hides the others
@@ -238,7 +251,8 @@ def menu_lines(loaded: Loaded, *, store: Any = None, now: float | None = None, c
                rank: str = "hour", audience: str = TALKER) -> list[str]:
     """The menu's lines (:func:`menu_skills` for ``audience``): every capability line with the user's values (with
     ``store``: only skills that have a usable rung or may hand over), then the learned ways, within ``chars``: the
-    values give way first (half their budget, then none), then the ways; a capability's own words are never cut."""
+    values give way first (their budget in :data:`VALUES_STEP` steps down to none; memory is read once), then the
+    ways; a capability's own words are never cut."""
     from yuki.skills import registry
 
     skills: list[Skill] = []
@@ -250,9 +264,9 @@ def menu_lines(loaded: Loaded, *, store: Any = None, now: float | None = None, c
         skills.append(skill)
     ways = way_lines(store) if store is not None else []
     out: list[str] = []
-    for budget in (VALUES_CHARS, VALUES_CHARS // 2, 0):
-        out = [skill_line(s, values=values_part(s, store, now=now, rank=rank, chars=budget)
-                          if store is not None and budget else "") for s in skills]
+    parts = [_value_parts(s, store, now=now, rank=rank) if store is not None else [] for s in skills]
+    for budget in range(VALUES_CHARS, -1, -VALUES_STEP):
+        out = [skill_line(s, values=_fit_parts(p, budget) if budget else "") for s, p in zip(skills, parts)]
         if sum(len(x) + 1 for x in out) + sum(len(x) + 1 for x in ways) <= chars or not budget:
             break
     used = sum(len(x) + 1 for x in out)

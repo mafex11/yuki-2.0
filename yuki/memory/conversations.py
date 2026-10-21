@@ -762,9 +762,14 @@ def resource_seen(value: str, turns: Sequence[Any]) -> bool:
 
 def ran(action: Any) -> bool:
     """morning21 (K8): whether one entry of a turn's actions ran on the PC: every entry but one whose status (the word
-    after its verb, :data:`NOT_RUN_STATUS`) says one of Yuki's own rules refused it. Our own log format, never words."""
-    parts = str(action or "").split(None, 2)
-    return bool(parts) and not (len(parts) >= 2 and parts[1].rstrip(":").casefold() == NOT_RUN_STATUS)
+    after its verb, :data:`NOT_RUN_STATUS`) says one of Yuki's own rules refused it. A capability's step carries its
+    id before the status (``brain.agent.turn_actions``: ``run_skill browser.site_tab refused (join rule)``; integ29
+    seam fix), so its status may be the word after that. Our own log format, never words."""
+    parts = str(action or "").split(None, 3)
+    if not parts:
+        return False
+    status = parts[1:3] if parts[0] == "run_skill" else parts[1:2]
+    return NOT_RUN_STATUS not in [p.rstrip(":").casefold() for p in status]
 
 
 def acted(t: Any) -> bool:

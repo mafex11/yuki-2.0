@@ -34,7 +34,7 @@ from typing import Any
 NONE = "none"
 #: An occasion's target kind by its end kind (the moments' D1 vocabulary; ``yuki.skills.connection.TARGET_KINDS``).
 END_TARGETS: dict[str, str] = {"call_join": "call", "message_sent": "chat", "page": "page",
-                               "media_context": "playlist", "volume_change": "level"}
+                               "media_context": "playlist", "volume_change": "level", "display_change": "level"}
 #: A browser, measured (critique L6): at least this many registrable domains over this many days, at least
 #: :data:`BROWSER_MIN_REPEAT` of them seen on this many distinct days. (Design section 3.3 words it "each on >= 2 days";
 #: on the 10 Oct copy that reading leaves out a program that showed 7 domains, 2 of them on several days, which the

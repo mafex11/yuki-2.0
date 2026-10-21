@@ -152,8 +152,9 @@ DEFAULT_COUNTDOWN_S = 3.0
 #: Brain's and the old loop's default, off the desktop) returns at once.
 COUNTED_MIN_S = 0.5
 #: review r2 M1: a ``run_skill`` send whose engine outcome is one of these sent nothing (it asked, handed over, was
-#: refused or held, or its check saw nothing go), so the same message may be sent by a later step of the request.
-NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "held_call", "failed"})
+#: refused or held, or its check saw nothing go; morning21 ma note 7: or stopped not done before acting), so the same
+#: message may be sent by a later step of the request.
+NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "held_call", "failed", "not_done"})
 #: kBrain review M1: the skill engine's code words for a run it held before acting: a game in front, a call live
 #: (decision 2: a pick is never put on then). Settled: the run ends on the engine's own line, never a replan.
 HELD_OUTCOMES = {"held_game": "game", "held_call": "call"}
@@ -926,6 +927,9 @@ class Executor:
         #: aBrain: each act step's call as it ran (step index -> Call), for a done none's derived probe
         #: (:meth:`_derived_probe`)
         self._ran_calls: dict[int, Call] = {}
+        #: morning21 (mb note 5): the launch_app steps whose own report says a tray app started (``details.tray_app``:
+        #: no window by design), so the derived probe reads no foreground for them (:meth:`_derived_probe`)
+        self._tray_launches: set[int] = set()
         #: jBrain (fMsg B1): a capability with a person slot asked about it, or dropped it as unheard, in this request,
         #: and no later run of it confirmed a chat: whom the message goes to is not settled, so nothing is typed into
         #: whichever chat is open (:meth:`_who_guard`)
@@ -2369,6 +2373,9 @@ class Executor:
             self._note_page(index, outcome, verdict)
         self.last_act = {"hwnd": call.hwnd, "app": call.app, "title": call.title, "verdict": verdict}
         self._ran_calls[index] = call
+        self._tray_launches.discard(index)
+        if call.tool == "launch_app" and _tray_app(outcome):
+            self._tray_launches.add(index)
         if call.tool == "run_skill":
             return self._skill_result(index, step, call, outcome)
         if not outcome.ok or verdict is False:
@@ -2863,8 +2870,9 @@ class Executor:
         "Microsoft Teams" for teams.microsoft.com) names no browser, and Yuki's own window is never one. A name an app
         on this PC is known by (``appnames.aliases``: machine data) is that app, never a title hint: "Arc" while Arc is
         closed starts Arc, never a Chrome window whose title has the word "Arc". A name that fits windows on screen by
-        their titles but no one program is not started either. No browser named: ``app`` stays unset (Windows' default
-        handler, as before).
+        their titles but no one program is not started either. No browser named: the browser the site's own visits live
+        in (integ29, ma merge note 1: :func:`_site_browser`, source ``site``), else ``app`` stays unset (Windows'
+        default handler, as before).
 
         A bare host ("youtube.com", :func:`_bare_host`) is a web address here only when its browser is named (review
         r1 L1); it goes to that browser as ``https://``, as a browser opens it. An ``app`` the step value wrote is kept
@@ -2929,6 +2937,21 @@ class Executor:
                 tool_input["app"] = name   # a browser that isn't open: open_url starts it with the address
                 chosen, source = (None, {}, ""), "named_" + kind
                 break
+            if chosen is None and host:
+                # integ29 (ma merge note 1, K5 parity with the talker's open_url hand, morning21 A3): no browser named,
+                # so the one the site's own visits live in (``names.site_browser``: 0.8 of at least 3 of the user's
+                # own visits; 21 Oct: Meet in Zen, never the most-used Chrome); none measured: the default handler
+                site = _site_browser(host)
+                if site and self._is_browser(site):
+                    found = _app_windows(windows, site, front)
+                    if found:
+                        image = str(found[0].get("process_name") or "")
+                        tool_input["app"] = _launch_name(image)
+                        chosen = (done.as_hwnd(found[0].get("hwnd")), found[0], image)
+                    else:
+                        tool_input["app"] = site   # not open: open_url starts it with the address
+                        chosen = (None, {}, "")
+                    source = "site"
             if bare and chosen is not None:
                 tool_input["url"] = "https://" + url   # a bare host its browser opens as https
             elif bare:
@@ -3962,6 +3985,10 @@ class Executor:
         click, a key, a command: their own verdicts stand), or its program can't be told. Code facts only."""
         index = self._last_ran()
         if index is None:
+            return None
+        if index in self._tray_launches:
+            # morning21 (mb note 5): a tray app started with no window by design (launch's own report): there is no
+            # foreground to read, so its own report's verdict stands ("it runs in the tray"), never "not in front"
             return None
         # only the last act step: a later step (a click after typing, a focus back after a focus) may have changed
         # what an earlier one did, so an earlier step's read would check something that no longer holds
@@ -5021,6 +5048,25 @@ def _cut_words(text: Any, limit: int) -> str:
     head = text[:limit]
     whole = text[limit:limit + 1] == " " or " " not in head   # cut at a word's end already, or one long word
     return (head if whole else head.rsplit(" ", 1)[0]).rstrip(",;:")
+
+
+def _site_browser(host: str) -> str:
+    """integ29 (ma merge note 1): the browser a web host's own visits live in, as Windows names it
+    (:func:`yuki.skills.names.site_browser`, a bounded memory read), ``""`` when none is. Never raises."""
+    try:
+        from yuki.skills.names import site_browser
+
+        return " ".join(str(site_browser(host) or "").split())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _tray_app(outcome: Any) -> bool:
+    """morning21 (mb note 5): ``launch_app``'s own report says the app runs in the tray, with no window by design
+    (``details.tray_app``, measured by launch). Code facts only."""
+    payload = getattr(outcome, "payload", None)
+    details = payload.get("details") if isinstance(payload, dict) else None
+    return isinstance(details, dict) and details.get("tray_app") is True
 
 
 def _effect_probe(call: Call, step: Any, image: str = "") -> tuple[str, dict[str, Any]] | None:

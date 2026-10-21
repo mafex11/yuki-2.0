@@ -204,6 +204,9 @@ _SLOT_NAME = re.compile(r"[a-z_][a-z0-9_]{0,40}")
 COMMIT_BY_END: dict[str, str] = {
     "call_join": "user", "game_voice": "user", "message_sent": "words", "volume_change": "none",
     "media_context": "none", "page": "none", "site_front": "none", "media_play": "none",
+    # morning21 (mb note 1): a monitor's brightness or power, read back; its own off question (only screen, a game or
+    # a call shown) is the display driver's, so the run itself commits nothing
+    "display_change": "none",
 }
 #: The end kinds whose commit depends on what serves them (PLAN D24, lSplit review r1 L2): a join of a chat app's voice
 #: channel (the serve needs ``chat_voice``) is the user's own "join X" (rule 8, Q3), so ``words``, where a calling
@@ -2427,11 +2430,28 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
             asked_slot = (res.facts or {}).get("slot") if isinstance(res.facts, Mapping) else None
             if isinstance(asked_slot, str) and skill.slot(asked_slot) is not None:
                 state["asked_slot"] = asked_slot      # fd (D4): the slot this rung's question is about (the means ask)
+            # integ29 (mb merge note 12; review M2, m21_bright_both_up_back): the rung's question may carry, in RAM, the
+            # forms of the slots it asks about (``facts_ram["form"]``: the display driver's "which monitor" when a
+            # target names none). The first such slip of a request that touched nothing goes back to a caller that
+            # calls again, as the resolver's A19 recall does; else the question's report names the forms
+            ram = res.facts_ram if isinstance(res.facts_ram, Mapping) else {}
+            forms_ram = ram.get("form")
+            forms: dict[str, str] = {}
+            if isinstance(forms_ram, Mapping) and forms_ram and all(skill.slot(str(k)) is not None for k in forms_ram):
+                forms = {str(k): str(v) for k, v in forms_ram.items()}
             _ledger_finish(ctx, run_key, outcome="asked", checked=None, route=route, ms=route_ms, app=app_done,
                            acted=acted)
+            if forms and not acted and _first_form_slip(ctx, skill.key, forms):
+                _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="asked",
+                      reason="form_recall", ms=route_ms, observed=res.facts)
+                return _simple(skill.key, "asked", ctx, started, ask="", options=[], say="", run_key=run_key,
+                               route=route.key, tried=tried,
+                               evidence={"acted": False, "reason": "form", "form": forms, FORM_RECALL: True})
             _emit(ctx, "route_try", front=front_w, skill=skill.key, route=route.key, result="asked", ms=route_ms,
                   observed=res.facts)   # integ28 fix F2: held_by_check / taken_over / act_off ends' facts
             asked_ev = evidence(route=route, reason=res.outcome or "asked", line=res.ask)
+            if forms:
+                asked_ev["form"] = forms
             current = (res.facts or {}).get("current") if isinstance(res.facts, Mapping) else None
             if isinstance(current, (int, float)) and not isinstance(current, bool):
                 asked_ev["current"] = float(current)    # skill19 (O5): the control's level as the rung read it

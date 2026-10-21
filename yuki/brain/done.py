@@ -163,6 +163,7 @@ MOMENT_WORDS: dict[str, str] = {
     "call_join": "You're in the call", "game_voice": "You're in the voice chat", "site_front": "The site is in front",
     "media_play": "It's playing", "media_context": "It's playing from there", "page": "The page is open",
     "volume_change": "The volume changed", "message_sent": "The message went",
+    "display_change": "The monitor changed",
 }
 #: What a probe that read "not so" saw, by its evidence's status word (a closed vocabulary of the probes' own words).
 SEEN_WORDS: dict[str, str] = {

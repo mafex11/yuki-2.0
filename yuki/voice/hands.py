@@ -460,8 +460,8 @@ _FAILED_NOTE_LEAN = (
 #: when Arc failed, where his drawings are not: a FAIL). Once the time is spent the note is the plain one.
 _RETRY_OPEN = (
     " Or, instead of the hand-off: a few seconds are left for another way, one hand on another app, target or way that "
-    "does what they asked (never a step already tried, never one their words ruled out: an app or browser they named "
-    "stays that one)."
+    "does what they asked (never a step already tried, never one their words ruled out: an app or browser they named, "
+    "or the one the thing lives in, stays that one: opened if closed, never swapped)."
 )
 #: N1 (report 47): a level asked to move that cannot (already at its top or bottom, or already there). Live 3 Oct
 #: "increase the Spotify volume" at 100% was said as "Turned it up" twice while nothing changed.
@@ -733,7 +733,8 @@ RETRY_BUDGET_S = 8.0
 #: offer one other way, never loop.
 _HALTED_NOTE = (
     "Not tried: nothing was done; your time for other ways in this turn is spent. In one line say what did not work "
-    "(the earlier try, as the reason above says) and offer one other way, unless you said it already; no other hand."
+    "(the earlier try, as the reason above says) and offer one other way that keeps the app or browser it needs, "
+    "unless you said it already; no other hand."
 )
 #: fHands (k-live-A k_t3_draft): a hand stopped before it acted by something other than a game (the gate could not
 #: check and failed closed, or another guard refused it): said plainly as what it is, never as a game, and not handed
