@@ -19,6 +19,16 @@ screen (:func:`background_apps`), so "running in the background" can be told
 from "not running": a browser whose window was closed keeps running, and an
 overview of visible windows alone cannot say so.  That join goes through the
 Start menu, read once in the background at import (:func:`warm_start_menu_index`).
+
+morning21 (lane B): each monitor carries its own identity, read from Windows'
+display configuration when the displays change (its EDID model name, device path,
+Plug and Play id and connector), its role by place (``main``, ``second``, ...:
+:func:`monitor_roles`; the words to say it by, never its index), and its screen
+power as the display driver last read it (:func:`note_display_power`, never
+polled).  The overview names the notification area's icons too
+(:func:`tray_icons`: UI Automation's names of the tray buttons and the shell's
+record of the icons of running programs; read in the background at most every
+:data:`TRAY_CACHE_S`, never on the overview's own time, no screenshot).
 """
 
 from __future__ import annotations
@@ -184,6 +194,18 @@ class MonitorInfo:
             cursor) is already in physical pixels and needs no scaling.  It tells
             a reader why text on that display looks bigger for the same pixels.
         dpi: the raw effective DPI ``dpi_scale`` was derived from.
+        label: morning21 B2: the monitor's own model name from its EDID, as Windows reads it
+            (``DisplayConfigGetDeviceInfo`` target name: ``VG271U``); ``""`` when it gives none.
+        device_path: the monitor's device path (``\\\\?\\DISPLAY#ACR06D7#...``), its identity across
+            reconnects and renumbering (``\\\\.\\DISPLAYn`` and ``index`` are not); ``""`` unread.
+        pnp: its Plug and Play id from that path (``ACR06D7``: maker and product code).
+        connector: how it is connected, in a word (``HDMI``, ``DisplayPort``, ``internal``); ``""`` unknown.
+        role: what the user calls it by place (:func:`monitor_roles`): ``main`` (the primary), then
+            ``second``, ``third``, ... left to right; never a number said to the user.
+        power: its screen's power as last read over DDC/CI by the display driver
+            (:func:`note_display_power`, at most :data:`POWER_FRESH_S` old): ``on``, ``off``, or ``""`` not
+            known (never polled).
+        handle: its ``HMONITOR`` now (valid until the next display change; the display driver's way in).
     """
 
     index: int
@@ -193,6 +215,13 @@ class MonitorInfo:
     is_primary: bool
     dpi_scale: float
     dpi: int
+    label: str = ""
+    device_path: str = ""
+    pnp: str = ""
+    connector: str = ""
+    role: str = ""
+    power: str = ""
+    handle: int = 0
 
 
 @dataclass
@@ -231,6 +260,29 @@ class DesktopOverview:
     #: the background or the tray) - see :func:`background_apps`.  Empty until
     #: the Start menu index has been read (a second or so after import).
     background_apps: list["BackgroundApp"] = field(default_factory=list)
+    #: morning21 B7: the notification area's icons by name (:func:`tray_icons`, the
+    #: last read, at most :data:`TRAY_CACHE_S` old; never read on this call).
+    tray: list["TrayIcon"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TrayIcon:
+    """One icon of the taskbar's notification area (morning21 B7), by name only.
+
+    Attributes:
+        name: what the icon says it is (its tooltip, as UI Automation or the
+            shell's own record of it names it).
+        image: its program's file name when the shell's record names it
+            (``Twinkle Tray.exe``), else ``""``.
+        shown: on the taskbar itself (False: among the hidden icons).
+        monitor_app: its program is a monitor app by Yuki's app data
+            (``yuki/connect/sites/*.toml`` ``[app] controls = "monitors"``).
+    """
+
+    name: str
+    image: str = ""
+    shown: bool = True
+    monitor_app: bool = False
 
 
 @dataclass
@@ -1133,6 +1185,314 @@ def background_apps(
     return apps
 
 
+# ---------------------------------------------------------------------------
+# The notification area (morning21 B7): the tray's icons by name, so "the
+# brightness app in my taskbar" can be matched to an app and a tray app's
+# missing window is known to be by design.  Names only: UI Automation's names
+# of the notification area's buttons, and the shell's own record of the icons
+# of programs running now.  No screenshot, no pixel, nothing clicked.
+# ---------------------------------------------------------------------------
+
+#: A tray read counts for this long (s); an overview older than that starts a new read in the background.
+TRAY_CACHE_S = 120.0
+#: One tray read's UI Automation part stops by this much (s).
+TRAY_READ_S = 0.6
+#: At most this many icons are said.
+MAX_TRAY_ICONS = 14
+#: An icon's name is said up to this many characters (its tooltip's first line).
+TRAY_NAME_CHARS = 40
+#: UI Automation ids (``UIA_*PropertyId``, ``UIA_ButtonControlTypeId``, ``TreeScope_Descendants``).
+_UIA_P_NAME, _UIA_P_AUTOMATION_ID, _UIA_P_CONTROL_TYPE = 30005, 30011, 30003
+_UIA_BUTTON = 50000
+_UIA_DESCENDANTS = 4
+_UIA_CLSID = "{ff48dba4-60ef-4201-aa87-54103eef594e}"
+#: The AutomationId Windows 11's taskbar gives a notification icon's button (shell plumbing, never an app's name).
+_NOTIFY_ICON_ID = "NotifyItemIcon"
+#: The window classes that hold notification icons: Windows 11's taskbar and its hidden-icons flyout.
+_TRAY_XAML_HOSTS = (("Shell_TrayWnd", True), ("TopLevelWindowForOverflowXamlIsland", False))
+#: Windows 10's notification area toolbars: (class path from a top-level window, shown on the taskbar).
+_TRAY_TOOLBARS = ((("Shell_TrayWnd", "TrayNotifyWnd", "SysPager", "ToolbarWindow32"), True),
+                  (("NotifyIconOverflowWindow", "ToolbarWindow32"), False))
+#: The shell's record of every notification icon (Windows 11): its program, first tooltip, and whether it is pinned
+#: to the taskbar.
+_NOTIFY_SETTINGS_KEY = r"Control Panel\NotifyIconSettings"
+
+_tray_lock = threading.Lock()
+#: ``(monotonic time read, icons)``: the last read.
+_tray_cache: tuple[float, list[TrayIcon]] | None = None
+_tray_thread: threading.Thread | None = None
+
+
+def _tray_name(text: object) -> str:
+    """An icon's name as said: its tooltip's first line, spaced once, cut to :data:`TRAY_NAME_CHARS`."""
+    first = str(text or "").strip().splitlines()[0] if str(text or "").strip() else ""
+    first = " ".join(first.split())
+    return first if len(first) <= TRAY_NAME_CHARS else first[: TRAY_NAME_CHARS - 1].rstrip() + "…"
+
+
+def _squash_name(text: object) -> str:
+    """Letters and digits only, lower case: two names compared without spaces, case or punctuation."""
+    return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
+
+
+def _names_alike(a: str, b: str) -> bool:
+    """Two names that are one name: equal once squashed, or one inside the other when that one is 4 characters or
+    more ("Twinkle Tray" in "Twinkle Tray - 2 monitors"). Spelling only, no list of apps."""
+    x, y = _squash_name(a), _squash_name(b)
+    if not x or not y:
+        return False
+    return x == y or (len(x) >= 4 and x in y) or (len(y) >= 4 and y in x)
+
+
+def _child_of_class(parent: int, cls: str) -> int:
+    try:
+        return int(win32gui.FindWindowEx(parent, 0, cls, None) or 0)
+    except Exception:
+        return 0
+
+
+def _tray_uia(deadline: float) -> list[tuple[str, bool]]:
+    """``[(name, shown on the taskbar)]`` of the notification icons UI Automation names: Windows 11's taskbar and
+    hidden-icons flyout buttons whose AutomationId marks a notification icon, and every button of Windows 10's
+    notification area toolbars. One ``FindAll`` per host, names and ids only. ``[]`` when none can be read."""
+    import comtypes
+    import comtypes.client
+
+    try:
+        comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+    except Exception:
+        pass   # already initialised for this thread
+    out: list[tuple[str, bool]] = []
+    try:
+        module = comtypes.client.GetModule("UIAutomationCore.dll")
+        automation = comtypes.client.CreateObject(_UIA_CLSID, interface=module.IUIAutomation)
+        request = automation.CreateCacheRequest()
+        request.AddProperty(_UIA_P_NAME)
+        request.AddProperty(_UIA_P_AUTOMATION_ID)
+        buttons = automation.CreatePropertyCondition(_UIA_P_CONTROL_TYPE, _UIA_BUTTON)
+
+        def read(hwnd: int, shown: bool, only_icons: bool) -> None:
+            if not hwnd or time.monotonic() > deadline:
+                return
+            try:
+                found = automation.ElementFromHandle(hwnd).FindAllBuildCache(_UIA_DESCENDANTS, buttons, request)
+            except Exception:
+                return
+            for i in range(int(found.Length or 0)):
+                try:
+                    element = found.GetElement(i)
+                    ident = str(element.GetCachedPropertyValue(_UIA_P_AUTOMATION_ID) or "")
+                    name = _tray_name(element.GetCachedPropertyValue(_UIA_P_NAME))
+                except Exception:
+                    continue
+                if name and (not only_icons or ident == _NOTIFY_ICON_ID):
+                    out.append((name, shown))
+
+        for cls, shown in _TRAY_XAML_HOSTS:
+            read(int(win32gui.FindWindow(cls, None) or 0), shown, True)
+        for path, shown in _TRAY_TOOLBARS:
+            hwnd = int(win32gui.FindWindow(path[0], None) or 0)
+            for cls in path[1:]:
+                hwnd = _child_of_class(hwnd, cls) if hwnd else 0
+            read(hwnd, shown, False)
+    except Exception:
+        pass   # what was read so far
+    finally:
+        try:
+            comtypes.CoUninitialize()
+        except Exception:
+            pass
+    return out
+
+
+def _known_folder_path(path: str) -> str:
+    """A path the shell writes with a known folder's id in front (``{6D809377-...}\\App\\app.exe``) as a plain path;
+    any other path as it is. ``""`` when the folder can't be named."""
+    path = str(path or "").strip()
+    if not path.startswith("{") or "}" not in path:
+        return path
+    guid_text, _, rest = path.partition("}")
+    try:
+        from comtypes import GUID
+
+        folder_id = GUID(guid_text + "}")
+        out = ctypes.c_wchar_p()
+        shell32 = ctypes.WinDLL("shell32")
+        shell32.SHGetKnownFolderPath.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.HANDLE,
+                                                 ctypes.POINTER(ctypes.c_wchar_p)]
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+        if shell32.SHGetKnownFolderPath(ctypes.byref(folder_id), 0, None, ctypes.byref(out)) != 0:
+            return ""
+        try:
+            folder = str(out.value or "")
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(out)
+    except Exception:
+        return ""
+    return os.path.join(folder, rest.lstrip("\\/")) if folder else ""
+
+
+def _tray_registry() -> list[tuple[str, str, bool]]:
+    """``[(tooltip, program path normcased, pinned to the taskbar)]`` from the shell's record of notification icons
+    (Windows 11, ``HKCU\\Control Panel\\NotifyIconSettings``). Read-only; ``[]`` where there is no such record."""
+    import winreg
+
+    out: list[tuple[str, str, bool]] = []
+    try:
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _NOTIFY_SETTINGS_KEY)
+    except OSError:
+        return out
+    with root:
+        index = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(root, index)
+            except OSError:
+                break
+            index += 1
+            try:
+                with winreg.OpenKey(root, sub) as item:
+                    values: dict[str, object] = {}
+                    for name in ("ExecutablePath", "InitialTooltip", "IsPromoted"):
+                        try:
+                            values[name] = winreg.QueryValueEx(item, name)[0]
+                        except OSError:
+                            values[name] = None
+            except OSError:
+                continue
+            exe = _known_folder_path(str(values.get("ExecutablePath") or ""))
+            if exe:
+                out.append((_tray_name(values.get("InitialTooltip")), os.path.normcase(exe),
+                            bool(values.get("IsPromoted"))))
+    return out
+
+
+def _monitor_apps() -> tuple[frozenset[str], tuple[str, ...]]:
+    """``(program file names casefolded, display names)`` of the monitor apps Yuki's app data describes
+    (``yuki/connect/sites/*.toml`` whose ``[app] controls = "monitors"``). Data only."""
+    try:
+        from yuki.connect.templates import site, sites
+    except Exception:
+        return frozenset(), ()
+    images: set[str] = set()
+    names: list[str] = []
+    for key in sites():
+        app = site(key).get("app") or {}
+        if not isinstance(app, dict) or str(app.get("controls") or "") != "monitors":
+            continue
+        images |= {str(i).casefold() for i in app.get("images") or [] if str(i).strip()}
+        if str(app.get("name") or "").strip():
+            names.append(str(app["name"]))
+    return frozenset(images), tuple(names)
+
+
+def _read_tray() -> list[TrayIcon]:
+    """One tray read: the names UI Automation gives the notification icons, joined with the shell's record of the
+    icons of programs running now (their program file, and the icons among the hidden ones), in that order, each
+    name once; at most :data:`MAX_TRAY_ICONS`."""
+    uia = _tray_uia(time.monotonic() + TRAY_READ_S)
+    try:
+        record = _tray_registry()
+    except Exception:
+        record = []
+    running: set[str] = set()
+    if record:
+        for pid in psutil.pids():
+            exe = _facts_for(pid)[1]
+            if exe:
+                running.add(exe)
+    live = [(tip, exe, pinned) for tip, exe, pinned in record if exe in running]
+    images, app_names = _monitor_apps()
+    icons: list[TrayIcon] = []
+    said: set[str] = set()
+
+    def add(name: str, image: str, shown: bool) -> None:
+        key = _squash_name(name)
+        if not key or key in said or len(icons) >= MAX_TRAY_ICONS:
+            return
+        said.add(key)
+        mine = (bool(image) and image.casefold() in images) or any(_names_alike(name, n) for n in app_names)
+        icons.append(TrayIcon(name=name, image=image, shown=shown, monitor_app=mine))
+
+    for name, shown in uia:
+        exe = next((e for tip, e, _p in live if tip and _names_alike(tip, name)), "")
+        add(name, os.path.basename(exe), shown)
+    for tip, exe, pinned in live:
+        stem = os.path.splitext(os.path.basename(exe))[0]
+        if any(_names_alike(tip or stem, i.name) for i in icons):
+            continue
+        add(tip or stem, os.path.basename(exe), pinned and not uia)
+    return icons
+
+
+def warm_tray() -> threading.Thread | None:
+    """Start a tray read in the background (returns at once) unless one is running, or a game is in front (nothing
+    is read then; the last read stands). The read's thread, or ``None``."""
+    global _tray_thread
+    with _tray_lock:
+        if _tray_thread is not None and _tray_thread.is_alive():
+            return _tray_thread
+    try:
+        from yuki.memory.gamegate import game_in_front
+
+        if game_in_front():
+            return None
+    except Exception:
+        pass   # no game check: the read is a few names, read off the game's own process
+
+    def run() -> None:
+        global _tray_cache
+        try:
+            icons = _read_tray()
+        except Exception:
+            icons = []
+        with _tray_lock:
+            _tray_cache = (time.monotonic(), icons)
+
+    with _tray_lock:
+        if _tray_thread is not None and _tray_thread.is_alive():
+            return _tray_thread
+        _tray_thread = threading.Thread(target=run, name="yuki-tray-read", daemon=True)
+        _tray_thread.start()
+        return _tray_thread
+
+
+def tray_icons(*, wait_s: float = 0.0, max_age_s: float = TRAY_CACHE_S, refresh: bool = True) -> list[TrayIcon]:
+    """The notification area's icons (:class:`TrayIcon`) from the last read when it is at most ``max_age_s`` old;
+    else (``refresh``) a new read is started in the background and waited for up to ``wait_s`` (``0``: the last
+    read, or ``[]``, at once). ``refresh=False``: the last read whatever its age, nothing started (a desk read
+    around an act). Names in RAM only. Never raises."""
+    with _tray_lock:
+        hit = _tray_cache
+    if refresh and (hit is None or time.monotonic() - hit[0] > max_age_s):
+        thread = warm_tray()
+        if thread is not None and wait_s > 0:
+            thread.join(wait_s)
+        with _tray_lock:
+            hit = _tray_cache
+    return list(hit[1]) if hit is not None else []
+
+
+def format_tray(icons: Iterable[TrayIcon | dict], limit: int = MAX_TRAY_ICONS) -> str:
+    """The tray in words (``""`` with none): ``Twinkle Tray (monitor app), Steam; hidden icons: OneDrive``. Takes
+    :class:`TrayIcon` records or their dict form (an overview's payload)."""
+
+    def get(icon: object, key: str, default: object) -> object:
+        return icon.get(key, default) if isinstance(icon, dict) else getattr(icon, key, default)
+
+    listed = [i for i in list(icons or [])[: max(0, int(limit))] if str(get(i, "name", "") or "").strip()]
+
+    def word(icon: object) -> str:
+        return str(get(icon, "name", "")) + (" (monitor app)" if get(icon, "monitor_app", False) else "")
+
+    shown = [word(i) for i in listed if get(i, "shown", True)]
+    hidden = [word(i) for i in listed if not get(i, "shown", True)]
+    parts = [", ".join(shown)] if shown else []
+    if hidden:
+        parts.append("hidden icons: " + ", ".join(hidden))
+    return "; ".join(parts)
+
+
 def _monitor_dpi(handle: int) -> int:
     """Effective DPI of one monitor, or 96 when Windows will not say.
 
@@ -1157,8 +1517,243 @@ def _monitor_dpi(handle: int) -> int:
     return int(dpi_x.value)
 
 
+# ---------------------------------------------------------------------------
+# Monitor identity (morning21 B2): the EDID name, device path and connector of
+# each display, from Windows' display configuration (QueryDisplayConfig +
+# DisplayConfigGetDeviceInfo).  Read-only, no DDC/CI, about a millisecond; read
+# again only when the set of displays changes (the enumeration's own stamp:
+# what WM_DISPLAYCHANGE would say, with no window to receive it).
+# ---------------------------------------------------------------------------
+
+#: ``QDC_ONLY_ACTIVE_PATHS``: the displays Windows is showing now.
+_QDC_ONLY_ACTIVE_PATHS = 0x2
+#: ``DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME`` / ``..._GET_TARGET_NAME``.
+_DCI_SOURCE_NAME = 1
+_DCI_TARGET_NAME = 2
+_ERROR_INSUFFICIENT_BUFFER = 122
+
+
+class _LUID(ctypes.Structure):
+    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+
+class _PathSourceInfo(ctypes.Structure):
+    _fields_ = [("adapterId", _LUID), ("id", ctypes.c_uint32), ("modeInfoIdx", ctypes.c_uint32),
+                ("statusFlags", ctypes.c_uint32)]
+
+
+class _Rational(ctypes.Structure):
+    _fields_ = [("Numerator", ctypes.c_uint32), ("Denominator", ctypes.c_uint32)]
+
+
+class _PathTargetInfo(ctypes.Structure):
+    _fields_ = [("adapterId", _LUID), ("id", ctypes.c_uint32), ("modeInfoIdx", ctypes.c_uint32),
+                ("outputTechnology", ctypes.c_uint32), ("rotation", ctypes.c_uint32),
+                ("scaling", ctypes.c_uint32), ("refreshRate", _Rational), ("scanLineOrdering", ctypes.c_uint32),
+                ("targetAvailable", wintypes.BOOL), ("statusFlags", ctypes.c_uint32)]
+
+
+class _PathInfo(ctypes.Structure):
+    """``DISPLAYCONFIG_PATH_INFO`` (72 bytes)."""
+
+    _fields_ = [("sourceInfo", _PathSourceInfo), ("targetInfo", _PathTargetInfo), ("flags", ctypes.c_uint32)]
+
+
+class _ModeInfo(ctypes.Structure):
+    """``DISPLAYCONFIG_MODE_INFO`` (64 bytes; its union is never read here)."""
+
+    _fields_ = [("infoType", ctypes.c_uint32), ("id", ctypes.c_uint32), ("adapterId", _LUID),
+                ("mode", ctypes.c_uint64 * 6)]
+
+
+class _DeviceInfoHeader(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_uint32), ("size", ctypes.c_uint32), ("adapterId", _LUID),
+                ("id", ctypes.c_uint32)]
+
+
+class _SourceDeviceName(ctypes.Structure):
+    """``DISPLAYCONFIG_SOURCE_DEVICE_NAME``: the source's GDI name (``\\\\.\\DISPLAY1``)."""
+
+    _fields_ = [("header", _DeviceInfoHeader), ("viewGdiDeviceName", wintypes.WCHAR * 32)]
+
+
+class _TargetDeviceName(ctypes.Structure):
+    """``DISPLAYCONFIG_TARGET_DEVICE_NAME`` (420 bytes): the monitor's EDID name and device path."""
+
+    _fields_ = [("header", _DeviceInfoHeader), ("flags", ctypes.c_uint32), ("outputTechnology", ctypes.c_uint32),
+                ("edidManufactureId", ctypes.c_uint16), ("edidProductCodeId", ctypes.c_uint16),
+                ("connectorInstance", ctypes.c_uint32), ("monitorFriendlyDeviceName", wintypes.WCHAR * 64),
+                ("monitorDevicePath", wintypes.WCHAR * 128)]
+
+
+_display_api = ctypes.WinDLL("user32")  # private: its argtypes leak nowhere
+_display_api.GetDisplayConfigBufferSizes.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+                                                     ctypes.POINTER(ctypes.c_uint32)]
+_display_api.GetDisplayConfigBufferSizes.restype = ctypes.c_long
+_display_api.QueryDisplayConfig.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+                                            ctypes.POINTER(_PathInfo), ctypes.POINTER(ctypes.c_uint32),
+                                            ctypes.POINTER(_ModeInfo), ctypes.c_void_p]
+_display_api.QueryDisplayConfig.restype = ctypes.c_long
+_display_api.DisplayConfigGetDeviceInfo.argtypes = [ctypes.c_void_p]
+_display_api.DisplayConfigGetDeviceInfo.restype = ctypes.c_long
+
+#: ``DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY`` values as a word (Windows' own enum, a fixed machine table).
+_CONNECTOR_WORDS = {0: "VGA", 4: "DVI", 5: "HDMI", 6: "internal", 10: "DisplayPort", 11: "internal", 12: "UDI",
+                    13: "internal", 15: "wireless", 16: "USB", 17: "virtual", 18: "USB-C", 0x80000000: "internal"}
+#: How the monitors other than the primary are called by place, left to right (the words a person uses for them).
+_ROLE_WORDS = ("second", "third", "fourth", "fifth", "sixth")
+
+
+@dataclass(frozen=True)
+class _Target:
+    """One monitor as Windows' display configuration names it."""
+
+    label: str
+    device_path: str
+    pnp: str
+    connector: str
+
+
+def _pnp_of(device_path: str) -> str:
+    """The Plug and Play id in a monitor device path (``\\\\?\\DISPLAY#ACR06D7#5&...#{guid}`` -> ``ACR06D7``): the
+    segment after ``DISPLAY#``, a fixed machine format."""
+    parts = str(device_path or "").split("#")
+    return parts[1].upper() if len(parts) > 2 and parts[0].upper().endswith("DISPLAY") else ""
+
+
+def _read_display_targets() -> dict[str, list[_Target]]:
+    """``{GDI device name (\\\\.\\DISPLAYn): [the monitors it shows]}`` for the active display paths (one, or more
+    for a duplicated display). ``{}`` when Windows would not say. Read-only."""
+    for _ in range(3):
+        n_paths, n_modes = ctypes.c_uint32(0), ctypes.c_uint32(0)
+        if _display_api.GetDisplayConfigBufferSizes(_QDC_ONLY_ACTIVE_PATHS, ctypes.byref(n_paths),
+                                                    ctypes.byref(n_modes)) != 0:
+            return {}
+        paths = (_PathInfo * max(1, n_paths.value))()
+        modes = (_ModeInfo * max(1, n_modes.value))()
+        got = _display_api.QueryDisplayConfig(_QDC_ONLY_ACTIVE_PATHS, ctypes.byref(n_paths), paths,
+                                              ctypes.byref(n_modes), modes, None)
+        if got == _ERROR_INSUFFICIENT_BUFFER:
+            continue   # the configuration changed between the two calls
+        if got != 0:
+            return {}
+        break
+    else:
+        return {}
+    out: dict[str, list[_Target]] = {}
+    for i in range(n_paths.value):
+        path = paths[i]
+        source = _SourceDeviceName()
+        source.header.type = _DCI_SOURCE_NAME
+        source.header.size = ctypes.sizeof(_SourceDeviceName)
+        source.header.adapterId = path.sourceInfo.adapterId
+        source.header.id = path.sourceInfo.id
+        if _display_api.DisplayConfigGetDeviceInfo(ctypes.byref(source)) != 0:
+            continue
+        target = _TargetDeviceName()
+        target.header.type = _DCI_TARGET_NAME
+        target.header.size = ctypes.sizeof(_TargetDeviceName)
+        target.header.adapterId = path.targetInfo.adapterId
+        target.header.id = path.targetInfo.id
+        if _display_api.DisplayConfigGetDeviceInfo(ctypes.byref(target)) != 0:
+            continue
+        device_path = str(target.monitorDevicePath or "")
+        out.setdefault(str(source.viewGdiDeviceName or "").upper(), []).append(_Target(
+            label=" ".join(str(target.monitorFriendlyDeviceName or "").split()),
+            device_path=device_path,
+            pnp=_pnp_of(device_path),
+            connector=_CONNECTOR_WORDS.get(int(target.outputTechnology), ""),
+        ))
+    return out
+
+
+_targets_lock = threading.Lock()
+#: ``(stamp, targets)``: the last read, kept until the displays' own stamp changes.
+_targets_cache: tuple[tuple, dict[str, list[_Target]]] | None = None
+
+
+def _display_targets(stamp: tuple) -> dict[str, list[_Target]]:
+    """:func:`_read_display_targets`, read again only when ``stamp`` (every display's GDI name and rectangle) is not
+    the last read's. Never raises (``{}``)."""
+    global _targets_cache
+    with _targets_lock:
+        hit = _targets_cache
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    try:
+        got = _read_display_targets()
+    except Exception:
+        got = {}
+    with _targets_lock:
+        _targets_cache = (stamp, got)
+    return got
+
+
+def monitor_roles(monitors: Iterable[MonitorInfo]) -> dict[int, str]:
+    """``{index: role}``: ``main`` for the primary display, then ``second``, ``third``, ... left to right (top to
+    bottom when two share a left edge): the place a person names a monitor by. Pure geometry."""
+    listed = list(monitors)
+    out: dict[int, str] = {}
+    rest = sorted((m for m in listed if not m.is_primary), key=lambda m: (m.bounds[0], m.bounds[1]))
+    for m in listed:
+        if m.is_primary:
+            out[m.index] = "main"
+    if not out and listed:
+        first = min(listed, key=lambda m: (m.bounds[0], m.bounds[1]))
+        out[first.index] = "main"
+        rest = [m for m in rest if m.index != first.index]
+    for i, m in enumerate(rest):
+        out[m.index] = _ROLE_WORDS[i] if i < len(_ROLE_WORDS) else f"monitor {i + 2}"
+    return out
+
+
+#: A screen power state read over DDC/CI counts for this long (s): the user may change it with the monitor's own
+#: buttons or another app at any time, and nothing here polls the monitor.
+POWER_FRESH_S = 120.0
+_power_lock = threading.Lock()
+#: ``{device path: (VCP 0xD6 value, wall time read)}``: written by the display driver's own reads
+#: (:func:`note_display_power`), never by polling.
+_power: dict[str, tuple[int, float]] = {}
+#: ``{device path: (label, pnp)}``: every monitor this process saw attached, so a monitor Windows dropped (switched
+#: fully off) can still be named.
+_seen_monitors: dict[str, tuple[str, str]] = {}
+
+
+def note_display_power(device_path: str, value: int | None) -> None:
+    """Keep a monitor's screen power as the display driver just read it (VCP 0xD6: 1 on, 2-5 standby or off;
+    ``None`` forgets it). RAM only."""
+    key = str(device_path or "")
+    if not key:
+        return
+    with _power_lock:
+        if value is None:
+            _power.pop(key, None)
+        else:
+            _power[key] = (int(value), time.time())
+
+
+def display_power(device_path: str, *, fresh_s: float = POWER_FRESH_S) -> str:
+    """``on`` / ``off`` from the last DDC/CI read of this monitor's power, when it is at most ``fresh_s`` old; ``""``
+    otherwise (not known: never a guess)."""
+    with _power_lock:
+        hit = _power.get(str(device_path or ""))
+    if hit is None or time.time() - hit[1] > fresh_s:
+        return ""
+    return "on" if hit[0] == 1 else "off" if 2 <= hit[0] <= 5 else ""
+
+
+def seen_monitors() -> dict[str, tuple[str, str]]:
+    """``{device path: (label, pnp)}`` of every monitor this process saw attached (a copy)."""
+    with _power_lock:
+        return dict(_seen_monitors)
+
+
 def list_monitors() -> list[MonitorInfo]:
     """Every display attached right now, in the order Windows enumerates them.
+
+    morning21 B2: each carries its monitor's EDID name, device path, Plug and Play id and connector (Windows' display
+    configuration, read again only when the displays change), its role by place (:func:`monitor_roles`), its screen
+    power as last read by the display driver (:func:`display_power`), and its ``HMONITOR``.
 
     Returns:
         One :class:`MonitorInfo` per monitor.  Never empty in practice; a session
@@ -1202,8 +1797,29 @@ def list_monitors() -> list[MonitorInfo]:
                 is_primary=bool(info.dwFlags & _MONITORINFOF_PRIMARY),
                 dpi_scale=round(dpi / _DEFAULT_DPI, 4),
                 dpi=dpi,
+                handle=int(handle),
             )
         )
+    try:
+        targets = _display_targets(tuple((m.name, m.bounds) for m in monitors))
+        roles = monitor_roles(monitors) if len(monitors) > 1 else {m.index: "main" for m in monitors}
+        attached: set[str] = set()
+        for m in monitors:
+            m.role = roles.get(m.index, "")
+            shown = targets.get(m.name.upper()) or []
+            if not shown:
+                continue
+            first = shown[0]
+            m.label, m.device_path, m.pnp, m.connector = first.label, first.device_path, first.pnp, first.connector
+            m.power = display_power(m.device_path)
+            attached.add(m.device_path)
+            with _power_lock:
+                _seen_monitors[m.device_path] = (m.label, m.pnp)
+        with _power_lock:
+            for gone in [k for k in _power if k not in attached]:
+                del _power[gone]   # a monitor Windows dropped: its last read says nothing now
+    except Exception:
+        pass   # identity is extra: the displays themselves are still reported
     return monitors
 
 
@@ -1310,6 +1926,10 @@ def get_desktop_overview() -> DesktopOverview:
         background = background_apps(windows, hidden, others=elsewhere)
     except Exception:  # an overview without them is still an overview
         background = []
+    try:
+        tray = tray_icons()   # morning21 B7: the last read (a stale one starts a new read in the background)
+    except Exception:
+        tray = []
     virtual_bounds = virtual_screen_bounds()
     left, top, right, bottom = virtual_bounds
     try:
@@ -1331,6 +1951,7 @@ def get_desktop_overview() -> DesktopOverview:
         user_locale=str(locale.get("user_locale") or ""),
         keyboard_layout=str(keyboard.get("summary") or ""),
         background_apps=background,
+        tray=tray,
     )
 
 
@@ -1421,11 +2042,16 @@ def format_overview(o: DesktopOverview) -> str:
         cursor_monitor = monitor_at(o.cursor[0], o.cursor[1], o.monitors)
         for monitor in o.monitors:
             left, top, right, bottom = monitor.bounds
+            # morning21 B3: its role and its own model name, the words a person uses for it (never the index)
+            named = ", ".join(x for x in (getattr(monitor, "role", ""), getattr(monitor, "label", "")) if x)
             parts = [
                 f"monitor {monitor.index}"
-                f"{' PRIMARY' if monitor.is_primary else ''}:"
+                f"{' PRIMARY' if monitor.is_primary else ''}"
+                f"{f' ({named})' if named else ''}:"
                 f" @{left},{top} {right - left}x{bottom - top}"
             ]
+            if getattr(monitor, "power", "") == "off":
+                parts.append("screen off")
             if monitor.work_area != monitor.bounds:
                 w_left, w_top, w_right, w_bottom = monitor.work_area
                 parts.append(
@@ -1467,6 +2093,9 @@ def format_overview(o: DesktopOverview) -> str:
         lines.append(
             "running with no open window: " + ", ".join(names) + (" and more" if more else "")
         )
+    tray = format_tray(getattr(o, "tray", None) or [])
+    if tray:
+        lines.append("in the tray: " + tray)
     return "\n".join(lines)
 
 

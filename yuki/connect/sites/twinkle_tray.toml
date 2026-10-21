@@ -1,0 +1,35 @@
+# Twinkle Tray as data (morning21 lane B: B5, B6): a monitor app, one possible means of the display capability
+# (yuki/skills/connections/display.toml, means = "app"). Facts true for anyone's Twinkle Tray, from its README (v1.13+)
+# and its source (src/electron.js, handleCommandLine); whether *this* user uses it is told or learned, never written
+# here, and nothing about it is ever required (Windows' own DDC/CI always works without it).
+#
+# Zero setup (D0): its command line only, handed to the running app; never its UDP interface (off by default and
+# keyed: that would be setup) and never its panel (an Electron flyout that closes when it loses focus).
+
+[app]
+name = "Twinkle Tray"
+# What it controls: the display driver (yuki/skills/display_route.py) reads every app data file that says so.
+controls = "monitors"
+# The program that runs it, in both install forms (the Store package and the classic installer).
+images = ["Twinkle Tray.exe"]
+store_package_name = "38002AlexanderFrangos.TwinkleTray"
+# How its command line is reached: the Store build's App Execution Alias (in %LOCALAPPDATA%\Microsoft\WindowsApps),
+# else the classic install's program. Environment variables are expanded; the first that exists is run.
+programs = ["%LOCALAPPDATA%\\Microsoft\\WindowsApps\\Twinkle-Tray.exe",
+            "%LOCALAPPDATA%\\Programs\\twinkle-tray\\Twinkle Tray.exe"]
+
+[cli]
+# The command line reaches the running app only: started cold it does nothing, so Yuki asks rather than run it.
+needs_running = true
+# It prints nothing and its exit status says nothing: every change is read back from the monitor (DDC/CI).
+exit_works = false
+# One monitor by its own id: a lower-case part of the monitor's id, its Plug and Play id ("acr06d7") works.
+select = "--MonitorID={pnp}"
+# A brightness level, 0-100 (applied to the selected monitor).
+set = "--Set={level}"
+# Any VCP code and value ("--VCP=0xD6:1" wakes a monitor; written without quotes: the app strips none).
+vcp = "--VCP={code}:{value}"
+# --MonitorNum=N is a place in the app's own list (neither Windows' numbering nor Yuki's): never used.
+positional_select = "never"
+# --List does nothing (its handler is empty): nothing is read from the app.
+list_works = false
