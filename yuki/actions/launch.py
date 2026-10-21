@@ -108,7 +108,13 @@ brought back when launched without arguments: its own hidden main window is
 shown, or, when it has none, a new window is asked for the way the Start menu
 would start it (``ActivateApplication`` for a packaged app, its program run
 again for a desktop app), and the summary says "Arc was running in the
-background with no window; opened a new window".
+background with no window; opened a new window".  morning21 B8: when no window
+comes, the app keeps no main-style window of its own hidden, and it has its own
+icon in the notification area (``windows.tray_icons``: its program in the
+shell's record of the icons, or the icon's name being the app's), it is a
+**tray app**: ``ok=True`` with
+``details["tray_app"]`` and a summary that says so ("no window by design ...
+its own window or panel opens from that icon"), never a mismatch to retry.
 
 **After the window shows up** it is brought to the foreground exactly as
 :func:`focus_window` does and waited on until it accepts input: launching an app
@@ -1931,6 +1937,35 @@ def _open_new_window(chosen: dict[str, str], identity: _AppIdentity, budget_s: f
     return None, "shell:AppsFolder", error
 
 
+#: morning21 B8: how long a launch waits for a fresh read of the notification area when it needs one (s).
+TRAY_WAIT_S = 0.8
+#: The summary of a running app with no window and a tray icon of its own: its design, never a failed launch.
+TRAY_APP_LINE = ("{lead}; it is a tray app: no window by design. It runs in the notification area (its tray icon "
+                 "\"{icon}\"), and its own window or panel opens from that icon")
+
+
+def _tray_icon_of(chosen: dict[str, str], pids: set[int]) -> str:
+    """morning21 B8: the name of the app's own icon in the notification area (``""`` none): an icon whose program is
+    one the app runs as (the shell's record of it), else one whose name is the app's Start menu name
+    (:func:`_names_agree`). OS facts and names only (``windows.tray_icons``, read fresh within
+    :data:`TRAY_WAIT_S`). Never raises."""
+    try:
+        from yuki.perception.windows import _facts_for, tray_icons
+
+        icons = tray_icons(wait_s=TRAY_WAIT_S, max_age_s=10.0)
+        images = {os.path.basename(_facts_for(pid)[1]).casefold() for pid in pids if _facts_for(pid)[1]}
+        for icon in icons:
+            if icon.image and icon.image.casefold() in images:
+                return icon.name
+        name = str(chosen.get("name") or "")
+        for icon in icons:
+            if name and _names_agree(frozenset({_squash(icon.name)}), name):
+                return icon.name
+    except Exception:  # noqa: BLE001 - no tray read: said as before
+        return ""
+    return ""
+
+
 def _spawned_by(pid: int, running: set[int]) -> bool:
     """Whether ``pid`` was started (at any depth) by one of ``running`` - appOpen final check V1-riot: the running
     instance brought up its own interface in a new child process (the Riot Client's window, a child of the running
@@ -2016,6 +2051,17 @@ def _restore_background_app(
         for other in appeared
     ]
     if hwnd is None:
+        # review L1: the shell keeps a record for every program that ever had a tray icon, so a windowed app that
+        # keeps its own main window hidden (Discord, Steam closed to the tray: measured above, ``kept_hidden``, or the
+        # hidden window that wouldn't show) is never called a tray app; only one with no such window of its own is
+        own_window = bool(kept_hidden) or bool(hidden_hwnd)
+        icon = "" if own_window else _tray_icon_of(chosen, set(running) | identity.running_pids())
+        if icon:
+            # morning21 B8 (live 21 Oct: "launch Twinkle Tray" mismatched twice and was tried again): a running app
+            # with no window of its own and an icon in the notification area is a tray app; no window is its design,
+            # so the launch did what can be done (it runs) and is never a mismatch to retry
+            details.update(tray_app=True, window_reason="tray app: no window by design")
+            return True, TRAY_APP_LINE.format(lead=lead, icon=icon)
         return False, (
             f"{lead}; asked it for a new window ({via}) but none appeared within "
             f"{timeout_s:g}s - it is still running with no window"
@@ -3507,6 +3553,11 @@ def _no_window_outcome(
             program = os.path.basename(sorted(identity.exe_paths or [""])[0]) or "the program that shows it"
             return f"{lead}; {program}, which shows it, is shared with other windows, and no new window of it came"
         if pids:
+            icon = _tray_icon_of(chosen, set(pids))
+            if icon:
+                # morning21 B8: started (or handed over) and running in the tray with no window: its design
+                details.update(tray_app=True, window_reason="tray app: no window by design")
+                return TRAY_APP_LINE.format(lead=lead, icon=icon)
             return (
                 f"{lead}; it is running (pid {', '.join(str(p) for p in sorted(pids)[:6])}) "
                 f"but has no window a user could switch to, shown or hidden"

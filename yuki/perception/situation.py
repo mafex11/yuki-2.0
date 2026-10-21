@@ -38,6 +38,11 @@ Public API::
     front_window(raw=None) -> (hwnd, how)          # fa (A5): the window in front now, by the one front rule
     front_rule(raw, keyboard, root_owner, listed, popup) -> (hwnd, how)   # pure: that rule
 
+morning21 (lane B, contract K3): a monitor is said by its place and its own model name ("Monitor 1 (second, VG271U,
+2560x1440; screen off)"): the ``[n]`` id is the hands' only, never words to say; "screen off" only from the display
+driver's own recent read. The notification area's icons are one line ("In the tray: Twinkle Tray (monitor app),
+Steam; hidden icons: ..."), from the last tray read (``windows.tray_icons``; nothing is read for a desk).
+
 **The one front rule** (fa, final-F #4a): the front is ``GetForegroundWindow`` when it is a listed window or a popup
 the desk keeps; a foreground on no list stands for the listed window holding the keyboard, else its listed root owner.
 :func:`snapshot` and :func:`front_window` both apply it, so a diff's ``focus_to`` and a guard's "front now" read the
@@ -99,13 +104,19 @@ class _Rec:
 
 @dataclass
 class Monitor(_Rec):
-    """One display: ``rect`` the whole monitor, ``work`` without the taskbar (virtual-desktop px)."""
+    """One display: ``rect`` the whole monitor, ``work`` without the taskbar (virtual-desktop px). morning21 B3:
+    ``label`` its own model name (EDID, ``VG271U``; ``""`` none), ``role`` its place (``main``, ``second``, ...:
+    ``windows.monitor_roles``), ``power`` its screen as the display driver last read it (``off`` / ``on`` / ``""``
+    not known; ``windows.display_power``)."""
 
     index: int
     rect: tuple[int, int, int, int]
     work: tuple[int, int, int, int]
     primary: bool = False
     dpi_scale: float = 1.0
+    label: str = ""
+    role: str = ""
+    power: str = ""
 
 
 @dataclass
@@ -180,6 +191,9 @@ class DeskState(_Rec):
     #: fa (A5): how :attr:`foreground` was found by the one front rule (:func:`front_rule`): ``listed``, ``popup``,
     #: ``keyboard``, ``owner``, ``unlisted``, ``none``; ``""`` when not read by :func:`snapshot` (a code word, logged).
     front_how: str = ""
+    #: morning21 B7: the notification area's icons (``windows.TrayIcon`` records or their dicts) from the last tray
+    #: read (never read for this desk: ``windows.tray_icons``' cache).
+    tray: list[Any] = field(default_factory=list)
 
     def window(self, hwnd: Any) -> Window | None:
         try:
@@ -194,7 +208,8 @@ class DeskState(_Rec):
                 "popups": sum(1 for w in self.windows if w.kind == "popup"),
                 "playing": sum(1 for m in self.media if m.playing),
                 "playing_mapped": sum(1 for m in self.media if m.playing and m.hwnd),
-                "errors": sorted(self.errors), "ms": round(self.ms, 1), "front_how": self.front_how or None}
+                "errors": sorted(self.errors), "ms": round(self.ms, 1), "front_how": self.front_how or None,
+                "tray": len(self.tray), "screens_off": sum(1 for m in self.monitors if m.power == "off")}
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +479,9 @@ def snapshot(*, media: Iterable[Any] | None = None, audio: Iterable[Any] | None 
         from yuki.perception.windows import list_monitors, list_windows
 
         state.monitors = [Monitor(index=m.index, rect=tuple(m.bounds), work=tuple(m.work_area), primary=m.is_primary,
-                                  dpi_scale=float(m.dpi_scale)) for m in list_monitors()]
+                                  dpi_scale=float(m.dpi_scale), label=str(getattr(m, "label", "") or ""),
+                                  role=str(getattr(m, "role", "") or ""), power=str(getattr(m, "power", "") or ""))
+                          for m in list_monitors()]
         infos = list_windows()
         lay = layout()
         raw = int(lay.foreground or _user32.GetForegroundWindow() or 0)
@@ -503,6 +520,12 @@ def snapshot(*, media: Iterable[Any] | None = None, audio: Iterable[Any] | None 
         state.windows = out
     except Exception as exc:  # noqa: BLE001
         state.errors["windows"] = type(exc).__name__
+    try:
+        from yuki.perception.windows import tray_icons
+
+        state.tray = tray_icons(refresh=False)   # morning21 B7: the last tray read only (nothing is read here)
+    except Exception:  # noqa: BLE001
+        state.tray = []
 
     if media is None:
         try:
@@ -570,7 +593,8 @@ def snapshot(*, media: Iterable[Any] | None = None, audio: Iterable[Any] | None 
 
 def warm() -> None:
     """Pay the first read's one-off costs in the background (returns at once): the WinRT media manager (~120 ms cold)
-    and the Core Audio COM import (~250 ms cold), so the first :func:`snapshot` before an act is ms. Never raises."""
+    and the Core Audio COM import (~250 ms cold), so the first :func:`snapshot` before an act is ms; and the first
+    tray read (morning21 B7: the desk's tray line has names from the first request on). Never raises."""
     import threading
 
     def run() -> None:
@@ -581,6 +605,12 @@ def warm() -> None:
             from yuki.actions.app_volume import audio_apps
 
             audio_apps(limit=1)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from yuki.perception.windows import warm_tray
+
+            warm_tray()
         except Exception:  # noqa: BLE001
             pass
 
@@ -609,11 +639,13 @@ def from_overview(payload: dict[str, Any], *, shares: dict[int, float] | None = 
         work = tuple(int(v) for v in (m.get("work_area") or m.get("work") or rect))
         monitors.append(Monitor(index=int(m.get("index") or 0), rect=rect, work=work,
                                 primary=bool(m.get("is_primary", m.get("primary", False))),
-                                dpi_scale=float(m.get("dpi_scale") or 1.0)))
+                                dpi_scale=float(m.get("dpi_scale") or 1.0), label=str(m.get("label") or ""),
+                                role=str(m.get("role") or ""), power=str(m.get("power") or "")))
     if not monitors and payload.get("virtual_bounds"):
         rect = tuple(int(v) for v in payload["virtual_bounds"])
         monitors.append(Monitor(index=0, rect=rect, work=rect, primary=True))
     state.monitors = monitors
+    state.tray = [t for t in payload.get("tray") or [] if hasattr(t, "get") or hasattr(t, "name")]
     fg = int(payload.get("foreground_hwnd") or 0)
     kb = int(keyboard or fg or 0)
     state.foreground, state.keyboard = (fg or None), (kb or None)
@@ -786,13 +818,17 @@ def _items(state: DeskState, *, planner: bool, cap: int, said: int, short: bool,
     shown = [w for w in state.windows if not w.minimized]
     for m in state.monitors:
         width, height = m.rect[2] - m.rect[0], m.rect[3] - m.rect[1]
-        bits = [b for b in ("main" if m.primary and multi else "", f"{width}x{height}") if b]
+        # morning21 B3 (contract K3): its place and its own model name, the words to say it by ("second, VG271U");
+        # the index is the hands' id only. "screen off" only from the display driver's own recent read
+        role = m.role or ("main" if m.primary else "")
+        bits = [b for b in (role if multi else "", m.label, f"{width}x{height}") if b]
         if planner:
             bits.append(f"@{m.rect[0]},{m.rect[1]}")
             if m.work != m.rect:
                 bits.append(f"work area {m.work[2] - m.work[0]}x{m.work[3] - m.work[1]}")
         group = f"m{m.index}"
-        add(0, group, f"Monitor {m.index} ({', '.join(bits)}):")
+        power = "; screen off" if m.power == "off" else ""
+        add(0, group, f"Monitor {m.index} ({', '.join(bits)}{power}):")
         mine = [w for w in shown if w.monitor == m.index]
         if not mine:
             add(0, group, "nothing open")
@@ -819,6 +855,14 @@ def _items(state: DeskState, *, planner: bool, cap: int, said: int, short: bool,
             f'{m.app}{" " + chr(34) + _title(m.title, min(40, cap)) + chr(34) if m.title and cap > 0 else ""}'
             for m in paused) + ".")
     add(3, "sound", sound_line(state))
+    if state.tray:
+        try:
+            from yuki.perception.windows import format_tray
+
+            tray = format_tray(state.tray)
+        except Exception:  # noqa: BLE001
+            tray = ""
+        add(3, "tray", f"In the tray: {tray}." if tray else "")
     if state.holds:
         add(0, "holds", f"Holding them: {state.holds}.")
     if just_asked:
