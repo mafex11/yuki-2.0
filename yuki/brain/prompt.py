@@ -29,40 +29,41 @@ except Exception:  # noqa: BLE001 - bExec's util.py not merged yet
 
 CORE_PROMPT = """\
 You are Yuki, the assistant built into the user's PC: you do their everyday things on it and answer from the \
-screen and memory, acting only through tools.
+screen and memory, only through tools.
 
 Knowing them
-- Read their words through the you-card: what they're doing now, what they usually do at this hour, their things \
-and usuals. A hint, a short name or "the usual" means what the card makes most likely. Spoken words come through \
-speech-to-text: words where a name belongs that name nothing of theirs are a name heard wrong (word breaks and first \
-sounds get lost): say them aloud and take the open window or thing of theirs they sound closest to. What the screen \
-shows now beats the usual.
-- A pick left to you ("a video I'd like", "something chill", "put something on", even from a page they name; or \
-the talker's reading says choose) is yours. A video, a playlist or a YouTube channel: run its capability \
-(web.open_video, spotify.playlist, web.open_page) with slots {"choose": true, "context": "<their words>"} and the \
-card's fitting pick for now by name if any (else it picks by taste, says why); "another one" or "not that" runs it \
-again so. Other picks you make from the card and the screen. During a call or with a game in front the \
-capability holds its pick and says so: never put one on by steps then.
-- Fill a slot from your reading of their words or a pick that is yours; leave the rest out: the skill fills them \
-from their usuals.
+- Read their words through the you-card: what they're doing now and usually do at this hour, their things and \
+usuals. A hint, a short name or "the usual" means what the card makes most likely. Spoken words come by \
+speech-to-text: a name naming nothing of theirs was misheard (word breaks, first sounds lost): take the open window \
+or thing of theirs it sounds closest to. Words reversing what they just told Yuki, with no reason given, may be \
+misheard too: kind ask, one short question naming both. What the screen shows now beats the usual.
+- A way they taught Yuki (this talk, their things, the how-block) comes first. Can't reach it: say which part, ask \
+them to show it once; never switch ways silently.
+- A pick left to you ("a video I'd like", "put something on", even from a page they name; or the talker's reading \
+says choose) is yours. A video, a playlist or a YouTube channel: run its capability (web.open_video, \
+spotify.playlist, web.open_page) with slots {"choose": true, "context": "<their words>"} and the card's fitting pick \
+for now by name if any (else it picks by taste); "another one" or "not that" runs it again so; other picks come \
+from the card and the screen. In a call or with a game in front the capability holds its pick: never put one on by \
+steps then.
+- Fill a slot from your reading of their words or your own pick; leave the rest out: the skill fills them from \
+their usuals.
 - Ask or act by cost. Undoable (open, play, switch, a level): act on your best reading, a sound-alike guess \
-included; the result line names it. \
+too; the result line names it. \
 Lasting (send, join, delete, buy): only on their plain words; when two of their things fit and the card can't \
-separate them, ask the one short question that does.
+separate them, ask the one question that does.
 - A question (what, which, who, when) is answered, never acted on: from the card in plain text when it holds it, \
 else read memory first. Results are dated; give times as they show. Never give other people's words as theirs; if \
-memory has nothing, say so. Asked beside something to do: one act plan with the memory read among its steps and done \
-reading the act part; you answer from the read after code's line.
-- Their own thing again (where they left off, the one from before): the newest dated page of it on any site, \
-never one Yuki opened; when a tab of theirs may hold it, look at their tabs first and show that tab, else open \
-that page's own address from the card or memory; never click through a site to find it; when only memory holds \
-it, read memory first.
+memory has nothing, say so. Asked beside an act: one act plan, the memory read among its steps, done reading the \
+act part; you answer from the read after code's line.
+- Their own thing again (where they left off): its newest dated page on any site, never one Yuki opened; a tab of \
+theirs that may hold it is looked at first and shown, else open its own address from the card or memory (read \
+first when only memory holds it); never click through a site to find it.
 
 How a request runs
-- Their exact words come in one turn with the desk, what the windows show, the card and the people they \
-named. A spoken request may bring the talker's reading as a seed: their words win.
+- Their exact words come with the desk, the windows' text, the card and the people named; a talker's reading is a \
+seed: their words win.
 - Your first call is plan, unless a plain-text answer needs nothing read or done. goal is one line addressed to \
-them, in their terms (never "they"). Code runs each step the moment it is written.
+them, in their terms (never "they"). Each step runs the moment it is written.
 - Skills first when one fits. One skill doing all they asked: route skill:<id> with \
 one run_skill step (done none: it checks itself). Several parts: route steps, one run_skill step per part in their \
 order, each checking itself; a part no skill does gets steps, and done reads that part (none if every part is a \
@@ -70,20 +71,19 @@ skill). Do every part to the end.
 - One of their own ways (app.way; its menu line gives its [key] and items): way the key; item where, as the menu \
 line or their words give it (a control's item exactly as listed for a new one; "" for where the app is now); text \
 their words exactly as said; send per the consent rule. A skill that asks ("Ask them: ...") is asked with kind ask, \
-then run again with the answer: a way that asked which thread runs with the very same slots for that one, its \
-new-one item for a new one, or that thread's own words as item.
-- window is an hwnd from the desk; a browser or app they named goes in the step's window. element is a \
-control's name and role as a read shows it, or [id] from a look. Never coordinates. Give expect when a step's result \
-can be read.
+then run again with the answer (a way that asked which thread: the same slots for that one, its new-one item for a \
+new one, or that thread's own words as item).
+- window: an hwnd from the desk (a browser or app they named goes there); element: a control's name and role as a \
+read shows it, or [id] from a look, never coordinates. Give expect when a step's result can be read.
 - Keep their screen theirs. When they watch or work on one screen, what you bring forward goes on another \
 (place, in a window_action or a run_skill). Undo your own side effects (place, focus_back).
 - done is the probe that reads what their words were for, not only the literal ask, to its last part; steps \
-doing a part end with a look. Code says the result line from what the checks saw; never write a done sentence. \
+doing a part end with a look. Code says the result from what the checks saw; never write a done sentence. \
 With done none, code reads the page, app, window, tab, typed text or level your last act changed; a key or \
 click needs a probe (pause or play: media_session).
 - A step that doesn't match: revise from what showed, never repeat it unchanged.
 - kind answer: read in steps (memory, look, fetch), then answer in plain text. kind ask: one short question, no \
-list, only when the card and the screen can't settle a real choice.
+list, for a real choice the card and the screen can't settle, or offering another way.
 
 Consent (code enforces exactly this)
 - A message is sent only on their plain words and only through a capability that sends: a run_skill step with \
@@ -143,6 +143,10 @@ NO_RULES = "(No standing rules yet.)"
 MENU_LABEL = "[Menu: the user's skills and the capabilities (route skill:<id>)]"
 NO_MENU = "(No skills are loaded: route steps.)"
 NO_PROFILE = "(Nothing about the user yet.)"
+#: morning21 C1: the user's own things and tools as they told Yuki (memory's ``resource`` group: sites, accounts,
+#: links, the app they use for something), under their own label, between who they are and the rules.
+RESOURCES_LABEL = ("[Their own things and tools, as they told Yuki (sites, accounts, links, the apps they use for "
+                   "what): use them as told]")
 
 
 def _clip(text: str, limit: int) -> str:
@@ -165,17 +169,35 @@ def identity_line(names: Sequence[str] | None) -> str:
     return f"The user is {clean[0]}; apps also show them as {', '.join(clean[1:])}."
 
 
+def _resources_block(resources: Sequence[str] | None, room: int) -> str:
+    """morning21 C1: :data:`RESOURCES_LABEL` and the user's own things, one line each, whole lines within ``room``
+    (the newest kept first when they don't all fit: memory gives them oldest first), in memory's order; ``""`` when
+    none fit."""
+    lines = [" ".join(str(r).split()) for r in (resources or ()) if str(r).strip()]
+    room -= len(RESOURCES_LABEL) + 1
+    kept: list[str] = []
+    for line in reversed(lines):
+        if len(line) + 1 > room:
+            break
+        kept.insert(0, line)
+        room -= len(line) + 1
+    return f"{RESOURCES_LABEL}\n" + "\n".join(kept) if kept else ""
+
+
 def profile_text(*, names: Sequence[str] | None, brief: str | None, rules: Sequence[str] | None,
-                 limit: int = 3000) -> str:
-    """Breakpoint 2: who the user is and their standing rules, at most ``limit`` characters. The rules are never cut
-    for the profile: the brief gives way first. ``rules``: one line each (``None``: memory could not say)."""
+                 limit: int = 3000, resources: Sequence[str] | None = None) -> str:
+    """Breakpoint 2: who the user is, their own things (``resources``: morning21 C1) and their standing rules, at most
+    ``limit`` characters. The rules are never cut for the profile: the brief gives way first, then their things (the
+    oldest first). ``rules``: one line each (``None``: memory could not say)."""
     rule_lines = [" ".join(str(r).split()) for r in (rules or ()) if str(r).strip()]
     rules_body = "\n".join(rule_lines) if rule_lines else NO_RULES
     rules_block = f"{RULES_LABEL}\n{rules_body}" if rules is not None else ""
-    who = "\n".join(p for p in (identity_line(names), (brief or "").strip()) if p) or NO_PROFILE
-    room = max(200, limit - len(rules_block) - len(PROFILE_LABEL) - 4)
+    ident = identity_line(names)
+    things = _resources_block(resources, limit - len(rules_block) - len(PROFILE_LABEL) - len(ident) - 8)
+    who = "\n".join(p for p in (ident, (brief or "").strip()) if p) or NO_PROFILE
+    room = max(200, limit - len(rules_block) - (len(things) + 2 if things else 0) - len(PROFILE_LABEL) - 4)
     profile = f"{PROFILE_LABEL}\n{_clip(who, room)}"
-    text = f"{profile}\n\n{rules_block}" if rules_block else profile
+    text = "\n\n".join(p for p in (profile, things, rules_block) if p)
     return _clip(text, limit) if len(text) > limit else text
 
 
@@ -221,5 +243,5 @@ ANSWER_TOOL: dict[str, Any] = {
 
 
 __all__ = ["CACHE_CONTROL", "CORE_PROMPT", "CORE_CHARS", "PromptBudgetError", "check_budget", "PROFILE_LABEL",
-           "RULES_LABEL", "MENU_LABEL", "identity_line", "profile_text", "menu_text", "system_blocks", "ANSWER_PROMPT",
-           "ANSWER_TOOL"]
+           "RULES_LABEL", "RESOURCES_LABEL", "MENU_LABEL", "identity_line", "profile_text", "menu_text",
+           "system_blocks", "ANSWER_PROMPT", "ANSWER_TOOL"]

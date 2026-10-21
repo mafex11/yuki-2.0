@@ -55,8 +55,9 @@ from yuki.brain import util
 ENGINE_PROBES: tuple[str, ...] = ("read_back", "uia_name", "media_session", "audio_active", "level", "page_at",
                                   "tab_shown", "foreground", "mic_held", "chat_open", "message_sent", "moment",
                                   "driver")
-#: The generic UIA probes of this module.
-GENERIC_PROBES: tuple[str, ...] = ("field_holds", "window_state", "gone", "file_exists")
+#: The generic probes of this module: four UIA reads and a file, and morning21 C12's ``display`` (a monitor's
+#: brightness or power read back over Windows' own monitor control: lane B's ``display_route.read``, contract K2).
+GENERIC_PROBES: tuple[str, ...] = ("field_holds", "window_state", "gone", "file_exists", "display")
 #: The closed list a plan's ``done.probe`` and ``expect.probe`` take (plus ``none`` for an answer plan's done).
 PROBES: tuple[str, ...] = ENGINE_PROBES + GENERIC_PROBES
 NONE = "none"
@@ -85,6 +86,7 @@ PROBE_ARGS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "window_state": (("window", "state"), ()),
     "gone": (("window",), ("role", "name")),
     "file_exists": (("path",), ()),
+    "display": (("monitor",), ("brightness", "power", "tolerance")),
 }
 #: The probes whose ``window`` argument the engine reads as the process (``donecheck._proc``).
 PROCESS_ALIAS = frozenset({"uia_name", "audio_active", "tab_shown", "foreground", "mic_held"})
@@ -97,14 +99,16 @@ COVERS: dict[str, tuple[str, ...]] = {
     "level": ("app",), "page_at": ("app", "window"), "tab_shown": ("app", "window"), "foreground": ("app",),
     "mic_held": ("app",), "chat_open": ("app", "person"), "message_sent": ("app", "person", "item"),
     "moment": ("app",), "driver": ("app",), "field_holds": ("window", "item"), "window_state": ("app", "window"),
-    "gone": ("window", "item"), "file_exists": ("item",),
+    "gone": ("window", "item"), "file_exists": ("item",), "display": ("item",),
 }
 #: A plan that declares no send or join can't send or join (consent rows 3-4), so a send or a join it reads can only be
 #: the user's own: ``message_sent`` is not a pick, nor a ``moment`` of these kinds (the capability's checks read those).
 COMMIT_MOMENTS = frozenset({"message_sent", "call_join", "game_voice"})
 PICK_PROBES: tuple[str, ...] = tuple(p for p in PROBES if p != "message_sent")
-#: Probes whose result can flip by itself soon after (read again ~2 s later, off the speaking path).
-FLIPPABLE = frozenset({"media_session", "page_at", "foreground", "tab_shown", "window_state", "audio_active"})
+#: Probes whose result can flip by itself soon after (read again ~2 s later, off the speaking path; a monitor may snap
+#: back to its old level or fall asleep again).
+FLIPPABLE = frozenset({"media_session", "page_at", "foreground", "tab_shown", "window_state", "audio_active",
+                       "display"})
 #: When the re-check reads again (s after the done line).
 RECHECK_AFTER_S = 2.0
 #: Read budgets (s): a step's ``expect``, and the done-check.
@@ -145,7 +149,14 @@ LINES: dict[str, str] = {
     "gone_plain": "The window is closed.",
     "gone_element": "\"{name}\" is gone.",
     "file_exists": "{file} is there.",
+    "display": "{monitors}.",
 }
+#: morning21 C12: how far a monitor's read-back brightness may sit from the level asked (points of 0-100), unless the
+#: plan gives ``tolerance``; and the power words a read or a plan may use (K2's ``power``: VCP 0xD6's values, 1 on,
+#: 2-5 standby / suspend / off, or their words).
+DISPLAY_TOLERANCE = 3.0
+DISPLAY_POWER_ON = frozenset({"on", "1", "true"})
+DISPLAY_POWER_OFF = frozenset({"off", "standby", "suspend", "2", "3", "4", "5", "false"})
 #: D1's moment kinds as said (a closed vocabulary, ``connection.END_KINDS``).
 MOMENT_WORDS: dict[str, str] = {
     "call_join": "You're in the call", "game_voice": "You're in the voice chat", "site_front": "The site is in front",
@@ -165,7 +176,7 @@ LINE_NOT_CONFIRMED = "I couldn't confirm {what}: {seen}."
 LINE_NOT_CONFIRMED_PLAIN = "I couldn't confirm it: {seen}."
 #: The line templates that start with the thing they name, so they read inside "I couldn't confirm ...": the rest
 #: start with a fixed word ("The", "Your", "That") and would need their case changed mid-sentence.
-NAMED_FIRST: tuple[str, ...] = ("{App}", "{site}", "{file}", "\"")
+NAMED_FIRST: tuple[str, ...] = ("{App}", "{site}", "{file}", "\"", "{monitors}")
 #: Probes whose line claims nothing a person could check by looking ("shows the change", "its own check saw it").
 NO_CLAIM = frozenset({NONE, "read_back", "driver"})
 LINE_RECHECK = "Looking again, I can't see that any more."
@@ -685,9 +696,95 @@ def probe_file_exists(args: dict[str, Any], env: ProbeEnv) -> tuple[bool | None,
         return None, {"status": "unread"}
 
 
+def _power_word(value: Any) -> str:
+    """A power state (K2's read, or a plan's ``power``) as ``on`` / ``off``; ``""`` when it can't be told."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    text = " ".join(str(value if value is not None else "").split()).casefold()
+    if isinstance(value, float) and value.is_integer():
+        text = str(int(value))
+    return "on" if text in DISPLAY_POWER_ON else "off" if text in DISPLAY_POWER_OFF else ""
+
+
+def _level(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _monitor_said(row: Mapping[str, Any], *, brightness: bool, power: bool) -> str:
+    """One monitor as read, in a done line's words ("VG271U at 50%", "VG271U is off"): its name (the monitor's own
+    EDID name from K2, else its role), never a desk index."""
+    name = " ".join(str(row.get("name") or row.get("role") or "the monitor").split())[:40]
+    parts: list[str] = []
+    level = _level(row.get("brightness"))
+    if brightness and level is not None:
+        parts.append(f"at {int(round(level))}%")
+    word = _power_word(row.get("power"))
+    if power and word:
+        parts.append(f"is {word}")
+    return f"{name} {' and '.join(parts)}" if parts else name
+
+
+def probe_display(args: dict[str, Any], env: ProbeEnv) -> tuple[bool | None, dict[str, Any]]:
+    """morning21 C12: a monitor's brightness (within ``tolerance``) and / or power, read back over Windows' own
+    monitor control through lane B's ``yuki.skills.display_route.read(target)`` (contract K2: one dict per monitor
+    the target names, ``name, role, brightness, power, ok, why``). ``monitor``: the target as the plan names it (a
+    name, ``main``, ``second``, ``all``), resolved by the driver. True when every monitor read is as asked; False when
+    one that answered is not; ``None`` when none could be read (or the driver is not there). With neither brightness
+    nor power given, a monitor that answers counts. Evidence: counts, and the monitors as read for the line (RAM
+    only). Never raises."""
+    del env
+    try:
+        from yuki.skills import display_route  # type: ignore[attr-defined]
+
+        reader = getattr(display_route, "read", None)
+    except Exception:  # noqa: BLE001 - lane B's driver not here: nothing can read a monitor
+        reader = None
+    if not callable(reader):
+        return None, {"status": "no_probe"}
+    target = " ".join(str(args.get("monitor") or "").split()) or None
+    try:
+        rows = [dict(r) for r in reader(target) or [] if isinstance(r, Mapping)]
+    except Exception as exc:  # noqa: BLE001
+        return None, {"status": "error", "error_kind": type(exc).__name__}
+    if not rows:
+        return None, {"status": "no_monitor"}
+    want_level = _level(args.get("brightness"))
+    want_power = _power_word(args.get("power")) if args.get("power") not in (None, "") else ""
+    tolerance = _level(args.get("tolerance"))
+    tolerance = DISPLAY_TOLERANCE if tolerance is None else abs(tolerance)
+    verdicts: list[bool | None] = []
+    for row in rows:
+        if not row.get("ok"):
+            verdicts.append(None)
+            continue
+        level_ok: bool | None = True
+        power_ok: bool | None = True
+        if want_level is not None:
+            level = _level(row.get("brightness"))
+            level_ok = None if level is None else abs(level - want_level) <= tolerance
+        if want_power:
+            word = _power_word(row.get("power"))
+            power_ok = None if not word else word == want_power
+        verdicts.append(False if False in (level_ok, power_ok) else None if None in (level_ok, power_ok) else True)
+    said = [_monitor_said(r, brightness=want_level is not None or not want_power, power=bool(want_power))
+            for r in rows if r.get("ok")]
+    evidence: dict[str, Any] = {"status": "read", "n": len(rows), "ok_n": sum(1 for r in rows if r.get("ok")),
+                                "said": "; ".join(said)}
+    if any(v is False for v in verdicts):
+        return False, {**evidence, "status": "other_level"}
+    if verdicts and all(v is True for v in verdicts):
+        return True, evidence
+    return None, {**evidence, "status": "unread"}
+
+
 _GENERIC: dict[str, Callable[[dict[str, Any], ProbeEnv], tuple[bool | None, dict[str, Any]]]] = {
     "field_holds": probe_field_holds, "window_state": probe_window_state, "gone": probe_gone,
-    "file_exists": probe_file_exists,
+    "file_exists": probe_file_exists, "display": probe_display,
 }
 
 
@@ -745,7 +842,7 @@ def coverage(probe: str, args: Mapping[str, Any], plan: Any, *, window_entry: Ma
             elif key == "person":
                 ok = _matches(want, str(args.get("person") or consent.get("to") or ""))
             elif key == "item":
-                named = str(args.get("text") or args.get("name") or args.get("path") or "")
+                named = str(args.get("text") or args.get("name") or args.get("path") or args.get("monitor") or "")
                 ok = _matches(want, named) or (probe == "file_exists" and _matches(want, Path(named).name))
         (covered if ok else uncovered).append(key)
     return covered, uncovered
@@ -862,6 +959,16 @@ def _line_parts(probe: str, args: Mapping[str, Any], evidence: Mapping[str, Any]
         return ("gone", {"App": _display(named)}) if named else ("gone_plain", {})
     if probe == "file_exists":
         return "file_exists", {"file": Path(str(args.get("path") or "")).name or "It"}
+    if probe == "display":
+        # morning21 C12: each monitor as the read saw it ("VG271U at 50%, 24HC1QR at 50%"); before a read (a claim),
+        # what was asked of the named target
+        said = " ".join(str(evidence.get("said") or "").split()).replace("; ", ", ")
+        if not said:
+            asked = {"name": " ".join(str(args.get("monitor") or "").split())[:40] or "the monitor",
+                     "brightness": args.get("brightness"), "power": args.get("power")}
+            said = _monitor_said(asked, brightness=args.get("brightness") is not None,
+                                 power=args.get("power") not in (None, ""))
+        return "display", {"monitors": said[:1].upper() + said[1:] if said else "The monitor"}
     return (probe if probe in LINES else "read_back"), {"App": app}
 
 
@@ -944,6 +1051,8 @@ def seen_words(probe: str, verdict: bool | None, evidence: Mapping[str, Any]) ->
         return "it's still there"
     if probe == "file_exists":
         return "the file isn't there"
+    if probe == "display" and str(evidence.get("said") or "").strip():
+        return " ".join(str(evidence["said"]).split()).replace("; ", ", ")   # morning21 C12: what each monitor read
     return "the PC shows otherwise"
 
 
@@ -1228,7 +1337,7 @@ def pick_done(plan: Any, env: ProbeEnv, *, hwnd: int | None = None, last_window:
         return DoneResult(None, util.UNVERIFIED, unread, seen="a send or a join is not this plan's to check",
                           probe=probe, args=args)
     entry: dict[str, Any] = dict(last_window or {}) if probe == "read_back" else {}
-    if probe in GENERIC_PROBES and probe != "file_exists" and env.dispatcher is not None:
+    if probe in GENERIC_PROBES and probe not in ("file_exists", "display") and env.dispatcher is not None:
         found, entry = window_of(env.dispatcher, args.get("window"), lock=env.lock)
         hwnd = found or hwnd
         if probe == "gone" and not entry:

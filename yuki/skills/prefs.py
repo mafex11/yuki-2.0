@@ -36,6 +36,9 @@ before it; the best is kept when it beats "most used" by 5 points, else "most us
   writes ``corrected`` (+3) for the option they named and ``rejected`` for the one the last run used, then the same
   one question. Only a named alternative is a preference negative (redteam D14): a cancel, slowness or a bad click
   counts against the route (``skill_runs``), never here.
+* **A correction that came as a new request** (morning21 C8: the planner's capability run whose app means slot came
+  from their words right after Yuki acted in another app of that kind): :func:`note_switch` writes the same
+  ``corrected`` / ``rejected`` pair (``yuki.brain.executor``'s caller).
 * **Conversation memory**: the extractor's ``usual`` field picks one entry of :func:`usual_choices` (a closed list in
   our own ``<pref slot>=<option>`` format, read by :func:`parse_choice`, never matched against words); code proposes it
   (:func:`propose`, a ``said`` event) and asks once on a question card (origin ``usual``, :func:`usual_question`); the
@@ -322,6 +325,108 @@ def note_correction(store: Any, skill: Any, *, values: dict[str, Any], previous:
             if record(store, old_key, old, "rejected", source=source, at=at) is not None:
                 entry["rejected"] = old
         out.append(entry)
+    return out
+
+
+def _app_names(value: Any) -> set[str]:
+    """Every name an app value goes by, casefolded: as given, its process key and the name Windows gives it (the
+    brain's ``util.app_names`` rule, kept here so the skills layer reads no brain module). Never raises."""
+    text = " ".join(str(value or "").split())
+    if not text:
+        return set()
+    try:
+        from yuki.core.appnames import app_key, resolver
+
+        names = {text.casefold(), app_key(text)}
+        try:
+            names.add(resolver().name_for_key(app_key(text)).casefold())
+        except Exception:  # noqa: BLE001 - the plain names still match
+            pass
+        return {n for n in names if n}
+    except Exception:  # noqa: BLE001
+        return {text.casefold()}
+
+
+def _app_option(store: Any, slot_key: str, value: Any) -> str | None:
+    """An app value as an option of ``slot_key``: the option already kept for that slot (any scope of it) that names
+    the same app (:func:`_app_names`), else the value's process key. ``None`` for no value. Never raises."""
+    names = _app_names(value)
+    if not names:
+        return None
+    base = slot_key.split("@", 1)[0]
+    try:
+        rows = store._query("SELECT DISTINCT option FROM prefs WHERE slot = ? OR slot LIKE ?", (base, base + "@%"))
+        for (option,) in rows:
+            if names & _app_names(option):
+                return str(option)
+    except Exception:  # noqa: BLE001 - no table: the value's own key
+        pass
+    try:
+        from yuki.core.appnames import app_key
+
+        return app_key(str(value)) or None
+    except Exception:  # noqa: BLE001
+        return " ".join(str(value).split()).casefold() or None
+
+
+def _kept_option(store: Any, slot_key: str, option: str) -> bool:
+    """Whether ``option`` is already one of the slot's options (any scope): a measured sign it is the same kind of
+    means (a browser for a browser slot). Never raises."""
+    base = slot_key.split("@", 1)[0]
+    try:
+        return bool(store._query("SELECT 1 FROM prefs WHERE (slot = ? OR slot LIKE ?) AND option = ? LIMIT 1",
+                                 (base, base + "@%", option)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: morning21 C8: the step a correction follows opened an address in its app (a page goes where pages open: that app is
+#: the same kind of means as a browser slot's), a code fact of Yuki's own step.
+ADDRESS_VERBS = frozenset({"open_url"})
+
+
+def note_switch(store: Any, skill: Any, *, values: dict[str, Any], previous_app: Any, previous_verb: str = "",
+                run_key: str | None, quote: str | None = None, at: float | None = None) -> list[dict[str, Any]]:
+    """morning21 C8: a correction that came as a new request, not the talker's ``corrects`` flag: Yuki acted on
+    something in ``previous_app`` (its newest earlier step, in this conversation), then the user's words named another
+    app and a capability ran with it (21 Oct: Meet opened in Chrome, "the link in Zen browser", ``browser.site_tab``
+    ran with browser Zen from their words, and nothing was kept).
+
+    For each app-typed means slot that reads a preference and whose value came from the user's words this run
+    (``skill_runs.filled`` of ``run_key``: ``words``) and names another app than ``previous_app``: ``corrected`` (+3)
+    for the option they named and ``rejected`` for the one Yuki used, under the slot's preference key for these values
+    (its scope filled from them), as :func:`note_correction` writes. Only when the app Yuki used is that kind of means:
+    an option the slot already keeps (:func:`_kept_option`), or one Yuki opened an address in
+    (:data:`ADDRESS_VERBS`). Content-free result (preference keys and option codes). Never raises."""
+    at = time.time() if at is None else float(at)
+    out: list[dict[str, Any]] = []
+    try:
+        sources = run_sources(store, run_key)
+        if not sources:
+            return out
+        for slot in getattr(skill, "slots", ()) or ():
+            if not getattr(slot, "pref", "") or getattr(slot, "role", "") != "means" or getattr(slot, "type", "") \
+                    != "app" or sources.get(slot.name) != "words":
+                continue
+            value = values.get(slot.name)
+            if not isinstance(value, str) or not value.strip() or _app_names(value) & _app_names(previous_app):
+                continue
+            key = slot.pref_key(skill.key, values)
+            new = _app_option(store, key, value)
+            old = _app_option(store, key, previous_app)
+            if not new or not old or new == old:
+                continue
+            if str(previous_verb or "") not in ADDRESS_VERBS and not _kept_option(store, key, old):
+                continue
+            source = f"correction:{run_key}"
+            if record(store, key, new, "corrected", quote=quote, source=source, at=at) is None:
+                continue
+            entry: dict[str, Any] = {"pref": key, "option": new, "rejected": None}
+            if record(store, key, old, "rejected", source=source, at=at) is not None:
+                entry["rejected"] = old
+            out.append(entry)
+    except Exception:  # noqa: BLE001 - nothing more is written
+        return out
     return out
 
 

@@ -18,7 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from yuki.brain.plan import LOOK_WHATS, MEMORY_KINDS, PLAN_TOOL, VERB_FIELDS, plan_schema, probe_args_text
+from yuki.brain.plan import (BRAIN_MEMORY_KINDS, LOOK_WHATS, MEMORY_KINDS, PLAN_TOOL, VERB_FIELDS, plan_schema,
+                             probe_args_text)
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Schemas
@@ -38,7 +39,7 @@ PLAN_DESCRIPTION = "Verbs:\n" + _VERB_LINES + "\n" + probe_args_text()
 
 LOOK_TOOL: dict[str, Any] = {
     "name": "look",
-    "description": "Read the screen. desktop: the desk; window: a window's controls, with ids; page: a page's "
+    "description": "Read the screen. desktop: the desk; window: its controls, with ids; page: a page's "
                    "text; tabs: a tab strip; focus: what has focus; clipboard; system: time and load.",
     "input_schema": _obj({"what": {"type": "string", "enum": list(LOOK_WHATS)},
                           "window": {"type": "integer", "description": "The hwnd."},
@@ -49,18 +50,17 @@ LOOK_TOOL: dict[str, Any] = {
 MEMORY_TOOL: dict[str, Any] = {
     "name": "memory",
     "description": (
-        "Memory of the user, dated, with sources. recall: facts matching query (since, until; with_time_use). "
+        "Memory, dated, with sources. recall: facts matching query (since, until; with_time_use). "
         "activity: time per app, site or page (group_by) in since..until. calls: calls and voice chats; "
         "call_timeline: one call (call:16) in timed stretches, words for exact words, who spoke. threads: their work "
         "threads (action, query, thread). before: what came before a moment or break (at, event, minutes). links: "
-        "pages open and links shared. people: a person (name), where they talk, the user's last messages to them. "
-        "skills: what Yuki can do."
+        "pages open and links shared. people: a person (name), where they talk, the user's last messages."
     ),
     "input_schema": _obj(
         {
             "kind": {"type": "string", "enum": list(MEMORY_KINDS)},
             "query": {"type": "string"},
-            "since": {"type": "string", "description": "Local ISO date or date-time."},
+            "since": {"type": "string", "description": "Local ISO date or time."},
             "until": {"type": "string"},
             "app": {"type": "string"},
             "with_time_use": {"type": "boolean"},
@@ -83,8 +83,7 @@ MEMORY_TOOL: dict[str, Any] = {
 
 FETCH_TOOL: dict[str, Any] = {
     "name": "fetch",
-    "description": "Read a web page (url) or a text file on this PC (path, from start_line) in the background; "
-                   "nothing opens.",
+    "description": "Read a web page (url) or a text file on this PC (path, from start_line) in the background.",
     "input_schema": _obj({"url": {"type": "string"}, "path": {"type": "string"},
                           "start_line": {"type": "integer"}}),
 }
@@ -100,11 +99,16 @@ REMEMBER_KINDS: dict[str, str] = {
     "rule": "remember_rule", "forget_rule": "forget_rule", "correct": "correct_memory", "todo": "todo",
     "watch": "watch_for", "answer": "answer_question", "usual": "keep_usual",
 }
+#: morning21 C4 (contract K4): the planner's memory writes: the shared ones and ``how``, a way they told Yuki they do
+#: something on this PC ("Twinkle Tray turns my monitors on and off"), kept as know-how at once (in force for the next
+#: request, before the conversation worker's pass restates it). The shared ``REMEMBER_TOOL`` (the ONE agent's block
+#: reuses it, within its own ceiling) stays as it was; the planner's block carries :data:`BRAIN_REMEMBER_TOOL`.
+BRAIN_REMEMBER_KINDS: dict[str, str] = {**REMEMBER_KINDS, "how": "remember_how"}
 
 REMEMBER_TOOL: dict[str, Any] = {
     "name": "remember",
     "description": (
-        "Keep what the user said, in their words. rule: a standing instruction (text). forget_rule: drop one (text: "
+        "Keep what they said, in their words. rule: a standing instruction (text). forget_rule: drop one (text: "
         "its id). correct: their correction of a fact. todo: action add|done|not_needed|wrong|list, text, due. watch: "
         "action add|list|cancel, condition, quote (their exact words), repeat, days, request. answer: their reply to "
         "Yuki's question (question, outcome, answer exactly). usual: text slot=option from the skill's result, answer "
@@ -129,6 +133,30 @@ REMEMBER_TOOL: dict[str, Any] = {
     ),
 }
 
+
+def _brain_tool(tool: Mapping[str, Any], *, kinds: Any, sentence: str,
+                extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """morning21 C2/C4: a shared tool as the planner's block carries it: its ``kind`` enum ``kinds``, ``sentence``
+    after its description, ``extra`` properties after ``text`` (or at the end). The shared one is never changed."""
+    schema = dict(tool["input_schema"])
+    props: dict[str, Any] = {}
+    for name, spec in dict(schema["properties"]).items():
+        props[name] = {**spec, "enum": list(kinds)} if name == "kind" else spec
+        if name == "text" and extra:
+            props.update(extra)
+    if extra and "text" not in props:
+        props.update(extra)
+    return {**dict(tool), "description": f"{tool['description']} {sentence}",
+            "input_schema": {**schema, "properties": props}}
+
+
+#: The planner's ``memory`` (morning21 C2: and ``knowhow``) and ``remember`` (C4: and ``how``) tools.
+BRAIN_MEMORY_TOOL: dict[str, Any] = _brain_tool(
+    MEMORY_TOOL, kinds=BRAIN_MEMORY_KINDS, sentence="knowhow: how it's done on this PC (query, app).")
+BRAIN_REMEMBER_TOOL: dict[str, Any] = _brain_tool(
+    REMEMBER_TOOL, kinds=BRAIN_REMEMBER_KINDS, sentence="how: how they do something on this PC (text, app).",
+    extra={"app": {"type": "string"}})
+
 #: The six tool names, in block order (the order is part of the cached prefix).
 TOOL_NAMES: tuple[str, ...] = (PLAN_TOOL, "look", "memory", "fetch", "ask_user", "remember")
 #: The tools whose result is text read from outside (fenced as untrusted data).
@@ -146,8 +174,8 @@ def plan_tool() -> dict[str, Any]:
 def tool_params(*, streamed: bool, eager: bool = True) -> list[dict[str, Any]]:
     """The ``tools`` parameter: the six tools, in a fixed order. ``eager_input_streaming`` on every tool only when the
     call is streamed and ``eager`` (a non-streamed call never carries it: design 10.2)."""
-    tools = [plan_tool(), dict(LOOK_TOOL), dict(MEMORY_TOOL), dict(FETCH_TOOL), dict(ASK_USER_TOOL),
-             dict(REMEMBER_TOOL)]
+    tools = [plan_tool(), dict(LOOK_TOOL), dict(BRAIN_MEMORY_TOOL), dict(FETCH_TOOL), dict(ASK_USER_TOOL),
+             dict(BRAIN_REMEMBER_TOOL)]
     if streamed and eager:
         for tool in tools:
             tool["eager_input_streaming"] = True
@@ -272,12 +300,14 @@ def run_memory(memory: Any, tool_input: Mapping[str, Any], *, words: str, nonce:
     started = time.perf_counter()
     args = _clean(tool_input)
     kind = str(args.pop("kind", "") or "")
-    if kind not in MEMORY_KINDS:
-        return ToolRun("memory", "memory", False, f"kind must be one of: {', '.join(MEMORY_KINDS)}")
+    if kind not in BRAIN_MEMORY_KINDS:
+        return ToolRun("memory", "memory", False, f"kind must be one of: {', '.join(BRAIN_MEMORY_KINDS)}")
     if kind == "skills":
         text = menu.strip() or "No skills are loaded; Yuki can still do things step by step."
         return ToolRun("memory", "skills", True, text, {"kind": "skills"}, {"kind": "skills"},
                        (time.perf_counter() - started) * 1000)
+    if kind == "knowhow":
+        return run_knowhow(memory, args, words=words, nonce=nonce, started=started)
     if kind == "people":
         name = str(args.get("name") or args.get("query") or "").strip()
         if not name:
@@ -295,6 +325,30 @@ def run_memory(memory: Any, tool_input: Mapping[str, Any], *, words: str, nonce:
         text = _fenced(text, source="the user's memory (captured screen text, chats, calls)", nonce=nonce)
     return ToolRun("memory", inner, ok, text, getattr(outcome, "payload", None), call,
                    (time.perf_counter() - started) * 1000, private=True)
+
+
+def run_knowhow(memory: Any, args: Mapping[str, Any], *, words: str, nonce: str,
+                started: float | None = None) -> ToolRun:
+    """morning21 C2: ``memory`` of kind ``knowhow``: how things are done on this PC nearest ``query`` (else their own
+    words) and ``app``, each marked taught, worked or failed (``yuki.brain.context.read_knowhow``: the brain's own read,
+    never MemoryAccess's tool, which has no such kind), fenced as memory's text. Used by the standalone tool and by a
+    plan's memory step (the executor). Never raises."""
+    from yuki.brain.context import KNOWHOW_TOOL_LINES, knowhow_text, read_knowhow
+
+    started = time.perf_counter() if started is None else started
+    query = " ".join(str(args.get("query") or "").split()) or " ".join(str(words or "").split())
+    app = " ".join(str(args.get("app") or "").split()) or None
+    try:
+        limit = max(1, min(KNOWHOW_TOOL_LINES, int(args.get("limit") or KNOWHOW_TOOL_LINES)))
+    except (TypeError, ValueError):
+        limit = KNOWHOW_TOOL_LINES
+    call = {"kind": "knowhow", **({"app": app} if app else {})}
+    lines = read_knowhow(memory, query, app=app, limit=limit, timeout_s=2.0)
+    ms = (time.perf_counter() - started) * 1000
+    if lines is None:
+        return ToolRun("memory", "knowhow", False, "Memory could not be read just now.", input=call, ms=ms)
+    text = knowhow_text(lines, nonce=nonce, limit=2000) or "Nothing kept about how that is done on this PC."
+    return ToolRun("memory", "knowhow", True, text, {"kind": "knowhow", "n": len(lines)}, call, ms, private=True)
 
 
 def run_fetch(dispatcher: Any, tool_input: Mapping[str, Any], *, nonce: str) -> ToolRun:
@@ -329,11 +383,13 @@ def run_remember(memory: Any, tool_input: Mapping[str, Any], *, words: str) -> T
     started = time.perf_counter()
     args = _clean(tool_input)
     kind = str(args.pop("kind", "") or "")
-    inner = REMEMBER_KINDS.get(kind)
+    inner = BRAIN_REMEMBER_KINDS.get(kind)
     if inner is None:
-        return ToolRun("remember", "remember", False, f"kind must be one of: {', '.join(REMEMBER_KINDS)}")
+        return ToolRun("remember", "remember", False, f"kind must be one of: {', '.join(BRAIN_REMEMBER_KINDS)}")
     if inner == "keep_usual":
         return _keep_usual(memory, args, words=words, started=started)
+    if inner == "remember_how":
+        return _remember_how(memory, args, words=words, started=started)
     keys = {"remember_rule": ("text",), "forget_rule": ("text",), "correct_memory": ("text",),
             "todo": ("action", "text", "due"),
             "watch_for": ("action", "condition", "quote", "repeat", "days", "request"),
@@ -346,6 +402,46 @@ def run_remember(memory: Any, tool_input: Mapping[str, Any], *, words: str) -> T
                        input=call)
     return ToolRun("remember", inner, bool(getattr(outcome, "ok", False)), outcome_text(outcome),
                    getattr(outcome, "payload", None), call, (time.perf_counter() - started) * 1000)
+
+
+#: morning21 C4: the know-how origin a way the user told Yuki is kept with (memory's own word, the conversation
+#: worker's ``taught``), when memory's ``remember_how`` takes one.
+HOW_ORIGIN = "taught"
+
+
+def _remember_how(memory: Any, args: Mapping[str, Any], *, words: str, started: float) -> ToolRun:
+    """morning21 C4 (contract K4): ``remember(how)``: a way they told Yuki they do something on this PC, kept as
+    know-how at once (``MemoryClient.remember_how``: a restatement supersedes the entry it restates), with origin
+    :data:`HOW_ORIGIN` when that method takes an origin (else memory's default), so the next request's how-block shows
+    it as taught. ``text``: the way in their words; ``app``: the app it is about, when they named one. Their words go
+    with it as its source request. Never raises."""
+    text = " ".join(str(args.get("text") or "").split())
+    app = " ".join(str(args.get("app") or "").split()) or None
+    call = {"text": text, **({"app": app} if app else {})}
+    if not text:
+        return ToolRun("remember", "remember_how", False, "how needs text: the way, in their words", input=call)
+    source = " ".join(str(words or "").split())[:600] or None
+
+    def go(client: Any) -> Any:
+        import inspect
+
+        keep = client.remember_how
+        try:
+            takes_origin = "origin" in inspect.signature(keep).parameters
+        except (TypeError, ValueError):
+            takes_origin = False
+        if takes_origin:
+            return keep(app, text, source_request=source, origin=HOW_ORIGIN)
+        return keep(app, text, source_request=source)
+
+    try:
+        row = memory.call("remember_how", go, timeout_s=3.0)
+    except Exception as exc:  # noqa: BLE001
+        return ToolRun("remember", "remember_how", False, f"Not saved ({type(exc).__name__}).", input=call,
+                       ms=(time.perf_counter() - started) * 1000)
+    where = f" for {app}" if app else ""
+    return ToolRun("remember", "remember_how", True, f"Kept{where}: Yuki does it this way from now on.",
+                   {"saved": True, "id": row}, call, (time.perf_counter() - started) * 1000)
 
 
 def _keep_usual(memory: Any, args: Mapping[str, Any], *, words: str, started: float) -> ToolRun:
@@ -369,7 +465,7 @@ def _keep_usual(memory: Any, args: Mapping[str, Any], *, words: str, started: fl
 
 
 __all__ = ["PLAN_DESCRIPTION", "LOOK_TOOL", "MEMORY_TOOL", "FETCH_TOOL", "ASK_USER_TOOL", "REMEMBER_TOOL",
-           "REMEMBER_KINDS", "TOOL_NAMES", "READ_TOOLS", "SCHEMA_CHARS", "plan_tool", "tool_params", "schema_chars",
-           "check_budget",
+           "REMEMBER_KINDS", "BRAIN_REMEMBER_KINDS", "BRAIN_MEMORY_TOOL", "BRAIN_REMEMBER_TOOL", "TOOL_NAMES",
+           "READ_TOOLS", "SCHEMA_CHARS", "plan_tool", "tool_params", "schema_chars", "check_budget",
            "LOOK_DISPATCH", "PRIVATE_READS", "ToolRun", "outcome_text", "run_look", "run_memory", "run_fetch",
-           "run_remember"]
+           "run_remember", "run_knowhow", "HOW_ORIGIN"]

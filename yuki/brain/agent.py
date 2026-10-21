@@ -60,6 +60,8 @@ from yuki.brain.context import (
     load_catalog,
     look_report,
     one_line,
+    part_open_line,
+    part_open_report,
     part_rest_report,
     read_card,
     read_menu,
@@ -71,6 +73,7 @@ from yuki.brain.context import (
     seed_block,
     seed_memory,
     sends_fn,
+    shell_output_report,
     step_report,
     steer_blocks,
     swap_blocks,
@@ -243,6 +246,10 @@ QUESTION_PART_CALLS = 2
 #: again). The turn is exactly one model call (whatever comes back ends it); it adds TIDY_CALLS to the act budget
 #: (code's question). No flag: no turn, no cost.
 TIDY_CALLS = 1
+#: morning21 C7: the turns one request gets at an ending to name a part left open (:meth:`Brain._open_part_turn`),
+#: and the model calls each adds to the act budget (code's question, never the planner's spending).
+PART_OPENS_MAX = 1
+PART_OPEN_CALLS = 2
 #: The read verbs whose results are content for the user (a look reads the screen to check or to find a control).
 #: desk22 (A13): a ``keep_way`` step's result (code's line on what was kept) is answered from too.
 ANSWER_READ_VERBS: frozenset[str] = frozenset({"memory", "fetch", "keep_way"})
@@ -321,6 +328,10 @@ class _State:
     #: Cut-off responses so far, and the output ceiling now in force (0: the setting's).
     cutoffs: int = 0
     max_tokens: int = 0
+    #: morning21 C6: a broken stream (a tool input the SDK could not parse) is asked again without eager input
+    #: streaming for the rest of the request (21 Oct: two broken eager streams in a row ended "I couldn't work that
+    #: out."). A max_tokens cut-off keeps it.
+    no_eager: bool = False
     verdict: bool | None = None
     probe: str = ""
     check_calls: int = 0
@@ -359,6 +370,13 @@ class _State:
     #: question) there were when the last plan began; words added since mean the user spoke after it (a steer folded
     #: into its report, an answer), and :func:`text_back` then leaves their reply to the planner's reading of them.
     plan_words: int = 0
+    #: morning21 C7: the request's parts (a ``run_skill`` step's capability, by family) whose run did not get there and
+    #: that no later plan of this request has a step for yet: ``{family: {"n", "skill", "why", "app"}}`` (code facts:
+    #: the part's place among the plan's capability steps, the outcome's code word, the app slot it was given); the
+    #: turns code gave at an ending to name one (:data:`PART_OPENS_MAX`), and the ending such a turn holds.
+    open_parts: dict[str, dict[str, str]] = field(default_factory=dict)
+    part_opens: int = 0
+    open_held: tuple[str, dict[str, Any]] | None = None
 
 
 class _NoticeSink:
@@ -874,9 +892,10 @@ class Brain:
         bs = BrainSettings.read(self.settings)
         names = list(getattr(self.settings, "user_names", []) or [])
         card = read_card(self.memory)
-        brief, rules = read_profile_parts(self.memory)
+        brief, rules, resources = read_profile_parts(self.memory, with_resources=True)
         # the same bytes as the request's breakpoint 2 and 3 (context.gather composes them the same way)
-        profile = profile_text(names=names, brief=None if card else brief, rules=rules, limit=bs.profile_chars)
+        profile = profile_text(names=names, brief=None if card else brief, rules=rules, limit=bs.profile_chars,
+                               resources=resources)
         menu, _lines, _keys = read_menu(self.memory, self.settings, limit=bs.menu_chars)
         params = build_params(model=bs.model, max_tokens=1, system=system_blocks(profile, menu),
                               messages=[{"role": "user", "content": [{"type": "text", "text": WARM_TEXT}]}],
@@ -1718,7 +1737,8 @@ class Brain:
                         overview_chars=len(gathered.overview), you_chars=len(gathered.you),
                         people_chars=len(gathered.people), profile_chars=len(gathered.profile),
                         menu_chars=len(gathered.menu), skills=len(gathered.skill_keys or ()),
-                        card_chars=len(gathered.card), understanding=req.understanding is not None,
+                        card_chars=len(gathered.card), knowhow_chars=len(gathered.knowhow),
+                        understanding=req.understanding is not None,
                         private_read=state.private_read, gather_ms=round(self._gather_ms, 1),
                         parts_ms=gathered.parts_ms)
         host.nonce = nonce
@@ -1757,7 +1777,7 @@ class Brain:
             return state.calls < (bs.act_calls + state.part_rests * PART_REST_CALLS
                                   + state.text_backs * TEXT_BACK_CALLS + state.answer_parts * ANSWER_PART_CALLS
                                   + state.question_parts * QUESTION_PART_CALLS
-                                  + int(state.tidied) * TIDY_CALLS)
+                                  + int(state.tidied) * TIDY_CALLS + state.part_opens * PART_OPEN_CALLS)
         work_s = time.monotonic() - req.started - self._waited_s
         return state.calls < bs.answer_calls and work_s < bs.answer_s
 
@@ -1779,7 +1799,7 @@ class Brain:
                             words=tuple(host.user_words), text_bounced=state.text_bounced)
             params = build_params(model=bs.model, max_tokens=state.max_tokens or bs.max_tokens, system=system,
                                   messages=conv.messages(), effort=effort, thinking_display=bs.thinking_display,
-                                  stream=bs.stream, eager=bs.eager)
+                                  stream=bs.stream, eager=bs.eager and not state.no_eager)
             # no step is said as it streams (aBrain, phase 2.3: the executor says a slow one in the goal's words)
             call = ModelCall(self.client, params, checks=checks, emit=self._push, cancelled=self._cancelled.is_set,
                              log=self.logger.log, stream=bs.stream)
@@ -1850,8 +1870,12 @@ class Brain:
         source = call.plan
         taken = source.taken if source is not None else 0
         ran = taken > 0 or (result is not None and _acted(result))
+        if resp.broken:
+            # morning21 C6: the SDK could not read a streamed tool input: asked again with the input sent whole
+            # (eager input streaming off for the rest of this request); a max_tokens cut-off only gets more room
+            state.no_eager = True
         self.logger.log("brain_reissue", why="broken" if resp.broken else "max_tokens", acted=state.acted, ran=ran,
-                        taken=taken, n=state.cutoffs)
+                        taken=taken, n=state.cutoffs, eager=bool(bs.eager and not state.no_eager))
         if ran:
             plan = source.plan if source is not None else None
             if plan is not None:
@@ -2095,7 +2119,9 @@ class Brain:
         found = getattr(got, "done", None)
         base: dict[str, Any] = {
             "statuses": [_step_status(s) for s in raw], "reads": reads,
-            "acted": any(getattr(s, "tool", "") and getattr(s, "verb", "") in ACT_VERBS for s in raw),
+            # morning21 C5: a command the commit check judged to change nothing is a read, never an act
+            "acted": any(getattr(s, "tool", "") and getattr(s, "verb", "") in ACT_VERBS and not shell_read(s)
+                         for s in raw),
             "verdict": getattr(found, "verdict", None) if found is not None else None,
             "probe": str(getattr(found, "probe", "") or "") if found is not None else "",
             "line": str(getattr(got, "line", "") or ""), "check_calls": checks,
@@ -2235,6 +2261,7 @@ class Brain:
             state.current = plan
         state.last = result
         status = result.status
+        close_parts(plan, state, result)   # morning21 C7: a plan that ran an open part's step (or asked) closes it
         if status != "read":
             state.held = None   # an act plan ran after a held ending: its own result decides now (reads don't)
         if status == "done" and not result.line:
@@ -2277,6 +2304,9 @@ class Brain:
                 state.held = (line, outcome) if state.acted else None
                 self.logger.log("brain_look_only", n=state.look_backs, reads=len(result.reads),
                                 probe=result.probe or None, acted=state.acted)
+                if any(shell_read(s) for s in result.statuses):
+                    # morning21 C5: a command that only read: its output goes back like a look's
+                    self.logger.log("brain_read_back", why="effect_none", reads=len(result.reads))
                 conv.add_user([tool_result(tool_id, look_report(result, plan)), *extra, *self._steer_turn(host)])
                 return False
             if (status == "unconfirmed" and result.unconfirmed_skill and not state.retried_unconfirmed
@@ -2317,6 +2347,21 @@ class Brain:
                 self.logger.log("brain_done_part", n=state.part_rests, reads=len(result.reads),
                                 probe=result.probe or None)
                 conv.add_user([tool_result(tool_id, part_rest_report(result, plan, line)), *extra,
+                               *self._steer_turn(host)])
+                return False
+            if self._open_part_turn(result, plan, line, outcome, status, state, bs, conv, extra, host, tool_id,
+                                    sent=sent):
+                return False
+            if (shell_ending(plan, result, status) and state.answer_parts < ANSWER_PARTS_MAX
+                    and not self._cancelled.is_set() and self._budget_left(state, bs, self._req)):
+                # morning21 C5: the plan ended not confirmed on a command that ran: what it printed goes back once (its
+                # line is held); the planner adds a probe or a revise step, answers from it, or gives the one done
+                # word (the held line stands); never a done sentence of its own (code's line comes first)
+                state.answer_parts += 1
+                state.held = state.answer_held = (line, outcome)
+                state.answer_act = (result, plan)
+                self.logger.log("brain_read_back", why="ending_output", reads=len(result.reads), status=status)
+                conv.add_user([tool_result(tool_id, shell_output_report(result, plan, line)), *extra,
                                *self._steer_turn(host)])
                 return False
             if (answer_due(plan, result, status) and state.answer_parts < ANSWER_PARTS_MAX
@@ -2398,9 +2443,36 @@ class Brain:
                                 hint=self._seed_hint(result.seed))
             if seeded:
                 blocks.append({"type": "text", "text": seeded})
+        if status in ("mismatch", "refused", "error"):
+            part = open_part(plan, result, state)
+            if part is not None:
+                # morning21 C7: the replan input names the part that run left open (its code word, the app it needs)
+                self.logger.log("part_open", n=int(part.get("n") or 1), when="replan", app=bool(part.get("app")))
+                blocks.append({"type": "text", "text": part_open_line(part)})
         conv.add_user([tool_result(tool_id, step_report(result, plan, limit=bs.result_chars, replans_left=left)),
                        *extra, *blocks, *self._steer_turn(host)])
         return False
+
+    def _open_part_turn(self, result: ExecResult, plan: Plan | None, line: str, outcome: dict[str, Any], status: str,
+                        state: _State, bs: BrainSettings, conv: Conversation, extra: list[dict[str, Any]], host: Host,
+                        tool_id: str, *, sent: bool) -> bool:
+        """morning21 C7: an act plan ended (done or not confirmed) while a part of the request is still open (a
+        capability step of an earlier plan did not get there and no plan since had a step for it, nor asked): its line
+        is held and the planner gets one turn (:data:`PART_OPENS_MAX`) to do that part, ask, or say in one short line
+        which part can't be done and why (said after code's line, the ending then partial). Never on a send or a join
+        (consent's own line stands alone). ``True`` when the turn was given. Code facts only."""
+        part = next(iter(state.open_parts.values()), None)
+        if (part is None or status not in ("done", "unconfirmed") or sent or result.asks or self._consent_lined(plan)
+                or state.part_opens >= PART_OPENS_MAX or self._cancelled.is_set()
+                or not self._budget_left(state, bs, self._req)):
+            return False
+        state.part_opens += 1
+        state.held = state.answer_held = state.open_held = (line, outcome)
+        state.answer_act = (result, plan)   # the held act's tidy step still follows its line (as the answer turn's)
+        self.logger.log("part_open", n=int(part.get("n") or 1), when="ending", app=bool(part.get("app")),
+                        status=status)
+        conv.add_user([tool_result(tool_id, part_open_report(plan, line, part)), *extra, *self._steer_turn(host)])
+        return True
 
     # -- the look after acting (P1.3) ---------------------------------------------------------------------------------
 
@@ -2576,6 +2648,9 @@ class Brain:
             run = ToolRun("ask_user", "ask_user", answer is not None, answer_report(question, answer))
         elif name == "remember":
             run = run_remember(self.memory, tool_input, words=words)
+            if str(tool_input.get("kind") or "") == "how":
+                # morning21 C4 (K4): a way they told Yuki, kept as know-how at once (content-free)
+                self.logger.log("remember", kind="how", ok=run.ok, app=bool(run.input.get("app")))
         else:
             run = ToolRun(name, name, False, f"No tool {name!r}: use plan, look, memory, fetch, ask_user or remember.")
         if name != "ask_user":
@@ -2724,6 +2799,12 @@ class Brain:
             # kw2 (K1): the answer is said last, so its own mark decides; with none, the held line's own stands
             outcome = (_awaiting({**dict(held_outcome or {}), "line": line}, marked) if answer
                        else dict(held_outcome or {}))
+            if answer and state.held is state.open_held:
+                # morning21 C7: the planner said which part could not be done and why (after code's line): the
+                # request ends partial, never as all done
+                outcome.update(level="failed", label=LEVEL_LABELS["failed"], partial=True,
+                               open=max(1, int(outcome.get("open") or 0)))
+                self.logger.log("part_open", when="said", chars=len(answer))
             # kw2 review M1 (tidy21, the user's decision 1): the held act's own after-look still decides the tidy
             # step, as when no answer turn is given: code takes the measured step (or says its flag line) after the
             # line and the answer, else the planner's one tidy-up turn. Code facts only (the act's report)
@@ -3039,9 +3120,15 @@ class Brain:
 
         try:
             state = self._state or _State()
-            actions = []
-            if state.current is not None and state.current.kind == "act":
-                actions = [f"{s.verb}" for s in state.current.steps]
+            executor = getattr(self, "_executor", None)
+            trace = getattr(executor, "trace", None) if executor is not None and getattr(
+                executor, "host", None) is self._host_ref else None
+            # morning21 C11 (contract K8): each act step with what became of it ("click refused (join rule)", "click
+            # ok", "click unverified"), from the executor's trace of the whole request; never the planned verbs alone
+            # ("Yuki did: click; click." for two clicks the join rule refused before they ran)
+            actions = turn_actions(trace) if trace is not None else []
+            if trace is None and state.current is not None and state.current.kind == "act":
+                actions = status_actions(state.current, state.last)
             queued = log_turn(request_id=f"{self.lane}-{req.number}", at=req.epoch, user_text=req.shown,
                               reply_text=reply, actions=actions, outcome=outcome, on_done=done)
             self.logger.log("memory_turn_queued", queued=bool(queued), outcome=outcome, reply_chars=len(reply))
@@ -3292,16 +3379,167 @@ def question_part_report(plan: Plan | None, line: str) -> str:
 
 def look_only(plan: Plan | None, result: ExecResult) -> bool:
     """An act plan whose every step only reads (look, memory, fetch, wait), so nothing of it acted (sBrainFix, F9): its
-    check reading nothing is not the end of the request. Code facts only (the closed verb lists, the step states)."""
+    check reading nothing is not the end of the request. morning21 C5: a ``run_powershell`` the commit check judged
+    ``effect none`` (:func:`shell_read`) is such a read: what it printed goes back to the planner (21 Oct: "which
+    brightness app is in my taskbar" ended "Worked on your PC" and the script's findings were thrown away). Code facts
+    only (the closed verb lists, the step states, the check's effect word)."""
     if plan is None or plan.kind != "act" or not plan.steps or plan.skill:
         return False
-    return all(s.verb not in ACT_VERBS for s in plan.steps) and not _acted(result)
+    reads = {s.index for s in result.statuses if shell_read(s)}
+    return all(s.verb not in ACT_VERBS or i in reads for i, s in enumerate(plan.steps)) and not _acted(result)
+
+
+def shell_ending(plan: Plan | None, result: ExecResult, status: str) -> bool:
+    """morning21 C5: an act plan (no skill route, no send or join) that ended not confirmed on a ``run_powershell`` step
+    that ran, whose output came back: what the command printed is the only evidence of what happened, so it goes back
+    to the planner once (:func:`yuki.brain.context.shell_output_report`); that turn may add a probe or a revise step,
+    or answer from it, never write a done sentence. Code facts only (the plan's verbs, its status, the step states,
+    whether reads came back)."""
+    if plan is None or plan.kind != "act" or plan.skill or status != "unconfirmed" or not result.reads:
+        return False
+    if plan.consent.commit in ("send", "join"):
+        return False
+    acts = [s for s in result.statuses if s.verb in ACT_VERBS and s.state != "not_run"]
+    return bool(acts) and acts[-1].verb == "run_powershell" and acts[-1].state == "ok"
+
+
+#: morning21 C7: a capability step's outcomes that leave no part open for the planner to carry: a hand-off (the next
+#: plan is seeded with it and does it by steps) and an open "whom" (the planner asks whom: its own report says so).
+PART_NOT_OPEN: frozenset[str] = frozenset({"handed_over", "who_open"})
+
+
+def part_app(key: Any, slots: Mapping[str, Any] | None) -> str:
+    """The app a capability step was given (its slots of type app or role means, as the plan wrote them), ``""`` when
+    none: what an open part needs open. Code facts only (the catalog's slot types); never raises."""
+    try:
+        from yuki.brain import util as _util
+
+        sk = _util.skill(str(key or ""))
+        names = [one_line(slots.get(s.name), 40) for s in getattr(sk, "slots", ()) or ()
+                 if (getattr(s, "type", "") == "app" or getattr(s, "role", "") == "means")
+                 and isinstance((slots or {}).get(s.name), str) and str(slots.get(s.name)).strip()]
+        return ", ".join(n for n in names if n)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def open_part(plan: Plan | None, result: ExecResult, state: _State) -> dict[str, str] | None:
+    """morning21 C7: the part a plan's ``run_skill`` step left open when it stopped there (mismatch, a refusal that
+    comes back, an error; never a hand-off or an open "whom": :data:`PART_NOT_OPEN`): kept in ``state.open_parts`` by
+    its capability's family, with its place among the plan's capability steps (one per part, in their order), the
+    outcome's code word and the app it was given. ``None`` when the step that stopped is no capability's. Code facts
+    only; never raises."""
+    try:
+        if plan is None or not isinstance(result.step, int) or not 0 <= result.step < len(plan.steps):
+            return None
+        if result.seed or str(result.reason or "") in PART_NOT_OPEN:
+            return None
+        got = plan.steps[result.step].skill_call(plan.skill)
+        if got is None:
+            return None
+        key, slots = got
+        family = skill_family(key) or str(key)
+        n = 1 + sum(1 for s in plan.steps[:result.step] if s.verb == "run_skill")
+        part = {"n": str(n), "skill": family, "why": one_line(result.reason or result.status, 40),
+                "app": part_app(key, slots)}
+        state.open_parts[family] = part
+        return part
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def close_parts(plan: Plan | None, state: _State, result: ExecResult | None = None) -> None:
+    """morning21 C7: a plan whose step ran an open part's capability again (any values; ``result``: only a step that
+    ran counts), or that asks them (kind ask), closes it. Code facts only."""
+    if plan is None or not state.open_parts:
+        return
+    if plan.kind == "ask":
+        state.open_parts.clear()
+        return
+    ran = None if result is None else {s.index for s in result.statuses if s.state != "not_run"}
+    for index, step in enumerate(plan.steps):
+        got = step.skill_call(plan.skill)
+        if got is not None and (ran is None or index in ran):
+            state.open_parts.pop(skill_family(got[0]) or str(got[0]), None)
 
 
 def _acted(result: ExecResult) -> bool:
     """Whether a plan's run did something on the PC: the executor says so, or an act step's status shows it ran (so a
-    model's text after non-committing steps is never taken as the final word)."""
-    return bool(result.acted) or any(s.verb in ACT_VERBS and s.state in ACTED_STATES for s in result.statuses)
+    model's text after non-committing steps is never taken as the final word). morning21 C5: a command the commit
+    check judged to change nothing (:func:`shell_read`) is a read here, never an act."""
+    return bool(result.acted) or any(s.verb in ACT_VERBS and s.state in ACTED_STATES and not shell_read(s)
+                                     for s in result.statuses)
+
+
+def shell_read(status: Any) -> bool:
+    """morning21 C5: a ``run_powershell`` step that ran and that the commit check judged ``effect none`` (it only
+    reads): its output is what it was for, so it goes back to the planner like a look's. Code facts only (the verb, the
+    step's state, the check's effect word)."""
+    return (str(getattr(status, "verb", "") or "") == "run_powershell" and str(getattr(status, "state", "")) == "ok"
+            and str(getattr(status, "effect", "") or "") == "none")
+
+
+#: morning21 C11 (contract K8): how a refused step's code word is said in the turn log ("click refused (join rule)"),
+#: by the consent rule's own code-word families; any other refusal is Yuki's check.
+REFUSED_WORDS: tuple[tuple[str, str], ...] = (("join", "join rule"), ("game", "game in front"),
+                                              ("act_off", "Act switch off"), ("blocked", "Yuki's check"))
+#: The most step lines one turn log entry carries (the newest kept).
+TURN_ACTIONS_MAX = 12
+
+
+def _refused_said(why: Any) -> str:
+    code = str(why or "").partition("refused:")[2].strip() or str(why or "").strip()
+    for prefix, said in REFUSED_WORDS:
+        if code.startswith(prefix):
+            return said
+    return "Yuki's check"
+
+
+def turn_actions(trace: Sequence[Mapping[str, Any]] | None) -> list[str]:
+    """morning21 C11 (K8): the request's act steps for memory's turn log, each with what became of it: ``<tool> ok``
+    (its own check saw it), ``<tool> unverified`` (it ran, nothing could tell), ``<tool> failed``, ``<tool> refused
+    (<rule>)`` (it never ran), ``<tool> declined`` (they said no), ``<tool> not run``. A capability's step carries its
+    id (``run_skill browser.site_tab ok``). From the executor's trace of every plan of the request (code facts: the
+    Dispatcher's tool names, the verdicts, the refusal code words); reads are not listed. Never raises."""
+    out: list[str] = []
+    for s in trace or ():
+        if not isinstance(s, Mapping):
+            continue
+        kind = str(s.get("kind") or "")
+        tool = str(s.get("tool") or "")
+        if kind not in ("action", "control", "ask") or not tool:
+            continue
+        given = s.get("input") if isinstance(s.get("input"), Mapping) else {}
+        if tool == "run_skill" and str(given.get("skill") or "").strip():
+            tool = f"run_skill {one_line(given.get('skill'), 60)}"
+        if s.get("refused"):
+            label = f"refused ({_refused_said(s.get('why'))})"
+        elif kind == "ask":
+            label = "declined" if s.get("verdict") is False else "asked"
+        elif kind == "control":
+            label = "not run"
+        elif s.get("ok") is False or s.get("verdict") is False:
+            label = "failed"
+        elif s.get("verdict") is True:
+            label = "ok"
+        else:
+            label = "unverified"
+        out.append(f"{tool} {label}")
+    return out[-TURN_ACTIONS_MAX:]
+
+
+#: morning21 C11: a plan step's state as said in the turn log when no executor trace is there.
+STATE_WORDS: dict[str, str] = {"ok": "ran", "mismatch": "did not match", "failed": "failed", "refused": "refused",
+                               "drafted": "drafted", "asked": "asked", "skipped": "not run", "not_run": "not run"}
+
+
+def status_actions(plan: Plan | None, last: ExecResult | None) -> list[str]:
+    """The current plan's act steps with their states (no executor trace: a lane without hands). Never raises."""
+    if plan is None:
+        return []
+    states = {s.index: s.state for s in (last.statuses if last is not None else ())}
+    return [f"{s.verb} {STATE_WORDS.get(states.get(i, 'not_run'), 'not run')}" for i, s in enumerate(plan.steps)
+            if s.verb in ACT_VERBS][-TURN_ACTIONS_MAX:]
 
 
 def _step_status(s: Any) -> StepStatus:
@@ -3324,7 +3562,7 @@ def _step_status(s: Any) -> StepStatus:
         state, note = "skipped", "the user said no"
     elif state not in STEP_STATES:
         state = "failed"
-    return StepStatus(index, verb, state, note)
+    return StepStatus(index, verb, state, note, effect=str(getattr(s, "effect", "") or ""))
 
 
 def _as_result(got: Any) -> ExecResult:
@@ -3359,4 +3597,5 @@ __all__ = ["Brain", "Host", "CANCELLED", "WITHDRAWN", "PARKED", "PAUSE_STOP_LINE
            "LOOK_BACKS_MAX", "OBSERVE_LEVELS", "OBSERVE_ACTED_LEVELS", "PART_RESTS_MAX", "PART_REST_CALLS",
            "rest_done_reply", "LINE_REST_UNDONE", "answer_due", "ANSWER_PARTS_MAX", "ANSWER_PART_CALLS",
            "question_due", "question_part_report", "QUESTION_PART_CALLS", "SEND_HOLD", "SEND_GO_ON",
-           "SEND_PAUSE_MAX_S"]
+           "SEND_PAUSE_MAX_S", "shell_read", "shell_ending", "open_part", "close_parts", "part_app", "PART_OPENS_MAX",
+           "PART_OPEN_CALLS", "turn_actions", "status_actions"]
