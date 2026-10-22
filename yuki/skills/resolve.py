@@ -239,6 +239,10 @@ class Plan:
     #: (where its value came from), ``how`` (:data:`PERSON_HOWS`), and counts: ``people`` the name names as written,
     #: ``dms`` their direct-message routes, ``threads`` those routes' capture thread ids. ``{}`` with no person slot.
     person: dict[str, Any] = field(default_factory=dict)
+    #: integ30 (F2): the site page item this plan swapped for one of the user's own names
+    #: (:func:`yuki.skills.web_route.site_page`'s ``"value"``): ``(the value given, squashed; the digest of the
+    #: words)``, for the engine to note once its run put the page on (``web_route.note_page_swap``). RAM only.
+    page_swap: tuple[str, str] | None = None
 
     @property
     def kind(self) -> str:
@@ -381,6 +385,8 @@ def _site_page_given(skill: Skill, given: Mapping[str, Any], words: Sequence[str
         box["slot"] = item_slot
         if how:
             box["how"] = str(how)
+        if how == "value" and isinstance(miss.get("swap"), tuple):
+            box["swap"] = miss["swap"]   # integ30 (F2): the engine notes it once its run put the page on
         if isinstance(miss.get("why"), str) and not item:
             box["miss"] = str(miss["why"])
     out: dict[str, Any] = {}
@@ -2251,14 +2257,17 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                         names_miss.setdefault(slot.name, "not_theirs")
                 elif not src and not _caller_word(given_from, slot.name) and (
                         (skill.bind.get(slot.name) == SITE_BIND and theirs)
-                        or (slot.type == "app" and _own_app(reading, store=store, until=until))):
+                        or (slot.type == "app" and slot.say and _own_app(reading, store=store, until=until))):
                     # lb B3 (final-H2 p24_misheard_excalidraw, both brains: "Excalidraw.com is up in Google Chrome, if
                     # that's what you meant." - the model sent no ``from`` in 0 of 4 calls; an optional tag is not
                     # sent): as the entity path already does (an untagged listed name is their word), an untagged value
                     # that is by identity one of their own known sites (``_known_site``; a site code measured by sound
                     # set ``src`` above) or programs (``_own_app``), on this undoable run, for a slot that is no person
                     # (``undoable``), is their word: no hedge, the user's 19 Oct decision. The done line names it as it
-                    # names any value. A caller's ``card`` (or any other word) and code's own fills stay named guesses
+                    # names any value. A caller's ``card`` (or any other word) and code's own fills stay named guesses.
+                    # integ30 (F3): a program only for an app slot with its own ``say`` (web's "in {browser}"), so the
+                    # line names it; one with none (the message capability's chat app: its driver's line leaves a given
+                    # app out) keeps an untagged program a named guess ("I took that as WhatsApp."), as before lb B3
                     src = FROM_WORDS
                     names_how.setdefault(slot.name, NAMES_HOW_OWN)
                     names_miss.pop(slot.name, None)
@@ -2386,7 +2395,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 dropped=dropped, game=live.game, ask_keep=None if once else ask_keep,
                 handoff=skill.handoff and not live.game,
                 sources=origin, measured=measured, names_how=names_how, names_miss=names_miss,
-                person=_person_plan(skill, values, origin, person_how, dropped, store))
+                person=_person_plan(skill, values, origin, person_how, dropped, store),
+                page_swap=page_box.get("swap") if isinstance(page_box.get("swap"), tuple) else None)
 
 
 def _title(app: str) -> str:

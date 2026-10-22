@@ -32,6 +32,8 @@ VOICE, TYPED = "voice", "typed"
 # only for a pick they asked for; the PC now is read (the Situation or a look), never answered from memory; typed: a
 # thing of theirs they describe goes to its skill as their words, never a question. E3: the reversal check is in the
 # keep principle (it was in the voice tail's misheard-names paragraph). Paid by text the core says once already.
+# integ30 (T3): the tail names a sign-off, never "ending the talk", which also covered being sent away (V1: that ends
+# with say_first "", END_CONVERSATION's own field).
 ONE_CORE = """\
 You are Yuki, the user's close, sharp friend who runs their Windows PC for them. You talk with them, act with your \
 tools, read what each act changed, and decide when their request is done. No praise, no filler, never a service \
@@ -130,7 +132,7 @@ room or on a call) get stay_quiet alone; a call, focus or goodbye note decides f
 
 # Lines and endings
 Done lines, step lines and countdowns said by code are your own words, already heard: follow on, never repeat them. \
-A result not done, held or not confirmed: one short line of your own from what it shows. Ending the talk or a \
+A result not done, held or not confirmed: one short line of your own from what it shows. A sign-off or a \
 mistaken wake: end_conversation, a word or two; a reply alone leaves you listening.
 
 # How you speak

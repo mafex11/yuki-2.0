@@ -561,7 +561,9 @@ def test_rules(conn: sqlite3.Connection, known: Sequence[tuple[float, float]] | 
       desktop and the user said nothing to Yuki. Conservative: a real exchange anywhere in that stretch keeps every
       rule written in the span, a rule a correction rewrote keeps its first ``valid_from`` (outside the span), and
       only rules written before :data:`SPAN_RULE_BEFORE` are judged so (after it, a rule with no stamp is one typed in
-      the Yuki window, never a test's).
+      the Yuki window, never a test's). integ30 (S5): the span is judged from its first test turn on (the stored span
+      less its :data:`SPAN_PAD_S` lead: a test's remember is written after the turn that asked for it, which is dated
+      at its opening), so a rule the user typed in the Yuki window just before a test began is never taken for it.
 
     Read-only; content-free; ``{}`` on an older database."""
     out: dict[int, str] = {}
@@ -574,7 +576,8 @@ def test_rules(conn: sqlite3.Connection, known: Sequence[tuple[float, float]] | 
                 " WHERE f.kind = ? AND f.origin = ? AND b.purpose = ? AND b.session_id >= ? AND b.session_id < ?",
                 (REMEMBERED_KIND, REMEMBERED_ORIGIN, REMEMBER_PURPOSE, lo, hi)).fetchall():
             out[int(fid)] = "session"
-    spans = list(known_spans(conn) if known is None else known)
+    # integ30 (S5): from each span's first test turn (its padded lead off), to its padded end
+    spans = [(a + SPAN_PAD_S, b) for a, b in (known_spans(conn) if known is None else known) if a + SPAN_PAD_S <= b]
     if not spans or not _has(conn, "conversation_turns", "session_id"):
         return out
     cond, params = _in_spans("valid_from", spans)

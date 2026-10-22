@@ -3786,6 +3786,17 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         except Exception:  # noqa: BLE001 - the offer is extra; the run goes on without it
             pending = None
     result = run(resolved, ctx)
+    if isinstance(resolved, Plan) and getattr(resolved, "page_swap", None) \
+            and result.outcome not in NOT_RAN_OUTCOMES | NOTHING_ON_OUTCOMES:
+        # integ30 (F2): a site page item swapped for one of the user's own names is noted here, in the engine's own
+        # thread, once its run put something on (they may have seen it): the same value given again is their
+        # correction. A resolve abandoned past its wait, or a run that put nothing on, never marks one
+        try:
+            from yuki.skills.web_route import note_page_swap
+
+            note_page_swap(resolved.page_swap)
+        except Exception:  # noqa: BLE001
+            pass
     if isinstance(resolved, Plan) and resolved.guessed and result.outcome not in (
             "asked", "held_game", HELD_CALL, HELD_BLOCKED, "refused"):
         _note_guesses(resolved)      # Phase 2.1: "not that" next takes another, never this one again

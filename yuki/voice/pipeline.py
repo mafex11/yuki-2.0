@@ -6556,6 +6556,7 @@ class OneVoice:
             names = [n for g in self._turn_groups() if g is not group for n in g.names.values()]
             if not any(one_kind(n) in ("act", "write") for n in names):
                 self._stop_refused = self._quiet_refused = True
+                self._words_for_yuki()
                 return "stopped_send"
         if self.rounds < 2:
             if group.spoke:
@@ -6567,6 +6568,7 @@ class OneVoice:
             if self._follow_on():
                 # gc (final-G2 C2): their words follow Yuki's own heard line (kw_offer_then_yes t2)
                 self._quiet_refused = True
+                self._words_for_yuki()
                 return "follow_on"
             return ""
         names = [n for g in self._turn_groups() if g is not group for n in g.names.values()]
@@ -6576,6 +6578,18 @@ class OneVoice:
             return ""
         self._quiet_refused = True
         return "read_unanswered"
+
+    def _words_for_yuki(self) -> None:
+        """integ30 (T1): a quiet refused on the user's words (``stopped_send``, ``follow_on``) marks the observer's open
+        user turn as integration F4 marks S10's (``quiet_refused``): its answer comes in a turn of its own, and memory
+        never files their words as said to someone else. Only the user's own turn (a later round's open turn may be a
+        result turn). State only; never raises."""
+        try:
+            turn = getattr(getattr(self.c, "observer", None), "turn", None)
+            if turn is not None and getattr(turn, "trigger", None) == "user":
+                turn.quiet_refused = True
+        except Exception:  # noqa: BLE001
+            pass
 
     def _follow_on(self) -> bool:
         """gc (final-G2 C2): this user turn's words follow Yuki's own line. Words of Yuki's left the speaker in this
@@ -8786,9 +8800,12 @@ class Conversation:
         # integ23 S2: asked while an "all" send counts down, it has a stop part newer words never void (``stop``), for
         # the sends open now only (``sends``: never one opened since); under one their final words end its countdown;
         # la A3: whether nothing of Yuki's had been heard in this conversation when these words were judged (``fresh``:
-        # an end after a reply's words never acts on such words, :meth:`_route_end_reply`)
+        # an end after a reply's words never acts on such words, :meth:`_route_end_reply`); integ30 (S3): whether
+        # recognition was unsure of the words judged (``unsure``, the hand-off's own measured test above: an end after
+        # a reply's words never acts on such words either)
         state = {"handoff": handoff, "ends": ends, "stop": False, "to": None, "sends": None,
-                 "start": float(getattr(self.observer, "_user_started_at", 0.0) or 0.0), "fresh": fresh}
+                 "start": float(getattr(self.observer, "_user_started_at", 0.0) or 0.0), "fresh": fresh,
+                 "unsure": bool(self.observer.heard and not getattr(self.observer, "heard_plain", False))}
         counting = getattr(self.bridge, "counting_sends", None)
         if sending and callable(counting) and getattr(self, "one_driver", None) is None:
             state["sends"] = counting()
@@ -9100,13 +9117,16 @@ class Conversation:
         (``turn.quiet``: a stay_quiet call or a quiet marker): the two judgements agree. la A3 (final-H2
         kw_dismiss_after_answer: "Anytime." with no call, the end skipped as ``replied`` and the conversation left
         open): :data:`ROUTE_END_AFTER_WORDS` when that reply has words of its own and no call but stay_quiet, on words
-        that came after a line of Yuki's was heard (the decision's ``fresh``, and never S10's first words): the end
-        acts once those words were heard (:meth:`_route_end_after_words`). The reply's words are never the block. Else
+        that came after a line of Yuki's was heard (the decision's ``fresh``, and never S10's first words) and that
+        recognition was sure of (integ30 S3: the decision's ``unsure``, or the final turn's own ``heard_low`` /
+        ``heard_near``): the end acts once those words were heard (:meth:`_route_end_after_words`). The reply's words
+        are never the block. Else
         a code word: ``no_quiet`` (it ended with no words and no quiet chosen: unmarked text, an act marker with no
         call, a broken call or an empty reply; the reply watch answers it again), the block's reason as soon as one
         holds (they spoke again, the reply made a call, a new run of it began), ``quiet_refused`` (its quiet on these
         words was refused once, S10 on any path, la A2's follow-on refusal under all, or the ONE driver's: another run
         answers them), ``fresh`` (a reply of words on the first words they said before anything of Yuki's was heard),
+        ``unsure`` (a reply of words on words recognition was unsure of: the talker may be asking what they meant),
         ``voided`` (newer words voided the decision's end) or ``no_reply`` (no reply in time: the talker's own
         judgement stands, the conversation stays open). gc review L2: a reply being written or settling when
         :data:`ROUTE_END_REPLY_S` runs out is waited for up to :data:`ROUTE_END_REPLY_MAX_S`. Stream facts only;
@@ -9139,7 +9159,14 @@ class Conversation:
                             # la A3: a reply of words alone (a call would have been ``acted``): the two judgements
                             # agree once those words are heard; never on their first words before Yuki was heard
                             fresh = bool(state.get("fresh", True)) if isinstance(state, dict) else True
-                            return "fresh" if fresh else self.ROUTE_END_AFTER_WORDS
+                            if fresh:
+                                return "fresh"
+                            # integ30 (S3): nor on words recognition was unsure of (measured: the decision's own doubt,
+                            # or the final turn's counts, which also cover a decision made on an eager transcript)
+                            if (isinstance(state, dict) and state.get("unsure")) or getattr(turn, "heard_low", 0) \
+                                    or getattr(turn, "heard_near", 0):
+                                return "unsure"
+                            return self.ROUTE_END_AFTER_WORDS
                         # integ28 fix T1: the talker's measured choice of silence (a stay_quiet call or a quiet marker:
                         # ``turn.quiet``) is the only agreement; unmarked text, an act marker with no call, a broken
                         # call or an empty reply is the reply watch's to answer (its rerun), never a silent end
@@ -10365,7 +10392,8 @@ class Conversation:
                 return False
             if not self._follows_line(float(getattr(obs, "words_heard_at", 0.0) or 0.0)):
                 return False
-            turn.follow_refused = True
+            # integ30 (T1): their words were for Yuki, as F4 marks S10's (memory never files them as others')
+            turn.follow_refused = turn.quiet_refused = True
             self.log.event("session", state="follow_quiet_refused", session=self.session, via=via or "bridge")
             return True
         except Exception:  # noqa: BLE001

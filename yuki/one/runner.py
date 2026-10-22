@@ -3320,7 +3320,10 @@ class Runner:
         through the gate (an inner step; it marks the text as Yuki's unsent text), never around it. final-H2 (C1): the
         window in front must be the run's own chat as the run measured it (:meth:`_chat_windows`); unknown is not
         typed into (fail closed). The latent second copy (safety lane §4d): when Yuki's own unsent text already waits
-        in that chat (the same wording, or text not known), nothing is typed again and code says the draft is there."""
+        in that chat with this very wording (known text that ends with it), nothing is typed again and code says the
+        draft is there. integ30 (S1): an unknown entry (``""``, ``policy.adopt_typed`` of the route's own typing: a
+        quick switcher's or search box's query) never holds a draft's wording, so the wording is typed through the
+        gate."""
         if facts.get("verified") is not True:
             return False, LINE_CHAT_UNCONFIRMED, {**facts, "verified": False, "type_after": "not_open"}
         front, target, fits = self._chat_windows(facts, key, slots or {}, app)
@@ -3328,8 +3331,8 @@ class Runner:
             return False, LINE_CHAT_UNCONFIRMED, {**facts, "verified": False, "type_after": "not_in_front"}
         text = str(decision.type_after or "")
         waiting = policy.typed_text(front)
-        if waiting is not None and (not waiting or _words(waiting).casefold().endswith(_words(text).casefold())):
-            self._emit("one_type_after", how="waiting", known=bool(waiting))
+        if waiting and _words(waiting).casefold().endswith(_words(text).casefold()):
+            self._emit("one_type_after", how="waiting", known=True)
             return True, f"{report}; Yuki's unsent text already waits in that chat, nothing typed again", \
                 {**facts, "verified": True, "type_after": "waiting", "done_line": LINE_DRAFT_WAITS}
         gated = policy.gate("type_text", {"hwnd": int(front), "text": text}, target, turn, inner=True)

@@ -1586,6 +1586,32 @@ def site_file(site_word: Any) -> str:
 #: again within one request: a learned skill's capability, a strict pass), never the user's correction, which comes
 #: only after the page opened and its line was said (seconds later).
 SWAP_SELF_S = 2.0
+#: integ30 (F2): the item values :func:`_page_measure` swapped, by their squashed form -> ``(when the run that took the
+#: swap ended with something put on, monotonic; the digest of the words it was resolved on)``. Noted by the skill
+#: engine in its own thread once that run ended (:func:`note_page_swap`): a resolve the engine no longer waited for, or
+#: a run that put nothing on (a timed-out rung, a hand-over: the thinker's retry of the same value), never marks one.
+#: Kept apart from :func:`yuki.skills.names.own_url`'s own record (``names._swapped``), which reads only its own swaps
+#: again (as before lb B4). RAM only, never logged.
+_page_swaps: dict[str, tuple[float, str]] = {}
+_page_swaps_lock = threading.Lock()
+
+
+def note_page_swap(swap: Any) -> None:
+    """integ30 (F2): the engine's note, after a run that put something on, that its plan's site page item was a swap
+    (``Plan.page_swap``: ``(the value given, squashed; the digest of the words)``). Never raises."""
+    try:
+        squash, asked = swap
+        if not squash:
+            return
+        now = time.monotonic()
+        from yuki.skills.names import CHANNEL_SWAP_KEEP_S
+
+        with _page_swaps_lock:
+            for old in [k for k, (t, _a) in _page_swaps.items() if now - t > CHANNEL_SWAP_KEEP_S]:
+                _page_swaps.pop(old, None)
+            _page_swaps[str(squash)] = (now, str(asked or ""))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _page_pool(store: Any, site: str, page: str, names: Sequence[str],
@@ -1618,7 +1644,7 @@ def _page_pool(store: Any, site: str, page: str, names: Sequence[str],
 
 
 def _page_measure(store: Any, site: str, page: str, said: str, names: Sequence[str], *, dropped: str | None,
-                  box: dict[str, Any], gone: set[str] | None = None) -> tuple[str, str] | None:
+                  box: dict[str, Any], gone: set[str] | None = None, asked: str = "") -> tuple[str, str] | None:
     """lb B4: the page value of the user's own name a site page's item ``said`` is, with how (``"listed"`` /
     ``"value"``), else ``None``. As :func:`yuki.skills.names.own_url` checks a model-built address, over the whole pool
     (:func:`_page_pool`, not only the hour's candidates):
@@ -1628,11 +1654,15 @@ def _page_measure(store: Any, site: str, page: str, said: str, names: Sequence[s
       False: every visit memory holds of it was Yuki's own pick or a test's), with both its names (its value is added
       to ``gone``, a set the caller passes, so its sound tier leaves it out too; ``box["why"] = "not_own"``);
     * else the same value given again within ``CHANNEL_SWAP_KEEP_S`` of a swap (and at least :data:`SWAP_SELF_S` after
-      it: not this request's own second pass) is a correction and stays as written (``box["why"] = "again"``);
+      it: not this request's own second pass) is a correction and stays as written (``box["why"] = "again"``).
+      integ30 (F2): only a swap whose run put something on (:func:`note_page_swap`, the engine's note in its own
+      thread), and only on other words than that run's (``asked``, the digest of the words this resolve reads: the
+      same words again are the same request's retry, never their correction);
     * else the names measure (``best_match`` ``as_name``, ``clip=False``, :data:`yuki.skills.names.BAR` and
       :data:`yuki.skills.names.MARGIN`; the value only, never the turn): a winner whose digits are not the value's is
-      another page (``"digits"``); a swap is noted (``names._swapped_now``), so a second ask of the same value opens as
-      written on either path (``"value"``).
+      another page (``"digits"``); the swap goes back in ``box["swap"]`` (the value squashed, ``asked``) for the
+      engine to note once its run put the page on (integ30 F2), so a second ask of the same value opens as written
+      (``"value"``).
 
     Never raises (``None``)."""
     from yuki.skills import names as N
@@ -1649,6 +1679,12 @@ def _page_measure(store: Any, site: str, page: str, said: str, names: Sequence[s
         for value, _its in written:
             if N.own_visit(store, site, page, value) is not False:
                 return value, "listed"          # nothing swapped
+        if not written and store is not None and (site, page, heard) in N.own_channels_written(store) \
+                and N.own_visit(store, site, page, said) is not False:
+            # integ30 (F4): as own_url's rule (integ22 S5/names-1), "as written" covers every page of theirs of that
+            # kind, uncapped (the pool keeps the names measure's OWN_CHANNELS): one past the cap, given exactly, is that
+            # page, never measured against a near neighbour
+            return _words(said).lstrip("@"), "listed"
         # gd D5: the rest were theirs only through Yuki's or a test's opens: none of theirs, both names out
         out = {value for value, _its in written}
         if out:
@@ -1659,9 +1695,10 @@ def _page_measure(store: Any, site: str, page: str, said: str, names: Sequence[s
         for value, its in groups:
             for n in its if value not in out else ():
                 pool.setdefault(n, value)
-        with N._lock:
-            at = N._swapped.get(heard)
-        if at is not None and SWAP_SELF_S <= time.monotonic() - at <= N.CHANNEL_SWAP_KEEP_S:
+        with _page_swaps_lock:
+            rec = _page_swaps.get(heard)
+        if rec is not None and SWAP_SELF_S <= time.monotonic() - rec[0] <= N.CHANNEL_SWAP_KEEP_S \
+                and not (asked and rec[1] == asked):
             box["why"] = "again"
             return None
         if not pool:
@@ -1673,10 +1710,21 @@ def _page_measure(store: Any, site: str, page: str, said: str, names: Sequence[s
         if N._digits(said) and N._digits(said) not in (N._digits(value), N._digits(got[0])):
             box["why"] = "digits"
             return None
-        N._swapped_now({"how": "heard"}, said.lstrip("@"))
+        box["swap"] = (heard, asked)   # integ30 (F2): noted by the engine once its run put the page on
         return value, "value"
     except Exception:  # noqa: BLE001 - no measure: taste's sound tier, as before
         return None
+
+
+def _asked_digest(words: Sequence[str]) -> str:
+    """integ30 (F2): the digest of the words a resolve reads (the engine's own ``_heard_digest``), ``""`` with none.
+    RAM only. Never raises."""
+    try:
+        from yuki.skills.engine import _heard_digest
+
+        return _heard_digest(words)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words: Sequence[str], *,
@@ -1751,7 +1799,8 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
                 box["why"] = "not_own"
             # lb B4: the names measure first, as own_url measures the same value on the hand path
             gone: set[str] = set()
-            took = _page_measure(store, name, pk, said, names, dropped=exact, box=box, gone=gone)
+            took = _page_measure(store, name, pk, said, names, dropped=exact, box=box, gone=gone,
+                                 asked=_asked_digest(words))
             if took:
                 box.pop("why", None)
                 return pk, took[0], took[1]

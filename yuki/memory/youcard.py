@@ -474,7 +474,10 @@ def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: 
     (:meth:`contacts.WorkMarks.page`, their own verdicts: picking up where they left off is for their own time).
     RAM only. ``names``: the display names already read (:func:`_browser_name`). final-H2 D3 (a): the talker's card
     takes the newest one too (``n`` 1, ``priority`` 0 beside what they are in the middle of, its own ``head``) with
-    the browser they had it in (``browser``: the page's own app, as memory saw it)."""
+    the browser they had it in (``browser``). integ30 (F1): that browser is the program of their own newest stretch
+    on the page (``links.own_app``), never the link's own ``app`` (its newest sighting's, Yuki's or a test's too); a
+    pick whose own program is not one of their browsers is passed over, and with none measured the browser is left
+    out."""
     try:
         from yuki.core.appnames import shown
     except Exception:  # noqa: BLE001
@@ -502,7 +505,7 @@ def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: 
         work = None
     from urllib.parse import urlsplit
 
-    from yuki.memory.links import own_days, own_lasts
+    from yuki.memory.links import own_app, own_days, own_lasts
 
     pages: list[tuple[Any, str, str]] = []
     for link in links:
@@ -544,13 +547,22 @@ def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: 
     picks.sort(key=lambda x: -x[2])   # the newest of their own visits first: a newer page carries an older one on
     today = datetime.fromtimestamp(now).date()
     bits = []
-    for link, title, at in picks[:n]:
+    for link, title, at in picks:
+        if len(bits) >= n:
+            break
         day = datetime.fromtimestamp(at).date()
         gap = (today - day).days
         when = "today" if gap <= 0 else "yesterday" if gap == 1 else f"{day:%d %b}"
         where = ""
-        if browser and getattr(link, "app", None):
-            where = f", in {shown(link.app) or link.app}"
+        if browser:
+            # integ30 (F1): where they had it is their own last stretch's program (a code-measured fact), never the
+            # link's newest sighting's; one that is no browser of theirs is no page to pick up there
+            had = own_app(store, link, since=since, now=now)
+            if had is not None:
+                name = str(shown(had[0], had[1] or None) or had[0] or had[1])
+                if not ({had[0].casefold(), had[1].casefold(), name.casefold()} - {""}) & browsers:
+                    continue
+                where = f", in {name}"
         bits.append(f'"{_clip(title, LEFT_OFF_TITLE_CHARS)}" ({link.url}), {when}{where}')
     # the header says what the planner's rule says (mem22 merge notes 1-2, desk22 / one22: "their own thing again"),
     # no longer than before: the card is full, and a longer head costs the line a page (measured 19 Oct)

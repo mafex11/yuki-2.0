@@ -498,13 +498,16 @@ QUESTION_SHELL_ASKING = ("Something I tried to close may be asking you a questio
 #: A1 (Z7): a run_powershell command longer than the commit check reads whole (``one.tools.SHELL_CHARS``) is refused
 #: in the executor too, as ONE does (``one/policy.py``), so the check never judges a cut command. Planner-facing
 #: (non-final): split it into shorter commands (the session keeps variables), or say plainly what it would do and
-#: offer to do it now (A4: a step ends inside its own run).
+#: offer to do it now (A4: a step ends inside its own run). integ30 (S2): that offer ends with the planner's awaits mark
+#: (``context.AWAITS_MARK``), asked here inside the very clause it qualifies: only a marked reply ends as E5's answer
+#: (``agent.refusal_answered``); an unmarked one gets code's stuck line.
 LINE_SHELL_LONG = ("the command is longer than the check reads whole, so it was not run: split it into shorter "
-                   "commands (the session keeps variables), or say what it would do and offer to do it now")
+                   "commands (the session keeps variables), or say what it would do and offer to do it now, that "
+                   "reply ending with <awaits/>")
 #: integ28 fix S1: the same for an app started with arguments Yuki wrote (``launch_app`` with ``args`` that are no web
 #: address) whose command line is longer than the check reads whole (planner-facing, non-final).
 LINE_ARGS_LONG = ("the app's arguments are longer than the check reads whole, so it was not started: open it without "
-                  "them, or say what it would do and offer to do it now")
+                  "them, or say what it would do and offer to do it now, that reply ending with <awaits/>")
 #: final-H2 lane E (E5): the code words of the planner-facing, non-final refusals whose line (:data:`LINE_SHELL_LONG`,
 #: :data:`LINE_ARGS_LONG`) asks the planner to say what it would do and offer it now. With nothing acted in the request,
 #: the planner's plain reply after one is that answer, said as an answer (``agent.refusal_answered``), not code's stuck

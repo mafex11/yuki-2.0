@@ -546,6 +546,32 @@ def own_lasts(store: Any, links: Sequence[Any], *, since: float | None = None,
     return out
 
 
+def own_app(store: Any, link: Any, *, since: float | None = None,
+            now: float | None = None) -> tuple[str, str] | None:
+    """integ30 (F1): ``(app, process)`` of the user's own newest stretch on a keyed viewed page (its timeline keys,
+    :func:`_page_keys`; the rows :func:`own_lasts` measures, :func:`_own_rows`: ``by_yuki = 0``, outside a live test's
+    span, never Yuki's visit), ``since`` on. A link's own ``app`` is its newest sighting's, Yuki's or a test's too
+    (``Store.upsert_links``: last writer wins), so where they had the page is read here. ``None``: no key, or no
+    stretch of theirs. Content-free (cleartext metadata). Never raises."""
+    if not getattr(link, "page_key", None) or getattr(link, "how", None) != "viewed" \
+            or getattr(link, "attention", None) == "visible":
+        return None
+    try:
+        keys = sorted(k for k in _page_keys(store, [link]).get(int(link.id), {str(link.page_key)}) if k)
+        if not keys:
+            return None
+        now = time.time() if now is None else float(now)
+        lo = float(since) if since is not None else 0.0
+        rows = _own_rows(store, f"SELECT t.app, t.process, coalesce(t.ended_at, t.started_at) FROM timeline t WHERE "
+                         f"t.page_key IN ({','.join('?' * len(keys))}) AND t.state = 'present' AND t.started_at >= ? "
+                         "AND t.started_at <= ?{own} ORDER BY 3 DESC LIMIT 1", (*keys, lo, now), lo, now)
+    except Exception:  # noqa: BLE001
+        return None
+    if not rows or not (rows[0][0] or rows[0][1]):
+        return None
+    return str(rows[0][0] or ""), str(rows[0][1] or "")
+
+
 def own_last(store: Any, link: Any, *, since: float | None = None, now: float | None = None) -> float | None:
     """:func:`own_lasts` for one link (``None``: no visit of theirs). Never raises."""
     return own_lasts(store, [link], since=since, now=now).get(int(link.id))

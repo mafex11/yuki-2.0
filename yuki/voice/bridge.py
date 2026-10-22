@@ -1954,7 +1954,15 @@ class VoiceBridge(QObject):
                 self._log("bridge", op="withdrawn_settled", job_id=job.job_id, raced=kind != "withdrawn")
                 return
             late = self._moved_on(job)
-            if kind == "done" and job.remember:
+            held_keep = kind == "done" and job.remember and isinstance(job.verdict, dict) and (
+                job.verdict.get("held_keep") is True or job.verdict.get("awaits") is True)
+            if held_keep:
+                # integ30 (S4, contract K-R): the planner's shared handler held a keep of this request to ask first (a
+                # code fact on its outcome; or the planner marked its ending as waiting for their answer): nothing was
+                # saved and its ending is that question, so it takes the spoken path below (the talker says it; a
+                # remember job is never said by code), never the quiet "saved"
+                self._log("bridge", op="keep_held", job_id=job.job_id)
+            if kind == "done" and job.remember and not held_keep:
                 # The mouth already reacted when it handed this over; the brain's "saved" is
                 # put into the conversation without a turn (a spoken "noted" would repeat it).
                 await params.result_callback({"saved": payload, "how_to_handle_it": SAVED_NOTE},
@@ -4492,9 +4500,15 @@ class VoiceBridge(QObject):
                 # integ30 (le merge note 1, K-R talker side): a reversal of this talk with no reason said is never
                 # kept before their answer; the call's say_first is the one question (HAND_OVER), said if unsaid
                 await self._ack_if_silent(params, args)
-                self._log("bridge", op="remember_held", call=params.tool_call_id)
-                await params.result_callback({"held": REMEMBER_HELD, "how_to_handle_it": REMEMBER_HELD_NOTE},
-                                             properties=FunctionCallResultProperties(run_llm=False))
+                # integ30 fix (T2): whether that question was said is measured (the words said for this very call,
+                # early or by code just now; the reply's own words): an early say the one-acknowledgement rule held
+                # back, or an ack refused, leaves it unsaid, and then the talker asks it now
+                spoke = self.spoke_in_reply() if self.spoke_in_reply is not None else True
+                unsaid = not spoke and not self.early_said(params.tool_call_id)
+                self._log("bridge", op="remember_held", call=params.tool_call_id, unsaid=unsaid or None)
+                await params.result_callback({"held": REMEMBER_HELD, "how_to_handle_it": REMEMBER_HELD_ASK_NOTE
+                                              if unsaid else REMEMBER_HELD_NOTE},
+                                             properties=FunctionCallResultProperties(run_llm=unsaid))
                 return
             if asked:
                 self._log("bridge", op="remember_released", call=params.tool_call_id)
@@ -5189,6 +5203,10 @@ REMEMBER_CONTEXT = ("Yuki's voice took these words as something to keep: a rule 
 #: past the turn that carried it goes through (:meth:`VoiceBridge._reversal_gate`).
 REMEMBER_HELD = "not kept: their answer to your question decides"
 REMEMBER_HELD_NOTE = "Nothing was kept. Their answer is the change: hand_over intent remember again then."
+#: integ30 fix (T2): the same hold when its question was never said (measured: no words of the call's say_first, nor
+#: of the reply, went out): the talker asks it now.
+REMEMBER_HELD_ASK_NOTE = ("Nothing was kept, and your question was not said. Ask it now: one short question naming "
+                          "both. Their answer is the change: hand_over intent remember again then.")
 #: integ30 (K-R): the labelled, code-measured line a released keep goes to the planner with (the held item is the
 #: talker's own field; "heard" is the narrator's measured time), so its remember names their answer as their_reason.
 REMEMBER_ASKED = ("Yuki's voice held a keep that turns around {around}, to ask them first; its question was heard, "

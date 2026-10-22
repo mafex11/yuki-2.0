@@ -179,6 +179,9 @@ LINE_NO_REPLY = "I couldn't work that out."
 LINE_CANCELLED = "Cancelled by the user."
 LINE_WITHDRAWN = "Withdrawn: replaced by the user's newer request."
 LINE_PARKED = "Parked: the question stays open until the user answers it."
+#: integ30 (S4, contract K-R): the planner's own suffix to a keep the shared handler held (``tools.LINE_ASK_FIRST``,
+#: shared with ONE, whose voice has no ask_user): how this planner asks that one question.
+LINE_HELD_ASK = "Ask it with ask_user, so their answer comes back to you."
 
 #: A step's verb in plain words (the stuck line and the status line), never the step's values.
 STEP_WORDS: dict[str, str] = {
@@ -377,6 +380,11 @@ class _State:
     open_parts: dict[str, dict[str, str]] = field(default_factory=dict)
     part_opens: int = 0
     open_held: tuple[str, dict[str, Any]] | None = None
+    #: integ30 (S4, contract K-R): the keeps of this request the shared handler held to ask first (``remember``'s
+    #: payload ``held: ask_first``), each by its ``turns_around`` and ``text`` folded (``tools._ident``); a later save
+    #: of the same item in the request takes it off. Any left at the ending marks the outcome ``held_keep`` (a code fact:
+    #: the voice never settles that ending quietly as "saved").
+    held_keeps: set[frozenset[str]] = field(default_factory=set)
 
 
 class _NoticeSink:
@@ -2645,6 +2653,7 @@ class Brain:
             run = ToolRun("ask_user", "ask_user", answer is not None, answer_report(question, answer))
         elif name == "remember":
             run = run_remember(self.memory, tool_input, words=words)
+            self._note_held_keep(run, tool_input, state)
             if str(tool_input.get("kind") or "") == "how":
                 # morning21 C4 (K4): a way they told Yuki, kept as know-how at once (content-free)
                 self.logger.log("remember", kind="how", ok=run.ok, app=bool(run.input.get("app")))
@@ -2655,6 +2664,27 @@ class Brain:
         if run.private:
             state.private_read = True
         self._tool_s += time.perf_counter() - started
+        return run
+
+    def _note_held_keep(self, run: ToolRun, tool_input: Mapping[str, Any], state: _State) -> ToolRun:
+        """integ30 (S4, contract K-R): a ``remember`` the shared handler held to ask first is noted on the request
+        (:attr:`_State.held_keeps`, by its ``turns_around`` folded) and its result gets the planner's own way to ask:
+        ``ask_user`` (a plain reply ending a keep is settled quietly by the voice). A later save of the same item in
+        the request takes it off. The payload's code word and the model's own field only; never raises."""
+        try:
+            from yuki.brain.tools import TURNS_AROUND_FIELD, _ident
+
+            keys = frozenset(k for k in (_ident(tool_input.get(TURNS_AROUND_FIELD)), _ident(tool_input.get("text")))
+                             if k) or frozenset({"?"})
+            payload = run.payload if isinstance(run.payload, Mapping) else {}
+            if payload.get("held") == "ask_first":
+                state.held_keeps.add(keys)
+                run.text = f"{run.text} {LINE_HELD_ASK}"
+                self.logger.log("brain_keep_held", kind=str(payload.get("kind") or "") or None)
+            elif run.ok:
+                state.held_keeps = {held for held in state.held_keeps if not held & keys}
+        except Exception:  # noqa: BLE001 - a note never breaks a tool
+            pass
         return run
 
     def _emit_run(self, run: ToolRun) -> None:
@@ -2708,6 +2738,11 @@ class Brain:
     def _final(self, text: str, outcome: dict[str, Any]) -> None:
         # an ending made before this (held, a tidy-up's) carries its own evidence; one made now is weighed now
         outcome = self._with_evidence(text, outcome)
+        state = self._state
+        if isinstance(outcome, dict) and state is not None and getattr(state, "held_keeps", None):
+            # integ30 (S4, K-R): a keep of this request is still held to ask first (code fact): the voice says this
+            # ending (the question) rather than settling it quietly as saved
+            outcome = {**outcome, "held_keep": True}
         if isinstance(outcome, dict) and "evidence" in outcome and not outcome["evidence"]:
             outcome = {k: v for k, v in outcome.items() if k != "evidence"}
         self._last_outcome = outcome
@@ -2841,9 +2876,14 @@ class Brain:
             # acted false, the planner's own awaits mark), so the voice's answer gates read it as they read every
             # answer. sBrainFix's case below (a refused send then claimed as sent) is untouched: that refusal is
             # another code word, or carries its own line, or came after something acted. Code facts only.
+            # integ30 (S2): only a reply the planner itself marked as waiting for their answer (its structured awaits
+            # mark: the offer E5 asks for) ends this way. An unmarked reply ("I'll pause it when the song ends.") is no
+            # offer, and under "all" a short one would be said by code word for word with no claim check: it falls
+            # through to sBrainFix's stuck line below, as before E5
             self.logger.log("brain_refusal_reply", why=str(last.reason), chars=len(text), awaits=marked)
-            self._final(text, _awaiting(self._outcome(state, level="answer"), marked))
-            return True
+            if marked:
+                self._final(text, _awaiting(self._outcome(state, level="answer"), marked))
+                return True
         if state.acted or (state.kind == "act" and last is not None
                            and last.status in ("refused", "mismatch", "error")):
             # sBrainFix (review r1 runs): a plan that tried to act and was stopped, even with nothing acted, leaves the
