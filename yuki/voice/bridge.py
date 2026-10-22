@@ -801,6 +801,11 @@ class VoiceBridge(QObject):
         #: note alone), else ``None``. Set by the conversation. voice22 (review L3): called ``(spoke, tool_call_id)``,
         #: the refused stay_quiet's id (the run its result starts is the refusal's answer).
         self.opened_quiet: Callable[..., Any] | None = None
+        #: la A2 (final-H2 kw_offer_then_yes t2): ``(spoke, tool_call_id) -> result | None``: a lone stay_quiet on the
+        #: talker's own first reply to words that follow Yuki's own heard line (no call, game or dictation, nothing
+        #: heard this turn, once a turn: ``Conversation._follow_quiet``) is refused once, with ONE's own note; else
+        #: ``None``. Set by the conversation; under one ``OneVoice.control`` refuses its own.
+        self.follow_quiet: Callable[..., Any] | None = None
         #: Whether the mouth run now answers the first words after the wake word heard the user say the name
         #: (set by the conversation; v3.6): those words were said to Yuki, so staying quiet is refused once.
         self.named_turn: Callable[[], bool] | None = None
@@ -963,6 +968,7 @@ class VoiceBridge(QObject):
             self.call_evidence = None
             self.quiet_requested = None
             self.opened_quiet = None
+            self.follow_quiet = None
             self.named_turn = None
             self.said_early = None
             self.early_words = None
@@ -2588,11 +2594,26 @@ class VoiceBridge(QObject):
                 await params.result_callback(dict(refused) if isinstance(refused, dict)
                                              else {"not_quiet": OPENED_QUIET})
                 return
+        if (by_user and not in_call and not spoke_now and not getattr(self, "one", False)
+                and self.follow_quiet is not None):
+            # la A2 (final-H2 kw_offer_then_yes t2: "Yeah, go ahead and do that." right after Yuki's offer got a lone
+            # stay_quiet, and the conversation ended in silence): ONE's follow-on refusal under all. The talker's own
+            # first quiet on words that follow Yuki's own heard line is refused once with ONE's note (answer; a
+            # sign-off or "go away" ends with end_conversation); the run its result starts answers, and its own quiet
+            # is final (V2 below). Stream facts only (Conversation._follow_quiet).
+            try:
+                refused = self.follow_quiet(spoke_now, getattr(params, "tool_call_id", None))
+            except Exception:  # noqa: BLE001 - no reading: the quiet stands
+                refused = None
+            if refused:
+                self._log("bridge", op="quiet", refused="follow_on", asked_by_user=True)
+                await params.result_callback(dict(refused))
+                return
         # V2 (3 Oct): a stay_quiet on the user's own words is final. It used to be refused once after the name (v3.6)
         # and once in a live exchange (v3.9); live 3 Oct "go away" got a quiet, the refusal made the talker run again,
         # and it said it was still there. Whom the words were for is the talker's judgement (the prompt: outside a
         # call they are for Yuki unless plainly not), and code never makes it speak after it chose silence.
-        # voice21: but for the S10 refusal above, once a conversation.
+        # voice21: but for the S10 refusal above, once a conversation; la A2: and the follow-on refusal, once a turn.
         spoke = bool(self.spoke_in_reply()) if self.spoke_in_reply is not None else False
         held = self.held_at
         if not by_user and not spoke and held is not None and time.monotonic() - held < 20.0:
