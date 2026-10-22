@@ -16,8 +16,13 @@ memory's monitor record (``yuki.memory.monitors``) still knows it: its name, its
 a monitor app lists it by, the GPU target id) and when Windows dropped it. So it is named, never mistaken for the one
 attached, and never asked about as "the other one". By measured state:
 
-* attached and on (0xD6 1): nothing is written; the line names its power and brightness ("24HC1QR is on, at 0%
-  brightness": on but dark is told, never "already on" alone);
+* attached and on (0xD6 1): its brightness is read beside the power. Visible: nothing is written, and the line says so
+  with the level ("24HC1QR is already on, at 25% brightness"). On but dark (22 Oct 08:44: the 24HC1QR read on at 0%
+  and looked off; "turn it on" means "make it visible"): at 0, or below every level memory's record measured it at
+  while visible (``lit_low``), its brightness is raised to the level it was last measured at while visible
+  (``lit_level``, the middle of its range with no history), read back, and said ("24HC1QR was on but at 0%; it's at
+  25% now"). Only brightness, only up: 0xD6 is never written for it (:func:`_light`). Not when the turn-on gives a
+  level or a change of its own (theirs is set);
 * attached in standby (2-5): 0xD6 = 1 over DDC/CI, read until it reads 1;
 * dropped (in the record, not attached, its port not available): the monitor app, only when its own list (read only,
   e.g. Twinkle Tray's pipe ``list``) still holds the monitor's instance key, and only counted woken when Windows lists
@@ -73,7 +78,7 @@ data only, never a list of words. A value that names no monitor is asked about (
 among the options, the dropped ones named too) with the forms the slot takes beside it (``facts_ram["form"]``), except
 a power-on with one monitor attached while exactly one of theirs is dropped: that one is meant (and the attached one
 too unless it reads on). Left out or ``all``: every monitor ("on" wakes the ones that are off, the dropped ones
-included; "off" of every screen is asked first, as the only screen on).
+included, and raises the ones on but dark; "off" of every screen is asked first, as the only screen on).
 
 **Windows' place is Windows' word, not the user's** (mon1 fix round, 22 Oct: Windows' primary moved to the VG271U when
 the AOpen dropped and stayed there, before any record of it, so "second" by place is the user's first monitor). A
@@ -83,8 +88,9 @@ guess); a turn-on whose monitor already reads on takes the one other monitor of 
 or dropped), or asks which when several are.
 
 Logs (content-free; ``yuki.log.events``' vocabulary): ``display stage=read|set|power route=ddc|wmi|app|record
-verdict=held|stale|none monitors=<n> ok=<n> ms=<ms>`` (the plan's ``op`` and ``readback`` under the log's own enum
-keys ``stage`` and ``verdict``; ``record``: only dropped monitors, nothing reached); never a monitor's name.
+verdict=held|stale|none monitors=<n> ok=<n> [lit=<n>] ms=<ms>`` (the plan's ``op`` and ``readback`` under the log's own
+enum keys ``stage`` and ``verdict``; ``record``: only dropped monitors, nothing reached; ``lit``: monitors on but dark
+that a turn-on raised); never a monitor's name or a level.
 
 Public API::
 
@@ -92,7 +98,7 @@ Public API::
     away_monitors(screens) -> list[Known]               # mon1: theirs that Windows doesn't list now (memory's record)
     read(target=None, *, log=None) -> list[dict]        # K2: {name, role, brightness, power, ok, why} per monitor
     set_brightness(screens, *, level=None, change=None, app=None) -> list[Change]
-    set_power(screens, state, *, app=None) -> list[Change]
+    set_power(screens, state, *, app=None, rows=None, light=True) -> list[Change]   # mon1: on but dark is raised
     pick(value, screens, away=None) -> Picked           # a target slot's value -> the monitors it names
     target_form(screens, away=()) -> str                # the forms the target slot takes now
     monitor_apps() -> list[MonitorApp]                  # the monitor apps the app data describes, as found now
@@ -133,6 +139,9 @@ TOLERANCE = 1.0
 APP_TOLERANCE = 5.0
 #: The re-check's own tolerance (a monitor that drifts a point is no snap back).
 RECHECK_TOLERANCE = 2.0
+#: mon1: a monitor on but dark, with no level of it measured while visible in memory's record, is raised to the middle
+#: of its range (levels here are a percent of the monitor's own maximum).
+MID_LEVEL = 50.0
 #: A monitor app's command line must exit within this (s), and its change reaches the monitor within this (s).
 APP_WAIT_S = 4.0
 APP_SETTLE_S = 0.5
@@ -639,7 +648,8 @@ def _wmi_set(level: float) -> bool:
 
 
 #: mon1: the reads and writes memory's monitor record is told of, written once the bus is free (a database write never
-#: holds the DDC/CI lock): ``(device path, pnp, label, what, value, wrote)``.
+#: holds the DDC/CI lock): ``(device path, pnp, label, what, value, flag)``; ``what`` ``power`` (``flag``: an off it
+#: wrote) or ``level`` (``flag``: a level it sat at, :func:`_note_level`).
 _notes: list[tuple[str, str, str, str, float, bool]] = []
 _notes_lock = threading.Lock()
 
@@ -656,10 +666,12 @@ def _note_power(screen: Screen, value: int | None, *, wrote: bool = False) -> No
             _notes.append((screen.key, screen.pnp, screen.label, "power", float(value), wrote))
 
 
-def _note_level(screen: Screen, level: float | None) -> None:
+def _note_level(screen: Screen, level: float | None, *, sat: bool = True) -> None:
+    """A brightness read for the record. ``sat=False``: a read a turn-on found dark, or Yuki's own restore read back
+    (never a level they sat at: ``yuki.memory.monitors.note_level``)."""
     if level is not None:
         with _notes_lock:
-            _notes.append((screen.key, screen.pnp, screen.label, "level", float(level), False))
+            _notes.append((screen.key, screen.pnp, screen.label, "level", float(level), sat))
 
 
 def _flush_notes() -> None:
@@ -674,12 +686,12 @@ def _flush_notes() -> None:
         from yuki.memory import monitors as record
     except Exception:  # noqa: BLE001
         return
-    for path, pnp, label, what, value, wrote in queued:
+    for path, pnp, label, what, value, flag in queued:
         try:
             if what == "power":
-                record.note_power(path, int(value), wrote=wrote, pnp=pnp, label=label)
+                record.note_power(path, int(value), wrote=flag, pnp=pnp, label=label)
             else:
-                record.note_level(path, value, pnp=pnp, label=label)
+                record.note_level(path, value, sat=flag, pnp=pnp, label=label)
         except Exception:  # noqa: BLE001
             continue
 
@@ -901,11 +913,13 @@ class Change:
     """One monitor's change: its ``name`` (as said) and ``role``; ``before`` / ``want`` / ``after`` (brightness 0-100,
     or 0xD6 power values); ``ok`` (True read back, False not so, None not readable); ``why`` (a code word,
     :data:`WHY_WORDS`, or ``already``); ``via`` (``ddc`` / ``wmi`` / ``app``). ``key``/``handle``/``what`` are what
-    the re-check reads again (RAM only). mon1: ``level``, the brightness read beside a power that was already on (on
-    but dark is told); ``by``, the monitor app that woke a dropped monitor with no means chosen (the line names it);
+    the re-check reads again (RAM only). mon1: ``level``, the brightness read beside a power that was already on (said
+    with it; on but dark is raised, ``lit``); ``by``, the monitor app that woke a dropped monitor with no means chosen (the line names it);
     ``dropped``, a monitor of theirs Windows doesn't list (memory's record); ``when``, when Windows dropped it (epoch
     s); ``app``, the monitor app that couldn't reach it or was tried; ``tried``, that app was run for it. Fix round:
-    ``held``, what kept that app from running for it right then (``why`` ``held``: ``game`` / ``blocked``)."""
+    ``held``, what kept that app from running for it right then (``why`` ``held``: ``game`` / ``blocked``). ``lit``:
+    a turn-on of a monitor on but dark, its brightness raised (``what`` brightness, ``before`` the dark level,
+    :func:`_light`)."""
 
     name: str
     role: str
@@ -926,6 +940,7 @@ class Change:
     tried: bool = False
     dropped: bool = False
     held: str = ""
+    lit: bool = False
 
 
 def _brightness_one(screen: Screen, level: float | None, change: float | None, app: MonitorApp | None) -> Change:
@@ -1000,10 +1015,10 @@ def _power_one(screen: Screen, state: str, app: MonitorApp | None) -> Change:
             out.before = float(got[0])
             if (got[0] == POWER_ON) == want_on:
                 if want_on:
-                    # mon1: on already: nothing is written, and its brightness is read beside it (on at 0% looks off)
+                    # mon1: on already: no power is written, and its brightness is read beside it (on at 0% looks
+                    # off; set_power judges it and notes the read)
                     level = _level_get(handle)
                     out.level = _percent(level[0], level[1]) if level is not None else None
-                    _note_level(screen, out.level)
                 out.after, out.ok, out.why = float(got[0]), True, "already"
                 return out
         elif not want_on:
@@ -1051,6 +1066,43 @@ def _power_one(screen: Screen, state: str, app: MonitorApp | None) -> Change:
     return out
 
 
+def _dark(level: float | None, row: Any) -> bool:
+    """mon1 (22 Oct): whether a monitor that reads on is dark to the user: at 0, or below every level memory's record
+    measured it at while visible (its row's ``lit_low``). Measured facts only; an unread level is never dark."""
+    if level is None:
+        return False
+    low = getattr(row, "lit_low", None)
+    return float(level) <= 0.0 or (low is not None and float(level) < float(low))
+
+
+def _lit_level(row: Any) -> float:
+    """The level to raise a monitor on but dark to: the last level memory's record measured it at while visible (its
+    row's ``lit_level``), else :data:`MID_LEVEL`."""
+    got = getattr(row, "lit_level", None)
+    return float(got) if got is not None and float(got) > 0.0 else MID_LEVEL
+
+
+def _light(screen: Screen, on: Change, row: Any, app: MonitorApp | None) -> Change:
+    """mon1 (22 Oct, "turn on my first monitor" with the 24HC1QR on at 0%): a turn-on of a monitor that reads on but
+    dark (:func:`_dark`): its brightness raised to :func:`_lit_level`, through the same means (the told app's
+    ``set`` too), read back (:func:`_brightness_one`). Only brightness, only up: 0xD6 is never written here. The
+    change is ``lit`` (said "24HC1QR was on but at 0%; it's at 25% now"); one already at that level reads visible and
+    stays the power change it was. Under the bus lock (``set_power``)."""
+    want = _lit_level(row)
+    if on.level is None or want <= on.level:
+        return on
+    got = _brightness_one(screen, want, None, app)
+    if got.after is not None:
+        _note_level(screen, got.after, sat=False)   # Yuki's own restore: never a level they sat at
+    if got.why == "already":
+        on.level = got.after
+        return on
+    got.lit = True
+    if got.before is None:
+        got.before = on.level
+    return got
+
+
 def set_brightness(screens: Sequence[Screen], *, level: float | None = None, change: float | None = None,
                    app: MonitorApp | None = None) -> list[Change]:
     """Set each monitor's brightness to ``level`` (0-100) or by ``change`` points from its own level, through DDC/CI
@@ -1065,11 +1117,24 @@ def set_brightness(screens: Sequence[Screen], *, level: float | None = None, cha
     return got
 
 
-def set_power(screens: Sequence[Screen], state: str, *, app: MonitorApp | None = None) -> list[Change]:
+def set_power(screens: Sequence[Screen], state: str, *, app: MonitorApp | None = None,
+              rows: Mapping[str, Any] | None = None, light: bool = True) -> list[Change]:
     """Turn each monitor's screen ``on`` or ``off`` (VCP 0xD6 through DDC/CI or the monitor ``app``), read back (a wake
-    until it reads on, up to :data:`WAKE_S`). No question here: :func:`_off_question` is the route's."""
+    until it reads on, up to :data:`WAKE_S`). No question here: :func:`_off_question` is the route's. mon1: ``rows``
+    (a turn-on from the route: each monitor's row of memory's record, by :func:`_ident`, read before the bus is taken)
+    judges each monitor that already reads on: on but dark (:func:`_dark`) is raised (:func:`_light`), unless
+    ``light`` is False (the turn-on gives a level of its own); its read is never a level they sat at either way."""
+    got: list[Change] = []
     with _bus:
-        got = [_power_one(s, state, app) for s in screens]
+        for s in screens:
+            c = _power_one(s, state, app)
+            if c.why == "already" and c.level is not None:
+                row = rows.get(_ident(s)) if rows is not None else None
+                dark = rows is not None and _dark(c.level, row)
+                _note_level(s, c.level, sat=not dark)
+                if dark and light:
+                    c = _light(s, c, row, app)
+            got.append(c)
     _flush_notes()
     return got
 
@@ -1317,12 +1382,15 @@ def _line(changes: Sequence[Change], app: MonitorApp | None) -> tuple[str, str]:
         if c.what == "power":
             on = c.after == POWER_ON or (c.after is None and c.want == POWER_ON)
             if on and c.why == "already" and c.level is not None:
-                # mon1: on, with what it shows: "24HC1QR is on, at 0% brightness" (on but dark is told)
-                return f"{c.name} is on, at {c.level:g}% brightness"
+                # mon1: on and visible, with what it shows: nothing changed, said so
+                return f"{c.name} is already on, at {c.level:g}% brightness"
             if not on and c.why == "already" and c.dropped:
                 return f"{c.name} is already off (Windows doesn't list it now)"
             return f"{c.name} is{already} {'on' if on else 'off'}{by}"
         level = c.after if c.after is not None else c.want
+        if c.lit and c.before is not None:
+            # mon1: on but dark, raised (read back): what it was and what it is now
+            return f"{c.name} was on but at {c.before:g}%; it's at {level:g}% now"
         return f"{c.name} {'is already ' if already else ''}at {level:g}%"
 
     def missed(c: Change) -> str:
@@ -1339,14 +1407,18 @@ def _line(changes: Sequence[Change], app: MonitorApp | None) -> tuple[str, str]:
             # the app's part in it, never only "isn't in its list"
             words = WHY_WORDS["dropped"].format(when=_when_words(c.when)).replace(
                 ";", f", and it isn't in {named}'s list;", 1)
+        if c.lit and c.before is not None:
+            # mon1: on but dark, and the raise didn't read back: still dark, said so
+            words = f"is on but at {c.before:g}% brightness, and it {words}"
         return f"{c.name if c.name.startswith('the ') else 'the ' + c.name} {words}"
 
     good = [c for c in changes if c.ok is True]
     bad = [c for c in changes if c.ok is not True]
-    done = _cap(", ".join(took(c) for c in good)) + "." if good else ""
+    sep = "; " if any(c.lit for c in good) else ", "   # a raised monitor's part has a "; " of its own
+    done = _cap(sep.join(took(c) for c in good)) + "." if good else ""
     if not bad:
         return done, ""
-    head = ", ".join(took(c) for c in good)
+    head = sep.join(took(c) for c in good)
     tail = "; ".join(missed(c) for c in bad)
     return done, _cap(f"{head}; {tail}." if head else f"{tail}.")
 
@@ -1367,12 +1439,14 @@ def _finish(call: Any, changes: list[Change], *, op: str, via: str, app: Monitor
     stale = any(c.why in ("readback_stale", "no_readback") for c in changes)
     verdict = "held" if held else "stale" if stale else "none"
     _emit(call.ctx, "display", stage=op, route=via, verdict=verdict, monitors=len(changes),
-          ok=sum(1 for c in changes if c.ok is True), ms=round((time.perf_counter() - started) * 1000.0, 1))
+          ok=sum(1 for c in changes if c.ok is True), lit=sum(1 for c in changes if c.lit) or None,
+          ms=round((time.perf_counter() - started) * 1000.0, 1))
     done, partly = _line(changes, app)
     facts = {"op": op, "via": via, "status": verdict, "monitors": len(changes),
              "ok": sum(1 for c in changes if c.ok is True), "acted": len(acted)}
     ram = {"display": [c for c in changes if c.ok is True and c.why != "already"]}
-    first = next((c.after for c in changes if c.what == "brightness" and c.after is not None), None)
+    # the level the run set for them (a raise of a monitor on but dark is the record's level, never a value they gave)
+    first = next((c.after for c in changes if c.what == "brightness" and c.after is not None and not c.lit), None)
     if held and not acted:
         return _rr(ran=False, already=True, verified=True, outcome="already", say=done, facts=facts, facts_ram=ram,
                    value=first)
@@ -1664,7 +1738,14 @@ def _run(call: Any, via: str) -> Any:
             options=["windows"], outcome="app_unlisted", facts={"slot": "means"})
     changes: list[Change] = []
     if power and reach:
-        changes += set_power(reach, power, app=app)
+        # mon1 (22 Oct): a turn-on judges each monitor that reads on against memory's record (read here, before the bus
+        # is taken): on but dark is raised to the level it was last seen at while visible, unless the turn-on gives a
+        # level or a change of its own (theirs is set below)
+        rows = None
+        if power == "on":
+            got_rows = _record_rows()
+            rows = {_ident(s): _row_of(s, got_rows) for s in reach}
+        changes += set_power(reach, power, app=app, rows=rows, light=level is None and change is None)
     if (level is not None or change is not None) and reach and power != "off":
         lit = [s for s, c in zip(reach, changes) if c.ok is not False] if power == "on" else reach
         changes += set_brightness(lit, level=level, change=None if level is not None else change, app=app)

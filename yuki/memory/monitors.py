@@ -13,7 +13,11 @@ target id); when it was first and last seen attached, its seconds attached, as W
 (``main``, ``second``, ...: ``windows.monitor_roles``), its last place left to right; its last power (VCP 0xD6) and
 brightness (0x10) as the display driver read them, an off the driver wrote, when Windows last stopped listing it, and
 ``left_bus`` (1: it left Windows within :data:`LEFT_BUS_S` of an off Yuki wrote or of a read that said off; 0: it
-stayed attached that long after an off; ``None`` not measured).
+stayed attached that long after an off; ``None`` not measured). The levels it was measured at while visible: the
+last brightness above 0 read (``lit_level``, ``lit_at``) and the lowest (``lit_low``), from the reads of the level it
+sat at (a level they set read back, a read, a turn-on that found it visible), never Yuki's own restore and never a
+read that a turn-on found dark (22 Oct: "turn on my first monitor" with the 24HC1QR on at 0%: the driver restores
+``lit_level``, the middle of its range with none).
 
 **Writers** (code only, measured facts, never a model, never the user's words):
 
@@ -45,7 +49,7 @@ Public::
     match(rows, device_path, pnp, label) -> Known | None
     words(row, heard=True) -> tuple[str, ...]    # their words for it (learned), then heard forms
     card_stamp(store) -> tuple                   # what the you-card's monitor line depends on
-    note_power(device_path, value, *, wrote=False, pnp="", label="")  /  note_level(device_path, level, ...)
+    note_power(device_path, value, *, wrote=False, pnp="", label="")  /  note_level(device_path, level, sat=True, ...)
     Recorder(store, log=None).tick(now)          # the timeline's sightings
 """
 
@@ -104,6 +108,9 @@ class Known:
     power_at: float | None = None
     level: float | None = None
     level_at: float | None = None
+    lit_level: float | None = None
+    lit_low: float | None = None
+    lit_at: float | None = None
     off_at: float | None = None
     removed_at: float | None = None
     left_bus: int | None = None
@@ -246,7 +253,8 @@ def _read(store: Any) -> list[Known]:
             target_id=int(r["target_id"] or 0), first_seen=r["first_seen"], last_seen=r["last_seen"],
             attached_s=float(r["attached_s"] or 0.0), primary_s=float(r["primary_s"] or 0.0),
             roles=_roles(r["roles"]), place=r["place"], power=r["power"], power_at=r["power_at"],
-            level=r["level"], level_at=r["level_at"], off_at=r["off_at"], removed_at=r["removed_at"],
+            level=r["level"], level_at=r["level_at"], lit_level=r["lit_level"], lit_low=r["lit_low"],
+            lit_at=r["lit_at"], off_at=r["off_at"], removed_at=r["removed_at"],
             left_bus=r["left_bus"], called=tuple(called[:WORDS_N]), heard=tuple(dict.fromkeys(mine))[:WORDS_N]))
     return out
 
@@ -333,7 +341,8 @@ def words(row: Known, *, heard: bool = True) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _note(device_path: str, pnp: str, label: str, sets: dict[str, Any], store: Any = None) -> bool:
+def _note(device_path: str, pnp: str, label: str, sets: dict[str, Any], store: Any = None, *,
+          low: float | None = None) -> bool:
     store = _store(store)
     if store is None or not sets:
         return False
@@ -341,12 +350,15 @@ def _note(device_path: str, pnp: str, label: str, sets: dict[str, Any], store: A
         row = match(rows(store), device_path, pnp, label)
         if row is None:
             return False
-        names = list(sets)
-        values = [sets[n] for n in names]
+        assign = [f"{n} = ?" for n in sets]
+        values: list[Any] = list(sets.values())
+        if low is not None:
+            # the lowest level it sat at, kept by the database itself (two notes of one flush never race the RAM table)
+            assign.append("lit_low = CASE WHEN lit_low IS NULL OR lit_low > ? THEN ? ELSE lit_low END")
+            values += [low, low]
         now = time.time()
         store._write(lambda conn: conn.execute(
-            f"UPDATE monitors SET {', '.join(f'{n} = ?' for n in names)}, updated_at = ? WHERE id = ?",
-            (*values, now, row.id)))
+            f"UPDATE monitors SET {', '.join(assign)}, updated_at = ? WHERE id = ?", (*values, now, row.id)))
         clear_cache()
         return True
     except Exception:  # noqa: BLE001 - a note never breaks a run
@@ -366,11 +378,20 @@ def note_power(device_path: str, value: int | None, *, wrote: bool = False, pnp:
     return _note(device_path, pnp, label, sets, store)
 
 
-def note_level(device_path: str, level: float | None, *, pnp: str = "", label: str = "", store: Any = None) -> bool:
-    """The display driver read a monitor's brightness (0-100)."""
+def note_level(device_path: str, level: float | None, *, sat: bool = True, pnp: str = "", label: str = "",
+               store: Any = None) -> bool:
+    """The display driver read a monitor's brightness (0-100). ``sat``: a level it sat at (a level they set read back,
+    a read, a turn-on that found it visible): above 0 it is the last level measured while visible (``lit_level``) and
+    may be the lowest (``lit_low``). ``sat=False``: a read a turn-on found dark, or Yuki's own restore read back: the
+    last level only (never a level they chose or sat at)."""
     if level is None:
         return False
-    return _note(device_path, pnp, label, {"level": float(level), "level_at": time.time()}, store)
+    now = time.time()
+    sets: dict[str, Any] = {"level": float(level), "level_at": now}
+    lit = sat and float(level) > 0.0
+    if lit:
+        sets.update(lit_level=float(level), lit_at=now)
+    return _note(device_path, pnp, label, sets, store, low=float(level) if lit else None)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

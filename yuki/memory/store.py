@@ -3666,11 +3666,13 @@ MIGRATIONS: tuple[str, ...] = (
     # start from Windows' own device list (the port and the last removal only: never a sighting, so a monitor Yuki
     # never saw attached is never theirs); the display driver's own reads add the last power (VCP 0xD6) and
     # brightness (0x10), an off it wrote, and ``left_bus`` (1: it left Windows within 30 s of an off or of a read that
-    # said off; 0: it stayed 30 s). Hardware facts only (the EDID name, Plug and Play id, connector, native size, the
-    # port's instance key and GPU target id), never content. ``info_at`` moves only when a stable field does (the
-    # you-card's stamp). The meanings' ``called_ciphertext``: the words the user calls a thing by in the evidence
-    # (their "first"), checked against the cited lines (yuki.memory.meanings). Additive only; one self-contained entry
-    # (renumber freely at a merge).
+    # said off; 0: it stayed 30 s), and the levels it was measured at while visible (``lit_level`` / ``lit_at``: the
+    # last brightness above 0 read; ``lit_low``: the lowest such; a turn-on of a monitor on but dark restores
+    # ``lit_level``; never Yuki's own restore nor a read that turn-on found dark). Hardware facts only (the EDID name,
+    # Plug and Play id, connector, native size, the port's instance key and GPU target id), never content. ``info_at``
+    # moves only when a stable field does (the you-card's stamp). The meanings' ``called_ciphertext``: the words the
+    # user calls a thing by in the evidence (their "first"), checked against the cited lines (yuki.memory.meanings).
+    # Additive only; one self-contained entry (renumber freely at a merge).
     """
     CREATE TABLE IF NOT EXISTS monitors (
         id          INTEGER PRIMARY KEY,
@@ -3692,6 +3694,9 @@ MIGRATIONS: tuple[str, ...] = (
         power_at    REAL,
         level       REAL,
         level_at    REAL,
+        lit_level   REAL,
+        lit_low     REAL,
+        lit_at      REAL,
         off_at      REAL,
         removed_at  REAL,
         left_bus    INTEGER,
