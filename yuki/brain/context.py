@@ -30,10 +30,11 @@
   (``format_now``), as before. It is text for the planner only; the consent rule reads its facts itself.
 * **People named** in the user's words: memory's people index (``frame_facts`` names them, ``contact`` gives routes
   and the user's own last messages, dated), so the planner can ask about a reworded repeat (M12). final-H2 (C3): when
-  their newest words name nobody, the people this talk named before stand in (memory's ``said``, the earlier
-  requests' words kept in RAM for ten minutes); the chat the request acts in comes with its person and the handle it
-  shows: the window in front (the Now board's, :func:`front_screen`), else, from Yuki's own window, the chat they were
-  in last (memory's measured chats in front lately).
+  their newest words name nobody, the people the request just before named stand in, their routes only (memory's
+  ``said``: that request's words, kept in RAM for a follow-on's two minutes); the chat the request acts in comes with
+  its person and the handle it shows: the window in front (the Now board's, :func:`front_screen`), else, from Yuki's
+  own window, the chat they were in last when that was within the same two minutes (memory's measured chats in front
+  lately).
 * **Their places** (lBrain, live problem 11): the pages they watch on each site and the voice channels they joined,
   from memory's tastes and capture threads (:func:`read_places`), with the rule that a channel they name is a place to
   watch first and a join goes only to a channel memory has seen; the plan validator checks a join against the same
@@ -158,11 +159,15 @@ PEOPLE_MAX = 2
 #: Most of the user's own last messages shown per request turn (design 2.3: the last 3 or fewer, dated).
 MESSAGES_MAX = 3
 #: final-H2 (C3, typed T1 under one: "now press enter in discord" named nobody, so the people block was empty and the
-#: model took Hemanth's own DM handle for someone else): the words of the requests the people block was read for
-#: (RAM only, never logged or stored) are kept this long and at most this many, as memory's ``frame_facts`` ``said``
-#: (the people named earlier in this talk); memory's own "chats in front lately" reach (``RECENT_CHAT_MINUTES``).
-EXCHANGE_KEEP_S = 600.0
-EXCHANGE_KEEP = 4
+#: model took Hemanth's own DM handle for someone else): the words of the request the people block was read for (RAM
+#: only, never logged or stored) are kept for the next one, as memory's ``frame_facts`` ``said`` (the people named
+#: just before). lc review F2: only the request just before, and only for a follow-on's while (T1's two steps came
+#: seconds apart): one list serves every brain and conversation of the process, and a people block on a later request
+#: that names nobody sets M9's private read (``bool(gathered.people)``: the planner's direct fetch refused, an
+#: ``open_url`` with a query to the commit check). The same while bounds the chat a typed request from Yuki's own
+#: window acts in (the chat they were in last). Earlier-named people get their route line only, never message samples.
+EXCHANGE_KEEP_S = 120.0
+EXCHANGE_KEEP = 1
 #: How long the Now board's answer is waited for, for the window in front (the chat the request acts in).
 PEOPLE_BOARD_WAIT_S = 0.1
 #: Waits of the parts read for the request turn (s): each part is left out when it misses its wait.
@@ -483,12 +488,21 @@ def _when(at: Any) -> str:
 
 
 _exchange_lock = threading.Lock()
-#: final-H2 (C3): ``(time.time(), words)`` of the requests the people block was read for, newest last (RAM only).
+#: final-H2 (C3): ``(time.time(), words)`` of the request the people block was last read for (at most
+#: :data:`EXCHANGE_KEEP`, newest last; RAM only).
 _exchange: list[tuple[float, str]] = []
 
 
+def _within_follow_on(at: Any) -> bool:
+    """Whether a measured time (epoch seconds) is within :data:`EXCHANGE_KEEP_S` of now; no time, ``False``."""
+    try:
+        return -2.0 <= time.time() - float(at) <= EXCHANGE_KEEP_S   # memory reads captures up to 1 s ahead
+    except (TypeError, ValueError):
+        return False
+
+
 def _exchange_said(words: str) -> list[dict[str, Any]]:
-    """The words of the requests read before this one within :data:`EXCHANGE_KEEP_S` (``frame_facts``' ``said``:
+    """The words of the request read just before this one, within :data:`EXCHANGE_KEEP_S` (``frame_facts``' ``said``:
     ``{"at", "text", "who"}``, the user's own words only), and these words kept for the next one. Never raises."""
     now = time.time()
     text = " ".join(str(words or "").split())
@@ -539,7 +553,8 @@ def front_screen() -> tuple[dict[str, Any] | None, bool]:
 def _person_lines(memory: Any, people: Sequence[Any], *, earlier: bool,
                   messages: list[tuple[float, str, str, str]]) -> list[str]:
     """One line per person (their usual routes; ``earlier``: named earlier in this talk), and their own last messages
-    into ``messages``."""
+    into ``messages`` (only for people their newest words name: lc review F2, an earlier-named person gets the route
+    line alone)."""
     lines: list[str] = []
     for person in list(people)[:PEOPLE_MAX]:
         if not isinstance(person, Mapping):
@@ -561,6 +576,8 @@ def _person_lines(memory: Any, people: Sequence[Any], *, earlier: bool,
         if earlier:
             line += " (named earlier in this talk)"
         lines.append(line)
+        if earlier:
+            continue
         for r in routes:
             if not isinstance(r, Mapping):
                 continue
@@ -576,11 +593,12 @@ def read_people(memory: Any, words: str, *, limit: int, nonce: str, screen: Mapp
     their usual routes and the user's own last messages to them, dated (at most :data:`MESSAGES_MAX` in all), and the
     chat in front. ``""`` when memory names nobody or cannot say. Never raises.
 
-    final-H2 (C3): when their newest words name nobody, the people this talk named before (memory's ``said``: the
-    requests read within :data:`EXCHANGE_KEEP_S`) stand in, marked so. The chat the request acts in, with its person and
-    the handle the chat shows: the window in front (``screen``, :func:`front_screen`; it was never passed, so this line
-    never came), else, when Yuki's own window is in front (``own_front``: a typed request) and their newest words name
-    nobody, the chat they were in last (memory's measured chats in front lately)."""
+    final-H2 (C3): when their newest words name nobody, the people the request just before named (memory's ``said``:
+    the one request read within :data:`EXCHANGE_KEEP_S`) stand in, marked so, with their route line only (lc review
+    F2). The chat the request acts in, with its person and the handle the chat shows: the window in front (``screen``,
+    :func:`front_screen`; it was never passed, so this line never came), else, when Yuki's own window is in front
+    (``own_front``: a typed request) and their newest words name nobody, the chat they were in last (memory's measured
+    chats in front lately), when it was in front within :data:`EXCHANGE_KEEP_S` (a measured time; none, no line)."""
     if memory is None or not getattr(memory, "installed", False) or not words.strip():
         return ""
     said = _exchange_said(words)
@@ -609,6 +627,8 @@ def read_people(memory: Any, words: str, *, limit: int, nonce: str, screen: Mapp
             lines.append(f"- The chat in front is with {who}" + (f" ({shown})." if shown else "."))
     elif own_front and not named:
         last = next((p for p in facts.get("recent") or [] if isinstance(p, Mapping) and p.get("name")), None)
+        if last is not None and not _within_follow_on(last.get("at")):
+            last = None   # lc review F2: not the chat they came from just now (memory's reach is ten minutes)
         if last is not None:
             shown = one_line(last.get("route"), 60)
             when = _when(last.get("at"))

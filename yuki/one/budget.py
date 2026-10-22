@@ -55,23 +55,22 @@ LINE_REST_LEFT = "I couldn't get to the rest of it. Want me to try another way?"
 #: final-H2 (C2, kw_name_word_in_text under one: two refused typings and a skill run that touched nothing settled with
 #: "the rest of it", as if part were done): the second refusal settled a turn in which no call took or touched the PC
 #: (the runner's measured facts, ``policy.Turn.took``): code says nothing was done and why, by the refusal's own code
-#: word (:data:`NOTHING_WHY`), then its one other way (:data:`NOTHING_OFFER`, else :data:`OFFER_OTHER_WAY`).
+#: word (:data:`NOTHING_WHY`, :data:`SHARED_WHY`), then its one other way (:data:`NOTHING_OFFER`, else :data:`OFFER_OTHER_WAY`).
 LINE_NOTHING_DONE = "I didn't do any of that: {why}."
 LINE_NOTHING_PLAIN = "I didn't do any of that."
 OFFER_OTHER_WAY = "Want me to try another way?"
 #: The gate's and this budget's refusal code words (``Decision.reason``) -> why, in code's plain words for the user.
-#: A code word not here: :data:`LINE_NOTHING_PLAIN` (never a guessed reason).
-_SEND_UNASKED = "that would have sent a message you didn't ask me to send"
+#: A code word not here nor in :data:`SHARED_WHY`: :data:`LINE_NOTHING_PLAIN` (never a guessed reason).
+#: lc review F1: a send refusal is about the way a message goes (only run_skill message, with consent and the
+#: countdown), never about whether they asked: "a message you didn't ask me to send" was said right after their "now
+#: press enter" (consent's sBrainFix trap). ``send_by_code``'s words make no claim about their ask.
 _SEND_UNMATCHED = "I couldn't match that message to your own words, so nothing was sent"
 NOTHING_WHY: dict[str, str] = {
     "chat_type": "I only put words in a chat as a message to someone you name",
-    "send_by_code": _SEND_UNASKED, "undeclared_send": _SEND_UNASKED, "not_capability": _SEND_UNASKED,
-    "recipient": _SEND_UNMATCHED, "recipient_slot": _SEND_UNMATCHED, "text_mismatch": _SEND_UNMATCHED,
-    "quote": _SEND_UNMATCHED, "quote_turn": _SEND_UNMATCHED, "send_slot": _SEND_UNMATCHED,
-    "declared_draft": _SEND_UNMATCHED,
-    "no_draft": "that can't be left as a draft",
+    "send_by_code": "a message goes out only through the chat app's own way, with the countdown",
+    "text_mismatch": _SEND_UNMATCHED, "quote": _SEND_UNMATCHED, "quote_turn": _SEND_UNMATCHED,
+    "send_slot": _SEND_UNMATCHED, "declared_draft": _SEND_UNMATCHED,
     "already_sent": "that message already went to them",
-    "device_key": "that key flips your mic or camera whatever state it's in",
     "join_unidentified": "I couldn't tell what that button on the call does",
     "shell_long": "that command was too long for my check",
     "error": "my check couldn't run",
@@ -88,6 +87,20 @@ NOTHING_OFFER: dict[str, str] = {
     "chat_type": "Who's it for?",
     "already_sent": "", "budget_lasting_retry": "", "tidy_off": "", "tidy_steps": "",
 }
+#: lc review F1: the code words the commit check's rules already word for the user (``yuki.brain.consent.PLAIN_WHY``):
+#: their words are read from there, one source (looked up when said, so this module imports nothing of Yuki's).
+SHARED_WHY = frozenset({"undeclared_send", "not_capability", "recipient", "recipient_slot", "no_draft", "device_key"})
+
+
+def _shared_why(code: str) -> str:
+    """``consent.PLAIN_WHY``'s words for a :data:`SHARED_WHY` code word; ``""`` when they can't be read (the plain
+    line, never a guessed reason). Never raises."""
+    try:
+        from yuki.brain.consent import PLAIN_WHY
+
+        return " ".join(str(PLAIN_WHY.get(code) or "").split())
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def settle_line(reason: str = "", *, nothing_done: bool = False) -> str:
@@ -97,7 +110,7 @@ def settle_line(reason: str = "", *, nothing_done: bool = False) -> str:
     if not nothing_done:
         return LINE_REST_LEFT
     code = str(reason or "")
-    why = NOTHING_WHY.get(code, "")
+    why = _shared_why(code) if code in SHARED_WHY else NOTHING_WHY.get(code, "")
     head = LINE_NOTHING_DONE.format(why=why) if why else LINE_NOTHING_PLAIN
     offer = NOTHING_OFFER.get(code, OFFER_OTHER_WAY) if why else OFFER_OTHER_WAY
     return f"{head} {offer}".strip()
@@ -492,5 +505,5 @@ Turn = TurnBudget
 
 __all__ = ["LINE_CLOSED", "LINE_HOLD_MISS", "LINE_LASTING_RETRY", "LINE_NOTHING_DONE", "LINE_NOTHING_PLAIN",
            "LINE_READS_SPENT", "LINE_REST_LEFT", "LINE_RETRY_SPENT", "LINE_SAME_STEP", "LINE_SPENT", "Limits",
-           "NOTHING_OFFER", "NOTHING_WHY", "OFFER_OTHER_WAY", "OK", "Spend", "TYPED", "Turn", "TurnBudget", "VOICE",
-           "limits_for", "settle_line", "step_key"]
+           "NOTHING_OFFER", "NOTHING_WHY", "OFFER_OTHER_WAY", "OK", "SHARED_WHY", "Spend", "TYPED", "Turn",
+           "TurnBudget", "VOICE", "limits_for", "settle_line", "step_key"]

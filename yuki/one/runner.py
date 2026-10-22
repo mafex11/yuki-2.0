@@ -632,6 +632,11 @@ def state_of(turn: Any) -> RunState:
     return state
 
 
+#: lc review F3: the call running on this worker thread: ``last``, whether it is the last call of the model's reply
+#: (:meth:`Runner.run`'s ``last``; ``None``: not known). Per thread, because a reply's calls may run side by side.
+_CALL = threading.local()
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # One call on its worker thread: the gate at the verbs' authorizer points
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1225,10 +1230,22 @@ class Runner:
     # -- the entry points ------------------------------------------------------------------------------------------
 
     def run(self, name: str, args: Mapping[str, Any] | None, turn: policy.Turn,
-            speak: Callable[[str], Any] | None = None, call_id: str = "") -> OneResult:
+            speak: Callable[[str], Any] | None = None, call_id: str = "", last: bool | None = None) -> OneResult:
         """One call, blocking (the caller's worker thread: the verb runs here, holding the desk lease here). Never
         raises: an error is a failure, nothing more done. ``call_id``: the model's tool call id (the voice driver
-        passes it by name), for the say_first spoken early for it (:meth:`_early_heard`)."""
+        passes it by name), for the say_first spoken early for it (:meth:`_early_heard`). ``last``: whether this call
+        is the last of the model's reply (the voice driver's ``group.last(call_id)``, passed by name); ``None``: not
+        known (lc review F3: a skill's question is said by code only when no later call of the reply is left,
+        :meth:`_ask_by_code`)."""
+        _CALL.last = last
+        try:
+            return self._run_one(name, args, turn, speak, call_id)
+        finally:
+            _CALL.last = None
+
+    def _run_one(self, name: str, args: Mapping[str, Any] | None, turn: policy.Turn,
+                 speak: Callable[[str], Any] | None, call_id: str) -> OneResult:
+        """:meth:`run`'s body."""
         started = time.perf_counter()
         name = str(name or "")
         args = dict(args) if isinstance(args, Mapping) else {}
@@ -1286,7 +1303,8 @@ class Runner:
         return True
 
     async def arun(self, name: str, args: Mapping[str, Any] | None, turn: policy.Turn,
-                   speak: Callable[[str], Any] | None = None, call_id: str = "") -> OneResult:
+                   speak: Callable[[str], Any] | None = None, call_id: str = "",
+                   last: bool | None = None) -> OneResult:
         """:meth:`run` on a worker thread (never on the event loop), the turn's calls one after another in the order
         they arrived (Pipecat starts a reply's calls side by side, in the order written; ``asyncio.Lock`` wakes its
         waiters first come, first served: the hands' order gate, ``Hands._enter_order``)."""
@@ -1295,7 +1313,7 @@ class Runner:
         if state.order is None or state.order[0] is not loop:
             state.order = (loop, asyncio.Lock())
         async with state.order[1]:
-            return await asyncio.to_thread(self.run, name, args, turn, speak, call_id)
+            return await asyncio.to_thread(self.run, name, args, turn, speak, call_id, last)
 
     @staticmethod
     def answer(turn: policy.Turn, yes: bool) -> None:
@@ -2570,10 +2588,14 @@ class Runner:
         under ``all``, where code says it with the run. Voice only (the typed loop asks in its own way), with a speaker
         that said it, only when the call leaves nothing of their request for later (its ``then`` empty) and the reply's
         earlier calls left nothing for the agent (each clean, a read or a driver tool's). The budget is closed, so no
-        later call of the same reply acts before they answer. Code facts only; never raises."""
+        later call of the same reply acts before they answer. lc review F3: never when the driver says a later call of
+        the reply is left (``last`` False, :data:`_CALL`): closing the turn would settle that call silently, neither
+        done nor said; the agent words the question then, as before C3. Code facts only; never raises."""
         try:
             budget = getattr(turn, "budget", None)
             if turn.channel != "voice" or say is None or result.then or (budget is not None and budget.closed):
+                return
+            if getattr(_CALL, "last", None) is False:
                 return
             earlier = [r for r in state.results if r.round == state.round]
             if any(not (r.clean or r.status in (READ, DRIVER)) for r in earlier):
