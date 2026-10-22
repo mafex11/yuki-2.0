@@ -17,7 +17,8 @@ stayed attached that long after an off; ``None`` not measured). The levels it wa
 last brightness above 0 read (``lit_level``, ``lit_at``) and the lowest (``lit_low``), from the reads of the level it
 sat at (a level they set read back, a read, a turn-on that found it visible), never Yuki's own restore and never a
 read that a turn-on found dark (22 Oct: "turn on my first monitor" with the 24HC1QR on at 0%: the driver restores
-``lit_level``, the middle of its range with none).
+``lit_level``, the middle of its range with none). ``lit_low`` is 0 only from a 0 read taken while they were using
+that monitor (the window in front on it, their own input just now): 0% is then a level they sit at, never dark.
 
 **Writers** (code only, measured facts, never a model, never the user's words):
 
@@ -49,7 +50,8 @@ Public::
     match(rows, device_path, pnp, label) -> Known | None
     words(row, heard=True) -> tuple[str, ...]    # their words for it (learned), then heard forms
     card_stamp(store) -> tuple                   # what the you-card's monitor line depends on
-    note_power(device_path, value, *, wrote=False, pnp="", label="")  /  note_level(device_path, level, sat=True, ...)
+    note_power(device_path, value, *, wrote=False, pnp="", label="")
+    note_level(device_path, level, *, sat=True, used=False, pnp="", label="")
     Recorder(store, log=None).tick(now)          # the timeline's sightings
 """
 
@@ -368,7 +370,8 @@ def _note(device_path: str, pnp: str, label: str, sets: dict[str, Any], store: A
 def note_power(device_path: str, value: int | None, *, wrote: bool = False, pnp: str = "", label: str = "",
                store: Any = None) -> bool:
     """The display driver read a monitor's power (VCP 0xD6, 1 on, 2-5 standby or off) or wrote it (``wrote``: an
-    off it wrote is kept as ``off_at``). ``False`` when the monitor has no row yet (the service's recorder writes it)."""
+    off it wrote is kept as ``off_at``). ``False`` when the monitor has no row yet (the service's recorder writes
+    it)."""
     if value is None:
         return False
     now = time.time()
@@ -378,12 +381,16 @@ def note_power(device_path: str, value: int | None, *, wrote: bool = False, pnp:
     return _note(device_path, pnp, label, sets, store)
 
 
-def note_level(device_path: str, level: float | None, *, sat: bool = True, pnp: str = "", label: str = "",
-               store: Any = None) -> bool:
+def note_level(device_path: str, level: float | None, *, sat: bool = True, used: bool = False, pnp: str = "",
+               label: str = "", store: Any = None) -> bool:
     """The display driver read a monitor's brightness (0-100). ``sat``: a level it sat at (a level they set read back,
     a read, a turn-on that found it visible): above 0 it is the last level measured while visible (``lit_level``) and
     may be the lowest (``lit_low``). ``sat=False``: a read a turn-on found dark, or Yuki's own restore read back: the
-    last level only (never a level they chose or sat at)."""
+    last level only (never a level they chose or sat at). ``used`` (fix round 2, 22 Oct): the read was taken while
+    they were using that monitor (the window in front on it and their own keyboard or mouse input just now: the
+    driver's ``_in_use``), so even 0 is a level they sat at and ``lit_low`` may become 0 (at 10:50 the VG271U read 0%
+    as their primary while they worked on it). A 0 read without it never counts (the 24HC1QR read 0% overnight and at
+    08:44 with nothing of theirs in front on it). ``lit_level`` stays the last level above 0."""
     if level is None:
         return False
     now = time.time()
@@ -391,7 +398,8 @@ def note_level(device_path: str, level: float | None, *, sat: bool = True, pnp: 
     lit = sat and float(level) > 0.0
     if lit:
         sets.update(lit_level=float(level), lit_at=now)
-    return _note(device_path, pnp, label, sets, store, low=float(level) if lit else None)
+    low = float(level) if sat and (lit or used) else None
+    return _note(device_path, pnp, label, sets, store, low=low)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
