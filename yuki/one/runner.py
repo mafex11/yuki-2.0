@@ -76,6 +76,15 @@ question itself (``diff.tidy_ask``, fa note 4). A verified browser focus says th
 note 5). The D6 line's front test is ``diff.front_moved_on``, one rule for both brains (fb note A3). A countdown a
 chip changed owes nothing (fc note 3).
 
+**final-H2** (lane lc, the last loop; measured facts and the model's structured fields only): a draft's own wording is
+typed only into the chat the run measured (its route's app, its own window: :meth:`Runner._chat_windows`, as
+``Executor._skill_windows``), never compared with the capability's generic app, and never a second time beside Yuki's
+own unsent text already waiting there (C1); every call that took or touched the PC is a turn fact
+(``policy.Turn.took``), so the second refusal of a turn that did nothing says so and why (C2, ``budget.settle_line``);
+on voice a skill run's own structured question is said by code at once and settles the turn, which awaits their
+answer with no model round (C3, :meth:`Runner._ask_by_code`); ``look what="apps"`` is a measured read of the running
+apps (C4, :func:`apps_now`).
+
 **The turn state** (:class:`RunState` on the gate's ``Turn``): every result, the act's own windows (tidy), the lines
 said; ``private_read`` and the refusal count are the gate's and the budget's (``policy.Turn``, ``budget.TurnBudget``).
 
@@ -143,6 +152,9 @@ LINE_BUSY = "Not done: another hand of Yuki's is using the mouth and keyboard ri
 LINE_NOT_ONE = "Not done: Yuki's ONE brain is not switched on here, so nothing was done."
 #: A drafted message whose chat Yuki couldn't see open (``executor.LINE_CHAT_UNCONFIRMED``).
 LINE_CHAT_UNCONFIRMED = "I couldn't confirm the chat is open, so I didn't type anything."
+#: final-H2 (C1; safety lane §4d): a draft's wording not typed a second time: Yuki's own unsent text already waits in
+#: that very chat (the same wording, or text whose words are not known). Code's words, true either way.
+LINE_DRAFT_WAITS = "My unsent draft is already waiting in that chat, so I left it as it is."
 #: The skill engine's outcomes after which a send did not go (``executor.NOT_SENT_OUTCOMES``).
 NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "held_call", "failed", "not_done"})
 #: tidy21 (the user's decision 1, 19 Oct): under the tidy dial "do" code takes the flagged diff's one legal undoable
@@ -428,6 +440,9 @@ class OneResult:
     #: effect in the very window it acted on (``util.media_effect``): ``"media"``; for the voice driver's claim gate
     #: only (``OneVoice.acted``), never the status, the settle rule or what the agent reads (it reads After itself).
     effect: str = ""
+    #: final-H2 (C3): the model reply this call came in (the budget's round count when it ran), so a skill's own
+    #: question is said by code only when the reply's earlier calls left nothing for the agent (RAM only).
+    round: int = 0
 
     @property
     def refused(self) -> bool:
@@ -601,6 +616,8 @@ class RunState:
     #: question (the window the close acted in, the question's own window when measured), each with their words as
     #: they stood then: until their words change, no call of the turn acts there (:func:`_held_close`).
     held: dict[int, tuple[str, ...]] = field(default_factory=dict)
+    #: final-H2 (C3): the model reply the call running now came in (the budget's round count).
+    round: int = 0
 
 
 def state_of(turn: Any) -> RunState:
@@ -931,6 +948,42 @@ def _skill_app(sk: Any, slots: Mapping[str, Any], app: str) -> str:
     return _words(app)
 
 
+def _note_took(turn: Any) -> None:
+    """final-H2 (C2): ``Turn.note_took`` read with getattr (a stand-in turn without it: nothing kept). Never raises."""
+    note = getattr(turn, "note_took", None)
+    if callable(note):
+        try:
+            note()
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            pass
+
+
+def _skill_programs(route: Any, key: str, slots: Mapping[str, Any], app: str) -> frozenset[str]:
+    """final-H2 (C1): the programs (app keys) of the app a capability's run acted in (``Executor._skill_programs``,
+    copied): the route it took (``payload.route``, its ``args.app``), else the value of its slot of type ``app``, else
+    the capability's app; that app's connection data (``[chat] processes`` / ``images``). Empty: the data names none.
+    Catalog data only; never raises."""
+    try:
+        sk = util.skill(key)
+        if sk is None:
+            return frozenset()
+        taken = str(route or "")
+        name = ""
+        for r in getattr(sk, "routes", ()) or ():
+            if taken and str(getattr(r, "key", "") or "") == taken:
+                name = str((getattr(r, "args", None) or {}).get("app") or "")
+                break
+        name = name or _skill_app(sk, slots, "") or str(getattr(sk, "app", "") or "") or _words(app)
+        from yuki.memory.store import app_key
+        from yuki.skills.chat import app_data
+
+        data = app_data(name) if name else {}
+        names = [str(n) for n in list(data.get("processes") or []) + list(data.get("images") or [])]
+        return frozenset(k for k in (app_key(n) for n in names) if k)
+    except Exception:  # noqa: BLE001 - no data: the fit is unknown
+        return frozenset()
+
+
 def _hwnd_of(value: Any) -> int | None:
     if value is None or isinstance(value, bool):
         return None
@@ -1188,6 +1241,7 @@ class Runner:
             # the call before it acts (refused or not), so no master change of the turn is ever called a side effect
             state.sound = True
         early = self._early_heard(call_id, state)
+        state.round = int(getattr(getattr(turn, "budget", None), "rounds", 0) or 0)
         try:
             result = self._run(name, args, turn, say, state)
         except Exception as exc:  # noqa: BLE001 - fail closed
@@ -1195,6 +1249,9 @@ class Runner:
                                evidence={"why": "Yuki's runner broke on this call"}, owed=OWED_LINES[FAILED])
             self._emit("one_run_error", tool=name, error=type(exc).__name__)
         result.ms = (time.perf_counter() - started) * 1000.0
+        result.round = state.round
+        if result.status in (DONE, ALREADY, WRITTEN, STOPPED):
+            _note_took(turn)   # final-H2 (C2): it took (a memory write kept counts), for the settle line
         budget = getattr(turn, "budget", None)
         if budget is not None and budget.late() and not result.settle:
             # the turn was closed while this ran (the hard stop): its result settles silently (code said the owed line)
@@ -1340,6 +1397,8 @@ class Runner:
     # -- reads and writes ----------------------------------------------------------------------------------------------
 
     def _read(self, name: str, args: dict[str, Any], turn: policy.Turn, state: RunState, say: Any) -> OneResult:
+        if name == "look" and _words(args.get("what")).casefold() == T.APPS_LOOK:
+            return self._apps(name, args, turn, state, say)
         facts = self._facts_of(args.get("window"))
         decision = policy.gate(name, args, facts, turn)
         if not decision.allowed:
@@ -1350,6 +1409,27 @@ class Runner:
             self._learn_payload(got.payload)
         return OneResult(name, READ if got.ok else FAILED, verified=None, result=got.text, decision=decision,
                          payload=got.payload, verb=got.tool)
+
+    def _apps(self, name: str, args: dict[str, Any], turn: policy.Turn, state: RunState, say: Any) -> OneResult:
+        """final-H2 (C4, m21_ps_read_answers under one: "which app uses the most memory right now" was answered from a
+        26 Sep chat): ``look what="apps"``, a read of the running apps measured now (:func:`apps_now`: memory and CPU,
+        every process of one program summed, as Task Manager counts them), through the gate as a read (no shell, no
+        commit check, never a window touched). The text is fenced (program names are outside text). Never raises."""
+        decision = policy.gate(name, args, {}, turn)
+        if not decision.allowed:
+            return self._refused(name, decision, say, state, turn)
+        started = time.perf_counter()
+        try:
+            got = apps_now()
+            text = reads._fence(apps_text(got), tool="read_apps", tool_input={}, nonce=state.nonce,
+                                source="Windows' list of running programs, measured now")
+            ok = True
+        except Exception as exc:  # noqa: BLE001 - a read that broke says so
+            got, text, ok = {}, f"The running apps could not be read ({type(exc).__name__}).", False
+        self._emit("one_apps_read", ok=ok, apps=len(got.get("apps") or ()) if ok else 0,
+                   ms=round((time.perf_counter() - started) * 1000, 1))
+        return OneResult(name, READ if ok else FAILED, verified=None, result=text, decision=decision,
+                         verb="read_apps")
 
     def _write(self, name: str, args: dict[str, Any], turn: policy.Turn, state: RunState, say: Any) -> OneResult:
         decision = policy.gate(name, args, {}, turn)
@@ -1432,7 +1512,9 @@ class Runner:
                     and not getattr(decision, "settle", False):
                 # a later target of the call refused (an inner decision): the call's refusal all the same (the gate
                 # counts only the agent's own first decision); the second refusal of the turn settles it
-                spend = budget.refused(decision.line if decision.final else "")
+                spend = budget.refused(decision.line if decision.final else "",
+                                       reason=str(getattr(decision, "reason", "") or ""),
+                                       nothing_done=not int(getattr(turn, "took", 0) or 0))
                 if spend.settle:
                     decision = replace(decision, settle=True, line=spend.line)
             return self._refused(name, decision, say, state, turn)
@@ -1511,6 +1593,10 @@ class Runner:
             if facts.get("held") and facts.get("question"):
                 result.status, result.question = ASKED, str(facts.get("question") or "")
         acted = facts.get("sent_at") is not None or status in (DONE, NOT_CONFIRMED, FAILED)
+        if acted and not (name == "run_skill" and facts.get("acted") is False and facts.get("type_after") != "typed"):
+            # final-H2 (C2): a call that may have changed the PC (a skill run the engine measured touching nothing,
+            # with no draft typed after it, did not), for the second refusal's settle line (``Turn.took``)
+            _note_took(turn)
         if ctx.before is not None:
             self._diff(name, resolved, facts, ctx, result, turn, state, scope=scope, say=say)
         if acted or result.status == DONE:
@@ -2394,7 +2480,7 @@ class Runner:
                         else:
                             second = ""
                 if drafted and decision.type_after and ok:
-                    ok, report, facts = self._type_after(turn, decision, key, app, ok, report, facts)
+                    ok, report, facts = self._type_after(turn, decision, key, app, ok, report, facts, run_slots)
         facts = dict(facts or {})
         if second:
             facts["second_way"] = second
@@ -2464,6 +2550,8 @@ class Runner:
         result.second = second
         if counted:
             result.countdown = "sent"
+        if result.status == ASKED and result.question and not result.said:
+            self._ask_by_code(result, turn, say, state)
         if result.status == DONE and result.verified is True:
             # one20 (S5): a later pick re-run of this skill by code's second way (this turn or the next) is a
             # correction of this run (kw2, B2: the slots it was given are no longer kept: nothing reads a re-ask)
@@ -2473,6 +2561,32 @@ class Runner:
         if prefs is not None:
             self._after_skill(prefs)
         return result
+
+    def _ask_by_code(self, result: OneResult, turn: policy.Turn, say: Any, state: RunState) -> None:
+        """final-H2 (C3; k_clarify_who_draft, kw_not_now_answer under one: the skill's own "Who to?" went back to the
+        model and a second round worded it, 8.5 s against all's 3.1 s): a skill run's own structured question (the
+        engine's ``ask``, :meth:`_skill`'s ``_asked``) is said by code at once and settles the turn with no model
+        round; the turn awaits their answer (their next words carry it, the result stays in the agent's context), as
+        under ``all``, where code says it with the run. Voice only (the typed loop asks in its own way), with a speaker
+        that said it, only when the call leaves nothing of their request for later (its ``then`` empty) and the reply's
+        earlier calls left nothing for the agent (each clean, a read or a driver tool's). The budget is closed, so no
+        later call of the same reply acts before they answer. Code facts only; never raises."""
+        try:
+            budget = getattr(turn, "budget", None)
+            if turn.channel != "voice" or say is None or result.then or (budget is not None and budget.closed):
+                return
+            earlier = [r for r in state.results if r.round == state.round]
+            if any(not (r.clean or r.status in (READ, DRIVER)) for r in earlier):
+                return
+            said, heard = self._speak(result.question, say, state)
+            if not heard:
+                return
+            result.said, result.heard, result.line, result.settle = said, True, said, True
+            if budget is not None:
+                budget.close("asked")
+            self._emit("one_ask_by_code", said=bool(said), earlier=len(earlier))
+        except Exception:  # noqa: BLE001 - the agent words the question, as before
+            pass
 
     # -- one20: the second way, the guessed reading, the hand-off for ONE ---------------------------------------------
 
@@ -2964,7 +3078,12 @@ class Runner:
 
     def _note_chat(self, turn: policy.Turn, app: str) -> None:
         """One20 (S17): the window in front after a message skill's verified run, when it is that skill's app: the chat
-        it opened (the agent's own typing there is allowed this turn). Never raises."""
+        it opened (the agent's own typing there is allowed this turn). Never raises.
+
+        final-H2 (C1) note: this compares with the capability's own app (``"chat"`` for ``message``), which no chat
+        window matches, so the agent's own typing stays refused in every chat window (``policy`` ``chat_type``). Left
+        as it is on purpose in the last loop: :meth:`_chat_windows` would open that typing path, never exercised live;
+        a draft's own wording is typed by code (:meth:`_type_after`), which now measures the run's chat."""
         note = getattr(turn, "note_chat", None)
         if not callable(note) or not app:
             return
@@ -3112,6 +3231,14 @@ class Runner:
             facts["acted"] = payload["acted"]               # C1 (review fix F6): something on the PC was touched
         if isinstance(payload.get("acted_apps"), (list, tuple)):
             facts["acted_apps"] = [str(a) for a in payload["acted_apps"] if isinstance(a, str) and a.strip()]
+        # final-H2 (C1, typed T1 under one): where the run's chat is, as the run measured it (the route it took, the
+        # windows its rungs brought forward, the window it reports), for :meth:`_chat_windows` (code facts, RAM only)
+        facts["_route"] = str(payload.get("route") or "")
+        facts["_acted_windows"] = [int(h) for h in payload.get("acted_windows") or ()
+                                   if isinstance(h, int) and not isinstance(h, bool) and h]
+        own = details.get("hwnd")
+        if isinstance(own, int) and not isinstance(own, bool) and own:
+            facts["_hwnd"] = int(own)
         if isinstance(payload.get("evidence"), Mapping):
             facts["evidence"] = dict(payload["evidence"])
         if refused:
@@ -3121,25 +3248,64 @@ class Runner:
                          if isinstance(b, Mapping) and b.get("type") == "text") or str(outcome.summary or "")
         return bool(getattr(outcome, "ok", False)), text, facts
 
+    def _chat_windows(self, facts: Mapping[str, Any], key: str, slots: Mapping[str, Any], app: str
+                      ) -> tuple[int | None, dict[str, Any], bool | None]:
+        """final-H2 (C1, typed T1 under one: ``_type_after`` compared the window in front with the capability's generic
+        app ``"chat"``, so a draft's wording was never typed): where a capability's chat is now, as
+        ``Executor._skill_windows`` measures it (copied, never imported): ``(the window in front, its facts, whether it
+        is the run's chat)``. The window list is read fresh (a chat the run just opened is on no earlier summary); the
+        run's programs are its route's own app (``payload.route``), else its app slot, else the capability's app, by that
+        app's connection data (``[chat] processes`` / ``images``). A run that reports its window needs that window in
+        front; data that names no program: the window in front is one the run's rungs measurably brought forward
+        (``acted_windows``), else unknown (``None``). Never raises."""
+        from yuki.brain import done
+        from yuki.memory.store import app_key
+
+        try:
+            now = done.overview(self.dispatcher)
+        except Exception:  # noqa: BLE001
+            now = {}
+        front = done.as_hwnd(now.get("foreground_hwnd"))
+        if front is None:
+            try:
+                front = done.as_hwnd(self.verbs.foreground())
+            except Exception:  # noqa: BLE001
+                front = None
+        entry = next((w for w in now.get("windows") or [] if isinstance(w, Mapping)
+                      and done.as_hwnd(w.get("hwnd")) == front), {}) if front else {}
+        target = {**self._facts_of(front)} if front else {}
+        if entry:
+            target.update({k: v for k, v in (("app", entry.get("process_name")), ("title", entry.get("title")))
+                           if str(v or "").strip()})
+        programs = _skill_programs(facts.get("_route"), key, slots, app)
+        fits: bool | None = None
+        if programs and front:
+            fits = app_key(str(target.get("app") or "")) in programs
+        own = done.as_hwnd(facts.get("_hwnd"))
+        if own is not None:
+            fits = own == front and fits is not False
+        elif fits is None and front and facts.get("_acted_windows"):
+            fits = front in set(facts.get("_acted_windows") or ())
+        return front, target, fits
+
     def _type_after(self, turn: policy.Turn, decision: Any, key: str, app: str, ok: bool, report: str,
-                    facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+                    facts: dict[str, Any], slots: Mapping[str, Any] | None = None) -> tuple[bool, str, dict[str, Any]]:
         """A draft's own wording (``Decision.type_after``) typed with no Enter once the chat is open and in front:
-        through the gate (an inner step; it marks the text as Yuki's unsent text), never around it."""
+        through the gate (an inner step; it marks the text as Yuki's unsent text), never around it. final-H2 (C1): the
+        window in front must be the run's own chat as the run measured it (:meth:`_chat_windows`); unknown is not
+        typed into (fail closed). The latent second copy (safety lane §4d): when Yuki's own unsent text already waits
+        in that chat (the same wording, or text not known), nothing is typed again and code says the draft is there."""
         if facts.get("verified") is not True:
             return False, LINE_CHAT_UNCONFIRMED, {**facts, "verified": False, "type_after": "not_open"}
-        front = None
-        try:
-            front = self.verbs.foreground()
-        except Exception:  # noqa: BLE001
-            front = None
-        target = self._facts_of(front) if front else {}
-        from yuki.voice.hands import _app_id
-
-        same = bool(front and app) and (_app_id(target.get("app")) == _app_id(app) or _app_id(
-            util.app_name(target.get("app") or "")) == _app_id(util.app_name(app)))
-        if not same:
+        front, target, fits = self._chat_windows(facts, key, slots or {}, app)
+        if not front or fits is not True:
             return False, LINE_CHAT_UNCONFIRMED, {**facts, "verified": False, "type_after": "not_in_front"}
         text = str(decision.type_after or "")
+        waiting = policy.typed_text(front)
+        if waiting is not None and (not waiting or _words(waiting).casefold().endswith(_words(text).casefold())):
+            self._emit("one_type_after", how="waiting", known=bool(waiting))
+            return True, f"{report}; Yuki's unsent text already waits in that chat, nothing typed again", \
+                {**facts, "verified": True, "type_after": "waiting", "done_line": LINE_DRAFT_WAITS}
         gated = policy.gate("type_text", {"hwnd": int(front), "text": text}, target, turn, inner=True)
         if not gated.allowed:
             return False, gated.line or "I opened the chat but didn't type the text in.", \
@@ -3177,6 +3343,123 @@ class Runner:
             pass
 
 
+#: final-H2 (C4): the CPU sample of ``look what="apps"`` (two process-list reads this far apart), and how many apps each
+#: list names.
+APPS_SAMPLE_S = 0.75
+APPS_TOP = 5
+#: The least CPU share (percent of the whole processor) an app needs to be on the CPU list (below it: idle, not news).
+APPS_CPU_MIN = 0.5
+#: Process ids that are no program of the user's: the idle process and the kernel's (Windows' fixed ids; structure).
+_NOT_APPS = frozenset({0, 4})
+
+
+def _process_times() -> dict[int, tuple[str, float, int]]:
+    """Every process now: ``pid -> (image name, private working set MB, CPU time used in 100 ns)``, in one
+    ``NtQuerySystemInformation`` call (``perception.system``'s structure; its ``_process_entries`` keeps no CPU time).
+    Read-only. Raises on a failed read."""
+    import ctypes
+    from ctypes import wintypes
+
+    from yuki.perception import system as S
+
+    ntdll = ctypes.windll.ntdll
+    size = 512 * 1024
+    for _ in range(8):
+        buffer = ctypes.create_string_buffer(size)
+        needed = wintypes.ULONG(0)
+        status = ntdll.NtQuerySystemInformation(ctypes.c_ulong(S._SYSTEM_PROCESS_INFORMATION), buffer,
+                                                ctypes.c_ulong(size), ctypes.byref(needed))
+        if status == 0:
+            break
+        if status & 0xFFFFFFFF != S._STATUS_INFO_LENGTH_MISMATCH:
+            raise OSError(f"NtQuerySystemInformation failed: {status:#x}")
+        size = max(needed.value + 64 * 1024, size * 2)
+    else:
+        raise OSError("NtQuerySystemInformation: buffer never large enough")
+    out: dict[int, tuple[str, float, int]] = {}
+    offset, base = 0, ctypes.addressof(buffer)
+    while True:
+        entry = S._SystemProcessInformation.from_address(base + offset)
+        pid = int(entry.UniqueProcessId or 0)
+        out[pid] = (str(entry.ImageName.Buffer or ""), max(0, int(entry.WorkingSetPrivateSize)) / (1024 * 1024),
+                    int(entry.UserTime) + int(entry.KernelTime))
+        if entry.NextEntryOffset == 0:
+            break
+        offset += entry.NextEntryOffset
+    return out
+
+
+def apps_now(*, sample_s: float = APPS_SAMPLE_S, top: int = APPS_TOP,
+             snapshot: Callable[[], Mapping[int, tuple[str, float, int]]] | None = None,
+             sleep: Callable[[float], Any] = time.sleep, clock: Callable[[], float] = time.monotonic,
+             cpus: int | None = None) -> dict[str, Any]:
+    """final-H2 (C4): the running apps measured now, every process of one program summed (Task Manager's figures:
+    memory is the private working set; CPU is the share of the whole processor between two reads ``sample_s`` apart):
+    ``{"apps": every app [{"name", "mb", "cpu", "n"}], "by_mb" / "by_cpu": the top ``top`` of each (the CPU list only
+    apps at :data:`APPS_CPU_MIN` or more), "cpu_busy": the whole processor's percent (``None``: unread), "sample_s": the
+    measured span}``. A process id another program took between the reads counts no CPU. Machine facts only; raises on
+    a failed read."""
+    import os
+
+    from yuki.memory.store import app_key
+
+    read = snapshot or _process_times
+    first, t0 = dict(read()), clock()
+    sleep(max(0.0, float(sample_s)))
+    second, t1 = dict(read()), clock()
+    seconds = max(1e-3, t1 - t0)
+    span = seconds * 1e7 * max(1, int(cpus or os.cpu_count() or 1))
+    rows: dict[str, dict[str, Any]] = {}
+    for pid, (image, mb, used) in second.items():
+        before = first.get(pid)
+        cpu = (max(0, used - before[2]) / span * 100.0) if before is not None and before[0] == image else 0.0
+        if pid in _NOT_APPS or not image:
+            continue
+        key = app_key(image) or image.casefold()
+        row = rows.setdefault(key, {"name": util.app_name(image), "mb": 0.0, "cpu": 0.0, "n": 0})
+        row["mb"] += float(mb)
+        row["cpu"] += cpu
+        row["n"] += 1
+    idle = second.get(0)
+    was = first.get(0)
+    busy = None
+    if idle is not None and was is not None:
+        busy = max(0.0, min(100.0, 100.0 - max(0, idle[2] - was[2]) / span * 100.0))
+    every = list(rows.values())
+    by_mb = sorted(every, key=lambda r: -r["mb"])[:max(1, top)]
+    by_cpu = sorted((r for r in every if r["cpu"] >= APPS_CPU_MIN), key=lambda r: -r["cpu"])[:max(1, top)]
+    return {"apps": every, "by_mb": by_mb, "by_cpu": by_cpu, "cpu_busy": busy, "sample_s": seconds}
+
+
+def _size(mb: float) -> str:
+    return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+
+
+def apps_text(got: Mapping[str, Any]) -> str:
+    """final-H2 (C4): :func:`apps_now`'s measure in plain lines for the agent (code's words; the names are the
+    programs')."""
+    def one(r: Mapping[str, Any], what: str) -> str:
+        n = int(r.get("n") or 0)
+        many = f" ({n} processes)" if n > 1 else ""
+        figure = _size(float(r.get("mb") or 0.0)) if what == "mb" else "{:.0f}%".format(float(r.get("cpu") or 0.0))
+        return f"{r.get('name')} {figure}{many}"
+
+    busy = "; ".join(one(r, "cpu") for r in got.get("by_cpu") or [])
+    lines = ["Running apps, measured now (each program's processes summed, as Task Manager counts them):",
+             "By memory: " + "; ".join(one(r, "mb") for r in got.get("by_mb") or []),
+             f"By CPU over the last {float(got.get('sample_s') or 0):.1f} s: "
+             + (busy or f"no app above {APPS_CPU_MIN:g}%")]
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        lines.append(f"Whole PC: memory {vm.percent:.0f}% used of {_size(vm.total / (1024 * 1024))}"
+                     + (f"; CPU {float(got['cpu_busy']):.0f}% busy" if got.get("cpu_busy") is not None else ""))
+    except Exception:  # noqa: BLE001 - the lists stand alone
+        pass
+    return "\n".join(lines)
+
+
 def speaker(loop: asyncio.AbstractEventLoop, say: Callable[[str], Any], *, wait_s: float = 1.0
             ) -> Callable[[str], None]:
     """A ``speak`` for :class:`Runner` on voice: ``say(text)`` (a coroutine function, e.g. pushing a
@@ -3196,4 +3479,4 @@ def speaker(loop: asyncio.AbstractEventLoop, say: Callable[[str], Any], *, wait_
 __all__ = ["ALREADY", "ASKED", "BUSY", "CHANGED", "CLEAN", "CallContext", "DONE", "DRIVER", "DRIVER_TOOLS", "FAILED",
            "NOT_CONFIRMED", "NOT_DONE", "NO_CHANGE", "OWED_LINES", "OneResult", "READ", "REFUSED", "Reply", "ReplyEnd",
            "RunState", "Runner", "STARTING", "STATUS_WORDS", "STOPPED", "WRITTEN", "current", "settles", "skill_step",
-           "speaker", "state_of"]
+           "speaker", "state_of", "LINE_DRAFT_WAITS", "apps_now", "apps_text"]

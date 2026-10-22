@@ -20,7 +20,9 @@ One :class:`TurnBudget` per user turn (voice) or request (typed). Every number i
   closing hold's one miss).
 * **Same failing step**: refused at once, keyed by :func:`step_key` (``voice.hands._step_key``'s identity, on the
   resolved target: the window the gate found, whatever named it; one20, final-D one-core §3.4).
-* **Refusals**: the second refusal in a turn settles it: no model run (``run_llm=False``), code's rule-#149 line.
+* **Refusals**: the second refusal in a turn settles it: no model run (``run_llm=False``), code's rule-#149 line;
+  final-H2 (C2): when no call of the turn took or touched the PC, the line says nothing was done and the refusal's own
+  reason (:func:`settle_line`).
 * **Tidy steps** (one20): a step that undoes the turn's own side effect (the gate's row 8, an Escape on a window the
   turn's own act opened something in) is never "another way" after a miss: the retry window and the same-step bar do
   not apply to it (the gate's two-steps cap does).
@@ -50,6 +52,55 @@ from typing import Any, Callable, Iterator, Mapping
 #: Rule #149 (18 Oct): stuck, say so in one line and offer one other way, never loop. Code's own line, said when the
 #: turn is settled by code (``voice.hands._REST_LEFT_LINE``'s words).
 LINE_REST_LEFT = "I couldn't get to the rest of it. Want me to try another way?"
+#: final-H2 (C2, kw_name_word_in_text under one: two refused typings and a skill run that touched nothing settled with
+#: "the rest of it", as if part were done): the second refusal settled a turn in which no call took or touched the PC
+#: (the runner's measured facts, ``policy.Turn.took``): code says nothing was done and why, by the refusal's own code
+#: word (:data:`NOTHING_WHY`), then its one other way (:data:`NOTHING_OFFER`, else :data:`OFFER_OTHER_WAY`).
+LINE_NOTHING_DONE = "I didn't do any of that: {why}."
+LINE_NOTHING_PLAIN = "I didn't do any of that."
+OFFER_OTHER_WAY = "Want me to try another way?"
+#: The gate's and this budget's refusal code words (``Decision.reason``) -> why, in code's plain words for the user.
+#: A code word not here: :data:`LINE_NOTHING_PLAIN` (never a guessed reason).
+_SEND_UNASKED = "that would have sent a message you didn't ask me to send"
+_SEND_UNMATCHED = "I couldn't match that message to your own words, so nothing was sent"
+NOTHING_WHY: dict[str, str] = {
+    "chat_type": "I only put words in a chat as a message to someone you name",
+    "send_by_code": _SEND_UNASKED, "undeclared_send": _SEND_UNASKED, "not_capability": _SEND_UNASKED,
+    "recipient": _SEND_UNMATCHED, "recipient_slot": _SEND_UNMATCHED, "text_mismatch": _SEND_UNMATCHED,
+    "quote": _SEND_UNMATCHED, "quote_turn": _SEND_UNMATCHED, "send_slot": _SEND_UNMATCHED,
+    "declared_draft": _SEND_UNMATCHED,
+    "no_draft": "that can't be left as a draft",
+    "already_sent": "that message already went to them",
+    "device_key": "that key flips your mic or camera whatever state it's in",
+    "join_unidentified": "I couldn't tell what that button on the call does",
+    "shell_long": "that command was too long for my check",
+    "error": "my check couldn't run",
+    "tidy_off": "your settings say to leave your windows as they are",
+    "tidy_steps": "that tidy-up was done already",
+    "budget_same_step": "that same step had already failed",
+    "budget_retry": "my time for other tries ran out",
+    "budget_soft": "the time for it ran out",
+    "budget_lasting_retry": "a send or join already didn't go through, so it isn't tried again",
+}
+#: The one other way after a code word's reason (rule #149), where :data:`OFFER_OTHER_WAY` would be wrong: ``""``: no
+#: offer (nothing to try again: it went already, it is never tried again, their settings say so).
+NOTHING_OFFER: dict[str, str] = {
+    "chat_type": "Who's it for?",
+    "already_sent": "", "budget_lasting_retry": "", "tidy_off": "", "tidy_steps": "",
+}
+
+
+def settle_line(reason: str = "", *, nothing_done: bool = False) -> str:
+    """Code's line for a turn the second refusal settles (rule #149): :data:`LINE_REST_LEFT` when a call of the turn
+    took or touched the PC; when none did (``nothing_done``, the runner's measured facts), that nothing was done, the
+    refusal's own reason (``reason``: its code word) and its one other way. Code words only; never raises."""
+    if not nothing_done:
+        return LINE_REST_LEFT
+    code = str(reason or "")
+    why = NOTHING_WHY.get(code, "")
+    head = LINE_NOTHING_DONE.format(why=why) if why else LINE_NOTHING_PLAIN
+    offer = NOTHING_OFFER.get(code, OFFER_OTHER_WAY) if why else OFFER_OTHER_WAY
+    return f"{head} {offer}".strip()
 #: What an acting call returns once the turn's rounds or soft time are spent (to the model: one more line, no act).
 LINE_SPENT = ("Not done: this turn's time for acting is spent, nothing was done. In one line say what is left of their "
               "request and offer one other way; no other call.")
@@ -408,15 +459,17 @@ class TurnBudget:
         except Exception:  # noqa: BLE001 - no hold
             return None
 
-    def refused(self, final_line: str = "") -> Spend:
+    def refused(self, final_line: str = "", *, reason: str = "", nothing_done: bool = False) -> Spend:
         """A call was refused (by the gate or this budget). The second refusal of the turn settles it by code: no model
-        run, ``final_line`` when the refusal is one said as it is (a game, Act off), else rule #149's line; the turn is
-        closed (a later call of the same reply settles silently)."""
+        run, ``final_line`` when the refusal is one said as it is (a game, Act off), else rule #149's line
+        (:func:`settle_line`: final-H2 C2, with ``nothing_done`` that nothing was done and the refusal's own reason,
+        ``reason`` its code word); the turn is closed (a later call of the same reply settles silently)."""
         with self._lock:
             self.refusals += 1
             if self.refusals >= self.limits.refusals:
                 self._close("refusals")
-                return Spend(False, "refusals", str(final_line or "") or LINE_REST_LEFT, settle=True)
+                line = str(final_line or "") or settle_line(reason, nothing_done=nothing_done)
+                return Spend(False, "refusals", line, settle=True)
             return OK
 
     def late(self) -> bool:
@@ -437,6 +490,7 @@ class TurnBudget:
 Turn = TurnBudget
 
 
-__all__ = ["LINE_CLOSED", "LINE_HOLD_MISS", "LINE_LASTING_RETRY", "LINE_READS_SPENT", "LINE_REST_LEFT",
-           "LINE_RETRY_SPENT", "LINE_SAME_STEP", "LINE_SPENT", "Limits", "OK", "Spend", "TYPED", "Turn", "TurnBudget",
-           "VOICE", "limits_for", "step_key"]
+__all__ = ["LINE_CLOSED", "LINE_HOLD_MISS", "LINE_LASTING_RETRY", "LINE_NOTHING_DONE", "LINE_NOTHING_PLAIN",
+           "LINE_READS_SPENT", "LINE_REST_LEFT", "LINE_RETRY_SPENT", "LINE_SAME_STEP", "LINE_SPENT", "Limits",
+           "NOTHING_OFFER", "NOTHING_WHY", "OFFER_OTHER_WAY", "OK", "Spend", "TYPED", "Turn", "TurnBudget", "VOICE",
+           "limits_for", "settle_line", "step_key"]

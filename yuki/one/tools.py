@@ -14,6 +14,10 @@ controls (``stay_quiet``, ``end_conversation``, ``go_quiet``, ``more_of_result``
 Reused as they are: ``look``/``memory``/``fetch``/``ask_user``/``remember`` (``brain.tools``), ``quick_memory``
 (``voice.recall``), the voice controls (``voice.mouth``), ``run_skill``'s base (``skills.menu.talker_tool``).
 
+**final-H2** (lane lc): ``remember`` REQUIRES ``turns_around`` and ``their_reason`` (contract K-R: a reversal is a
+declared fact the shared handler enforces, never an optional tag), and ``look`` reads ``apps`` too (C4: the running
+apps by memory and CPU, measured by the runner).
+
 **``then`` is REQUIRED on every acting tool** (addendum must-fix 2): ``""`` = nothing left. Code settles a turn only
 when every call of the reply verified, nothing was flagged and every ``then`` is empty (:func:`then_of`,
 :data:`ACTING`).
@@ -46,6 +50,11 @@ CHANNELS: tuple[str, ...] = (VOICE, TYPED)
 ONE_TOOLS_CHARS = 15_000
 #: Room kept under the ceiling for one conversation's skill keys (the ``run_skill`` enum: the 8 capabilities are 124
 #: characters; with the 7 learned skills on the 18 Oct database copy, 15 keys are 280; this is twice that).
+#: final-H2 (lane lc, contract K-B): remember's two required fields (C5) and look's ``apps`` (C4) replaced text, never
+#: raised the ceiling: words the enums, the prompt's tools paragraph ("take seconds") or a result's own line already
+#: say (window's plain actions and its chat clause, which ``type`` and the gate's refusal carry; open_url's and
+#: open_app's "(seconds)"; click's "refused if the window changed"; tab close's "verified gone"; open_yuki's and
+#: app_volume's "verified"; place's "for its app's window"; look's ``within`` said twice). 14,397 -> 14,370.
 SKILL_KEYS_ROOM = 600
 #: The skill that takes every volume request (``voice.hands.VOLUME_SKILL``): with it on the menu ``app_volume`` and the
 #: media_key volume keys are off, as on the talker today.
@@ -57,8 +66,10 @@ VOLUME_KEYS: tuple[str, ...] = ("volumeup", "volumedown", "volumemute")
 WINDOW_ACTIONS: tuple[str, ...] = ("focus", "minimize", "maximize", "fullscreen", "restore", "close", "move",
                                    "focus_back", "undo")
 TAB_ACTIONS: tuple[str, ...] = ("show", "close", "new", "reopen")
-#: ``look``'s kinds on the ONE agent: the screen only (the clipboard and system facts stay the planner's).
-LOOK_KINDS: tuple[str, ...] = ("desktop", "window", "page", "tabs", "focus")
+#: ``look``'s kinds on the ONE agent: the screen, and (final-H2 C4) the running apps, measured (the clipboard and the
+#: other system facts stay the planner's).
+APPS_LOOK = "apps"
+LOOK_KINDS: tuple[str, ...] = ("desktop", "window", "page", "tabs", "focus", APPS_LOOK)
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Shared fields
@@ -98,10 +109,10 @@ _OWN_STEP = {"type": "boolean", "description": "true: your own step to read or c
 
 WINDOW_TOOL = _tool(
     "window",
-    "A window, read back: focus, minimize, maximize, fullscreen, restore, close (only when they asked; named: their "
-    "words), move (to monitor; how), focus_back (the front as before your last act), undo (your last move or "
-    "focus_back). By [hwnd] or app as they named it (minimize, close: all its windows). Not a tab; a message "
-    "in a chat is run_skill message.",
+    # final-H2 (C5's room, contract K-B): the plain actions the enum lists are no longer named again here
+    "A window, read back: close (only when they asked; named: their words), move (to monitor; how), focus_back (the "
+    "front as before your last act), undo (your last move or focus_back). By [hwnd] or app as they named it "
+    "(minimize, close: all its windows). Not a tab.",
     {"window": _WINDOW,
      "app": {"type": "string"},
      "action": {"type": "string", "enum": list(WINDOW_ACTIONS)},
@@ -115,7 +126,7 @@ WINDOW_TOOL = _tool(
 TAB_TOOL = _tool(
     "tab",
     "A browser's tabs in any of its windows. show (default): the tab named, its window forward. close: exactly the "
-    "tabs named, verified gone. new: a new tab (url: that address). reopen: the last closed (expect: its title). "
+    "tabs named. new: a new tab (url: that address). reopen: the last closed (expect: its title). "
     "named: their word for it (\"YouTube\"), never a title you read; app: only a browser they named.",
     {"named": {"type": "string"},
      "app": {"type": "string"},
@@ -129,7 +140,7 @@ TAB_TOOL = _tool(
 OPEN_URL_TOOL = _tool(
     "open_url",
     "Open an address in a new tab of the browser they named or their usual (also a web search), or a Windows address "
-    "(ms-settings:bluetooth). Verified at the address (seconds).",
+    "(ms-settings:bluetooth). Verified at the address.",
     {"say_first": _SAY_FIRST, "url": {"type": "string", "description": "The full address."},
      "app": {"type": "string", "description": "Optional browser."},
      "say_when_done": _DONE, "then": _THEN},
@@ -137,7 +148,7 @@ OPEN_URL_TOOL = _tool(
 
 OPEN_APP_TOOL = _tool(
     "open_app",
-    "Open or bring up an app by its Start menu name, as they said it. Verified once its window is in front (seconds).",
+    "Open or bring up an app by its Start menu name, as they said it. Verified once its window is in front.",
     {"say_first": _SAY_FIRST, "name": {"type": "string"},
      "say_when_done": _DONE, "then": _THEN},
     ["say_first", "name", "then"])
@@ -145,7 +156,7 @@ OPEN_APP_TOOL = _tool(
 CLICK_TOOL = _tool(
     "click",
     "Click one item: its number on the items line, or its [id] from look window; toggle_to: an on/off control's "
-    "wanted state. Refused if the window changed since. Verified when the page, focus or window visibly changes.",
+    "wanted state. Verified when the page, focus or window visibly changes.",
     {"window": _WINDOW, "item": {"type": "integer"}, "id": {"type": "integer"},
      "toggle_to": {"type": "string", "enum": ["on", "off"]},
      "say_when_done": _DONE, "then": _THEN},
@@ -198,14 +209,14 @@ MEDIA_KEY_TOOL = _tool(
 APP_VOLUME_TOOL = _tool(
     "app_volume",
     "ONE app's own mixer volume (the app as the Sound line names it). change: points (-20), or level 0-100; mute "
-    "true silences that app alone (it plays on). Verified by reading it back.",
+    "true silences that app alone (it plays on).",
     {"app": {"type": "string"}, "change": {"type": "integer"}, "level": {"type": "integer"},
      "mute": {"type": "boolean"},
      "say_when_done": _DONE, "then": _THEN},
     ["app", "then"])
 
 OPEN_YUKI_TOOL = _tool(
-    "open_yuki", "Open your own window (Yuki's) in front, on one page. Verified once it is open.",
+    "open_yuki", "Open your own window (Yuki's) in front, on one page.",
     {"page": {"type": "string", "enum": list(YUKI_PAGES)}, "say_when_done": _DONE, "then": _THEN},
     ["page", "then"])
 
@@ -218,7 +229,7 @@ CONSENT_FIELD = {
     "properties": {"to": {"type": "string"}, "text": {"type": "string"}, "quote": {"type": "string"}},
     "required": ["to", "text", "quote"],
 }
-_PLACE = {"type": "string", "description": "\"other\" or a monitor's number, for its app's window."}
+_PLACE = {"type": "string", "description": "\"other\" or a monitor's number."}
 #: ``run_skill``'s slots (the talker's words, shorter: picks are the prompt's). final-G2 E1 (contract K-H, writer side):
 #: a real name the model read from a misheard word of theirs carries the run's note ``from`` as a slot -> ``heard`` map
 #: inside the slots (``skills.engine.note_args`` takes it out for every origin; ONE's runner passes only ``slots`` on, so
@@ -233,12 +244,18 @@ _SLOTS = {"type": "object", "description": "From their words (a misheard name: a
 KEEP_USUAL_TOOL = _tool("keep_usual", "Their answer to \"Keep this as your usual?\".",
                         {"answer": {"type": "string", "enum": ["yes", "just_this_time"]}}, ["answer"])
 
+#: final-H2 (C4, m21_ps_read_answers under one: "which app uses the most memory" was answered from memory): ``apps``
+#: is a read of the running apps measured now (the runner's ``Runner._apps``: no shell, no commit check).
 LOOK_ONE_TOOL = _from_anthropic(
     LOOK_TOOL,
     description="Read the screen as text when the Situation isn't enough: window (its controls, with [id]s; within: "
-                "one part), page (its text), tabs, focus (what has the keyboard), desktop (every window).")
+                "one part), page (its text), tabs, focus (what has the keyboard), desktop (every window); apps: "
+                "running apps' memory and CPU.")
+# final-H2 (C5's room, contract K-B): ``window`` as every verb names it, and ``within`` explained once, in the
+# description above (the planner's schema says it again in the property)
 LOOK_ONE_TOOL["properties"] = {**LOOK_ONE_TOOL["properties"],
-                               "what": {"type": "string", "enum": list(LOOK_KINDS)}}
+                               "what": {"type": "string", "enum": list(LOOK_KINDS)}, "window": _WINDOW,
+                               "within": {"type": "integer"}}
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Typed only
@@ -280,13 +297,33 @@ MEMORY_ONE_TOOL = _from_anthropic(
 #: the planner's schema here only when it doesn't carry it yet (a later merge that adds it there stays one kind).
 WAY_KIND = "way"
 _WAY_SENTENCE = " way: keep how your acts just did it as their own way (text: its name, their words)."
-REMEMBER_ONE_TOOL = _from_anthropic(REMEMBER_TOOL)
+#: final-H2 (C5, contract K-R, writer side for ONE's schema; m21_reversal_checkback: ONE saw the reversal, wrote it in
+#: the rule's own text, and it was saved at once): the reversal is a declared fact, REQUIRED on every remember (an
+#: optional tag is never sent: the loop's lesson), that code enforces like the commit check: ``turns_around`` (the rule
+#: or way of theirs this one reverses, ``""`` for none) and ``their_reason`` (their reason, ``""`` when their words
+#: gave none). The shared handler (``brain.tools.run_remember``, lane D's D2) holds a reversal with no reason and asks
+#: first. ONE's own texts for both (whatever the planner's schema says of them), so ONE's voice block stays measured.
+TURNS_AROUND = "turns_around"
+THEIR_REASON = "their_reason"
+_REVERSAL_FIELDS: dict[str, dict[str, str]] = {
+    TURNS_AROUND: {"type": "string", "description": "The rule or way of theirs this reverses, or \"\"."},
+    THEIR_REASON: {"type": "string", "description": "Their reason as they said it, or \"\"."},
+}
+#: ONE's own description (the planner's, kept here so a change of the planner's text never moves ONE's block; ``way``
+#: is ONE's kind, one22 A13).
+_REMEMBER_DESCRIPTION = (
+    "Keep what they said, in their words. rule: a standing instruction (text). forget_rule: drop one (text: its "
+    "id). correct: their correction of a fact. todo: action add|done|not_needed|wrong|list, text, due. watch: action "
+    "add|list|cancel, condition, quote (their exact words), repeat, days, request. answer: their reply to your "
+    "question (question, outcome, answer exactly). usual: text slot=option from the skill's result, answer "
+    "yes|just_this_time." + _WAY_SENTENCE)
+REMEMBER_ONE_TOOL = _from_anthropic(REMEMBER_TOOL, description=_REMEMBER_DESCRIPTION)
 _kinds = dict(REMEMBER_ONE_TOOL["properties"].get("kind") or {})
 if WAY_KIND not in list(_kinds.get("enum") or []):
     REMEMBER_ONE_TOOL["properties"] = {**REMEMBER_ONE_TOOL["properties"],
                                        "kind": {**_kinds, "enum": [*list(_kinds.get("enum") or []), WAY_KIND]}}
-if " way:" not in str(REMEMBER_ONE_TOOL["description"]):
-    REMEMBER_ONE_TOOL["description"] = str(REMEMBER_ONE_TOOL["description"]).rstrip() + _WAY_SENTENCE
+REMEMBER_ONE_TOOL["properties"] = {**REMEMBER_ONE_TOOL["properties"], **_REVERSAL_FIELDS}
+REMEMBER_ONE_TOOL["required"] = list(dict.fromkeys([*REMEMBER_ONE_TOOL["required"], "kind", *_REVERSAL_FIELDS]))
 del _kinds
 
 
@@ -366,7 +403,9 @@ DISPATCHER_SPECS: dict[str, Spec] = {
 }
 #: ``look``'s kinds -> the Dispatcher's read (``brain.tools.LOOK_DISPATCH``).
 LOOK_VERBS: dict[str, str] = {"desktop": "look_at_desktop", "window": "look_at_window", "page": "read_page",
-                              "tabs": "read_tabs", "focus": "look_at_focus"}
+                              "tabs": "read_tabs", "focus": "look_at_focus",
+                              # final-H2 (C4): no Dispatcher read; the runner measures it (``Runner._apps``)
+                              APPS_LOOK: "read_apps"}
 #: The ONE tools that act (``then`` required; the settle rule reads them).
 ACTING: frozenset[str] = frozenset(n for n, s in SPECS.items() if s.acts)
 #: The window actions the place verb runs (``actions.place``; consent's ``window_action`` ops).

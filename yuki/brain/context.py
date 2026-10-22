@@ -29,7 +29,11 @@
   it already. With ``[you] enabled = false`` (or a service without the record) the Now board stands in
   (``format_now``), as before. It is text for the planner only; the consent rule reads its facts itself.
 * **People named** in the user's words: memory's people index (``frame_facts`` names them, ``contact`` gives routes
-  and the user's own last messages, dated), so the planner can ask about a reworded repeat (M12).
+  and the user's own last messages, dated), so the planner can ask about a reworded repeat (M12). final-H2 (C3): when
+  their newest words name nobody, the people this talk named before stand in (memory's ``said``, the earlier
+  requests' words kept in RAM for ten minutes); the chat the request acts in comes with its person and the handle it
+  shows: the window in front (the Now board's, :func:`front_screen`), else, from Yuki's own window, the chat they were
+  in last (memory's measured chats in front lately).
 * **Their places** (lBrain, live problem 11): the pages they watch on each site and the voice channels they joined,
   from memory's tastes and capture threads (:func:`read_places`), with the rule that a channel they name is a place to
   watch first and a join goes only to a channel memory has seen; the plan validator checks a join against the same
@@ -75,6 +79,9 @@ UNDERSTANDING_LABEL = ("[The voice talker's first reading of their words: a seed
 UNDERSTANDING_CHARS = 700
 UNDERSTANDING_PARTS = 6
 PEOPLE_LABEL = "[People their words name, from memory's people index]"
+#: final-H2 (C3): the label when the people come from earlier in this talk (their newest words name nobody) or the
+#: block names only the chat the request acts in.
+PEOPLE_TALK_LABEL = "[People this talk names and the chat it acts in, from memory's people index]"
 #: The seed block's label (x10): what to do next, by the hand-off's ``why`` (the engine's code word; x5Fallback adds
 #: ``unverified``, ``error`` and ``dropped``). Every hand-off but a commit's is done by steps, never by that skill again
 #: (:func:`yuki.brain.plan.spent_skills` refuses a plan that runs it).
@@ -150,6 +157,14 @@ AWAITS_LINE = (f"[A plain-text spoken reply of yours (never a plan's question) t
 PEOPLE_MAX = 2
 #: Most of the user's own last messages shown per request turn (design 2.3: the last 3 or fewer, dated).
 MESSAGES_MAX = 3
+#: final-H2 (C3, typed T1 under one: "now press enter in discord" named nobody, so the people block was empty and the
+#: model took Hemanth's own DM handle for someone else): the words of the requests the people block was read for
+#: (RAM only, never logged or stored) are kept this long and at most this many, as memory's ``frame_facts`` ``said``
+#: (the people named earlier in this talk); memory's own "chats in front lately" reach (``RECENT_CHAT_MINUTES``).
+EXCHANGE_KEEP_S = 600.0
+EXCHANGE_KEEP = 4
+#: How long the Now board's answer is waited for, for the window in front (the chat the request acts in).
+PEOPLE_BOARD_WAIT_S = 0.1
 #: Waits of the parts read for the request turn (s): each part is left out when it misses its wait.
 OVERVIEW_WAIT_S = 3.0
 YOU_WAIT_S = 0.25
@@ -467,21 +482,66 @@ def _when(at: Any) -> str:
     return stamp.strftime("%H:%M on %d %b")
 
 
-def read_people(memory: Any, words: str, *, limit: int, nonce: str) -> str:
-    """People the user's words name (memory's people index, by name or alias: data matching, never meaning), each with
-    their usual routes and the user's own last messages to them, dated (at most :data:`MESSAGES_MAX` in all), and the
-    chat in front. ``""`` when memory names nobody or cannot say. Never raises."""
-    if memory is None or not getattr(memory, "installed", False) or not words.strip():
-        return ""
+_exchange_lock = threading.Lock()
+#: final-H2 (C3): ``(time.time(), words)`` of the requests the people block was read for, newest last (RAM only).
+_exchange: list[tuple[float, str]] = []
+
+
+def _exchange_said(words: str) -> list[dict[str, Any]]:
+    """The words of the requests read before this one within :data:`EXCHANGE_KEEP_S` (``frame_facts``' ``said``:
+    ``{"at", "text", "who"}``, the user's own words only), and these words kept for the next one. Never raises."""
+    now = time.time()
+    text = " ".join(str(words or "").split())
     try:
-        facts = memory.frame_facts(words, timeout_s=PEOPLE_WAIT_S / 2)
+        with _exchange_lock:
+            _exchange[:] = [(at, w) for at, w in _exchange if now - at <= EXCHANGE_KEEP_S and w != text]
+            said = [{"at": at, "text": w, "who": "user"} for at, w in _exchange]
+            if text:
+                _exchange.append((now, text))
+                del _exchange[:-EXCHANGE_KEEP]
+        return said
     except Exception:  # noqa: BLE001
-        facts = None
-    if not isinstance(facts, Mapping):
-        return ""
+        return []
+
+
+def front_screen() -> tuple[dict[str, Any] | None, bool]:
+    """final-H2 (C3): the window in front as the Now board read it (``frame_facts``' ``screen``: its app, process,
+    title, address, scope; the old loop's ``_live_screen`` shape), and whether it is Yuki's own window (a typed
+    request: the chat it acts in is then the one they were in last). ``(None, False)`` when it can't be read, a
+    privacy-blocked window included. Read-only; never raises."""
+    try:
+        from yuki.memory.now import shared_client
+
+        client = shared_client()
+        board = client.now(wait_s=PEOPLE_BOARD_WAIT_S) if client is not None else None
+    except Exception:  # noqa: BLE001
+        board = None
+    if not isinstance(board, Mapping):
+        return None, False
+    want = board.get("foreground")
+    window = next((w for w in board.get("windows") or [] if isinstance(w, Mapping) and w.get("hwnd") == want), None)
+    own = False
+    try:
+        from yuki.agent.tools import _is_own_window
+
+        own = bool(want) and bool(_is_own_window(want))
+    except Exception:  # noqa: BLE001
+        own = False
+    if window is None or window.get("blocked") or own:
+        return None, own
+    title = window.get("live_title") or window.get("title")
+    if not title:
+        return None, own
+    return {"app": window.get("app"), "process": window.get("process"), "title": title,
+            "url": window.get("url") or None, "scope": window.get("scope")}, own
+
+
+def _person_lines(memory: Any, people: Sequence[Any], *, earlier: bool,
+                  messages: list[tuple[float, str, str, str]]) -> list[str]:
+    """One line per person (their usual routes; ``earlier``: named earlier in this talk), and their own last messages
+    into ``messages``."""
     lines: list[str] = []
-    messages: list[tuple[float, str, str, str]] = []
-    for person in list(facts.get("named") or [])[:PEOPLE_MAX]:
+    for person in list(people)[:PEOPLE_MAX]:
         if not isinstance(person, Mapping):
             continue
         name = one_line(person.get("name"), 60)
@@ -498,6 +558,8 @@ def read_people(memory: Any, words: str, *, limit: int, nonce: str) -> str:
             line += f": usually {labels[0]}" + (f"; also {labels[1]}" if len(labels) > 1 else "")
         if isinstance(card, Mapping) and card.get("close"):
             line += " (the first two routes are close: name both if they did not say which)"
+        if earlier:
+            line += " (named earlier in this talk)"
         lines.append(line)
         for r in routes:
             if not isinstance(r, Mapping):
@@ -505,14 +567,56 @@ def read_people(memory: Any, words: str, *, limit: int, nonce: str) -> str:
             for s in r.get("samples") or []:
                 if isinstance(s, Mapping) and s.get("text") and s.get("at"):
                     messages.append((float(s["at"]), name, one_line(r.get("label"), 40), one_line(s["text"], 160)))
+    return lines
+
+
+def read_people(memory: Any, words: str, *, limit: int, nonce: str, screen: Mapping[str, Any] | None = None,
+                own_front: bool = False) -> str:
+    """People the user's words name (memory's people index, by name or alias: data matching, never meaning), each with
+    their usual routes and the user's own last messages to them, dated (at most :data:`MESSAGES_MAX` in all), and the
+    chat in front. ``""`` when memory names nobody or cannot say. Never raises.
+
+    final-H2 (C3): when their newest words name nobody, the people this talk named before (memory's ``said``: the
+    requests read within :data:`EXCHANGE_KEEP_S`) stand in, marked so. The chat the request acts in, with its person and
+    the handle the chat shows: the window in front (``screen``, :func:`front_screen`; it was never passed, so this line
+    never came), else, when Yuki's own window is in front (``own_front``: a typed request) and their newest words name
+    nobody, the chat they were in last (memory's measured chats in front lately)."""
+    if memory is None or not getattr(memory, "installed", False) or not words.strip():
+        return ""
+    said = _exchange_said(words)
+    try:
+        facts = memory.frame_facts(words, said=said, screen=dict(screen) if screen else None,
+                                   timeout_s=PEOPLE_WAIT_S / 2)
+    except TypeError:   # a memory without the said and screen inputs: their words alone, as before
+        try:
+            facts = memory.frame_facts(words, timeout_s=PEOPLE_WAIT_S / 2)
+        except Exception:  # noqa: BLE001
+            facts = None
+    except Exception:  # noqa: BLE001
+        facts = None
+    if not isinstance(facts, Mapping):
+        return ""
+    messages: list[tuple[float, str, str, str]] = []
+    named = [p for p in facts.get("named") or [] if isinstance(p, Mapping)]
+    kept = [] if named else [p for p in facts.get("said") or [] if isinstance(p, Mapping)]
+    lines = _person_lines(memory, named or kept, earlier=not named, messages=messages)
     front = facts.get("front") if isinstance(facts.get("front"), Mapping) else None
-    if front and front.get("people"):
-        who = ", ".join(one_line(p.get("name"), 40) for p in front["people"][:3] if isinstance(p, Mapping))
+    members = [p for p in (front or {}).get("people") or [] if isinstance(p, Mapping)]
+    if members:
+        who = ", ".join(one_line(p.get("name"), 40) for p in members[:3])
+        shown = one_line(members[0].get("route"), 60)
         if who:
-            lines.append(f"- The chat in front is with {who}.")
+            lines.append(f"- The chat in front is with {who}" + (f" ({shown})." if shown else "."))
+    elif own_front and not named:
+        last = next((p for p in facts.get("recent") or [] if isinstance(p, Mapping) and p.get("name")), None)
+        if last is not None:
+            shown = one_line(last.get("route"), 60)
+            when = _when(last.get("at"))
+            lines.append(f"- The chat they were in last{f' ({when})' if when else ''} is with "
+                         f"{one_line(last.get('name'), 40)}" + (f" ({shown})." if shown else "."))
     if not lines:
         return ""
-    text = PEOPLE_LABEL + "\n" + "\n".join(lines)
+    text = (PEOPLE_LABEL if named else PEOPLE_TALK_LABEL) + "\n" + "\n".join(lines)
     if messages:
         messages.sort(key=lambda m: -m[0])
         said = "\n".join(f"- to {who} on {where}, {_when(at)}: \"{body}\""
@@ -953,6 +1057,15 @@ def sends_fn(loaded: Any) -> Callable[[str, Mapping[str, Any]], bool] | None:
     return sends
 
 
+def _people_now(memory: Any, words: str, limit: int, nonce: str) -> str:
+    """The request turn's people block (:func:`read_people`) with the window in front read first (:func:`front_screen`,
+    final-H2 C3), on the people part's own thread. Never raises."""
+    if memory is None or not getattr(memory, "installed", False) or not str(words or "").strip():
+        return ""
+    screen, own = front_screen()
+    return read_people(memory, words, limit=limit, nonce=nonce, screen=screen, own_front=own)
+
+
 def gather(*, dispatcher: Any, memory: Any, settings: Any, words: str, names: Sequence[str], limits: Any,
            nonce: str, reuse: Gathered | None = None) -> Gathered:
     """Read the request turn's parts in parallel (each bounded; a part that misses its wait is left out). ``reuse``: a
@@ -967,7 +1080,7 @@ def gather(*, dispatcher: Any, memory: Any, settings: Any, words: str, names: Se
     if not keep_rest:
         jobs["card"] = lambda: read_card(memory)
         jobs["you"] = lambda: read_you(dispatcher, limit=limits.you_chars)
-        jobs["people"] = lambda: read_people(memory, words, limit=limits.people_chars, nonce=nonce)
+        jobs["people"] = lambda: _people_now(memory, words, limits.people_chars, nonce)
         jobs["places"] = lambda: read_places(memory, limit=PLACES_CHARS, nonce=nonce)
         jobs["profile"] = lambda: read_profile_parts(memory, with_resources=True)
         jobs["menu"] = lambda: read_menu(memory, settings, limit=limits.menu_chars)
@@ -1762,7 +1875,8 @@ def answer_report(question: str, answer: str | None) -> str:
 
 
 __all__ = ["ALSO_OPEN_CHARS", "KEEP_THEIRS", "SITUATION_CHARS", "also_open", "desk_text", "tidy_report",
-           "Gathered", "gather", "read_overview", "read_you", "read_people", "read_places", "Places", "channel_known",
+           "Gathered", "gather", "read_overview", "read_you", "read_people", "front_screen", "PEOPLE_TALK_LABEL",
+           "read_places", "Places", "channel_known",
            "PLACES_LABEL", "read_profile_parts", "read_card", "beside_card", "CARD_LABEL", "understanding_block",
            "UNDERSTANDING_LABEL", "read_menu",
            "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "seed_memory", "seed_memory_text",
