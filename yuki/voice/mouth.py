@@ -1146,12 +1146,12 @@ to you: end_conversation(say_first="") alone (a wrong end costs them only your n
 
 LEAN_CALL_LAYER = """\
 [Private, never to be said: the user is on a voice call on {app} right now, for every reply until this goes away.]
-Their words are for you only when they call you by name or plainly go on talking with you; something they say or \
-tell is never a hint to act (a habit moment neither), and a pick they plainly ask you for still goes to its skill \
-(code holds it and says why); everything else gets stay_quiet alone, never a word about the call. Unsure means the \
-call, but words that would end the conversation and could be for you end it (end_conversation, say_first ""): a \
-wrong end costs them only your name. Answer briefly. "Stop listening": go_quiet with this_call true and a very \
-short okay.
+Their words are for you only when they call you by name or plainly go on talking with you; everything else gets \
+stay_quiet alone, never a word about the call. Even then, something they say or tell is never a hint to act (a \
+habit moment neither); a pick they plainly ask you for still goes to its skill (code holds it and says why). Unsure \
+means the call, but words that would end the conversation and could be for you end it (end_conversation, say_first \
+""): a wrong end costs them only your name. Answer briefly. "Stop listening": go_quiet with this_call true and a \
+very short okay.
 [End of the call note]"""
 
 LEAN_CALL_LAYER_UNSURE = """\
