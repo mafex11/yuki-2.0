@@ -47,7 +47,10 @@ offer never named is never scored and never pickable. **The offer plays nothing:
 only when the user picks one ("the Deji one": :func:`pick`, through ``web.open_video``). When the user asks Yuki to
 choose ("a video I like", "put something on": ``choose = true``, decision 2), Yuki's own pick plays instead
 (:func:`yuki.skills.taste.choose`, which reads the same feeds through :func:`refresh`). Shorts are left out (their link
-is not a watch page).
+is not a watch page). lb B5 (final-H2 kw_chrome_crashing_youtube; the user's rule "proactive = cards only"): the
+engine starts a request's offer (:func:`start`) and says it only for a run that left the pick to Yuki (its own
+``choose`` slot) when no pick of Yuki's played; a plain "open YouTube" names none and reads no feed (the cards keep
+their own offers, ``yuki.memory.candidates``).
 
 **Learning and the live check:** each offer named is a ``taste_events`` row; the nightly part writes its outcome: the
 user's next YouTube pick within :data:`OUTCOME_S` was one of the three (``hit``), from one of the three channels
@@ -791,7 +794,8 @@ def start(memory: Any, values: Mapping[str, Any] | None, *, game: str | None = N
     short thread of its own (it reads the feeds while the page opens); None otherwise. The feed budget and the fresh
     window come from ``settings`` (``youtube_feed_budget_s``, ``youtube_fresh_days``; else :data:`REQUEST_BUDGET_S`,
     :data:`FRESH_DAYS`). The caller waits on the returned :class:`Pending` after the run's done-check, names the offers
-    only with a checked done, and notes them then (:meth:`Pending.confirm`)."""
+    only with a checked done, and notes them then (:meth:`Pending.confirm`). lb B5: the engine calls it only for a run
+    whose own ``choose`` slot left the pick to Yuki (never after a plain open: proactive = cards only)."""
     if not wants(values) or game:
         return None
     budget = float(budget_s) if budget_s is not None else _setting(settings, "youtube_feed_budget_s",

@@ -61,6 +61,12 @@ bind = { person = "contact", app = "app" }
 # never matched by sound (yuki/memory/contacts.py sounds_alike, alike_answered; yuki/skills/chat.py find_target,
 # _sounds_alike, _send_gate). Each such question is asked once: the same name given again is "I don't know who that
 # is".
+# lb B1 (contract K-F, "type X in this chat"): for a draft or an open only, the caller may give the person of the chat
+# that was in front when they spoke (its person's name, or the chat's own name as the window shows it) though their
+# words don't name them: code takes it only when memory's thread identity of that window is that one person's own
+# direct message (yuki/skills/chat.py front_chat; never a title, never by sound), keeps the run in that very chat, and
+# the done line names the person and the chat's own name. A send still needs the person in their words. A name the
+# words don't hold that is neither is asked "Who to?" once, never handed over to be typed by steps (lb B2).
 [[capability.message.slot]]
 name = "person"
 type = "text"
