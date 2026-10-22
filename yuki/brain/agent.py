@@ -2023,7 +2023,7 @@ class Brain:
             else:   # invalid: the steps already run are reported, the rest never runs
                 statuses = list(getattr(executor, "statuses", []) or [])
                 return ExecResult(status="invalid", statuses=[_step_status(s) for s in statuses],
-                                  acted=any(s.tool and s.verb in ACT_VERBS for s in statuses))
+                                  acted=any(s.tool and s.verb in ACT_VERBS and not _only_asked(s) for s in statuses))
         return self._exec_result(got, host)
 
     def _seed_executor(self, executor: Any, header: Plan, host: Any = None) -> None:
@@ -2128,8 +2128,12 @@ class Brain:
         base: dict[str, Any] = {
             "statuses": [_step_status(s) for s in raw], "reads": reads,
             # integ29 (S8): a command counts as acted whatever effect the check gave it ("none" also means it only
-            # opened or moved something); what it printed goes back through shell_ending (C5)
-            "acted": any(getattr(s, "tool", "") and getattr(s, "verb", "") in ACT_VERBS for s in raw),
+            # opened or moved something); what it printed goes back through shell_ending (C5). mon1 (22 Oct: the
+            # display route only asked, then "I got stuck partway: it needed a detail I didn't have" threw the
+            # planner's own reply away): a step whose run only asked the user (the executor's own code word) did
+            # nothing on the PC and never counts as acted
+            "acted": any(getattr(s, "tool", "") and getattr(s, "verb", "") in ACT_VERBS and not _only_asked(s)
+                         for s in raw),
             "verdict": getattr(found, "verdict", None) if found is not None else None,
             "probe": str(getattr(found, "probe", "") or "") if found is not None else "",
             "line": str(getattr(got, "line", "") or ""), "check_calls": checks,
@@ -3509,6 +3513,12 @@ def close_parts(plan: Plan | None, state: _State, result: ExecResult | None = No
         got = step.skill_call(plan.skill)
         if got is not None and (ran is None or index in ran):
             state.open_parts.pop(skill_family(got[0]) or str(got[0]), None)
+
+
+def _only_asked(status: Any) -> bool:
+    """mon1: an executor step status whose run only asked the user (a skill route's question: ``failed`` with the
+    executor's code word ``asked``, ``executor._run_skill``): nothing was done on the PC. Code facts only."""
+    return getattr(status, "state", "") == "failed" and getattr(status, "why", "") == "asked"
 
 
 def _acted(result: ExecResult) -> bool:

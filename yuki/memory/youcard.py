@@ -30,7 +30,9 @@ reason from, not a catalog, in this order (the situation on the screens stays se
    first); Spotify playlists with what the user calls them; the voice channels and servers of the apps that join calls
    (``yuki.skills.discord_route.voice_channels``), most days used first with the count ("4 of the last 14 days":
    final-B, a recent-first list read as the usual); the things inside their own ways' apps (their projects); usual means
-   (``prefs``); **Where they left off** (planner only) - on the :data:`LEFT_OFF_N` sites they came back to latest (never
+   (``prefs``); **Their monitors** (mon1, every purpose: memory's monitor record, left to right, each with its
+   measured size, connector and place and the user's own learned words for it: "they call it 'first'", "heard as
+   'PG'"); **Where they left off** (planner only) - on the :data:`LEFT_OFF_N` sites they came back to latest (never
    a work site), the last page they themselves had in front in one of their browsers (an app's own embedded page is
    no page to open), with its title and address (``Store.links``), dated by their own visit
    (``yuki.memory.links.own_lasts``: never a page Yuki opened, nor a live test's), newest first (S19); final-H2 D3 (a):
@@ -228,6 +230,16 @@ def _stamp(store: Any) -> tuple[Any, ...]:
         got = tuple(row[0]) if row else ()
     except Exception:  # noqa: BLE001 - an older database: the time bound alone
         return ()
+    try:
+        # mon1: the monitor line's own stamp (the user's monitors and their stable facts) and the learned names'
+        from yuki.memory.monitors import card_stamp
+
+        got = got + tuple(card_stamp(store) or ())
+        alias = store._query("SELECT count(*) || ':' || coalesce(max(id), 0) || ':' || coalesce(max(ended_at), 0)"
+                             " FROM name_aliases")
+        got = got + (tuple(alias[0]) if alias else ())
+    except Exception:  # noqa: BLE001
+        pass
     try:
         return got + tuple(more(store) or ()) if more is not None else got
     except Exception:  # noqa: BLE001
@@ -758,7 +770,39 @@ def _things(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, wide:
     out += _places(store, now, VOICE_N[i], SERVERS_N[i])
     out += _way_things(store, ways, WAY_THINGS_N[i])
     out += _list(3, "Usual means: ", ((x, MEANT) for x in _usuals(store, 4 if not wide else 8)), sep="; ")
+    out += _monitors(store)
     return out
+
+
+#: mon1: the you-card's monitor line, its head (internal understanding: never a UI list).
+MONITORS_HEAD = "Their monitors (measured; their own words for them learned): "
+#: The place words of a monitor among two or three, left to right (code's own rendering of measured geometry).
+_PLACES = {2: ("left", "right"), 3: ("left", "middle", "right")}
+
+
+def _monitors(store: Any) -> list[list[Any]]:
+    """mon1 (PLAN section 6): one code-rendered line, every purpose: the user's monitors from memory's monitor record
+    (``yuki.memory.monitors``), left to right, each with what Yuki measured (its size's line count, its connector,
+    its place) and the user's own words for it, learned (``meanings.called_of``: "they call it 'first'"; the heard
+    forms of its name: "heard as 'PG'"). Windows' primary is not here: it moves (the desk says it as Windows' fact).
+    ``[]`` with none known."""
+    try:
+        from yuki.memory import monitors as record
+
+        rows = [r for r in record.known(store) if r.label or r.pnp]
+    except Exception:  # noqa: BLE001
+        return []
+    if not rows:
+        return []
+    rows.sort(key=lambda r: (r.place if r.place is not None else 99, -r.attached_s))
+    places = _PLACES.get(len(rows), ())
+    bits = []
+    for n, r in enumerate(rows):
+        facts = [x for x in (f"{r.height}p" if r.height else "", r.connector, places[n] if places else "") if x]
+        said = [f'they call it "{c}"' for c in r.called[:2]] + [f'heard as "{h}"' for h in r.heard[:2]]
+        bits.append(f"{r.label or r.pnp} ({', '.join(facts)}" + (f"; {'; '.join(said)}" if said else "") + ")"
+                    if facts or said else (r.label or r.pnp))
+    return [_line(1, MONITORS_HEAD + "; ".join(bits) + ".")]
 
 
 def _settled_called(store: Any, kind: str, now: float) -> dict[str, list[str]]:

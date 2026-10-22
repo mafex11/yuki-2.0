@@ -426,6 +426,13 @@ class MemoryClient:
 
     def __init__(self, store: Store) -> None:
         self.store = store
+        try:
+            # mon1: memory's monitor record reads (and the display driver's notes write) through this process's store
+            from yuki.memory import monitors as _monitors
+
+            _monitors.use(store)
+        except Exception:  # noqa: BLE001 - memory works without it
+            pass
         self._embedder: Any = None
         self._embedder_lock = threading.Lock()
         self._app_names: dict[str, set[str]] = {}

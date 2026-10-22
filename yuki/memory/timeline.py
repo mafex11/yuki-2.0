@@ -1358,6 +1358,14 @@ class TimelineRecorder:
         self._desk_screens = ""
         self._desk_apps: dict[int, tuple[int, str]] = {}
         self._desk_rules: Any = None
+        #: mon1: memory's monitor record (yuki.memory.monitors.Recorder): the monitors attached, read on this thread
+        #: at most every few seconds and at once when the desk's monitors change; ``None`` when it can't be made.
+        try:
+            from yuki.memory.monitors import Recorder
+
+            self._monitor_rec: Any = Recorder(store, log=self._log)
+        except Exception:  # noqa: BLE001 - the timeline runs without it
+            self._monitor_rec = None
         u.IsZoomed.argtypes = [wintypes.HWND]
         u.IsZoomed.restype = wintypes.BOOL
 
@@ -1561,6 +1569,8 @@ class TimelineRecorder:
                 self._advance(now)
                 self._close(now)
                 self._desk.observe(now, None, screens="")
+                if self._monitor_rec is not None:
+                    self._monitor_rec.close(now)
             except Exception as exc:
                 self._log_error("final_close", exc)
             self._cleanup()
@@ -2503,9 +2513,10 @@ class TimelineRecorder:
         """Tell the desk record the desk now: the newest layout's windows (read once per layout, by identity: the
         watcher's thread only ever replaces the reference, so a layout stored mid-read is read on the next tick), with
         what plays, the window in front, full screen, away and Yuki acting applied. Never raises."""
-        if self._desk.disabled:
-            return
+        screens_before = self._desk_screens
         try:
+            if self._desk.disabled:
+                return
             if self._blocked:
                 self._desk.observe(now, None, screens="")
                 return
@@ -2521,6 +2532,11 @@ class TimelineRecorder:
             self._desk.flush(now)
         except Exception as exc:  # noqa: BLE001 - never breaks the timeline
             self._log_error("desk", exc)
+        finally:
+            # mon1: the monitor record's sightings (paused or locked too: which monitors are attached is no content),
+            # at once when the measured layout's monitors changed
+            if self._monitor_rec is not None:
+                self._monitor_rec.tick(now, force=self._desk_screens != screens_before)
 
     def _desk_read(self, layout: Any) -> None:
         """The windows of a measured layout as the desk record keeps them: per user window on a monitor its app key

@@ -38,10 +38,14 @@ Public API::
     front_window(raw=None) -> (hwnd, how)          # fa (A5): the window in front now, by the one front rule
     front_rule(raw, keyboard, root_owner, listed, popup) -> (hwnd, how)   # pure: that rule
 
-morning21 (lane B, contract K3): a monitor is said by its place and its own model name ("[m1] second monitor (VG271U,
-2560x1440; screen off)"): the ``[n]`` and ``[mN]`` ids are the hands' only, never words to say (integ29 LD3: no
-"Monitor 1" a planner's question would copy, said by code word for word); "screen off" only from the display
-driver's own recent read. The notification area's icons are one line ("In the tray: Twinkle Tray (monitor app),
+morning21 (lane B, contract K3): a monitor is said by its own model name ("[m1] VG271U (2560x1440; screen off)"): the
+``[n]`` and ``[mN]`` ids are the hands' only, never words to say (integ29 LD3: no "Monitor 1" a planner's question
+would copy, said by code word for word); "screen off" only from the display driver's own recent read. mon1 (22 Oct:
+"[m0]" read as the user's "first"): the header says ``[mN]`` is an id, not a place; Windows' primary is said as
+Windows' fact ("Windows' main display": it moves when a monitor drops); the user's own words for a monitor, learned,
+ride beside it ("they call it 'second'"); and a monitor of theirs Windows doesn't list now gets a line that never
+gives way ("Not connected to Windows now ...: 24HC1QR (they call it "first"; dropped 08:45)", memory's monitor record,
+``windows.away_monitors``; :func:`from_overview` reads it from the overview's ``monitors_away``). The notification area's icons are one line ("In the tray: Twinkle Tray (monitor app),
 Steam; hidden icons: ..."), from the last tray read (``windows.tray_icons``; nothing is read for a desk).
 
 **The one front rule** (fa, final-F #4a): the front is ``GetForegroundWindow`` when it is a listed window or a popup
@@ -118,6 +122,45 @@ class Monitor(_Rec):
     label: str = ""
     role: str = ""
     power: str = ""
+    #: mon1: the user's own words for it, learned (memory's monitor record: "first"), ``()`` none.
+    called: tuple[str, ...] = ()
+
+
+@dataclass
+class AwayMonitor(_Rec):
+    """mon1: a monitor of the user's that Windows doesn't list now (memory's monitor record, ``windows.away_monitors``):
+    its own name, connector, when Windows dropped it (epoch s, ``None`` unknown) and their own words for it."""
+
+    label: str
+    connector: str = ""
+    removed_at: float | None = None
+    called: tuple[str, ...] = ()
+
+
+def _away_from(raw: Iterable[Any]) -> list[AwayMonitor]:
+    out = []
+    for a in raw or []:
+        get = a.get if hasattr(a, "get") else (lambda k, d=None, a=a: getattr(a, k, d))
+        label = str(get("label") or get("pnp") or "")
+        if not label:
+            continue
+        removed = get("removed_at")
+        out.append(AwayMonitor(label=label, connector=str(get("connector") or ""),
+                               removed_at=float(removed) if isinstance(removed, (int, float)) and removed else None,
+                               called=tuple(str(c) for c in (get("called") or ()) if str(c or "").strip())))
+    return out
+
+
+def _their_words(device_path: str, pnp: str, label: str) -> tuple[str, ...]:
+    """mon1: the user's own words for an attached monitor (memory's monitor record, learned), ``()`` none. Never
+    raises."""
+    try:
+        from yuki.memory import monitors as record
+
+        row = record.match(record.rows(), device_path, pnp, label)
+        return tuple(row.called) if row is not None else ()
+    except Exception:  # noqa: BLE001
+        return ()
 
 
 @dataclass
@@ -195,6 +238,8 @@ class DeskState(_Rec):
     #: morning21 B7: the notification area's icons (``windows.TrayIcon`` records or their dicts) from the last tray
     #: read (never read for this desk: ``windows.tray_icons``' cache).
     tray: list[Any] = field(default_factory=list)
+    #: mon1: the user's monitors Windows doesn't list now (memory's monitor record).
+    away: list[AwayMonitor] = field(default_factory=list)
 
     def window(self, hwnd: Any) -> Window | None:
         try:
@@ -210,7 +255,8 @@ class DeskState(_Rec):
                 "playing": sum(1 for m in self.media if m.playing),
                 "playing_mapped": sum(1 for m in self.media if m.playing and m.hwnd),
                 "errors": sorted(self.errors), "ms": round(self.ms, 1), "front_how": self.front_how or None,
-                "tray": len(self.tray), "screens_off": sum(1 for m in self.monitors if m.power == "off")}
+                "tray": len(self.tray), "screens_off": sum(1 for m in self.monitors if m.power == "off"),
+                "monitors_away": len(self.away)}
 
 
 # ---------------------------------------------------------------------------
@@ -477,12 +523,17 @@ def snapshot(*, media: Iterable[Any] | None = None, audio: Iterable[Any] | None 
     state = DeskState(at=time.time())
     try:
         from yuki.perception.visibility import layout
-        from yuki.perception.windows import list_monitors, list_windows
+        from yuki.perception.windows import away_monitors, list_monitors, list_windows
 
+        listed = list_monitors()
         state.monitors = [Monitor(index=m.index, rect=tuple(m.bounds), work=tuple(m.work_area), primary=m.is_primary,
                                   dpi_scale=float(m.dpi_scale), label=str(getattr(m, "label", "") or ""),
-                                  role=str(getattr(m, "role", "") or ""), power=str(getattr(m, "power", "") or ""))
-                          for m in list_monitors()]
+                                  role=str(getattr(m, "role", "") or ""), power=str(getattr(m, "power", "") or ""),
+                                  called=_their_words(str(getattr(m, "device_path", "") or ""),
+                                                      str(getattr(m, "pnp", "") or ""),
+                                                      str(getattr(m, "label", "") or "")))
+                          for m in listed]
+        state.away = _away_from(away_monitors(listed))
         infos = list_windows()
         lay = layout()
         raw = int(lay.foreground or _user32.GetForegroundWindow() or 0)
@@ -641,11 +692,15 @@ def from_overview(payload: dict[str, Any], *, shares: dict[int, float] | None = 
         monitors.append(Monitor(index=int(m.get("index") or 0), rect=rect, work=work,
                                 primary=bool(m.get("is_primary", m.get("primary", False))),
                                 dpi_scale=float(m.get("dpi_scale") or 1.0), label=str(m.get("label") or ""),
-                                role=str(m.get("role") or ""), power=str(m.get("power") or "")))
+                                role=str(m.get("role") or ""), power=str(m.get("power") or ""),
+                                called=tuple(str(c) for c in m.get("called") or ())
+                                or (_their_words(str(m.get("device_path") or ""), str(m.get("pnp") or ""),
+                                                 str(m.get("label") or "")) if m.get("label") else ())))
     if not monitors and payload.get("virtual_bounds"):
         rect = tuple(int(v) for v in payload["virtual_bounds"])
         monitors.append(Monitor(index=0, rect=rect, work=rect, primary=True))
     state.monitors = monitors
+    state.away = _away_from(payload.get("monitors_away") or [])
     state.tray = [t for t in payload.get("tray") or [] if hasattr(t, "get") or hasattr(t, "name")]
     fg = int(payload.get("foreground_hwnd") or 0)
     kb = int(keyboard or fg or 0)
@@ -800,6 +855,21 @@ def sound_line(state: DeskState) -> str:
     return ("Sound: " + "; ".join(parts) + ".") if parts else ""
 
 
+def _dropped_words(at: float | None) -> str:
+    """mon1: when Windows dropped a monitor, as the desk says it ("dropped 08:45" today, "dropped 21 Oct 08:45"), or
+    ``""``."""
+    if not at:
+        return ""
+    try:
+        from datetime import datetime
+
+        then = datetime.fromtimestamp(float(at))
+        return (f"dropped {then:%H:%M}" if then.date() == datetime.now().date()
+                else f"dropped {then.day} {then:%b} {then:%H:%M}")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
 def _items(state: DeskState, *, planner: bool, cap: int, said: int, short: bool, just_asked: str,
            just_did: str) -> list[tuple[int, int, str, str]]:
     """The render's pieces: ``(priority, order, group, text)``; a group joins its pieces on one line. Priority 0 and
@@ -814,29 +884,39 @@ def _items(state: DeskState, *, planner: bool, cap: int, said: int, short: bool,
     if not state.windows:
         add(0, "head", "Desk now: no windows open.")
     else:
-        add(0, "head", "Desk now ([n] = window id, [mN] = monitor number N):" if short else
-            "Desk now (each monitor's windows top first; [n] is the window id and [mN] monitor number N, for your "
-            "hands):")
+        # mon1: [mN] is an id for the hands, never a place or the user's word ("m0" read as their "first" on 22 Oct)
+        add(0, "head", "Desk now ([n] = window id, [mN] = a monitor's id, not its place):" if short else
+            "Desk now (each monitor's windows top first; [n] is the window id and [mN] a monitor's id for your hands, "
+            "never its place or the user's word for it):")
     shown = [w for w in state.windows if not w.minimized]
     for m in state.monitors:
         width, height = m.rect[2] - m.rect[0], m.rect[3] - m.rect[1]
-        # morning21 B3 (contract K3): its place and its own model name, the words to say it by ("second, VG271U");
-        # the index is the hands' id only. "screen off" only from the display driver's own recent read
-        role = m.role or ("main" if m.primary else "")
-        bits = [b for b in (m.label, f"{width}x{height}") if b]
+        # morning21 B3 (contract K3): its own model name, the word to say it by; mon1: Windows' primary said as
+        # Windows' fact (it moves when a monitor drops), and the user's own words for it, learned ("they call it
+        # 'second'"); the index is the hands' id only. "screen off" only from the display driver's own recent read
+        bits = [f"{width}x{height}"]
         if planner:
             bits.append(f"@{m.rect[0]},{m.rect[1]}")
             if m.work != m.rect:
                 bits.append(f"work area {m.work[2] - m.work[0]}x{m.work[3] - m.work[1]}")
+        notes = [n for n in ("Windows' main display" if m.primary and multi else "",
+                             *(f'they call it "{c}"' for c in m.called[:2]),
+                             "screen off" if m.power == "off" else "") if n]
         group = f"m{m.index}"
-        power = "; screen off" if m.power == "off" else ""
-        said = f"{role} monitor" if role and multi else "monitor"
-        add(0, group, f"[m{m.index}] {said} ({', '.join(bits)}{power}):")
+        said = m.label or (f"{m.role} monitor" if m.role and multi else "monitor")
+        add(0, group, f"[m{m.index}] {said} ({', '.join(bits)}{'; ' + '; '.join(notes) if notes else ''}):")
         mine = [w for w in shown if w.monitor == m.index]
         if not mine:
             add(0, group, "nothing open")
         for w in mine:
             add(_priority(w), group, _window_words(state, w, planner=planner, cap=cap) + ";")
+    if state.away:
+        # mon1: a monitor of theirs Windows doesn't list (memory's record): never mistaken for the one on screen
+        parts = []
+        for a in state.away:
+            notes = [n for n in (*(f'they call it "{c}"' for c in a.called[:2]), _dropped_words(a.removed_at)) if n]
+            parts.append(a.label + (f" ({'; '.join(notes)})" if notes else ""))
+        add(0, "away", "Not connected to Windows now (switched fully off or unplugged): " + "; ".join(parts) + ".")
     off = [w for w in shown if w.monitor is None or w.monitor not in {m.index for m in state.monitors}]
     for w in off:
         add(4, "off", ("Off every monitor: " if w is off[0] else "") + name_of(w, cap=cap) + ";")

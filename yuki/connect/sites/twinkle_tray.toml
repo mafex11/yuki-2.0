@@ -1,10 +1,17 @@
 # Twinkle Tray as data (morning21 lane B: B5, B6): a monitor app, one possible means of the display capability
 # (yuki/skills/connections/display.toml, means = "app"). Facts true for anyone's Twinkle Tray, from its README (v1.13+)
-# and its source (src/electron.js, handleCommandLine); whether *this* user uses it is told or learned, never written
-# here, and nothing about it is ever required (Windows' own DDC/CI always works without it).
+# and its source (src/electron.js, handleCommandLine and handleClientMessage; src/Utils.js; read 22 Oct, mon1, from
+# its app.asar as text); whether *this* user uses it is told or learned, never written here, and nothing about it is
+# ever required (Windows' own DDC/CI always works without it).
 #
-# Zero setup (D0): its command line only, handed to the running app; never its UDP interface (off by default and
-# keyed: that would be setup) and never its panel (an Electron flyout that closes when it loses focus).
+# Zero setup (D0): its command line, handed to the running app, and its named pipe's read-only list; never its UDP
+# interface (off by default and keyed: that would be setup) and never its panel (an Electron flyout that closes when it
+# loses focus).
+#
+# What it can reach (mon1, its source): every path of it (flyout, command line, pipe) writes DDC/CI through the
+# physical-monitor handle of a monitor Windows lists now, the same way Yuki's own control does. Its live list is
+# rebuilt at each full refresh (5 s after a display change), so a monitor Windows dropped leaves it too: it can't wake
+# a monitor that is no longer attached.
 
 [app]
 name = "Twinkle Tray"
@@ -23,13 +30,25 @@ programs = ["%LOCALAPPDATA%\\Microsoft\\WindowsApps\\Twinkle-Tray.exe",
 needs_running = true
 # It prints nothing and its exit status says nothing: every change is read back from the monitor (DDC/CI).
 exit_works = false
-# One monitor by its own id: a lower-case part of the monitor's id, its Plug and Play id ("acr06d7") works.
-select = "--MonitorID={pnp}"
+# One monitor by its own key in the app's list: the app lower-cases the argument and takes the first key of its list
+# that contains it. Its keys are each monitor's Plug and Play instance part ("5&19123132&0&uid155906": the README's
+# "UID2353" form, and what its pipe's list is keyed by), never the Plug and Play id: "acr06d7" matches no key and the
+# app does nothing (mon1: the morning21 data said it worked; it never ran on this PC). The whole instance part is given,
+# so it can't match another monitor's key.
+select = "--MonitorID={instance}"
 # A brightness level, 0-100 (applied to the selected monitor).
 set = "--Set={level}"
 # Any VCP code and value ("--VCP=0xD6:1" wakes a monitor; written without quotes: the app strips none).
 vcp = "--VCP={code}:{value}"
 # --MonitorNum=N is a place in the app's own list (neither Windows' numbering nor Yuki's): never used.
 positional_select = "never"
-# --List does nothing (its handler is empty): nothing is read from the app.
+# --List handed to the running app does nothing (its own handler is empty); a second instance's --List asks the pipe
+# below and prints a console listing. Yuki reads the pipe itself (no console).
 list_works = false
+
+[pipe]
+# Its named pipe (zero setup: no key) answers {"type":"list"} with its live monitor list: a JSON object keyed by each
+# monitor's instance part (the select key above). Read only: the display driver sends this one request, to learn
+# whether the app can reach a monitor before running its command line for it, and nothing else.
+path = '\\.\pipe\twinkle-tray\cmds'
+list = '{"type":"list"}'

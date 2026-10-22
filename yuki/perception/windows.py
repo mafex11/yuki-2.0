@@ -206,6 +206,9 @@ class MonitorInfo:
             (:func:`note_display_power`, at most :data:`POWER_FRESH_S` old): ``on``, ``off``, or ``""`` not
             known (never polled).
         handle: its ``HMONITOR`` now (valid until the next display change; the display driver's way in).
+        target: mon1: the GPU target id of its port (``QueryDisplayConfig``; the "UID" of its Plug and Play
+            instance), ``0`` unread: memory's monitor record keeps it, so a monitor Windows dropped can be told
+            from an empty port.
     """
 
     index: int
@@ -222,6 +225,7 @@ class MonitorInfo:
     role: str = ""
     power: str = ""
     handle: int = 0
+    target: int = 0
 
 
 @dataclass
@@ -263,6 +267,9 @@ class DesktopOverview:
     #: morning21 B7: the notification area's icons by name (:func:`tray_icons`, the
     #: last read, at most :data:`TRAY_CACHE_S` old; never read on this call).
     tray: list["TrayIcon"] = field(default_factory=list)
+    #: mon1: the user's monitors memory's monitor record knows that Windows does not list now (switched fully off,
+    #: unplugged), as :func:`away_monitors` says them: ``{"label", "pnp", "connector", "removed_at", "called"}``.
+    monitors_away: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1606,12 +1613,13 @@ _ROLE_WORDS = ("second", "third", "fourth", "fifth", "sixth")
 
 @dataclass(frozen=True)
 class _Target:
-    """One monitor as Windows' display configuration names it."""
+    """One monitor as Windows' display configuration names it (``target_id``: its port's GPU target id)."""
 
     label: str
     device_path: str
     pnp: str
     connector: str
+    target_id: int = 0
 
 
 def _pnp_of(device_path: str) -> str:
@@ -1619,6 +1627,26 @@ def _pnp_of(device_path: str) -> str:
     segment after ``DISPLAY#``, a fixed machine format."""
     parts = str(device_path or "").split("#")
     return parts[1].upper() if len(parts) > 2 and parts[0].upper().endswith("DISPLAY") else ""
+
+
+#: ``GUID_DEVINTERFACE_MONITOR``: the interface class a monitor's device path ends with.
+_MONITOR_INTERFACE = "{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"
+
+
+def instance_of(device_path: str) -> str:
+    """mon1: the Plug and Play instance part of a monitor device path (``\\\\?\\DISPLAY#AOP069C#5&19123132&0&UID155906
+    #{guid}`` -> ``5&19123132&0&UID155906``): the port it is on (it changes when the cable moves), and the key a monitor
+    app such as Twinkle Tray lists it by. A fixed machine format; ``""`` for anything else."""
+    parts = str(device_path or "").split("#")
+    return parts[2] if len(parts) > 3 and parts[0].upper().endswith("DISPLAY") else ""
+
+
+def device_path_of(pnp: str, instance: str) -> str:
+    """mon1: the device path a monitor of this Plug and Play id on this instance has while attached (the inverse of
+    :func:`_pnp_of` / :func:`instance_of`). ``""`` without both."""
+    if not pnp or not instance:
+        return ""
+    return f"\\\\?\\DISPLAY#{pnp}#{instance}#{_MONITOR_INTERFACE}"
 
 
 def _read_display_targets() -> dict[str, list[_Target]]:
@@ -1663,7 +1691,291 @@ def _read_display_targets() -> dict[str, list[_Target]]:
             device_path=device_path,
             pnp=_pnp_of(device_path),
             connector=_CONNECTOR_WORDS.get(int(target.outputTechnology), ""),
+            target_id=int(path.targetInfo.id),
         ))
+    return out
+
+
+#: ``QDC_ALL_PATHS``: every path the adapters could show, active or not (an empty or dark port too).
+_QDC_ALL_PATHS = 0x1
+#: ``DISPLAYCONFIG_PATH_ACTIVE``.
+_PATH_ACTIVE = 0x1
+
+
+@dataclass(frozen=True)
+class DisplayPort:
+    """mon1: one GPU port (``target_id``) as Windows' display configuration holds it now: ``available`` a monitor
+    answers on it (attached, lit or in standby), ``active`` Windows shows a desktop on it, the monitor's
+    ``device_path`` and ``label`` when one is named there, its ``connector`` word."""
+
+    target_id: int
+    available: bool
+    active: bool
+    device_path: str = ""
+    label: str = ""
+    connector: str = ""
+
+
+def display_ports() -> dict[int, DisplayPort]:
+    """mon1: ``{GPU target id: DisplayPort}`` from ``QueryDisplayConfig(QDC_ALL_PATHS)``: every port, so a monitor that
+    left Windows (its port kept, ``available`` False) is told from one Windows keeps but shows nothing on
+    (``available`` True, ``active`` False). Read-only (no SetDisplayConfig), about a millisecond, never cached (a
+    driver run reads it once). ``{}`` when Windows would not say. Never raises."""
+    try:
+        for _ in range(3):
+            n_paths, n_modes = ctypes.c_uint32(0), ctypes.c_uint32(0)
+            if _display_api.GetDisplayConfigBufferSizes(_QDC_ALL_PATHS, ctypes.byref(n_paths),
+                                                        ctypes.byref(n_modes)) != 0:
+                return {}
+            paths = (_PathInfo * max(1, n_paths.value))()
+            modes = (_ModeInfo * max(1, n_modes.value))()
+            got = _display_api.QueryDisplayConfig(_QDC_ALL_PATHS, ctypes.byref(n_paths), paths,
+                                                  ctypes.byref(n_modes), modes, None)
+            if got == _ERROR_INSUFFICIENT_BUFFER:
+                continue
+            if got != 0:
+                return {}
+            break
+        else:
+            return {}
+        out: dict[int, DisplayPort] = {}
+        for i in range(n_paths.value):
+            path = paths[i]
+            tid = int(path.targetInfo.id)
+            seen = out.get(tid)
+            available = bool(path.targetInfo.targetAvailable) or bool(seen and seen.available)
+            active = bool(path.flags & _PATH_ACTIVE) or bool(seen and seen.active)
+            device_path, label = (seen.device_path, seen.label) if seen is not None else ("", "")
+            if not device_path and path.targetInfo.targetAvailable:
+                target = _TargetDeviceName()
+                target.header.type = _DCI_TARGET_NAME
+                target.header.size = ctypes.sizeof(_TargetDeviceName)
+                target.header.adapterId = path.targetInfo.adapterId
+                target.header.id = path.targetInfo.id
+                if _display_api.DisplayConfigGetDeviceInfo(ctypes.byref(target)) == 0:
+                    device_path = str(target.monitorDevicePath or "")
+                    label = " ".join(str(target.monitorFriendlyDeviceName or "").split())
+            out[tid] = DisplayPort(target_id=tid, available=available, active=active, device_path=device_path,
+                                   label=label,
+                                   connector=_CONNECTOR_WORDS.get(int(path.targetInfo.outputTechnology), ""))
+        return out
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# mon1: the monitors Windows keeps a device for, attached now or not (SetupAPI,
+# non-present devices included) with their EDID from the registry. Read-only,
+# no admin, no setup; read at the memory service's start (names and ports for
+# memory's monitor record: never a sighting) and for one monitor's EDID when it
+# is first seen attached.
+# ---------------------------------------------------------------------------
+
+_GUID_DEVCLASS_MONITOR = "{4d36e96e-e325-11ce-bfc1-08002be10318}"
+#: ``DEVPKEY_Device_LastArrivalDate`` / ``..._LastRemovalDate`` / ``DEVPKEY_Device_IsPresent`` (devpkey.h).
+_DEVPKEY_ARRIVAL = ("{83da6326-97a6-4088-9453-a1923f573b29}", 102)
+_DEVPKEY_REMOVAL = ("{83da6326-97a6-4088-9453-a1923f573b29}", 103)
+_DEVPKEY_PRESENT = ("{540b947e-8b40-45bc-a8a2-6a0b894cbda2}", 5)
+_DEVPROP_TYPE_FILETIME = 0x10
+_DEVPROP_TYPE_BOOLEAN = 0x11
+#: FILETIME's epoch (1601) to the Unix one, in seconds.
+_FILETIME_EPOCH_S = 11_644_473_600
+_EDID_HEADER = b"\x00\xff\xff\xff\xff\xff\xff\x00"
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8)]
+
+
+class _DevPropKey(ctypes.Structure):
+    _fields_ = [("fmtid", _GUID), ("pid", wintypes.ULONG)]
+
+
+class _SpDevInfoData(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("ClassGuid", _GUID), ("DevInst", wintypes.DWORD),
+                ("Reserved", ctypes.c_size_t)]
+
+
+def _guid(text: str) -> _GUID:
+    import uuid
+
+    u = uuid.UUID(text)
+    g = _GUID()
+    g.Data1, g.Data2, g.Data3 = u.time_low, u.time_mid, u.time_hi_version
+    for i, b in enumerate(u.bytes[8:]):
+        g.Data4[i] = b
+    return g
+
+
+_setupapi_lib: object = None
+
+
+def _setupapi() -> object:
+    """setupapi with its signatures (private), or ``None`` where it can't be loaded."""
+    global _setupapi_lib
+    if _setupapi_lib is None:
+        try:
+            lib = ctypes.WinDLL("setupapi")
+            lib.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(_GUID), wintypes.LPCWSTR, wintypes.HWND,
+                                                 wintypes.DWORD]
+            lib.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+            lib.SetupDiEnumDeviceInfo.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_SpDevInfoData)]
+            lib.SetupDiEnumDeviceInfo.restype = wintypes.BOOL
+            lib.SetupDiGetDeviceInstanceIdW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_SpDevInfoData),
+                                                        wintypes.LPWSTR, wintypes.DWORD,
+                                                        ctypes.POINTER(wintypes.DWORD)]
+            lib.SetupDiGetDeviceInstanceIdW.restype = wintypes.BOOL
+            lib.SetupDiGetDevicePropertyW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_SpDevInfoData),
+                                                      ctypes.POINTER(_DevPropKey), ctypes.POINTER(wintypes.ULONG),
+                                                      ctypes.c_void_p, wintypes.DWORD,
+                                                      ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+            lib.SetupDiGetDevicePropertyW.restype = wintypes.BOOL
+            lib.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+            lib.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
+            _setupapi_lib = lib
+        except Exception:
+            _setupapi_lib = False
+    return _setupapi_lib or None
+
+
+def _dev_prop(lib: object, info: object, data: _SpDevInfoData, key: tuple[str, int]) -> tuple[int, bytes] | None:
+    """One device property's ``(type, raw bytes)``, or ``None``."""
+    pk = _DevPropKey()
+    pk.fmtid, pk.pid = _guid(key[0]), key[1]
+    kind, need = wintypes.ULONG(0), wintypes.DWORD(0)
+    buf = (ctypes.c_ubyte * 64)()
+    if not lib.SetupDiGetDevicePropertyW(info, ctypes.byref(data), ctypes.byref(pk), ctypes.byref(kind), buf,
+                                         ctypes.sizeof(buf), ctypes.byref(need), 0):
+        return None
+    return int(kind.value), bytes(buf[: min(int(need.value), ctypes.sizeof(buf))])
+
+
+def _filetime_s(raw: tuple[int, bytes] | None) -> float | None:
+    if raw is None or raw[0] != _DEVPROP_TYPE_FILETIME or len(raw[1]) < 8:
+        return None
+    ticks = int.from_bytes(raw[1][:8], "little")
+    return ticks / 10_000_000 - _FILETIME_EPOCH_S if ticks else None
+
+
+def edid_facts(edid: bytes) -> tuple[str, str, int, int]:
+    """mon1: ``(name, serial, width, height)`` from an EDID block (VESA E-EDID: the 0xFC name and 0xFF serial
+    descriptors, else the numeric serial at bytes 12-15; the first detailed timing is the native mode). A fixed
+    machine format; ``("", "", 0, 0)`` for a block that isn't one."""
+    data = bytes(edid or b"")
+    if len(data) < 128 or data[:8] != _EDID_HEADER:
+        return "", "", 0, 0
+    name = text_serial = ""
+    width = height = 0
+    for off in (54, 72, 90, 108):
+        d = data[off:off + 18]
+        if d[0] or d[1]:
+            if not width:
+                width = d[2] | ((d[4] & 0xF0) << 4)
+                height = d[5] | ((d[7] & 0xF0) << 4)
+            continue
+        text = d[5:18].split(b"\n")[0].decode("ascii", "ignore").strip()
+        if d[3] == 0xFC and not name:
+            name = text
+        elif d[3] == 0xFF and not text_serial:
+            text_serial = text
+    number = int.from_bytes(data[12:16], "little")
+    return " ".join(name.split()), text_serial or (str(number) if number else ""), int(width), int(height)
+
+
+_edid_cache: dict[str, tuple[str, str, int, int]] = {}
+_edid_lock = threading.Lock()
+
+
+def monitor_edid(pnp: str, instance: str) -> tuple[str, str, int, int]:
+    """mon1: ``(name, serial, width, height)`` of the monitor Windows keeps as ``DISPLAY\\<pnp>\\<instance>``, from its
+    EDID in the registry (readable without admin, for a device not attached now too), cached per device. ``("", "",
+    0, 0)`` when none. Never raises."""
+    if not pnp or not instance:
+        return "", "", 0, 0
+    key = f"DISPLAY\\{pnp}\\{instance}".upper()
+    with _edid_lock:
+        hit = _edid_cache.get(key)
+    if hit is not None:
+        return hit
+    got = ("", "", 0, 0)
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            f"SYSTEM\\CurrentControlSet\\Enum\\{key}\\Device Parameters") as reg:
+            value, _kind = winreg.QueryValueEx(reg, "EDID")
+        got = edid_facts(bytes(value or b""))
+    except Exception:
+        got = ("", "", 0, 0)
+    with _edid_lock:
+        _edid_cache[key] = got
+    return got
+
+
+@dataclass(frozen=True)
+class MonitorDevice:
+    """mon1: a monitor Windows keeps a device for: ``pnp`` (``AOP069C``), ``instance`` (the port's instance key,
+    ``5&19123132&0&UID155906``), the EDID ``label``, ``serial``, native ``width`` x ``height``, whether it is
+    ``present`` now (``None`` unread), and when it last arrived and was last removed (epoch seconds, ``None``
+    unread)."""
+
+    pnp: str
+    instance: str
+    label: str = ""
+    serial: str = ""
+    width: int = 0
+    height: int = 0
+    present: bool | None = None
+    arrived_at: float | None = None
+    removed_at: float | None = None
+
+
+def monitor_devices() -> list[MonitorDevice]:
+    """mon1: every monitor device Windows keeps (SetupAPI, not-present ones included: a monitor switched fully off or
+    unplugged keeps its device, its EDID and its last arrival and removal times), each with its EDID facts. Read-only,
+    no admin; tens of milliseconds, so read rarely (the memory service's start). ``[]`` when it can't be read. Never
+    raises."""
+    lib = _setupapi()
+    if lib is None:
+        return []
+    out: list[MonitorDevice] = []
+    info = None
+    try:
+        cls_guid = _guid(_GUID_DEVCLASS_MONITOR)
+        info = lib.SetupDiGetClassDevsW(ctypes.byref(cls_guid), None, None, 0)   # 0: present and not present
+        if not info or info == ctypes.c_void_p(-1).value:
+            return []
+        index = 0
+        while index < 256:
+            data = _SpDevInfoData()
+            data.cbSize = ctypes.sizeof(_SpDevInfoData)
+            if not lib.SetupDiEnumDeviceInfo(info, index, ctypes.byref(data)):
+                break
+            index += 1
+            buf = ctypes.create_unicode_buffer(512)
+            if not lib.SetupDiGetDeviceInstanceIdW(info, ctypes.byref(data), buf, 512, None):
+                continue
+            parts = str(buf.value or "").split("\\")
+            if len(parts) != 3 or parts[0].upper() != "DISPLAY":
+                continue
+            pnp, instance = parts[1].upper(), parts[2]
+            present_raw = _dev_prop(lib, info, data, _DEVPKEY_PRESENT)
+            present = (bool(present_raw[1][0]) if present_raw and present_raw[0] == _DEVPROP_TYPE_BOOLEAN
+                       and present_raw[1] else None)
+            label, serial, width, height = monitor_edid(pnp, instance)
+            out.append(MonitorDevice(pnp=pnp, instance=instance, label=label, serial=serial, width=width,
+                                     height=height, present=present,
+                                     arrived_at=_filetime_s(_dev_prop(lib, info, data, _DEVPKEY_ARRIVAL)),
+                                     removed_at=_filetime_s(_dev_prop(lib, info, data, _DEVPKEY_REMOVAL))))
+    except Exception:
+        return out
+    finally:
+        if info and info != ctypes.c_void_p(-1).value:
+            try:
+                lib.SetupDiDestroyDeviceInfoList(info)
+            except Exception:
+                pass
     return out
 
 
@@ -1717,6 +2029,11 @@ _power: dict[str, tuple[int, float]] = {}
 #: ``{device path: (label, pnp)}``: every monitor this process saw attached, so a monitor Windows dropped (switched
 #: fully off) can still be named.
 _seen_monitors: dict[str, tuple[str, str]] = {}
+#: mon1: ``{device path: wall time}`` when this process's last read no longer listed a monitor it listed before (RAM;
+#: memory's monitor record keeps the lasting one).
+_gone_at: dict[str, float] = {}
+#: mon1: the device paths the last :func:`list_monitors` listed.
+_attached_last: set[str] = set()
 
 
 def note_display_power(device_path: str, value: int | None) -> None:
@@ -1743,9 +2060,49 @@ def display_power(device_path: str, *, fresh_s: float = POWER_FRESH_S) -> str:
 
 
 def seen_monitors() -> dict[str, tuple[str, str]]:
-    """``{device path: (label, pnp)}`` of every monitor this process saw attached (a copy)."""
+    """``{device path: (label, pnp)}`` of every monitor this process saw attached, and (mon1) every one memory's
+    monitor record knows as the user's (``yuki.memory.monitors``: so a fresh process names a monitor that was
+    switched fully off before it started), by the device path it had on its last port. A copy; never raises."""
     with _power_lock:
-        return dict(_seen_monitors)
+        out = dict(_seen_monitors)
+    try:
+        from yuki.memory import monitors as record
+
+        for row in record.known():
+            path = device_path_of(row.pnp, row.instance)
+            if path and path not in out and (row.label or row.pnp):
+                out[path] = (row.label, row.pnp)
+    except Exception:
+        pass
+    return out
+
+
+def gone_at(device_path: str) -> float | None:
+    """mon1: when this process's reads stopped listing the monitor (wall time), or ``None`` (listed now, or never
+    seen leave)."""
+    with _power_lock:
+        return _gone_at.get(str(device_path or ""))
+
+
+def away_monitors(listed: Iterable[MonitorInfo] | None = None) -> list[dict]:
+    """mon1: the user's monitors memory's monitor record knows that Windows does not list now (``listed``: a
+    :func:`list_monitors` already read), as the desk says them: ``{"label", "pnp", "connector", "removed_at",
+    "called"}`` (``called``: the user's own words for it, learned; ``removed_at``: the record's, else when this
+    process saw it leave). ``[]`` without memory. Never raises."""
+    try:
+        from yuki.memory import monitors as record
+
+        attached = list(listed) if listed is not None else list_monitors()
+        out = []
+        for row in record.away([m.device_path for m in attached if m.device_path],
+                               [(m.pnp, m.label) for m in attached]):
+            seen = gone_at(device_path_of(row.pnp, row.instance))
+            removed = max(x for x in (row.removed_at, seen, 0.0) if x is not None) or None
+            out.append({"label": row.label, "pnp": row.pnp, "connector": row.connector, "removed_at": removed,
+                        "called": list(record.words(row, heard=False))})
+        return out
+    except Exception:
+        return []
 
 
 def list_monitors() -> list[MonitorInfo]:
@@ -1811,13 +2168,22 @@ def list_monitors() -> list[MonitorInfo]:
                 continue
             first = shown[0]
             m.label, m.device_path, m.pnp, m.connector = first.label, first.device_path, first.pnp, first.connector
+            m.target = first.target_id
             m.power = display_power(m.device_path)
             attached.add(m.device_path)
             with _power_lock:
                 _seen_monitors[m.device_path] = (m.label, m.pnp)
+        now = time.time()
         with _power_lock:
             for gone in [k for k in _power if k not in attached]:
                 del _power[gone]   # a monitor Windows dropped: its last read says nothing now
+            # mon1: when a monitor this process listed stops being listed (RAM; the record keeps the lasting one)
+            for left in _attached_last - attached:
+                _gone_at[left] = now
+            for back in attached:
+                _gone_at.pop(back, None)
+            _attached_last.clear()
+            _attached_last.update(attached)
     except Exception:
         pass   # identity is extra: the displays themselves are still reported
     return monitors
@@ -1937,13 +2303,15 @@ def get_desktop_overview() -> DesktopOverview:
     except Exception:  # an overview without locale is still an overview
         locale = {}
     keyboard = locale.get("keyboard") or {}
+    monitors = list_monitors()
     return DesktopOverview(
         windows=windows,
         foreground_hwnd=foreground or None,
         cursor=cursor_position(),
         screen_size=(right - left, bottom - top),
         captured_at=time.time(),
-        monitors=list_monitors(),
+        monitors=monitors,
+        monitors_away=away_monitors(monitors),
         virtual_bounds=virtual_bounds,
         foreground_owner_hwnd=(owner_of(foreground) or None) if foreground else None,
         foreground_title=win32gui.GetWindowText(foreground) if foreground else "",

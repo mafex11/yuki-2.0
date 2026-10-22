@@ -14,11 +14,18 @@
 # (the route that always exists). A told app that can't be reached is said and asked about, never swapped for
 # Windows' control silently: the windows routes run only for means "windows" or no means at all.
 #
-# Turning a screen off asks first only when it is the only screen on, or shows a game or a call (the user's decision):
-# the question names it, and the answer comes back as the anyway slot (honoured only as the answer to that question,
-# the engine's own record). Turning one on and brightness never ask. Brightness and the DDC power commands take no
-# focus and send no input, so the windows routes run with a game in front too; a monitor app is a program started,
-# so its route never does.
+# mon1 (22 Oct): a monitor of theirs Windows no longer lists (switched fully off, "missing on the bus") is known from
+# memory's monitor record (yuki/memory/monitors.py) and named. Turning it on tries the monitor app only when the app's
+# own list still holds it (read only), and counts it on only once Windows lists it again and it reads on; with nothing
+# left that can reach it, the run ends on a plain line saying so (which monitor, since when), never a question that
+# hands their request back to them ("press its power button?").
+#
+# Turning a screen off asks first only when it is the only screen on, or shows a game or a call (the user's decision),
+# or (mon1) when memory saw that monitor leave Windows the last time it was turned off, or when it was named by
+# Windows' place alone and that place held another of their monitors before: the question names it, and the answer
+# comes back as the anyway slot (honoured only as the answer to that question, the engine's own record). Turning one
+# on and brightness never ask. Brightness and the DDC power commands take no focus and send no input, so the windows
+# routes run with a game in front too; a monitor app is a program started, so its route never does.
 
 [connection]
 app = "display"
@@ -36,9 +43,10 @@ handoff = true
 serves = [{ end = "display_change", target = "*" }]
 bind = { level = "value", means = "means" }
 
-# Which monitor: its place (main, second, ...) or its own name from the desk (VG271U; a misheard name is matched by its
-# spelling against the monitors' own names; "all" is taken too). Left out: every monitor ("on" wakes the ones that are
-# off; "off" of every screen always asks first).
+# Which monitor: its own name from the desk (VG271U; a misheard name is matched by its spelling against the monitors'
+# own names), the user's own word for it that memory learned (their "first"), or its place (main, second, ...: Windows'
+# place, a fallback); "all" is taken too. A monitor of theirs Windows doesn't list now is named the same ways. Left out:
+# every monitor ("on" wakes the ones that are off; "off" of every screen always asks first).
 [[capability.display.slot]]
 name = "target"
 type = "text"

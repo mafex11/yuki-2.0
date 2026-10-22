@@ -3879,6 +3879,12 @@ class VoiceBridge(QObject):
         if claim is None or claim.dropped or intent == "remember":
             return None
         if claim.done and intent in ("new_task", "follow_up"):
+            if getattr(claim.job, "state", None) not in OPEN_STATES:
+                # mon1 (22 Oct: "use Twinkle Tray" merged into a job that had ended 3 s before, and nothing ran): the
+                # job these words answered has finished, so the hand-off runs as usual (a new job, or the follow-up's
+                # own path), never swallowed by a job that is gone
+                self._log("bridge", op="claim_closed", job_id=claim.job.job_id, intent=intent)
+                return None
             return claim, "merged"
         if intent in ("new_task", "instead"):
             self._drop_claim(intent)

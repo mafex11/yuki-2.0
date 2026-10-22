@@ -7,10 +7,24 @@ controls brightness and power itself, and knows the user's monitor app as app da
 **How a monitor is reached** (ctypes only, no new dependency): its ``HMONITOR`` (``windows.list_monitors``, which also
 names it: the EDID model name, the device path, the Plug and Play id, the role by place) -> its physical monitor
 (dxva2 ``GetPhysicalMonitorsFromHMONITOR``) -> MCCS VCP codes over DDC/CI: ``0x10`` brightness, ``0xD6`` power mode
-(1 on; 2-5 standby or off; Yuki writes 4, the DPM off that keeps the monitor attached to Windows). Brightness falls
-back to the high-level ``Get/SetMonitorBrightness``; a built-in panel (a laptop's) is read and set through WMI
-(``WmiMonitorBrightness``). A monitor Windows no longer lists (switched fully off at its button) has no handle and no
-path: that is said plainly, with its power button as the way.
+(1 on; 2-5 standby or off; Yuki writes 4, the DPM off that keeps the HDMI VG271U attached to Windows; whether a monitor
+stays attached when off is measured per monitor, memory's ``left_bus``). Brightness falls back to the high-level
+``Get/SetMonitorBrightness``; a built-in panel (a laptop's) is read and set through WMI (``WmiMonitorBrightness``).
+
+**A monitor Windows no longer lists** (mon1, 22 Oct: the AOpen "missing on the bus" after an off) has no handle, but
+memory's monitor record (``yuki.memory.monitors``) still knows it: its name, its port (the Plug and Play instance key
+a monitor app lists it by, the GPU target id) and when Windows dropped it. So it is named, never mistaken for the one
+attached, and never asked about as "the other one". By measured state:
+
+* attached and on (0xD6 1): nothing is written; the line names its power and brightness ("24HC1QR is on, at 0%
+  brightness": on but dark is told, never "already on" alone);
+* attached in standby (2-5): 0xD6 = 1 over DDC/CI, read until it reads 1;
+* dropped (in the record, not attached, its port not available): the monitor app, only when its own list (read only,
+  e.g. Twinkle Tray's pipe ``list``) still holds the monitor's instance key, and only counted woken when Windows lists
+  it again within :data:`RETURN_S` and it reads 0xD6 1; else a plain stop line (:data:`LINE_DROPPED`), never a
+  question that hands the user's own request back to them ("Could you press its power button?" is gone);
+* connected but not in use (its port available, no desktop on it): handed on (the planner's way: Windows' display
+  settings), never an ask.
 
 **Every change is read back** from the monitor itself, per monitor (:class:`Change`): its level or power before, the
 value asked, what it reads after (a stale reply is read again; a wake is read until 0xD6 reads 1, up to
@@ -26,10 +40,13 @@ for the desk (``windows.note_display_power``: "screen off", for :data:`yuki.perc
 **The user's monitor app** (means ``app``): any app data file ``yuki/connect/sites/<app>.toml`` whose ``[app]
 controls = "monitors"`` (Twinkle Tray today) is a monitor app: found installed (one of its ``programs`` exists) and
 running (one of its ``images`` runs). Its ``[cli]`` templates are filled per monitor (``select`` by the monitor's own
-Plug and Play id, never a place in the app's list; ``set`` a level; ``vcp`` the power code), the program is run and
-waited for, and the monitor is read back over DDC/CI: the app is the hand, the monitor the judge. Not installed, or not
-running when its command line needs it running: said and asked ("start it, or Windows' own control?"), never swapped
-for Windows' control silently.
+instance key, ``{instance}``, the key the app's own list holds it by, never a place in the app's list; ``set`` a
+level; ``vcp`` the power code), the program is run and waited for, and the monitor is read back over DDC/CI: the app
+is the hand, the monitor the judge. mon1: when the app data says how to read its list (``[pipe]``), it is never run for
+a monitor that list doesn't hold, and the line names it. Not installed, or not running when its command line needs it
+running: said and asked ("start it, or Windows' own control?"), never swapped for Windows' control silently. With no
+means chosen, a running monitor app is the next way for a dropped monitor only (Windows' own control can't reach one),
+and the line says it was used.
 
 **Turning a screen off asks first** only when it is the only screen on, or shows a game or a call (the user's
 decision; any window of a game on it, not only the one in front), or when the target named several monitors by its
@@ -37,27 +54,35 @@ parts: the question names the monitors and why, and the answer comes back as the
 the answer to that very question (the engine's own record, ``engine._answered_slots``) and only for the very
 monitors it named (kept in RAM for :data:`ASKED_OFF_S`), never as a value a caller guessed.
 
-Targets (the ``target`` slot, the model's value): ``all``; a place (``main``, ``second``, ... as the desk says it);
-a monitor's own name or Plug and Play id, whole or its start ("VG"); its connector word ("HDMI"), when only one
-monitor has it; every monitor any of these names (never one of them alone); else a misheard initialism one letter
-off a name's letters ("PG" for the VG271U), only when the value is that one short word or writes it in capitals ("PG
-monitor"; never a lower-case "or" inside a phrase) and exactly one name is that close. Never the desk's ``Monitor <n>`` (the hands' id). Spelling and data only, never a list of words. A
-value that names no monitor is asked about ("Which monitor: ..., or both?", ``all`` among the options) with the forms
-the slot takes beside it (``facts_ram["form"]``, for a caller that calls again). Left out: every monitor ("on" wakes
-the ones that are off; "off" of every screen is asked first, as the only screen on).
+Targets (the ``target`` slot, the model's value): ``all``; first (mon1) the user's own words for a monitor, learned
+(memory's monitor record: what the meanings pass learned they call it, their "first", and the heard forms the names
+pass learned for its name, "PG"), whole words in the value, a form two monitors share naming neither; then a place
+(``main``, ``second``, ... as Windows' place gives it: a fallback); a monitor's own name or Plug and Play id, whole or
+its start ("VG"); its connector word ("HDMI"), when only one monitor has it; every monitor any of these names (never
+one of them alone); else a misheard initialism one letter off a name's letters ("PG" for the VG271U), only when the
+value is that one short word or writes it in capitals ("PG monitor"; never a lower-case "or" inside a phrase) and
+exactly one name is that close. A monitor of theirs Windows doesn't list now is named the same ways (by its words,
+name, id or a misheard initialism). Never the desk's ``Monitor <n>`` (the hands' id). Spelling and data only, never a
+list of words. A value that names no monitor is asked about ("Which monitor: ..., or both?", ``all`` among the options,
+the dropped ones named too) with the forms the slot takes beside it (``facts_ram["form"]``), except a power-on with
+one monitor attached while exactly one of theirs is dropped: that one is meant. Left out: every monitor ("on" wakes the
+ones that are off, the dropped ones included; "off" of every screen is asked first, as the only screen on). An off
+named by place alone asks which when the record shows that place held another monitor before (Windows' primary
+moves when a monitor drops).
 
-Logs (content-free; ``yuki.log.events``' vocabulary): ``display stage=read|set|power route=ddc|wmi|app
+Logs (content-free; ``yuki.log.events``' vocabulary): ``display stage=read|set|power route=ddc|wmi|app|record
 verdict=held|stale|none monitors=<n> ok=<n> ms=<ms>`` (the plan's ``op`` and ``readback`` under the log's own enum
-keys ``stage`` and ``verdict``); never a monitor's name.
+keys ``stage`` and ``verdict``; ``record``: only dropped monitors, nothing reached); never a monitor's name.
 
 Public API::
 
     monitors() -> list[Screen]                          # the displays now, named (no DDC)
+    away_monitors(screens) -> list[Known]               # mon1: theirs that Windows doesn't list now (memory's record)
     read(target=None, *, log=None) -> list[dict]        # K2: {name, role, brightness, power, ok, why} per monitor
     set_brightness(screens, *, level=None, change=None, app=None) -> list[Change]
     set_power(screens, state, *, app=None) -> list[Change]
-    pick(value, screens) -> Picked                      # a target slot's value -> the monitors it names
-    target_form(screens) -> str                         # the forms the target slot takes now
+    pick(value, screens, away=None) -> Picked           # a target slot's value -> the monitors it names
+    target_form(screens, away=()) -> str                # the forms the target slot takes now
     monitor_apps() -> list[MonitorApp]                  # the monitor apps the app data describes, as found now
     ROUTES = {"route_windows", "route_app"}; PROBES = {"still"}
 """
@@ -101,6 +126,13 @@ APP_WAIT_S = 4.0
 APP_SETTLE_S = 0.5
 #: WMI (a built-in panel) answers within this (s).
 WMI_WAIT_S = 2.0
+#: mon1: a dropped monitor a monitor app was told to wake counts as back only when Windows lists it again within this
+#: (s), read every :data:`RETURN_POLL_S` (and then it must read 0xD6 1).
+RETURN_S = 15.0
+RETURN_POLL_S = 0.5
+#: mon1: a monitor app's own list (its pipe, read only) answers within this (s), at most this many bytes.
+LIST_WAIT_S = 2.0
+LIST_MAX_BYTES = 1 << 20
 #: The capability's app key (``[connection] app``): the app a run acted on (D18).
 APP = "display"
 #: The slot that carries the user's answer to the turn-off question.
@@ -117,21 +149,36 @@ ASK_GAME = "{name} is showing your game. Turn it off anyway?"
 ASK_CALL = "{name} is showing your call. Turn it off anyway?"
 ASK_UNSURE_SHOWN = "I can't tell what {name} is showing. Turn it off anyway?"
 ASK_SEVERAL = "That turns off {name}. Turn them off?"
+#: mon1: memory's monitor record says this monitor left Windows the last time it was turned off (``left_bus``).
+ASK_LEAVES_BUS = ("{name} dropped off Windows the last time it was turned off, and once it does I can't turn it back "
+                  "on. Turn it off anyway?")
 #: A turn-off question's monitors are kept this long (s, RAM only): an ``anyway`` yes counts for those monitors only.
 ASKED_OFF_S = 120.0
-ASK_DETACHED = ("{name} isn't connected to Windows right now (switched fully off), so I can't reach it. Could you "
-                "press its power button?")
-ASK_ONLY_ONE = ("I can see only one monitor connected to Windows, {name}; the other may be switched fully off. Could "
-                "you press its power button?")
 ASK_NO_APP = "I don't see a monitor app on this PC. Use Windows' own control instead?"
 ASK_APP_OFF = "{app} isn't running. Start it, or use Windows' own control this time?"
 ASK_APP_GONE = "I couldn't run {app}'s command line. Use Windows' own control this time?"
+#: mon1: the told app's own list doesn't hold the monitor(s): it can't reach them (Yuki's own control can).
+ASK_APP_UNLISTED = "{app} doesn't list {name}, so it can't reach it. Use Windows' own control this time?"
+#: mon1: the plain stop line for a monitor Windows dropped that nothing could reach (``{when}``: " at 08:45", " on 21
+#: Oct at 08:45" or ""; ``{reach}``: :data:`REACH_NONE` or :data:`REACH_APP`). Said, never asked: no way is left.
+LINE_DROPPED = ("Your {name} is switched fully off: Windows dropped it{when}, so {reach}. Only its own power button "
+                "brings it back.")
+LINE_DROPPED_SEVERAL = ("Your {name} are switched fully off: Windows dropped them, so {reach}. Only their own power "
+                        "buttons bring them back.")
+LINE_DROPPED_LEVEL = "Your {name} is switched fully off (Windows dropped it{when}), so it has no brightness to set."
+REACH_NONE = "I can't reach {it}"
+REACH_APP = "neither I nor {app} can reach {it}"
+REACH_APP_TRIED = "I can't reach {it}, and {app} couldn't bring {it} back"
 #: Why a monitor didn't take a change, as said after its name (the ``why`` code words of :class:`Change`).
 WHY_WORDS: dict[str, str] = {
     "no_handle": "isn't connected to Windows", "no_ddc": "doesn't take commands over its cable",
     "no_power": "doesn't take power commands over its cable", "no_off": "has no off command",
     "write_failed": "didn't take the change", "no_readback": "didn't answer",
     "readback_stale": "still reads {after}", "app_failed": "wasn't changed by {app}",
+    # mon1
+    "dropped": "is switched fully off (Windows dropped it{when}); only its own power button brings it back",
+    "app_unlisted": "isn't in {app}'s list, so {app} can't reach it",
+    "inactive": "is connected, but Windows isn't showing anything on it",
 }
 
 _bus = threading.Lock()
@@ -185,14 +232,66 @@ def monitors() -> list[Screen]:
 @dataclass(frozen=True)
 class Picked:
     """What a target names: the monitors (``screens``), or why none (``why``: ``none`` nothing given, ``unknown``
-    nothing matched, ``detached`` a monitor this process saw that Windows no longer lists, named in ``name``).
+    nothing matched, ``detached`` only monitors of theirs Windows no longer lists, named in ``name``).
     ``several``: the value named more than one monitor by its parts (never ``all``): each is taken, and turning them
-    off asks first (fix M1: a role and a name that disagree are never settled by one of them alone)."""
+    off asks first (fix M1: a role and a name that disagree are never settled by one of them alone). mon1: ``away``,
+    the monitors of theirs it named that Windows doesn't list now (memory's monitor record rows); ``place_only``: the
+    attached ones were named by Windows' place alone (``main``, ``second``)."""
 
     screens: tuple[Screen, ...] = ()
     why: str = ""
     name: str = ""
     several: bool = False
+    away: tuple[Any, ...] = ()
+    place_only: bool = False
+
+
+def _record_rows() -> list[Any]:
+    """Memory's monitor record (every row; ``[]`` without memory). Never raises."""
+    try:
+        from yuki.memory import monitors as record
+
+        return record.rows()
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _row_of(s: Screen, rows: Sequence[Any]) -> Any:
+    """The record's row of an attached monitor (by its port, else its id and name), or ``None``."""
+    try:
+        from yuki.memory import monitors as record
+
+        return record.match(rows, s.key, s.pnp, s.label)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def away_monitors(screens: Sequence[Screen]) -> list[Any]:
+    """mon1: the monitors of theirs Windows doesn't list now (memory's monitor record, ``yuki.memory.monitors.Known``
+    rows), and, without memory, the ones this process saw attached that it no longer lists (rows with no port facts).
+    Never raises."""
+    out: list[Any] = []
+    try:
+        from yuki.memory import monitors as record
+
+        out = record.away([s.key for s in screens if s.key], [(s.pnp, s.label) for s in screens])
+    except Exception:  # noqa: BLE001
+        out = []
+    try:
+        from yuki.memory.monitors import Known
+        from yuki.perception.windows import instance_of, seen_monitors
+
+        attached = {s.key.casefold() for s in screens if s.key} | {f"{s.pnp}|{s.label}".casefold() for s in screens}
+        have = {r.device_path.casefold() for r in out} | {f"{r.pnp}|{r.label}".casefold() for r in out}
+        for n, (path, (label, pnp)) in enumerate(seen_monitors().items()):
+            if not (label or pnp) or path.casefold() in attached | have or f"{pnp}|{label}".casefold() in attached:
+                continue
+            have.add(path.casefold())
+            out.append(Known(id=-(n + 1), ident="", label=str(label or ""), pnp=str(pnp or ""),
+                             instance=instance_of(path), first_seen=0.0))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def _squash(text: Any) -> str:
@@ -257,47 +356,108 @@ def _ident(s: Screen) -> str:
     return s.key or str(s.index)
 
 
-def pick(value: Any, screens: Sequence[Screen]) -> Picked:
+def _away_ident(row: Any) -> str:
+    return f"away:{getattr(row, 'id', 0)}:{getattr(row, 'pnp', '')}:{getattr(row, 'label', '')}"
+
+
+def _said_keys(text: str, owned: Sequence[tuple[str, Any]]) -> set[str]:
+    """mon1: the keys of the monitors whose learned words (``yuki.memory.monitors.words``: what the user calls it, a
+    heard form of its name) stand whole and in order in ``text``'s words; a form two monitors share names neither.
+    Spelling against learned data only, never a list of words."""
+    words = _tokens(text)
+    forms: dict[str, set[str]] = {}
+    try:
+        from yuki.memory.monitors import words as learned
+    except Exception:  # noqa: BLE001
+        return set()
+    for key, row in owned:
+        try:
+            mine = learned(row) if row is not None else ()
+        except Exception:  # noqa: BLE001
+            mine = ()
+        for form in mine:
+            run = _tokens(form)
+            if run:
+                forms.setdefault(" ".join(run), set()).add(key)
+    out: set[str] = set()
+    for form, keys in forms.items():
+        if len(keys) == 1 and _has_run(words, form.split()):
+            out |= keys
+    return out
+
+
+def pick(value: Any, screens: Sequence[Screen], away: Sequence[Any] | None = None) -> Picked:
     """The monitors a ``target`` value names (see the module docstring). Spelling and data only.
 
     Fix M1: its place, its own name or id, and its connector are read together, and every monitor any of them names
     is taken (``several`` when that is more than one): "VG and main" is both, never the place alone. A connector
     word two monitors share names neither of them. Fix L3: the desk's ``Monitor <n>`` (the hands' id, counted from
-    0 where Windows' Settings counts from 1) is no form of it: such a value names nothing and is asked about."""
+    0 where Windows' Settings counts from 1) is no form of it: such a value names nothing and is asked about.
+
+    mon1: the user's own learned words for a monitor come first (their "first" is the AOpen whichever monitor Windows
+    calls main); ``away`` (default: :func:`away_monitors`) are the monitors of theirs Windows doesn't list now, named
+    by their words, name, id or a misheard initialism."""
     text = " ".join(str(value or "").split()).casefold()
     if not text:
         return Picked(why="none")
     listed = list(screens)
     if text == "all":
         return Picked(tuple(listed))
+    gone = list(away) if away is not None else away_monitors(listed)
+    rows = _record_rows()
+    owned = [(_ident(s), _row_of(s, rows)) for s in listed] + [(_away_ident(r), r) for r in gone]
+    said = _said_keys(text, owned)
+    if said:
+        hit = tuple(s for s in listed if _ident(s) in said)
+        off = tuple(r for r in gone if _away_ident(r) in said)
+        return Picked(hit, why="" if hit else "detached", name="" if hit else off[0].said, away=off,
+                      several=len(hit) + len(off) > 1)
     words = _tokens(text)
     names = [(_ident(s), s.label) for s in listed if s.label] + [(_ident(s), s.pnp) for s in listed if s.pnp]
     by_connector = [s for s in listed if s.connector and _has_run(words, _tokens(s.connector))]
-    keys = ({_ident(s) for s in listed if s.role and _has_run(words, _tokens(s.role))}
-            | set(_named(text, names))
-            | ({_ident(s) for s in by_connector} if len(by_connector) == 1 else set()))
+    by_place = {_ident(s) for s in listed if s.role and _has_run(words, _tokens(s.role))}
+    by_name = set(_named(text, names)) | ({_ident(s) for s in by_connector} if len(by_connector) == 1 else set())
+    keys = by_place | by_name
     if not keys:
         keys = set(_near(value, names))
     hit = tuple(s for s in listed if _ident(s) in keys)
     if hit:
-        return Picked(hit, several=len(hit) > 1)
-    try:
-        from yuki.perception.windows import seen_monitors
-
-        attached = {s.key for s in listed}
-        gone = [(k, label or pnp) for k, (label, pnp) in seen_monitors().items() if k not in attached and (label or pnp)]
-    except Exception:  # noqa: BLE001
-        gone = []
-    away = _named(text, gone) or _near(value, gone)
-    if len(away) == 1:
-        return Picked(why="detached", name=next(n for k, n in gone if k == away[0]))
+        return Picked(hit, several=len(hit) > 1, place_only=bool(by_place) and not by_name)
+    gone_names = ([(_away_ident(r), r.label) for r in gone if r.label]
+                  + [(_away_ident(r), r.pnp) for r in gone if r.pnp])
+    found = _named(text, gone_names) or _near(value, gone_names)
+    off = tuple(r for r in gone if _away_ident(r) in set(found))
+    if off:
+        return Picked(why="detached", name=off[0].said, away=off, several=len(off) > 1)
     return Picked(why="unknown")
 
 
-def target_form(screens: Sequence[Screen]) -> str:
+#: mon1: another monitor held a place word at least this long (s, memory's monitor record) for that place to be
+#: ambiguous (a reconnect's blip is not a move).
+ROLE_MOVED_S = 300.0
+
+
+def _place_moved(chosen: Sequence[Screen], rows: Sequence[Any]) -> bool:
+    """mon1: whether memory's monitor record shows another monitor of theirs held a chosen monitor's place word before
+    (at least :data:`ROLE_MOVED_S` under that role): Windows' primary moved (the 22 Oct drop made the VG271U "main"
+    and the AOpen "second"), so the place alone may not be the monitor meant. Measured data only."""
+    for s in chosen:
+        mine = _row_of(s, rows)
+        for r in rows:
+            if not getattr(r, "theirs", False) or (mine is not None and r.id == mine.id):
+                continue
+            if mine is None and r.pnp == s.pnp and r.label == s.label:
+                continue
+            if s.role and float((getattr(r, "roles", None) or {}).get(s.role, 0.0)) >= ROLE_MOVED_S:
+                return True
+    return False
+
+
+def target_form(screens: Sequence[Screen], away: Sequence[Any] = ()) -> str:
     """The forms the ``target`` slot takes, from the monitors now (fix M2: handed back to a caller whose value named
-    none): each place, each own name, ``all``, or left out. Data only."""
-    parts = [s.role for s in screens if s.role] + [s.label for s in screens if s.label]
+    none): each own name (the dropped ones too, mon1), each place, ``all``, or left out. Data only."""
+    parts = ([s.label for s in screens if s.label] + [r.label for r in away if getattr(r, "label", "")]
+             + [s.role for s in screens if s.role])
     return " | ".join([*dict.fromkeys(parts), "all"]) + "; or left out (every monitor)"
 
 
@@ -478,13 +638,50 @@ def _wmi_set(level: float) -> bool:
     return _wmi(put) is True
 
 
-def _note_power(screen: Screen, value: int | None) -> None:
+#: mon1: the reads and writes memory's monitor record is told of, written once the bus is free (a database write never
+#: holds the DDC/CI lock): ``(device path, pnp, label, what, value, wrote)``.
+_notes: list[tuple[str, str, str, str, float, bool]] = []
+_notes_lock = threading.Lock()
+
+
+def _note_power(screen: Screen, value: int | None, *, wrote: bool = False) -> None:
     try:
         from yuki.perception.windows import note_display_power
 
         note_display_power(screen.key, value)
     except Exception:  # noqa: BLE001
         pass
+    if value is not None:
+        with _notes_lock:
+            _notes.append((screen.key, screen.pnp, screen.label, "power", float(value), wrote))
+
+
+def _note_level(screen: Screen, level: float | None) -> None:
+    if level is not None:
+        with _notes_lock:
+            _notes.append((screen.key, screen.pnp, screen.label, "level", float(level), False))
+
+
+def _flush_notes() -> None:
+    """Tell memory's monitor record the reads and writes queued (``yuki.memory.monitors.note_power`` /
+    ``note_level``; the process's memory store). Never raises."""
+    with _notes_lock:
+        queued = list(_notes)
+        _notes.clear()
+    if not queued:
+        return
+    try:
+        from yuki.memory import monitors as record
+    except Exception:  # noqa: BLE001
+        return
+    for path, pnp, label, what, value, wrote in queued:
+        try:
+            if what == "power":
+                record.note_power(path, int(value), wrote=wrote, pnp=pnp, label=label)
+            else:
+                record.note_level(path, value, pnp=pnp, label=label)
+        except Exception:  # noqa: BLE001
+            continue
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -496,7 +693,8 @@ def _note_power(screen: Screen, value: int | None) -> None:
 class MonitorApp:
     """A monitor app the app data describes: its data file's ``key``, ``name``, the ``images`` it runs as, its
     ``programs`` (paths, expanded), its ``[cli]`` table, and as found now: ``program`` (the first that exists, ``""``
-    not installed) and ``running``."""
+    not installed) and ``running``. mon1: ``pipe``, its ``[pipe]`` table (how its own monitor list is read: ``path``
+    and the ``list`` request), ``{}`` when the data gives none."""
 
     key: str
     name: str
@@ -505,6 +703,7 @@ class MonitorApp:
     cli: Mapping[str, Any]
     program: str = ""
     running: bool = False
+    pipe: Mapping[str, Any] = field(default_factory=dict)
 
 
 def _running_images() -> set[str]:
@@ -537,27 +736,89 @@ def monitor_apps() -> list[MonitorApp]:
         programs = tuple(os.path.expandvars(str(p)) for p in app.get("programs") or [] if str(p).strip())
         images = tuple(str(i) for i in app.get("images") or [] if str(i).strip())
         program = next((p for p in programs if os.path.lexists(p)), "")
+        pipe = data.get("pipe") if isinstance(data.get("pipe"), Mapping) else {}
         out.append(MonitorApp(key=key, name=str(app.get("name") or key), images=images, programs=programs, cli=cli,
-                              program=program, running=any(i.casefold() in running for i in images)))
+                              program=program, running=any(i.casefold() in running for i in images),
+                              pipe=dict(pipe)))
     return out
 
 
-def _cli_args(app: MonitorApp, screen: Screen, **values: Any) -> list[str] | None:
-    """The app's command line for one monitor (its ``select`` filled with the monitor's Plug and Play id, lower case,
-    then the ``[cli]`` templates named in ``values``: ``set=level``, ``vcp={code, value}``), or ``None`` when a
-    template is missing or can't be filled."""
+def _instance(target: Any) -> str:
+    """The Plug and Play instance key of an attached :class:`Screen` (from its device path) or of a record row (its
+    last port)."""
+    if isinstance(target, Screen):
+        try:
+            from yuki.perception.windows import instance_of
+
+            return instance_of(target.key)
+        except Exception:  # noqa: BLE001
+            return ""
+    return str(getattr(target, "instance", "") or "")
+
+
+def _cli_args(app: MonitorApp, target: Any, **values: Any) -> list[str] | None:
+    """The app's command line for one monitor (an attached :class:`Screen` or a record row): its ``select`` filled
+    with the monitor's own ids, lower case (``{instance}``: the key the app's own list holds it by, mon1; ``{pnp}``:
+    its Plug and Play id), then the ``[cli]`` templates named in ``values``: ``set=level``, ``vcp={code, value}``), or
+    ``None`` when a template is missing or can't be filled."""
     from yuki.skills.connection import fill
 
     select = str(app.cli.get("select") or "")
-    if not select or not screen.pnp:
+    pnp, instance = str(getattr(target, "pnp", "") or ""), _instance(target)
+    if not select or not (pnp or instance):
         return None
-    args = [fill(select, {"pnp": screen.pnp.casefold()}, strict=True)]
+    args = [fill(select, {"pnp": pnp.casefold(), "instance": instance.casefold()}, strict=True)]
     for name, slots in values.items():
         template = str(app.cli.get(name) or "")
         if not template:
             return None
         args.append(fill(template, slots if isinstance(slots, Mapping) else {"level": slots}, strict=True))
     return None if any(a is None for a in args) else [str(a) for a in args]
+
+
+def _app_list(app: MonitorApp) -> list[str] | None:
+    """mon1: the monitor keys the app's own list holds now (its ``[pipe]``: the ``list`` request sent to its named pipe,
+    the reply a JSON object keyed by monitor; Twinkle Tray's keys are each monitor's instance key), or ``None`` when
+    the data gives no way to read it or it didn't answer within :data:`LIST_WAIT_S`. Read only: the one request the
+    data names, nothing else is sent. Never raises."""
+    path, request = str(app.pipe.get("path") or ""), str(app.pipe.get("list") or "")
+    if not path or not request or not app.running:
+        return None
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        import json
+
+        try:
+            with open(path, "r+b", buffering=0) as pipe:
+                pipe.write(request.encode("utf-8"))
+                data = b""
+                while len(data) < LIST_MAX_BYTES:
+                    chunk = pipe.read(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                    try:
+                        box["value"] = json.loads(data.decode("utf-8"))
+                        break
+                    except ValueError:
+                        continue   # a reply in several chunks
+        except Exception:  # noqa: BLE001 - no pipe (an older app), or it closed
+            box.pop("value", None)
+
+    thread = threading.Thread(target=run, name="yuki-display-applist", daemon=True)
+    thread.start()
+    thread.join(LIST_WAIT_S)
+    got = box.get("value")
+    return [str(k) for k in got] if isinstance(got, Mapping) else None
+
+
+def _app_holds(listed: Sequence[str] | None, instance: str) -> bool | None:
+    """Whether the app's list holds the monitor of this instance key (``None``: the list couldn't be read)."""
+    if listed is None:
+        return None
+    want = str(instance or "").casefold()
+    return bool(want) and any(want in str(k).casefold() for k in listed)
 
 
 def _act_off(app: MonitorApp) -> bool:
@@ -595,7 +856,10 @@ class Change:
     """One monitor's change: its ``name`` (as said) and ``role``; ``before`` / ``want`` / ``after`` (brightness 0-100,
     or 0xD6 power values); ``ok`` (True read back, False not so, None not readable); ``why`` (a code word,
     :data:`WHY_WORDS`, or ``already``); ``via`` (``ddc`` / ``wmi`` / ``app``). ``key``/``handle``/``what`` are what
-    the re-check reads again (RAM only)."""
+    the re-check reads again (RAM only). mon1: ``level``, the brightness read beside a power that was already on (on
+    but dark is told); ``by``, the monitor app that woke a dropped monitor with no means chosen (the line names it);
+    ``dropped``, a monitor of theirs Windows doesn't list (memory's record); ``when``, when Windows dropped it (epoch
+    s); ``app``, the monitor app that couldn't reach it or was tried; ``tried``, that app was run for it."""
 
     name: str
     role: str
@@ -609,6 +873,12 @@ class Change:
     key: str = ""
     handle: int = 0
     internal: bool = False
+    level: float | None = None
+    by: str = ""
+    when: float | None = None
+    app: str = ""
+    tried: bool = False
+    dropped: bool = False
 
 
 def _brightness_one(screen: Screen, level: float | None, change: float | None, app: MonitorApp | None) -> Change:
@@ -682,6 +952,11 @@ def _power_one(screen: Screen, state: str, app: MonitorApp | None) -> Change:
             _note_power(screen, got[0])
             out.before = float(got[0])
             if (got[0] == POWER_ON) == want_on:
+                if want_on:
+                    # mon1: on already: nothing is written, and its brightness is read beside it (on at 0% looks off)
+                    level = _level_get(handle)
+                    out.level = _percent(level[0], level[1]) if level is not None else None
+                    _note_level(screen, out.level)
                 out.after, out.ok, out.why = float(got[0]), True, "already"
                 return out
         elif not want_on:
@@ -703,6 +978,8 @@ def _power_one(screen: Screen, state: str, app: MonitorApp | None) -> Change:
         if not wrote:
             out.ok, out.why = False, ("app_failed" if app is not None else "write_failed")
             return out
+        if not want_on:
+            _note_power(screen, value, wrote=True)   # mon1: the off Yuki wrote (the record judges left_bus from it)
         # a wake is read until it reads on, up to WAKE_S; an off is read READ_TRIES times
         gap = WAKE_POLL_S if want_on else SETTLE_S
         reads = max(READ_TRIES, int(WAKE_S / WAKE_POLL_S)) if want_on else READ_TRIES
@@ -733,14 +1010,21 @@ def set_brightness(screens: Sequence[Screen], *, level: float | None = None, cha
     (WMI for a built-in panel) or the monitor ``app``'s command line, and read each back. One at a time, on the bus
     alone."""
     with _bus:
-        return [_brightness_one(s, level, change, app) for s in screens]
+        got = [_brightness_one(s, level, change, app) for s in screens]
+    for s, c in zip(screens, got):
+        if c.after is not None:
+            _note_level(s, c.after)
+    _flush_notes()
+    return got
 
 
 def set_power(screens: Sequence[Screen], state: str, *, app: MonitorApp | None = None) -> list[Change]:
     """Turn each monitor's screen ``on`` or ``off`` (VCP 0xD6 through DDC/CI or the monitor ``app``), read back (a wake
     until it reads on, up to :data:`WAKE_S`). No question here: :func:`_off_question` is the route's."""
     with _bus:
-        return [_power_one(s, state, app) for s in screens]
+        got = [_power_one(s, state, app) for s in screens]
+    _flush_notes()
+    return got
 
 
 def _power_now(screen: Screen) -> int | None:
@@ -749,19 +1033,26 @@ def _power_now(screen: Screen) -> int | None:
         got = _vcp_get(handle, VCP_POWER) if handle else None
     if got is not None:
         _note_power(screen, got[0])
+        _flush_notes()
     return got[0] if got is not None else None
 
 
 def read(target: str | None = None, *, log: Callable[..., Any] | None = None) -> list[dict[str, Any]]:
     """Contract K2 (the brain's ``display`` probe): each monitor ``target`` names (:func:`pick`; ``None`` or ``""``:
     every monitor) read now: ``{"name", "role", "brightness" (0-100 or None), "power" ("on" / "off" / None), "ok"
-    (anything read), "why" ("" / "no_handle" / "no_ddc")}``. ``[]`` when the target names no attached monitor. Never
-    raises; ``log(event, **fields)`` gets one content-free ``display`` line."""
+    (anything read), "why" ("" / "no_handle" / "no_ddc")}``. ``[]`` when the target names no attached monitor. mon1: a
+    monitor of theirs Windows doesn't list now that the target names is read as Windows' own fact: ``power`` "off",
+    ``ok`` True, ``why`` "not_connected" (never "on"). Never raises; ``log(event, **fields)`` gets one content-free
+    ``display`` line."""
     started = time.perf_counter()
     out: list[dict[str, Any]] = []
     try:
         screens = monitors()
-        chosen = list(screens) if not str(target or "").strip() else list(pick(target, screens).screens)
+        picked = pick(target, screens) if str(target or "").strip() else Picked(tuple(screens))
+        chosen = list(picked.screens)
+        for r in picked.away:
+            out.append({"name": r.said, "role": "", "brightness": None, "power": "off", "ok": True,
+                        "why": "not_connected"})
         with _bus:
             for s in chosen:
                 with _physical(s.handle) as handle:
@@ -774,10 +1065,13 @@ def read(target: str | None = None, *, log: Callable[..., Any] | None = None) ->
                     _note_power(s, power[0])
                 said = None if power is None else ("on" if power[0] == POWER_ON else "off")
                 ok = brightness is not None or said is not None
+                if brightness is not None and not s.internal:
+                    _note_level(s, brightness)
                 out.append({"name": s.said, "role": s.role, "brightness": brightness, "power": said, "ok": ok,
                             "why": "" if ok else ("no_handle" if not s.handle else "no_ddc")})
     except Exception:  # noqa: BLE001 - what was read so far
         pass
+    _flush_notes()
     _log(log, stage="read", route="ddc", verdict="held" if out and all(r["ok"] for r in out) else "none",
          monitors=len(out), ok=sum(1 for r in out if r["ok"]), ms=round((time.perf_counter() - started) * 1000.0, 1))
     return out
@@ -814,9 +1108,10 @@ def _number(value: Any) -> float | None:
     return x if x == x else None
 
 
-def _which(screens: Sequence[Screen]) -> str:
-    """ASK_WHICH's choices: each monitor by name, then every monitor ("both" of two, "all of them")."""
-    said = [s.said for s in screens]
+def _which(names: Sequence[Any]) -> str:
+    """ASK_WHICH's choices: each monitor by name (a :class:`Screen` or its said name), then every monitor ("both" of
+    two, "all of them")."""
+    said = [n.said if isinstance(n, Screen) else str(n) for n in names]
     if len(said) > 1:
         said.append("both" if len(said) == 2 else "all of them")
     return said[0] if len(said) == 1 else ", ".join(said[:-1]) + " or " + said[-1]
@@ -868,9 +1163,11 @@ def _off_question(call: Any, chosen: Sequence[Screen], screens: Sequence[Screen]
 
 
 def _off_reason(call: Any, chosen: Sequence[Screen], screens: Sequence[Screen], *, several: bool) -> str | None:
-    """:func:`_off_question`'s checks, in order: the only screen on; a game on a chosen monitor (the one in front, and
-    fix M3: any window of a game shown there, by ``gamegate.window_game``, a measured fact); a call shown there; several
-    monitors named. A check that can't read asks (fails closed), never with a claim the read doesn't hold."""
+    """:func:`_off_question`'s checks, in order: the only screen on; (mon1) a monitor memory's record saw leave Windows
+    the last time it was turned off (``left_bus``: then only its button brings it back); a game on a chosen monitor
+    (the one in front, and fix M3: any window of a game shown there, by ``gamegate.window_game``, a measured fact); a
+    call shown there; several monitors named. A check that can't read asks (fails closed), never with a claim the read
+    doesn't hold."""
     from yuki.skills import engine
 
     said = [s.said for s in chosen]
@@ -884,6 +1181,10 @@ def _off_reason(call: Any, chosen: Sequence[Screen], screens: Sequence[Screen], 
         # the others read off, or can't be read: never a claim the read doesn't hold
         return ASK_ONLY_SCREEN.format(name=_cap(names)) if all(p is not None for p in powers) \
             else ASK_UNSURE_SCREEN.format(name=names)
+    rows = _record_rows()
+    leaves = [s for s in chosen if getattr(_row_of(s, rows), "left_bus", None) == 1]
+    if leaves:
+        return ASK_LEAVES_BUS.format(name=_cap(leaves[0].said))
     unsure = ASK_UNSURE_SHOWN.format(name=names)
     try:
         from yuki.perception.windows import list_windows
@@ -933,22 +1234,46 @@ def _off_reason(call: Any, chosen: Sequence[Screen], screens: Sequence[Screen], 
     return None
 
 
+def _when_words(at: float | None, *, now: float | None = None) -> str:
+    """When Windows dropped a monitor, as said after "dropped it": " at 08:45" today, " on 21 Oct at 08:45" before,
+    "" unknown."""
+    if not at:
+        return ""
+    try:
+        from datetime import datetime
+
+        then = datetime.fromtimestamp(float(at))
+        today = datetime.fromtimestamp(time.time() if now is None else float(now)).date()
+        return f" at {then:%H:%M}" if then.date() == today else f" on {then.day} {then:%b} at {then:%H:%M}"
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
 def _line(changes: Sequence[Change], app: MonitorApp | None) -> tuple[str, str]:
     """``(done line, line when not all took)``: each monitor named with its read-back."""
     def took(c: Change) -> str:
         already = " already" if c.why == "already" else ""
+        by = f" (through {c.by})" if c.by else ""
         if c.what == "power":
             on = c.after == POWER_ON or (c.after is None and c.want == POWER_ON)
-            return f"{c.name} is{already} {'on' if on else 'off'}"
+            if on and c.why == "already" and c.level is not None:
+                # mon1: on, with what it shows: "24HC1QR is on, at 0% brightness" (on but dark is told)
+                return f"{c.name} is on, at {c.level:g}% brightness"
+            if not on and c.why == "already" and c.dropped:
+                return f"{c.name} is already off (Windows doesn't list it now)"
+            return f"{c.name} is{already} {'on' if on else 'off'}{by}"
         level = c.after if c.after is not None else c.want
         return f"{c.name} {'is already ' if already else ''}at {level:g}%"
 
     def missed(c: Change) -> str:
         after = f"{c.after:g}%" if c.what == "brightness" and c.after is not None else "the same"
-        words = WHY_WORDS.get(c.why, "didn't answer").format(after=after,
-                                                             app=app.name if app is not None else "the app")
+        named = c.app or (app.name if app is not None else "the app")
+        words = WHY_WORDS.get(c.why, "didn't answer").format(after=after, app=named, when=_when_words(c.when))
         if c.what == "power" and c.want == POWER_OFF and c.why == "no_readback":
             words = "stopped answering, so it's most likely off"   # many monitors go quiet in standby
+        if c.why == "dropped" and c.tried and c.app:
+            words = WHY_WORDS["dropped"].format(when=_when_words(c.when)).replace(
+                ";", f", and {c.app} couldn't bring it back;", 1)
         return f"{c.name if c.name.startswith('the ') else 'the ' + c.name} {words}"
 
     good = [c for c in changes if c.ok is True]
@@ -961,8 +1286,10 @@ def _line(changes: Sequence[Change], app: MonitorApp | None) -> tuple[str, str]:
     return done, _cap(f"{head}; {tail}." if head else f"{tail}.")
 
 
-#: A change's ``why`` when its monitor wasn't reached at all (nothing written to it).
-UNREACHED = ("no_handle", "no_ddc", "no_power", "no_off")
+#: A change's ``why`` when its monitor wasn't reached at all (nothing written to it). mon1: a monitor Windows dropped
+#: (``dropped``), one its monitor app's list doesn't hold (``app_unlisted``), one connected but not in use
+#: (``inactive``).
+UNREACHED = ("no_handle", "no_ddc", "no_power", "no_off", "dropped", "app_unlisted", "inactive")
 
 
 def _finish(call: Any, changes: list[Change], *, op: str, via: str, app: MonitorApp | None, started: float) -> Any:
@@ -988,7 +1315,8 @@ def _finish(call: Any, changes: list[Change], *, op: str, via: str, app: Monitor
         # fix L4: one monitor already so and the rest not reachable over their cable: nothing was written, and both
         # are said ("24HC1QR is already at 80%; the VG271U doesn't take commands over its cable"). As a no-op that
         # can't be confirmed whole, the run stops here (``ran=None`` with ``already``: the engine's settled end),
-        # never handed on to steps. A monitor Windows no longer lists is asked about instead (``_run``)
+        # never handed on to steps. mon1: a monitor Windows dropped is said the same way, by name ("...; the 24HC1QR
+        # is switched fully off (Windows dropped it at 08:45); only its own power button brings it back")
         return _rr(ran=None, already=True, verified=None, outcome="partly_already", unverified_line=partly,
                    facts=facts, value=first)
     if not acted:
@@ -1002,6 +1330,143 @@ def _finish(call: Any, changes: list[Change], *, op: str, via: str, app: Monitor
                value=first)
 
 
+def _ask_which(screens: Sequence[Screen], gone: Sequence[Any], *, outcome: str = "ask_which") -> Any:
+    """ASK_WHICH with every monitor of theirs among the options (the dropped ones named too, mon1). Fix M2: every
+    monitor is one of the answers ("both" -> the slot's ``all``), and the forms the slot takes ride beside the question
+    in RAM (``facts_ram["form"]``) for a caller that calls once more with one of them (engine merge note 12: a value
+    that names no monitor is the caller's slip the first time, skill22 A19)."""
+    said = list(dict.fromkeys([s.said for s in screens] + [r.said for r in gone]))
+    options = said + ([ALL] if len(said) > 1 else [])
+    return _rr(ran=False, ask=ASK_WHICH.format(names=_which(said)), options=options, outcome=outcome,
+               facts={"slot": "target"}, facts_ram={"form": {"target": target_form(screens, gone)}})
+
+
+def _apps_for_dropped(call: Any) -> list[MonitorApp]:
+    """mon1: with no means chosen, the monitor apps that may be the next way for a dropped monitor (Windows' own
+    control can't reach one): installed and running, the Act switch on, nothing holding launches, and no game in front
+    (a program started never runs with a game in front: the app route's own rule). ``[]`` otherwise."""
+    try:
+        live = [a for a in monitor_apps() if a.program and a.running]
+        if not live:
+            return []
+        game = call.ctx.game_now()
+        if game:
+            return []
+        from yuki.actions import gate
+
+        if gate.refuse("launch") is not None:
+            return []
+        return [a for a in live if not _act_off(a)]
+    except Exception:  # noqa: BLE001 - no next way known: the plain line
+        return []
+
+
+def _await_return(row: Any, deadline: float | None) -> Screen | None:
+    """mon1: the attached monitor a dropped one came back as (its port's device path, else its id and name), polled
+    every :data:`RETURN_POLL_S` for at most :data:`RETURN_S` (and never past the route's deadline); ``None``."""
+    limit = time.monotonic() + RETURN_S
+    if deadline:
+        limit = min(limit, float(deadline) - 1.0)
+    path = str(getattr(row, "device_path", "") or "").casefold()
+    while True:
+        for s in monitors():
+            if (path and s.key.casefold() == path) or (s.pnp and s.pnp == row.pnp and s.label == row.label):
+                return s
+        if time.monotonic() + RETURN_POLL_S > limit:
+            return None
+        time.sleep(RETURN_POLL_S)
+
+
+def _read_on(screen: Screen) -> int | None:
+    """A monitor that just came back: its 0xD6, read until it reads on (up to :data:`WAKE_S`), or ``None``."""
+    got: int | None = None
+    with _bus, _physical(screen.handle) as handle:
+        if not handle:
+            return None
+        for attempt in range(max(1, int(WAKE_S / WAKE_POLL_S))):
+            again = _vcp_get(handle, VCP_POWER, tries=1)
+            if again is not None:
+                got = int(again[0])
+                if got == POWER_ON:
+                    break
+            time.sleep(WAKE_POLL_S)
+    if got is not None:
+        _note_power(screen, got)
+        _flush_notes()
+    return got
+
+
+def _wake_dropped(call: Any, row: Any, app: MonitorApp | None, via: str) -> Change:
+    """mon1: one monitor of theirs Windows dropped, to be turned on (the ladder of the module docstring): connected but
+    not in use -> ``inactive`` (handed on); else the monitor app (the told one, or with no means a running one), only
+    when its own list holds the monitor's instance key, then woken only when Windows lists it again and it reads on;
+    else ``dropped`` (the plain line)."""
+    out = Change(name=row.said, role="", what="power", want=float(POWER_ON), key=row.device_path, dropped=True,
+                 when=getattr(row, "removed_at", None), via="app" if app is not None else "ddc")
+    port = None
+    try:
+        from yuki.perception.windows import display_ports, gone_at
+
+        seen_leave = gone_at(row.device_path)
+        if seen_leave and (out.when is None or seen_leave > out.when):
+            out.when = seen_leave
+        port = display_ports().get(int(row.target_id)) if getattr(row, "target_id", 0) else None
+    except Exception:  # noqa: BLE001
+        port = None
+    if port is not None and port.available and not port.active:
+        out.ok, out.why = False, "inactive"
+        return out
+    out.ok, out.why = False, "dropped"
+    # the told app; with no means chosen, a running monitor app (the next way); never one when they chose Windows'
+    told_windows = str((getattr(call, "values", None) or {}).get("means") or "").casefold() == "windows"
+    candidates = [app] if app is not None else ([] if via == "app" or told_windows else _apps_for_dropped(call))
+    if not candidates:
+        out.app = next((a.name for a in monitor_apps() if a.program), "")
+        return out
+    for a in candidates:
+        out.app = a.name
+        holds = _app_holds(_app_list(a), row.instance)
+        if not holds:
+            # never run for a monitor its own list doesn't hold (or a list that can't be read): it can't reach it
+            out.why = "app_unlisted" if holds is False else "dropped"
+            continue
+        args = _cli_args(a, row, vcp={"code": f"0x{VCP_POWER:02X}", "value": POWER_ON})
+        if not args or not _run_app(a, args):
+            out.why = "dropped"
+            continue
+        out.tried = True
+        back = _await_return(row, getattr(call, "deadline", None))
+        if back is None:
+            out.why = "dropped"
+            continue
+        out.key, out.handle, out.internal = back.key, back.handle, back.internal
+        woke = _read_on(back)
+        out.after = float(woke) if woke is not None else None
+        if woke == POWER_ON:
+            out.ok, out.why, out.by = True, "", (a.name if app is None else "")
+            return out
+        out.ok, out.why = (None, "no_readback") if woke is None else (False, "app_failed")
+        return out
+    return out
+
+
+def _dropped_line(changes: Sequence[Change], *, level: bool) -> str:
+    """mon1: the plain stop line when every monitor named is one Windows dropped and nothing reached it
+    (:data:`LINE_DROPPED`, :data:`LINE_DROPPED_SEVERAL`, :data:`LINE_DROPPED_LEVEL`)."""
+    names = [c.name for c in changes]
+    one = len(names) == 1
+    said = names[0] if one else ", ".join(names[:-1]) + " and " + names[-1]
+    if level:
+        return LINE_DROPPED_LEVEL.format(name=said, when=_when_words(changes[0].when) if one else "")
+    it = "it" if one else "them"
+    app = next((c.app for c in changes if c.app), "")
+    tried = any(c.tried for c in changes)
+    reach = (REACH_APP_TRIED if tried else REACH_APP).format(app=app, it=it) if app else REACH_NONE.format(it=it)
+    if one:
+        return LINE_DROPPED.format(name=said, when=_when_words(changes[0].when), reach=reach)
+    return LINE_DROPPED_SEVERAL.format(name=said, reach=reach)
+
+
 def _run(call: Any, via: str) -> Any:
     started = time.perf_counter()
     values = call.values or {}
@@ -1012,26 +1477,29 @@ def _run(call: Any, via: str) -> Any:
     if level is None and change is None and not power:
         return _rr(ran=False, ask=ASK_WHAT, outcome="no_amount")
     screens = monitors()
-    if not screens:
+    gone = away_monitors(screens)
+    if not screens and not gone:
         return _rr(ran=False, outcome="no_monitors")
-    picked = pick(values.get("target"), screens)
-    if picked.why == "detached":
-        return _rr(ran=False, ask=ASK_DETACHED.format(name=picked.name), outcome="detached",
-                   facts={"slot": "target"})
+    picked = pick(values.get("target"), screens, gone)
     if picked.why == "unknown":
-        if power == "on" and len(screens) == 1:
-            return _rr(ran=False, ask=ASK_ONLY_ONE.format(name=screens[0].said), outcome="only_one",
-                       facts={"slot": "target"})
-        # fix M2: every monitor is one of the answers ("both" -> the slot's ``all``), and the forms the slot takes
-        # ride beside the question in RAM (``facts_ram["form"]``) for a caller that calls once more with one of them
-        # (engine merge note 12: a value that names no monitor is the caller's slip the first time, skill22 A19)
-        options = [s.said for s in screens] + ([ALL] if len(screens) > 1 else [])
-        return _rr(ran=False, ask=ASK_WHICH.format(names=_which(screens)), options=options, outcome="ask_which",
-                   facts={"slot": "target"}, facts_ram={"form": {"target": target_form(screens)}})
-    # left out: every monitor (an off of every screen is asked first, below)
+        if power == "on" and len(screens) <= 1 and len(gone) == 1:
+            # mon1 (22 Oct, "turn on my first monitor" with only the VG271U listed): one monitor attached and
+            # exactly one of theirs dropped: a turn-on that names neither means that one, never "press its button?"
+            picked = Picked(why="detached", name=gone[0].said, away=(gone[0],))
+        else:
+            return _ask_which(screens, gone)
+    if power == "off" and picked.place_only and _place_moved(picked.screens, _record_rows()):
+        # mon1: an off named by Windows' place alone, where another of their monitors held that place before (the
+        # primary moved): which one is asked, never the place's monitor of the moment
+        return _ask_which(screens, gone, outcome="ask_place")
+    # left out: every monitor (an off of every screen is asked first, below); a turn-on includes the dropped ones
     chosen = list(picked.screens) if picked.why != "none" else list(screens)
+    dropped = list(picked.away) if picked.why != "none" else (list(gone) if power == "on" else [])
     app: MonitorApp | None = None
-    if via == "app":
+    if via == "app" and not chosen:
+        # only dropped monitors: the told app is tried when it runs (its list decides); nothing to ask about it
+        app = next((a for a in monitor_apps() if a.program and a.running), None)
+    elif via == "app":
         apps = monitor_apps()
         found = [a for a in apps if a.program]
         if not found:
@@ -1051,28 +1519,60 @@ def _run(call: Any, via: str) -> Any:
             from yuki.skills.chat import LINE_ACT_OFF
 
             return _rr(ran=False, ask=LINE_ACT_OFF.format(app=app.name), outcome="act_off")
-    if power == "off":
+    if power == "off" and chosen:
         question = _off_question(call, chosen, screens, several=picked.several)
         if question is not None:
             return _rr(ran=False, ask=question, outcome="ask_off", facts={"slot": ANYWAY_SLOT})
+    # mon1: the told app is never run for a monitor its own list doesn't hold (read only; a list that can't be read
+    # leaves it to the read-back): that monitor is named in the line, or asked about when it is the only one
+    unlisted: set[str] = set()
+    if app is not None and chosen:
+        listed = _app_list(app)
+        unlisted = {s.key for s in chosen if _app_holds(listed, _instance(s)) is False}
+    reach = [s for s in chosen if s.key not in unlisted]
+    if app is not None and chosen and not reach and not dropped:
+        names = [s.said for s in chosen]
+        return _rr(ran=False, ask=ASK_APP_UNLISTED.format(
+            app=app.name, name=names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]),
+            options=["windows"], outcome="app_unlisted", facts={"slot": "means"})
     changes: list[Change] = []
-    if power:
-        changes += set_power(chosen, power, app=app)
-    if level is not None or change is not None:
-        lit = [s for s, c in zip(chosen, changes) if c.ok is not False] if power == "on" else chosen
-        if power != "off":
-            changes += set_brightness(lit, level=level, change=None if level is not None else change, app=app)
+    if power and reach:
+        changes += set_power(reach, power, app=app)
+    if (level is not None or change is not None) and reach and power != "off":
+        lit = [s for s, c in zip(reach, changes) if c.ok is not False] if power == "on" else reach
+        changes += set_brightness(lit, level=level, change=None if level is not None else change, app=app)
+    changes += [Change(name=s.said, role=s.role, what="power" if power else "brightness", key=s.key, handle=s.handle,
+                       via="app", ok=False, why="app_unlisted", app=app.name if app is not None else "")
+                for s in chosen if s.key in unlisted]
+    for r in dropped:
+        if power == "on":
+            changes.append(_wake_dropped(call, r, app, via))
+        elif power == "off":
+            changes.append(Change(name=r.said, role="", what="power", want=float(POWER_OFF), after=float(POWER_OFF),
+                                  ok=True, why="already", dropped=True, when=r.removed_at))
+        else:
+            changes.append(Change(name=r.said, role="", what="brightness", ok=False, why="dropped", dropped=True,
+                                  when=r.removed_at))
+    if not changes:
+        return _rr(ran=False, outcome="no_monitors")
     op = "power" if power else "set"
-    if app is not None and changes and all(c.why == "app_failed" and c.after is None and c.before is None
-                                           for c in changes):
+    attached = [c for c in changes if not c.dropped]
+    if app is not None and attached and all(c.why == "app_failed" and c.after is None and c.before is None
+                                            for c in attached):
         return _rr(ran=False, ask=ASK_APP_GONE.format(app=app.name), options=["windows"], outcome="app_failed",
                    facts={"slot": "means"})
+    if all(c.dropped and c.why in ("dropped", "app_unlisted") for c in changes):
+        # mon1: every monitor named is one Windows dropped and nothing reached it: said plainly (which monitor, since
+        # when, that neither Yuki nor their monitor app can reach it), never a question handing their request back
+        from yuki.skills.engine import _emit
+
+        _emit(call.ctx, "display", stage=op, route="record", verdict="none", monitors=len(changes), ok=0,
+              ms=round((time.perf_counter() - started) * 1000.0, 1))
+        return _rr(ran=False, stop=True, outcome="dropped", say=_dropped_line(changes, level=not power),
+                   facts={"op": op, "via": "record", "status": "none", "monitors": len(changes), "ok": 0,
+                          "acted": 0, "dropped": len(changes)})
     result = _finish(call, changes, op=op, via="app" if app is not None else _via_word(changes), app=app,
                      started=started)
-    if result.ran is False and not result.already and any(c.why == "no_handle" for c in changes):
-        gone = next(c for c in changes if c.why == "no_handle")
-        return _rr(ran=False, ask=ASK_DETACHED.format(name=_cap(gone.name)), outcome="detached",
-                   facts={"slot": "target"})
     if power == "off" and result.ran is False and not result.already:
         # integ29 (S6): an off that reached no monitor (no 0xD6, DDC/CI off, a built-in panel) ends here, said plainly:
         # never handed on to steps, whose off (SC_MONITORPOWER) would turn every screen off, the one the off question
@@ -1136,5 +1636,5 @@ ROUTES: dict[str, Callable[[Any], Any]] = {"route_windows": route_windows, "rout
 PROBES: dict[str, Callable[[Any, Mapping[str, Any]], tuple[bool | None, dict[str, Any]]]] = {"still": probe_still}
 
 __all__ = ["APP", "ANYWAY_SLOT", "Change", "MonitorApp", "PROBES", "Picked", "POWER_OFF", "POWER_ON", "ROUTES",
-           "Screen", "VCP_BRIGHTNESS", "VCP_POWER", "monitor_apps", "monitors", "pick", "probe_still", "read",
-           "route_app", "route_windows", "set_brightness", "set_power", "target_form"]
+           "Screen", "VCP_BRIGHTNESS", "VCP_POWER", "away_monitors", "monitor_apps", "monitors", "pick", "probe_still",
+           "read", "route_app", "route_windows", "set_brightness", "set_power", "target_form"]

@@ -3659,6 +3659,47 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS desk_stretches_at ON desk_stretches(started_at);
     CREATE INDEX IF NOT EXISTS desk_stretches_end ON desk_stretches(ended_at);
     """,
+    # 49 (2026-10-22, mon1; f\mon\PLAN.md section 2): the user's monitors as measured (yuki.memory.monitors). One row
+    # per monitor (``ident``: a keyed digest of its EDID maker, product and serial; the serial itself is never
+    # stored), written by the timeline's desk recorder on each change of the monitors attached (``first_seen`` /
+    # ``last_seen`` / the seconds attached, as Windows' primary and per place word) and refreshed at the service's
+    # start from Windows' own device list (the port and the last removal only: never a sighting, so a monitor Yuki
+    # never saw attached is never theirs); the display driver's own reads add the last power (VCP 0xD6) and
+    # brightness (0x10), an off it wrote, and ``left_bus`` (1: it left Windows within 30 s of an off or while it last
+    # read off; 0: it stayed 30 s). Hardware facts only (the EDID name, Plug and Play id, connector, native size, the
+    # port's instance key and GPU target id), never content. ``info_at`` moves only when a stable field does (the
+    # you-card's stamp). The meanings' ``called_ciphertext``: the words the user calls a thing by in the evidence
+    # (their "first"), checked against the cited lines (yuki.memory.meanings). Additive only; one self-contained entry
+    # (renumber freely at a merge).
+    """
+    CREATE TABLE IF NOT EXISTS monitors (
+        id          INTEGER PRIMARY KEY,
+        ident       TEXT NOT NULL UNIQUE,
+        label       TEXT NOT NULL DEFAULT '',
+        pnp         TEXT NOT NULL DEFAULT '',
+        connector   TEXT NOT NULL DEFAULT '',
+        width       INTEGER NOT NULL DEFAULT 0,
+        height      INTEGER NOT NULL DEFAULT 0,
+        instance    TEXT NOT NULL DEFAULT '',
+        target_id   INTEGER NOT NULL DEFAULT 0,
+        first_seen  REAL,
+        last_seen   REAL,
+        attached_s  REAL NOT NULL DEFAULT 0,
+        primary_s   REAL NOT NULL DEFAULT 0,
+        roles       TEXT NOT NULL DEFAULT '{}',
+        place       INTEGER,
+        power       INTEGER,
+        power_at    REAL,
+        level       REAL,
+        level_at    REAL,
+        off_at      REAL,
+        removed_at  REAL,
+        left_bus    INTEGER,
+        info_at     REAL NOT NULL,
+        updated_at  REAL NOT NULL
+    );
+    ALTER TABLE meanings ADD COLUMN called_ciphertext TEXT;
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`

@@ -302,8 +302,9 @@ def _key(text: Any) -> str:
 @dataclass
 class KnownNames:
     """The names a learned alias may point to, from memory's data: the people index (each person's name and own
-    aliases), the portrait's people, the user's own names and Yuki's. ``canonical``: words -> the name as memory
-    spells it (a person's name for any of their names)."""
+    aliases), the portrait's people, the user's own names and Yuki's, and (mon1) the user's monitors' own names from
+    memory's monitor record (so "PG" heard for "VG271U" can be learned once the exchanges settle it). ``canonical``:
+    words -> the name as memory spells it (a person's name for any of their names)."""
 
     canonical: dict[str, str] = field(default_factory=dict)
 
@@ -333,6 +334,13 @@ class KnownNames:
                 subject = " ".join(str(f.subject or "").split())
                 if subject and len(subject) <= MAX_CHARS and len(subject.split()) <= MAX_WORDS:
                     add(subject)
+        except Exception:
+            pass
+        try:
+            from yuki.memory import monitors as _m
+
+            for row in _m.known(store):
+                add(row.label)
         except Exception:
             pass
         for n in user_names:
