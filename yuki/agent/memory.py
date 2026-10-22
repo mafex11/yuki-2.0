@@ -1500,9 +1500,25 @@ class MemoryAccess:
         )
 
     def _remember_rule(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """final-H2 lane D1 (contract K-P): the rule is stamped with this app run's session (:attr:`session_id`, the
+        one its exchanges are logged under: ``livetest-...`` in a live test), when memory's ``remember_rule`` takes
+        one, so the live-test purge finds a test's rule by its session. Every caller comes through here: the planner's
+        and the ONE agent's ``remember`` (``yuki.brain.tools.run_remember``) and the agent loop's ``remember_rule``."""
         text = _need_text(tool_input, "text")
+        session = self.session_id
+
+        def keep(client: Any) -> Any:
+            import inspect
+
+            fn = client.remember_rule
+            try:
+                takes = "session" in inspect.signature(fn).parameters
+            except (TypeError, ValueError):
+                takes = False
+            return fn(text, session=session) if takes and session else fn(text)
+
         try:
-            row = self.call_method("remember_rule", text, timeout_s=TOOL_TIMEOUT_S)
+            row = self.call("remember_rule", keep, timeout_s=TOOL_TIMEOUT_S)
         except MemoryUnavailable as exc:
             return _not_saved("remember_rule", exc, {"text": text})
         return ToolOutcome(

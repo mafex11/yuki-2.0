@@ -38,6 +38,7 @@ Public API::
     parse_work(items, offered, sources, fact_sources, *, thread, origin="journal") -> (ops, rejected)
     attach_vectors(ops, vectors, model, offered); texts_for(ops, offered) -> list[str]
     dedupe_starts(ops, store) -> list[str]                     # measured: a "start" close to a thread continues it
+                                                               # (and an op only from a live test's span drops)
     thread_text(title, state, entities) -> str                 # what a thread is embedded as
     thread_line(t, now=None) -> str;  describe_thread(store, t, ...) -> dict
     checklists(store, threads) -> {id: {"done", "open", "total", "next"}}   # milestones landed / open items
@@ -346,8 +347,11 @@ def parse_work(items: Any, offered: dict[int, WorkThread], sources: Sequence[Any
             rejected.append("a new thread without a title")
             continue
         idx = sorted({i - 1 for i in _ints(item.get("sources")) if 1 <= i <= len(sources)})
-        if action == "starts" and idx and all(getattr(getattr(sources[i], "capture", None), "by_yuki", False)
-                                              for i in idx):
+        rest = [sources[i] for i in idx] or list(sources)
+        # final-H2 D3 (b), the links rule (yuki.memory.links: a page up while Yuki acted is never their own visit):
+        # the op's sources are all Yuki's own screens (captured while Yuki acted: ``capture.by_yuki``)
+        yukis = bool(rest) and all(getattr(getattr(s, "capture", None), "by_yuki", False) for s in rest)
+        if action == "starts" and yukis:
             rejected.append("what Yuki put on screen starts no thread")
             continue
         if action in ("starts", "ends") and idx and all(_others_call_line(sources[i]) for i in idx):
@@ -363,14 +367,27 @@ def parse_work(items: Any, offered: dict[int, WorkThread], sources: Sequence[Any
         captured = [float(getattr(getattr(s, "capture", None), "at", 0.0) or 0.0)
                     for s in ([sources[i] for i in idx] or list(sources))]
         captured = [t for t in captured if t > 0.0]
-        ops.append(WorkOp(
+        state = _clean(item.get("state"), 400)
+        open_items = [x for x in (_clean(v, 140) for v in list(item.get("open_items") or [])[:MAX_OPEN]) if x]
+        entities = [x for x in (_clean(v, 80) for v in list(item.get("entities") or [])[:MAX_ENTITIES]) if x]
+        app, host = getattr(thread, "app", None), getattr(thread, "host", None)
+        if yukis:
+            # final-H2 D3 (b) (k_resume_anime: thread 140 took Yuki's own Arc pages as where the user stood, and Arc
+            # among what it involves): only what Yuki put on screen is no state of theirs. It notes the thread came
+            # up (``visible``: status and last seen stay, :meth:`Store._apply_work`), and nothing of where it stands,
+            # what is open, what it involves or the app it was in changes
+            state, open_items, entities, attention, app, host = "", [], [], "visible", None, None
+        op = WorkOp(
             seen_at=max(captured) if captured else None,
             action=action, work_thread_id=None if action == "starts" else n, title=title,
-            state=_clean(item.get("state"), 400),
-            open_items=[x for x in (_clean(v, 140) for v in list(item.get("open_items") or [])[:MAX_OPEN]) if x],
-            entities=[x for x in (_clean(v, 80) for v in list(item.get("entities") or [])[:MAX_ENTITIES]) if x],
-            at=max(times), capture_thread_id=getattr(thread, "id", None), app=getattr(thread, "app", None),
-            host=getattr(thread, "host", None), origin=origin, attention=attention))
+            state=state, open_items=open_items, entities=entities,
+            at=max(times), capture_thread_id=getattr(thread, "id", None), app=app,
+            host=host, origin=origin, attention=attention)
+        if captured:
+            # final-H2 D3 (b): when its sources were seen, for the live-test span check (:func:`dedupe_starts`, which
+            # holds the store): an op resting only on a live test's span is dropped there
+            op._sources_seen = (min(captured), max(captured))   # type: ignore[attr-defined]
+        ops.append(op)
         cited.append(idx)
         if action != "starts":
             seen.add(n)
@@ -415,8 +432,26 @@ def attach_vectors(ops: Sequence[WorkOp], vectors: Any, model: str | None) -> No
 def dedupe_starts(ops: Sequence[WorkOp], store: Any, *, same_as: float = WORK_SAME_AS) -> list[str]:
     """A "starts" whose vector is within ``same_as`` of an existing thread (or of another start in the same
     batch) continues that one instead: the same work under another name (measured; the nightly pass merges
-    what this misses). Returns what it did, for the log."""
+    what this misses). Returns what it did, for the log (ids and counts only).
+
+    final-H2 D3 (b), the links rule (``yuki.memory.links``: a page up while a live test ran is never their own visit):
+    first, an op of a journal batch whose sources were all seen inside one live test's span (:func:`parse_work`'s
+    ``_sources_seen``; ``testtag.store_test_spans``: the test sessions' and the spans earlier purges kept) is dropped:
+    what the harness and Yuki had on the desktop then is never the user's work, nor where a thread of theirs stands."""
     notes: list[str] = []
+    timed = [op for op in ops if getattr(op, "_sources_seen", None) and op.action in ("starts", "continues", "pauses",
+                                                                                      "ends")]
+    if timed:
+        try:
+            spans = testtag.store_test_spans(store)
+        except Exception:  # noqa: BLE001 - no spans known: every op stands
+            spans = []
+        for op in timed:
+            first, last = op._sources_seen   # type: ignore[attr-defined]
+            if any(a <= first and last <= b for a, b in spans):
+                notes.append("a live test's span: " + ("no new thread" if op.action == "starts"
+                                                       else f"W{op.work_thread_id} left as it was"))
+                op.action = "dropped"
     starts = [op for op in ops if op.action == "starts" and op.vector is not None]
     if not starts:
         return notes

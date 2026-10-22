@@ -26,8 +26,9 @@ Conversation memory (Yuki's own exchanges; extracted by the service, yuki.memory
     memory.log_turn(session_id, request_id, at, user_text, reply_text, actions, outcome) -> int
     memory.standing_context() -> str                  # rules/preferences/feedback (<= 2,400) + commitments (<= 1,200)
     memory.resume_context(within_hours=6.0) -> str | None   # last session's summary + last 6 exchanges, <= 4,000
-    memory.remember_rule(text, source_turn=None, supersedes=None) -> int   # immediate, the user's words;
-                                                             # supersedes a near-duplicate (or the given id)
+    memory.remember_rule(text, source_turn=None, supersedes=None, *, session=None) -> int   # immediate, the user's
+                                                             # words; supersedes a near-duplicate (or the given id);
+                                                             # session: the Yuki session it was said in (K-P)
     memory.revoke_rule(ref) -> int                           # "rule:12" as standing_context shows it; 0 if not one
     (both ask the service for a debounced portrait re-render, for its Relationship section)
     memory.recall(...)                                       # also kind "chat" (turns) and "session" (summaries)
@@ -179,6 +180,11 @@ KNOWHOW_DUPLICATE_COSINE = 0.85
 #: A rule given with :meth:`MemoryClient.remember_rule` whose embedding is at
 #: least this close to an active rule or preference supersedes it.
 RULE_DUPLICATE_COSINE = 0.85
+#: final-H2 lane D1 (contract K-P): the purpose of the provenance row a rule kept by ``remember`` is written with
+#: (``conversation_batches``: no model call, no tokens; its ``session_id`` is the Yuki session the rule was said in,
+#: cleartext metadata like ``conversation_turns.session_id``). The fact's ``batch_id`` names it, so the live-test purge
+#: (``yuki.memory.testtag``) finds a rule a test session wrote by that session, never by its words.
+REMEMBER_BATCH_PURPOSE = "remember"
 #: Hard budgets (characters, ~4 per token) of the blocks Yuki attaches to requests.
 STANDING_CONTEXT_CHARS = 1_200
 #: The user's rules, preferences and coach feedback have their own budget, apart from the commitments:
@@ -1718,7 +1724,8 @@ class MemoryClient:
         except Exception:
             return None
 
-    def remember_rule(self, text: str, source_turn: int | None = None, supersedes: int | None = None) -> int:
+    def remember_rule(self, text: str, source_turn: int | None = None, supersedes: int | None = None, *,
+                      session: str | None = None) -> int:
         """Store a standing rule the user just gave, in the user's words; returns its id.
 
         ``text``: the rule as the user said it ("call me captain always");
@@ -1733,6 +1740,12 @@ class MemoryClient:
         rule or preference is ignored. Asks the service for a portrait
         re-render (:meth:`rerender_portrait`). Raises ``ValueError`` for an
         empty text.
+
+        ``session`` (final-H2 lane D1, contract K-P): the Yuki session the rule was said in (``MemoryAccess.session_id``,
+        the one its exchanges are logged under). The rule is then written with its provenance row
+        (:data:`REMEMBER_BATCH_PURPOSE`, that session) in the same transaction, its ``batch_id`` naming it: the turn
+        the rule came from is logged only after the exchange ends, so the session is the stamp a remember can carry
+        when it writes. A live test's rule is then found by its session (``yuki.memory.testtag``), never by its words.
         """
         from yuki.memory.conversations import normalize_quote
 
@@ -1759,13 +1772,45 @@ class MemoryClient:
                 if score >= RULE_DUPLICATE_COSINE and score > best:
                     supersedes, best = f.id, score
         model = getattr(self._embedder, "model_name", None) if vec is not None else None
-        fact_id = self.store.add_conversation_fact(
-            "rule", text, quote=text, subject="", origin="user",
-            source_turn_ids=[int(source_turn)] if source_turn else (), vector=vec, embed_model=model,
-            supersedes=supersedes,
-        )
+        cited = [int(source_turn)] if source_turn else []
+        session = " ".join(str(session or "").split())[:120]
+        if session:
+            fact_id = self._rule_with_session(text, cited, vec, model, supersedes, session)
+        else:
+            fact_id = self.store.add_conversation_fact(
+                "rule", text, quote=text, subject="", origin="user",
+                source_turn_ids=cited, vector=vec, embed_model=model,
+                supersedes=supersedes,
+            )
         self.rerender_portrait()
         return fact_id
+
+    def _rule_with_session(self, text: str, cited: list[int], vec: Any, model: str | None, supersedes: int | None,
+                           session: str) -> int:
+        """final-H2 lane D1 (K-P): :meth:`Store.add_conversation_fact`'s write of a user rule, with its provenance row
+        (``conversation_batches``: purpose :data:`REMEMBER_BATCH_PURPOSE`, ``session_id`` = ``session``, no model, no
+        tokens) inserted first in the same transaction and named by the fact's ``batch_id``. A superseded fact that
+        ended meanwhile: a plain add, as there. Returns the new fact's id."""
+        from yuki.memory.store import ConversationCall, ConversationChange
+
+        store = self.store
+        now = time.time()
+        ch = ConversationChange(op="UPDATE" if supersedes is not None else "ADD", fact_id=supersedes, kind="rule",
+                                subject="", text=text, quote=text, source_turn_ids=list(cited), at=now, origin="user",
+                                vector=vec, embed_model=model)
+        call = ConversationCall(at=now, purpose=REMEMBER_BATCH_PURPOSE, model=REMEMBER_BATCH_PURPOSE,
+                                session_id=session)
+
+        def op(conn: Any) -> int:
+            batch_id = store._insert_cbatch(conn, call)
+            if supersedes is not None:
+                ok, new_id = store._apply_cchanges(conn, [ch], now, batch_id)[0]
+                if ok and new_id is not None:
+                    return int(new_id)
+                ch.op = "ADD"   # the old fact ended meanwhile: plain add
+            return int(store._insert_cfact(conn, ch, now, batch_id))
+
+        return int(store._write(op))
 
     def revoke_rule(self, ref: str, *, note: str | None = None) -> int:
         """Mark one active rule (or preference) revoked by its id; returns the id, or 0.

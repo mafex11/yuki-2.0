@@ -44,6 +44,11 @@ request id, else a run within :data:`CONFIRM_RUN_S` after it that no other excha
 Still in force is the "no correction afterwards": a correction drops a pairing (``taste.unsay``) or ends an alias.
 A pick row that a kept pairing (or a pairing outside the span) points at is kept too. Only test-only rows go.
 The standing rules a test session made are conversation facts resting on its exchanges only, so they go with them.
+final-H2 lane D1 (contract K-P): a rule kept through ``remember`` cites no exchange (the exchange is logged after it
+ends), so it carries its session instead (``MemoryClient.remember_rule``'s provenance row) and goes by that; one written
+before that stamp goes when it was written inside a test's span with no real exchange there (:func:`test_rules`), and a
+rule of the user's it superseded stands again. The planner's "Keep this as your usual?" answers carry their session in
+their source (``brain:<session>``) and go with the test's other preference events.
 Kept: what the screen showed in the span (screen journal facts, links shared in messages and pages only beside the window
 in front, the hour counts of "observed" tastes), which may be real incoming content.
 
@@ -72,6 +77,7 @@ Public API::
     test_turn_ids(store) -> frozenset[int]
     store_test_spans(store) -> list[(start, end)];  sql_outside_spans(column, spans) -> (SQL, params)
     is_test_journal(entry, turn_ids) -> bool;  is_test_fact(fact, turn_ids) -> bool
+    known_spans(conn) -> list[(start, end)];  test_rules(conn, known=None) -> {fact id: "session" | "span"}
     report(db_path=None, *, show=False) -> dict               # read-only; the database is opened ?mode=ro
     purge(conn, dec, *, now) -> dict[str, int]                # inside the caller's write transaction; counts
 
@@ -516,6 +522,136 @@ def _purge_corrections(conn: sqlite3.Connection, dec: Callable[[Any], str | None
     return out
 
 
+#: final-H2 lane D1 (contract K-P): a rule the user gave Yuki through ``remember`` (``MemoryClient.remember_rule``):
+#: kind ``rule``, origin ``user``.
+REMEMBERED_KIND = "rule"
+REMEMBERED_ORIGIN = "user"
+#: The purpose of the provenance row ``remember_rule`` writes a rule with (``yuki.memory.api.REMEMBER_BATCH_PURPOSE``).
+REMEMBER_PURPOSE = "remember"
+#: A remember is written within this long (s) after the exchange that asked for it: a span's real-exchange check reaches
+#: this far before the span, so a real rule said just before a test began is never taken for the test's.
+REMEMBER_AFTER_S = 600.0
+#: The span rule (:func:`test_rules` ``span``) is for the rules written before ``remember`` stamped its session (final-H2,
+#: 22 Oct 2026; installed by this date at the latest). After it every ``remember`` carries its session, and a rule with
+#: none is one the user typed in the Yuki window (it has no exchange): never taken by time.
+SPAN_RULE_BEFORE = datetime(2026, 11, 1).timestamp()
+#: The preference-event sources that carry the session they were said in after ``:`` (``yuki.brain.tools.USUAL_SOURCE``,
+#: the planner's "Keep this as your usual?" answers: ``brain:<session>``).
+SESSION_SOURCES = ("brain",)
+
+
+def known_spans(conn: sqlite3.Connection) -> list[tuple[float, float]]:
+    """The live tests' spans this database knows: its test sessions' (:func:`test_spans`) and those earlier purges
+    kept (:data:`KEPT_SPANS_STATE`; their turns are gone). Read-only."""
+    return _union_spans(test_spans(conn), _kept_spans(_state_value(conn, KEPT_SPANS_STATE)))
+
+
+def test_rules(conn: sqlite3.Connection, known: Sequence[tuple[float, float]] | None = None) -> dict[int, str]:
+    """final-H2 lane D1 (contract K-P; live 22 Oct: ``rule:172`` "Don't use Twinkle Tray ..." was written by
+    m21_reversal_checkback and every purge said "Rules ... 0"): ``{conversation fact id: why}`` of the rules a live
+    test's session kept through ``remember``, which :func:`is_test_fact` cannot see (``remember_rule`` cites no
+    exchange: the exchange is logged only after it ends). Two measured rules, never a reading of words:
+
+    * ``session``: its provenance row (the fact's ``batch_id``, a ``conversation_batches`` row of purpose
+      :data:`REMEMBER_PURPOSE`) names a live test's session: ``MemoryClient.remember_rule``'s stamp.
+    * ``span``: a rule written before the stamp existed (kind ``rule``, origin ``user``, no provenance row, no exchange
+      cited) whose writing (``valid_from`` and ``created_at``) lies inside a live test's span (``known``: this
+      database's test sessions and the spans earlier purges kept; :func:`known_spans` when ``None``) in which, from
+      :data:`REMEMBER_AFTER_S` before it to its end, no exchange of a real session took place: the harness had the
+      desktop and the user said nothing to Yuki. Conservative: a real exchange anywhere in that stretch keeps every
+      rule written in the span, a rule a correction rewrote keeps its first ``valid_from`` (outside the span), and
+      only rules written before :data:`SPAN_RULE_BEFORE` are judged so (after it, a rule with no stamp is one typed in
+      the Yuki window, never a test's).
+
+    Read-only; content-free; ``{}`` on an older database."""
+    out: dict[int, str] = {}
+    if not _has(conn, "conversation_facts", "batch_id"):
+        return out
+    lo, hi = _session_range()
+    if _has(conn, "conversation_batches", "session_id"):
+        for (fid,) in conn.execute(
+                "SELECT f.id FROM conversation_facts f JOIN conversation_batches b ON b.id = f.batch_id"
+                " WHERE f.kind = ? AND f.origin = ? AND b.purpose = ? AND b.session_id >= ? AND b.session_id < ?",
+                (REMEMBERED_KIND, REMEMBERED_ORIGIN, REMEMBER_PURPOSE, lo, hi)).fetchall():
+            out[int(fid)] = "session"
+    spans = list(known_spans(conn) if known is None else known)
+    if not spans or not _has(conn, "conversation_turns", "session_id"):
+        return out
+    cond, params = _in_spans("valid_from", spans)
+    rows = conn.execute(
+        f"SELECT id, valid_from, created_at, source_turn_ids FROM conversation_facts WHERE kind = ? AND origin = ? AND"
+        f" batch_id IS NULL AND {cond}", (REMEMBERED_KIND, REMEMBERED_ORIGIN, *params)).fetchall()
+    quiet: dict[tuple[float, float], bool] = {}
+    for fid, vfrom, created, cited in rows:
+        if int(fid) in out:
+            continue
+        try:
+            if json.loads(cited or "[]"):
+                continue   # it cites an exchange: is_test_fact's to judge
+        except (TypeError, ValueError):
+            continue
+        span = next(((a, b) for a, b in spans if a <= float(vfrom) <= b), None)
+        if span is None or created is None or not span[0] <= float(created) <= span[1]:
+            continue
+        if float(created) >= SPAN_RULE_BEFORE:
+            continue   # written after remember stamped its session: one with none came from the Yuki window
+        if span not in quiet:
+            quiet[span] = conn.execute(
+                "SELECT 1 FROM conversation_turns WHERE NOT (session_id >= ? AND session_id < ?) AND at >= ? AND"
+                " at <= ? LIMIT 1", (lo, hi, span[0] - REMEMBER_AFTER_S, span[1])).fetchone() is None
+        if quiet[span]:
+            out[int(fid)] = "span"
+    return out
+
+
+def _restore_before_rules(conn: sqlite3.Connection, gone: set[int]) -> dict[str, int]:
+    """final-H2 lane D1: before the test's rules (``gone``) are deleted, a fact one of them superseded (``remember_rule``
+    supersedes a near-duplicate: a test's "don't use X" can end the user's own "use X") stands again when the test's
+    rules are all that came after it and the last of them is still in force; when a fact that stays carries its line
+    on, it points at that one. A line the test itself ended (revoked or done) leaves it ended. Counts."""
+    rows = conn.execute("SELECT id, status, superseded_by FROM conversation_facts").fetchall()
+    after = {int(r[0]): (int(r[2]) if r[2] is not None else None) for r in rows}
+    status = {int(r[0]): str(r[1] or "") for r in rows}
+    restore: list[int] = []
+    repoint: list[tuple[int, int]] = []
+    for fid, sup in after.items():
+        if fid in gone or sup is None or sup not in gone or status.get(fid) != "superseded":
+            continue
+        j: int | None = sup
+        last, seen = None, set()
+        while j is not None and j in gone and j not in seen:
+            seen.add(j)
+            last, j = j, after.get(j)
+        if j is None and last is not None and status.get(last) == "active":
+            restore.append(fid)
+        elif j is not None and j not in gone:
+            repoint.append((fid, j))
+    out: dict[str, int] = {}
+    for fid in restore:
+        n = int(conn.execute("UPDATE conversation_facts SET status = 'active', valid_to = NULL, expired_at = NULL,"
+                             " superseded_by = NULL, end_note_ciphertext = NULL WHERE id = ? AND status = 'superseded'",
+                             (fid,)).rowcount or 0)
+        if n:
+            out["rules_restored"] = out.get("rules_restored", 0) + n
+    for fid, j in repoint:
+        conn.execute("UPDATE conversation_facts SET superseded_by = ? WHERE id = ?", (j, fid))
+    return out
+
+
+def _session_sources(conn: sqlite3.Connection) -> list[str]:
+    """final-H2 lane D1: the preference-event sources stamped with a live test's session (:data:`SESSION_SOURCES`
+    ``:livetest-...``), by the session index's range. Read-only."""
+    if not _has(conn, "pref_events", "source"):
+        return []
+    out: list[str] = []
+    for prefix in SESSION_SOURCES:
+        lo = f"{prefix}:{TEST_SESSION_PREFIX}"
+        hi = lo[:-1] + chr(ord(lo[-1]) + 1)
+        out += [str(r[0]) for r in conn.execute("SELECT DISTINCT source FROM pref_events WHERE source >= ? AND"
+                                                 " source < ?", (lo, hi)).fetchall()]
+    return out
+
+
 def _refresh_prefs(conn: sqlite3.Connection, gone: Sequence[tuple[int, str]]) -> dict[str, int]:
     """After preference events were deleted (``gone``: their ``(pref_id, type)``), each preference row they touched
     stands as its remaining events say (``skills.prefs.record``'s own bookkeeping, redone): no event left -> the row
@@ -645,8 +781,9 @@ def _purge_run_effects(conn: sqlite3.Connection, turn_ids: set[int] | frozenset[
         test_keys = [str(r[0]) for r in conn.execute(
             f"SELECT run_key FROM skill_runs WHERE run_key IS NOT NULL AND NOT ({sql_real_skill_run()})").fetchall()]
     if _has(conn, "pref_events", "source"):
+        # final-H2 lane D1 (K-P): and the answers stamped with a test session (the planner's "keep this as your usual")
         sources = ([f"skill_run:{k}" for k in test_keys] + [f"turn:{int(i)}" for i in sorted(turn_ids)]
-                   + [f"question:{int(q)}" for q in questions])
+                   + [f"question:{int(q)}" for q in questions] + _session_sources(conn))
         gone: list[tuple[int, str]] = []
         for i in range(0, len(sources), 400):
             part = sources[i:i + 400]
@@ -960,6 +1097,15 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
                 facts.append(int(r["id"]))
         _delete_ids(conn, "conversation_fact_vec", "fact_id", facts)
         count("conversation_facts", _delete_ids(conn, "conversation_facts", "id", facts))
+    # final-H2 lane D1 (contract K-P): the rules a test session kept through remember (its stamp, or for one written
+    # before the stamp, a test's span with no real exchange in it), before the test's batches (the stamps) go; a fact
+    # of the user's they superseded stands again (:func:`_restore_before_rules`)
+    rules = test_rules(conn, _union_spans(spans, _kept_spans(_state_value(conn, KEPT_SPANS_STATE))))
+    if rules:
+        for kind, n in _restore_before_rules(conn, set(rules)).items():
+            count(kind, n)
+        _delete_ids(conn, "conversation_fact_vec", "fact_id", rules)
+        count("remembered_rules", _delete_ids(conn, "conversation_facts", "id", rules))
     # the user's corrections said inside the test's span (a correction carries no session) and what their pass changed
     for kind, n in _purge_corrections(conn, dec, spans, now=now).items():
         count(kind, n)
@@ -1127,7 +1273,7 @@ _TAGGED = (
     ("conversation_turns", "session_id"), ("conversation_batches", "session_id"), ("session_summaries", "session_id"),
     ("runs", "session_id"), ("runs", "run_key"), ("skill_runs", "session_id"), ("skill_runs", "request_id"),
     ("skill_route_tries", "run_key"), ("playbook_events", "run_key"), ("surfaced", "session_id"),
-    ("moments", "request_id"), ("ui_actions", "run_key"),
+    ("moments", "request_id"), ("ui_actions", "run_key"), ("pref_events", "source"),
 )
 
 
@@ -1268,6 +1414,20 @@ def report(db_path: str | Path | None = None, *, show: bool = False) -> dict[str
                     cfacts.append({"id": int(r["id"]), "kind": r["kind"], "status": r["status"],
                                    **({"text": dec(r["text_ciphertext"])} if show else {})})
             derived["conversation_facts"] = cfacts
+        # final-H2 lane D1 (K-P): what --purge takes of the rules kept through remember (why: "session" by its stamp,
+        # "span" written in a test's span with no real exchange there)
+        rules = test_rules(conn)
+        if "batch_id" in _columns(conn, "conversation_facts"):
+            items = []
+            ids = sorted(rules)
+            for i in range(0, len(ids), 400):
+                part = ids[i:i + 400]
+                for r in conn.execute(f"SELECT id, kind, status, valid_from, text_ciphertext FROM conversation_facts"
+                                      f" WHERE id IN ({','.join('?' * len(part))}) ORDER BY id", part):
+                    items.append({"id": int(r["id"]), "kind": r["kind"], "status": r["status"],
+                                  "at": _when(r["valid_from"]), "why": rules[int(r["id"])],
+                                  **({"text": dec(r["text_ciphertext"])} if show else {})})
+            derived["remembered_rules"] = items
         out["derived"] = derived
     except sqlite3.Error as exc:
         out["error"] = type(exc).__name__
@@ -1296,7 +1456,9 @@ def format_report(rep: Mapping[str, Any]) -> str:
     labels = {"session_summaries": "Session summaries of test sessions",
               "journal_facts": "Journal facts drawn from test exchanges",
               "portrait_facts_citing": "Portrait facts citing one of those journal facts",
-              "conversation_facts": "Rules, preferences and commitments resting on test exchanges only"}
+              "conversation_facts": "Rules, preferences and commitments resting on test exchanges only",
+              "remembered_rules": "Rules kept through remember in a live test's session (why: session = its "
+                                  "stamp; span = written in a test's span with no real exchange there)"}
     for key, label in labels.items():
         items = derived.get(key)
         if items is None:
@@ -1344,7 +1506,9 @@ __all__ = ["TEST_SESSION_PREFIX", "is_test_session", "is_test_request", "is_test
            "sql_real_session", "sql_real_request", "sql_real_run", "sql_real_skill_run", "sql_real_route_try",
            "test_turn_ids", "is_test_journal", "is_test_fact", "test_spans", "store_test_spans",
            "sql_outside_spans", "purge", "report", "format_report",
-           "main", "real_uses", "CONFIRM_RUN_S", "CONFIRM_DAYS"]
+           "main", "real_uses", "CONFIRM_RUN_S", "CONFIRM_DAYS", "known_spans", "test_rules", "REMEMBER_AFTER_S",
+           "SPAN_RULE_BEFORE",
+           "SESSION_SOURCES"]
 
 
 if __name__ == "__main__":
