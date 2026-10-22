@@ -4205,10 +4205,12 @@ def _default_handler(target: str) -> str:
 #: which takes an address the same way: the path that worked in Arc on 5 Oct). The same fact as
 #: ``yuki/skills/connections/web.toml``'s ``new_tab``.
 _NEW_TAB_KEYS: tuple[str, ...] = ("ctrl", "t")
-#: How long the address-bar step watches for the page after Enter (at least :data:`_BAR_PAGE_MIN_S`), and the least
-#: time the whole step gets however much of a caller's deadline the hand-off before it spent.
-_BAR_PAGE_S = 4.0
-_BAR_PAGE_MIN_S = 1.5
+#: How long the address-bar step watches for the page after Enter, and the least time the whole step gets however
+#: much of a caller's deadline the hand-off before it spent. la A7 (final-H2 k_resume_anime under one: what was left of
+#: the deadline gave the watch its 1.5 s floor, Arc's slow load was reported as a miss and the retry opened on a page
+#: that was in fact loading): the watch waits, bounded, for the page at the address to show in the browser's windows
+#: (a measured page change: :func:`_await_page` returns as soon as it shows), whatever is left of the deadline.
+_BAR_PAGE_S = 5.0
 _BAR_FLOOR_S = 6.0
 #: How many address hand-offs in a row an app may ignore (keep the very page it had) before :func:`open_url` types the
 #: address at once (the hand-off's page wait skipped), and for how long that holds. One when Windows already refused
@@ -4670,7 +4672,7 @@ def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: 
     if not entered.ok:
         return finish(False, f"Enter in {chosen['name']}'s address field was refused ({entered.summary})",
                       "enter_refused")
-    watch = max(_BAR_PAGE_MIN_S, min(_BAR_PAGE_S, end - time.monotonic()))
+    watch = _BAR_PAGE_S   # la A7: a slow load is waited for (bounded), never cut short by the caller's deadline
     wait = _await_page(identity, [target], before, watch, unchanged=befores)
     details["page_check"] = _page_details(wait)
     details["identity"] = identity.describe()

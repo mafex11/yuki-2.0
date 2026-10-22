@@ -20,11 +20,14 @@ judges the intent from the words, the earlier turns and the screen summary. The 
 waits for the user's words or runs for them (a task's question, a held call, a hand at work). gc (final-G2 C1, the
 kw1 regression p24_hinglish_garbled: the router ended a conversation silently on garbled first words, a second before
 the agent's own reply): the end of a conversation waits, bounded, for the talker's own reply to the same words and
-acts only when that reply has no words and no call but stay_quiet (two judgements agree; a dismissal ends at about
-2.5-3.5 s), never on the first words of a conversation the user opened themselves before anything of Yuki's was heard
-(S10's facts), and the router is told when Yuki has not spoken yet (:data:`FRESH_LINE`). While a send of theirs counts
-down, ``end`` also means they call it off: the send is stopped at once, nothing sent, even when the talker answered
-first or they spoke again since (a wrong stop never sends); a held countdown waits for that verdict (integ23 S1, S2).
+acts only when that reply made no call but stay_quiet (two judgements agree; a dismissal ends at about 2.5-3.5 s; la
+A3: a reply of words alone ends it once those words were heard, never cut), never on the first words of a
+conversation the user opened themselves before anything of Yuki's was heard (S10's facts), and the router is told when
+Yuki has not spoken yet (:data:`FRESH_LINE`). la A2: a lone quiet on words that follow Yuki's own line is refused
+once in both brains, so the end then waits for the talker's own answer (its end_conversation ends a sign-off). While a
+send of theirs counts down, ``end`` also means they call it off: the send is stopped at once, nothing sent, even when
+the talker answered first or they spoke again since (a wrong stop never sends); a held countdown waits for that
+verdict (integ23 S1, S2).
 
 No keywords anywhere: the decision is the router model's, from principles and worked examples; the code reads only its
 tool call's own JSON (a fixed format).
@@ -85,7 +88,7 @@ talker. "click the mix" and the mix is on the items line -> talker; it is not ->
 and play my focus playlist" -> talker when the Skills line has a playlist skill, else thinker. "who's my \
 accountant?" -> thinker. "close the Claude tabs" and they are on the tabs line -> talker. On a call, "bro did you see that clutch" -> talker. "my cousin just got a job at Zomato" -> \
 thinker (a fact to keep). "okay that's all, thanks" after Yuki's answer -> end. "not now" to Yuki's "send it \
-now?" -> talker (an answer)."""
+now?" -> talker (an answer). "yeah, go ahead" right after Yuki offered something -> talker (it asks for that)."""
 
 #: The one tool, forced: its fields are written in this order, so ``to`` is known a few tokens in.
 ROUTE_TOOL: dict[str, Any] = {

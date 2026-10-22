@@ -484,6 +484,10 @@ class LlmCall:
     made_ids: set[str] = field(default_factory=set)
     stop_reason: str | None = None
     broken: tuple[str, ...] = ()
+    #: la A1 (final-H2 R10): the API's own uncached input count for this call (Anthropic's ``input_tokens``, already
+    #: net of the cache), taken once: the largest of the cumulative values its ``message_start`` and ``message_delta``
+    #: report, never their sum (Pipecat adds both). ``None``: the stream gave none. A number, never content.
+    input_tokens: int | None = None
     #: fc (C3): this reply had no marker line and no call and answered a rerun: its own text was spoken (through the
     #: spoken-line check, as any reply of the talker's).
     voiced_unmarked: bool = False
@@ -506,6 +510,30 @@ def answers_user(call: Any) -> bool:
     or it is the reply watch's rerun of their turn (``rerun_of_user``: Yuki's heard words after theirs, nothing else).
     Code facts only."""
     return bool(getattr(call, "user_turn", False) or getattr(call, "rerun_of_user", False))
+
+
+def _note_input_tokens(call: Any, event: Any, kind: str) -> None:
+    """la A1 (final-H2 R10): one stream event's ``input_tokens`` taken into ``call.input_tokens`` once per call. The
+    API reports the call's uncached input as a cumulative count on ``message_start`` (``message.usage``) and again on
+    ``message_delta`` (``usage``); the larger of the two is the call's, never their sum. Numbers only; never raises."""
+    try:
+        usage = getattr(getattr(event, "message", None), "usage", None) if kind == "message_start" \
+            else getattr(event, "usage", None)
+        value = getattr(usage, "input_tokens", None) if usage is not None else None
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            seen = getattr(call, "input_tokens", None)
+            call.input_tokens = value if not isinstance(seen, int) else max(seen, value)
+    except Exception:  # noqa: BLE001 - Pipecat's own count then
+        pass
+
+
+def _stop_word(value: Any) -> str | None:
+    """la A6: a model reply's stop reason (the API's own code word: ``end_turn``, ``max_tokens``, ``tool_use``, ...) for
+    a content-free log line: a short lower-case code word as it is, anything else ``"other"``, none ``None``."""
+    if value is None:
+        return None
+    word = str(value)
+    return word if 0 < len(word) <= 32 and all(ch.islower() or ch == "_" for ch in word) else "other"
 
 
 def own_words_after_user(context: Any) -> bool:
@@ -1950,10 +1978,23 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             assert last is not None
             raise last
 
+        async def _report_usage_metrics(self, *args: Any, **kwargs: Any) -> None:
+            """la A1 (final-H2 R10: no turn row ever carried uncached input, so the meter priced it at 0): Pipecat
+            sums the ``input_tokens`` of a stream's ``message_start`` and of its ``message_delta`` (both cumulative
+            for the one call) into ``prompt_tokens``. The call's own count, taken once from the stream as it passed
+            (``LlmCall.input_tokens``), replaces that sum; the cache counts Pipecat reads once from ``message_start``
+            stay as they are. With no count of its own, Pipecat's figure goes on as before. Numbers only."""
+            call = self._yuki_call
+            measured = getattr(call, "input_tokens", None) if call is not None else None
+            if isinstance(measured, int) and not isinstance(measured, bool) and "prompt_tokens" in kwargs:
+                kwargs["prompt_tokens"] = max(0, measured)
+            await super()._report_usage_metrics(*args, **kwargs)
+
         async def _create_message_stream(self, api_call: Any, params: Any) -> Any:
             call = self._yuki_call
             if call is not None:
                 call.sent = time.monotonic()
+                call.input_tokens = None   # la A1: this stream's own count (a stream sent again counts afresh)
             stream, head = await self._yuki_open(api_call, params)
             # hotTools: every tool_use block of this reply, seen before anything below drops or edits an event
             tools = ReplyToolCalls()
@@ -1994,6 +2035,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                         if call.first_event is None:
                             call.first_event = now
                         kind = getattr(event, "type", "")
+                        if kind in ("message_start", "message_delta"):
+                            _note_input_tokens(call, event, kind)   # la A1: the call's net input, once
                         if keep_thoughts and kind == "content_block_start" and getattr(
                                 event.content_block, "type", "") in ("thinking", "redacted_thinking"):
                             call.one_thoughts += 1
@@ -2555,6 +2598,7 @@ class _Turn:
     rerun_why: str = ""                  # fc (C1-C3): why it was answered again: broken | act | unmarked | ""
     unmarked_refused: bool = False       # fc review M1: a rerun's unmarked text was refused by the guard's check
     quiet_refused: bool = False          # integration F4: its quiet on their opening words was refused (S10, any path)
+    follow_refused: bool = False         # la A2: under all, its lone quiet on words after Yuki's own line refused once
     # vGame (5 Oct): said to Yuki by measured evidence, and what the fast path did with it
     named: bool = False                  # the name was heard with it (the wake word), or it came right after the name
     fast: str | None = None              # "name" (the name alone, answered at once) | "end" (D1: the router ended it)
@@ -3008,8 +3052,10 @@ class TurnObserver:
         if turn is None:
             return
         usage = {
-            "input_tokens": turn.tokens.get("prompt_tokens", 0) - turn.tokens.get("cache_read_input_tokens", 0)
-            - turn.tokens.get("cache_creation_input_tokens", 0),
+            # la A1 (final-H2 R10): Pipecat's ``prompt_tokens`` is Anthropic's ``input_tokens``, already net of the
+            # cache, and each call's is its own count once (``_report_usage_metrics``): priced as it is at the input
+            # rate. The cache reads and writes were subtracted from it again before, so it was always 0
+            "input_tokens": turn.tokens.get("prompt_tokens", 0),
             "cache_read_tokens": turn.tokens.get("cache_read_input_tokens", 0),
             "cache_write_tokens": turn.tokens.get("cache_creation_input_tokens", 0),
             "output_tokens": turn.tokens.get("completion_tokens", 0),
@@ -4446,9 +4492,12 @@ ONE_STOPPED_QUIET = ("Not quiet: their words stopped the message that was counti
 #: stay_quiet): a lone round-1 stay_quiet on a user turn whose words follow Yuki's own heard line (``OneVoice.
 #: _follow_on``: stream facts), with no call, game or dictation and nothing heard this turn, is refused once with this.
 #: A second quiet is final.
+#: la A2: the same note refuses the all talker's lone quiet there (``Conversation._follow_quiet_result``); a sign-off
+#: gets end_conversation with a word or two, as the cores' sign-off principle says (lane E, E1).
 ONE_FOLLOW_QUIET = ("Not quiet: their words follow your own line, and nothing has answered them yet. Answer in a few "
-                    "words; only if they plainly spoke to someone else, stay_quiet again; if they sent you away or "
-                    "signed off, end_conversation with say_first \"\", alone.")
+                    "words; only if they plainly spoke to someone else, stay_quiet again; if they signed off, "
+                    "end_conversation with a word or two; if they sent you away, end_conversation with say_first \"\", "
+                    "alone.")
 
 
 def _code_word(why: str) -> dict[str, Any]:
@@ -5394,7 +5443,10 @@ class OneVoice:
             # same rerun rule the user's own turn has), never a silent end. fc (C1/C2): so does a closing reply whose
             # call never came through, or one marked act with no call (nothing ran)
             self._rerun, self._rerun_at, self._rerun_why = "due", time.monotonic(), why
-            self._log("unheard_close", round=int(getattr(call, "one_round", 0) or 0), why=why)
+            # la A6 (final-H2 R10, p1 / k_playlist_not_that): why that reply ended with no call, as the API said it
+            # (``LlmCall.stop_reason``: end_turn, max_tokens, ...), content-free
+            self._log("unheard_close", round=int(getattr(call, "one_round", 0) or 0), why=why,
+                      stop=_stop_word(getattr(call, "stop_reason", None)))
             return
         if rerun_why in LOST_ACTS and (broken or self._act_unmade(call)):
             # fc (C1/C2, never silent): the rerun of a reply that meant to act ran nothing again: code's owed line
@@ -6527,29 +6579,18 @@ class OneVoice:
         conversation (:meth:`heard_now`) before this turn began and nothing of hers since (:meth:`heard_this_turn`),
         their words began within ``Conversation.EXCHANGE_LIVE_S`` of that line, no other words of theirs reached her
         in between (``recent_heard``), no call is live, no full-screen game is in front (``game_app`` too, with focus
-        mode off), and no dictation was measured while they spoke. gc review M1 (the 3 Oct V2 lesson, bridge.py's
-        "go away"): not when the router's own decision on these same words is already an end that may still act
-        (``Conversation._route_said_end``: its structured output): the quiet then stands, the two judgements agree and
-        the router's end acts; with its verdict not in yet, refused as before. Stream and state facts and the router's
-        structured output only, never the words. Never raises (unsure: not a follow-on)."""
+        mode off), and no dictation was measured while they spoke (``Conversation._follows_line``: the one predicate
+        both brains use). la A2 (final-H2 kw_offer_then_yes t2): gc review M1's exception is gone: a router end on the
+        same words no longer lets a lone quiet stand (a yes after Yuki's offer was judged an end and went silent); the
+        refusal's note tells the agent that a sign-off or a dismissal ends with end_conversation, so the router's end
+        acts only on the talker's own end or a quiet that stands. Stream and state facts only, never the words. Never
+        raises (unsure: not a follow-on)."""
         try:
-            c = self.c
-            if getattr(c, "call_app", None) or getattr(c, "focus", None) or getattr(c, "game_app", None):
-                return False
             heard = float(self._heard_at or 0.0)
             if heard <= 0.0 or self.heard_this_turn():
                 return False
-            obs = getattr(c, "observer", None)
-            start = float(getattr(obs, "_user_started_at", 0.0) or 0.0)
-            if not start or start - heard > float(getattr(c, "EXCHANGE_LIVE_S", 20.0) or 20.0):
-                return False
-            if any(heard < float(at) < start for at, _words in list(getattr(obs, "recent_heard", ()) or ())):
-                return False
-            said_end = getattr(c, "_route_said_end", None)
-            if callable(said_end) and said_end(start):
-                return False   # gc review M1: the router judged these words an end; its end acts on the quiet
-            dictating = getattr(c, "_dictating_now", None)
-            return not (callable(dictating) and dictating() is not None)
+            follows = getattr(self.c, "_follows_line", None)
+            return bool(callable(follows) and follows(heard))
         except Exception:  # noqa: BLE001
             return False
 
@@ -7478,6 +7519,8 @@ class Conversation:
         bridge.call_evidence = lambda: self.call_evidence if self.call_app else None
         # voice21 (final-D S10): a stay_quiet on the first words of a conversation they opened is refused once
         bridge.opened_quiet = self._opened_quiet_result
+        # la A2: a lone quiet on words that follow Yuki's own heard line is refused once (ONE's follow-on rule)
+        bridge.follow_quiet = self._follow_quiet_result
         bridge.quiet_requested = self.on_quiet
         # The summary is a user-role message nobody said: never "what the user said" to the thinker;
         # nor, in a call, what the mouth judged was said to the people on it (it stayed quiet).
@@ -7529,6 +7572,9 @@ class Conversation:
             # review r2 L3: the volume skill runs unheld on unsure words, so then it takes no focus (the same state
             # _held reads: a Speech line for the latest words)
             hands.unsure = lambda: bool(self.observer.heard and not getattr(self.observer, "heard_plain", False))
+            # la A4 (contract K-C): the conversation's own measured call state (the call the talker's call note is
+            # built from), for the skill engine's call hold through ``Hands.in_call``, in both brains
+            hands.call_state = lambda: bool(self.call_app)
             hands.skill_memory = self.memory
             hands.skill_settings = self.settings
             hands.last_skill = None
@@ -8733,9 +8779,11 @@ class Conversation:
         turn = self.observer.user_turns
         # what this decision may still do: the talker's reply ending first voids its hand-off (:meth:`_reply_done`);
         # integ23 S2: asked while an "all" send counts down, it has a stop part newer words never void (``stop``), for
-        # the sends open now only (``sends``: never one opened since); under one their final words end its countdown
+        # the sends open now only (``sends``: never one opened since); under one their final words end its countdown;
+        # la A3: whether nothing of Yuki's had been heard in this conversation when these words were judged (``fresh``:
+        # an end after a reply's words never acts on such words, :meth:`_route_end_reply`)
         state = {"handoff": handoff, "ends": ends, "stop": False, "to": None, "sends": None,
-                 "start": float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)}
+                 "start": float(getattr(self.observer, "_user_started_at", 0.0) or 0.0), "fresh": fresh}
         counting = getattr(self.bridge, "counting_sends", None)
         if sending and callable(counting) and getattr(self, "one_driver", None) is None:
             state["sends"] = counting()
@@ -8810,9 +8858,9 @@ class Conversation:
 
     def _reply_done(self, pending: bool) -> None:
         """The talker's reply ended: a router start it did not take (it answered, used a hand, stayed quiet) is void.
-        D1: a router decision still out that may end the conversation runs on (its end reads the reply itself: words
-        said or a call made keep the conversation, :meth:`_route_end_block`; a silent stay_quiet does not), but a late
-        "thinker" from it starts nothing."""
+        D1: a router decision still out that may end the conversation runs on (its end reads the reply itself: a call
+        made keeps the conversation, :meth:`_route_end_block`; la A3: words alone end it once they were heard; a silent
+        stay_quiet ends it), but a late "thinker" from it starts nothing."""
         if pending:
             return
         routed = getattr(self.bridge, "routed_job", None)
@@ -8845,11 +8893,11 @@ class Conversation:
         stands: its end_conversation ends it). gc (final-G2 C1): with no send stopped and no stop line owed, the end
         first waits, bounded, for the talker's own reply to the same words (:meth:`_route_end_reply`). ``start``: the
         start of speech of the words judged. ``state``: the decision's own (:meth:`_route_turn`); an end skipped marks
-        it ``skipped`` (gc review M1: :meth:`_route_said_end` then reads it as no end). integ23 S2: a decision asked
-        while an "all" send counted down (``stop``) stops that send even when they spoke again since (logged ``late``;
-        only the sends open when it was asked, ``sends``; under one their final words end the countdown themselves),
-        and when newer words voided its end part (:meth:`_cancel_route`), the stop is all it does. Measured states
-        only, never the words; logged content-free."""
+        it ``skipped``. integ23 S2: a decision asked while an "all" send counted down (``stop``) stops that send even
+        when they spoke again since (logged ``late``; only the sends open when it was asked, ``sends``; under one their
+        final words end the countdown themselves), and when newer words voided its end part (:meth:`_cancel_route`),
+        the stop is all it does. la A3: a reply of words alone to the same words ends the conversation once they were
+        heard (:meth:`_route_end_after_words`). Measured states only, never the words; logged content-free."""
         sends = state.get("sends") if state else None
         stop_part = bool(state and state.get("stop") and sends)
         llm = getattr(self, "_llm", None)
@@ -8870,18 +8918,27 @@ class Conversation:
             stopped = self._stop_sends(late=not same, only=None if same else sends)
         if state is not None and not state.get("ends"):
             return   # integ23 S2: its end part was voided by newer words; the stop was its part
+        after_words = False
         if not sending and not stopped and not self._stop_line_pending():
             # gc (final-G2 C1, kw1 regression p24_hinglish_garbled: ``end`` 1.0 s after their words, before the agent's
             # own reply, on garbled first words): the end of a conversation (never the stop of a send, above) waits,
-            # bounded, for the talker's own reply to the same words and acts only when that reply has no words and no
-            # call but stay_quiet (:meth:`_route_end_reply`): two judgements agree
+            # bounded, for the talker's own reply to the same words and acts only when that reply made no call but
+            # stay_quiet (:meth:`_route_end_reply`): two judgements agree. la A3 (final-H2 kw_dismiss_after_answer,
+            # both brains: "Okay, that's all, thanks." got "Anytime." with no call and the end was skipped as
+            # ``replied``): a reply of words alone ends the conversation once those words were heard
+            # (:meth:`_route_end_after_words`), never cut and with no second line
             why = await self._route_end_reply(start, state)
-            if why:
+            if why == self.ROUTE_END_AFTER_WORDS:
+                after_words = True
+            elif why:
                 self._end_skipped(state, why)
                 return
-        why = self._route_end_block(start, sending=sending)
+        why = self._route_end_block(start, sending=sending, words=after_words)
         if why:
             self._end_skipped(state, why)
+            return
+        if after_words:
+            await self._route_end_after_words(start, state)
             return
         turn = obs.turn
         obs.fast_handled("end")
@@ -8911,26 +8968,10 @@ class Conversation:
 
     def _end_skipped(self, state: dict[str, Any] | None, why: str) -> None:
         """The router's end did not act (``why``, a code word): logged content-free, and the decision's state marked
-        ``skipped`` so :meth:`_route_said_end` no longer reads it as an end that may act (gc review M1). State only."""
+        ``skipped`` (no end of it may act any more). State only."""
         if isinstance(state, dict):
             state["skipped"] = True
         self.log.event("router", op="end_skipped", session=self.session, why=why)
-
-    def _route_said_end(self, start: float) -> bool:
-        """gc review M1 (the 3 Oct V2 lesson: "go away" got a quiet, its refusal reran the talker and it said it was
-        still there): the router's own decision on the words whose speech began at ``start`` is in, is an end of the
-        conversation (``to == "end"``), and that end may still act: not voided by newer words (``ends``), not skipped
-        (:meth:`_end_skipped`), and still this conversation's current decision (:meth:`_cancel_route` clears it).
-        The ONE driver's follow-on refusal (``OneVoice._follow_on``) then lets a lone quiet on those words stand, so
-        :meth:`_route_end_reply` sees the two judgements agree. The router model's structured output and stream facts
-        only, never the words. Never raises (unsure: ``False``)."""
-        try:
-            state = getattr(self, "_route_state", None)
-            if not isinstance(state, dict) or state.get("to") != "end" or not state.get("ends") or state.get("skipped"):
-                return False
-            return bool(start) and float(state.get("start") or 0.0) == float(start)
-        except Exception:  # noqa: BLE001
-            return False
 
     def _end_told(self, told: str, stopped: int) -> bool:
         """integ27 fix TV1 (C4 retest: "Stopped. Nothing was sent." and then the agent's "Okay, I won't send it."): the
@@ -8991,7 +9032,7 @@ class Conversation:
             return ""
         return ""
 
-    def _route_end_block(self, start: float, *, sending: bool = False) -> str:
+    def _route_end_block(self, start: float, *, sending: bool = False, words: bool = False) -> str:
         """Why the router's end may not act now (a code word), else ``""``: the conversation is ending or dormant;
         they spoke again or are speaking (a new start of speech, their voice just now); something now waits for their
         words or runs for them (:meth:`_words_awaited`; a send counting down is ended with the conversation, never
@@ -9001,8 +9042,9 @@ class Conversation:
         the user opened themselves with nothing of Yuki's heard yet (``first_words``, :meth:`_first_words`; with no
         send stopped, :meth:`_route_end_reply` also waits for the reply). A send still counting down hides nothing
         else (review L1: :meth:`_words_awaited` puts it first only for the router's judgement of a spoken stop): a hand
-        at work, a scroll, a call held for their answer or another task still refuses the end. Measured states only;
-        never raises."""
+        at work, a scroll, a call held for their answer or another task still refuses the end. la A3: ``words`` (the
+        wait for the reply, and the end after its words are heard): the reply's words and Yuki speaking them are no
+        block (``replied`` is not judged); every other block stands. Measured states only; never raises."""
         try:
             if self._stop.is_set() or self.dormant:
                 return "stopping"
@@ -9019,7 +9061,7 @@ class Conversation:
             turn = obs.turn
             if turn is None or turn.trigger != "user":
                 return "no_turn"
-            if obs.bot_speaking or obs.speech_pending or strip_tags("".join(turn.reply)).strip():
+            if not words and (obs.bot_speaking or obs.speech_pending or strip_tags("".join(turn.reply)).strip()):
                 return "replied"
             if [t for t in turn.tools if t != "stay_quiet"]:
                 return "acted"
@@ -9039,20 +9081,31 @@ class Conversation:
     ROUTE_END_REPLY_S = 4.0
     ROUTE_END_REPLY_MAX_S = 8.0
     ROUTE_END_SETTLE_S = 0.35
+    #: la A3: :meth:`_route_end_reply`'s code word for a reply of words alone (the end acts once they were heard).
+    ROUTE_END_AFTER_WORDS = "after_words"
+    #: la A3: the end after such a reply waits at most this long (s) for its words to be heard and the voice to be done;
+    #: past it, still speaking or nothing heard, the end does not act (never a cut line, never an end on unheard words).
+    ROUTE_END_HEARD_MAX_S = 10.0
 
     async def _route_end_reply(self, start: float, state: dict[str, Any] | None = None) -> str:
         """gc (final-G2 C1): the router judged their words an end of the conversation; the end waits, bounded
         (:data:`ROUTE_END_REPLY_S`), for the talker's (or the ONE agent's) own reply to the same words. ``""``: that
         reply is in, ended a moment ago (:data:`ROUTE_END_SETTLE_S`), :meth:`_route_end_block` finds nothing against
-        the end (no words, no call but stay_quiet, not the first words) and, integ28 fix T1, the reply chose silence
-        (``turn.quiet``: a stay_quiet call or a quiet marker): the two judgements agree. Else a code word: ``no_quiet``
-        (it ended with no words and no quiet chosen: unmarked text, an act marker with no call, a broken call or an
-        empty reply; the reply watch answers it again), the block's reason as soon as one holds (they spoke again, the
-        reply has words or a call, a new run of it began), ``quiet_refused`` (its quiet on these words was refused once,
-        S10 on any path or the ONE driver's: another run answers them), ``voided`` (newer words voided the decision's end) or ``no_reply`` (no reply in
-        time: the talker's own judgement stands, the conversation stays open). gc review L2: a reply being written or
-        settling when :data:`ROUTE_END_REPLY_S` runs out is waited for up to :data:`ROUTE_END_REPLY_MAX_S`. Stream
-        facts only; never raises."""
+        the end (no call but stay_quiet, not the first words) and, integ28 fix T1, the reply chose silence
+        (``turn.quiet``: a stay_quiet call or a quiet marker): the two judgements agree. la A3 (final-H2
+        kw_dismiss_after_answer: "Anytime." with no call, the end skipped as ``replied`` and the conversation left
+        open): :data:`ROUTE_END_AFTER_WORDS` when that reply has words of its own and no call but stay_quiet, on words
+        that came after a line of Yuki's was heard (the decision's ``fresh``, and never S10's first words): the end
+        acts once those words were heard (:meth:`_route_end_after_words`). The reply's words are never the block. Else
+        a code word: ``no_quiet`` (it ended with no words and no quiet chosen: unmarked text, an act marker with no
+        call, a broken call or an empty reply; the reply watch answers it again), the block's reason as soon as one
+        holds (they spoke again, the reply made a call, a new run of it began), ``quiet_refused`` (its quiet on these
+        words was refused once, S10 on any path, la A2's follow-on refusal under all, or the ONE driver's: another run
+        answers them), ``fresh`` (a reply of words on the first words they said before anything of Yuki's was heard),
+        ``voided`` (newer words voided the decision's end) or ``no_reply`` (no reply in time: the talker's own
+        judgement stands, the conversation stays open). gc review L2: a reply being written or settling when
+        :data:`ROUTE_END_REPLY_S` runs out is waited for up to :data:`ROUTE_END_REPLY_MAX_S`. Stream facts only;
+        never raises."""
         obs = self.observer
         step = 0.05
         waited = 0.0
@@ -9061,22 +9114,40 @@ class Conversation:
             while True:
                 if state is not None and not state.get("ends"):
                     return "voided"
-                why = self._route_end_block(start)
+                why = self._route_end_block(start, words=True)   # la A3: the reply's words are no block
                 if why:
                     return why
                 turn = obs.turn
+                if (obs.bot_speaking or obs.speech_pending) and not strip_tags("".join(turn.reply)).strip():
+                    return "replied"   # Yuki is saying something that is not this reply's own words (as before A3)
                 one = getattr(self, "one_driver", None)
-                if getattr(turn, "quiet_refused", False) or bool(one is not None and getattr(one, "_quiet_refused",
-                                                                                           False)):
-                    return "quiet_refused"   # its quiet on these words was refused (S10, or ONE's): another run answers
+                if getattr(turn, "quiet_refused", False) or getattr(turn, "follow_refused", False) or bool(
+                        one is not None and getattr(one, "_quiet_refused", False)):
+                    # its quiet on these words was refused (S10, la A2's follow-on under all, or ONE's): another run
+                    # answers them, and its own end_conversation ends a sign-off
+                    return "quiet_refused"
                 if turn is not None and int(getattr(turn, "responses", 0) or 0) > 0 and not obs.generating:
                     if ended_at is None:
                         ended_at = waited
                     elif waited - ended_at >= self.ROUTE_END_SETTLE_S:
+                        if strip_tags("".join(turn.reply)).strip():
+                            # la A3: a reply of words alone (a call would have been ``acted``): the two judgements
+                            # agree once those words are heard; never on their first words before Yuki was heard
+                            fresh = bool(state.get("fresh", True)) if isinstance(state, dict) else True
+                            return "fresh" if fresh else self.ROUTE_END_AFTER_WORDS
                         # integ28 fix T1: the talker's measured choice of silence (a stay_quiet call or a quiet marker:
                         # ``turn.quiet``) is the only agreement; unmarked text, an act marker with no call, a broken
                         # call or an empty reply is the reply watch's to answer (its rerun), never a silent end
-                        return "" if getattr(turn, "quiet", False) else "no_quiet"
+                        if not getattr(turn, "quiet", False):
+                            return "no_quiet"
+                        if one is not None or "stay_quiet" in turn.tools:
+                            return ""
+                        # la A2: under all, a quiet marker alone: its stay_quiet call (the bridge's to refuse) may still
+                        # come, as the reply watch allows (:data:`REPLY_WATCH_QUIET_S`); then, on words that follow
+                        # Yuki's own line, the marker is waived once here as the reply watch would (it may come after
+                        # this end): another run answers them
+                        if time.monotonic() - float(obs.last_response_end or 0.0) >= self.REPLY_WATCH_QUIET_S:
+                            return "quiet_refused" if self._follow_marker(turn) else ""
                 else:
                     ended_at = None
                 if waited >= self.ROUTE_END_REPLY_S:
@@ -9091,6 +9162,57 @@ class Conversation:
             raise
         except Exception:  # noqa: BLE001 - unsure: the talker's own judgement
             return "unknown"
+
+    async def _route_end_after_words(self, start: float, state: dict[str, Any] | None = None) -> None:
+        """la A3 (final-H2 kw_dismiss_after_answer, both brains): the router judged their words an end, and the talker's
+        (or the ONE agent's) reply to the same words was words alone (:data:`ROUTE_END_AFTER_WORDS`): the conversation
+        ends once those words were heard, as the talker's own end_conversation with a word or two ends it. It waits,
+        bounded (:data:`ROUTE_END_HEARD_MAX_S`), until words of the reply left the speaker (``turn.heard``) and nothing
+        is being said, written or on its way to the voice; every block of :meth:`_route_end_block` but the reply's own
+        words is judged again at each step (they spoke again or are speaking, something awaits their words or runs for
+        them, a call was made, no user turn, the conversation ending), and under one the agent's turn must be over (a
+        held round still to come is never cut). Never a cut line (still speaking at the bound: no end), never a second
+        line (the end says nothing and plays no cue: their words were answered aloud). Measured stream states only,
+        never the words; logged content-free. Never raises."""
+        obs = self.observer
+        step = 0.05
+        waited = 0.0
+        try:
+            while True:
+                if state is not None and not state.get("ends"):
+                    self._end_skipped(state, "voided")
+                    return
+                why = self._route_end_block(start, words=True)
+                if why:
+                    self._end_skipped(state, why)
+                    return
+                turn = obs.turn
+                busy = bool(obs.bot_speaking or obs.speech_pending or obs.generating)
+                if turn is not None and turn.heard and not busy:
+                    break
+                if waited >= self.ROUTE_END_HEARD_MAX_S:
+                    self._end_skipped(state, "speaking" if busy else "unheard")
+                    return
+                await asyncio.sleep(step)
+                waited += step
+            one = getattr(self, "one_driver", None)
+            if one is not None and one.busy():
+                self._end_skipped(state, "one_open")   # the agent's turn is still open (a held round to come)
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - unsure: the conversation stays open
+            self._end_skipped(state, "unknown")
+            return
+        turn = obs.turn
+        now = time.monotonic()
+        self.log.event("router", op="end", session=self.session, call_mode=bool(self.call_app),
+                       game=bool(self.game_app), after_words=True,
+                       eos_to_end_ms=round((now - turn.speech_end) * 1000) if turn is not None and turn.speech_end
+                       else None)
+        self.log.event("session", state="end_asked", session=self.session, waited_ms=round(waited * 1000),
+                       by="router")
+        self._set_stop("user_asked")
 
     def _stop_line_pending(self) -> bool:
         """gc (final-G2 C1): a "nothing was sent" line for a send their words stopped is still owed and untold (under
@@ -9577,10 +9699,29 @@ class Conversation:
             return False
         if time.monotonic() - float(self.observer.last_response_end or 0.0) < self.REPLY_WATCH_QUIET_S:
             return False
-        if not self._opened_quiet(via="marker"):
+        if self._opened_quiet(via="marker"):
+            turn.marker, turn.opened_quiet = None, True
+            return True
+        return self._follow_marker(turn)   # la A2: else a quiet marker alone on a follow-on, waived once
+
+    def _follow_marker(self, turn: Any) -> bool:
+        """la A2 (ONE's integ28 fix T2 for the "all" talker): the user turn's silence is a quiet marker with no
+        stay_quiet call (a call is the bridge's to refuse, :meth:`_follow_quiet_result`), on the talker's own first
+        reply to words that follow Yuki's own heard line (:meth:`_follow_quiet`, ``via`` marker: once a turn). The
+        marker is waived (``turn.marker`` back to ``None``) and the turn marked ``follow_quiet``, so the reply watch
+        answers it again once with ``mouth.FOLLOW_RERUN_NOTE``; the rerun's own quiet is final. Called by the reply
+        watch (:meth:`_opened_marker_quiet`) and by the router's end as that reply settles (:meth:`_route_end_reply`),
+        whichever comes first. Not under one. Stream facts only; never raises."""
+        try:
+            if (turn is None or turn.marker != "quiet" or "stay_quiet" in turn.tools or turn.rerun
+                    or not turn.responses or getattr(self, "one_driver", None) is not None):
+                return False
+            if not self._follow_quiet(via="marker"):
+                return False
+            turn.marker, turn.follow_quiet = None, True
+            return True
+        except Exception:  # noqa: BLE001
             return False
-        turn.marker, turn.opened_quiet = None, True
-        return True
 
     def _acting_tools(self, tools: Any) -> list[str]:
         """The calls of a turn that act or hand over (everything but a read: ``quick_memory``, and under one the reads
@@ -9685,7 +9826,9 @@ class Conversation:
                                marker=turn.marker, unmarked=turn.unmarked, tts_silent=turn.tts_silent,
                                guarded=turn.guarded, opened_quiet=bool(getattr(turn, "opened_quiet", False)),
                                follow_quiet=bool(getattr(turn, "follow_quiet", False)) or None,
-                               opened_answer=turn.trigger == "result", why=turn.rerun_why or None)
+                               opened_answer=turn.trigger == "result", why=turn.rerun_why or None,
+                               # la A6: why the reply it answers again ended with no call (the API's stop reason)
+                               stop=_stop_word(getattr(turn.llm, "stop_reason", None)) if turn.rerun_why else None)
                 await self.worker.queue_frame(LLMRunFrame())
         except asyncio.CancelledError:
             return
@@ -10153,6 +10296,89 @@ class Conversation:
         self._opened_refused_n = getattr(self.observer.turn, "n", None)
         self._opened_refused_id = str(call_id) if call_id else None
         out: dict[str, Any] = {"not_quiet": OPENED_QUIET}
+        if getattr(self, "channel", "") == "marker":
+            out[ONE_FORMAT_KEY] = MARKER_REMINDER
+        return out
+
+    def _follows_line(self, heard: float) -> bool:
+        """gc (final-G2 C2), shared by both brains since la A2: the user's words now follow Yuki's own line. Her words
+        last left the speaker at ``heard`` (monotonic: the ONE driver's ``_heard_at``, the observer's
+        ``words_heard_at``; the same moment), their speech began within :data:`EXCHANGE_LIVE_S` of it, no other words
+        of theirs reached her in between (``recent_heard``), no call is live (``call_app``), no full-screen game is in
+        front (``focus``, ``game_app``) and no dictation was measured while they spoke (:meth:`_dictating_now`). The
+        caller checks that nothing of Yuki's was heard this turn. Stream and state facts only, never the words. Never
+        raises (unsure: ``False``)."""
+        try:
+            if self.call_app or getattr(self, "focus", None) or getattr(self, "game_app", None):
+                return False
+            heard = float(heard or 0.0)
+            if heard <= 0.0:
+                return False
+            obs = self.observer
+            start = float(getattr(obs, "_user_started_at", 0.0) or 0.0)
+            if not start or start - heard > float(self.EXCHANGE_LIVE_S or 20.0):
+                return False
+            if any(heard < float(at) < start for at, _words in list(getattr(obs, "recent_heard", ()) or ())):
+                return False
+            return self._dictating_now() is None
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _follow_quiet(self, *, spoke: bool = False, via: str = "") -> bool:
+        """la A2 (final-H2 kw_offer_then_yes t2, all: "Yeah, go ahead and do that." 10 s after Yuki's done line got a
+        lone stay_quiet, and the router's end took the silence): ONE's follow-on refusal
+        (``OneVoice._quiet_unanswered``, ``follow_on``) for the "all" talker. Whether this quiet is refused once: the
+        talker's own first reply to the user's words (``LlmCall.user_turn``, not the reply watch's rerun) and a lone
+        quiet (no other call written, ``LlmCall.tool_names``; a quiet marker alone is judged after its reply ended, so
+        ``via`` marker takes the turn's own facts), nothing said by it (``spoke``) and nothing of Yuki's heard this
+        turn, no call of the turn that acts and nothing on its way for these words (:meth:`_opened_acted`), nothing
+        waiting for their words (:meth:`_words_awaited`: a task's open question, a held call, a send counting down),
+        not refused this turn already (a second quiet is final), and their words follow Yuki's own heard line
+        (:meth:`_follows_line`). Not under one (``OneVoice.control`` refuses its own). Marks the turn
+        ``follow_refused`` (the router's end then waits for the talker's own answer, :meth:`_route_end_reply`) and logs
+        content-free. Stream and state facts only, never the words. Never raises (unsure: the quiet stands)."""
+        try:
+            if spoke or getattr(self, "one_driver", None) is not None:
+                return False
+            obs = self.observer
+            turn = obs.turn
+            if turn is None or turn.trigger != "user" or turn.heard or turn.rerun:
+                return False
+            if turn.follow_refused or turn.quiet_refused or turn.opened_quiet or turn.follow_quiet:
+                return False
+            if via != "marker":
+                call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
+                if call is None or not getattr(call, "user_turn", False) or getattr(call, "rerun", False):
+                    return False
+                if any(str(n) != "stay_quiet" for n in dict(getattr(call, "tool_names", None) or {}).values()):
+                    return False   # a lone quiet only: the reply wrote another call too (fc C1's stream record)
+            if self._opened_acted(turn):
+                return False
+            if self._words_awaited():
+                # something waits for their words or runs for them (a task's open question, a held call, a send
+                # counting down): their words may be its answer, and the talker's quiet there stands (V2)
+                return False
+            if not self._follows_line(float(getattr(obs, "words_heard_at", 0.0) or 0.0)):
+                return False
+            turn.follow_refused = True
+            self.log.event("session", state="follow_quiet_refused", session=self.session, via=via or "bridge")
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _follow_quiet_result(self, spoke: bool = False, call_id: Any = None) -> dict[str, Any] | None:
+        """la A2: the bridge's stay_quiet refusal on a follow-on (:meth:`_follow_quiet`, ``via`` bridge) as its tool
+        result: ONE's own note (:data:`ONE_FOLLOW_QUIET`: answer, or end_conversation when they signed off or sent
+        Yuki away), and in the marker channel the reply format last, as :meth:`_opened_quiet_result`. The talker's run
+        that answers it is the result run it starts; a silent one gets the reply watch's rerun (:meth:`_opened_answer`).
+        ``None``: the quiet stands."""
+        if not self._follow_quiet(spoke=bool(spoke), via="bridge"):
+            return None
+        from yuki.voice.mouth import MARKER_REMINDER
+
+        self._opened_refused_n = getattr(self.observer.turn, "n", None)
+        self._opened_refused_id = str(call_id) if call_id else None
+        out: dict[str, Any] = {"not_quiet": ONE_FOLLOW_QUIET}
         if getattr(self, "channel", "") == "marker":
             out[ONE_FORMAT_KEY] = MARKER_REMINDER
         return out

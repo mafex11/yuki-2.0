@@ -1688,6 +1688,12 @@ class Hands:
         #: a volume skill run then takes no focus (review r2 L3: it is never held on unsure words, as the old sound
         #: hands were not, so its focus rungs and a hand-off are left out on that run).
         self.unsure: Any = None
+        #: la A4 (contract K-C, final-H2 k_s10_quiet_in_call: a pick ran during a call the talker was told about,
+        #: because the skill engine's call hold read only memory's calls): ``() -> bool``, whether the conversation is
+        #: in a call now by its own measured call state (``Conversation.call_app``: the call the talker's call note is
+        #: built from), set by the conversation; read through :attr:`in_call`. ``None`` (hands with no conversation:
+        #: a typed lane's), or no call by it: the engine reads memory's calls, as before.
+        self.call_state: Any = None
         #: appOpen: the watches of openings still starting (their results, newest last) and the stop of the running one.
         self.watched: list[dict[str, Any]] = []
         self._watch_stop: threading.Event | None = None
@@ -1799,6 +1805,24 @@ class Hands:
     def skills_on(self) -> bool:
         """Whether run_skill is the skill hand in this conversation (a Skills menu with keys)."""
         return bool(self.skill_keys)
+
+    @property
+    def in_call(self) -> bool:
+        """la A4 (contract K-C): ``True`` when the conversation's own measured call state (:attr:`call_state`) says a
+        call is live, so the skill engine's call hold (``engine._in_call``: it reads ``hands.in_call`` when the hands
+        carry one) holds a pick during the call the talker is told about, in both brains (the ONE driver's runner acts
+        through these same hands). With no call by that state, or no state (hands with no conversation, a state that
+        fails to read), the hands carry no reading: ``AttributeError``, so ``hasattr`` is false and the engine (and
+        the join question, ``chat._call_question``) read memory's measured calls, as before. So the conversation's
+        state adds the call the talker knows of and never hides one memory measured. Measured state only."""
+        state = self.call_state
+        try:
+            live = bool(state()) if callable(state) else False
+        except Exception:  # noqa: BLE001 - unreadable: memory's calls decide
+            live = False
+        if live:
+            return True
+        raise AttributeError("in_call")
 
     def new_conversation(self) -> None:
         """lVoice (live 17 Oct, problem 2): a new conversation went live (the bridge's ``attach``): the shared action
@@ -9155,15 +9179,18 @@ def _stage_ms(timings: Any) -> dict[str, int]:
 
 
 def _takes_kw(fn: Any, name: str) -> bool:
-    """Whether ``fn`` names a keyword parameter ``name`` (probed, never assumed)."""
+    """Whether ``fn`` takes a keyword argument ``name`` (probed, never assumed): it names that parameter, or it takes
+    any keyword (``**kwargs``). la A5 (final-H2 youtube_channel_deji_arc under one: a wrapper ``(url, *, app=None,
+    **kwargs)`` around the backend's open_url hid ``heard`` and ``deadline``, so neither was ever passed)."""
     if not callable(fn):
         return False
     try:
         import inspect
 
-        return name in inspect.signature(fn).parameters
+        params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def judged_call(name: str, args: dict[str, Any], *, tab_names: list[str] | None = None
