@@ -2832,6 +2832,18 @@ class Brain:
             self._final(line, _awaiting(self._outcome(state, level="failed" if state.acted else "answer", line=line,
                                                       partial=bool(last.parts)), last.asks))
             return True
+        if text and not state.acted and refusal_answered(last):
+            # final-H2 lane E (E5; live kw_pause_when_song_ends, all): the executor refused a step back to the planner
+            # with a line that asks it to say what it would do and offer it now (A1's shell_long: a command longer
+            # than the commit check reads whole, never run), nothing in the request acted, and the planner did just
+            # that in plain text ("I can't wait for the song to end; want it paused now?"). That reply is its answer
+            # to the refusal, never a claim of a result: it ends as any answer with nothing done does (level answer,
+            # acted false, the planner's own awaits mark), so the voice's answer gates read it as they read every
+            # answer. sBrainFix's case below (a refused send then claimed as sent) is untouched: that refusal is
+            # another code word, or carries its own line, or came after something acted. Code facts only.
+            self.logger.log("brain_refusal_reply", why=str(last.reason), chars=len(text), awaits=marked)
+            self._final(text, _awaiting(self._outcome(state, level="answer"), marked))
+            return True
         if state.acted or (state.kind == "act" and last is not None
                            and last.status in ("refused", "mismatch", "error")):
             # sBrainFix (review r1 runs): a plan that tried to act and was stopped, even with nothing acted, leaves the
@@ -3467,6 +3479,23 @@ def _acted(result: ExecResult) -> bool:
     return bool(result.acted) or any(s.verb in ACT_VERBS and s.state in ACTED_STATES for s in result.statuses)
 
 
+def refusal_answered(last: Any) -> bool:
+    """final-H2 lane E (E5): the request's last stop is a non-final refusal whose planner-facing line asked the planner
+    to say what it would do and offer it now (``executor.SAY_AND_OFFER``: A1's ``shell_long``, for a command or an
+    app's arguments longer than the commit check reads whole), and code gave no line of its own for the user: the
+    planner's plain reply after it is its answer to that refusal. Code facts only (the stop's status, its code word,
+    whether it was final and whether it carries a line); never the words. ``False`` when the executor can't say."""
+    if last is None or str(getattr(last, "status", "") or "") != "refused" or getattr(last, "final", False):
+        return False
+    if str(getattr(last, "line", "") or "").strip():
+        return False
+    try:
+        from yuki.brain.executor import SAY_AND_OFFER
+    except Exception:  # noqa: BLE001 - no executor: no such refusal (code's stuck line, as before)
+        return False
+    return str(getattr(last, "reason", "") or "") in SAY_AND_OFFER
+
+
 def shell_read(status: Any) -> bool:
     """morning21 C5: a ``run_powershell`` step that ran and that the commit check judged ``effect none``. integ29 (S8):
     no longer counted as a read (``none`` also means it only opened or moved something): kept for callers that log it.
@@ -3593,5 +3622,6 @@ __all__ = ["Brain", "Host", "CANCELLED", "WITHDRAWN", "PARKED", "PAUSE_STOP_LINE
            "LOOK_BACKS_MAX", "OBSERVE_LEVELS", "OBSERVE_ACTED_LEVELS", "PART_RESTS_MAX", "PART_REST_CALLS",
            "rest_done_reply", "LINE_REST_UNDONE", "answer_due", "ANSWER_PARTS_MAX", "ANSWER_PART_CALLS",
            "question_due", "question_part_report", "QUESTION_PART_CALLS", "SEND_HOLD", "SEND_GO_ON",
-           "SEND_PAUSE_MAX_S", "shell_read", "shell_ending", "open_part", "close_parts", "part_app", "PART_OPENS_MAX",
+           "SEND_PAUSE_MAX_S", "refusal_answered", "shell_read", "shell_ending", "open_part", "close_parts",
+           "part_app", "PART_OPENS_MAX",
            "PART_OPEN_CALLS", "turn_actions", "status_actions"]
