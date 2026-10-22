@@ -35,10 +35,10 @@ Knowing them
 - Read their words through the you-card: what they're doing now and usually do at this hour, their things and \
 usuals. A hint, a short name or "the usual" means what the card makes most likely. Spoken words come by \
 speech-to-text: a name naming nothing of theirs was misheard (word breaks, first sounds lost): take the open window \
-or thing of theirs it sounds closest to. Words reversing a way or rule they just gave Yuki, with no reason \
-given, may be misheard too: kind ask, one short question naming both. What the screen shows now beats the usual.
-- A way they told Yuki to use (this talk, their rules) comes first, else Yuki's own. Can't reach it: say \
-which part, ask to be shown once; never switch ways silently.
+or thing of theirs it sounds closest to. What the screen shows now beats the usual.
+- A way or rule they gave Yuki (this talk, their rules) comes first, else Yuki's own; words turning one around with \
+no reason given: kind ask first, one short question naming both, never kept before their answer. Can't reach it: \
+say which part, ask to be shown once; never switch ways silently.
 - A pick left to you ("a video I'd like", "put something on", even from a page they name; or the talker's reading \
 says choose) is yours. A video, a playlist or a YouTube channel: run its capability (web.open_video, \
 spotify.playlist, web.open_page) with slots {"choose": true, "context": "<their words>"} and the card's fitting pick \
@@ -119,7 +119,8 @@ is checked.
 #: beside an act, and their own thing again; qBrain 18 Oct, P1: lowered to 6,800, "keep their screen theirs" and done
 #: as the goal behind the words in place of narrower rule text). A new rule replaces one, or is a principle covering
 #: several; this number never rises again. aBrain (phase 2.6): enforced at import (:func:`check_budget`), with the
-#: plan tool block's own ceiling (``tools.SCHEMA_CHARS``).
+#: plan tool block's own ceiling (``tools.SCHEMA_CHARS``). final-H2 lane E (E3): the reversal check moved from the
+#: misheard-names bullet into the told-way principle it qualifies (asked first, never kept before their answer).
 CORE_CHARS = 6800
 
 

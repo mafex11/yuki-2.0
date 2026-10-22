@@ -505,6 +505,11 @@ LINE_SHELL_LONG = ("the command is longer than the check reads whole, so it was 
 #: address) whose command line is longer than the check reads whole (planner-facing, non-final).
 LINE_ARGS_LONG = ("the app's arguments are longer than the check reads whole, so it was not started: open it without "
                   "them, or say what it would do and offer to do it now")
+#: final-H2 lane E (E5): the code words of the planner-facing, non-final refusals whose line (:data:`LINE_SHELL_LONG`,
+#: :data:`LINE_ARGS_LONG`) asks the planner to say what it would do and offer it now. With nothing acted in the request,
+#: the planner's plain reply after one is that answer, said as an answer (``agent.refusal_answered``), not code's stuck
+#: line (live final-H2 kw_pause_when_song_ends: "I got stuck working on your PC" replaced its honest offer).
+SAY_AND_OFFER = frozenset({"shell_long"})
 LINE_BUSY = "Something else is using the mouse and keyboard right now, so I stopped. Try again in a moment?"
 LINE_PAUSE_STOP = "Stopped. Nothing else was done."
 LINE_STOPPED_SEND = "Stopped. Nothing was sent."
@@ -541,11 +546,16 @@ HINT_WHO_FIRST = ("not typed: whom this message goes to isn't settled (its capab
                   "person), so nothing is typed into whichever chat is open. Ask them whom (a plan kind ask), then run "
                   "the message capability with that person.")
 #: A8 (final-G2 R13; ONE's one20 rule, ``one/policy.py`` ``chat_type``): the planner's own typing into a chat app's
-#: window that no message capability of this request opened (code's words, planner-facing; never said).
+#: window that no message capability of this request opened (code's words, planner-facing; never said). final-H2 lane E
+#: (E5, contract K-F reader): it points at the legal path for "type this in this chat": the message capability takes
+#: the chat that was in front when they spoke as its recipient, for a draft (lane B: by that chat's measured thread
+#: identity; a draft with no person fills from it), so the planner never meets the dead end of live H2
+#: kw_name_word_in_text (a refused type, a dropped person, "do it by steps", the same type refused again).
 HINT_CHAT_TYPE = ("not typed: this window is a chat's, and no message capability of this request opened this chat; "
                   "text for a person goes only through run_skill message (it opens their chat, asks whom when it "
-                  "can't tell, and leaves a draft). If that can't run in this request, say so plainly. Nothing was "
-                  "typed.")
+                  "can't tell, and leaves a draft). For the chat that was in front when they spoke: person left out, "
+                  "send \"draft\" (it takes that chat by its own check; a send needs the person in their words). If "
+                  "that can't run in this request, say so plainly. Nothing was typed.")
 #: A7 (final-G2 R13; gb's contract K-S): a skill hand-off whose run ended with the switcher its own shortcut opened
 #: still holding the keyboard (measured at the run's end), told to the planner first so its first step closes it.
 SWITCHER_HELD = "switcher_held"
@@ -5421,5 +5431,5 @@ def _board() -> Mapping[str, Any] | None:
 
 
 __all__ = ["ACT_VERBS", "ANSWER_MODEL_CALLS", "ANSWER_SECONDS", "ACT_MODEL_CALLS", "ELEMENT_VERBS", "Executor",
-           "LINE_SWITCHER_HELD", "LOOK_TOOLS", "MAX_REPLANS", "Mismatch", "READ_VERBS", "RunResult", "StepStatus",
-           "VERBS", "switcher_held"]
+           "LINE_SWITCHER_HELD", "LOOK_TOOLS", "MAX_REPLANS", "Mismatch", "READ_VERBS", "RunResult", "SAY_AND_OFFER",
+           "StepStatus", "VERBS", "switcher_held"]
