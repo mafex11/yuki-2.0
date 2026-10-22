@@ -33,7 +33,9 @@ reason from, not a catalog, in this order (the situation on the screens stays se
    (``prefs``); **Where they left off** (planner only) - on the :data:`LEFT_OFF_N` sites they came back to latest (never
    a work site), the last page they themselves had in front in one of their browsers (an app's own embedded page is
    no page to open), with its title and address (``Store.links``), dated by their own visit
-   (``yuki.memory.links.own_lasts``: never a page Yuki opened, nor a live test's), newest first (S19);
+   (``yuki.memory.links.own_lasts``: never a page Yuki opened, nor a live test's), newest first (S19); final-H2 D3 (a):
+   the talker's card carries the newest such page as **Partway through** (:data:`PARTWAY_HEAD`, with the browser they
+   had it in), right after "In the middle of", a live line never cut;
 4. **People** (planner and judge; the talker's profile layer has the directory at 900) - the people block
    (``yuki.memory.contacts.directory`` without its header: the whole :data:`PEOPLE_CHARS` is the people's, closest
    first), then **Who** - the portrait's work and interests, first sentence each.
@@ -138,6 +140,13 @@ LEFT_OFF_MIN_DAYS = 2
 LEFT_OFF_URL_CHARS = 140
 LEFT_OFF_QUERY_CHARS = 40
 LEFT_OFF_TITLE_CHARS = 40
+#: final-H2 D3 (a) (k_resume_anime under ONE: the talker's card had no dated page of theirs, so ONE named a browser
+#: itself and clicked through a site's own "continue watching"): beside what they are in the middle of, the talker's
+#: card (both brains' voice) carries the newest dated page of a thing they are partway through, the planner's "Where
+#: they left off" rule (:func:`_left_off`, their own visits only) for one page, with the browser they had it in. It
+#: is a live line (priority 0: never cut); internal understanding for choosing, never a list shown to them.
+PARTWAY_HEAD = ("Partway through (their own last page, dated, where they had it; to pick it up, open that address; "
+                "never recited unasked): ")
 #: The day and "in the middle of" lines at most, each (a thread, three due titles, two names).
 MIDDLE_CHARS = 420
 #: Phase 2.2, the picks for now on the "Usually around now" line (talker, wide): how many in all (fewer when the line
@@ -450,7 +459,8 @@ def _portrait_routine(store: Any, cap: int, priority: int = 2) -> list[list[Any]
 
 
 def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: int,
-              names: dict[str, str]) -> list[list[Any]]:
+              names: dict[str, str], *, priority: int = 1, head: str | None = None,
+              browser: bool = False) -> list[list[Any]]:
     """fBrain (k_resume_anime: the planner clicked through "continue watching" instead of opening the episode): on the
     ``n`` sites the user came back to latest (their own pages there on at least :data:`LEFT_OFF_MIN_DAYS` days), the
     last page past the site's root they themselves had in front there in one of their browsers (never one only on
@@ -462,7 +472,9 @@ def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: 
     visits to their sites used (the ``browser`` means on their values, what the sites line names; an app drawing its
     own embedded pages, e.g. a game store's local bundle, is none). Only an http(s) address; never a site of their work
     (:meth:`contacts.WorkMarks.page`, their own verdicts: picking up where they left off is for their own time).
-    Planner only; RAM only. ``names``: the display names already read (:func:`_browser_name`)."""
+    RAM only. ``names``: the display names already read (:func:`_browser_name`). final-H2 D3 (a): the talker's card
+    takes the newest one too (``n`` 1, ``priority`` 0 beside what they are in the middle of, its own ``head``) with
+    the browser they had it in (``browser``: the page's own app, as memory saw it)."""
     try:
         from yuki.core.appnames import shown
     except Exception:  # noqa: BLE001
@@ -536,12 +548,16 @@ def _left_off(store: Any, vals: dict[str, list[dict[str, Any]]], now: float, n: 
         day = datetime.fromtimestamp(at).date()
         gap = (today - day).days
         when = "today" if gap <= 0 else "yesterday" if gap == 1 else f"{day:%d %b}"
-        bits.append(f'"{_clip(title, LEFT_OFF_TITLE_CHARS)}" ({link.url}), {when}')
+        where = ""
+        if browser and getattr(link, "app", None):
+            where = f", in {shown(link.app) or link.app}"
+        bits.append(f'"{_clip(title, LEFT_OFF_TITLE_CHARS)}" ({link.url}), {when}{where}')
     # the header says what the planner's rule says (mem22 merge notes 1-2, desk22 / one22: "their own thing again"),
     # no longer than before: the card is full, and a longer head costs the line a page (measured 19 Oct)
-    return _list(1, "Where they left off (their own last page per site, newest first; the newest dated page of a thing "
-                    "wins on any site; when a tab of theirs may hold it, look at their tabs first and show that tab, "
-                    "else open that page's own address): ",
+    return _list(priority, head if head is not None else
+                 "Where they left off (their own last page per site, newest first; the newest dated page of a thing "
+                 "wins on any site; when a tab of theirs may hold it, look at their tabs first and show that tab, "
+                 "else open that page's own address): ",
                  ((b, PLAIN) for b in bits), sep="; ",
                  min_n=min(len(bits), LEFT_OFF_MIN_N))
 
@@ -1096,6 +1112,9 @@ def _slow(store: Any, purpose: str, now: float) -> list[list[Any]]:
     out += _things(store, vals, now, wide, ways, names)
     if purpose == "planner":
         out += _left_off(store, vals, now, LEFT_OFF_N, names)
+    elif purpose == "talker":
+        # final-H2 D3 (a): first in the slow part, so right after the live lines ("in the middle of")
+        out = _left_off(store, vals, now, 1, names, priority=0, head=PARTWAY_HEAD, browser=True) + out
     if wide:
         # the talker has the people directory in its profile layer (900 chars); "what did I do" stays a lookup
         out += _people(store)
