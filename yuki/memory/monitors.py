@@ -12,8 +12,8 @@ port it was last on (the Plug and Play instance key, which a monitor app such as
 target id); when it was first and last seen attached, its seconds attached, as Windows' primary and per place word
 (``main``, ``second``, ...: ``windows.monitor_roles``), its last place left to right; its last power (VCP 0xD6) and
 brightness (0x10) as the display driver read them, an off the driver wrote, when Windows last stopped listing it, and
-``left_bus`` (1: it left Windows within :data:`LEFT_BUS_S` of an off or while it last read off; 0: it stayed attached
-that long after one; ``None`` not measured).
+``left_bus`` (1: it left Windows within :data:`LEFT_BUS_S` of an off Yuki wrote or of a read that said off; 0: it
+stayed attached that long after an off; ``None`` not measured).
 
 **Writers** (code only, measured facts, never a model, never the user's words):
 
@@ -67,8 +67,8 @@ READ_EVERY_S = 5.0
 FLUSH_EVERY_S = 300.0
 #: A gap between two reads longer than this (the PC slept) adds no seconds (s).
 MAX_GAP_S = 120.0
-#: An off written this close before Windows stopped listing a monitor means it leaves Windows when off; one it stayed
-#: attached this long after means it doesn't (s).
+#: An off written (or a read that said off) this close before Windows stopped listing a monitor means it leaves
+#: Windows when off; one it stayed attached this long after means it doesn't (s).
 LEFT_BUS_S = 30.0
 #: The words kept per monitor (learned names and heard forms).
 WORDS_N = 4
@@ -549,15 +549,18 @@ class Recorder:
                     (s.ident, s.label, s.pnp, s.connector, s.width, s.height, s.instance, s.target_id, now, now,
                      s.place, now, now, now if changed else (cur["info_at"] if cur is not None else now)))
             for s in left:
-                cur = conn.execute("SELECT off_at, power, left_bus FROM monitors WHERE ident = ?",
+                cur = conn.execute("SELECT off_at, power, power_at, left_bus FROM monitors WHERE ident = ?",
                                    (s.ident,)).fetchone()
                 if cur is None:
                     continue
-                off_at, power = cur["off_at"], cur["power"]
-                # it left Windows within LEFT_BUS_S of an off, or while its last read said off: it leaves the bus
-                # when off (a measured fact the off question names next time)
+                off_at, power, power_at = cur["off_at"], cur["power"], cur["power_at"]
+                # it left Windows within LEFT_BUS_S of an off, or of a read that said off: it leaves the bus when off
+                # (a measured fact the off question names next time). Fix round F5: an older read says nothing (a
+                # wake by the mouse or its own button is never read, so a standby read of hours ago plus a later
+                # button-off is no measure of it)
                 leaves = (off_at is not None and 0.0 <= now - float(off_at) <= LEFT_BUS_S) or (
-                    power is not None and 2 <= int(power) <= 5)
+                    power is not None and 2 <= int(power) <= 5
+                    and power_at is not None and 0.0 <= now - float(power_at) <= LEFT_BUS_S)
                 conn.execute("UPDATE monitors SET removed_at = ?, last_seen = ?, left_bus = ?, updated_at = ?"
                              " WHERE ident = ?",
                              (now, now, 1 if leaves else cur["left_bus"], now, s.ident))

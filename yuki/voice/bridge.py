@@ -124,6 +124,20 @@ def say_waits_for_game(name: Any, args: Any = None) -> bool:
 QUEUED, RUNNING, WAITING, DONE, FAILED, CANCELLED = (
     "queued", "running", "waiting_for_answer", "done", "failed", "cancelled")
 OPEN_STATES = (QUEUED, RUNNING, WAITING)
+
+
+def _job_succeeded(job: Any) -> bool:
+    """mon1 fix round F6: whether a finished job did what it was asked, so words it took as its answer must never start
+    a second run of it: a send went, or it ended done with a verdict that is not ``failed`` and awaits no answer (the
+    22 Oct job that only asked ended done at ``failed``). Its state and verdict fields only, never its words."""
+    verdict = getattr(job, "verdict", None)
+    verdict = verdict if isinstance(verdict, dict) else {}
+    if verdict.get("send") or getattr(job, "sent", False):
+        return True
+    return (getattr(job, "state", None) == DONE and str(verdict.get("level") or "") != "failed"
+            and verdict.get("awaits") is not True)
+
+
 #: A request pack built when the user's turn ended goes with that turn's hand-off only this soon after (s); the agent
 #: itself reads the screen again when a pack is older than its own ``pack_max_age_s`` (20 s).
 PACK_MAX_AGE_S = 15.0
@@ -3879,10 +3893,11 @@ class VoiceBridge(QObject):
         if claim is None or claim.dropped or intent == "remember":
             return None
         if claim.done and intent in ("new_task", "follow_up"):
-            if getattr(claim.job, "state", None) not in OPEN_STATES:
-                # mon1 (22 Oct: "use Twinkle Tray" merged into a job that had ended 3 s before, and nothing ran): the
-                # job these words answered has finished, so the hand-off runs as usual (a new job, or the follow-up's
-                # own path), never swallowed by a job that is gone
+            if getattr(claim.job, "state", None) not in OPEN_STATES and not _job_succeeded(claim.job):
+                # mon1 (22 Oct: "use Twinkle Tray" merged into a job that had ended 3 s before as failed, and nothing
+                # ran): the job these words answered has finished without doing it, so the hand-off runs as usual (a
+                # new job, or the follow-up's own path), never swallowed by a job that is gone. Fix round F6: a job
+                # that did it (or sent) keeps them merged, so the same words never start a second run of it
                 self._log("bridge", op="claim_closed", job_id=claim.job.job_id, intent=intent)
                 return None
             return claim, "merged"

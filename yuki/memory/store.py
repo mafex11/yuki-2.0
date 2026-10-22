@@ -3665,8 +3665,8 @@ MIGRATIONS: tuple[str, ...] = (
     # ``last_seen`` / the seconds attached, as Windows' primary and per place word) and refreshed at the service's
     # start from Windows' own device list (the port and the last removal only: never a sighting, so a monitor Yuki
     # never saw attached is never theirs); the display driver's own reads add the last power (VCP 0xD6) and
-    # brightness (0x10), an off it wrote, and ``left_bus`` (1: it left Windows within 30 s of an off or while it last
-    # read off; 0: it stayed 30 s). Hardware facts only (the EDID name, Plug and Play id, connector, native size, the
+    # brightness (0x10), an off it wrote, and ``left_bus`` (1: it left Windows within 30 s of an off or of a read that
+    # said off; 0: it stayed 30 s). Hardware facts only (the EDID name, Plug and Play id, connector, native size, the
     # port's instance key and GPU target id), never content. ``info_at`` moves only when a stable field does (the
     # you-card's stamp). The meanings' ``called_ciphertext``: the words the user calls a thing by in the evidence
     # (their "first"), checked against the cited lines (yuki.memory.meanings). Additive only; one self-contained entry

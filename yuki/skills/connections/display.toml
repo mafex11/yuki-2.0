@@ -21,11 +21,16 @@
 # hands their request back to them ("press its power button?").
 #
 # Turning a screen off asks first only when it is the only screen on, or shows a game or a call (the user's decision),
-# or (mon1) when memory saw that monitor leave Windows the last time it was turned off, or when it was named by
-# Windows' place alone and that place held another of their monitors before: the question names it, and the answer
-# comes back as the anyway slot (honoured only as the answer to that question, the engine's own record). Turning one
-# on and brightness never ask. Brightness and the DDC power commands take no focus and send no input, so the windows
-# routes run with a game in front too; a monitor app is a program started, so its route never does.
+# or (mon1) when memory saw that monitor leave Windows the last time it was turned off (said in the same question as
+# any other reason, never instead of it), or when it was named by Windows' place alone: the question names it, and the
+# answer comes back as the anyway slot (honoured only as the answer to that question, the engine's own record).
+# Windows' place ("main", "second") is Windows' word, not the user's (22 Oct: the primary moved when the AOpen dropped
+# and stayed there): with two monitors attached and no word of theirs learned for it, an off or a brightness change by
+# place alone asks which, and a turn-on by place whose monitor is already on takes the one of theirs that is off.
+# Otherwise turning one on and brightness never ask. Brightness and the DDC power commands take no focus and send no
+# input, so the windows routes run with a game in front too; a monitor app is a program started, so the driver never
+# starts one with a game in front (read right before it would run; its route itself runs, so a dropped monitor the
+# app's list doesn't hold is said plainly whatever is in front).
 
 [connection]
 app = "display"
@@ -34,9 +39,10 @@ app = "display"
 end = "display_change"
 kind = "change"
 # One neutral line within MENU_LINE_CHARS with its slots (the slots' forms give way first): what it reaches and the
-# target's form, the monitor's place or its own name as the desk says it (never the desk's index); left out, every
-# monitor (a value the user's words don't hold is named in the done line as a guess, so "both" is no value).
-menu = "monitor brightness or screen on/off; target main/second/its name, none = all"
+# target's form, the user's own word for the monitor ("first") or its own name as the desk says it (never the desk's
+# index, and never Windows' place put for their word: mon1 fix round F1); left out, every monitor (a value the user's
+# words don't hold is named in the done line as a guess, so "both" is no value).
+menu = "monitor brightness or screen on/off; target their word/its name, none = all"
 done_line = "The monitor is set."
 offer_class = "everyday"
 handoff = true
@@ -45,8 +51,9 @@ bind = { level = "value", means = "means" }
 
 # Which monitor: its own name from the desk (VG271U; a misheard name is matched by its spelling against the monitors'
 # own names), the user's own word for it that memory learned (their "first"), or its place (main, second, ...: Windows'
-# place, a fallback); "all" is taken too. A monitor of theirs Windows doesn't list now is named the same ways. Left out:
-# every monitor ("on" wakes the ones that are off; "off" of every screen always asks first).
+# place, a fallback that never decides an off or a brightness change alone with two monitors attached); "all" is taken
+# too, as left out. A monitor of theirs Windows doesn't list now is named the same ways. Left out: every monitor ("on"
+# wakes the ones that are off, the dropped ones too; "off" of every screen always asks first).
 [[capability.display.slot]]
 name = "target"
 type = "text"
@@ -89,7 +96,9 @@ role = "fill"
 # -- the user's monitor app (means = app) -------------------------------------------------------------------------------
 # Its own command line from its data file, one monitor at a time by that monitor's own id (never by its place in the
 # app's list), then read back over DDC/CI. Not running or not installed: said and asked (start it, or Windows' own
-# control?), never swapped silently. A program started, so never with a game in front.
+# control?), never swapped silently. A program started, so never with a game in front: the driver holds it itself,
+# read right before the program would run (mon1 fix round F7: so the route runs with a game in front, and a monitor
+# Windows dropped that the app's own list doesn't hold is said plainly, never "a game is in front"; it takes no focus).
 [[capability.display.route]]
 rung = "A"
 variant = "app"
@@ -97,7 +106,7 @@ via = "driver"
 driver = "display_route"
 call = "route_app"
 needs_focus = false
-game = "never"
+game = "always"
 when = { slot = "means", in = ["app"] }
 retry_after_acting = false
 done = { probe = "read_back" }

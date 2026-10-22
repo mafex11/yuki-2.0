@@ -34,7 +34,9 @@ exit_works = false
 # that contains it. Its keys are each monitor's Plug and Play instance part ("5&19123132&0&uid155906": the README's
 # "UID2353" form, and what its pipe's list is keyed by), never the Plug and Play id: "acr06d7" matches no key and the
 # app does nothing (mon1: the morning21 data said it worked; it never ran on this PC). The whole instance part is given,
-# so it can't match another monitor's key.
+# but one monitor's can still stand inside another's ("...&uid1" in "...&uid12"), and the instance part is the port's,
+# not the monitor's (another monitor on that port has the same key): so the driver runs it only when exactly one key of
+# the pipe's list contains it and that entry is the same monitor (its Plug and Play id, [pipe] pnp below).
 select = "--MonitorID={instance}"
 # A brightness level, 0-100 (applied to the selected monitor).
 set = "--Set={level}"
@@ -52,3 +54,6 @@ list_works = false
 # whether the app can reach a monitor before running its command line for it, and nothing else.
 path = '\\.\pipe\twinkle-tray\cmds'
 list = '{"type":"list"}'
+# Where each entry of the list gives the monitor's Plug and Play id: its "hwid" ("\\?\DISPLAY", "AOP069C", the instance
+# part, ...), item 1 (Monitors.js builds it from the device path).
+pnp = "hwid.1"
