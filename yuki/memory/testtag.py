@@ -1483,11 +1483,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.purge:
         from yuki.memory.store import Store
 
-        store = Store.open(args.db)
         try:
-            got = store._write(lambda conn: purge(conn, store._dec, now=time.time()))
-        finally:
-            store.close()
+            store = Store.open(args.db)
+            try:
+                got = store._write(lambda conn: purge(conn, store._dec, now=time.time()))
+            finally:
+                store.close()
+        except Exception as exc:  # noqa: BLE001 - integ30 (lh merge note 4): a failed purge exits non-zero, content-free
+            print(json.dumps({"purged": None, "error": type(exc).__name__}, indent=2))
+            return 2
         print(json.dumps({"purged": got}, indent=2))
         return 0
     rep = report(args.db, show=args.show)

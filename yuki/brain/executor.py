@@ -549,13 +549,15 @@ HINT_WHO_FIRST = ("not typed: whom this message goes to isn't settled (its capab
 #: window that no message capability of this request opened (code's words, planner-facing; never said). final-H2 lane E
 #: (E5, contract K-F reader): it points at the legal path for "type this in this chat": the message capability takes
 #: the chat that was in front when they spoke as its recipient, for a draft (lane B: by that chat's measured thread
-#: identity; a draft with no person fills from it), so the planner never meets the dead end of live H2
-#: kw_name_word_in_text (a refused type, a dropped person, "do it by steps", the same type refused again).
+#: identity), so the planner never meets the dead end of live H2 kw_name_word_in_text (a refused type, a dropped person,
+#: "do it by steps", the same type refused again). integ30 (le merge note 4): lane B's B1 takes a named person equal to
+#: the front chat's (``resolve.FROM_FRONT``); a draft with no person still asks "Who to?" (lb "Not done"), so the hint
+#: names that chat's person (the planner reads "The chat in front is with ..."), as ONE's ``LINE_CHAT_TYPE`` does.
 HINT_CHAT_TYPE = ("not typed: this window is a chat's, and no message capability of this request opened this chat; "
                   "text for a person goes only through run_skill message (it opens their chat, asks whom when it "
-                  "can't tell, and leaves a draft). For the chat that was in front when they spoke: person left out, "
-                  "send \"draft\" (it takes that chat by its own check; a send needs the person in their words). If "
-                  "that can't run in this request, say so plainly. Nothing was typed.")
+                  "can't tell, and leaves a draft). For the chat that was in front when they spoke: that chat's "
+                  "person, send \"draft\" (it checks that chat by its own measure; a send needs the person in their "
+                  "words). If that can't run in this request, say so plainly. Nothing was typed.")
 #: A7 (final-G2 R13; gb's contract K-S): a skill hand-off whose run ended with the switcher its own shortcut opened
 #: still holding the keyboard (measured at the run's end), told to the planner first so its first step closes it.
 SWITCHER_HELD = "switcher_held"

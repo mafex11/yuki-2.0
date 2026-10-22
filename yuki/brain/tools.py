@@ -185,6 +185,8 @@ BRAIN_FETCH_TOOL: dict[str, Any] = _brain_tool(
 #: what it keeps turns around something kept before (``turns_around``: that item, or ``""``) and the reason their words
 #: gave (``their_reason``, or ``""``). Both are required: an optional provenance field is not sent (final-H2 lesson).
 #: The handler (:func:`run_remember`) holds a reversal with no reason until they answered one short question.
+#: integ30 (le merge note 3): ``turns_around`` names what was given in this talk, as ``mouth.HAND_OVER``'s and the three
+#: cores' keep principles do, so a standing rule from an earlier day turned around is kept at once, never held.
 TURNS_AROUND_FIELD = "turns_around"
 THEIR_REASON_FIELD = "their_reason"
 BRAIN_REMEMBER_TOOL: dict[str, Any] = _brain_tool(
@@ -196,7 +198,7 @@ BRAIN_REMEMBER_TOOL: dict[str, Any] = _brain_tool(
                 "of a fact. todo: action add|done|not_needed|wrong|list, text, due. watch: action add|list|cancel, "
                 "condition, quote (exact words), repeat, days, request. answer: their reply to your question "
                 "(question, outcome, answer). usual: text slot=option from the result, answer yes|just_this_time. "
-                "turns_around: what kept before it reverses; their_reason: their reason, or their yes to a question "
+                "turns_around: what of this talk it reverses; their_reason: their reason, or their yes to a question "
                 "naming both (\"\" if neither).",
     extra={"app": {"type": "string"}, TURNS_AROUND_FIELD: {"type": "string"},
            THEIR_REASON_FIELD: {"type": "string"}},

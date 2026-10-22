@@ -37,7 +37,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from yuki.brain.tools import ASK_USER_TOOL, FETCH_TOOL, LOOK_TOOL, MEMORY_TOOL, REMEMBER_TOOL
+from yuki.brain.tools import (ASK_USER_TOOL, FETCH_TOOL, LOOK_TOOL, MEMORY_TOOL, REMEMBER_TOOL, THEIR_REASON_FIELD,
+                              TURNS_AROUND_FIELD)
 from yuki.skills.menu import talker_tool
 from yuki.ui.own_window import PAGES as YUKI_PAGES
 from yuki.voice.mouth import END_CONVERSATION, GO_QUIET, MORE_OF_RESULT, STAY_QUIET
@@ -303,10 +304,11 @@ _WAY_SENTENCE = " way: keep how your acts just did it as their own way (text: it
 #: or way of theirs this one reverses, ``""`` for none) and ``their_reason`` (their reason, ``""`` when their words
 #: gave none). The shared handler (``brain.tools.run_remember``, lane D's D2) holds a reversal with no reason and asks
 #: first. ONE's own texts for both (whatever the planner's schema says of them), so ONE's voice block stays measured.
-TURNS_AROUND = "turns_around"
-THEIR_REASON = "their_reason"
+TURNS_AROUND = TURNS_AROUND_FIELD   # integ30 (ld merge note 1): the names come from brain.tools (contract K-R)
+THEIR_REASON = THEIR_REASON_FIELD
 _REVERSAL_FIELDS: dict[str, dict[str, str]] = {
-    TURNS_AROUND: {"type": "string", "description": "The rule or way of theirs this reverses, or \"\"."},
+    TURNS_AROUND: {"type": "string", "description": "The rule or way they gave in this talk that this reverses, "
+                                                    "or \"\"."},
     THEIR_REASON: {"type": "string", "description": "Their reason as they said it, or \"\"."},
 }
 #: ONE's own description (the planner's, kept here so a change of the planner's text never moves ONE's block; ``way``

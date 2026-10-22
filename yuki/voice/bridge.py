@@ -806,6 +806,12 @@ class VoiceBridge(QObject):
         #: heard this turn, once a turn: ``Conversation._follow_quiet``) is refused once, with ONE's own note; else
         #: ``None``. Set by the conversation; under one ``OneVoice.control`` refuses its own.
         self.follow_quiet: Callable[..., Any] | None = None
+        #: integ30 (le merge note 1, contract K-R talker side): ``() -> float``: when words of Yuki's last left the
+        #: speaker (monotonic, 0: never; the observer's ``words_heard_at``), set by the conversation.
+        self.yuki_heard_at: Callable[[], float] | None = None
+        #: integ30 (K-R talker side): the talker's remember held to ask first (:meth:`_reversal_gate`):
+        #: ``(conversation, user turn, when that turn was heard, what it turns around)``, else ``None`` (RAM only).
+        self._remember_held: tuple[int, int, float, str] | None = None
         #: Whether the mouth run now answers the first words after the wake word heard the user say the name
         #: (set by the conversation; v3.6): those words were said to Yuki, so staying quiet is refused once.
         self.named_turn: Callable[[], bool] | None = None
@@ -969,6 +975,8 @@ class VoiceBridge(QObject):
             self.quiet_requested = None
             self.opened_quiet = None
             self.follow_quiet = None
+            self.yuki_heard_at = None
+            self._remember_held = None
             self.named_turn = None
             self.said_early = None
             self.early_words = None
@@ -4477,6 +4485,19 @@ class VoiceBridge(QObject):
         remember = intent == "remember"
         if await self._claim_decides(params, args, intent, heard, None):
             return   # Item 2(c, e): their answer to the waiting question, routed once
+        asked = ""
+        if remember:
+            hold, asked = self._reversal_gate(args, turn)
+            if hold:
+                # integ30 (le merge note 1, K-R talker side): a reversal of this talk with no reason said is never
+                # kept before their answer; the call's say_first is the one question (HAND_OVER), said if unsaid
+                await self._ack_if_silent(params, args)
+                self._log("bridge", op="remember_held", call=params.tool_call_id)
+                await params.result_callback({"held": REMEMBER_HELD, "how_to_handle_it": REMEMBER_HELD_NOTE},
+                                             properties=FunctionCallResultProperties(run_llm=False))
+                return
+            if asked:
+                self._log("bridge", op="remember_released", call=params.tool_call_id)
         steered = self._held_steered_job() if intent in ("new_task", "follow_up") else None
         if steered is not None:
             # hands19 review M2: code already gave these very words to the task whose send they paused (the talker
@@ -4562,6 +4583,9 @@ class VoiceBridge(QObject):
         if done_here:
             note = _done_here_note(done_here)
             extra = f"{extra}\n\n{note}" if extra else note
+        if asked:
+            note = REMEMBER_ASKED.format(around=asked)
+            extra = f"{extra}\n\n{note}" if extra else note
         context = self._voice_context(params.context, turns, extra=extra, remember=remember,
                                       done_here=bool(done_here))
         query = _memory_words(request, heard)
@@ -4591,6 +4615,40 @@ class VoiceBridge(QObject):
                 self._unowe(job)
                 self._log("bridge", op="cancel", job_id=job.job_id, by="mouth")
             raise
+
+    def _reversal_gate(self, args: dict[str, Any], turn: tuple[int, int] | None) -> tuple[bool, str]:
+        """integ30 (le merge note 1, contract K-R talker side; final-H2 m21_reversal_checkback): whether the talker's
+        remember hand-over is held to ask first, and what a released one turns around.
+
+        Released (``(False, item)``): a hold of this conversation is recorded for an earlier user turn, within
+        ``brain.tools.HOLD_S``, the user has spoken since (the turn count moved on) and words of Yuki's were heard
+        after the turn that carried it (:attr:`yuki_heard_at`, the narrator's measured time: her question), whatever
+        this call's ``turns_around`` says, so the item is never asked twice. Held (``(True, "")``): no release, and
+        the call's ``turns_around`` (the talker's required declaration: something given in this talk, turned around
+        with no reason said) is set; recorded with when that turn was heard. Anything else (``turns_around`` empty or
+        missing, or no turn or heard time to measure by): ``(False, "")``, it goes on as before (the shared handler
+        still checks the planner's own declaration). The model's own field and stream facts only, never the words;
+        never raises."""
+        try:
+            from yuki.brain.tools import HOLD_S
+
+            now = time.monotonic()
+            held = self._remember_held
+            if held is not None and (turn is None or held[0] != turn[0] or now - held[2] > HOLD_S):
+                held = self._remember_held = None   # another conversation's, or lapsed
+            seen = self.yuki_heard_at
+            heard = float(seen() or 0.0) if callable(seen) else 0.0
+            if held is not None and turn is not None and turn[1] > held[1] and heard > held[2]:
+                self._remember_held = None
+                return False, held[3]
+            around = " ".join(str(args.get("turns_around") or "").split())[:160]
+            if not around or turn is None or not callable(seen):
+                return False, ""
+            newest = self.heard_log.newest() if self.heard_log is not None else None
+            self._remember_held = (turn[0], turn[1], float(newest) if newest is not None else now, around)
+            return True, ""
+        except Exception:  # noqa: BLE001 - no measure: as before
+            return False, ""
 
     def _reply_calls(self, params: Any) -> set[Any] | None:
         """hands19 (all-questions RC3a): the other calls of the reply this call came in that are still running
@@ -5121,8 +5179,21 @@ class VoiceBridge(QObject):
 REMEMBER_CONTEXT = ("Yuki's voice took these words as something to keep: a rule about how Yuki talks or behaves, a "
                     "correction of something Yuki got wrong about them, a fact about their life, or how they do "
                     "something on this PC (the app or way they use). Keep it with "
-                    "remember when it is one (something about this moment only is not kept). Nothing else is asked, "
-                    "and the voice has already answered them, so the answer is not spoken unless keeping it failed.")
+                    "remember when it is one (something about this moment only is not kept). The voice has already "
+                    "answered them, so the answer is not spoken unless keeping it failed; ask them nothing but the "
+                    "one question a keep held to ask first needs.")
+#: integ30 (le merge note 1, contract K-R talker side): the talker's remember hand-over that declares it turns around
+#: something given in this talk (``turns_around``, a required field of ``mouth.HAND_OVER``) is held by code, as the
+#: shared handler holds the planner's and ONE's (``brain.tools.reversal_hold``): nothing goes to the planner, the call
+#: settles quietly (its say_first was the one question), and the next remember hand-over after Yuki's words were heard
+#: past the turn that carried it goes through (:meth:`VoiceBridge._reversal_gate`).
+REMEMBER_HELD = "not kept: their answer to your question decides"
+REMEMBER_HELD_NOTE = "Nothing was kept. Their answer is the change: hand_over intent remember again then."
+#: integ30 (K-R): the labelled, code-measured line a released keep goes to the planner with (the held item is the
+#: talker's own field; "heard" is the narrator's measured time), so its remember names their answer as their_reason.
+REMEMBER_ASKED = ("Yuki's voice held a keep that turns around {around}, to ask them first; its question was heard, "
+                  "and these are their words since. That change is kept only on their yes (their_reason: their "
+                  "yes); anything else they want kept is kept as usual.")
 #: bTalk: the note a late addition (words said after the request's last step) goes with.
 LATE_ADDED = "Added by voice right after the previous request finished: take it from what the screen shows now."
 

@@ -6190,7 +6190,8 @@ class OneVoice:
         except Exception:  # noqa: BLE001 - no verbs: no runner (fail closed)
             return None
 
-    async def _run(self, name: str, args: dict[str, Any], turn: Any, call_id: str) -> dict[str, Any]:
+    async def _run(self, name: str, args: dict[str, Any], turn: Any, call_id: str,
+                   last: bool | None = None) -> dict[str, Any]:
         """One call through the runner (``run(call, turn) -> dict``, its parameters read off its signature), on a
         worker thread (it takes the desk lease and may wait in the countdown there). Never raises."""
         runner = self._runner_obj()
@@ -6200,7 +6201,7 @@ class OneVoice:
         call = {"name": name, "args": dict(args), "id": call_id, "channel": "voice"}
         values = {"call": call, "name": name, "tool": name, "args": dict(args), "tool_input": dict(args),
                   "arguments": dict(args), "turn": turn, "speak": self.speak, "channel": "voice", "call_id": call_id,
-                  "tool_call_id": call_id}
+                  "tool_call_id": call_id, "last": last}
         bound = _one_bind(fn, values)
         if bound is None:
             self._log("runner", ready=False, why="signature")
@@ -6295,7 +6296,9 @@ class OneVoice:
                     if acting:
                         self._acts[call_id] = time.monotonic()   # gc (C7): a long act gets code's still-on-it line
                     try:
-                        result = await self._run(name, args, turn, call_id)
+                        # integ30 (lc merge note 1, F3): whether a later call of this reply is left, so a skill's
+                        # question said by code never closes the turn over it (``Runner.run``'s ``last``)
+                        result = await self._run(name, args, turn, call_id, last=group.last(call_id))
                     finally:
                         self._acts.pop(call_id, None)
             outcome = one_outcome(name, args, result)
@@ -7521,6 +7524,8 @@ class Conversation:
         bridge.opened_quiet = self._opened_quiet_result
         # la A2: a lone quiet on words that follow Yuki's own heard line is refused once (ONE's follow-on rule)
         bridge.follow_quiet = self._follow_quiet_result
+        # integ30 (le merge note 1, K-R talker side): when Yuki's words last left the speaker (a held keep's release)
+        bridge.yuki_heard_at = lambda: float(getattr(self.observer, "words_heard_at", 0.0) or 0.0)
         bridge.quiet_requested = self.on_quiet
         # The summary is a user-role message nobody said: never "what the user said" to the thinker;
         # nor, in a call, what the mouth judged was said to the people on it (it stayed quiet).

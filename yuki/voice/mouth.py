@@ -1245,7 +1245,7 @@ HAND_OVER: dict[str, Any] = {
             "description": (
                 "Intent remember only: what they gave you earlier in this talk (a way, rule or fact) that these words "
                 "turn around with no reason said, in a few words; \"\" when nothing is turned around, their words say "
-                "why, or for any other intent."
+                "why or answer your question about it, or for any other intent."
             ),
         },
         "understanding": UNDERSTANDING,
@@ -2533,7 +2533,8 @@ OPENED_RERUN_NOTE = ("[You chose silence on their first words, but they opened t
 #: (``pipeline.ONE_FOLLOW_QUIET``'s sentence; :data:`OPENED_RERUN_NOTE` says "first words", which a follow-on is not).
 FOLLOW_RERUN_NOTE = ("[You chose silence, but their words follow your own line and nothing has answered them yet. "
                      "Answer in a few words; only if they plainly spoke to someone else, choose quiet again; if they "
-                     "sent you away or signed off, end_conversation with say_first \"\", alone.]")
+                     "signed off, end_conversation with a word or two; if they sent you away, end_conversation with "
+                     "say_first \"\", alone.]")
 #: The last line of every request's volatile block in marker mode (v3.16): the format, right where the reply begins.
 MARKER_REMINDER = "[Start your reply with its marker line: say, act or quiet, alone on the first line.]"
 #: Added when the user's turn is answered again because nothing of the last reply to it was heard (v3.16).

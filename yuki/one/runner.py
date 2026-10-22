@@ -1465,10 +1465,14 @@ class Runner:
 
             run = run_remember(self.memory, args, words=" / ".join(turn.words))
             ok, text = bool(run.ok), str(run.text or "")
+            # integ30 (ld merge note 1, K-R): a reversal the shared handler held (its payload's ``held``) is theirs to
+            # answer first, nothing failed: asked ("needs their yes"), so no settle line says the remember failed
+            payload = getattr(run, "payload", None)
+            held = not ok and isinstance(payload, Mapping) and payload.get("held") == "ask_first"
         except Exception as exc:  # noqa: BLE001
-            ok, text = False, f"Not saved ({type(exc).__name__})."
-        return OneResult(name, WRITTEN if ok else FAILED, verified=True if ok else None, result=text[:RESULT_CHARS],
-                         decision=decision, verb="remember")
+            ok, held, text = False, False, f"Not saved ({type(exc).__name__})."
+        return OneResult(name, WRITTEN if ok else ASKED if held else FAILED, verified=True if ok else None,
+                         result=text[:RESULT_CHARS], decision=decision, verb="remember")
 
     # -- acts ----------------------------------------------------------------------------------------------------------
 
