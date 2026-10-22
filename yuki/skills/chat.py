@@ -694,12 +694,35 @@ def _target_route(call: RouteCall) -> tuple[Target, ChatRoute] | RouteResult:
     if isinstance(got, Asked):
         return RouteResult(ran=False, ask=got.line, options=list(got.options), outcome=got.outcome)
     target, route = got
+    front = _front_of(call)
+    if front is not None:
+        # lb B1 (K-F): the person came from the chat in front when they spoke: the run stays in that very chat (the
+        # route holding its thread), never their usual one elsewhere; none of theirs holds it: asked, nothing opened
+        here = next((r for r in target.routes if int(front.get("thread") or 0) in set(r.thread_ids)), None)
+        if here is None or (key[1] and here.app != key[1]):
+            return RouteResult(ran=False, ask=ASK_WHO, outcome="no_person")
+        return target, here
     if isinstance(route, Asked):
         if route.outcome == "no_route":
             # memory knows the person, but no chat of theirs is in an app these routes drive: the thinker may (pinned)
             return RouteResult(ran=False, outcome="no_route")
         return RouteResult(ran=False, ask=route.line, options=list(route.options), outcome=route.outcome)
     return target, route
+
+
+def _front_of(call: RouteCall) -> dict[str, Any] | None:
+    """lb B1 (K-F): the chat in front the resolver took this run's person from (the engine's ``ctx.front_chat``, set
+    only when the person's fill source is ``resolve.FROM_FRONT``), else ``None``. Never raises."""
+    try:
+        from yuki.skills.resolve import FROM_FRONT
+
+        sources = getattr(call, "fill_sources", None)
+        if not isinstance(sources, Mapping) or FROM_FRONT not in {str(v) for v in sources.values()}:
+            return None
+        front = getattr(call.ctx, "front_chat", None)
+        return dict(front) if isinstance(front, Mapping) and front.get("thread") else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1396,6 +1419,73 @@ def _other_chat(store: Any, tid: int | None, ids: set[int], person_id: int | Non
 OTHER_CHAT_FACTS = ("other_ids", "other_known", "other_same_person", "other_holders")
 
 
+def front_chat(store: Any, board: Mapping[str, Any] | None, *, spoke: int | None = None,
+               brought: Sequence[int] = ()) -> dict[str, Any] | None:
+    """lb B1 (final-H2 kw_name_word_in_text: "type bro I'm on my way in this chat" had no path; contract K-F, writer):
+    the chat in front, measured as :func:`chat_state` measures an opened chat, never by a title: memory's Now board's
+    window in front, a chat app's own program (its ``[chat]`` data), read and not stale since, not blocked, with a chat
+    scope or an address; its capture thread (``Store.find_thread``: a keyed digest of the app and the chat's scope);
+    and on that thread exactly one person's own direct message (``contacts.contacts_of_threads``: one person, every
+    route there a ``dm``: never a group chat or channel, never a DM memory linked to two people), in an app the routes
+    drive. ``spoke`` / ``brought`` (the engine's :func:`yuki.skills.engine._front_spoken`, from the run's hands): the
+    window in front when they spoke, when an act of Yuki's moved the focus since (the window must be that one), and
+    windows Yuki's own steps brought forward (never one of those): "the chat that was in front when they spoke".
+    ``{"id", "name", "thread", "app", "chat", "handle", "hwnd"}`` (RAM only: names stay here, never logged), else
+    ``None``. Never raises."""
+    try:
+        if store is None or not isinstance(board, Mapping):
+            return None
+        windows = list(board.get("windows") or [])
+        front = next((w for w in windows if isinstance(w, Mapping) and w.get("foreground")), None)
+        if front is None or front.get("blocked") or front.get("stale") or not front.get("read_at"):
+            return None
+        if not (front.get("scope") or front.get("url")):
+            return None                                     # a title alone is never an identity
+        hwnd = int(front.get("hwnd") or 0)
+        if not hwnd or (spoke and hwnd != int(spoke)) or hwnd in {int(h) for h in brought or () if h}:
+            return None
+        proc = _app_key(front.get("process"))
+        app = next((a for a in chat_apps() if proc and proc in {_app_key(p) for p in app_data(a).get("processes")
+                                                                or []}), "")
+        if not app:
+            return None
+        tid = store.find_thread(front.get("app"), front.get("title"), front.get("url"), process=front.get("process"),
+                                scope=front.get("scope"))
+        if tid is None:
+            return None
+        from yuki.memory import contacts as C
+
+        hits = C.contacts_of_threads(store, [int(tid)]).get(int(tid), [])
+        if not hits or any(getattr(r, "kind", "") != PERSON_KIND for _c, r in hits):
+            return None
+        people = {int(c.id): (c, r) for c, r in hits}
+        if len(people) != 1:
+            return None
+        contact, route = next(iter(people.values()))
+        own = _chat_route(store, route)
+        if own.app != app:
+            return None
+        return {"id": int(contact.id), "name": _words(contact.name), "thread": int(tid), "app": app,
+                "chat": _words(route.chat), "handle": _words(route.handle), "hwnd": hwnd}
+    except Exception:  # noqa: BLE001 - not measured: nobody in front
+        return None
+
+
+def _front_shown(target: Target, front: Mapping[str, Any] | None) -> str:
+    """lb B1 (K-F): how the done lines name a person taken from the chat in front: their name and that chat's own name
+    as memory keeps it (what the window shows: "Hemanth (Quasar40404)"), so the person and the handle on screen are
+    tied; the name alone when the chat's name is theirs. Never raises."""
+    try:
+        name = _words(target.name)
+        shown = _words((front or {}).get("chat")) or _words((front or {}).get("handle"))
+        if not shown or not name or shown.casefold().lstrip("@") in name.casefold() \
+                or name.casefold() in shown.casefold():
+            return name
+        return f"{name} ({shown})"
+    except Exception:  # noqa: BLE001
+        return _words(getattr(target, "name", ""))
+
+
 def chat_state(store: Any, thread_ids: Sequence[int], data: Mapping[str, Any], since: float,
                board: Mapping[str, Any] | None, *, person_id: int | None = None) -> tuple[bool | None, dict[str, Any]]:
     """Whether the chat with these capture threads is open now: memory's read of the window in front (read after
@@ -1862,6 +1952,11 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     text, send = _text_mode(call.values)
     send = send and not as_draft
     name = target.name
+    front = _front_of(call)
+    if front is not None:
+        # lb B1 (K-F): a person taken from the chat in front is named with that chat's own name ("your chat with
+        # Hemanth (Quasar40404)"), so the person and the handle on screen are tied and a wrong one shows
+        name = _front_shown(target, front)
     where = _where(call.values, app)
     person_id = getattr(target, "id", None) if not getattr(target, "place", False) else None
     chat, ev = _wait_chat(call, data, route, since, hwnd, person_id=person_id)
@@ -2601,4 +2696,4 @@ PROBES: dict[str, Callable[..., tuple[bool | None, dict[str, Any]]]] = {"message
 
 __all__ = ["ROUTES", "PROBES", "ChatRoute", "Target", "Asked", "app_data", "chat_apps", "app_of", "find_target",
            "pick_route", "whom", "deep_link", "switcher_query", "run_steps", "chat_state", "route_open_link",
-           "route_switcher", "route_voice_join", "probe_message_done", "sent_in_chat"]
+           "route_switcher", "route_voice_join", "probe_message_done", "sent_in_chat", "front_chat"]

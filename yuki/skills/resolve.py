@@ -148,12 +148,21 @@ CALLER_SOURCES: tuple[str, ...] = (FROM_CARD, FROM_SCREEN, FROM_MENU, FROM_READI
 CALLER_HEARD = FROM_HEARD
 #: gd D5 / D6: the content-free code words the ``skill_resolve`` line carries for how a name given to the act was
 #: resolved (``Plan.names_how``) or why it stayed as given (``Plan.names_miss``), and for how a person slot was
-#: resolved (``Plan.person["how"]``). Code words only, never a value or a name.
+#: resolved (``Plan.person["how"]``). Code words only, never a value or a name. lb B3: ``own``, an untagged value that
+#: is by identity one of their own known sites or apps (their word, no hedge). lb B4: ``digits`` / ``again``, a site
+#: page's item the names measure left as given (another number; the same value again right after its swap).
 NAMES_HOW_CALLER = "caller"
+NAMES_HOW_OWN = "own"
 NAMES_MISS_WORDS: tuple[str, ...] = ("no_pool", "below_bar", "act_off", "not_theirs", "no_entries", "unheard",
-                                     "not_own", "error")
+                                     "not_own", "digits", "again", "error")
 PERSON_HOWS: tuple[str, ...] = ("said", "heard", "script", "confirmed_sound", "who_answer", "said_for", "granted",
-                                "asked", "dropped", "fill")
+                                "asked", "dropped", "fill", "front")
+#: lb B1 (final-H2 kw_name_word_in_text; contract K-F, writer): where a person value came from when it is not in the
+#: user's words but is, by memory's thread identity, the person of the chat that was in front when they spoke (the
+#: engine's measure, :func:`yuki.skills.chat.front_chat`): accepted only on a draft or an open (a send still needs the
+#: person in their words, rule 8), never a guess (identity, not a reading), and the chat driver keeps the run in that
+#: very chat (its thread). A code word in RAM and the logs.
+FROM_FRONT = "front"
 #: ``app.way``'s slots (connections/ways.toml, contract C4): which way (a live way's key or name), and where in the app
 #: (a control's label the menu lists, one of their things, or an item's own words).
 WAY_CAPABILITY = "app.way"
@@ -1441,6 +1450,16 @@ def _given_source(given_from: Mapping[str, str] | str | None, slot_name: str) ->
     return word if word in CALLER_SOURCES else ""
 
 
+def _caller_word(given_from: Mapping[str, str] | str | None, slot_name: str) -> str:
+    """lb B3: the caller's own word for where the value it gave for ``slot_name`` came from, whatever it is (case
+    folded; ``""``: untagged). Never raises."""
+    try:
+        raw = given_from.get(slot_name) if isinstance(given_from, Mapping) else given_from
+        return _words(raw).casefold()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _caller_heard(given_from: Mapping[str, str] | str | None, slot_name: str) -> bool:
     """gd D1 (contract K-H): whether the caller's word for the value it gave for ``slot_name`` is :data:`CALLER_HEARD`
     (it read the value from a misheard word of theirs). Only ever a claim: :func:`resolve` checks the value by identity
@@ -1469,6 +1488,46 @@ def _own_app(value: Any, *, store: Any, until: float | None) -> bool:
         want = _name_key(text)
         return bool(want) and any(_name_key(n) == want for a in apps.values() for n in a.get("names") or [])
     except Exception:  # noqa: BLE001 - not known as theirs: the guess tag stays
+        return False
+
+
+def _front_names(fp: Mapping[str, Any], value: Any,
+                 people: Callable[[str], dict[str, Any] | None] | None) -> bool:
+    """lb B1 (contract K-F): whether a person value the caller gave names the person of the chat in front (``fp``:
+    :func:`yuki.skills.chat.front_chat`'s measure, ``{"id", "name", "chat", "handle", ...}``): by the people index,
+    exactly that one person (``people``: a name or alias as written, :func:`_person`), or that chat's own name or handle
+    as memory keeps it (what the window shows; case, spaces and a leading "@" aside). Identity only, never by sound and
+    never the user's words. Never raises (``False``)."""
+    try:
+        text = _words(value.get("name") if isinstance(value, Mapping) else value)
+        pid = fp.get("id")
+        if not text or pid is None:
+            return False
+        got = people(text) if people is not None else None
+        if isinstance(got, Mapping) and got.get("id") is not None and int(got["id"]) == int(pid):
+            return True
+
+        def fold(s: Any) -> str:
+            return _words(s).casefold().lstrip("@").strip()
+
+        return fold(text) in ({fold(fp.get("chat")), fold(fp.get("handle"))} - {""})
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _front_app_ok(skill: Skill, given: Mapping[str, Any], fp: Mapping[str, Any], *, store: Any,
+                  until: float | None) -> bool:
+    """lb B1: an app the caller gave with a front-chat person is that chat's own app (identity, :func:`_app_forms`);
+    no app given is fine (the chat driver keeps the run in that chat). Never raises (``False``)."""
+    try:
+        slot = next((s for s in skill.slots if s.type == "app"), None)
+        raw = given.get(slot.name) if slot is not None else None
+        text = _words(raw.get("name") if isinstance(raw, Mapping) else raw)
+        if not text:
+            return True
+        return bool(_app_forms(text, store=store, until=until) &
+                    _app_forms(str(fp.get("app") or ""), store=store, until=until))
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -1759,6 +1818,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             granted: Mapping[str, str] | None = None, chosen: Mapping[str, Any] | None = None,
             chosen_from: str = FROM_CHOSEN, given_from: Mapping[str, str] | str | None = None,
             own_pick: bool = False, once: bool = False, answered: Collection[str] = (),
+            front: Callable[[], Mapping[str, Any] | None] | None = None,
             _strict: bool = False) -> Result:
     """Fill ``skill_key``'s slots and pick its rungs (see the module docstring). ``words``: the user's own words, each
     turn exactly as heard or typed (the current exchange: their turns since the last finished job, newest last);
@@ -1803,7 +1863,21 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     (:data:`FROM_WORDED`), a person whose closest sound is a heard form the user confirmed runs unasked
     (:func:`_heard_confirmed`), and the caller's reading of an undoable slot (the chat app, a way's item) is accepted.
     ``_strict`` (internal): none of those, every run as a send (the loop's values sent after all, so it resolves
-    again)."""
+    again).
+
+    lb B1 (final-H2 kw_name_word_in_text, "type X in this chat"; contract K-F): ``front``, the caller's measure of the
+    chat that was in front when the user spoke (called at most once, only when needed: the engine's
+    :func:`yuki.skills.chat.front_chat`, ``{"id", "name", "thread", "app", "chat", "handle"}`` of one person's own direct
+    message by memory's thread identity, else ``None``). On a draft or an open only, a person-bound value the user's
+    words don't hold is that person when it names them by identity (:func:`_front_names`) and any app given is that
+    chat's own: filled :data:`FROM_FRONT`, run as their own name. A send still needs the person in their words (rule 8:
+    the run resolves again strictly when its values send after all).
+
+    lb B3 (final-H2 p24_misheard_excalidraw: the loop-2 ``from: heard`` tag was sent in 0 of 4 calls): on an undoable
+    run, for a slot that is no person, an untagged value the caller gave that is by identity one of the user's own
+    known sites (:func:`_known_site`) or programs (:func:`_own_app`) is their word, :data:`FROM_WORDS`: no hedge, the
+    done line names it as it names any value. A caller's ``card`` (or any other source word) and code's own fills stay
+    a named guess."""
     from yuki.skills import prefs, taste
 
     now = time.time() if now is None else float(now)
@@ -1851,6 +1925,17 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     relaxed = False
     worded: str | None = None
     cap = skill.capability or skill.key
+    # lb B1 (K-F): the chat in front when they spoke, measured once and only when a person needs it
+    front_box: dict[str, Any] = {}
+
+    def front_now() -> Mapping[str, Any] | None:
+        if "v" not in front_box:
+            try:
+                got = front() if callable(front) else None
+            except Exception:  # noqa: BLE001 - not measured: nobody in front
+                got = None
+            front_box["v"] = dict(got) if isinstance(got, Mapping) and got.get("id") is not None else None
+        return front_box["v"]
 
     def app_names(value: str) -> tuple[str, list[str]]:
         return app_identity(value, store=store, until=until)
@@ -2068,6 +2153,21 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                     return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=heard_as[0]), [heard_as[0]],
                                dropped=list(dropped),
                                person={"source": FROM_GIVEN, "how": "asked", **_person_facts(store, heard_as[0])})
+                if drafting and slot.type == "text" and heard and front is not None:
+                    # lb B1 (final-H2 kw_name_word_in_text: "type bro I'm on my way in this chat" had no legal path;
+                    # contract K-F): the caller's person is, by memory's thread identity, the person of the chat that
+                    # was in front when they spoke (one person's own direct message, never a title or a sound), and an
+                    # app it gave is that chat's own. On a draft or an open only: that person, by their own name, kept
+                    # in that very chat by the chat driver (its thread); the done line names them and the chat's own
+                    # name. A send never comes here (rule 8: ``drafting``; the loop's values are checked again after it)
+                    fp = front_now()
+                    if fp is not None and _words(fp.get("name")) and _front_names(fp, given[slot.name], people) \
+                            and _front_app_ok(skill, given, fp, store=store, until=until):
+                        values[slot.name], filled[slot.name] = _words(fp.get("name")), FROM_FRONT
+                        origin[slot.name] = FROM_FRONT
+                        person_how[slot.name] = "front"
+                        relaxed = True
+                        continue
             if way_slot:
                 # kWays review L1: a way that is none of theirs (a misroute: "in Notion type X") is kept as given, so
                 # the route asks "Which of your ways?"; dropped, the slot's default would run their only way instead
@@ -2149,6 +2249,23 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                         names_miss.pop(slot.name, None)
                     else:
                         names_miss.setdefault(slot.name, "not_theirs")
+                elif not src and not _caller_word(given_from, slot.name) and (
+                        (skill.bind.get(slot.name) == SITE_BIND and theirs)
+                        or (slot.type == "app" and _own_app(reading, store=store, until=until))):
+                    # lb B3 (final-H2 p24_misheard_excalidraw, both brains: "Excalidraw.com is up in Google Chrome, if
+                    # that's what you meant." - the model sent no ``from`` in 0 of 4 calls; an optional tag is not
+                    # sent): as the entity path already does (an untagged listed name is their word), an untagged value
+                    # that is by identity one of their own known sites (``_known_site``; a site code measured by sound
+                    # set ``src`` above) or programs (``_own_app``), on this undoable run, for a slot that is no person
+                    # (``undoable``), is their word: no hedge, the user's 19 Oct decision. The done line names it as it
+                    # names any value. A caller's ``card`` (or any other word) and code's own fills stay named guesses
+                    src = FROM_WORDS
+                    names_how.setdefault(slot.name, NAMES_HOW_OWN)
+                    names_miss.pop(slot.name, None)
+                    if slot.type == "app" and slot.name not in named:
+                        # a program they didn't name is still said plainly by its slot's own words when the line
+                        # doesn't say it ("Youtube is up in Arc."), never as a guess
+                        named.append(slot.name)
                 src = src or (FROM_CARD if theirs else FROM_READING)
                 # a heard value (names21) is the user's own word in the ledger, as by sound in step 1
                 values[slot.name], filled[slot.name] = reading, ("words" if src == FROM_HEARD else src)
@@ -2231,7 +2348,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                            again=again, disable_after=disable_after, people=people, default_step=default_step,
                            earlier=earlier, heard_person=heard_person, granted=granted, chosen=chosen,
                            chosen_from=chosen_from, given_from=given_from, own_pick=own_pick, once=once,
-                           answered=answered, _strict=True)
+                           answered=answered, front=front, _strict=True)
     # What the user said wins over a learned skill's bound value too: its routes carry that value in their arguments,
     # so a value given for a bound slot that is another one runs its capability instead (a learned skill never hides
     # its capability; the engine's request_key does the same for a given key slot before this). Phase 2.1: any value
@@ -2244,7 +2361,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                        again=again, disable_after=disable_after, people=people, default_step=default_step,
                        earlier=earlier, heard_person=heard_person, granted=granted, chosen=chosen,
                        chosen_from=chosen_from, given_from=given_from, own_pick=own_pick, once=once,
-                       answered=answered, _strict=_strict)
+                       answered=answered, front=front, _strict=_strict)
     # a direction with no amount: the user's own step for it (a preference), else the default step
     for slot in skill.slots:
         v = values.get(slot.name)
@@ -2475,6 +2592,7 @@ def eval_resolver(db_path: Any, *, client: Any = None, model: str | None = None,
 
 __all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "FROM_GRANT", "FROM_WORDED", "FROM_GIVEN",
            "FROM_CHOSEN", "FROM_WORDS", "FROM_HEARD", "FROM_MENU", "FROM_CARD", "FROM_SCREEN", "FROM_READING",
+           "FROM_FRONT", "NAMES_HOW_OWN",
            "GUESS_SOURCES", "CALLER_SOURCES", "CALLER_HEARD", "NAMES_HOW_CALLER", "NAMES_MISS_WORDS", "PERSON_HOWS",
            "GUESS_LINE", "GUESS_SAID_LINE", "WHY_LINE", "shown_value",
            "CODE_TYPES", "CONFIRM_PERSON", "JUST_ACTED_S",

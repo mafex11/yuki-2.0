@@ -132,6 +132,10 @@ ASK_TAB_WHICH = "I see {n} {service} tabs in {browser}. Which one, counting alon
 LINE_TAB_UP = "{service} is up in {browser}."
 #: A web page (``{site}``: the site file's name or the domain as the user hears it).
 LINE_PAGE_UP = "{site} is up."
+#: lb B4 (final-H2 youtube_channel_deji_arc: "Youtube is up." never named the stranger's channel it opened): a page of
+#: a site that takes an item (a channel's page) names that item, so a wrong one is heard and one "not that" fixes it.
+LINE_ITEM_UP = "{item}'s page on {site} is up."
+LINE_ITEM_ALREADY = "{item}'s page on {site} is already up."
 LINE_VIDEO_UP = "Playing it."
 #: skill22 (A8): a title with no link of its own opened as the site's search for it (never "playing").
 LINE_VIDEO_SEARCH = "I couldn't find that video's own link, so its search results are up."
@@ -1578,6 +1582,79 @@ def site_file(site_word: Any) -> str:
     return ""
 
 
+#: lb B4: a swap :func:`_page_measure` noted less than this long ago is this very request's own (the resolver runs
+#: again within one request: a learned skill's capability, a strict pass), never the user's correction, which comes
+#: only after the page opened and its line was said (seconds later).
+SWAP_SELF_S = 2.0
+
+
+def _page_pool(store: Any, site: str, page: str, names: Sequence[str], dropped: str | None) -> dict[str, str]:
+    """lb B4: the names a site page's item is measured against, each -> the page value it opens: the user's own names of
+    that page kind as taste lists them (``names``, as :func:`site_page` read them) and as the names measure keeps them
+    (:func:`yuki.skills.names._channel_entries`: every one they picked or their app showed, with the display name the
+    site gave it, as :func:`yuki.skills.names.own_url` measures), minus the as-written name D5 dropped (``dropped``) and
+    its display name. Data only. Never raises (what was read)."""
+    from yuki.skills import names as N
+
+    def fold(s: Any) -> str:
+        return _words(s).casefold().lstrip("@")
+
+    gone = fold(dropped) if dropped else ""
+    out: dict[str, str] = {}
+    try:
+        for e in N._channel_entries(store):
+            if e.site != site or e.page != page or not _words(e.key) or fold(e.key) == gone:
+                continue
+            for n in (e.key, e.name):
+                if _words(n):
+                    out.setdefault(_words(n), _words(e.key))
+    except Exception:  # noqa: BLE001 - taste's own list below
+        pass
+    for n in names or ():
+        if _words(n) and fold(n) != gone:
+            out.setdefault(_words(n), _words(n))
+    return out
+
+
+def _page_measure(store: Any, site: str, page: str, said: str, names: Sequence[str], *, dropped: str | None,
+                  box: dict[str, Any]) -> str | None:
+    """lb B4: the page value of the user's own name a site page's item ``said`` measures as (the names measure, as
+    :func:`yuki.skills.names.own_url` runs it on a model-built address: ``best_match`` ``as_name``, ``clip=False``,
+    :data:`yuki.skills.names.BAR` and :data:`yuki.skills.names.MARGIN`; the value only, never the turn), else ``None``.
+    own_url's rules hold: the same value given again within ``CHANNEL_SWAP_KEEP_S`` of a swap (and at least
+    :data:`SWAP_SELF_S` after it: not this request's own second pass) is a correction and stays as written
+    (``box["why"] = "again"``); a winner whose digits are not the value's is another page (``"digits"``). A
+    swap is noted (``names._swapped_now``), so a second ask of the same value opens as written on either path. Never
+    raises (``None``)."""
+    from yuki.skills import names as N
+
+    try:
+        heard = N._squash(said.lstrip("@"))
+        if not heard:
+            return None
+        with N._lock:
+            at = N._swapped.get(heard)
+        if at is not None and SWAP_SELF_S <= time.monotonic() - at <= N.CHANNEL_SWAP_KEEP_S:
+            box["why"] = "again"
+            return None
+        pool = _page_pool(store, site, page, names, dropped)
+        if not pool:
+            return None
+        got = N.best_match(said, list(pool), as_name=True, clip=False)
+        value = pool.get(got[0]) if got is not None else None
+        if not value:
+            return None
+        if N._digits(said) and N._digits(said) not in (N._digits(value), N._digits(got[0])):
+            box["why"] = "digits"
+            return None
+        if N._squash(value.lstrip("@")) == heard:
+            return value          # their own name as written (a display name's value): nothing swapped
+        N._swapped_now({"how": "heard"}, said.lstrip("@"))
+        return value
+    except Exception:  # noqa: BLE001 - no measure: taste's sound tier, as before
+        return None
+
+
 def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words: Sequence[str], *,
               now: float | None = None, miss: dict[str, Any] | None = None) -> tuple[str | None, str | None, str]:
     """fSkills (live 18 Oct: the talker gave ``page = "Deji"`` for "Deezy's YouTube channel" and ``page = "MBL
@@ -1603,8 +1680,19 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
     holds of it was Yuki's own pick or a test's) is none of theirs, so the value is heard against their other names.
     ``miss`` (a dict the caller passes) gets ``"why"`` when a given name stayed as given: ``no_entries`` (no names of
     that page kind), ``not_own`` (the as-written name was dropped by that rule and none other matched), ``below_bar``
-    (none sounds like it), ``unheard`` (one sounds like it, but the user's words don't hold it by sound), ``error``;
-    code words only, for the content-free ``skill_resolve`` line.
+    (none sounds like it), ``unheard`` (one sounds like it, but the user's words don't hold it by sound), ``digits``
+    (the measure's winner carries other digits), ``again`` (the same value given again right after its swap),
+    ``error``; code words only, for the content-free ``skill_resolve`` line.
+
+    lb B4 (final-H2 youtube_channel_deji_arc, all: ``names_miss below_bar`` on "Deezy" while the hand path's measure
+    takes "Deezy" for their Deji at 0.75): the caller's value is first measured as :func:`yuki.skills.names.own_url`
+    measures a model-built address, the one measure for a name given to an act: :func:`yuki.skills.names.best_match`
+    (``as_name``, no clip, its bar and :data:`yuki.skills.names.MARGIN` over every other group) against their own names
+    of that page kind (:func:`_page_pool`: each one's value and the display name the site gave it), with own_url's
+    digits rule and its "again" rule (the same value given again within ``names.CHANNEL_SWAP_KEEP_S`` of a swap opens as
+    written: a correction, so a wrong swap costs one "not that"; a swap is noted for that). D5's own-visit rule stays
+    (the as-written name first). Only when that measure takes none does taste's sound tier run, as before (its own
+    words check kept), so a page name the old tier heard still opens.
 
     Never raises."""
     box = miss if isinstance(miss, dict) else {}
@@ -1634,6 +1722,13 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
                 # their other names instead
                 names = [n for n in names if _words(n).casefold() != said.casefold()]
                 box["why"] = "not_own"
+            # lb B4: the names measure first, as own_url measures the same value on the hand path
+            took = _page_measure(store, name, pk, said, names, dropped=exact, box=box)
+            if took:
+                box.pop("why", None)
+                return pk, took, "value"
+            if box.get("why") in ("digits", "again"):
+                continue
             # the caller's value heard as one of their names (its sound, never a span of the turn); the user's words
             # holding that name by sound too keeps a model's rewrite from being swapped for one of theirs
             alike = taste.heard_as(names, said, loose=True) if names else None
@@ -1734,7 +1829,33 @@ def _target(call: RouteCall, opens: str) -> tuple[str | None, dict[str, Any], st
     if not url:
         return None, expect, "", ""
     site = _site_title(expect, said)
+    item = _item_said(call, expect)
+    if item:
+        # lb B4: the page's own item is named ("Deji's page on Youtube is up."), so a wrong one is heard at once
+        return url, expect, LINE_ITEM_UP.format(item=item, site=site), LINE_ITEM_ALREADY.format(item=item, site=site)
     return url, expect, LINE_PAGE_UP.format(site=site), LINE_PAGE_ALREADY.format(site=site)
+
+
+def _item_said(call: RouteCall, expect: Mapping[str, Any]) -> str:
+    """lb B4: the item a site page opens as the user hears it (its name, a leading "@" aside), for a page whose address
+    carries a speakable name (``expect["entity"]`` of a page kind :func:`yuki.skills.taste.site_kinds` lists: a
+    channel's handle page, never an opaque id); ``""`` for a front page, another page, or Yuki's own pick (``chosen``:
+    the pick's own line names it). Never raises."""
+    try:
+        if not expect.get("entity"):
+            return ""
+        from yuki.skills import taste
+
+        if (str(expect.get("site") or ""), str(expect.get("kind") or "")) not in \
+                {(site, page) for _kind, site, page, _var in taste.site_kinds()}:
+            return ""
+        sources = getattr(call, "fill_sources", None)
+        if isinstance(sources, Mapping) and str(sources.get("item") or "") == "chosen":
+            return ""
+        item = call.values.get("item")
+        return _words(item.get("name") if isinstance(item, Mapping) else item).lstrip("@").strip()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def measured_site(call: RouteCall, said: str) -> str:
@@ -2835,6 +2956,10 @@ def route_chat_web_link(call: RouteCall) -> RouteResult:
 
     if _words(call.values.get("text")):
         return RouteResult(ran=False, outcome="no_web_compose")
+    if chat._front_of(call) is not None:
+        # lb B1 (K-F): a person taken from the chat in front (an app's own window) stays in that very chat; its web
+        # address would open another window of it
+        return RouteResult(ran=False, outcome="front_chat")
     store = _store(call.ctx)
     if store is None:
         return RouteResult(ran=False, outcome="no_memory")

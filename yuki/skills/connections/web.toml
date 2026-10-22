@@ -33,6 +33,9 @@ app = "web"
 end = "page"
 kind = "open"
 menu = "open a site's front page or one of its pages in a browser; nothing plays unless choose=true"
+# lb B4 (final-H2 youtube_channel_deji_arc): both routes below say their own line, and a page of a site that takes a
+# name (a channel's handle page) names that item ("Deji's page on Youtube is up.": web_route LINE_ITEM_UP), so a wrong
+# one is heard and one "not that" fixes it; this template is only the fallback for a route that says none.
 done_line = "{site} is up."
 offer_class = "judged"
 handoff = true

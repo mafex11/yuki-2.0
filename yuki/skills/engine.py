@@ -378,6 +378,11 @@ class RunContext:
     #: last run), so a driver that learns from a run never keeps a correction's words as the name of the row it played
     #: (those words name what the user just rejected). Set by :func:`resolve_and_run`. RAM only.
     corrects: bool = False
+    #: lb B1 (contract K-F): the chat that was in front when the user spoke, as the resolver took its person
+    #: (:func:`yuki.skills.chat.front_chat`: ``{"id", "name", "thread", "app", "chat", "handle", "hwnd"}``), so the chat
+    #: driver keeps the run in that very chat (its thread) and names it. Set by :func:`resolve_and_run` only when the
+    #: person came from it (``resolve.FROM_FRONT``); ``None`` otherwise. RAM only, never logged.
+    front_chat: dict[str, Any] | None = None
 
     def game_now(self) -> str:
         """D9, read now (fails closed: a check that raised counts as a game)."""
@@ -3018,22 +3023,100 @@ def _dropped_handoff(resolved: Any, slots: Mapping[str, Any] | None, words: list
 def _asks_whom(resolved: Ask, slots: Mapping[str, Any] | None, loaded: Any) -> bool:
     """Whether the resolver's question is for a person slot nobody gave (fMsg merge note E1): the asked slot is
     person-bound by the capability's own data (``resolve._person_bound``: a ``person`` slot, or a text slot bound to a
-    contact, ``message.person``), the caller gave no value for it, and the resolver dropped none there. Data only;
-    never raises (``False``)."""
+    contact, ``message.person``), the caller gave no value for it, and the resolver dropped none there. lb B2: or its
+    given person was dropped (the words don't hold it) on a capability that types in a chat (:func:`_whom_in_chat`):
+    that question is "Who to?" too, kept, never handed over. Data only; never raises (``False``)."""
     try:
         from yuki.skills.resolve import _person_bound
 
-        if resolved.slot in set(getattr(resolved, "dropped", None) or ()):
-            return False
-        if _given_text((slots or {}).get(resolved.slot)):
-            return False
         if loaded is None or not hasattr(loaded, "get"):
             from yuki.skills.catalog import load
 
             loaded = load()
         skill = loaded.get(str(resolved.skill or ""))
         slot = skill.slot(resolved.slot) if isinstance(skill, Skill) else None
-        return slot is not None and bool(_person_bound(skill, slot))
+        if slot is None or not _person_bound(skill, slot):
+            return False
+        if resolved.slot in set(getattr(resolved, "dropped", None) or ()):
+            return _whom_in_chat(skill, slot)
+        return not _given_text((slots or {}).get(resolved.slot))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _front_spoken(hands: Any) -> tuple[int | None, frozenset[int]]:
+    """lb B1 (K-F): what the run's hands measured about the window in front since the user spoke, so a chat Yuki itself
+    brought to the front is never taken for the one they spoke over: ``(the window in front when they spoke, if an act
+    of Yuki's moved the focus in this turn; else None, windows the desk's own steps saw come to the front)``. Read from
+    the hands' own records (the voice hands' front before their last act that moved the focus, kept with its turn; the
+    brain's desk hands' window their steps brought forward), each by ``getattr``: hands that keep none give
+    ``(None, ())``. Never raises."""
+    spoke: int | None = None
+    brought: set[int] = set()
+    try:
+        kept = getattr(hands, "_front_before", None)
+        turn_of = getattr(hands, "user_turn", None)
+        if isinstance(kept, tuple) and len(kept) >= 3 and callable(turn_of):
+            turn = turn_of()
+            if turn is not None and kept[2] == turn and isinstance(kept[0], int) and kept[0]:
+                spoke = int(kept[0])
+        for name in ("_brought", "_prev_brought"):
+            hwnd = getattr(hands, name, None)
+            if isinstance(hwnd, int) and not isinstance(hwnd, bool) and hwnd:
+                brought.add(int(hwnd))
+    except Exception:  # noqa: BLE001 - what was read
+        pass
+    return spoke, frozenset(brought)
+
+
+def _front_reader(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunContext) -> Callable[[Any], Any] | None:
+    """lb B1 (final-H2 kw_name_word_in_text; contract K-F): for a capability that types in a chat whose person the caller
+    gave and the user's words don't hold as written, on a request with spoken words (voice or thinker), ``store ->``
+    the chat that was in front when they spoke (:func:`yuki.skills.chat.front_chat` on memory's Now board, read here
+    once, outside memory's call; minus a window Yuki brought forward this turn, :func:`_front_spoken`), for the
+    resolver's ``front``; ``None`` when not needed (no board read then). Never raises."""
+    try:
+        if ctx.origin not in HANDOFF_ORIGINS:
+            return None
+        words = [str(w) for w in ctx.words or () if str(w or "").strip()]
+        if not words:
+            return None
+        from yuki.skills.catalog import load
+        from yuki.skills.resolve import _person_bound
+
+        skill = load().get(str(skill_key or ""))
+        if skill is None or not getattr(skill, "sends", False):
+            return None
+        slot = next((s for s in skill.slots if _person_bound(skill, s)), None)
+        text = _given_text((slots or {}).get(slot.name)) if slot is not None else ""
+        if not text:
+            return None
+        from yuki.skills.uia_route import said
+
+        if said(text, words):
+            return None              # their words hold it as written: the resolver needs no chat in front
+        from yuki.skills import chat
+
+        board = chat._board_now()
+        if not isinstance(board, Mapping):
+            return None
+        spoke, brought = _front_spoken(ctx.hands)
+    except Exception:  # noqa: BLE001 - not measured: nobody in front
+        return None
+
+    def read(store: Any) -> Any:
+        return chat.front_chat(store, board, spoke=spoke, brought=brought)
+
+    return read
+
+
+def _whom_in_chat(skill: Any, slot: Any) -> bool:
+    """lb B2: whether ``slot`` is whom a capability that types in a chat writes to: person-bound by its own data
+    (``resolve._person_bound``) on a capability that may send (``sends``: ``message``). Data only; never raises."""
+    try:
+        from yuki.skills.resolve import _person_bound
+
+        return bool(getattr(skill, "sends", False)) and bool(_person_bound(skill, slot))
     except Exception:  # noqa: BLE001
         return False
 
@@ -3054,6 +3137,12 @@ def _dropped(resolved: Ask, slots: Mapping[str, Any] | None, words: list[str], l
         skill = None
     asked = skill.slot(resolved.slot) if isinstance(skill, Skill) else None
     if asked is None or not skill.handoff or asked.type not in WORD_TYPES:
+        return None
+    if _whom_in_chat(skill, asked):
+        # lb B2 (final-H2 kw_name_word_in_text, one: "Do it by steps (look, click, type)" after a dropped person, and
+        # both planners refuse typing into a chat by steps, one20 / integ28 A8): a person the capability would type to
+        # in a chat that the words don't hold is never handed over to be done by steps; the resolver's own question
+        # stands ("Who to?", once: an asked run settles the turn, and their answer is noted for it below)
         return None
     if run_commit(skill) != "none" and not skill.sends:
         # review r1 M1: a run that commits without sending (``discord.voice``: a call join reaches other people) keeps
@@ -3467,8 +3556,9 @@ def _next_own(ctx: RunContext, skill: Skill, slot_name: str, skip: Sequence[str]
 
 
 def _pick_where(line: str) -> str:
-    """The route's own browser words at the end of its done line (" in Arc"), to keep in the pick's line."""
-    m = re.search(r" in ([^.]+)\.$", str(line or "").strip())
+    """The route's own browser words at the end of its done line (" in Arc"), to keep in the pick's line. lb B4: the
+    last " in " of Yuki's own line (a page line now names its item, which may hold one)."""
+    m = re.search(r".* in ([^.]+)\.$", str(line or "").strip())
     return f" in {m.group(1)}" if m else ""
 
 
@@ -3503,6 +3593,9 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     ctx.why, ctx.given_from, slots = note_args(str(skill_key or ""), {"why": ctx.why, "from": ctx.given_from}, slots)
     # gd D2: the drivers read whether this run is a correction (a correction's words never teach a row's name)
     ctx.corrects = bool(corrects)
+    # lb B5: whether this very run left the pick to Yuki (its own ``choose`` slot, contract C2: a measured fact of the
+    # call, read before the choice slots leave it)
+    choose_asked = asks_choice(slots)
     if live is None:
         from yuki.skills.catalog import load
 
@@ -3539,6 +3632,9 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         answered = _answered_slots(_cap_key(_load_catalog().get(str(skill_key or ""))), ctx)
     except Exception:  # noqa: BLE001 - none known: every enum value as given
         answered = set()
+    # lb B1 (K-F): the chat in front when they spoke, read only for a person the words don't hold as written
+    front_read = _front_reader(str(skill_key or ""), slots, ctx)
+    front_seen: dict[str, Any] = {}
 
     def go(client: Any) -> Any:
         from yuki.skills.catalog import load
@@ -3566,7 +3662,15 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
             extra["own_pick"] = True        # a listed name it gave is its own pick from the candidates (a guess)
         if answered:
             extra["answered"] = set(answered)
-        return res_mod.resolve(key, slots, words, store=_store_of(client) if client is not None else None,
+        store = _store_of(client) if client is not None else None
+        if front_read is not None and store is not None:
+            def front() -> Any:
+                # lb B1 (K-F): called by the resolver at most once, only for a person their words don't hold
+                front_seen["v"] = front_read(store)
+                return front_seen["v"]
+
+            extra["front"] = front
+        return res_mod.resolve(key, slots, words, store=store,
                                live=live, again=again, default_step=step, disable_after=disable_after, **extra)
 
     resolved = _mem(ctx.memory, "skill_resolve", go, timeout_s=1.0) if ctx.memory is not None else go(None)
@@ -3577,6 +3681,10 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         return run(Refused(str(skill_key or ""), "memory_slow"), ctx)
     if resolved is None:
         resolved = go(None)
+    if isinstance(resolved, Plan) and res_mod.FROM_FRONT in set(resolved.sources.values()) \
+            and isinstance(front_seen.get("v"), Mapping):
+        # lb B1 (K-F): the person came from the chat in front: the chat driver keeps the run in that very chat
+        ctx.front_chat = dict(front_seen["v"])
     rejected = _rejected_slot(resolved) if corrects and picked is None else None
     replaced = rejected is not None     # review L3: this request's value was already swapped (no second swap below)
     if rejected is not None:
@@ -3662,9 +3770,14 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     # short thread of their own while the page opens; they are named (and noted, so "the B one" can pick one) only
     # after the run's checked done and a non-empty wait; a run that fails, asks or times out names nothing. A card's
     # run never offers. The offer plays nothing; a request that asked Yuki to choose plays its pick instead (above).
+    # lb B5 (final-H2 kw_chrome_crashing_youtube, one: "Youtube is up. ... New from SidemenReacts, angryginge13 and
+    # Sidemen: want one?" after a plain "open YouTube"): the offer is spoken only when this run left the pick to Yuki
+    # (its own ``choose`` slot, a measured fact of the call, and Yuki had nothing to play: the pick above took none);
+    # a plain open says nothing more and reads no feed (the user's rule: proactive = cards only; the cards keep their
+    # own offers, yuki.memory.candidates)
     pending = None
     if isinstance(resolved, Plan) and (resolved.skill.capability or resolved.skill.key) == "web.open_page" \
-            and ctx.origin != "card":
+            and ctx.origin != "card" and choose_asked:
         try:
             from yuki.skills import youtube_feed
 
