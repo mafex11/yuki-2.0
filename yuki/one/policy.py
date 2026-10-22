@@ -96,8 +96,13 @@ LINE_TIDY_OFF = ("Not done: their settings say no tidy-ups; leave the windows as
 LINE_TIDY_STEPS = "Not done: that change got its tidy-up already; nothing more was moved."
 #: One20 (final-D S17): the agent's own typing into a chat's window (the Enter rule's ``chat_window`` test) that no
 #: message skill of this turn opened: text for a person goes through the message skill (it settles whom).
-LINE_CHAT_TYPE = ("Not typed: this window is a chat's; text for a person goes only through run_skill message (it "
-                  "opens their chat, asks Who to? when it can't tell, and leaves a draft). Nothing was typed.")
+#: final-H2 (C2, contract K-F reader; kw_name_word_in_text under one): "type X in this chat" points at the chat in
+#: front, so the line points there too: run_skill message with that chat's person (the people block's chat-in-front
+#: line); the capability takes the chat that was in front when they spoke as the recipient of a draft or an open
+#: only, by its measured thread identity (lane B's B1), and asks Who to? when it can't tell.
+LINE_CHAT_TYPE = ("Not typed: this window is a chat's; text for a person goes only through run_skill message as a "
+                  "draft: for the chat in front, that chat's person. It opens or checks their chat, asks Who to? when "
+                  "it can't tell, and leaves a draft. Nothing was typed.")
 #: The tidy dial says ask: the step in code's words (``executor.LINE_TIDY_ASK``).
 LINE_TIDY_ASK: dict[str, str] = {"place": "Should I move {app} to your other screen?",
                                  "focus_back": "Should I put {app} back in front?"}
@@ -342,6 +347,10 @@ class Turn:
         self.log = log
         self.tidy = Tidy()
         self.refusals = 0
+        #: final-H2 (C2): this turn's calls that took or touched the PC, or kept a memory write (the runner's measured
+        #: facts, :meth:`note_took`); none when the second refusal settles it: code says nothing was done and why
+        #: (``budget.settle_line``), never "the rest of it".
+        self.took = 0
         #: Step identities the user said yes to, with the row that asked: that step is allowed once, then the yes is
         #: used up (:meth:`use_yes`). Never carried to a later turn.
         self.yes: dict[str, int] = {}
@@ -481,6 +490,12 @@ class Turn:
         if got:
             with self._lock:
                 self.own_windows |= got
+
+    def note_took(self) -> None:
+        """final-H2 (C2): a call of this turn took or touched the PC (the runner's measured facts), or kept a memory
+        write."""
+        with self._lock:
+            self.took += 1
 
     def note_chat(self, hwnd: Any) -> None:
         """A message skill of this turn opened the chat in this window (its verified run, the window in front)."""
@@ -676,17 +691,21 @@ def gate(tool: str, tool_input: Mapping[str, Any] | None = None, target: Mapping
 
 def _counted(decision: Decision, turn: Turn) -> Decision:
     """The second refusal of a turn settles it (addendum must-fix 6): code's line (a final refusal's own, else rule
-    #149's), no model run."""
+    #149's), no model run. final-H2 (C2): when no call of the turn took or touched the PC (:attr:`Turn.took`), rule
+    #149's line says nothing was done and this refusal's own reason (``budget.settle_line``, by its code word)."""
     if decision.kind != REFUSE or decision.settle:
         return decision
+    nothing = not int(getattr(turn, "took", 0) or 0)
     if turn.budget is not None:
-        spend = turn.budget.refused(decision.line if decision.final else "")
+        spend = turn.budget.refused(decision.line if decision.final else "", reason=decision.reason,
+                                    nothing_done=nothing)
         return replace(decision, settle=True, line=spend.line) if spend.settle else decision
     turn.refusals += 1
     if turn.refusals >= 2:
-        from yuki.one.budget import LINE_REST_LEFT
+        from yuki.one.budget import settle_line
 
-        return replace(decision, settle=True, line=decision.line if decision.final else LINE_REST_LEFT)
+        return replace(decision, settle=True,
+                       line=decision.line if decision.final else settle_line(decision.reason, nothing_done=nothing))
     return decision
 
 
