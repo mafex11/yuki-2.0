@@ -1588,56 +1588,82 @@ def site_file(site_word: Any) -> str:
 SWAP_SELF_S = 2.0
 
 
-def _page_pool(store: Any, site: str, page: str, names: Sequence[str], dropped: str | None) -> dict[str, str]:
-    """lb B4: the names a site page's item is measured against, each -> the page value it opens: the user's own names of
-    that page kind as taste lists them (``names``, as :func:`site_page` read them) and as the names measure keeps them
-    (:func:`yuki.skills.names._channel_entries`: every one they picked or their app showed, with the display name the
-    site gave it, as :func:`yuki.skills.names.own_url` measures), minus the as-written name D5 dropped (``dropped``) and
-    its display name. Data only. Never raises (what was read)."""
+def _page_pool(store: Any, site: str, page: str, names: Sequence[str],
+               dropped: str | None) -> list[tuple[str, tuple[str, ...]]]:
+    """lb B4: the user's own names of a site page kind a page's item is measured against, each as ``(the page value it
+    opens, the names it goes by)``: as taste lists them (``names``, as :func:`site_page` read them) and as the names
+    measure keeps them (:func:`yuki.skills.names._channel_entries`: every one they picked or their app showed, its
+    value and the display name the site gave it, as :func:`yuki.skills.names.own_url` measures), minus the as-written
+    name D5 dropped (``dropped``) with its display name. Data only. Never raises (what was read)."""
     from yuki.skills import names as N
 
     def fold(s: Any) -> str:
         return _words(s).casefold().lstrip("@")
 
     gone = fold(dropped) if dropped else ""
-    out: dict[str, str] = {}
+    out: dict[str, tuple[str, list[str]]] = {}
     try:
         for e in N._channel_entries(store):
-            if e.site != site or e.page != page or not _words(e.key) or fold(e.key) == gone:
+            key = _words(e.key)
+            if e.site != site or e.page != page or not key or fold(key) == gone:
                 continue
-            for n in (e.key, e.name):
-                if _words(n):
-                    out.setdefault(_words(n), _words(e.key))
+            its = out.setdefault(fold(key), (key, []))[1]
+            its += [_words(n) for n in (e.key, e.name) if _words(n) and _words(n) not in its]
     except Exception:  # noqa: BLE001 - taste's own list below
         pass
     for n in names or ():
         if _words(n) and fold(n) != gone:
-            out.setdefault(_words(n), _words(n))
-    return out
+            out.setdefault(fold(n), (_words(n), [_words(n)]))
+    return [(value, tuple(its)) for value, its in out.values()]
 
 
 def _page_measure(store: Any, site: str, page: str, said: str, names: Sequence[str], *, dropped: str | None,
-                  box: dict[str, Any]) -> str | None:
-    """lb B4: the page value of the user's own name a site page's item ``said`` measures as (the names measure, as
-    :func:`yuki.skills.names.own_url` runs it on a model-built address: ``best_match`` ``as_name``, ``clip=False``,
-    :data:`yuki.skills.names.BAR` and :data:`yuki.skills.names.MARGIN`; the value only, never the turn), else ``None``.
-    own_url's rules hold: the same value given again within ``CHANNEL_SWAP_KEEP_S`` of a swap (and at least
-    :data:`SWAP_SELF_S` after it: not this request's own second pass) is a correction and stays as written
-    (``box["why"] = "again"``); a winner whose digits are not the value's is another page (``"digits"``). A
-    swap is noted (``names._swapped_now``), so a second ask of the same value opens as written on either path. Never
-    raises (``None``)."""
+                  box: dict[str, Any], gone: set[str] | None = None) -> tuple[str, str] | None:
+    """lb B4: the page value of the user's own name a site page's item ``said`` is, with how (``"listed"`` /
+    ``"value"``), else ``None``. As :func:`yuki.skills.names.own_url` checks a model-built address, over the whole pool
+    (:func:`_page_pool`, not only the hour's candidates):
+
+    * a name of theirs that ``said`` is as written (its value or the display name the site gave it, squashed) is that
+      page (``"listed"``), nothing swapped; unless gd D5's own-visit rule drops it (:func:`yuki.skills.names.own_visit`
+      False: every visit memory holds of it was Yuki's own pick or a test's), with both its names (its value is added
+      to ``gone``, a set the caller passes, so its sound tier leaves it out too; ``box["why"] = "not_own"``);
+    * else the same value given again within ``CHANNEL_SWAP_KEEP_S`` of a swap (and at least :data:`SWAP_SELF_S` after
+      it: not this request's own second pass) is a correction and stays as written (``box["why"] = "again"``);
+    * else the names measure (``best_match`` ``as_name``, ``clip=False``, :data:`yuki.skills.names.BAR` and
+      :data:`yuki.skills.names.MARGIN`; the value only, never the turn): a winner whose digits are not the value's is
+      another page (``"digits"``); a swap is noted (``names._swapped_now``), so a second ask of the same value opens as
+      written on either path (``"value"``).
+
+    Never raises (``None``)."""
     from yuki.skills import names as N
 
     try:
         heard = N._squash(said.lstrip("@"))
         if not heard:
             return None
+        groups = _page_pool(store, site, page, names, dropped)
+        # theirs as written: a page value as written first (the very page the value names, as own_url leaves an
+        # address), then a display name the site gave one
+        written = sorted((g for g in groups if any(N._squash(n.lstrip("@")) == heard for n in g[1])),
+                         key=lambda g: N._squash(g[0].lstrip("@")) != heard)
+        for value, _its in written:
+            if N.own_visit(store, site, page, value) is not False:
+                return value, "listed"          # nothing swapped
+        # gd D5: the rest were theirs only through Yuki's or a test's opens: none of theirs, both names out
+        out = {value for value, _its in written}
+        if out:
+            box["why"] = "not_own"
+            if isinstance(gone, set):
+                gone |= out
+        pool: dict[str, str] = {}
+        for value, its in groups:
+            for n in its if value not in out else ():
+                pool.setdefault(n, value)
         with N._lock:
             at = N._swapped.get(heard)
         if at is not None and SWAP_SELF_S <= time.monotonic() - at <= N.CHANNEL_SWAP_KEEP_S:
             box["why"] = "again"
             return None
-        pool = _page_pool(store, site, page, names, dropped)
         if not pool:
             return None
         got = N.best_match(said, list(pool), as_name=True, clip=False)
@@ -1647,10 +1673,8 @@ def _page_measure(store: Any, site: str, page: str, said: str, names: Sequence[s
         if N._digits(said) and N._digits(said) not in (N._digits(value), N._digits(got[0])):
             box["why"] = "digits"
             return None
-        if N._squash(value.lstrip("@")) == heard:
-            return value          # their own name as written (a display name's value): nothing swapped
         N._swapped_now({"how": "heard"}, said.lstrip("@"))
-        return value
+        return value, "value"
     except Exception:  # noqa: BLE001 - no measure: taste's sound tier, as before
         return None
 
@@ -1691,8 +1715,11 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
     of that page kind (:func:`_page_pool`: each one's value and the display name the site gave it), with own_url's
     digits rule and its "again" rule (the same value given again within ``names.CHANNEL_SWAP_KEEP_S`` of a swap opens as
     written: a correction, so a wrong swap costs one "not that"; a swap is noted for that). D5's own-visit rule stays
-    (the as-written name first). Only when that measure takes none does taste's sound tier run, as before (its own
-    words check kept), so a page name the old tier heard still opens.
+    (the as-written name first), and, as own_url's, it covers the whole pool, not only the hour's candidates: a name of
+    theirs the value is as written (its value or its display name) opens as written with nothing swapped (``listed``)
+    unless only Yuki's or a test's opens made it theirs, and then it is out of the measure. Only when that measure takes
+    none does taste's sound tier run, as before (its own words check kept), so a page name the old tier heard still
+    opens.
 
     Never raises."""
     box = miss if isinstance(miss, dict) else {}
@@ -1723,12 +1750,17 @@ def site_page(store: Any, site_word: Any, page_word: Any, item_word: Any, words:
                 names = [n for n in names if _words(n).casefold() != said.casefold()]
                 box["why"] = "not_own"
             # lb B4: the names measure first, as own_url measures the same value on the hand path
-            took = _page_measure(store, name, pk, said, names, dropped=exact, box=box)
+            gone: set[str] = set()
+            took = _page_measure(store, name, pk, said, names, dropped=exact, box=box, gone=gone)
             if took:
                 box.pop("why", None)
-                return pk, took, "value"
+                return pk, took[0], took[1]
             if box.get("why") in ("digits", "again"):
                 continue
+            # the names the measure dropped by D5's rule (theirs only through Yuki's or a test's opens) are none of
+            # theirs for the sound tier either
+            out = {_words(g).casefold().lstrip("@") for g in gone}
+            names = [n for n in names if _words(n).casefold().lstrip("@") not in out]
             # the caller's value heard as one of their names (its sound, never a span of the turn); the user's words
             # holding that name by sound too keeps a model's rewrite from being swapped for one of theirs
             alike = taste.heard_as(names, said, loose=True) if names else None
