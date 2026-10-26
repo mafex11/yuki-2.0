@@ -2920,7 +2920,8 @@ class Hands:
 
     async def _look_after(self, params: Any, name: str, args: dict[str, Any], facts: dict[str, Any],
                           before: Any, rest: bool = False, end: bool = False,
-                          front_ok: Any = None, queued: bool = False) -> dict[str, Any] | None:
+                          front_ok: Any = None, queued: bool = False,
+                          hand_id: str | None = None) -> dict[str, Any] | None:
         """P1.3: once the act's done line is queued, read the desk again and compare it with ``before``. When the act
         took something the user had (``diff.any_flag``: measured shares and focus only) and the tidy dial is not off
         (integration review c2desk-2: or, whatever the dial, what they asked for did not reach its purpose: the sound
@@ -2961,7 +2962,8 @@ class Hands:
             return None
         if _moved_on(self, facts):
             if self.log is not None:
-                self.log.event("hands", op=name, after_look=False, moved_on=True, call=params.tool_call_id)
+                self.log.event("hands", op=name, after_look=False, moved_on=True, call=params.tool_call_id,
+                               request_id=hand_id)
             return None
         try:
             # hands19 (final-B all-desk): the turn's earliest before no look used yet, with every act of the turn since
@@ -3048,8 +3050,10 @@ class Hands:
             defer = bool((rest or queued) and not end and look and windowed and level == "do" and same_before
                          and not purpose and (step is not None or flag_said))
             if self.log is not None:
+                # sWire: the hand's own id, as on its other hands lines (follow finds the look with its hand)
                 self.log.event("hands", op=name, after_look=bool(text) and not defer, tidy=level or None,
-                               call=params.tool_call_id, tidy_step=(step or {}).get("action"), cover_said=bool(cover),
+                               call=params.tool_call_id, request_id=hand_id, tidy_step=(step or {}).get("action"),
+                               cover_said=bool(cover),
                                tidy_deferred=defer or None, end_look=end or None,
                                **{f"after_{k}": v for k, v in d.facts().items()})
             if cover:
@@ -4348,7 +4352,7 @@ class Hands:
             # integ22 turns-2: whether the reply's next part waits behind it now (read at the look, not before the
             # done line was queued: a part 2 that entered the gate since is the turn's rest too)
             look = await self._look_after(params, name, args, facts, desk_before,
-                                          queued=self._queued_behind(gate))
+                                          queued=self._queued_behind(gate), hand_id=hand_id)
             cover = str((look or {}).pop("_cover", "") or "")   # desk20 (S3): said by code after the done line
             quiet = bool((look or {}).pop("_quiet", False))   # tidy21: code took the tidy step; nothing for the talker
             said = " ".join(x for x in (line if speak else "", cover) if x)
@@ -5700,7 +5704,7 @@ class Hands:
             if not facts.get("keep_question"):
                 # review r1 L3: the run's after-look rides with this look when it flags (one talker run; the rest's
                 # calls stay open: the look is marked as one with a rest)
-                look = await self._look_after(params, name, args, facts, before, rest=True)
+                look = await self._look_after(params, name, args, facts, before, rest=True, hand_id=hand_id)
                 cover = str((look or {}).pop("_cover", "") or "")   # desk20 (S3): said by code after the line
                 (look or {}).pop("_quiet", None)   # tidy21: the rest is the talker's anyway
                 said = " ".join(x for x in (line, cover) if x)
@@ -5741,7 +5745,8 @@ class Hands:
             # usual?": that question waits for their answer)
             look = None
             if verified and not facts.get("keep_question"):
-                look = await self._look_after(params, name, args, facts, before, queued=self._queued_behind(gate))
+                look = await self._look_after(params, name, args, facts, before, queued=self._queued_behind(gate),
+                                              hand_id=hand_id)
             cover = str((look or {}).pop("_cover", "") or "")   # desk20 (S3): said by code after the done line
             quiet = bool((look or {}).pop("_quiet", False))   # tidy21: code took the tidy step; nothing for the talker
             said = " ".join(x for x in (line, cover) if x)
@@ -9346,6 +9351,12 @@ SKILL_FALLBACK_CONTEXT: dict[str, str] = {
                "not known, and it may still be acting. Look at the screen first, then again a few seconds later: "
                "while it is still changing, wait for it to stop. It may be done, or half done. Finish it by steps "
                "(click, type). Do not run that skill again.",
+    # fix-r31 (A2, L3 merge note): an unconfirmed hand-off whose rung put nothing out (the pin's rerun flag,
+    # ``yuki.brain.plan.seed_again``): the same as the engine's LINE_RERUN and the seed's SEED_AGAIN_LABEL, never "by
+    # steps" (A8 refuses that typing in a chat window: R13's dead end)
+    "rerun": "Yuki's voice ran their usual way ({skill}): nothing was typed or pressed (the PC could not confirm it "
+             "open), so a second run can't do anything twice. Bring the app's window up, then run that skill once "
+             "more with the same values; never type it by steps.",
 }
 #: What the talker reads for a run_skill that fell back to the thinker (x3): never the skill's own "say so plainly".
 SKILL_PASSED_REPORT = ("Its own way did not get there ({why}), so the thinker is doing their request now by steps, with "
@@ -9366,8 +9377,16 @@ _SKILL_OVERDUE_NOTE = ("Not started again: the same skill's earlier run is still
 def _pin_context(pin: dict[str, Any], skill_words: str) -> str:
     """The thinker's note for a rung C seed (:func:`yuki.skills.engine.pinned`), by the seed's own ``why``: an
     unconfirmed rung (``unverified``), a crash (``error``), a dropped value (``dropped``: the slot x5Fallback's seed marks
-    ``unheard``, with the value given), else its routes didn't get there. Code words in, plain words out."""
+    ``unheard``, with the value given), else its routes didn't get there. Code words in, plain words out.
+
+    fix-r31 (A2, L3 merge note): an unconfirmed pin whose rung put nothing out (its rerun flag,
+    ``yuki.brain.plan.seed_again``) gets its own note: run the skill once more, never by steps (the planner reads the
+    seed's matching label beside it)."""
+    from yuki.brain.plan import seed_again
+
     why = str(pin.get("why") or "")
+    if seed_again(pin):
+        return SKILL_FALLBACK_CONTEXT["rerun"].format(skill=skill_words)
     if why in ("unverified", "error"):
         return SKILL_FALLBACK_CONTEXT[why].format(skill=skill_words)
     if why == "dropped":

@@ -744,8 +744,11 @@ def probe_display(args: dict[str, Any], env: ProbeEnv) -> tuple[bool | None, dic
     one that answered is not; ``None`` when none could be read (or the driver is not there), or when a brightness or
     power is given in a form it can't read (``bad_args``: never "any monitor that answers"). With neither brightness
     nor power given, a monitor that answers counts. Evidence: counts, and the monitors as read for the line (RAM
-    only). Never raises."""
-    del env
+    only). Never raises.
+
+    fix-r31 (M2, integration): the read goes with the run's memory (``env.memory``: its ``session_id``) as its context,
+    so a live test's probe read is noted as the measured state only, whatever the process's default memory session."""
+    memory = getattr(env, "memory", None)
     want_level = _level(args.get("brightness"))
     want_power = _power_word(args.get("power")) if args.get("power") not in (None, "") else ""
     if (args.get("brightness") not in (None, "") and want_level is None) or (args.get("power") not in (None, "")
@@ -763,7 +766,7 @@ def probe_display(args: dict[str, Any], env: ProbeEnv) -> tuple[bool | None, dic
         return None, {"status": "no_probe"}
     target = " ".join(str(args.get("monitor") or "").split()) or None
     try:
-        rows = [dict(r) for r in reader(target) or [] if isinstance(r, Mapping)]
+        rows = [dict(r) for r in reader(target, ctx=memory) or [] if isinstance(r, Mapping)]
     except Exception as exc:  # noqa: BLE001
         return None, {"status": "error", "error_kind": type(exc).__name__}
     if not rows:

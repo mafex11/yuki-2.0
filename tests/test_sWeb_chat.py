@@ -63,6 +63,10 @@ def guard(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(CH, "_board_refresh", lambda hwnd: state["refreshed"].append(hwnd) or True)
     monkeypatch.setattr(CH, "_app_hwnd", lambda data: next((state["hwnds"].get(i, 0) for i in data.get("images") or []
                                                             if state["hwnds"].get(i)), 0))
+    # fix-r31 (A1): the link route's window reads (minimised, in front or behind) never reach this PC's windows; a
+    # test sets state["shown"] to "minimised" or "behind" to meet the bring-forward
+    monkeypatch.setattr(CH, "_minimised", lambda hwnd: False)
+    monkeypatch.setattr(CH, "_app_shown", lambda data, hwnd: state.get("shown", "unread"))
 
     def focus(hwnd: int) -> Any:
         state["focused"].append(hwnd)
