@@ -937,7 +937,7 @@ def test_r7_others_words_reach_no_generic_capture_reader(store):
         store._conn.execute("UPDATE captures SET journal_batch_id = 9 WHERE id = ?", (capture_id,))
     thread_id = store.call_record(cid).thread_id
     assert store.captures_between(t - 1, t + 10, limit=10) == []
-    texts = [store.captures_by_ids([capture_id])[0]["text"], store.first_capture_text(thread_id)[1],
+    texts = [store.first_capture_text(thread_id)[1],   # captures_by_ids went with kClean (18 Oct, nothing called it)
              store.batch_captures([9])[9][0]["text"],
              store.recent_captures(t - 1, t + 10, skip_kinds=())[0]["text"]]
     for text in texts:

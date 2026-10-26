@@ -517,8 +517,8 @@ def _run(rec, p: Presence, clock: Clock, until: float, *, real_every: float | No
 
 
 def test_jitter_alone_now_writes_away_and_the_return_is_a_picking_up_gap(store, tmp_path):
-    from yuki.memory.nudges import NudgeConfig, resume_gap
-
+    # the welcome back's own gap check (nudges.resume_gap) went with kProactive (18 Oct); the timeline's away row is
+    # what is checked here
     clock = Clock()
     p = presence(clock)
     rec = _recorder(store, tmp_path, p.idle_s)
@@ -535,8 +535,6 @@ def test_jitter_alone_now_writes_away_and_the_return_is_a_picking_up_gap(store, 
     assert away.started_at == pytest.approx(T0 + 600 + 60, abs=8)             # AWAY_AFTER_S after the last key
     assert away.ended_at == pytest.approx(T0 + 600 + 4 * 3600, abs=30)        # back within one tick of the first key
     assert sum(r.active_s for r in rows) == pytest.approx(600 + 60 + 390, abs=15)    # work, the away grace, back
-    gap = resume_gap(store, clock.t, NudgeConfig())
-    assert gap is not None and gap.qualifies and gap.away_s >= 3.9 * 3600
 
 
 def test_with_the_old_rule_jitter_kept_the_user_present(store, tmp_path):

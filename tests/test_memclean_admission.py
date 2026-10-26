@@ -470,51 +470,6 @@ def test_without_vectors_the_pairing_keeps_held_with_held_and_the_place_on_the_l
                                    [(None, None, True), (("call:1", 20.0, "user"), None, True)]) == {}
 
 
-def _keep_card(store: Store, cid: int):
-    from yuki.memory.nudges import NudgeConfig, NudgeWorker
-    from yuki.memory.presence import PresenceWorker
-
-    worker = NudgeWorker(store, config=NudgeConfig(), client=ToolClient({}), log_dir=Path(tempfile.mkdtemp()),
-                         locked_fn=lambda: False, media_fn=lambda: [], render_fn=lambda: [],
-                         event_name="Local\\YukiNudgeReadyTestMemCleanV3", clock=lambda: T0 + 3600)
-    presence = PresenceWorker(worker)
-    [call] = [c for c in store.calls(since=T0 - 60) if c.id == cid]
-    look = presence._recap_look(f"recap:call:{cid}", [call], T0 + 3600)
-    return presence.observe(T0 + 3600, NudgeConfig(), None, [], look)["nudge_id"], look.meta["keep"]
-
-
-def test_a_keep_card_written_before_a_rejournal_answers_the_line_that_took_its_place(store):
-    # review V3: the re-journal re-points the unanswered held facts; the card's refs follow them
-    from yuki.memory.api import MemoryClient
-
-    cid = call_with(store, SCENE)
-    emb = TextEmbedder()
-    journal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [JUDGE]}, emb)
-    nudge, keep = _keep_card(store, cid)
-    japan = next(k["ref"] for k in keep if "Japan" in k["text"])
-    rejournal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [JUDGE]}, emb)
-    [now_held] = [h for h in A.held_facts(store, now=T0 + 3600) if "Japan" in h.fact]
-    assert f"journal:{now_held.id}" != japan and A.moved_held(store, int(japan.split(":")[1])) == now_held.id
-    mem = MemoryClient(store)
-    got = mem.recap_keep(nudge, japan, "keep")
-    assert got["ok"] and got["ref"] == japan and got["moved_to"] == f"journal:{now_held.id}"
-    assert "The user has been to Japan four times." in {e.fact for e in store.journal_between()}
-    assert not [h for h in A.held_facts(store, now=T0 + 3600) if "Japan" in h.fact]
-    assert mem.recap_keep(nudge, japan, "keep")["why"] == "already"                # answered, wherever it moved
-    assert mem.recap_keep(nudge, japan, "undo")["ok"]                              # Undo from the card still works
-    assert "The user has been to Japan four times." not in {e.fact for e in store.journal_between()}
-    # the window's row from before the re-journal answers the same way
-    assert mem.resolve_held(japan, "not_true")["moved_to"] == f"journal:{now_held.id}"
-    assert mem.resolve_held(japan, "undo")["ok"]
-    # a re-journal that puts the line into memory: nothing to answer any more, and the card is told so
-    admit_all = {"verdicts": [verdict(n, "admit") for n in range(1, 7)]}
-    rejournal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [admit_all]}, emb)
-    assert "The user has been to Japan four times." in {e.fact for e in store.journal_between()}
-    moved = mem.recap_keep(nudge, japan, "keep")
-    assert not moved["ok"] and moved["why"] == "moved"
-    assert mem.resolve_held(japan, "keep")["why"] == "moved"
-
-
 def test_a_sensitive_plan_is_still_a_to_do_and_card_lines_restate_the_fact():
     # review V1: the sensitive mark holds a fact, never the user's own to-do (call side, where to-dos are taken)
     from yuki.memory.journal import system_prompt
@@ -548,47 +503,13 @@ def test_the_keep_list_offers_the_most_important_waiting_lines_never_sensitive_o
     assert A.recap_text(2) == "From your call: 2 things I'd keep"
 
 
-def test_a_call_recap_with_waiting_lines_is_a_keep_card_written_without_a_model(store):
-    from yuki.memory.api import MemoryClient
-    from yuki.memory.nudges import NudgeConfig, NudgeWorker
-    from yuki.memory.presence import PresenceWorker
-
-    cid = call_with(store, [line(T0 + 10, "hello")])
-    jid = held_fact(store, "The user has been to Japan four times.", A.HOLD_CALL, call=cid,
-                    shown="You've been to Japan four times.")
-    client = ToolClient({})
-    worker = NudgeWorker(store, config=NudgeConfig(), client=client, log_dir=Path(tempfile.mkdtemp()),
-                         locked_fn=lambda: False, media_fn=lambda: [], render_fn=lambda: [],
-                         event_name="Local\\YukiNudgeReadyTestMemClean", clock=lambda: T0 + 3600)
-    presence = PresenceWorker(worker)
-    [call] = [c for c in store.calls(since=T0 - 60) if c.id == cid]
-    look = presence._recap_look(f"recap:call:{cid}", [call], T0 + 3600)
-    assert look.meta["keep"] == [{"ref": f"journal:{jid}", "text": "You've been to Japan four times.", "who": "user"}]
-    out = presence.observe(T0 + 3600, NudgeConfig(), None, [], look)
-    assert out["nudge_id"] and client.requests == []                    # no model call writes it
-    mem = MemoryClient(store)
-    [card] = [n for n in mem.pending_nudges() if n["id"] == out["nudge_id"]] or \
-        [mem._nudge_dict(store.nudge(out["nudge_id"]))]
-    assert card["trigger"] == "recap" and card["kind"] == "notice"
-    assert card["head"] == "From your Discord call: 1 thing I'd keep"
-    assert card["keep"] == [{"ref": f"journal:{jid}", "text": "You've been to Japan four times.", "who": "user"}]
-    assert mem.recap_keep(out["nudge_id"], "journal:999999", "keep")["why"] == "not_on_card"
-    assert mem.recap_keep(out["nudge_id"], f"journal:{jid}", "maybe")["why"] == "bad_answer"
-    got = mem.recap_keep(out["nudge_id"], f"journal:{jid}", "keep")
-    assert got["ok"] and got["nature"] == "fact"
-    assert mem.recap_keep(out["nudge_id"], f"journal:{jid}", "keep")["why"] == "already"
-    assert "The user has been to Japan four times." in {e.fact for e in store.journal_between()}
-    assert presence._keep_look(f"recap:call:{cid}", [call], T0 + 3700) is None   # nothing waits any more
-
-
-def test_sensitive_matters_stay_off_the_recap_card_and_out_of_the_call_digest():
-    # review F4: when nothing waits, the old model-written recap reads the digest - neither carries the matter
+def test_sensitive_matters_stay_out_of_the_call_digest():
+    # review F4: when nothing waits, the model-written recap reads the digest, which never carries the matter. The old
+    # recap writer's own "never anything personal and sensitive" rule went with NOTICE_WRITER_PROMPT (kProactive,
+    # 18 Oct); the card judge writes the recap now.
     from yuki.memory.calldigest import system_prompt as digest_prompt
-    from yuki.memory.presence import NOTICE_WRITER_PROMPT
 
     assert "THE USER'S SENSITIVE MATTERS" in digest_prompt(["Sam"])
-    recap_rule = NOTICE_WRITER_PROMPT[NOTICE_WRITER_PROMPT.index("- recap: the user's own words"):]
-    assert "Never anything personal and sensitive about the user" in recap_rule.split("\n- plans:")[0]
 
 
 def test_held_facts_for_a_private_surface_never_list_dropped_ones(store):

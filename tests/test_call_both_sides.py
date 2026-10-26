@@ -424,7 +424,9 @@ def test_speaker_marks_and_the_related_source_say_whose_words():
 
 
 def test_a_game_voice_session_gets_no_recap_card(store):
-    from yuki.memory.presence import PresenceWorker
+    # kProactive (18 Oct): the recap card is the card judge's candidates.gen_recap now; a game-only session is skipped
+    # each time (no mark is written), so only the outcome is checked.
+    from yuki.memory.candidates import Context, Seen, gen_recap
 
     start = time.time() - 900.0      # the recap scan reads digests written lately, by the clock
     cid, _cap = call_with(store, [line(start + 5, "nice one", app="VALORANT", kind="game"),
@@ -436,12 +438,8 @@ def test_a_game_voice_session_gets_no_recap_card(store):
                            blocks=[{"start": start, "end": start + 60, "topic": "match", "lines": [
                                {"at": start + 5, "text": "Cheered a teammate", "nature": "fact", "who": "user",
                                 "app": "VALORANT", "track_kind": "game"}]}])
-    worker = PresenceWorker.__new__(PresenceWorker)
-    worker.store = store
-    worker._marks = {}
-    worker._seen = {}
-    marked: list[str] = []
-    worker._looked = lambda key, now, within: False
-    worker._mark = lambda key, now: marked.append(key)
-    assert worker._recap(time.time(), None, None, []) is None
-    assert marked == [f"recap:call:{cid}"]
+    assert gen_recap(Context(store, None, time.time(), None, Seen(store))) == []
+    # the same session as a call does get one: the game's own voice chat is what keeps it off
+    store._write(lambda conn: conn.execute("UPDATE calls SET kind='call' WHERE id=?", (cid,)))
+    [card] = gen_recap(Context(store, None, time.time(), None, Seen(store)))
+    assert card.type == "recap" and card.key == f"recap:call:{cid}"

@@ -282,16 +282,6 @@ def test_render_places_personality_under_its_heading(store):
 # -- readers downstream ----------------------------------------------------------------------
 
 
-def test_coach_leaves_out_uncertain_and_labels_jokes(store):
-    from yuki.memory.nudges import NudgeConfig, Trigger, build_coach_message, observe
-
-    portrait_setup(store)
-    view = observe(store, T0 + 600, NudgeConfig())
-    view.since = T0 - 60
-    text = build_coach_message(store, view, Trigger("periodic"), [], NudgeConfig())
-    assert "private island" not in text and "[joke/banter - humour, not a fact]" in text
-
-
 def test_recall_and_mouth_carry_it():
     from yuki.agent.memory import format_recall
     from yuki.voice.mouth import MouthMemory, PORTRAIT_CHARS, fetch_memory

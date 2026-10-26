@@ -342,7 +342,9 @@ def test_page_visits_join_present_and_away_rows_and_need_dwell_or_a_template(sto
     tl(store, "chrome", T0 + 460, T0 + 520, host="news.example.com", path="/b", title="b")
     tl(store, "chrome", T0 + 520, T0 + 600, host="bank.example", withheld="blocked_host", title=None)
     extractor(store, page_entity=yt).rebuild()
-    pages = store.moments_between(kinds=["page"])
+    # lCore (RULE_VERSION 3) also writes host-scope page moments for domains no site file covers; this test is about
+    # the page-scope ones
+    pages = [p for p in store.moments_between(kinds=["page"]) if p["facts"].get("scope") != "host"]
     assert [(p["facts"]["host"], p["value"], p["facts"].get("template")) for p in pages] == [
         ("docs.example.com", 340.0, None), ("youtube.com", 60.0, "youtube.watch")]
     long, video = pages

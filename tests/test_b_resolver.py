@@ -501,9 +501,8 @@ def test_the_frame_is_empty_when_nothing_clears_a_floor_and_bounded_otherwise():
     many = {"named": [_person(1, "Hemanth", words="Hemanth")],
             "routes": {1: {"name": "Hemanth", "margin": 0.9, "close": False, "preferred": None,
                            "routes": [{"ref": f"route:{i}", "label": f"Discord DM \"{'x' * 300}{i}\"", "mine": 9,
-                                       "theirs": 3, "kind": "dm", "processes": ["discord"]} for i in range(4)]}},
-            "pitfalls": [{"app": "discord", "text": "y" * 400}] * 3}
-    big = frame.build(many, knowhow=["[discord] " + "z" * 600] * 3, now=NOW)
+                                       "theirs": 3, "kind": "dm", "processes": ["discord"]} for i in range(4)]}}}
+    big = frame.build(many, now=NOW)
     assert big.text.startswith(frame.LABEL) and big.text.endswith(frame.END)
     assert len(big.text) <= frame.FRAME_CHARS and big.action
     body = big.text[: -len(frame.END)].rstrip()
