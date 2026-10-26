@@ -962,8 +962,10 @@ HAND_TOOLS: list[dict[str, Any]] = [
         "properties": {
             "say_first": _SAY_FIRST,
             "url": {"type": "string", "description": "The full address."},
-            "app": {"type": "string", "description": "Only a browser or app their words named, as the Start menu "
-                                                     "names it; else leave it out."},
+            "app": {"type": "string", "description": "The browser they want it in, as the Start menu names it: one "
+                                                     "they named for it, or, when their words rule one out (broken, "
+                                                     "closed, not that one), their other browser; else leave it out "
+                                                     "(code opens their usual)."},
             "then": _THEN,
             "say_when_done": _DONE_LINE,
         },
@@ -3031,7 +3033,10 @@ class Hands:
             front = d.taken_front if not off else None
             # desk20 / tidy21: code's own classification of the flag and the one legal step (measured: the act's
             # windows, the front it took, the monitors): code takes it under "do", the talker asks it under "ask"
-            step = (desk_diff.tidy_step(d, acts_now, front, len(getattr(after, "monitors", None) or ()))
+            # final-I Y4: a place step reads whether its monitor is lit (DDC/CI, under the display bus lock), so the
+            # step is found off the event loop
+            step = (await asyncio.to_thread(desk_diff.tidy_step, d, acts_now, front,
+                                            len(getattr(after, "monitors", None) or ()))
                     if look and windowed and not off else None)
             # desk22 (D6): no legal step for a window flag: code's one measured line about what is covered
             flag_said = (desk_diff.flag_line(d, name=_app_name) if look and windowed and not off and step is None
@@ -6078,7 +6083,9 @@ class Hands:
             # the acting marker); the sound of the apps it names is read with it (contract C2)
             desk["before"] = self._desk_read(self._skill_apps(skill_key, slots))
             desk["turn"] = (self._turn_now(), time.monotonic())   # safety timing 4: the turn the run began in
-        strips = self._strips_before()   # integ27 fix H1: what the run's tab record is measured against (no new read)
+        # integ27 fix H1: what the run's tab record is measured against; final-I Y1: with the browsers it may open a page
+        # in read now when the summary's last read did not hold them whole
+        strips = self._strips_for_run(skill_key, slots, sound_only=sound_only)
         try:
             result = engine.resolve_and_run(skill_key, slots, words, ctx, again=bool(args.get("again")),
                                             settings=self.skill_settings, corrects=bool(args.get("corrects")),
@@ -7824,6 +7831,16 @@ class Hands:
             # fHands (k_tab_close_it): several fit and one of them is the tab Yuki put up in this conversation: that is
             # the one their words point at ("close it" right after "pull up GitHub", with their own GitHub tab beside)
             own = self._opened_among(found) if len(found) > 1 else None
+            if own is None and action == "close":
+                # final-I Y2 (Z7: "close that YouTube tab" right after Yuki opened one; the user's own tab titled
+                # exactly "YouTube" filled the exact tier and hid Yuki's from the candidates, so the close aimed at
+                # theirs): for a close, the tab Yuki put up is looked for among every tab their words fit (the exact
+                # tier and the "holds the words" tier together, :func:`tabs_holding`); when it is there, it is the
+                # one. By identity only (the action log's tab ids). Else the narrowed match stands, as before: one
+                # goes through _theirs_check, several are asked about
+                own = self._opened_among([tabs[i - 1] for i in tabs_holding(words, names)])
+                if own is not None and all(own is not t for t in found):
+                    found = [*found, own]   # counted among the tabs that fit (``picked_of``)
             if own is not None:
                 out["_picked_of"], out["_picked_own"] = len(found), True
                 found = [own]
@@ -8432,6 +8449,41 @@ class Hands:
         except Exception:  # noqa: BLE001 - none kept: no tab counts as new
             return {}
 
+    def _strips_for_run(self, skill_key: str, slots: dict[str, Any], *, sound_only: bool = False) -> dict[str, Any]:
+        """final-I Y1 (Z7 under one: "pull up youtube in chrome" with the harness's Explorer window in front; the
+        summary's last read held only that window's strip, so the page ONE's skill run opened as a new tab in Chrome
+        behind was never kept as Yuki's, ``place_record not_own``, and the next "close that YouTube tab" had no tab of
+        Yuki's to aim at): right before a skill run, :meth:`_strips_before`, and for a skill that may open a page
+        (:func:`_may_open_page`: its routes' declared verb and means, the catalog's data, never words) also the strips
+        of the browser windows it may open in, read now as the open_url hand reads them (:meth:`_strips_now`, safety27
+        T2: the browser its app-typed slots name, else every browser of the last desk read), each kept whole with its
+        tab ids. A window the summary already read whole is not read again. Never with a game in front (no strip is
+        walked for nothing, D17), never for a sound-only run. RAM only; never raises (then the summary's read alone)."""
+        strips = self._strips_before()
+        try:
+            skill = _skill_def(skill_key)
+            values = {**{str(k): v for k, v in dict(getattr(skill, "bound", None) or {}).items()}, **(slots or {})}
+            if sound_only or not _may_open_page(skill, values) or self._game_front():
+                return strips
+            named = self._app_values(skill, values)
+            whole = {int(h) for h, ids in dict(strips.get("tabs") or {}).items()
+                     if ids and dict(strips.get("complete") or {}).get(h, True)}
+            fresh, _listed = self._strips_now(named[0] if named else None, skip=whole)
+            if not fresh:
+                return strips
+            out: dict[str, Any] = {"tabs": dict(strips.get("tabs") or {}),
+                                   "complete": dict(strips.get("complete") or {})}
+            if strips.get("hwnds"):
+                out["hwnds"] = set(strips["hwnds"])   # only the summary's own (fresh) window list
+            for h, ids in fresh.items():
+                out["tabs"][int(h)] = sorted(ids)
+                out["complete"][int(h)] = True
+            if self.log is not None:
+                self.log.event("hands", op="strips_before", read=len(fresh))   # content-free
+            return out
+        except Exception:  # noqa: BLE001 - the summary's read alone, as before
+            return strips
+
     def _title_record(self, record: Any, title: Any) -> None:
         """fa review L1 (A2): the title of the tab a record put up, kept on the action log (``ActionLog.titled``; a
         stand-in log without it keeps none). Never raises."""
@@ -8569,12 +8621,14 @@ class Hands:
     OPEN_BEFORE_WINDOWS = 4
     OPEN_BEFORE_TOTAL_S = 0.8
 
-    def _strips_now(self, app: Any) -> tuple[dict[int, set[str]], set[int]]:
+    def _strips_now(self, app: Any, *, skip: set[int] | frozenset[int] = frozenset()
+                    ) -> tuple[dict[int, set[str]], set[int]]:
         """safety27 T2: right before an address is opened, ``({window: the tab ids on its strip}, the windows the last
         desk read listed)``: the strips of the windows it may open in (the browser named, ``app``; else every browser
         of the last desk read), nearest first, read now with every group, at most :attr:`OPEN_BEFORE_WINDOWS` within
         :attr:`OPEN_BEFORE_TOTAL_S`. Only a read that came back whole, every tab with an identity, is kept (a window
-        missing from it is not known). Never raises."""
+        missing from it is not known). final-I Y1: ``skip``, windows the caller already holds whole (not read again,
+        not in the result). Never raises."""
         out: dict[int, set[str]] = {}
         listed: set[int] = set()
         try:
@@ -8589,6 +8643,7 @@ class Hands:
             else:
                 order = [int(w["hwnd"]) for w in overview.get("windows") or []
                          if isinstance(w, dict) and w.get("hwnd") is not None and self._is_browser(int(w["hwnd"]))]
+            order = [h for h in order if int(h) not in skip]
             deadline = time.monotonic() + self.OPEN_BEFORE_TOTAL_S
             for h in order[:self.OPEN_BEFORE_WINDOWS]:
                 left = deadline - time.monotonic()
@@ -9057,11 +9112,10 @@ def same_tab(expected: str, name: str) -> bool:
     return sum(1 for w in want if w in have) / len(want) >= 0.6
 
 
-def tabs_titled(title: str, names: list[str]) -> list[int]:
-    """The tabs (1-based places in ``names``) a title names (x3, 3f), the first rule that finds any: the tabs whose
-    title is it exactly (case and spacing aside); a title the tabs line cut with "…" that starts theirs; those whose
-    title holds its words in a row, whole words ("YouTube" names "(1646) YouTube", never "Arc" in "Search"); else
-    those that share most of its words (:func:`same_tab`: titles drift). The title's identity, never what it means."""
+def _title_tiers(title: str, names: list[str]) -> tuple[str, list[int], list[int], list[int]]:
+    """The title's rules over ``names`` (1-based places), each one whole: ``(the title folded, the tabs whose title is
+    it exactly (case and spacing aside), those whose title starts it when the tabs line cut it with "…", those whose
+    title holds its words in a row, whole words)``. The title's identity, never what it means."""
     def norm(text: str) -> str:
         return " ".join(str(text or "").casefold().split())
 
@@ -9071,24 +9125,40 @@ def tabs_titled(title: str, names: list[str]) -> list[int]:
     cut = norm(title).endswith("…")
     want = norm(title).rstrip("…").strip()
     if not want:
-        return []
+        return "", [], [], []
     exact = [i for i, n in enumerate(names, 1) if norm(n) == want]
-    if exact:
-        return exact
-    if cut:
-        starts = [i for i, n in enumerate(names, 1) if norm(n).startswith(want)]
-        if starts:
-            return starts
+    starts = [i for i, n in enumerate(names, 1) if norm(n).startswith(want)] if cut else []
     run = words(want)
 
     def holds(name: str) -> bool:
         have = words(name)
         return bool(run) and any(have[k:k + len(run)] == run for k in range(len(have) - len(run) + 1))
 
-    held = [i for i, n in enumerate(names, 1) if holds(n)]
-    if held:
-        return held
+    return want, exact, starts, [i for i, n in enumerate(names, 1) if holds(n)]
+
+
+def tabs_titled(title: str, names: list[str]) -> list[int]:
+    """The tabs (1-based places in ``names``) a title names (x3, 3f), the first rule that finds any: the tabs whose
+    title is it exactly (case and spacing aside); a title the tabs line cut with "…" that starts theirs; those whose
+    title holds its words in a row, whole words ("YouTube" names "(1646) YouTube", never "Arc" in "Search"); else
+    those that share most of its words (:func:`same_tab`: titles drift). The title's identity, never what it means."""
+    want, exact, starts, held = _title_tiers(title, names)
+    if not want:
+        return []
+    for tier in (exact, starts, held):
+        if tier:
+            return tier
     return [i for i, n in enumerate(names, 1) if same_tab(want, str(n))]
+
+
+def tabs_holding(title: str, names: list[str]) -> list[int]:
+    """final-I Y2: every tab (1-based places in ``names``) a title fits by the rules before :func:`tabs_titled`'s
+    drift rule, together: the exact title, the start of a cut one, and the titles that hold its words in a row (one
+    tier never hides another: a tab titled exactly "YouTube" and "(12) YouTube - a video" both fit "YouTube"). For
+    finding a tab Yuki put up among those the words fit (:meth:`Hands._opened_among`); never which tab the words mean
+    on their own. Pure."""
+    _want, exact, starts, held = _title_tiers(title, names)
+    return sorted({*exact, *starts, *held})
 
 
 def _detail(result: Any, key: str) -> Any:
@@ -9320,6 +9390,46 @@ def _skill_def(key: str) -> Any:
         return load().get(key)
     except Exception:  # noqa: BLE001 - unknown: the fallback treats it as one that may have acted
         return None
+
+
+#: final-I Y1: the route verbs that open an address in an app (``skills.connection.VERBS``: launch arguments).
+_PAGE_VERBS = frozenset({"open_url"})
+
+
+def _when_may_hold(route: Any, slots: Any) -> bool:
+    """final-I Y1: whether a route's slot conditions (its ``when``: ``in``, ``present``, ``field``/``has``) may hold for
+    a call's slots, read as the model gave them: a condition on a slot the call left out counts as met (the resolver
+    may fill it), as ``connection.sends_with(partial=True)`` reads them. Data only; never raises (``True``)."""
+    try:
+        values = slots if isinstance(slots, dict) else {}
+        for cond in getattr(route, "when", None) or ():
+            v = values.get(str(cond.get("slot") or ""))
+            if v is None or v == "":
+                continue
+            name = v.get("name") if isinstance(v, dict) else v
+            if "in" in cond and str(name) not in [str(x) for x in cond.get("in") or []]:
+                return False
+            if "present" in cond and not bool(cond.get("present")):
+                return False
+            if "field" in cond and isinstance(v, dict) and bool(v.get(str(cond.get("field")))) != bool(
+                    cond.get("has", True)):
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _may_open_page(skill: Any, slots: Any = None) -> bool:
+    """final-I Y1: whether a skill run may open a page in a browser, from its routes' declared data only (the catalog
+    entry, never words): a route whose verb opens an address (:data:`_PAGE_VERBS`) or that acts in a browser (its
+    ``means`` is ``browser``: the web skill's rungs, a site's tab and its told link, a chat's web link), whose slot
+    conditions may hold for the call's ``slots`` (:func:`_when_may_hold`: a chat's web link only opens with no text to
+    type). ``False`` for an unknown skill. Pure; never raises."""
+    try:
+        return any((str(getattr(r, "via", "") or "") in _PAGE_VERBS or str(getattr(r, "means", "") or "") == "browser")
+                   and _when_may_hold(r, slots) for r in getattr(skill, "routes", None) or ())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _skill_words(skill: Any, key: str) -> str:

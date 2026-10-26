@@ -98,7 +98,8 @@ Public API::
 
     monitors() -> list[Screen]                          # the displays now, named (no DDC)
     away_monitors(screens) -> list[Known]               # mon1: theirs that Windows doesn't list now (memory's record)
-    read(target=None, *, log=None) -> list[dict]        # K2: {name, role, brightness, power, ok, why} per monitor
+    read(target=None, *, log=None, ctx=None) -> list[dict]   # K2: {name, role, brightness, power, ok, why} per monitor
+    lit_now(index) -> bool | None                       # final-I Y4: the monitor at a desk index measured lit now
     set_brightness(screens, *, level=None, change=None, app=None) -> list[Change]
     set_power(screens, state, *, app=None, rows=None, light=True) -> list[Change]   # mon1: on but dark is raised
     pick(value, screens, away=None) -> Picked           # a target slot's value -> the monitors it names
@@ -658,14 +659,72 @@ def _wmi_set(level: float) -> bool:
 
 
 #: mon1: the reads and writes memory's monitor record is told of, written once the bus is free (a database write never
-#: holds the DDC/CI lock): ``(device path, pnp, label, what, value, flag, used)``; ``what`` ``power`` (``flag``: an
-#: off it wrote) or ``level`` (``flag``: a level it sat at; ``used``: read while they used it, :func:`_note_level`).
-_notes: list[tuple[str, str, str, str, float, bool, bool]] = []
+#: holds the DDC/CI lock): ``(device path, pnp, label, what, value, flag, used, test)``; ``what`` ``power`` (``flag``:
+#: an off it wrote) or ``level`` (``flag``: a level it sat at; ``used``: read while they used it, :func:`_note_level`);
+#: final-I M2: ``test``, a live test's (:func:`_testing`: the measured state only).
+_notes: list[tuple[str, str, str, str, float, bool, bool, bool]] = []
 _notes_lock = threading.Lock()
 #: mon1 fix round 2: the level Yuki last wrote to each monitor, ``{device path: (level, tolerance, monotonic time,
 #: restore)}`` (``restore``: Yuki's own raise of a monitor on but dark, :func:`_light`; else a level they set through
 #: Yuki), RAM only, under ``_notes_lock``: a read of that level soon after is that write read again.
 _wrote: dict[str, tuple[float, float, float, bool]] = {}
+
+
+#: final-I M2: whether this thread's display run is a live test's (``yuki.memory.testtag``: its run's session or
+#: request id), set for the length of a route run or a read (:func:`_test_scope`); unset: the process's own memory
+#: session decides (:func:`_testing`).
+_run_tag = threading.local()
+
+
+def _test_ids(ctx: Any) -> bool | None:
+    """final-I M2: whether a run context's session or request id is a live test's (``testtag``, read only); ``None``
+    when the context carries neither. Never raises."""
+    session = getattr(ctx, "session_id", None) if ctx is not None else None
+    request = getattr(ctx, "request_id", None) if ctx is not None else None
+    if not session and not request:
+        return None
+    try:
+        from yuki.memory import testtag
+
+        return bool(testtag.is_test_session(session) or testtag.is_test_request(request))
+    except Exception:  # noqa: BLE001 - unknown: kept out of the learning (the safe side for their record)
+        return True
+
+
+@contextlib.contextmanager
+def _test_scope(ctx: Any) -> Iterator[None]:
+    """final-I M2: this thread's display run tagged a live test's or not, from its context (:func:`_test_ids`), for
+    the length of the block (an outer tag stays when the context carries no ids)."""
+    tag = _test_ids(ctx)
+    before = getattr(_run_tag, "test", None)
+    if tag is not None:
+        _run_tag.test = tag
+    try:
+        yield
+    finally:
+        _run_tag.test = before
+
+
+def _testing() -> bool:
+    """final-I M2: whether the read or write being noted belongs to a live test: this thread's run tag
+    (:func:`_test_scope`), else the process's own memory session (``yuki.agent.memory``'s default access, read only,
+    never created here: the live harness runs Yuki under a ``livetest-`` session). Never raises."""
+    tag = getattr(_run_tag, "test", None)
+    if tag is not None:
+        return bool(tag)
+    try:
+        import sys
+
+        mod = sys.modules.get("yuki.agent.memory")
+        default = getattr(mod, "_default", None) if mod is not None else None
+        session = getattr(default, "session_id", None) if default is not None else None
+        if not session:
+            return False
+        from yuki.memory import testtag
+
+        return testtag.is_test_session(session)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _note_power(screen: Screen, value: int | None, *, wrote: bool = False) -> None:
@@ -676,8 +735,9 @@ def _note_power(screen: Screen, value: int | None, *, wrote: bool = False) -> No
     except Exception:  # noqa: BLE001
         pass
     if value is not None:
+        test = _testing()
         with _notes_lock:
-            _notes.append((screen.key, screen.pnp, screen.label, "power", float(value), wrote, False))
+            _notes.append((screen.key, screen.pnp, screen.label, "power", float(value), wrote, False, test))
 
 
 def _note_level(screen: Screen, level: float | None, *, sat: bool = True, used: bool = False) -> None:
@@ -685,13 +745,16 @@ def _note_level(screen: Screen, level: float | None, *, sat: bool = True, used: 
     (never a level they sat at: ``yuki.memory.monitors.note_level``). ``used``: read while they were using that
     monitor (:func:`_in_use`), so a 0 counts too. Fix round 2: a read of the level Yuki last wrote to it moments ago
     (:data:`RESTORE_ECHO_S`, no other level read since; the brain's ``expect`` probe right after the run, a second
-    turn-on) is that write again (:func:`_echo`): never ``used``, and Yuki's own restore never a level they sat at."""
+    turn-on) is that write again (:func:`_echo`): never ``used``, and Yuki's own restore never a level they sat at.
+    final-I M2: a live test's read (:func:`_testing`) is noted as the measured level only (the record learns no level
+    they sat at from it)."""
     if level is not None:
+        test = _testing()
         with _notes_lock:
             echo = _echo(screen.key, float(level))
             if echo is not None:
                 sat, used = sat and not echo, False
-            _notes.append((screen.key, screen.pnp, screen.label, "level", float(level), sat, used))
+            _notes.append((screen.key, screen.pnp, screen.label, "level", float(level), sat, used, test))
 
 
 def _echo(key: str, level: float) -> bool | None:
@@ -726,12 +789,14 @@ def _flush_notes() -> None:
         from yuki.memory import monitors as record
     except Exception:  # noqa: BLE001
         return
-    for path, pnp, label, what, value, flag, used in queued:
+    for path, pnp, label, what, value, flag, used, test in queued:
         try:
+            # final-I M2: a live test's note keeps the measured state only (``test``)
+            extra = {"test": True} if test else {}
             if what == "power":
-                record.note_power(path, int(value), wrote=flag, pnp=pnp, label=label)
+                record.note_power(path, int(value), wrote=flag, pnp=pnp, label=label, **extra)
             else:
-                record.note_level(path, value, sat=flag, used=used, pnp=pnp, label=label)
+                record.note_level(path, value, sat=flag, used=used, pnp=pnp, label=label, **extra)
         except Exception:  # noqa: BLE001
             continue
 
@@ -1245,13 +1310,49 @@ def _power_now(screen: Screen) -> int | None:
     return got[0] if got is not None else None
 
 
-def read(target: str | None = None, *, log: Callable[..., Any] | None = None) -> list[dict[str, Any]]:
+def lit_now(index: Any) -> bool | None:
+    """final-I Y4 (code's tidy moved a window onto the second monitor while it was in standby, out of the user's
+    sight): whether the monitor at desk index ``index`` (``windows.list_monitors``' order, the desk's and the diff's
+    index) is lit now, measured: it reads 0xD6 = 1 (a built-in panel, which has no DDC/CI power, counts as on while
+    Windows lists it) and its brightness is not dark by memory's record (:func:`_dark_now`: at 0 or below every level
+    measured while visible, unless they are using it now; an unread level is never dark). ``False``: it reads
+    standby or off, or on but dark; ``None``: not measured (not listed now, no handle, no DDC/CI reply). Only reads
+    (the power read is kept for the desk and the record as any read is; the level is never noted). Blocking: at most
+    two DDC/CI reads under the bus lock. Never raises."""
+    try:
+        idx = int(index)
+    except (TypeError, ValueError):
+        return None
+    try:
+        screen = next((s for s in monitors() if s.index == idx), None)
+        if screen is None or not (screen.handle or screen.internal):
+            return None
+        if not screen.internal:
+            power = _power_now(screen)
+            if power is None:
+                return None
+            if power != POWER_ON:
+                return False
+        return not _dark_now(screen, _level_now(screen), _row_of(screen, _record_rows()))
+    except Exception:  # noqa: BLE001 - not measured
+        return None
+
+
+def read(target: str | None = None, *, log: Callable[..., Any] | None = None,
+         ctx: Any = None) -> list[dict[str, Any]]:
     """Contract K2 (the brain's ``display`` probe): each monitor ``target`` names (:func:`pick`; ``None`` or ``""``:
     every monitor) read now: ``{"name", "role", "brightness" (0-100 or None), "power" ("on" / "off" / None), "ok"
     (anything read), "why" ("" / "no_handle" / "no_ddc")}``. ``[]`` when the target names no attached monitor. mon1: a
     monitor of theirs Windows doesn't list now that the target names is read as Windows' own fact: ``power`` "off",
     ``ok`` True, ``why`` "not_connected" (never "on"). Never raises; ``log(event, **fields)`` gets one content-free
-    ``display`` line."""
+    ``display`` line. final-I M2: ``ctx``, the probe's run context (its ``session_id`` / ``request_id``): a live
+    test's read is noted as the measured state only; none given, the process's own memory session decides
+    (:func:`_testing`)."""
+    with _test_scope(ctx):
+        return _read(target, log=log)
+
+
+def _read(target: str | None, *, log: Callable[..., Any] | None) -> list[dict[str, Any]]:
     started = time.perf_counter()
     out: list[dict[str, Any]] = []
     try:
@@ -1720,10 +1821,16 @@ def _place_on(picked: Picked, screens: Sequence[Screen], gone: Sequence[Any]) ->
     both; several others off: ``None`` (which is asked). Measured state only (DDC/CI reads of 0xD6). Fix round 2:
     another monitor counts as off by the route's own rule too: on but dark (:func:`_dark_now`, one brightness read
     per other monitor that reads on), so it is taken and raised (the place's own monitor on but dark is raised by
-    ``set_power`` either way)."""
+    ``set_power`` either way). final-I M1 (by reading: at night the main monitor read on at 0% and the second was in
+    standby, so "turn on my main monitor" would also have woken the one the user put in standby): the place's own
+    monitor that reads on but dark (:func:`_dark_now`, one brightness read) is the one the turn-on means ("turn it
+    on" = "make it visible"), so the pick stands as it is (no widening; ``set_power`` raises it); only a place
+    monitor that is visibly on widens."""
     if not picked.screens or not all(_power_now(s) == POWER_ON for s in picked.screens):
         return picked
     rows = _record_rows()
+    if any(_dark_now(s, _level_now(s), _row_of(s, rows)) for s in picked.screens):
+        return picked
     mine = {_ident(s) for s in picked.screens}
     off: list[Screen] = []
     for s in screens:
@@ -1906,13 +2013,16 @@ def _via_word(changes: Sequence[Change]) -> str:
 
 
 def route_windows(call: Any) -> Any:
-    """Rung A, Windows' own control: DDC/CI (WMI for a built-in panel), every monitor read back. No focus, no input."""
-    return _run(call, "windows")
+    """Rung A, Windows' own control: DDC/CI (WMI for a built-in panel), every monitor read back. No focus, no input.
+    final-I M2: a live test's run (its context's session or request id) teaches the record nothing."""
+    with _test_scope(getattr(call, "ctx", None)):
+        return _run(call, "windows")
 
 
 def route_app(call: Any) -> Any:
     """Rung A, the user's monitor app (means ``app``): its command line per monitor, read back over DDC/CI."""
-    return _run(call, "app")
+    with _test_scope(getattr(call, "ctx", None)):
+        return _run(call, "app")
 
 
 def probe_still(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
@@ -1954,4 +2064,4 @@ PROBES: dict[str, Callable[[Any, Mapping[str, Any]], tuple[bool | None, dict[str
 
 __all__ = ["APP", "ANYWAY_SLOT", "Change", "MonitorApp", "PROBES", "Picked", "POWER_OFF", "POWER_ON", "ROUTES",
            "Screen", "VCP_BRIGHTNESS", "VCP_POWER", "away_monitors", "monitor_apps", "monitors", "pick", "probe_still",
-           "read", "route_app", "route_windows", "set_brightness", "set_power", "target_form"]
+           "lit_now", "read", "route_app", "route_windows", "set_brightness", "set_power", "target_form"]
