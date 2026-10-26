@@ -106,6 +106,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from yuki.brain import consent as rule
 from yuki.brain import util
+from yuki.brain.plan import SEED_RERUN_KEY as _RERUN_KEY
 from yuki.one import policy
 from yuki.one import reads
 from yuki.one import tools as T
@@ -182,7 +183,13 @@ TIDIED: dict[str, str] = {
     # integ27 (fa merge note 7, A1): the close raised the page's or the app's own question: code took no tidy step
     # around it (a focus_back would hide it, a key would answer it)
     "asking": "the page's or the app's own question is up in front of them: code left every window as it is, and "
-              "nothing in that window is done this turn"}
+              "nothing in that window is done this turn",
+    # fix-r31 (F2): an own_step window call with a declared next step: its side effect waits for the turn's end
+    "later": "code left that side effect for now, as your next step goes on there; at the turn's end code undoes it "
+             "unless a later act of yours used that window. Never undo it yourself"}
+#: fix-r31 (Y3): the ONE tool that presses a shortcut in a window (typed only): a text field it brings up and that is
+#: left holding the keyboard at the turn's end gets one Escape (:meth:`Runner.turn_end`).
+KEYS_TOOL = "keys"
 #: integ27 (fa merge note 4, A7, final-F all p1_dial_ask_playlist_over_video): the dial at "ask" and code said the
 #: measured question itself (``diff.tidy_ask``): what the agent reads (its yes is the step).
 TIDY_ASKED_NOTE = ("code asked them in a few words whether to undo that side effect with its one undoable step: "
@@ -618,6 +625,9 @@ class RunState:
     held: dict[int, tuple[str, ...]] = field(default_factory=dict)
     #: final-H2 (C3): the model reply the call running now came in (the budget's round count).
     round: int = 0
+    #: fix-r31 (Y3): window -> the text field a ``keys`` call of this turn brought up there (an identity, RAM only) and
+    #: no later act of the turn used; :meth:`Runner.turn_end` undoes it if it still holds the keyboard.
+    raised: dict[int, tuple[int, int, str, str]] = field(default_factory=dict)
 
 
 def state_of(turn: Any) -> RunState:
@@ -1506,6 +1516,7 @@ class Runner:
                 args = {**args, "window": target}
                 self._emit("one_focus_back", filled=True)
         ctx = self._ctx(turn, name, args, bracket=spec.kind == T.ACT)
+        before_key = self._key_holder() if name == KEYS_TOOL else None   # fix-r31 (Y3): the holder before the keys
         with _Lease(turn, wanted=self.lease and spec.kind == T.ACT, wait_s=self.lease_wait_s) as lease:
             if not lease.got:
                 return OneResult(name, BUSY, verified=None, result=LINE_BUSY, evidence={"why": LINE_BUSY},
@@ -1519,7 +1530,9 @@ class Runner:
                 landed = _typing_landed(ok, dict(facts or {}))
             finally:
                 _land_typed(turn, landed)
-        return self._finish(name, args, turn, ctx, ok, report, dict(facts or {}), say, state)
+        result = self._finish(name, args, turn, ctx, ok, report, dict(facts or {}), say, state)
+        self._note_raised(name, dict(facts or {}), result, state, before_key)
+        return result
 
     def _finish(self, name: str, args: dict[str, Any], turn: policy.Turn, ctx: CallContext, ok: bool, report: str,
                 facts: dict[str, Any], say: Any, state: RunState, *, done_line: str | None = None,
@@ -1634,9 +1647,14 @@ class Runner:
                 # window: ``unsure`` (the engine's own outcome and settled fields, code words)
                 unsure = name == "run_skill" and str(facts.get("outcome") or "") == "unverified" \
                     and bool(facts.get("settled"))
+                # fix-r31 (F2): a run that handed the rest over ("look, then finish it by steps"): its retry window
+                # counts acting tries, never the looks; A2: one whose pin says nothing went out may run once more
+                handed = name == "run_skill" and str(facts.get("outcome") or "") == "handed_over"
+                pin = facts.get("handoff_skill") if isinstance(facts.get("handoff_skill"), Mapping) else {}
+                again = handed and pin.get(_RERUN_KEY) is True
                 budget.after_call(name, ctx.first_args or args, acts=True,
                                   ok=status in (DONE, ALREADY, NO_CHANGE, STARTING), lasting=lasting,
-                                  target=ctx.facts, unsure=unsure)
+                                  target=ctx.facts, unsure=unsure, handed=handed, again=again)
             try:
                 # fb fix (review 2, B4): an asked run is never an ok record, whatever a rung touched first (``all``'s
                 # ``as_voice``: ok = done), so the exchange floor (``_hand_marks``) never moves past their request;
@@ -1798,7 +1816,7 @@ class Runner:
                 self._front_kept = None   # an act of a later turn that moved no front lets an older one go (as all)
             pending: dict[str, Any] | None = None
             step: dict[str, Any] | None = None
-            settled = told = off = ask = False
+            settled = told = off = ask = later = False
             # integ27 (fa merge note 7, A1): a close that left the page's or the app's own question up takes no tidy
             # step around it (a focus_back would hide it, an Escape or any key would answer it): no tidy-up is opened
             asking = result.status == ASKED and _close_asking(facts)
@@ -1827,6 +1845,13 @@ class Runner:
                 # integration (one-tidy-on-unlanded-act): code's step only after an act that took, as the hands' look
                 # (a failed or unconfirmed try's turn goes on to another way, whose own diff or the tidy debt takes it)
                 landed = result.status in (DONE, ALREADY)
+                # fix-r31 (F2, final-I one p24 / k_clarify / typed T1: ONE restored the chat app's window as its own
+                # step to finish a skill's hand-over and code's focus_back undid it at once, so its typing found the
+                # keyboard elsewhere): a window call marked as its own means (``own_step``) with a declared next step
+                # (``then``) is a step toward the ask, so its side effect becomes the turn's tidy debt, settled at the
+                # turn's end (``tidy_debt``: a window a later act of the turn acted in is then the ask's, WW4)
+                own_next = (name == "window" and bool(result.then)
+                            and (resolved.get("own_step") is True or ctx.args.get("own_step") is True))
                 if state.tidied and not off:
                     # review F4: code already decided this turn's one tidy step (taken or left): a later flagged act
                     # settles by code too, as under "all" (one look a turn), never handed to the agent. integ27 (fa
@@ -1838,7 +1863,10 @@ class Runner:
                     # below (``_tidy_settled``: no agent round, no tidy debt); a sound left silent stays the agent's
                     pass
                 elif step is not None and (do or as_asked):
-                    if landed or not do:
+                    if own_next and do and landed and not as_asked:
+                        # fix-r31 (F2): left as the turn's tidy debt (the open tidy-up keeps its before and scope)
+                        later = True
+                    elif landed or not do:
                         pending = step
                     # else: code's one step waits (``state.tidied`` and ``Tidy.given`` stay unset, the flags stay on
                     # the result); under "do" the agent never takes or asks for it
@@ -1863,6 +1891,10 @@ class Runner:
                     self._tidy_settled(result, "asking", turn)
             elif pending is not None:
                 self._tidy_result(pending, d, after, result, turn, state, say)
+            elif later:
+                # fix-r31 (F2): no step now; the open tidy-up stays the turn's debt (``Tidy.given`` left unset)
+                self._tidy_later(result)
+                self._emit("one_tidy_code", action=str((step or {}).get("action") or ""), state="later")
             elif ask and step is not None:
                 how = self._tidy_ask(step, after, result, turn, state, say)
                 if how:
@@ -1965,6 +1997,20 @@ class Runner:
             tidy = getattr(turn, "tidy", None)
             if tidy is not None:
                 tidy.given = True
+        except Exception:  # noqa: BLE001 - the result stands as measured
+            pass
+
+    @staticmethod
+    def _tidy_later(result: OneResult) -> None:
+        """fix-r31 (F2): a flagged act result whose one legal tidy step waits for the turn's end (an ``own_step`` window
+        call with a declared ``then``): ``tidied`` says so, and the window flags are cleared as :meth:`_tidy_settled`
+        clears them (no agent round for them now), while the turn's open tidy-up stays its debt (``Tidy.given`` unset:
+        :meth:`tidy_debt` measures it once at the turn's end). Never raises."""
+        try:
+            result.tidied, result.tidy_state = TIDIED["later"], "later"
+            silent = bool(dict(result.flags or {}).get("left_silent"))
+            result.flags = {k: (bool(v) if k == "left_silent" else False) for k, v in dict(result.flags or {}).items()}
+            result.flagged = silent
         except Exception:  # noqa: BLE001 - the result stands as measured
             pass
 
@@ -2287,6 +2333,93 @@ class Runner:
             note([h for h in (ctx.facts.get("hwnd"), facts.get("live_hwnd"), *sorted(state.own)) if h])
         except Exception:  # noqa: BLE001
             pass
+
+    # -- fix-r31 (Y3): a text field the turn's own keys brought up, left holding the keyboard -------------------------
+
+    def _focus_hands(self) -> Any:
+        """The hands whose focus read (``_focus``) the chat driver's K-S reads use: the verbs' hands. ``None``: none."""
+        hands = getattr(self.verbs, "hands", None)
+        return hands if callable(getattr(hands, "_focus", None)) else None
+
+    def _key_holder(self) -> tuple[int, int, str, str] | None:
+        """fix-r31 (Y3): what holds the keyboard right before a ``keys`` call (``chat.holder_ident``); ``None``: unread.
+        Never raises."""
+        try:
+            hands = self._focus_hands()
+            if hands is None:
+                return None
+            from yuki.skills.chat import holder_ident
+
+            return holder_ident(hands)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _note_raised(self, name: str, facts: Mapping[str, Any], result: OneResult, state: RunState,
+                     before: Sequence[Any] | None) -> None:
+        """fix-r31 (Y3, final-I R13's gap under one as well): a ``keys`` call that took and moved the keyboard, inside
+        the window it pressed in (its ``live_hwnd``), from what held it before (read right before it) into a text field
+        (``chat.raised_field``: never a password field, never a chat app's composer): that field, kept for
+        :meth:`turn_end`. A later act of the turn that took in that window used it (a find bar typed into): let go.
+        Measured facts only. Never raises."""
+        try:
+            window = _hwnd_of(facts.get("live_hwnd"))
+            took = result.status in (DONE, ALREADY)
+            if name != KEYS_TOOL:
+                if took and window and window in state.raised:
+                    state.raised.pop(window, None)
+                return
+            if not took or not window or before is None:
+                return
+            hands = self._focus_hands()
+            if hands is None:
+                return
+            from yuki.skills.chat import raised_field
+
+            held = raised_field(hands, int(window), before)
+            if held is not None:
+                state.raised[int(window)] = held
+                self._emit("one_own_field", how="raised")
+        except Exception:  # noqa: BLE001 - nothing kept: nothing is undone
+            return
+
+    def turn_end(self, turn: Any, *, ended: str = "") -> None:
+        """fix-r31 (Y3): at the turn's end (the typed loop's own end), a text field a ``keys`` call of the turn brought
+        up (:meth:`_note_raised`) that no later act used and that still holds the keyboard, by the same focus read K-S
+        uses (``chat.still_held``), gets one Escape in that window (``press`` with ``expect_hwnd``: only while it is in
+        front; the input layer's game gate, D17; the Dispatcher's input gate waits while they type) and the focus read
+        back. Never after a stop (``ended`` cancelled); never a dialog (the field is inside the window the keys pressed
+        in) and never a field the user moved to (the identity differs). Logged content-free (``one_own_field``);
+        nothing said. Never raises."""
+        try:
+            state = state_of(turn)
+            raised, state.raised = dict(state.raised), {}
+            if not raised:
+                return
+            if ended == "cancelled":
+                self._emit("one_own_field", how="kept", why="cancelled")
+                return
+            hands = self._focus_hands()
+            if hands is None:
+                return
+            from yuki.skills.chat import still_held
+
+            for window, held in list(raised.items())[:2]:
+                now = still_held(hands, held)
+                if now is not True:
+                    self._emit("one_own_field", how="gone" if now is False else "unread")
+                    continue
+                acting = getattr(hands, "_acting", None)
+                with _Lease(turn, wanted=self.lease, wait_s=self.lease_wait_s) as lease:
+                    if not lease.got:
+                        self._emit("one_own_field", how="kept", why="busy")
+                        return
+                    with (acting("keys") if callable(acting) else nullcontext()):
+                        got = self.dispatcher.dispatch("press", {"key": "escape", "expect_hwnd": int(window)})
+                after = still_held(hands, held)
+                self._emit("one_own_field", how="closed" if after is False else "held" if after else "unread",
+                           pressed=bool(getattr(got, "ok", False)))
+        except Exception as exc:  # noqa: BLE001 - left as it is
+            self._emit("one_own_field", how="error", error=type(exc).__name__)
 
     def tidy_debt(self, turn: policy.Turn) -> dict[str, Any] | None:
         """Final-B (one-desk D3/F6): a reply code would settle while the turn's tidy-up is still open with no tidy step

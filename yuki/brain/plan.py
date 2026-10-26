@@ -543,6 +543,18 @@ class Checks:
 #: means the skill's own way didn't get there (its routes failed, it couldn't confirm, a value it was given was
 #: dropped): running it again would do the same, so the plan does it by steps.
 SEED_RERUN_OK: frozenset[str] = frozenset({"to_planner"})
+#: fix-r31 (A2, final-I R13): the pin's code fact (``yuki.skills.engine.RERUN_KEY``) that an unconfirmed hand-off's
+#: rung put nothing out (no typing, no key), so the skill may run once more with the same values: the planner brings
+#: the app's window up and runs it again, never types it by steps (A8 refuses that typing). The engine gives it once per
+#: skill and values; a second such hand-off is an ordinary one.
+SEED_RERUN_KEY = "rerun"
+
+
+def seed_again(seed: Mapping[str, Any] | None) -> bool:
+    """fix-r31 (A2): whether a plan seed's skill may run once more (:data:`SEED_RERUN_KEY`, on an unconfirmed
+    hand-off only). Code data only; never raises."""
+    return (isinstance(seed, Mapping) and seed.get(SEED_RERUN_KEY) is True
+            and str(seed.get("why") or "").strip() == "unverified")
 
 
 def skill_family(key: Any) -> str:
@@ -558,8 +570,8 @@ def seed_skill(seed: Mapping[str, Any] | None) -> str | None:
     if not isinstance(seed, Mapping):
         return None
     key = str(seed.get("skill") or seed.get("key") or "").strip()
-    if not key or str(seed.get("why") or "").strip() in SEED_RERUN_OK or person_open(seed):
-        return None
+    if not key or str(seed.get("why") or "").strip() in SEED_RERUN_OK or person_open(seed) or seed_again(seed):
+        return None   # fix-r31 (A2): nothing went out, so it runs once more (never barred for that one)
     return key
 
 
@@ -1122,7 +1134,9 @@ def parse_step(raw: Mapping[str, Any], index: int, header: Plan, checks: Checks,
     step = Step(index=index, verb=str(verb), window=window, element=element, value=value, submit=submit,
                 expect=expect)
     _check_verb(step, header, checks, prior, where)
-    if checks.failed_step is not None and not checks.repeat_rejected and step.same_as(checks.failed_step):
+    if checks.failed_step is not None and not checks.repeat_rejected and step.same_as(checks.failed_step) \
+            and not (step.verb == "run_skill" and seed_again(checks.seed)):
+        # fix-r31 (A2): a run_skill whose hand-off put nothing out runs once more as it was (the seed says so)
         checks.repeat_rejected = True
         raise PlanError([f"{where}that step just failed: change it"])
     return step
@@ -1477,7 +1491,7 @@ __all__ = [
     "Plan", "PlanError", "Checks", "required_probe", "parse_header", "parse_step", "validate_plan", "finish_plan",
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",
     "probe_args_text", "probe_errors", "error_code", "error_codes", "SEED_RERUN_OK", "skill_family", "seed_skill",
-    "spent_skills", "unescape", "seed_sends",
+    "spent_skills", "unescape", "seed_sends", "SEED_RERUN_KEY", "seed_again",
     "person_open", "handoff_person_open", "SEED_ALSO_PROBE", "DONE_STRENGTH", "stronger_done", "DONE_HERE_LEAD",
     "done_here_given", "several_parts",
 ]

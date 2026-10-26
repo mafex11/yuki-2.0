@@ -814,6 +814,10 @@ class Executor:
         #: in any other chat window it is refused toward run_skill message (:meth:`_chat_type_guard`).
         self._chats_opened: set[int] = set()
         self.reads_seen: set[str] = set()
+        #: fix-r31 (Y3, final-I R13): window -> the text field a key step of this request brought up in it
+        #: (:meth:`_note_raised`; an identity, RAM only): undone at the end of a request not done if it still holds the
+        #: keyboard (:meth:`_undo_raised`).
+        self._raised: dict[int, tuple[int, int, str, str]] = {}
         self.last_failed: dict[str, Any] | None = None
         self.last_act: dict[str, Any] = {}
         self.join_controls = consent.join_controls()
@@ -1119,6 +1123,10 @@ class Executor:
         except Exception:  # noqa: BLE001
             pass
         try:
+            self._undo_raised(outcome)   # fix-r31 (Y3): before the marker goes and the desk lease is freed
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             self.host.acting_end()   # idempotent (ExecHost): withdraws the marker and stops the takeover watch
         except Exception:  # noqa: BLE001
             pass
@@ -1141,6 +1149,85 @@ class Executor:
             threading.Thread(target=later, name="yuki-brain-run-row", daemon=True).start()
             return
         self._write_run({**run, **self._recheck_verdict})
+
+    # -- fix-r31 (Y3): a field the request's own key step brought up, left holding the keyboard ------------------------
+
+    def _note_raised(self, call: Call, outcome: Any, verdict: bool | None) -> None:
+        """fix-r31 (Y3, final-I R13: the planner's own Ctrl+K opened a chat app's quick switcher, its typing there was
+        refused, and the request ended with the switcher holding that app's keyboard; A7 / K-S cover only a switcher a
+        skill's run opened): a ``hotkey`` / ``press`` step that took and, by its own report (the input layer's focus
+        before and after), moved the keyboard inside the same window (no new window, the front unchanged) into a text
+        field: that field's identity, read once now (``chat.raised_field``: never a password field, never a chat app's
+        composer by its label data), kept by window for :meth:`_undo_raised`. Measured facts only. Never raises."""
+        if call.tool not in ("hotkey", "press") or not getattr(outcome, "ok", False) or verdict is False:
+            return
+        try:
+            payload = outcome.payload if isinstance(getattr(outcome, "payload", None), dict) else {}
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            window = done.as_hwnd(details.get("foreground_hwnd"))
+            if (not window or details.get("focus_changed") is not True or details.get("foreground_changed") is not False
+                    or details.get("new_windows") or details.get("focus_accepts_text") is not True):
+                return
+            from yuki.skills.chat import raised_field
+
+            held = raised_field(self._desk_hands(), int(window))
+            if held is not None:
+                self._raised[int(window)] = held
+                self._emit_log("own_field", how="raised")
+        except Exception:  # noqa: BLE001 - nothing kept: nothing is undone
+            return
+
+    def _undo_raised(self, ended: str) -> None:
+        """fix-r31 (Y3): at the request's end (:meth:`close`), a field a key step of it brought up (:meth:`_note_raised`)
+        that still holds the keyboard, by the same focus read K-S uses (``chat.still_held``: the same window, control,
+        role and name), gets one Escape in that window (``press`` with ``expect_hwnd``: sent only while it is in front;
+        the input layer's game gate, D17) and the focus read back. Never after a request whose result is done (what it
+        opened may be the ask: a find bar), a stop or a takeover; never a dialog (no new window was measured) and never a
+        field the user's own hands moved to (the identity differs). Logged content-free (``own_field_undo``); nothing
+        is said. Never raises."""
+        raised, self._raised = dict(self._raised), {}
+        if not raised:
+            return
+        result = getattr(self, "_result", None)
+        if ended == "cancelled" or (result is not None and getattr(result, "status", "") == "done"):
+            self._emit_log("own_field_undo", result="kept", why="cancelled" if ended == "cancelled" else "done")
+            return
+        for name in ("cancelled", "paused"):
+            test = getattr(self.host, name, None)
+            try:
+                if test() if callable(test) else bool(test):
+                    self._emit_log("own_field_undo", result="kept", why=name)
+                    return
+            except Exception:  # noqa: BLE001 - unreadable: the other checks stand
+                continue
+        from yuki.skills.chat import still_held
+
+        hands = self._desk_hands()
+        for window, held in list(raised.items())[:2]:
+            now = still_held(hands, held)
+            if now is not True:
+                self._emit_log("own_field_undo", result="gone" if now is False else "unread")
+                continue
+            if self.lease.held and self.lease.owner != threading.get_ident():
+                self._emit_log("own_field_undo", result="kept", why="wrong_thread")
+                return
+            if not self.lease.take():
+                self._emit_log("own_field_undo", result="kept", why="busy")
+                return
+            if not self.acting:
+                try:
+                    self.host.acting_begin()
+                    self.acting = True
+                except Exception:  # noqa: BLE001 - the marker never breaks a step
+                    pass
+            try:
+                with self._dispatch_lock:
+                    got = self.dispatcher.dispatch("press", {"key": "escape", "expect_hwnd": int(window)})
+            except Exception:  # noqa: BLE001 - not pressed: left as it is
+                got = None
+            after = still_held(hands, held)
+            self._emit_log("own_field_undo", result="closed" if after is False else "held" if after else "unread",
+                           pressed=bool(getattr(got, "ok", False)))
 
     # -- the after-look and the tidy-up turn (P1.2-P1.3) -------------------------------------------------------------
 
@@ -2385,6 +2472,8 @@ class Executor:
         self._trace_step(call, outcome, ok=bool(outcome.ok), verdict=verdict, why=why, ms=ms, started=started_at,
                          send=send_state, send_sig=send_sig)
         self._after_act(call, outcome, effect=effect, verdict=verdict)
+        if self.tidy is None:
+            self._note_raised(call, outcome, verdict)   # fix-r31 (Y3): a field this step's own keys brought up
         if call.tool == "run_skill" and verdict is True and self.tidy is None:
             self._note_switch(call)   # morning21 C8: a correction that came as a new request becomes a preference
         if call.tool == "open_url":
