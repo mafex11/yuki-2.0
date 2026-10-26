@@ -58,7 +58,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Mapping, Sequence
 
-from yuki.brain.plan import SEED_RERUN_OK, ExecResult, Plan, StepStatus, person_open, seed_sends, skill_family
+from yuki.brain.plan import (SEED_RERUN_OK, ExecResult, Plan, StepStatus, person_open, seed_again, seed_sends,
+                             skill_family)
 from yuki.brain.prompt import menu_text, profile_text
 
 #: How the request turn labels each part (Yuki's own words about the parts, never the user's).
@@ -104,6 +105,12 @@ SEED_WHO_LABEL = ("[A skill's hand-off: whom it goes to isn't in their words as 
                   "whom, run that skill with that person.]")
 SEED_LABELS: dict[str, str] = {"unverified": SEED_UNSURE_LABEL, "error": SEED_UNSURE_LABEL,
                                "dropped": SEED_DROPPED_LABEL}
+#: fix-r31 (A2, final-I R13: "finish it by steps (type)... never run that skill again" met A8's refusal of the
+#: planner's typing in the chat window, a dead end): a hand-off whose rung put nothing out, by its own code fact
+#: (``yuki.brain.plan.seed_again``): nothing in it can happen twice, so the skill runs once more (not barred).
+SEED_AGAIN_LABEL = ("[A skill's hand-off: nothing was typed or pressed (the PC couldn't confirm it open), so a second "
+                    "run can't do anything twice. Bring the app's window up (one window_action step), then run that "
+                    "skill once more with the same values; never type it by steps.]")
 #: A hand-off whose step would send or join with no plan behind it (``yuki.skills.engine.TO_PLANNER``): that step did
 #: not run; the planner runs the skill in a plan that declares the commit (x10).
 SEED_COMMIT_LABEL = ("[A skill stopped before a step that would send or join (not a failure: that step needs a plan). "
@@ -1352,8 +1359,10 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "",
         body = str(keep)
     why = str(seed.get("why") or "").strip()
     who = person_open(seed)
-    rerun = why in SEED_RERUN_OK or who
-    label = SEED_WHO_LABEL if who else SEED_COMMIT_LABEL if rerun else SEED_LABELS.get(why, SEED_LABEL)
+    again = seed_again(seed)   # fix-r31 (A2): nothing went out: once more, never by steps
+    rerun = why in SEED_RERUN_OK or who or again
+    label = (SEED_WHO_LABEL if who else SEED_AGAIN_LABEL if again else SEED_COMMIT_LABEL if rerun
+             else SEED_LABELS.get(why, SEED_LABEL))
     draft = not rerun and seed_sends(seed)
     if draft:
         # the skill's check reads a send, never a draft's (the validator gives a plan by steps none for it): the
@@ -1898,7 +1907,7 @@ __all__ = ["ALSO_OPEN_CHARS", "KEEP_THEIRS", "SITUATION_CHARS", "also_open", "de
            "Gathered", "gather", "read_overview", "read_you", "read_people", "front_screen", "PEOPLE_TALK_LABEL",
            "read_places", "Places", "channel_known",
            "PLACES_LABEL", "read_profile_parts", "read_card", "beside_card", "CARD_LABEL", "understanding_block",
-           "UNDERSTANDING_LABEL", "read_menu",
+           "UNDERSTANDING_LABEL", "read_menu", "SEED_AGAIN_LABEL",
            "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "seed_memory", "seed_memory_text",
            "request_turn", "Conversation",
            "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report",

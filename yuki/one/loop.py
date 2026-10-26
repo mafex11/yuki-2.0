@@ -610,6 +610,14 @@ class OneAgent(Brain):
             self._rounds(req, host, state, os_, bs, conv, system, tools, effort, turn, runner)
         finally:
             self._prev_turn = turn
+            # fix-r31 (Y3): a text field the turn's own keys brought up and left holding the keyboard gets one Escape
+            # (``Runner.turn_end``), before the acting marker goes
+            end = getattr(runner, "turn_end", None)
+            if callable(end):
+                try:
+                    end(turn, ended="cancelled" if self._cancelled.is_set() else (self._ended_by or "error"))
+                except Exception:  # noqa: BLE001 - the request ends as it would
+                    pass
             host.acting_end()
             try:   # content-free: counts and code words; the budget's own counts under "budget"
                 self.logger.log("one_turn", ended_by=self._ended_by or "error", calls=state.calls,

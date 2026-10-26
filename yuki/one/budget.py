@@ -17,7 +17,10 @@ One :class:`TurnBudget` per user turn (voice) or request (typed). Every number i
   arrival (its first call, keyed by :attr:`TurnBudget.rounds`), so a later call of the reply is never refused because
   an earlier one ran long; an act whose effect could not be read (a skill run the engine settled ``unverified``:
   ``after_call(unsure=True)``) is no miss of the window (it is still never run again as the same step, and still the
-  closing hold's one miss).
+  closing hold's one miss). fix-r31 (F2): when the first miss is a skill run that handed the rest over
+  (``after_call(handed=True)``: "look, then finish it by steps"), the window counts acting tries (``retry_acts``),
+  not seconds, so the looks it asks for first never spend it; a hand-over whose own fact says nothing went out
+  (``again``, the engine's ``RERUN_KEY``) is not barred as the same step.
 * **Same failing step**: refused at once, keyed by :func:`step_key` (``voice.hands._step_key``'s identity, on the
   resolved target: the window the gate found, whatever named it; one20, final-D one-core §3.4).
 * **Refusals**: the second refusal in a turn settles it: no model run (``run_llm=False``), code's rule-#149 line;
@@ -149,6 +152,9 @@ class Limits:
     answer_s: float
     retry_s: float = 8.0
     refusals: int = 2
+    #: fix-r31 (F2): after a skill hand-over ("finish it by steps: look, then act"), the retry window is this many
+    #: other tries (acting calls), never seconds: the looks the hand-over asks for first never spend it.
+    retry_acts: int = 3
 
 
 #: Voice: the design's numbers (planner ``act_calls``/``answer_calls``/``answer_s``, ``hands.RETRY_BUDGET_S``,
@@ -165,7 +171,7 @@ def limits_for(channel: str, settings: Any = None) -> Limits:
     if settings is None:
         return base
     out: dict[str, Any] = {}
-    for name in ("rounds", "soft_s", "hard_s", "reads", "answer_s", "retry_s", "refusals"):
+    for name in ("rounds", "soft_s", "hard_s", "reads", "answer_s", "retry_s", "refusals", "retry_acts"):
         raw = getattr(settings, f"one_{'voice' if base is VOICE else 'typed'}_{name}", None)
         if raw is None or isinstance(raw, bool):
             continue
@@ -271,6 +277,10 @@ class TurnBudget:
         #: seconds): the retry window judges every call of that reply at its arrival.
         self._reply_round: int | None = None
         self._reply_at: float | None = None
+        #: fix-r31 (F2, final-I Z3 under one: the 8 s went on the looks a skill hand-over asked for, so the focus into
+        #: the chat window was refused): the acting tries made since the turn's first miss that was a skill hand-over
+        #: (``after_call(handed=True)``); ``None``: none came. Its window counts these, at most ``retry_acts``.
+        self._handed_tries: int | None = None
         self.closed = False
         self.closed_why = ""
 
@@ -403,6 +413,11 @@ class TurnBudget:
             at = self._reply_at if self.rounds and self._reply_at is not None else now_s
             if self.first_miss is not None and at - self.first_miss > self.limits.retry_s:
                 return Spend(False, "retry", LINE_RETRY_SPENT)
+            if self.first_miss is None and self._handed_tries is not None:
+                # fix-r31 (F2): after a skill hand-over the window counts acting tries, never the time the looks took
+                if self._handed_tries >= self.limits.retry_acts:
+                    return Spend(False, "retry", LINE_RETRY_SPENT)
+                self._handed_tries += 1
             self.acts += 1
             return OK
 
@@ -417,7 +432,8 @@ class TurnBudget:
             return OK
 
     def after_call(self, name: str, args: Mapping[str, Any] | None = None, *, acts: bool = True, ok: bool = True,
-                   lasting: bool = False, target: Mapping[str, Any] | None = None, unsure: bool = False) -> None:
+                   lasting: bool = False, target: Mapping[str, Any] | None = None, unsure: bool = False,
+                   handed: bool = False, again: bool = False) -> None:
         """After one acting call: a call that did not take effect opens the retry window (its first miss) and is never
         tried again this turn (keyed on ``target`` as :meth:`before_call` read it); a lasting one that missed stops
         every later lasting act.
@@ -425,7 +441,13 @@ class TurnBudget:
         fb (B6): ``unsure``: it acted and its effect could not be read (a skill run the engine settled
         ``unverified``): no miss of the retry window (other ways and the next parts of their request go on), but
         never the same step again (it may have landed: a second press can undo it), and still the one miss the
-        closing hold reads. A lasting act is never unsure: a send or join that may have gone is a miss."""
+        closing hold reads. A lasting act is never unsure: a send or join that may have gone is a miss.
+
+        fix-r31 (F2): ``handed``: a skill run that handed the rest over ("finish it by steps"): its retry window is
+        counted in acting tries (``Limits.retry_acts``), not seconds, so the looks it asks for first never spend it.
+        ``again`` (A2): the hand-over's own code fact says nothing went out and the skill may run once more (the
+        engine's ``RERUN_KEY``): that step is not barred as the same step; it counts as a part still open (the closing
+        hold's one miss) instead."""
         if not acts or ok:
             return
         with self._lock:
@@ -434,9 +456,15 @@ class TurnBudget:
                 self.unsure += 1
                 if self._unsure_at is None:
                     self._unsure_at = now_s
+            elif handed and not lasting:
+                if self.first_miss is None and self._handed_tries is None:
+                    self._handed_tries = 0
             elif self.first_miss is None:
                 self.first_miss = now_s
-            self.failed.add(step_key(name, args, target))
+            if again and handed and not lasting:
+                self.unfinished += 1
+            else:
+                self.failed.add(step_key(name, args, target))
             self._acts_at_miss = self.acts
             if lasting:
                 self.lasting_missed = True

@@ -109,6 +109,20 @@ GUESS_FILLS: frozenset[str] = frozenset({*GUESS_SOURCES, "taste", FROM_CHOSEN})
 #: out or wasn't built): ``RouteResult.facts[UNREAD] = True``. The run's evidence and voice facts list such rungs
 #: (``unread``), so a caller may run the skill once more (nothing was pressed there).
 UNREAD = "unread"
+#: fix-r31 (A2, final-I R13, a message row): a rung's code fact that it put nothing anywhere: no typing
+#: step ran and no key was pressed (the chat driver's: the chat it opened was never confirmed open, so nothing was
+#: typed): ``RouteResult.facts[NOTHING_OUT] = True``. A run handed over unconfirmed on such a rung may run once more
+#: (nothing in it can happen twice), so its pin says so (:data:`RERUN_KEY`) and the caller is told to bring the app's
+#: window up and run it again, never to type it by steps (A8 and ONE's ``chat_type`` refuse that typing).
+NOTHING_OUT = "nothing_out"
+#: fix-r31 (A2): the pin's (and the plan seed's) code fact that this hand-off's skill may run once more with the same
+#: values (``yuki.brain.plan.SEED_RERUN_KEY`` reads the same key): ``True``, else left out. Given once per skill and
+#: values within :data:`REPEAT_HANDOFF_S` (:func:`_rerun_offer`): a second such hand-off is an ordinary one.
+RERUN_KEY = "rerun"
+#: fix-r31 (A2): the hand-off's first line when :data:`RERUN_KEY` is set (the planner and ONE read it; under 200
+#: characters, the run_skill summary's cut).
+LINE_RERUN = ("Nothing was typed or pressed (the PC couldn't confirm it open): bring the app's window up, then run this "
+              "skill once more with the same values; never type it by steps.")
 #: The resolver's refusals before anything ran whose report sends the caller to the normal way (by steps), each in
 #: plain words: a key no skill has (the model's own slip), skills switched off, memory too slow to know the user's
 #: usuals (the skill can't run blind, but steps need none of them; the thinker's origin only: the voice says its own
@@ -530,6 +544,10 @@ class SkillResult:
             if why == TO_PLANNER:
                 return ("A step of it would send or join something, so that step was not done; the request goes to "
                         "the planner with the skill pinned.")
+            if why == WHY_UNVERIFIED and (self.handoff or {}).get(RERUN_KEY) is True and self.why != "repeat":
+                # fix-r31 (A2): the rung's own code fact says nothing went out, so a second run can't do it twice; the
+                # old "finish it by steps (type)... don't run this skill again" met A8's refusal of that typing
+                return LINE_RERUN
             if why in (WHY_UNVERIFIED, WHY_ERROR):
                 first = ("It acted, but the PC couldn't confirm the result" if why == WHY_UNVERIFIED
                          else "It broke partway, so what it did is unknown")
@@ -1541,8 +1559,9 @@ def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], t
 #: The keys of a plan seed the brain reads (``yuki.brain.context.seed_block``: skill, goal, slots, done, tried, and
 #: x5Fallback's missing and seen; ``yuki.brain.done.seed_done``: done, done_words, baseline; the executor's run row:
 #: key). integ28 (gb merge note 6, K-S): ``switcher_held``, read by ``executor.switcher_held`` and ``seed_block``.
+#: fix-r31 (A2): :data:`RERUN_KEY`, read by ``yuki.brain.plan.seed_again`` and ``seed_block``.
 SEED_KEYS: tuple[str, ...] = ("skill", "key", "app", "goal", "slots", "done", "done_words", "tried", "why", "sends",
-                              "baseline", "missing", "seen", "switcher_held")
+                              "baseline", "missing", "seen", "switcher_held", RERUN_KEY)
 
 
 def plan_seed(pin: Any) -> dict[str, Any] | None:
@@ -1903,6 +1922,13 @@ def _not_typed(res: RouteResult) -> bool:
     if str(facts.get("why") or "") == "not_typed":
         return True
     return str(res.outcome or "") == "not_typed" and res.ran is not False and bool(res.ask)
+
+
+def _nothing_out(res: RouteResult) -> bool:
+    """fix-r31 (A2): whether a rung's own code fact says it put nothing anywhere (:data:`NOTHING_OUT`: no typing step
+    ran, no key was pressed), and no send key went out by its ``pressed`` fact. Code words only."""
+    facts = res.facts if isinstance(res.facts, Mapping) else {}
+    return facts.get(NOTHING_OUT) is True and _sent_key(res) is not True
 
 
 #: integ28 (gb merge note 6, contract K-S): the most characters a rung's ``stopped`` code word keeps on its tried entry.
@@ -2566,7 +2592,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                                 missing=missing, seen=seen, focus_taken=focus_taken,
                                 ledger={"route": route, "ms": route_ms, "value": res.value, "app": app_done,
                                         "evidence": {"numbers": _numbers(plan.values), "check": waited.evidence}},
-                                evidence=evidence(route=route, waited=waited, reason=WHY_UNVERIFIED))
+                                evidence=evidence(route=route, waited=waited, reason=WHY_UNVERIFIED),
+                                again=_nothing_out(res))   # fix-r31 (A2): nothing went out: it may run once more
             say = res.unverified_line or LINE_UNVERIFIED
             _ledger_try(ctx, run_key, route, None, "unverified", route_ms)
             _ledger_finish(ctx, run_key, outcome="unverified", checked=None, route=route, ms=route_ms,
@@ -2853,6 +2880,33 @@ def _note_handoff(skill: Skill, values: Mapping[str, Any], why: str, tried: list
         pass
 
 
+#: fix-r31 (A2): the skills and values whose hand-off already said "run it once more" (:data:`RERUN_KEY`) in the last
+#: :data:`REPEAT_HANDOFF_S` (RAM only, this process): ``{key: monotonic time}``. One such offer each, so a run that
+#: again puts nothing out is an ordinary hand-off (by steps, the skill barred), never a loop.
+_RERUN_OFFERED: dict[str, float] = {}
+
+
+def _rerun_offer(skill: Skill, values: Mapping[str, Any]) -> bool:
+    """fix-r31 (A2): whether this hand-off may say "run it once more" (the first for these skill and values within
+    :data:`REPEAT_HANDOFF_S`; noted here when it may). A relative change never (it has no repeat key). Never raises."""
+    try:
+        key = _repeat_key(skill, values)
+        if key is None:
+            return False
+        now = time.monotonic()
+        with _recent_lock:
+            for k in [k for k, at in _RERUN_OFFERED.items() if now - at > REPEAT_HANDOFF_S]:
+                _RERUN_OFFERED.pop(k, None)
+            if key in _RERUN_OFFERED:
+                return False
+            _RERUN_OFFERED[key] = now
+            while len(_RERUN_OFFERED) > RECENT_MAX:
+                _RERUN_OFFERED.pop(next(iter(_RERUN_OFFERED)), None)
+        return True
+    except Exception:  # noqa: BLE001 - no offer: the ordinary hand-off
+        return False
+
+
 def _recent_handoff(skill: Skill, values: Mapping[str, Any],
                     ctx: RunContext) -> tuple[str, list[dict[str, Any]], str | None, list[str]] | None:
     """The hand-off this same skill and values made within :data:`REPEAT_HANDOFF_S` after a rung acted unconfirmed (or
@@ -2879,7 +2933,7 @@ def _handoff(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str],
              routes: list[Route] | None = None, unconfirmed: bool = False, missing: str | None = None,
              seen: Any = (), partial: bool = False, focus_taken: bool = False,
              ledger: Mapping[str, Any] | None = None, repeat: bool = False,
-             evidence: Mapping[str, Any] | None = None) -> SkillResult:
+             evidence: Mapping[str, Any] | None = None, again: bool = False) -> SkillResult:
     """Rung C: never with a game in front (D17(2)), re-read right here. The pinned skill is the old loop's pin and the
     new brain's plan seed alike (:func:`pinned`), held to the done-check of the routes this run took (``routes``),
     with IF-seed's ``missing`` (its value left out of that check) and ``seen``. ``unconfirmed``: the last rung acted
@@ -2887,7 +2941,9 @@ def _handoff(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str],
     values are only what the caller gave (a dropped value handed over). ``ledger``: more of the run row's facts (the
     rung that acted, its value, app and the check's evidence: content-free). ``repeat``: the same thing handed over
     unconfirmed moments ago, so no rung ran this time (:func:`_recent_handoff`). ``evidence``: what the run tried
-    and saw (Phase 2.3, :func:`_evidence`; built here from ``tried`` when the caller has none)."""
+    and saw (Phase 2.3, :func:`_evidence`; built here from ``tried`` when the caller has none). ``again`` (fix-r31, A2):
+    the rung that acted put nothing out (:func:`_nothing_out`), so an unconfirmed hand-off may say "run it once more"
+    (:data:`RERUN_KEY` on the pin, once per skill and values: :func:`_rerun_offer`) and is not kept as a repeat."""
     ev = dict(evidence) if evidence else _evidence(skill, values, tried, acted=acted, missing=missing, seen=seen,
                                                    sources=None, reason=why)
     game = ctx.game_now()
@@ -2908,12 +2964,17 @@ def _handoff(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str],
                  partial=partial)
     _ledger_finish(ctx, run_key, outcome="handed_over", checked=False if acted and not unconfirmed else None,
                    acted=acted, **dict(ledger or {}))
-    if why in (WHY_UNVERIFIED, WHY_ERROR) and ctx.origin in HANDOFF_ORIGINS:
+    rerun = (bool(again) and not repeat and why == WHY_UNVERIFIED and ctx.origin in HANDOFF_ORIGINS
+             and _rerun_offer(skill, values))
+    if rerun:
+        # fix-r31 (A2): nothing went out, so the caller brings the window up and runs it once more (never by steps)
+        pin[RERUN_KEY] = True
+    elif why in (WHY_UNVERIFIED, WHY_ERROR) and ctx.origin in HANDOFF_ORIGINS:
         # a second run of the same thing in the next moments goes straight here (it could do it twice)
         _note_handoff(skill, values, why, tried, missing, seen)
     _emit(ctx, "skill_handoff", skill=skill.key, result="handed_over", reason=why, tried=len(tried),
           missing_slots=_slot_flags([pin["missing"]] if pin.get("missing") else []), seen=len(pin.get("seen") or []),
-          repeat=True if repeat else None, origin=ctx.origin)
+          repeat=True if repeat else None, rerun=True if rerun else None, origin=ctx.origin)
     return _simple(skill.key, "handed_over", ctx, started, handoff=pin, tried=tried, run_key=run_key,
                    values=dict(values), focus_taken=focus_taken, why="repeat" if repeat else "", evidence=ev)
 
@@ -3942,4 +4003,5 @@ __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_O
            "run_for_thinker", "granted_values", "place_arg", "place_hint", "place_for", "habit_place",
            "HABIT_PLACE_S",
            "CHOICE_SLOTS", "CHOOSE_TIMEOUT_S", "HELD_CALL", "asks_choice", "NOTE_SLOTS", "LINE_WHICH",
-           "GUESS_KEEP_S", "note_args", "evidence_words", "FrontRead", "front_now", "front_change"]
+           "GUESS_KEEP_S", "note_args", "evidence_words", "FrontRead", "front_now", "front_change", "NOTHING_OUT",
+           "RERUN_KEY", "LINE_RERUN"]

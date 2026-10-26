@@ -94,8 +94,11 @@ from yuki.brain.plan import (
     Step,
     StepStatus,
     error_codes,
+    seed_again,
+    seed_rerun_ran,
     seed_sends,
     seed_skill,
+    seed_spent,
     skill_family,
 )
 from yuki.brain.planner import CallCancelled, CallResult, ModelCall, PlanStream, build_params
@@ -2053,6 +2056,29 @@ class Brain:
         else:
             executor.seed = {k: v for k, v in seed.items() if k not in ("done", "done_words")}
 
+    def _rerun_ran(self, state: _State) -> None:
+        """fix-r31 (A2 review): a seed whose hand-off put nothing out lets its skill run once more
+        (``plan.seed_again``). Once a ``run_skill`` of that skill ran in the plan just finished, whatever its outcome (a
+        new hand-off replaces the seed after this; a contradicted check or any other end leaves it), the rerun flag is
+        dropped from the request's seed and the skill counted as spent, so the planner's bar and its repeat rule hold
+        for it again: exactly one rerun. The executor's own runs of this plan (code keys only). Never raises."""
+        try:
+            req = self._req
+            if req is None or not seed_again(req.seed):
+                return
+            ran: list[str] = []
+            for run in getattr(getattr(self, "_executor", None), "skill_outcomes", None) or ():
+                payload = getattr(getattr(run, "outcome", None), "payload", None)
+                ran.append(str(payload.get("skill") or "") if isinstance(payload, Mapping) else "")
+                ran.append(str(getattr(run, "key", "") or ""))
+            key = seed_rerun_ran(req.seed, ran)
+            if key:
+                req.seed = seed_spent(req.seed)
+                state.spent.add(key)
+                self.logger.log("seed_rerun", ran=True)
+        except Exception:  # noqa: BLE001 - the seed stays as it was
+            return
+
     def _unconfirmed_skill(self, executor: Any, plan: Plan | None, result: ExecResult) -> str | None:
         """The skill whose own check left this plan unconfirmed, when finishing it by steps after a look is safe
         (x10, principle 1), else ``None``. Safe means: the plan is a skill route (its ``run_skill`` step decides it)
@@ -2273,6 +2299,7 @@ class Brain:
             state.current = plan
         state.last = result
         status = result.status
+        self._rerun_ran(state)   # fix-r31 (A2 review): the seed's one rerun ran: its skill is spent again
         close_parts(plan, state, result)   # morning21 C7: a plan that ran an open part's step (or asked) closes it
         if status != "read":
             state.held = None   # an act plan ran after a held ending: its own result decides now (reads don't)

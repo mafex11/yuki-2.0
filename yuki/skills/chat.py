@@ -113,6 +113,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from yuki.skills.engine import NOTHING_OUT as _NOTHING_OUT
 from yuki.skills.engine import RouteCall, RouteResult
 
 #: The lines said when nothing is done (asked or told plainly; never a "done").
@@ -1658,6 +1659,98 @@ def _focus_app(data: Mapping[str, Any], ctx: Any = None) -> tuple[int, RouteResu
     return hwnd, None
 
 
+def _minimised(hwnd: int) -> bool:
+    """fix-r31 (A1): whether the window is minimised now (``IsIconic``; read only). ``False`` when it can't be read."""
+    try:
+        import win32gui
+
+        return bool(hwnd) and bool(win32gui.IsWindow(int(hwnd))) and bool(win32gui.IsIconic(int(hwnd)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _app_shown(data: Mapping[str, Any], hwnd: int) -> str:
+    """fix-r31 (A1): where the app's own window is now, measured: ``minimised``, ``front`` (the window in front is one
+    of the app's own programs: its data's ``images``), ``behind``, or ``unread``. Read only; never raises."""
+    if hwnd and _minimised(hwnd):
+        return "minimised"
+    try:
+        import win32gui
+        import win32process
+
+        from yuki.connect.spotify_desktop import _image_of
+
+        front = int(win32gui.GetForegroundWindow() or 0)
+        if not front:
+            return "behind"
+        if hwnd and front == int(hwnd):
+            return "front"
+        image = _image_of(int(win32process.GetWindowThreadProcessId(front)[1])).casefold()
+        images = {str(i).casefold() for i in data.get("images") or [] if str(i).strip()}
+        return "front" if image and image in images else "behind"
+    except Exception:  # noqa: BLE001
+        return "unread"
+
+
+def _bring_once(call: RouteCall, data: Mapping[str, Any], hwnd: int) -> tuple[str, str | None]:
+    """fix-r31 (A1): after the link, the app's own window brought forward once when it is measured minimised or behind
+    (:func:`_app_shown`), through :func:`_focus_app` (guarded: D17; the place hint honoured). ``(code word, held)``:
+    ``forward`` (it came forward), ``front`` (already there: nothing done), ``unread``, or the refusal's outcome
+    (``refused`` with ``held`` the gate's kind, ``not_open``, ``no_focus``). Content-free."""
+    where = _app_shown(data, hwnd)
+    if where in ("front", "unread"):
+        return where, None
+    got, stop = _focus_app(data, call.ctx)
+    if stop is not None:
+        return str(stop.outcome or "no_focus"), stop.held
+    return ("forward" if got else "no_focus"), None
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Y3: a text field a request's own key step brought up, left holding the keyboard (contract K-S, widened)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _is_composer(snap: Any) -> bool:
+    """fix-r31 (Y3): whether a focus read fits any chat app's composer by that app's own label data
+    (:func:`composer_shapes`): an Escape there may change the chat (close it, mark it read), so it is never pressed
+    there. Data only; never raises."""
+    try:
+        return any(_fits(snap, shapes) for shapes in (composer_shapes(app_data(a)) for a in chat_apps()) if shapes)
+    except Exception:  # noqa: BLE001 - unknown: as a composer (no key)
+        return True
+
+
+def holder_ident(hands: Any) -> tuple[int, int, str, str] | None:
+    """fix-r31 (Y3): what holds the keyboard now as an identity (its top-level window, native window, role and name:
+    UI facts, never read for meaning), by one focus read through ``hands._focus``; ``None`` when unread. RAM only."""
+    return _ident(_holder(hands))
+
+
+def raised_field(hands: Any, window: int, before: Sequence[Any] | None = None) -> tuple[int, int, str, str] | None:
+    """fix-r31 (Y3, final-I R13: the planner's own Ctrl+K left a quick switcher holding a chat app's keyboard when its
+    request ended): the text field a key step of the request just gave the keyboard to, as an identity, when it is one
+    that step brought up: a text field (never a password field), in that very ``window`` (the step's own), other than
+    ``before`` (what held the keyboard before the step, when read), and never a chat app's composer
+    (:func:`_is_composer`). ``None`` otherwise, or when the focus can't be read. Read only; RAM only."""
+    snap = _holder(hands)
+    if not _is_field(snap) or not window:
+        return None
+    ident = _ident(snap)
+    if ident is None or int(ident[0]) != int(window):
+        return None
+    if before is not None and tuple(before) == ident:
+        return None
+    if _is_composer(snap):
+        return None
+    return ident
+
+
+def still_held(hands: Any, held: Sequence[Any] | None) -> bool | None:
+    """fix-r31 (Y3): :func:`_still_held` (gb B3's K-S read) for a field a request's own key step brought up."""
+    return _still_held(hands, held)
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # message
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1942,13 +2035,21 @@ def _not_typed(call: RouteCall, app: str, name: str, hwnd: int, facts: Mapping[s
 
 
 def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Target, route: ChatRoute, *, via: str,
-                since: float, hwnd: int, as_draft: bool = False, own_field: Any = None) -> RouteResult:
+                since: float, hwnd: int, as_draft: bool = False, own_field: Any = None, bring_once: bool = False,
+                restored: bool = False) -> RouteResult:
     """After the chat was asked to open: wait until it is seen open, then (only then) put the keyboard in its composer
     (chat19, :func:`_composer_focus`), type the user's words, and press send when they plainly said so. The route's
     result: acted, with its RAM facts for the done-check. ``as_draft`` (:func:`_send_gate`): a send to a person matched
     by sound, answered since: typed and left, said so. ``own_field``: the text field this very run's switcher gave the
     keyboard to (its own to close if it still holds it). Nothing typed: :func:`_not_typed` (contract C3), never a
-    question."""
+    question.
+
+    fix-r31 (A1): ``bring_once`` (the link route): when the wait ends with another app's window in front while the
+    app's own window is minimised or behind (measured), that window is brought forward once (:func:`_focus_app`,
+    guarded) and the chat waited for once more. ``restored``: the route restored the app's minimised window before
+    its link (a content-free fact). A2: on the link route (``via == "link"``), a chat never confirmed open ends with
+    nothing typed and nothing pressed, said as the code fact :data:`yuki.skills.engine.NOTHING_OUT`; the switcher
+    route already typed into the switcher, so its hand-off stays an ordinary one."""
     text, send = _text_mode(call.values)
     send = send and not as_draft
     name = target.name
@@ -1960,9 +2061,26 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     where = _where(call.values, app)
     person_id = getattr(target, "id", None) if not getattr(target, "place", False) else None
     chat, ev = _wait_chat(call, data, route, since, hwnd, person_id=person_id)
+    brought = ""
+    if bring_once and chat is not True and ev.get("board") == "other_app":
+        # fix-r31 (A1): the link took, but the app's window never came in front (minimised, or behind another app's):
+        # brought forward once, and the chat waited for once more. A game in front refuses it (D17)
+        brought, held = _bring_once(call, data, hwnd)
+        if held:
+            return RouteResult(ran=True, held=held, outcome="refused", app=app,
+                               facts={"via": via, "brought": brought, **({"restored": True} if restored else {})},
+                               facts_ram={"app": app, "thread_ids": list(route.thread_ids), "chat": None,
+                                          "typed": False, "pressed": False})
+        if brought == "forward":
+            hwnd = _app_hwnd(data) or hwnd
+            chat, ev = _wait_chat(call, data, route, since, hwnd, person_id=person_id)
     facts: dict[str, Any] = {"via": via, "chat": {True: "open", False: "other", None: "unknown"}[chat],
                              "by": str(ev.get("by") or ev.get("board") or ev.get("status") or ""),
                              "mode": "send" if send else ("draft" if text else "open")}
+    if restored:
+        facts["restored"] = True
+    if brought:
+        facts["brought"] = brought
     if chat is False:
         # gb (B6, final-G2 R13's trigger lead): what the "another chat" read was, content-free (counts, booleans and a
         # code word), for the route's logged facts
@@ -1970,6 +2088,13 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     if as_draft:
         facts["as_draft"] = "sound_alike"
     ram: dict[str, Any] = {"app": app, "thread_ids": list(route.thread_ids), "chat": chat}
+    # fix-r31 (A2): the link route's chat never confirmed open: no typing step ran and no key was pressed anywhere (the
+    # link opens by the shell; A1's restore and bring-forward only focus), the code fact the engine reads
+    # (``NOTHING_OUT``), so a hand-off says "run it once more", never "type it by steps". Never the switcher route's:
+    # it already pressed the switcher's shortcut, typed the chat's name and pressed Enter (an ordinary hand-off)
+    nothing_out = chat is not True and via == "link"
+    if nothing_out:
+        facts.update({"typed": "no", "pressed": False, _NOTHING_OUT: True})
     if not text:
         return RouteResult(ran=True, outcome="opened", app=app, say=SAY_OPENED.format(name=name, where=where),
                            unverified_line=LINE_OPEN_UNCONFIRMED.format(app=_title(app), name=name), facts=facts,
@@ -1984,7 +2109,7 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
                                                                                      "pressed": False})
         return RouteResult(ran=True, outcome="chat_unconfirmed" if chat is None else "other_chat", app=app,
                            unverified_line=LINE_UNSURE_CHAT.format(app=_title(app), name=name), facts=facts,
-                           facts_ram=ram)
+                           facts_ram={**ram, "typed": False, "pressed": False} if nothing_out else ram)
     # chat19: the keyboard into the opened chat's composer first (found by the app's label data or by structure,
     # focused through UIA, confirmed by the focus read); nothing is read, typed or pressed anywhere else
     keyboard = _composer_focus(call, app, data, route, hwnd, own_field=own_field)
@@ -2146,6 +2271,19 @@ def route_open_link(call: RouteCall) -> RouteResult:
     if kind := _refused("open_url"):
         return RouteResult(ran=False, held=kind, outcome="refused")
     running = _app_hwnd(data)
+    restored = False
+    if running and _minimised(running):
+        # fix-r31 (A1, final-I R13's trigger, a message row; both brains, 5 of 5 minimised attempts
+        # unconfirmed): the app the user asked to message is the ask, not a side effect. Its link switches the chat
+        # inside a minimised window and leaves it there, so the chat is never seen open and nothing is typed. The
+        # window is restored in place first (the guarded focus: D17; ``SW_RESTORE`` keeps its own size), the place hint
+        # honoured right after (the place verb takes no minimised window). The window's measured state only
+        if kind := _refused("focus", hwnd=running):
+            return RouteResult(ran=False, held=kind, outcome="refused")
+        shown = _focus(running)
+        if kind := _held_by_game(shown):
+            return RouteResult(ran=False, held=kind, outcome="refused")
+        restored = not _minimised(running)
     # P1.4: an open window is put on the hint's screen first (the link brings it forward there); a cold start, or a
     # window that couldn't be placed yet (minimised), as soon as the link has brought it up
     placed = bool(running) and _place(call.ctx, running, activate=False)
@@ -2158,7 +2296,7 @@ def route_open_link(call: RouteCall) -> RouteResult:
     if not placed:
         _place(call.ctx, _app_hwnd(data) or running, activate=True)
     return _after_open(call, app, data, target, route, via="link", since=since, hwnd=_app_hwnd(data) or running,
-                       as_draft=as_draft)
+                       as_draft=as_draft, bring_once=True, restored=restored)
 
 
 def route_switcher(call: RouteCall) -> RouteResult:
@@ -2696,4 +2834,5 @@ PROBES: dict[str, Callable[..., tuple[bool | None, dict[str, Any]]]] = {"message
 
 __all__ = ["ROUTES", "PROBES", "ChatRoute", "Target", "Asked", "app_data", "chat_apps", "app_of", "find_target",
            "pick_route", "whom", "deep_link", "switcher_query", "run_steps", "chat_state", "route_open_link",
-           "route_switcher", "route_voice_join", "probe_message_done", "sent_in_chat", "front_chat"]
+           "route_switcher", "route_voice_join", "probe_message_done", "sent_in_chat", "front_chat",
+           "holder_ident", "raised_field", "still_held"]
