@@ -271,6 +271,22 @@ def _fresh_skill_ram():
 
 
 @pytest.fixture(autouse=True)
+def _no_taste_model(monkeypatch: pytest.MonkeyPatch):
+    """r31: the taste judge's own small-model client (``taste._judge_client``: ``failover.make_client``, the real
+    Bedrock) is never made in a test. The r31 sweep, fenced from the network, caught the playlist rung's and the skills
+    eval's tests calling it for "which item do the words mean" (the answer was never stubbed). A test that means a
+    judgement passes its own ``client``; without one the judgement is "unknown", as with no model."""
+    from yuki.skills import taste
+
+    def no_model(settings: object = None) -> object:
+        raise RuntimeError("no model in tests: pass a client")
+
+    monkeypatch.setattr(taste, "_judge_client", no_model)
+    monkeypatch.setattr(taste, "_client_box", [])
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_live_game_check(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
     """fGate (D17, review r2 L8): the input backstop reads the live foreground window's program and the window under
     the cursor; a game in front during a test run would refuse every stubbed action. Tests see no game, unless their

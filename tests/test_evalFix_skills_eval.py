@@ -276,13 +276,16 @@ def test_run_moments_on_a_copy(live, bars, capsys, monkeypatch):
     assert digest(live.parent) == before
 
 
-def test_run_requests_without_the_resolver_says_so(live, capsys):
+def test_run_requests_without_the_resolver_says_so(live, capsys, monkeypatch):
+    # r31: the resolver is built on this branch (resolve.eval_resolver), and it is a real model call: the sweep, fenced
+    # from the network, caught this test calling Bedrock with the fixture's words. "Without the resolver" is pinned.
+    monkeypatch.setattr(H, "load_resolver", lambda db_path: None)
     data = S.load_fixtures()
     S.add_fixtures(data, ["open my meeting"], skill="meet.open")
     S.save_fixtures(data)
-    assert S.main(["run", "--copy-real", "--suite", "requests"]) in (0, 1)
+    assert S.main(["run", "--copy-real", "--suite", "requests"]) == 1
     out = capsys.readouterr().out
-    assert ("Not available" in out) or ("Result:" in out)
+    assert "Not available" in out and "Result:" not in out
     assert "open my meeting" not in out
 
 
