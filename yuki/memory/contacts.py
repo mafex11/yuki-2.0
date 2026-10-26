@@ -1,4 +1,4 @@
-"""People and routes: who the user talks to, and where (revamp Phase B1, docs/research/revamp-2026-10-02/02 P3-P4).
+"""People and routes: who the user talks to, and where (revamp Phase B1, the design notes P3-P4).
 
 Memory already holds everything a human assistant would use to answer "message Hemanth": the capture threads of
 every chat the watcher read (Discord DM "@Quasar40404", WhatsApp "Hemanth", a server channel), their messages with

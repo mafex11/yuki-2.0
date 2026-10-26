@@ -1,7 +1,7 @@
 """Proactive check-ins: Yuki asks how the user's goals stand and how they are doing - did it land, what are you
 going for, what's next - at measured moments, on cards only.
 
-Contract: ``docs/research/revamp-2026-10-02/33-build-checkins.md``. On 3 Oct 2026 a card asked "Where on the C: drive
+Contract: ``the design notes``. On 3 Oct 2026 a card asked "Where on the C: drive
 do you want Arch installed?" because T3 Code had asked the user that. The user: "it just sees some shit on my screen
 and asks me randomly... it should connect this on-screen context with more data on what I am trying to achieve...
 and then ask me 'did you achieve what you were trying to do'" - past (did it land, or are you still on it), present
@@ -9,7 +9,7 @@ and then ask me 'did you achieve what you were trying to do'" - past (did it lan
 tomorrow easier so you don't burn out), the way a human who watched them work every day would ask: curious,
 concerned, never praise. And Yuki is one entity: a check-in is Yuki asking, not a coach.
 
-Who decides what (docs/HANDBOOK.md rule 3, no word lists):
+Who decides what (the project handbook rule 3, no word lists):
 
 * **Code measures when to look** (:class:`CheckinWorker`, inside the card worker :class:`yuki.memory.nudges.NudgeWorker`,
   after the welcome back and the due reminders, before the observation cards; every gate of that worker holds it -

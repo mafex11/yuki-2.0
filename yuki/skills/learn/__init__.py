@@ -1,4 +1,4 @@
-"""The skill learner (phase L, ``docs/research/audit-2026-10-09/learner/design.md`` revision 2; decisions D21-D24).
+"""The skill learner (phase L, ``the design notes`` revision 2; decisions D21-D24).
 
 Yuki learns which of its capabilities the user actually uses, with which values, in which program, when, and writes
 ONE record per capability (audit 17 Oct, contract C5): a ``skills`` row (``<capability>#all``) whose spec holds the

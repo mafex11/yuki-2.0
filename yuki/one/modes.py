@@ -9,7 +9,7 @@
 
 **An unknown value reads as ``all``**, never as ``loop`` (``voice.mouth.brain_mode`` read an unknown value as ``loop``
 until now, so a typo put voice on the old thinker and the full talker). Every ``== "all"`` site switches to this module
-(the wave-2 lanes; the list is in ``docs/research/audit-2026-10-18/builds/oCore.md``).
+(the wave-2 lanes; the list is in ``the design notes``).
 
 The mode is read at each request's start from the settings object it is given; with none, the process's own mode:
 ``YUKI_BRAIN``, else ``brain`` in ``%LOCALAPPDATA%/Yuki/settings.json``, else ``all`` (read once per process, as

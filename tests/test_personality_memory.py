@@ -207,7 +207,7 @@ def portrait_setup(store: Store) -> dict[str, int]:
     for key, text, nature in (
         ("joke", "In a Discord call, the user joked that they need a pilot partner earning a million a year.",
          "humor"),
-        ("opus", "The user said, possibly as banter, that they have unlimited Claude Opus accounts from Anthropic.",
+        ("boast", "The user said, possibly as banter, that they own a private island with its own airstrip.",
          "uncertain"),
         ("talk", "The user swears casually and mixes Hindi and English with friends.", "trait"),
         ("story", "The user said that in college their alarm clock was so loud the neighbours complained.",
@@ -231,7 +231,7 @@ def test_portrait_validation_by_nature(store):
     journal = store.journal_between()
     items = [
         op(kind="work", subject="money", text="The user will marry a rich pilot.", journal_ids=[ids["joke"]]),
-        op(kind="preference", subject="Claude", text="The user has unlimited Opus accounts.", journal_ids=[ids["opus"]]),
+        op(kind="preference", subject="island", text="The user owns a private island.", journal_ids=[ids["boast"]]),
         op(subject="rich partner bit", text="Jokes about needing a millionaire pilot partner (Discord, 2026-09-25).",
            journal_ids=[ids["joke"]], aspect="joke"),
         op(subject="register", text="Swears casually, Hinglish with friends.", journal_ids=[ids["talk"]]),
@@ -250,12 +250,12 @@ def test_portrait_validation_by_nature(store):
 
 def test_rejournaled_fact_may_be_dropped_and_is_marked(store):
     ids = portrait_setup(store)
-    [(ok, fid)] = store.commit_portrait_changes(None, [FactChange("ADD", None, "work", "Claude", "Has unlimited Opus.",
-                                                                  0.5, [ids["opus"]], T0)])
-    store._query("UPDATE journal SET superseded_at=?, superseded_by=99 WHERE id=?", (T0, ids["opus"]))
+    [(ok, fid)] = store.commit_portrait_changes(None, [FactChange("ADD", None, "work", "island", "Owns an island.",
+                                                                  0.5, [ids["boast"]], T0)])
+    store._query("UPDATE journal SET superseded_at=?, superseded_by=99 WHERE id=?", (T0, ids["boast"]))
     worker = PortraitWorker(store, client=object())
     facts = store.portrait_facts()
-    line = worker._fact_line(facts[0], lambda v, c: str(v or ""), store.superseded_journal([ids["opus"]]))
+    line = worker._fact_line(facts[0], lambda v, c: str(v or ""), store.superseded_journal([ids["boast"]]))
     assert "re-journaled entries" in line
     changes, outcomes = worker._validate([op(op="INVALIDATE", fact_id=fid, kind="work")], facts, [], T0 + 60)
     assert outcomes[0].status == "applied" and changes[0].op == "INVALIDATE"
@@ -289,7 +289,7 @@ def test_coach_leaves_out_uncertain_and_labels_jokes(store):
     view = observe(store, T0 + 600, NudgeConfig())
     view.since = T0 - 60
     text = build_coach_message(store, view, Trigger("periodic"), [], NudgeConfig())
-    assert "unlimited Claude Opus" not in text and "[joke/banter - humour, not a fact]" in text
+    assert "private island" not in text and "[joke/banter - humour, not a fact]" in text
 
 
 def test_recall_and_mouth_carry_it():

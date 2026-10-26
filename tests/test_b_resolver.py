@@ -1,4 +1,4 @@
-"""Phase B, the resolver (docs/research/revamp-2026-10-02/24-build-B.md): the people and routes index (migration 28,
+"""Phase B, the resolver (the design notes): the people and routes index (migration 28,
 yuki.memory.contacts), the people directory, route ranking with a margin, the user's route preference, the referent
 register and the task frame (yuki.agent.frame), the about tool, and the action weight of Yuki's own past exchanges in
 related() (follow-up 4).

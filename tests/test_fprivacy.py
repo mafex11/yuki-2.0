@@ -1,4 +1,4 @@
-"""Phase F, branch fPrivacy (docs/research/audit-2026-10-09/PLAN.md §3 F items 1, 2, 6; Appendix B.1):
+"""Phase F, branch fPrivacy (the design notes §3 F items 1, 2, 6; Appendix B.1):
 
 * trace privacy: a document or pane nested in a list item, a document or a group is content (a digest, never its
   name); one function decides the live capture and the Yuki-run scrub of the names stored before the rule;

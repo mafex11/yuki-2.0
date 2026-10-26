@@ -1,4 +1,4 @@
-/* Work (the page the user approved on 4 Oct, docs/research/revamp-2026-10-02/68-build-appWork.md): the week's hours in
+/* Work (the page the user approved on 4 Oct, the design notes): the week's hours in
    the head with how many things are due tomorrow; Today across the top (focus against your usual by now, the longest
    stretch, what you worked on, what's coming up); then two balanced columns: Your list and Waiting on on the left,
    Needs your reply and You said you'd on the right. Every row is one line and a short meta line; its keys show over

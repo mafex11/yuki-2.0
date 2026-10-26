@@ -7,7 +7,7 @@
   late" authorises nothing later); each line shows its age and the request boundary.
 
 Invented names only. Stub desk and stub model; the judge's verdict itself is the model's (checked offline against the
-real model in docs/research/revamp-2026-10-02/30c-build-D-personal.md §8), so these tests check what it is shown.
+real model in the design notes §8), so these tests check what it is shown.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """The status strip: what Yuki is doing, bottom-right, from the moment a request starts.
 
 Every agent run (typed, spoken, anything) shows here **from its first second**
-(2026-10-03, ``docs/research/revamp-2026-10-02/06-proactive-do-it.md`` §4.4: the one real
+(2026-10-03, ``the design notes`` §4.4: the one real
 "Do it" ran 9.6 s before anything appeared, and nothing on screen could stop it): the
 thinking line (Horizon's dotted grey wave, drifting while it works), the current step,
 the time it has taken and the step count, and a **Stop** pill that never takes focus and

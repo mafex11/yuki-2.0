@@ -48,6 +48,24 @@ def _brain_default() -> str:
     return brain_mode_of(data.get("brain") if isinstance(data, dict) else None)
 
 
+def _user_names_default() -> list[str]:
+    """``YUKI_USER_NAMES`` (comma-separated), else ``user_names`` in ``%LOCALAPPDATA%/Yuki/settings.json``, else none:
+    the user's own names live on their PC, never in the code."""
+    forced = os.environ.get("YUKI_USER_NAMES")
+    if forced:
+        return [n.strip() for n in forced.split(",") if n.strip()]
+    try:
+        import json
+
+        from yuki.core.models import prefs_path
+
+        data = json.loads(prefs_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, ImportError):
+        return []
+    names = data.get("user_names") if isinstance(data, dict) else None
+    return [str(n) for n in names if str(n).strip()] if isinstance(names, list) else []
+
+
 #: The skills switch (failure fix-plan Item 1, 10 Oct): ``on`` everything (the shipped capabilities and the skills Yuki
 #: learned from the user), ``capabilities`` the shipped capabilities only (the learned rows are not loaded, so no menu,
 #: tool enum, planner or card sees them), ``off`` no skills anywhere (the old hands and tools: ``Settings.skills``).
@@ -359,7 +377,9 @@ class Settings:
         user_names: The user's own names and handles as apps show them. Memory
             capture marks messages from these senders as the user's, and the
             journal is told these names are the user (plus the names the
-            watcher learns on screen, e.g. "Kian (you)").
+            watcher learns on screen, e.g. "<name> (you)"). None by default:
+            ``YUKI_USER_NAMES`` (comma-separated), else ``user_names`` in
+            ``%LOCALAPPDATA%/Yuki/settings.json`` (:func:`_user_names_default`).
 
     Voice (``voice_*``, docs/VOICE.md §15). None of it costs anything until
     voice is turned on from the tray or its hotkey, or the wake word is:
@@ -536,7 +556,7 @@ class Settings:
         voice_router: A small model call decides, from the user's words alone, whether the turn needs the thinker,
             and starts it ~1 s after they stop instead of when the talker begins its hand-off (v3.17, E3a). On since
             vGame (5 Oct: the user asked for the thinker to start at once); in a game or a call only on words said to
-            Yuki by name (docs/research/revamp-2026-10-02/26-build-voice-speed.md, 79-build-vGame.md).
+            Yuki by name (the design notes, 79-build-vGame.md).
         voice_router_end: D1 (20 Oct 2026, keyword audit A1): the router's small model also judges, on each user turn
             and under every brain, whether the user is ending the conversation (they send Yuki away or sign off); when
             it is and nothing waits for their words or runs for them, the conversation ends at once with the end cue
@@ -571,7 +591,7 @@ class Settings:
             (The learned reflexes of 17 Oct, ``voice_reflex*``, were removed on 20 Oct, keyword audit A5 / D2: exact
             words mapped to a stored hand ran it before any model read the turn; every hand is the talker's or the
             ONE agent's own call again, and the stored book is deleted once by code.)
-        skills: The skill path (PLAN.md Phase S, docs/research/audit-2026-10-09): the talker's Skills menu and its
+        skills: The skill path (PLAN.md Phase S, the design notes): the talker's Skills menu and its
             ``run_skill`` / ``keep_usual`` hands, the thinker's ``run_skill`` tool. With a ``volume`` skill loaded the
             talker's own ``app_volume`` hand, its volume keys and the thinker's ``app_volume`` tool are off; ``false``
             brings the old behaviour back everywhere (those hands and tools, no menu, no pinned skill). Read like
@@ -616,7 +636,7 @@ class Settings:
         default_factory=lambda: {model: dict(rates) for model, rates in DEFAULT_PRICING.items()}
     )
     requests_csv: Path = Path("logs/requests.csv")
-    user_names: list[str] = field(default_factory=lambda: ["Kian", "Mafex", "mafex11"])
+    user_names: list[str] = field(default_factory=_user_names_default)
     voice_hotkey: str = "ctrl+alt+y"
     voice_wake: bool = True
     voice_wake_during_calls: bool = True
@@ -721,13 +741,13 @@ class Settings:
     voice_local_models_dir: str = ""
     voice_speech_guard: bool = True
     voice_speech_guard_timeout_s: float = 2.5
-    # v3.16: "marker" by the offline eval (docs/research/revamp-2026-10-02/21-build-A1-A2.md): 220 replies, 0 unmarked,
+    # v3.16: "marker" by the offline eval (the design notes): 220 replies, 0 unmarked,
     # 0 reasoning in speech; "guard" (voice.json speech_channel) brings back the blocking line check
     voice_speech_channel: str = "marker"
     voice_end_tone: bool = True
     voice_prewarm: bool = True
     voice_prewarm_delay_s: float = 20.0
-    # v3.17 voice speed (docs/research/revamp-2026-10-02/26-build-voice-speed.md)
+    # v3.17 voice speed (the design notes)
     voice_results_by_code: bool = True
     voice_prefetch_results: bool = True
     voice_router: bool = True
@@ -737,7 +757,7 @@ class Settings:
     voice_router_end: bool = True
     voice_talker: str = ""
     voice_reply_words_cap: int = 45
-    # vGame (docs/research/revamp-2026-10-02/79-build-vGame.md)
+    # vGame (the design notes)
     voice_fast_ack: bool = True
     voice_focus_mode: bool = True
     voice_focus_close_on_quiet: bool = True
@@ -748,7 +768,7 @@ class Settings:
     voice_mmcss: bool = True
     # v3.18: the talker's hands are kept as run traces in memory (the old talker learning path is deleted, kClean)
     voice_hand_traces: bool = True
-    # Phase S skills (docs/research/audit-2026-10-09/PLAN.md; yuki.skills.DEFAULTS mirrors these). The switch (failure
+    # Phase S skills (the design notes; yuki.skills.DEFAULTS mirrors these). The switch (failure
     # fix-plan Item 1): YUKI_SKILLS, else "skills" in settings.json, else on; "capabilities" hides the learned rows
     skills: bool = field(default_factory=lambda: skills_mode() != "off")
     skills_learned: bool = field(default_factory=lambda: skills_mode() == "on")
@@ -809,7 +829,7 @@ class Settings:
     #: left out when it does not answer in time (measured 2026-09-29: pipe p50 1.4 ms, focus p50 ~10 ms).
     now_wait_ms: float = 50.0
     focus_wait_ms: float = 50.0
-    # -- revamp D, part 1: the brain's safety and speed (docs/research/revamp-2026-10-02/30b-build-D-brain.md) --
+    # -- revamp D, part 1: the brain's safety and speed (the design notes) --
     #: The authorization judge (yuki.agent.judge): a separate Haiku call that sees only the user's words and the
     #: proposed call, for calls whose tool metadata can destroy or reach someone and kinds the autonomy policy holds
     #: below "do it and tell me". Its model, and how long a verdict may take before the call is held (fail closed).
@@ -849,7 +869,7 @@ class Settings:
     takeover_idle_stop_s: float = 600.0
     #: A request pack (Agent.build_pack) older than this is rebuilt for its screen half (the memory half is kept).
     pack_max_age_s: float = 20.0
-    # -- the brain rebuild (docs/research/audit-2026-10-09/next/brain-design.md rev 2, release 17a) --
+    # -- the brain rebuild (the design notes rev 2, release 17a) --
     #: Which brain takes a request (:data:`BRAIN_MODES`, :mod:`yuki.one.modes`): ``all`` (typed and spoken on the plan
     #: brain; the default since 18 Oct and the rollback), ``one`` (phase 4: ONE Sonnet 5.5 agent owns the whole turn
     #: on voice and typed, ``yuki.one``), ``typed`` (typed only), ``loop`` (none: the old step-by-step agent and the

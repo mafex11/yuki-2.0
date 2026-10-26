@@ -1,4 +1,4 @@
-"""Offline checks of the coach and conversation fixes from docs/research/coach-and-answers-review.md.
+"""Offline checks of the coach and conversation fixes from the design notes
 
 Temp databases, synthetic timelines and stub models only; nothing touches the desktop
 or a real model.

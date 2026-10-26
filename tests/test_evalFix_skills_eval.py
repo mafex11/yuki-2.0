@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from test_evalFix_world import (MOMENTS_DDL, SECRET_WORDS, Rebuild, digest, hermetic, live, ts)  # noqa: F401
+from test_evalFix_world import (MOMENTS_DDL, SECRET_WORDS, Rebuild, bars, digest, hermetic, live, ts)  # noqa: F401
 from yuki.eval import dbcopy
 from yuki.eval import habits_replay as H
 from yuki.memory.store import Store
@@ -244,7 +244,7 @@ def test_run_dry_run_prints_the_plan_without_a_copy(hermetic, capsys, monkeypatc
     assert "A real run would be refused: the most it could cost" in capsys.readouterr().out
 
 
-def test_run_moments_on_a_copy(live, capsys, monkeypatch):
+def test_run_moments_on_a_copy(live, bars, capsys, monkeypatch):
     calls = []
 
     def runner_for(path, **kw):

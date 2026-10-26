@@ -109,7 +109,7 @@ CONVERSATION_IDLE_S = 30 * 60.0
 #: words in play, a current thread is shown when it is ON SCREEN or its own vector is at least this near the words;
 #: the freshest screens keep the last :data:`RECENT_TAIL_S` whole and, before that, only the window stretches whose
 #: text is at least :data:`RECENT_WORDS_MIN_COSINE` near the words. Measured on the logged requests replayed on a copy
-#: of the real memory (docs/research/revamp-2026-10-02/22-build-A6-A9.md).
+#: of the real memory (the design notes).
 THREAD_WORDS_MIN_COSINE = 0.40
 RECENT_TAIL_S = 180.0
 RECENT_WORDS_MIN_COSINE = 0.45
@@ -121,13 +121,13 @@ RECENT_FACT_LAG_S = 15 * 60.0
 DIET_LIMIT = 6
 DIET_CONTEXT_ITEMS = 3
 #: Yuki's own past exchanges and conversation summaries from another day weigh less for an action request (revamp
-#: follow-up 4, docs/research/revamp-2026-10-02/23 L3: on the first live request after Phase A, 3 of the 6 related items
+#: follow-up 4, the design notes L3: on the first live request after Phase A, 3 of the 6 related items
 #: were Yuki's own chats from other days at cosine 0.60-0.69 - not echoes, but low value next to the request's facts,
 #: episodes and threads). Their score drops by this much (a weight, on the same scale as the cosine) and at most
 #: :data:`ACTION_OWN_PER_KIND` of each such kind is kept. What happened earlier the same day keeps its weight (it is the
 #: day's context). The caller says what an action request is (the agent: a spoken hand-off, or a request whose task
 #: frame resolved a person, a route or a referent in play - measured, never from the words). Measured on the logged
-#: requests replayed on a copy of the real memory (docs/research/revamp-2026-10-02/24-build-B.md).
+#: requests replayed on a copy of the real memory (the design notes).
 ACTION_OWN_DISCOUNT = 0.10
 ACTION_OWN_PER_KIND = 1
 OWN_EXCHANGE_KINDS = ("chat", "session")

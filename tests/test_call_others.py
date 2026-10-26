@@ -1,4 +1,4 @@
-"""Calls, both sides (owner's decision 3 Oct 2026; docs/research/revamp-2026-10-02/60-build-call-others-capture.md).
+"""Calls, both sides (owner's decision 3 Oct 2026; the design notes).
 
 The user's microphone plus each consented app's own audio (process loopback) as tracks of one voice session; a
 full-screen game's voice chat as a session of its own, asked only when a card can be seen; every line attributed

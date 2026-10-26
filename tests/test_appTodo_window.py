@@ -1,4 +1,4 @@
-"""appTodo (4 Oct; docs/research/revamp-2026-10-02/64-build-appTodo.md): the to-do list in the window, open_yuki at the
+"""appTodo (4 Oct; the design notes): the to-do list in the window, open_yuki at the
 list, the thinker's map of Yuki's own window, and no threads anywhere in the window.
 
 The live test of 4 Oct: Yuki added seven to-dos by voice, then said the list "lives inside the Work tab thread card",

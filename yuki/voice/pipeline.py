@@ -1024,7 +1024,7 @@ def measured_near(items: Any, names: Any, *, skip: Any = ()) -> list[tuple[float
     in which any of ``names`` of :data:`LITERAL_MIN_LETTERS` letters or more stands as written (``names.literal``;
     review M1: "Open Python." with Pythonw on their list is Python said right, never a mishearing of Pythonw). The
     bar, the margin and the measure are names21's (calibrated on the user's turns); re-measured by voice22 on the
-    user's past spoken turns before shipping (docs/research/final-test-2026-10-19/builds/voice22.md). ``best_match``,
+    user's past spoken turns before shipping (the design notes). ``best_match``,
     ``score`` and ``literal`` are imported inside ``try/except ImportError`` (contract C14 and its merge note):
     without them, nothing; ``TURN_BAR`` is read with names21's value as the default. Never raises."""
     try:
@@ -4408,7 +4408,7 @@ def talker_you() -> TalkerYou:
 # oVoice (phase 4, ``brain = "one"``): the ONE agent's voice driver
 # ---------------------------------------------------------------------------------------------------------------------
 #
-# Design: docs/research/audit-2026-10-18/phase4-design.md with phase4-addendum.md (binding). Under ``brain = "one"``
+# Design: the design notes with phase4-addendum.md (binding). Under ``brain = "one"``
 # one Sonnet 5.5 agent owns the whole spoken turn: it talks, acts with the generic verbs (``yuki.one.tools``), gets
 # what changed with every result (the runner, ``yuki.one.runner``), and decides itself when it is done; every act
 # passes the one gate (``yuki.one.policy``, called by the runner); the budget (``yuki.one.budget``) is the runaway

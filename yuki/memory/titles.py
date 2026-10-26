@@ -83,7 +83,7 @@ LABEL_RULES = (
 )
 SUMMARY_FIELD = (
     f"The app's one-line label for the fact: at most {SUMMARY_MAX_WORDS} words, its gist "
-    "(\"Founding AI engineer at Corvana\", \"Plays Valorant most nights with friends\", \"Running joke about "
+    "(\"Founding AI engineer at Corvana\", \"Plays chess most nights with friends\", \"Running joke about "
     "his cat\"). For an open_loop, a title of 3 to 6 words of what is owed (\"Send Varun the demo video\"). "
     + LABEL_RULES
 )
@@ -205,7 +205,7 @@ at a glance, so every label is short. Each item is one thing memory holds: a por
 stories they tell - and the people in their life), an open loop (something owed by or to them), a to-do or \
 a promise of Yuki's, or a way Yuki learned to do something on the PC. Each line asks for one label:
 - a summary: AT MOST {SUMMARY_MAX_WORDS} WORDS, best four to six - the gist, not every detail. \
-"Founding AI engineer at Corvana", "Plays Valorant most nights with friends", "Teases Rohan about his \
+"Founding AI engineer at Corvana", "Plays chess most nights with friends", "Teases Rohan about his \
 aim", "Streams Minecraft to friends on Discord". A person: who they are to the user or what they share, \
 only as the item says it ("Colleague who reviews the demo videos", "School friend studying engineering \
 in Pune") - never one moment, something shared once or a figure. A way Yuki learned: the way that \

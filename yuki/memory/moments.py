@@ -1,6 +1,6 @@
 """Moments: one table of state changes, rebuildable from what memory already keeps (plan rev 4, Phase F item 4).
 
-``docs/research/audit-2026-10-09/PLAN.md`` decisions D1 (the vocabulary), D7 (where a meeting join comes from), D18
+``the design notes`` decisions D1 (the vocabulary), D7 (where a meeting join comes from), D18
 (Yuki's own runs are Yuki's); spec ``round3/map-foundations.md`` F1 (its Spotify Web API parts are void: zero setup).
 
 A *moment* is *that* something changed: a call joined, a page reached, a playlist started, a level moved. Nothing

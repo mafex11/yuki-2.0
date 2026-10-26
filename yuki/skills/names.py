@@ -60,7 +60,7 @@ group: within it the higher score wins, then the longer run of heard words, then
 before a site of the same name wins a tie). Otherwise ``None``: today's behaviour, unchanged.
 
 Calibrated on 19 Oct on the DB copy (200 own names: 123 apps, 77 sites), the clips' transcripts of final-B/final-D and
-the user's 1008 turns; the numbers are at each constant and in docs/research/final-test-2026-10-19/builds/names21.md.
+the user's 1008 turns; the numbers are at each constant and in the design notes
 
 Contract C11 (voice21): :func:`own_names` and :func:`best_match` (name mode only, contract K2), both pure apart from
 the store read, never raising.

@@ -1,4 +1,4 @@
-"""Revamp A8 (docs/research/revamp-2026-10-02/22-build-A6-A9.md): one opacity measure said as a number and a fact,
+"""Revamp A8 (the design notes): one opacity measure said as a number and a fact,
 "could not be read back" as expected-unverifiable (no escalation), and a vanished window's successor.
 
 Fake model client and stub desks: no desktop, no network.

@@ -1,4 +1,4 @@
-"""appLearn (4 Oct, docs/research/revamp-2026-10-02/54-build-appLearn.md): only a verified success is learned and
+"""appLearn (4 Oct, the design notes): only a verified success is learned and
 announced. The user: "the things it should learn should be the ones that it successfully executed. It just gives me the
 card that it learned this and that, but it was all failure."
 

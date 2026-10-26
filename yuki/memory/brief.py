@@ -1,6 +1,6 @@
 """The personal brief: who the user is, how to be with them and what is live, sliced per consumer (revamp 09 P1, P4).
 
-Design: ``docs/research/revamp-2026-10-02/09-personal.md`` §8 P1 and P4; build report ``30c-build-D-personal.md``.
+Design: ``the design notes`` §8 P1 and P4; build report ``30c-build-D-personal.md``.
 
 Yuki knew a lot about the user and showed almost none of it (09 §1): the same knowledge sat in eight places and each
 consumer got an accidental slice - the voice thinker no portrait at all, the talker a cut personality block, the card

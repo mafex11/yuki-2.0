@@ -1,6 +1,6 @@
 """The task frame: who and what a request may refer to, and what acting on it involves (revamp Phase B3-B4).
 
-"message him this" needs three things no similarity search gives (docs/research/revamp-2026-10-02/01 §3, 02 §4.2):
+"message him this" needs three things no similarity search gives (the design notes §3, 02 §4.2):
 who "him" is, what "this" is, and where the user talks with that person. The brain had a 1.8k-character memory dump
 and had to guess. This module builds, **in code only** (no model call, a few ms), a small structured frame for each
 request, the same for typed and voice:

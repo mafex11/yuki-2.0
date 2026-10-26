@@ -1,4 +1,4 @@
-"""E2 spike: measure the WebView2 Yuki window on this PC (docs/research/revamp-2026-10-02/08-ui-inventory.md §7.6).
+"""E2 spike: measure the WebView2 Yuki window on this PC (the design notes §7.6).
 
 Launches ``python -m yuki.ui.web_window --offscreen`` (a window beyond the left edge of every monitor that never
 activates; it renders the Home page from the fixture of invented data) and measures, per GPU configuration:

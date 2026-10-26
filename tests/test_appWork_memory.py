@@ -1,4 +1,4 @@
-"""The Work page's memory side (docs/research/revamp-2026-10-02/68-build-appWork.md): migration 36 (work_items), the
+"""The Work page's memory side (the design notes): migration 36 (work_items), the
 reply candidates from the stored chats, the one-call check (chats, loops, meetings) validated in code, the board the
 window reads, the user's marks, putting ended items back, and the add field's due words.
 

@@ -420,8 +420,8 @@ class Context:
         """``{"W<id>" | "G<id>": until}``: the work threads and goals today's dated events and goals rest on, while
         those are still ahead - an event until its follow-up moment (:func:`_event_over_at`), a goal until an hour past
         its due time (or the end of its day). A check-in about one of them waits until then: the Today line already
-        says it, and "did it land?" hours before the interview it leads to is the wrong question (craft-3, 26 Oct:
-        the interview, its prep row and the W123 "did it land" check-in were three lines about one thing). Measured
+        says it, and "did it land?" hours before the event it leads to is the wrong question (craft-3, 26 Oct:
+        an event, its prep row and a thread's "did it land" check-in were three lines about one thing). Measured
         links only - an event's evidence facts' own thread ids, a goal's own id and thread - no words read."""
         if self._held is not None:
             return self._held
@@ -704,8 +704,8 @@ def gen_followup_checkin(ctx: Context) -> list[Candidate]:
     the ledger's mode now. Rule 2's list-item case rests on the item id (the guard accepts it).
 
     craft-3 (26 Oct): none about a goal or a thread that today's dated events or goals rest on while those are still
-    ahead (:attr:`Context.held`): the 06:35 card would have read "Interview prep: did it
-    land, or are you still on it?" under the interview's own line, four hours before it."""
+    ahead (:attr:`Context.held`): a morning card would have read "<event> prep: did it
+    land, or are you still on it?" under the event's own line, hours before it."""
     cands: list[tuple[int, float, Candidate]] = []
     store, now = ctx.store, ctx.now
     goals = ctx.goals
@@ -1098,12 +1098,12 @@ def gen_event_followups(ctx: Context) -> list[Candidate]:
     tc1 (26 Oct): one follow-up per event, however many rows it was stored as (``ctx.events`` is folded; every row's
     ``followup:`` mark counts), and never before the event: an event with no sure time is asked from
     ``ALL_DAY_ASK_AT``, and not before ``FOLLOWUP_AFTER_S`` past the latest time any of its rows named (an offered
-    07:30 made 08:30 "how did it go?" eligible two hours before a 10:30 interview). Shown, it marks the threads its
+    07:30 made 08:30 "how did it go?" eligible two hours before a 10:30 event). Shown, it marks the threads its
     facts rest on as asked about (``about:W<id>``), so a thread check-in does not ask the same thing again (craft-3).
 
     Only an occasion is asked (:func:`yuki.memory.presence.event_kind`: the scan's kind, kept or corrected by the vet;
-    a row stored before that field only with a sure time). A task is done or not, and nothing "goes" (26 Oct: "Tamberlane
-    Studio interview preparation - 2 days remaining (yesterday) - how did it go?")."""
+    a row stored before that field only with a sure time). A task is done or not, and nothing "goes" (a prep
+    task was once asked "<event> preparation - 2 days remaining (yesterday) - how did it go?")."""
     now = ctx.now
     out: list[Candidate] = []
     for ev in ctx.events:
@@ -1243,7 +1243,7 @@ def _cited_items(ev: dict[str, Any]) -> set[str]:
 
 def _same_thing(ev: dict[str, Any], plan: dict[str, Any], corpus: list[frozenset[str]]) -> bool:
     """Whether an event that cites a plan on their list is that plan (T3, 26 Oct): a cite alone is not enough - a prep
-    to-do ("Prepare 7-slide presentation") is cited as evidence for the interview's day and is a different thing. The
+    to-do ("Prepare the slides") is cited as evidence for the event's day and is a different thing. The
     words must measure as one (:func:`yuki.memory.presence.title_overlap` by ``SAME_EVENT_MIN``, the rarity of each
     word over the stored event titles), and a sure time of the event must be the plan's own minute."""
     plan_words = event_words(resolve(plan["words"]))
@@ -1262,19 +1262,19 @@ def dated_today(ctx: Context) -> list[Candidate]:
     timed ones first; at most :data:`DATED_MAX`. Each once a day; shown, it marks its plans card seen (one mention per
     plan). Content-free ``why``.
 
-    tc1 (26 Oct 2026: "Today: Hollis ... at 07:30" / "... at 10:30" / "... at 10:30" for one 10:30 interview):
+    tc1 (26 Oct 2026: "Today: <event> at 07:30" / "... at 10:30" / "... at 10:30" for one 10:30 event):
 
     * **One line per thing.** An event is one row however many times the scan stored it (``ctx.events`` is folded,
       :func:`yuki.memory.presence.fold_events`). Two of today's things are one line when their words are the same, or
       when one cites the other (an event resting on a plan on their list, ``C<id>`` = ``commit:<id>``) and their
       words measure as one (:func:`yuki.memory.presence.title_overlap` by ``SAME_EVENT_MIN``): a prep to-do cited as
-      evidence for the interview's day is its own line (T3). Two things whose times differ are never one line. A line
+      evidence for the event's day is its own line (T3). Two things whose times differ are never one line. A line
       is skipped when any of its rows was shown or seen today, and every row's mark is set with it.
     * **A time only when it is sure, and only with its own words.** A list item's or goal's time is the user's own; an
       event has a time only when the scan stated it settled, in a zone code resolved, converted by code. A line's words
       are those of the thing whose time it shows (an all-day to-do never carries the event's time). A line with a time
       leaves once the time has passed; one without stays for the day, until an hour past the latest time any of its
-      rows named (T5: an interview over by 10:45 is not "waiting" at 15:00).
+      rows named (T5: an event over by 10:45 is not "waiting" at 15:00).
     * **Plain words.** The Today card says the title (clipped at a whole word), then " at HH:MM" only when sure: under
       "Here's what's waiting for you today" no "Today:" (``today_line``). Everywhere else - the away list, "what's
       waiting?" - the line says its day: "<title>, today at 10:30", "<title>, due today" (``digest_line``, craft-2).

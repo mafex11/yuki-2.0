@@ -1,4 +1,4 @@
-"""Voice v3.16 (docs/research/revamp-2026-10-02/04 §6 F1-F7, 07 §6 A-B): calls that never end on an owed answer, the
+"""Voice v3.16 (the design notes §6 F1-F7, 07 §6 A-B): calls that never end on an owed answer, the
 end cue, the stop record, a stall-proof idle clock, TTS resilience, listening off made visible, device identity, the
 owed-output ledger and the marker speech channel. Offline only: fakes and stand-ins, no microphone, no speakers, no
 network beyond localhost fakes.

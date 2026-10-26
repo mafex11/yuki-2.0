@@ -4,7 +4,7 @@ route on the invented-name fixtures", H1, M1a/b, M2, M5, M6, H2, L13).
 Offline: every run goes through the real engine (``yuki.skills.engine``), the real connection files
 (``yuki/skills/connections/{spotify,audio}.toml``) and the real driver (``yuki.skills.spotify_route``), with the live
 desktop replaced by a stand-in (:class:`FakeDesk`): Spotify's window is a synthetic UI Automation tree shaped like
-``docs/research/audit-2026-10-09/round4/spotify-desktop-route.md`` §2 with invented names, read through the real reader
+``the design notes`` §2 with invented names, read through the real reader
 code (``yuki.connect.spotify_desktop.UiaTree``) and the shared fake automation. No window, key, click, sound, network or
 real database: temp databases only.
 """

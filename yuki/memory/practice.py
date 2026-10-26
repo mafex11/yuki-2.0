@@ -2,7 +2,7 @@
 
 Practice memory (revamp Phase C, migration 29) once held four learners' output in ``playbooks``: the demo learner, the
 habit miner, the run learner's post-mortems and distills, the old loop's session pitfalls and slider ways. The audit
-of 17 Oct (docs/research/audit-2026-10-17/00-SYNTHESIS.md, decision 3) switched those learners off and deleted them;
+of 17 Oct (the design notes, decision 3) switched those learners off and deleted them;
 migration 45 retired every row they wrote, and nothing writes a new one. What stays:
 
 * **Run traces** (``runs``): every agent request and voice hand, one row per step - the tool, the target (the app as

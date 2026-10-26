@@ -113,7 +113,7 @@ Practice memory (migration 29, yuki.memory.practice; its learners were retired b
     memory.you_card(purpose="talker" | "planner" | "judge") -> str   # what Yuki knows about the user (contract C1)
     memory.run_ledger(since=None, until=None) -> list[dict]   # what Yuki did: requests and their acting steps
 
-The 3 Oct feedback (migration 33; docs/research/revamp-2026-10-02/38 and 43-build-appA-memory.md). Direct ops, no model
+The 3 Oct feedback (migration 33; the design notes and 43-build-appA-memory.md). Direct ops, no model
 on the click path; every text a list returns has a ``shown`` form said to the user (None until written)::
 
     memory.pin_fact("fact:N", on=True) -> {"ok", "ref", "pinned"}          # pin AND unpin (its own flag)

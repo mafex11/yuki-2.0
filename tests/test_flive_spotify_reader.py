@@ -1,7 +1,7 @@
 """fLive: Spotify's desktop window reader (PLAN.md D4, B.1 "Spotify window reader").
 
 Offline: synthetic UI Automation trees with invented names, shaped like the 28 Library reads in
-docs/research/audit-2026-10-09/round4/spotify-desktop-route.md §2, driven through the real reader code
+the design notes §2, driven through the real reader code
 (:class:`yuki.connect.spotify_desktop.UiaTree`) by the shared fake automation (tests/_fake_uia.py). Nothing touches a
 window, Spotify, the network or the real database.
 """

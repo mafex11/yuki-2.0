@@ -464,7 +464,7 @@ that, or what the call was about. At most two; most calls need none."""
 
 
 #: Text the user typed into, or read from, another AI tool (migration 17, ``journal.tainted``): the model
-#: judges it from the content, never from a site or app name (docs/research/coach-and-answers-review.md
+#: judges it from the content, never from a site or app name (the design notes
 #: C2: a ChatGPT test prompt was read as a fact about the user's life).
 OTHER_AI_GUIDANCE = """\
 TEXT FOR OR FROM ANOTHER AI TOOL. The user also talks to other AI assistants (a chatbot in the \

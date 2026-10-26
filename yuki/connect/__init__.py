@@ -1,4 +1,4 @@
-"""Zero-setup connections to the user's apps (docs/research/audit-2026-10-09/PLAN.md D0, D4).
+"""Zero-setup connections to the user's apps (the design notes D0, D4).
 
 Nothing in this package needs an account, an API key, a sign-in, a token or a per-app install. It holds:
 

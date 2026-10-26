@@ -1,5 +1,5 @@
 """Spotify and audio skills through Spotify's own desktop window (PLAN.md D0, D4, D17, D19; Phase S-1: ``volume``
-and ``spotify.playlist``; evidence ``docs/research/audit-2026-10-09/round4/spotify-desktop-route.md``).
+and ``spotify.playlist``; evidence ``the design notes``).
 
 **Zero setup.** Nothing here needs an account, a key, a token or a sign-in: Spotify's window is driven through UI
 Automation patterns (Invoke, RangeValue, Value), Windows' media session (play only, never a toggle), Core Audio (the

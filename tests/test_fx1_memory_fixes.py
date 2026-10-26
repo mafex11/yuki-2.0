@@ -1,4 +1,4 @@
-"""Review 34 fixes, builder fx1, memory side (docs/research/revamp-2026-10-02/34-review.md, 35-build-review-fixes.md).
+"""Review 34 fixes, builder fx1, memory side (the design notes, 35-build-review-fixes.md).
 
 H8 the thread-date repair's floor is when memory began (never the oldest capture the 30-day prune left), M5 an empty
 people index falls back to the portrait, M9 withdrawn_journal is indexed, short-circuited and cached, M10 re-read

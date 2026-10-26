@@ -109,9 +109,9 @@ def deadline_lines(store: Any, items: Sequence[Any], now: float, safe: Callable[
     commitments), the open goals with a due time, the user's personal events not yet past by a week (in their own words,
     :func:`event_status`) - soonest first, each ``- [id] what (status words; stated <day>)``; the events already past
     come after everything else, the latest first, so the ``limit`` drops them before anything still ahead (T1, 26 Oct:
-    past-week copies filled the 12 lines and today's interview was not in the block). An event is one line however
+    past-week copies filled the 12 lines and today's event was not in the block). An event is one line however
     many times the events scan stored it, with a time only when it is sure (:func:`yuki.memory.presence.fold_events`:
-    the 26 Oct block listed one interview at 7:30 AM, three times at 10:30 AM and five times at 2 PM), "stated" on the
+    the 26 Oct block listed one event once at 7:30 AM, three times at 10:30 AM and five times at 2 PM), "stated" on the
     last day memory said it. ``notes`` adds words to an item's line by its ref (the welcome back's "in DUE NOW above").
     ``["DEADLINES:", "(none)"]`` when there is none. Never raises."""
     rows: list[tuple[int, float, str]] = []   # (past event, order, line)

@@ -5,27 +5,23 @@ __pycache__/
 logs/
 docs/voice-samples/
 
-# UI mockups: large, and they show real memory (private)
-docs/ui-mockups/**/*.png
-docs/ui-mockups/**/*.gif
-
 # Windows app build output (packaging/build.ps1)
 packaging/dist/
 packaging/build/
 packaging/Output/
-
-# UI drafts hold real personal data from the memory DB
-docs/ui-mockups/drafts/
-docs/ui-mockups/horizon-field/fonts/
-
-# Mobbin reference boards: third-party screenshots, keep local
-docs/ui-mockups/mobbin/
-
-# 2026-10 revamp designs: real personal data + third-party research screenshots
-docs/ui-mockups/revamp-2026-10/
 
 # Claude Code agent worktrees
 .claude/worktrees/
 
 # the uiautomation library writes this beside the working directory
 @AutomationLog.txt
+
+# Personal working notes and design drafts live outside the repo (a private local folder). Never commit them.
+docs/CHAT-*.md
+docs/HANDBOOK.md
+docs/MORNING-*.md
+docs/test-reports/
+docs/research/
+docs/ui-mockups/
+scripts/resolver_eval.py
+scripts/judge_eval.py

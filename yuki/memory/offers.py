@@ -1,7 +1,7 @@
 """Typed offers: the only things a card's button may do, executed by code from typed fields - never an agent run.
 
 Contract: ``docs/MEMORY.md`` -> "Observation cards" (offers); the evidence and design are in
-``docs/research/revamp-2026-10-02/06-proactive-do-it.md`` §4. The user (2 Oct 2026): "that is my work, I'll do it.
+``the design notes`` §4. The user (2 Oct 2026): "that is my work, I'll do it.
 The agent is not supposed to work on my behalf unless I say it."
 
 Until 3 Oct a card's "Do it" handed one model-written sentence to the full-power agent as the user's own plain

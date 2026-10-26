@@ -15,8 +15,8 @@ look and writer prompts and their budgets are deleted. What stays:
 Every model call is logged to ``logs/memory/nudges-YYYYMMDD.jsonl`` (usage, cost, latency in the clear; request and
 response encrypted).
 
-**One event, one row, a time only when it is sure** (tc1, 26 Oct 2026: the Today card listed one interview three
-times, the first at an offered 07:30 that was never the time). Every reader of the stored events (the card generators,
+**One event, one row, a time only when it is sure** (tc1, 26 Oct 2026: the Today card listed one event three
+times, the first at an offered time that was never the time). Every reader of the stored events (the card generators,
 the card writers' DEADLINES block, the brief, the YouNow snapshot, the scan) reads them through :func:`fold_events`:
 rows of one event on the same local day are one row, and that row has a time only when it is sure
 (:func:`event_time_sure`: a time the scan returned as settled, in a zone code could resolve - the IANA zone the fact
@@ -133,19 +133,19 @@ EVENTS_SCAN_STATE = "presence_events_scan"   # "<journal id>|<at>": how far the 
 #: Two rows stored before tc1 (or two rows at one sure minute) on the same local day are one event when their titles
 #: share at least this much of the lighter title's word weight, on average over the rows already in that event (each
 #: word weighted by its rarity across the distinct stored titles, :func:`word_rarity`). Measured on the 50 rows stored
-#: on 26 Oct 2026: every copy of an event joined it at 0.59 or more (the 11 rows of one interview among them), every
-#: row of another event stayed at 0.42 or less (the prep task for that interview 0.31). It is the lenient measure (a
+#: on 26 Oct 2026: every copy of an event joined it at 0.59 or more (one event stored 11 times among them), every
+#: row of another event stayed at 0.42 or less (the prep task for that event 0.31). It is the lenient measure (a
 #: title inside a longer one scores 1.0: "Doctor appointment" / "... for Sam"), so it is used only where no identity
 #: judgement was made (the rows before tc1, which never come again) or where the sure minute already says one event.
 SAME_EVENT_MIN = 0.55
 #: Any other two rows on one day are one event when they are alike both ways (:func:`words_alike`, the weight they
 #: share over the weight of both) by at least this much. Measured with the 50 stored titles as the corpus: two
-#: different events alike in words score 0.38-0.53 ("Interview with Dr. Adair" / "... Dr. Holt" 0.53, "Doctor
+#: different events alike in words score 0.38-0.53 (two meetings with two different people 0.53, "Doctor
 #: appointment" / "... for Sam" 0.51, "Design review round 1" / "... 2" 0.47, "Call with Sam" / "... Ana" 0.38),
 #: so the bar sits clear above them. A copy reworded more than this stays its own line: two lines, never one lost.
 ALIKE_MIN = 0.6
 #: A new row is written merged with a stored one (for good) only when it is a copy: the same day, the same sure minute
-#: or neither timed, and alike both ways by at least this much (the copies of 26 Oct: 0.90-1.0).
+#: or neither timed, and alike both ways by at least this much (the measured copies: 0.90-1.0).
 COPY_MIN = 0.8
 #: A merged event keeps at most this many evidence ids (the newest).
 EVENT_EVIDENCE_MAX = 8
@@ -156,7 +156,7 @@ _WORD_TRIM = string.punctuation + "…–—‘’“”"
 #: What a found event is, as the scan returns it (a required field: loop 3, an optional tag is not sent) and the vet
 #: keeps or corrects it: an occasion happens at a time and goes well or not (an interview, a call, a trip, a match),
 #: so it is asked about afterwards; a task is a thing to get done (prep, a deadline), done or not: nothing "goes"
-#: (26 Oct: "Tamberlane Studio interview preparation - 2 days remaining (yesterday) - how did it go?").
+#: (a prep task was once asked "<event> preparation - 2 days remaining (yesterday) - how did it go?").
 EVENT_KINDS = ("occasion", "task")
 
 
@@ -514,7 +514,7 @@ def event_words(text: Any) -> frozenset[str]:
 def word_rarity(titles: Sequence[frozenset[str]]) -> dict[str, float]:
     """Each word's weight, ``log(1 + N / df)`` over the DISTINCT titles: a word few titles share weighs most, and a word
     every title shares still counts (three copies of one event, alone in the store, are still alike). Copies of one
-    title count once, so the names a much-copied event repeats (11 rows of one interview) still tell events apart."""
+    title count once, so the names a much-copied event repeats (one event stored 11 times) still tell events apart."""
     distinct = {t for t in titles if t}
     df = Counter(w for t in distinct for w in t)
     n = len(distinct)
@@ -535,7 +535,7 @@ def title_overlap(a: frozenset[str], b: frozenset[str], weight: dict[str, float]
 
 def words_alike(a: frozenset[str], b: frozenset[str], weight: dict[str, float]) -> float:
     """The weight the two titles share over the weight of both (weighted Jaccard, 0..1): alike both ways, so the words
-    one adds ("... for Sam", "... Dr. Holt") count against the match."""
+    one adds ("... for Sam", "... with Ana") count against the match."""
     union = _weight(a | b, weight)
     return _weight(a & b, weight) / union if union else 0.0
 
@@ -575,9 +575,9 @@ def _before_tc1(row: dict[str, Any]) -> bool:
 def _alike(a: dict[str, Any], b: dict[str, Any], wa: frozenset[str], wb: frozenset[str],
            weight: dict[str, float]) -> float | None:
     """How much two stored rows of one day read as one event, as a share of the bar their kind needs (1.0 or more:
-    one event), or None when they can never be one: two sure times that differ are two events (an interview at 11:00
-    and one at 16:00, two practice sessions), and so are an occasion and a task the scan or the vet told apart (the
-    interview and its prep). One sure minute, or two rows from before tc1 (copies stored when no id was shown): the
+    one event), or None when they can never be one: two sure times that differ are two events (a meeting at 11:00
+    and one at 16:00, two practice sessions), and so are an occasion and a task the scan or the vet told apart (an
+    event and its prep). One sure minute, or two rows from before tc1 (copies stored when no id was shown): the
     lenient :func:`title_overlap` against :data:`SAME_EVENT_MIN`. Any other pair: alike both ways,
     :func:`words_alike` against :data:`ALIKE_MIN`."""
     ma, mb = _sure_minute(a), _sure_minute(b)
@@ -649,7 +649,7 @@ def fold_events(rows: Sequence[Any]) -> list[dict[str, Any]]:
 
     1. the rows from before tc1 among themselves (copies stored when no id was shown): a row joins the event of its
        local day it reads most as, on average against its rows (:func:`_alike`: the lenient measure), 1.0 or more -
-       the rule measured on the 50 rows of 26 Oct;
+       the rule measured on 50 stored rows;
     2. every other row joins the event of its day it reads most as, on average against its rows, where the rows from
        before tc1 count once (the one it reads most as: they are copies of one event, and their many wordings must
        not outvote it) - never an event holding a sure time, or a kind (occasion / task), that differs from its own
@@ -774,8 +774,8 @@ def _fold_new(known: list[dict[str, Any]], new: list[dict[str, Any]]) -> tuple[l
     from before tc1) - the same local day, the same sure minute or neither with a sure time, not the other kind
     (occasion / task), and alike both ways (:func:`words_alike`) by :data:`COPY_MIN` - is written merged with it
     (:func:`_fold_group`). Any other new row is written as its own row, even when read folds it with a stored event:
-    a write is for good, a fold for reading is not (T2, 26 Oct: "Interview with Dr. Adair" 11:00 and "... Dr. Holt"
-    16:00 were written as one all-day row). Returns (rows, how many new rows were merged into a stored one)."""
+    a write is for good, a fold for reading is not (T2, 26 Oct: two meetings with two different people at
+    11:00 and 16:00 were written as one all-day row). Returns (rows, how many new rows were merged into a stored one)."""
     rows = list(known)
     weight = word_rarity([event_words(r.get("what")) for r in rows + list(new)])
     joined = 0

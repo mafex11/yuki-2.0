@@ -1,4 +1,4 @@
-"""Voice v3.18 (docs/research/revamp-2026-10-02/29-build-voice-procedures.md): the talker uses what practice memory
+"""Voice v3.18 (the design notes): the talker uses what practice memory
 learned. Hand traces into practice memory (off the voice loop), the Lessons and Learned ways lines in the talker's
 volatile block (measured floors, at most 400 characters of lessons), learned ways run as the talker's hand step by step
 with every step checked and the thinker taking over at the first deviation (never a send the user did not plainly ask

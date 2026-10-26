@@ -1,4 +1,4 @@
-"""Revamp D, part 2: making Yuki personal (docs/research/revamp-2026-10-02/30c-build-D-personal.md, 09 P1-P4).
+"""Revamp D, part 2: making Yuki personal (the design notes, 09 P1-P4).
 
 The personal brief written by the nightly render (fields, budgets, what code refuses), its slices per consumer and
 their wiring (the agent's profile layer, the card writers' ABOUT THE USER, the talker's slice), the content-first

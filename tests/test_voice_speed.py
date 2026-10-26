@@ -1,4 +1,4 @@
-"""Voice v3.17 (docs/research/revamp-2026-10-02/26-build-voice-speed.md): faster and steadier.
+"""Voice v3.17 (the design notes): faster and steadier.
 
 The memory_query hand-off (22 §4), results said by code (C1) and their voice fetched ahead (C2), the router-started
 thinker (E3a), the talker's prompt by measured state (H1), the answer's length budget (H2), popups on the items line

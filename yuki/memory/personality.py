@@ -91,8 +91,8 @@ being themselves and what is a joke:
 what happened.
 - trait: how the user thinks and behaves - their humour, values, tastes, habits, how they talk \
 (register, languages, swearing, banter) and how they are with people - drawn from how they talk \
-and what they say about themselves ("The user swears casually and switches between Hindi and \
-English mid-sentence with friends"; "The user says solving maths problems gives them a rush").
+and what they say about themselves ("The user teases friends with dry one-liners but writes \
+formally at work"; "The user says a long run is how they clear their head").
 - story: an anecdote from their own life that they told ("The user said that in college their \
 alarm clock was so loud the neighbours complained, so they switched to a sunrise lamp").
 - humor: a joke, a bit, a tease, a boast, banter, a hypothetical said for effect, playing along. \

@@ -9,7 +9,7 @@ cut where the call is not: a memory-service restart ends the open row
 same call, and Google Meet drops the microphone whenever the user mutes, so one
 meeting becomes many rows. Nothing downstream read the table, so the agent's
 ``activity`` tool, the coach and the request-origin line never knew a 13-hour
-Discord call was going on (docs/research/coach-and-answers-review.md section 2).
+Discord call was going on (the design notes section 2).
 
 This module is plumbing on those numbers (nothing decrypted, no model):
 

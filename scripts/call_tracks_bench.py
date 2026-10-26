@@ -1,4 +1,4 @@
-"""Footprint of recording both sides of a call, offline (docs/research/revamp-2026-10-02/60-build-call-others-capture.md).
+"""Footprint of recording both sides of a call, offline (the design notes).
 
     python scripts/call_tracks_bench.py [--seconds 60]
 

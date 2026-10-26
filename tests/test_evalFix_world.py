@@ -44,6 +44,28 @@ def evening_days(n: int = 15) -> list[str]:
     return [(start + timedelta(days=i)).date().isoformat() for i in range(n)]
 
 
+#: The world's own E1 weekdays (the onsets of its Zen rows below) and Discord window; the user's real ones live in
+#: their eval folder (``habits_replay.BARS_NAME``), never here.
+E1_DAYS = (
+    ("2026-09-25", "08:58:20", "seen"),
+    ("2026-09-28", "09:02:10", "hold"),
+    ("2026-09-29", "09:01:15", "seen"),
+    ("2026-09-30", "08:59:40", "hold"),
+    ("2026-10-05", "08:57:30", "seen"),
+    ("2026-10-07", "08:56:25", "seen"),
+    ("2026-10-08", "08:58:05", "seen"),
+)
+
+
+@pytest.fixture()
+def bars(monkeypatch) -> None:
+    """The world's expectations for E1 and the Discord evenings, never the user's file."""
+    monkeypatch.setattr(H, "E1_EXPECTED", E1_DAYS)
+    monkeypatch.setattr(H, "EVIDENCE_FROM", ("2026-09-24", "04:00:00"))
+    monkeypatch.setattr(H, "EVIDENCE_TO", ("2026-10-10", "04:00:00"))
+    monkeypatch.setattr(H, "DISCORD_EVENINGS_NEED", 15)
+
+
 @pytest.fixture()
 def hermetic(tmp_path, monkeypatch) -> Path:
     """Never the user's settings, eval files, temp folder or memory: all under the test's own folder."""
@@ -97,15 +119,15 @@ def fill_world(path: Path) -> None:
                 (start, start + 600, "present", process, app, host, f"pk{start}", now, meeting, mic)).lastrowid
 
         # E1: seen by the Meet site (25, 29 Sep, 5 Oct), by the screen (7, 8 Oct), mic holds (28, 30 Sep)
-        call("Zen", "zen", "meeting", ts("2026-09-25", "08:57:52"))
-        row("zen", "Zen", ts("2026-09-25", "08:57:52"), host="meet.google.com", meeting="Google Meet", mic=30)
-        call("Zen", "zen", "mic", ts("2026-09-28", "09:01:01"))
-        row("zen", "Zen", ts("2026-09-28", "09:01:34"), meeting="Zen", mic=20)
-        row("zen", "Zen", ts("2026-09-29", "09:00:06"), host="meet.google.com", meeting="Google Meet", mic=30)
-        row("zen", "Zen", ts("2026-09-30", "09:00:35"), meeting="Zen", mic=9)
-        row("zen", "Zen", ts("2026-10-05", "08:58:57"), host="meet.google.com", meeting="Google Meet", mic=30)
-        call("Zen", "zen", "screen", ts("2026-10-07", "08:55:59"))
-        call("Zen", "zen", "screen", ts("2026-10-08", "08:56:52"))
+        call("Zen", "zen", "meeting", ts("2026-09-25", "08:58:20"))
+        row("zen", "Zen", ts("2026-09-25", "08:58:20"), host="meet.google.com", meeting="Google Meet", mic=30)
+        call("Zen", "zen", "mic", ts("2026-09-28", "09:02:10"))
+        row("zen", "Zen", ts("2026-09-28", "09:02:43"), meeting="Zen", mic=20)
+        row("zen", "Zen", ts("2026-09-29", "09:01:15"), host="meet.google.com", meeting="Google Meet", mic=30)
+        row("zen", "Zen", ts("2026-09-30", "08:59:40"), meeting="Zen", mic=9)
+        row("zen", "Zen", ts("2026-10-05", "08:57:30"), host="meet.google.com", meeting="Google Meet", mic=30)
+        call("Zen", "zen", "screen", ts("2026-10-07", "08:56:25"))
+        call("Zen", "zen", "screen", ts("2026-10-08", "08:58:05"))
         # never meetings: mic holds of FL Studio, VALORANT (a game's voice) and Settings
         for d in ("2026-09-26", "2026-09-27", "2026-10-01"):
             row("fl64", "FL Studio", ts(d, "05:40:00"), meeting="FL Studio", mic=50)
@@ -185,7 +207,7 @@ class Rebuild:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def test_the_reference_finds_e1_from_raw_rows_alone(live):
+def test_the_reference_finds_e1_from_raw_rows_alone(live, bars):
     from yuki.eval import dbcopy
 
     copy = dbcopy.copy_db(live)

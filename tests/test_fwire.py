@@ -1,4 +1,4 @@
-"""fWire: the wave F merge notes, wired (docs/research/audit-2026-10-09/builds/fWire.md).
+"""fWire: the wave F merge notes, wired (the design notes).
 
 fLive's live sources on fMoments' hub in the memory service, the game gate's front source and refusal log in the tray,
 the pattern call's game check, one ``request_id`` from the words to the result (the agent's marker, requests.csv, the

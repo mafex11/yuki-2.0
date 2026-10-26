@@ -1,4 +1,4 @@
-"""Revamp E11-E14 (docs/research/revamp-2026-10-02/32-build-E11-E14.md): the data the Lattice window's new screens
+"""Revamp E11-E14 (the design notes): the data the Lattice window's new screens
 show, wired to memory, and the window's own frame.
 
 * E11 contact rhythm: messages a day with each person, 14 days, both ways (memory's people index + messages);

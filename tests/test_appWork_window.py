@@ -1,4 +1,4 @@
-"""The Work page in the window (docs/research/revamp-2026-10-02/68-build-appWork.md): the page data (memory's merged
+"""The Work page in the window (the design notes): the page data (memory's merged
 list split so each thing shows once, Today with the Day tab's own figures, the natural-date words), the window's ops
 (a row's mark, Open chat, the Continue run, Draft a nudge into the ask bar unsent) and the ask bar's note.
 

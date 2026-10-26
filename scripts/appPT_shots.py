@@ -44,7 +44,7 @@ def _crop(src: Path, box: str, dest: Path) -> Path | None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=Path(os.environ.get("TEMP", ".")) / "yuki-appPT")
-    ap.add_argument("--design", type=Path, default=Path("C:/Users/yukidev/yuki/docs/ui-mockups/revamp-2026-10/3-lattice"))
+    ap.add_argument("--design", type=Path, default=ROOT / "docs" / "ui-mockups" / "revamp-2026-10" / "3-lattice")
     ap.add_argument("--t", type=float, default=2.0)
     args = ap.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)

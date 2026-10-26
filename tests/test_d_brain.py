@@ -1,4 +1,4 @@
-"""Revamp D, part 1: the brain's safety and speed (docs/research/revamp-2026-10-02/30b-build-D-brain.md).
+"""Revamp D, part 1: the brain's safety and speed (the design notes).
 
 One piece per test: the authorization judge (gating by tool metadata, the stored policy, the deny limits, what it sees),
 the finish gate (three verdicts, the learned expected-unverifiable control, the send confirmation), the consult (its

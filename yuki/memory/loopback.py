@@ -1,6 +1,6 @@
 """An app's own sound through Windows process loopback, and which apps take the microphone when.
 
-Owner's decision 2026-10-03 (docs/HANDBOOK.md rule 9, docs/MEMORY.md "Calls: both sides"): a call is
+Owner's decision 2026-10-03 (the project handbook rule 9, docs/MEMORY.md "Calls: both sides"): a call is
 recorded on both sides - the user's microphone (headphones only, as before) plus the call app's own
 audio output - and a game's own voice chat is a track of its own. Never the whole output endpoint:
 music, a game that is not the target and Yuki's own voice stay out, because only the target

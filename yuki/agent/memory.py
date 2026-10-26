@@ -91,7 +91,7 @@ STANDING_SECTION_HEADINGS = RULE_HEADINGS + (
 #: The relevance floors of the request's memory (revamp 02 P2, 2026-10-03): the user's own to-dos and Yuki's know-how
 #: are attached only when their cosine to the user's words (the shared embedder's) clears these. A know-how entry of
 #: an app in play (the window in front, or an app the caller says the request names) needs less. Measured on the
-#: logged requests replayed on a copy of the real memory (docs/research/revamp-2026-10-02/22-build-A6-A9.md); before,
+#: logged requests replayed on a copy of the real memory (the design notes); before,
 #: the same 5 to-dos and 5 know-how lines (~2.5k chars) went with every request.
 TODO_MIN_COSINE = 0.40
 

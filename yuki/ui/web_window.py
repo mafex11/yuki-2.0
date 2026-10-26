@@ -18,7 +18,7 @@ What happens when it opens (E4):
    data is built by :mod:`yuki.ui.web_data` (Home first, then the others one at a time) and replaces the snapshot's.
 4. On close the pages are written back to the snapshot.
 
-**Live refresh** (docs/research/revamp-2026-10-02/42-window-live-refresh.md, 44-build-appL-live-refresh.md): the page
+**Live refresh** (the design notes, 44-build-appL-live-refresh.md): the page
 open in the window follows memory by events, not timers. The tray forwards memory's named events (cards, the call
 status) and its own (a request's end, the agent's memory tools by name, voice state) over the pipe; each is a closed
 topic that marks the pages showing it (:data:`TOPIC_PAGES`). Only the open page is built, after a short quiet

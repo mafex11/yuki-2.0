@@ -1,15 +1,11 @@
 """Call timeline digests (yuki.memory.calldigest), the calls / call_timeline tools, and the recall pointer.
 
-Offline: temp databases and a stub model client. The scenario test at the end reads a *copy* of the real
-database (made through a read-only connection) and never writes to the real one; it is skipped when there
-is no real database on this PC.
+Offline: temp databases and a stub model client; the real database is never read.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import shutil
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -405,52 +401,6 @@ def test_prompt_and_mouth_route_call_questions_to_the_timeline():
     assert "call_timeline" in SYSTEM_PROMPT and "each line says who spoke" in SYSTEM_PROMPT
     assert "their side alone" not in SYSTEM_PROMPT and "only their microphone" not in SYSTEM_PROMPT
     assert any("what they said on a call or in a meeting" in v for v in mouth.values() if isinstance(v, str))
-
-
-# ---------------------------------------------------------------------------
-# scenario: a copy of the real database (read-only source, nothing written to it)
-# ---------------------------------------------------------------------------
-
-
-def _real_db() -> Path | None:
-    base = Path(os.environ.get("LOCALAPPDATA", "")) / "Yuki" / "memory"
-    db = base / "memory.db"
-    return db if db.exists() and (base / "memory.key").exists() else None
-
-
-@pytest.mark.skipif(_real_db() is None, reason="no real memory database on this PC")
-def test_scenario_friday_discord_day_on_a_copy_of_the_real_db(tmp_path):
-    from yuki.memory.api import MemoryClient
-
-    real = _real_db()
-    copy = tmp_path / "memory" / "memory.db"
-    copy.parent.mkdir()
-    src = sqlite3.connect(f"file:{real}?mode=ro", uri=True)   # read-only: the real file is never written
-    dst = sqlite3.connect(copy)
-    src.backup(dst)
-    src.close()
-    dst.close()
-    shutil.copy(real.parent / "memory.key", copy.parent / "memory.key")
-    with Store.open(copy) as s:
-        client = MemoryClient(s)
-        friday = datetime(2026, 9, 25)
-        calls = client.calls_in(friday, friday + timedelta(days=1))
-        discord = [c for c in calls if c["app"] == "Discord" and 16 in c["call_ids"]]
-        if not discord:
-            pytest.skip("the Friday 25 Sept Discord calls are not in this database")
-        day = discord[0]
-        assert day["call_ids"][:6] == [16, 17, 18, 19, 20, 21]         # one session, not six calls
-        assert day["speech_s"] > 30 * 60                                 # about 80 minutes of the user's speech
-        words = client.call_transcript("call:20", per_page=50)
-        assert words["total"] > 1000 and words["pages"] > 20            # the whole session's words, paged
-        tl = client.call_timeline("call:16")
-        if tl["digested"]:                                              # after the backfill ran on the real db
-            assert len(tl["blocks"]) >= 10
-            starts = [b["start"] for b in tl["blocks"]]
-            assert starts == sorted(starts) and starts[0] < "2026-09-25T14" and starts[-1] > "2026-09-26T00"
-            from yuki.agent.memory import TIMELINE_MAX_CHARS, format_call_timeline
-
-            assert len(format_call_timeline(tl)) <= TIMELINE_MAX_CHARS + 2_000
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""The window's leftovers of 4 Oct (docs/research/revamp-2026-10-02/69-build-leftUI.md): Settings' takeover distance
+"""The window's leftovers of 4 Oct (the design notes): Settings' takeover distance
 (saved through the window, read by the takeover watch as a task starts) and Home's Your list following Work's split
 (a promise you made or someone owing you never shows as your to-do on Home).
 

@@ -1,4 +1,4 @@
-"""The 3 Oct feedback, memory side (Builder A; docs/research/revamp-2026-10-02/38-feedback-root-causes.md and
+"""The 3 Oct feedback, memory side (Builder A; the design notes and
 43-build-appA-memory.md): migration 33, the shown forms, the pin, the direct "maybe misheard" and "To review" ops, the
 people cards, the day digests and the dreaming tuning.
 

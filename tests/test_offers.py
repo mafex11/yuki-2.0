@@ -1,4 +1,4 @@
-"""Typed offers (yuki.memory.offers; docs/research/revamp-2026-10-02/06-proactive-do-it.md §4-5): validated when the
+"""Typed offers (yuki.memory.offers; the design notes §4-5): validated when the
 card is written and again at the click, run by code (never an agent, never a model call), with Undo, and learned
 from per (channel, kind) with numbers. Temp databases only; nothing touches the desktop or a model.
 """

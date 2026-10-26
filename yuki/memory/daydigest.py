@@ -1,5 +1,5 @@
 """Day digests: one short line per day, so a new chat each day still connects the dots (the 3 Oct feedback, item 15;
-docs/research/revamp-2026-10-02/38-feedback-root-causes.md §9).
+the design notes §9).
 
 The window starts a new chat every day (days start at 04:00, :func:`yuki.memory.checkins.user_day`). What carries over
 is a **day digest**: one or two sentences of what the day held - what got done, what was talked about, what is still

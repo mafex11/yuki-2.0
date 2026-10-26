@@ -13,7 +13,7 @@ recognisers use (Deepgram's keyterms, the local model's hotwords); the heard for
 learned are read in the same call (:func:`name_forms`) for the fast path.
 
 **What the user uses lately** (lKeys, live test 1 of 17 Oct, problem 5; the real cases are in
-docs/research/audit-2026-10-09/builds/lKeys.md, not in code). The terms came only from the portrait's facts, so they
+the design notes, not in code). The terms came only from the portrait's facts, so they
 were mostly old project names, while the words the user says to Yuki every day (his playlists, the channels he
 watches, the sites and apps he opens, a friend's nickname) were missing, and each of those misheard broke a task.
 :func:`usage_terms` builds the list from the user's own recent use, each source ranked by its own recency x count,
@@ -568,7 +568,7 @@ C11_MODULE = "yuki.skills.names"
 C11_READER = "own_names"
 C11_IS_SITE = "is_site"
 #: At most this many own names are measured (the reader's best first; never cut by name): C11's own cap. The offline
-#: re-measure on the user's 793 spoken turns (docs/research/final-test-2026-10-19/builds/voice21.md) added no near note
+#: re-measure on the user's 793 spoken turns (the design notes) added no near note
 #: with the whole list (lane names21's 116 names; a superset of every app and named site of the timeline, 170), once a
 #: heard word that is a name's tail letter for letter is no match (``pipeline.heard_note``).
 MAX_OWN_NAMES = 200

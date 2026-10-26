@@ -1,4 +1,4 @@
-"""Revamp A6 (docs/research/revamp-2026-10-02/22-build-A6-A9.md): the portrait's fields within their budgets, the card
+"""Revamp A6 (the design notes): the portrait's fields within their budgets, the card
 writers' ABOUT THE USER per kind, the to-do list kept true (mirrors, the check on newer evidence, jokes never a to-do,
 dated plans from calls) and the follow-up scan's new sources and vet.
 

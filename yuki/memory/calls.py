@@ -168,7 +168,7 @@ class CallConfig:
     #: An in-call screen stays fresh evidence this long after it was last seen (s); then the call is "stale"
     #: (probably still going, not certain: voice asks "was that for me?" on ambiguous words).
     evidence_fresh_s: float = 900.0
-    # -- one call = one session (CallLife; docs/research/revamp-2026-10-02/05-call-pill-timer.md §7.2) --
+    # -- one call = one session (CallLife; the design notes §7.2) --
     #: The call's app let go of the microphone less than this long ago: still the same call (a re-grab with a new
     #: ConsentStore ``since`` inside it continues the call). Measured: in the mic-only era one drop in 33.8 call
     #: hours (919 s, a real leave); Meet mute gaps 5-536 s are kept by the screen instead (``screen_alive_s``).
@@ -1523,7 +1523,7 @@ class _ConsentStoreWatch:
 
 
 # ---------------------------------------------------------------------------
-# One call = one session (docs/research/revamp-2026-10-02/05-call-pill-timer.md §7)
+# One call = one session (the design notes §7)
 # ---------------------------------------------------------------------------
 
 #: Two ConsentStore ``since`` values this close are the same microphone hold (the record's start, read by two

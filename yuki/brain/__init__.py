@@ -1,4 +1,4 @@
-"""Yuki's new brain: one decision path (brain rebuild rev 2, ``docs/research/audit-2026-10-09/next/brain-design.md``).
+"""Yuki's new brain: one decision path (brain rebuild rev 2, ``the design notes``).
 
 Exact words in -> a skill when one fits, else one plan (goal, kind, target, route, consent, done, steps) streamed from
 one model call -> the executor runs each step as it is written, under one consent rule and one commit check -> one

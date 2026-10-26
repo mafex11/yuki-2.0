@@ -1574,7 +1574,7 @@ class YouBuilder:
         try:
             from yuki.memory.presence import fold_events, load_events
 
-            # one row per event, a time only when it is sure (tc1: one interview was 12 rows at 07:30, 10:30, 14:00)
+            # one row per event, a time only when it is sure (tc1: one event was 12 rows at 07:30, 10:30, 14:00)
             for ev in fold_events(load_events(self.store)):
                 at = ev.get("at")
                 if not isinstance(at, (int, float)) or ev.get("asked"):

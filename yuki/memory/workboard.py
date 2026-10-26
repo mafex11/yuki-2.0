@@ -1,4 +1,4 @@
-"""The Work page's judgements (the Work page build, 4 Oct 2026, docs/research/revamp-2026-10-02/68-build-appWork.md).
+"""The Work page's judgements (the Work page build, 4 Oct 2026, the design notes).
 
 The user asked for a page that helps them track work: their list, who they wait on, the chats waiting on their
 reply, what they said they'd do, and today's figures. Three of those need judgement no query can make, and are made

@@ -1,4 +1,4 @@
-"""appClean (4 Oct, docs/research/revamp-2026-10-02/59-build-appClean.md): clean what practice memory has saved, and
+"""appClean (4 Oct, the design notes): clean what practice memory has saved, and
 let the portrait's bar pass include pinned facts.
 
 The user: "theres too many spotify lessons in 'How you do things' ... maybe fix and clean things up on whatever it has

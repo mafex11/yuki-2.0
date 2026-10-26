@@ -1,6 +1,6 @@
 """The plan: one object per model call that says what the user wants, where, how, and how Yuki will know it worked.
 
-Brain rebuild rev 2, design section 2.2 (``docs/research/audit-2026-10-09/next/brain-design.md``). bCore owns this file;
+Brain rebuild rev 2, design section 2.2 (``the design notes``). bCore owns this file;
 bExec builds the executor against the same pinned text (the schema below and :class:`ExecHost`).
 
 * :func:`plan_schema` is the ``plan`` tool's ``input_schema``: strict-compatible (every object

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -1031,7 +1032,7 @@ def _call_now(kind: str) -> tuple[str | None, str | None, dict[str, Any]]:
     tmp = Path(tempfile.mkdtemp(prefix="yuki-call928-"))
     store = Store.open(tmp / "memory.db")
     zen = r"C:\Program Files\Zen Browser\zen.exe"
-    discord = r"C:\Users\yukidev\AppData\Local\Discord\app-1.0.9200\Discord.exe"
+    discord = os.path.expandvars(r"%LOCALAPPDATA%\Discord\app-1.0.9200\Discord.exe")
     exe = zen if kind == "zen" else discord
     mic = [] if kind == "none" else [{"app": exe.rsplit("\\", 1)[-1], "packaged": False, "path": exe,
                                       "since": now - 3600}]

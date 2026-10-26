@@ -1,4 +1,4 @@
-"""Review 34 fixes, builder fx1 (docs/research/revamp-2026-10-02/34-review.md, 35-build-review-fixes.md).
+"""Review 34 fixes, builder fx1 (the design notes, 35-build-review-fixes.md).
 
 One regression test (or a few) per finding: H2 committing clicks reach the judge, H3 the judge's memo is per target and
 never keeps an allow of a call that can destroy or send, H5 the per-app "Act" switch is enforced, H6 window-lease

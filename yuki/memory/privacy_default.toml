@@ -152,7 +152,7 @@ blocked_apps = []
 blocked_domains = []
 
 [trace]
-# Recording how you work (docs/research/revamp-2026-10-02/78-capture-and-learning.md): which button
+# Recording how you work (the design notes): which button
 # or field you use, what kind of action and what changed - never the letters you type, never what
 # you copy, never pixels.  OFF until you turn on Settings -> Privacy and pause -> Record how I work.
 # The tray's pause pauses it; the raw list is kept 30 days.

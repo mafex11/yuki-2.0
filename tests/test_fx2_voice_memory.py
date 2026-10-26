@@ -1,4 +1,4 @@
-"""fx2 (docs/research/revamp-2026-10-02/37-build-fx2.md): the memory APIs the voice needs (29-build §3 items 1-3) and
+"""fx2 (the design notes): the memory APIs the voice needs (29-build §3 items 1-3) and
 the multi-part opening ("Open Chrome and restore the pages.": the talker opened Chrome and the rest was never done).
 
 * ``record_hand_trace(injected=, cited=, control=)``: the playbooks shown and followed reach the ledger from a hand

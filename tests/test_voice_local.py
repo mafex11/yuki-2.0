@@ -1,4 +1,4 @@
-"""vLocal (5 Oct 2026, docs/research/revamp-2026-10-02/86-build-vLocal.md): speech on this PC as a setting.
+"""vLocal (5 Oct 2026, the design notes): speech on this PC as a setting.
 
 Parakeet with Silero VAD and Smart Turn for recognition, Supertonic / Kokoro for the voice with Piper as the fallback;
 the models downloaded with checksums, loaded at the wake and let go when quiet; the cloud stays the default. Offline:
@@ -13,6 +13,7 @@ import bz2
 import hashlib
 import io
 import json
+import os
 import tarfile
 import time
 from concurrent.futures import Future
@@ -25,7 +26,7 @@ import pytest
 
 from yuki.config import Settings
 
-LAB = Path(r"C:\Users\yukidev\yuki-speech-lab\models")
+LAB = Path(os.environ.get("YUKI_SPEECH_LAB") or Path.home() / "yuki-speech-lab") / "models"
 PARAKEET_WAV = LAB / "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming" / "test_wavs" / "0.wav"
 HFC = LAB / "vits-piper-en_US-hfc_female-medium"
 

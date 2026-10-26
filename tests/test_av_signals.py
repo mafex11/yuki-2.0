@@ -9,6 +9,7 @@ microphone or the speakers: the timeline recorder's window, process and page rea
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -19,7 +20,7 @@ from yuki.memory.calls import CallConfig, CallWorker
 DISCORD = r"C:\Apps\Discord\Discord.exe"
 CHROME = r"C:\Apps\Chrome\chrome.exe"
 HANDY = r"C:\Apps\Handy\handy.exe"
-PYTHON = r"C:\Users\yukidev\yuki\.venv\Scripts\python.exe"
+PYTHON = str(Path(__file__).resolve().parents[1] / ".venv" / "Scripts" / "python.exe")
 
 
 class Stubs:

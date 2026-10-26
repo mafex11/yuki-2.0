@@ -1,4 +1,4 @@
-# Spotify's desktop app as data (docs/research/audit-2026-10-09/PLAN.md D0, D4; evidence round4/spotify-desktop-route.md §2).
+# Spotify's desktop app as data (the design notes D0, D4; evidence round4/spotify-desktop-route.md §2).
 #
 # Zero setup: nothing here needs an account, a key or a sign-in. Yuki reads Spotify's own window through UI Automation
 # (read-only in phase F), uses Windows' media session for play/pause/next/previous, and Spotify's own `spotify:` links.

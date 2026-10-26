@@ -1,4 +1,4 @@
-"""Revamp A9 (docs/research/revamp-2026-10-02/22-build-A6-A9.md): migration 27 merges chats split by a display-name
+"""Revamp A9 (the design notes): migration 27 merges chats split by a display-name
 change and keys threads by the app's process; game and DAW microphone use is not a meeting; threads go paused and are
 never dated in the future; the recheck step corrects the weekly review and the portrait from withdrawn entries.
 
@@ -327,7 +327,7 @@ def test_the_recheck_corrects_whole_sentences_and_stores_a_new_version(store):
 
 
 def test_the_recheck_keeps_an_open_todo_that_a_withdrawn_entry_only_touches(store):
-    """Regression (live dry run, real memory, 3 Oct 2026, docs/research/revamp-2026-10-02/23 L7): besides the invented
+    """Regression (live dry run, real memory, 3 Oct 2026, the design notes L7): besides the invented
     Google offer, the recheck also dropped "laminating the certificate documents for Bro" from the review's open items,
     citing a withdrawn "entrance exam score card" search - while the to-do was still open and sourced ("per Bro's request").
     The model now sees what is still true, names each claim it takes out, and code corrects a sentence only when

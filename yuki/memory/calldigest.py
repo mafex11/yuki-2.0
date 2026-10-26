@@ -12,7 +12,7 @@ others on the call asked of them or planned with them - each dated by the line i
 rests on (and saying whose line it was: ``who`` user | others), and a one-line gist
 of the call.
 
-Who decides what (docs/HANDBOOK.md rule 3):
+Who decides what (the project handbook rule 3):
 
 * Code does structure only. It reads the call's lines (:meth:`Store.call_lines`: every
   track, each with who spoke), leaves out exact repeats of a recent line of the same

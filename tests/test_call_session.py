@@ -1,4 +1,4 @@
-"""One call = one session (docs/research/revamp-2026-10-02/05-call-pill-timer.md §7-8).
+"""One call = one session (the design notes §7-8).
 
 The microphone hold is the call: the screen only decides that a hold is a call (the start) and ends a held call
 only on a persistent, reliable contradiction; a re-grab of the microphone by the same app is the same call; a

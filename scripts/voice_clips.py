@@ -453,7 +453,7 @@ V314_CLIPS = [
 ]
 
 
-#: v3.18 (docs/research/revamp-2026-10-02/29-build-voice-procedures.md): the user's side of 2 Oct 21:24-21:27 (the
+#: v3.18 (the design notes): the user's side of 2 Oct 21:24-21:27 (the
 #: volume mistake and its correction, the restore bubble, YouTube) for the practice-memory replays. A voice other than
 #: arcas: Flux heard arcas's "Open Chrome." as "Hook and crumb." in v3.17's replays.
 V318_USER = ("deepgram", "aura-2-apollo-en")

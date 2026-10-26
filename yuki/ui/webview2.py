@@ -1,7 +1,7 @@
 """A thin WebView2 host in ctypes: one top-level window and one WebView2 in it. No .NET, no Qt, no web server.
 
 The Yuki window is moving to HTML (the Lattice design) rendered by the WebView2 runtime that ships with Windows
-(docs/research/revamp-2026-10-02/08-ui-inventory.md §7). This module is the whole native side of that window:
+(the design notes §7). This module is the whole native side of that window:
 
 * a plain Win32 window (``CreateWindowExW``) with the page's umber background, so nothing flashes white;
 * the WebView2 environment and controller, made through the official ``WebView2Loader.dll`` and called through
@@ -26,7 +26,7 @@ The Yuki window is moving to HTML (the Lattice design) rendered by the WebView2 
 Why not pywebview: its EdgeChromium backend loads the .NET runtime and WinForms into the process, routes every
 resource request through a Python callback, shows its window with ``Form.Show()`` (which activates it) and keeps a
 500 ms timer running; it has no virtual host mapping. Its ``WebView2Loader.dll`` is reused here (the official,
-redistributable loader), nothing else of it is imported. See docs/research/revamp-2026-10-02/25-build-E1-E2-E5.md.
+redistributable loader), nothing else of it is imported. See the design notes
 
 All COM calls happen on the thread that called :meth:`WebView2Host.run` (an STA with a Win32 message loop).
 :meth:`WebView2Host.post` and :meth:`WebView2Host.close` are safe from any thread.
@@ -882,7 +882,7 @@ class WebView2Host:
         if not self._controller:
             return
         if minimized:   # hidden: no rendering, and let WebView2 give memory back (08 §7.4 levers; measured
-            # 2026-10-03: resident memory 384 MB -> 52 MB within 30 s, docs/research/revamp-2026-10-02/25-...)
+            # 2026-10-03: resident memory 384 MB -> 52 MB within 30 s, the design notes)
             self._controller.put_bool(CTL_PUT_IS_VISIBLE, False)
             self._low = self.set_memory_low(True)
             self._minimized = True

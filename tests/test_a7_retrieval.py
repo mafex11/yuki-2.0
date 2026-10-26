@@ -1,4 +1,4 @@
-"""Revamp A6 P0.1 and A7 (docs/research/revamp-2026-10-02/22-build-A6-A9.md): the standing context as parts, memory
+"""Revamp A6 P0.1 and A7 (the design notes): the standing context as parts, memory
 searched with the user's own words, Yuki's own conversation never returned as memory, the injection diet (to-dos and
 know-how only when they bear on the words), and turns stored apart from Yuki's envelope.
 

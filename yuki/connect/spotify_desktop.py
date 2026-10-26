@@ -1,7 +1,7 @@
 """Spotify's desktop window, read through UI Automation: no account, no key, no token (PLAN.md D0, D4).
 
 Spotify allows a Web API app at most 5 users, so no API route can serve people who install Yuki. Spotify's own window
-shows Windows everything needed instead (evidence: ``docs/research/audit-2026-10-09/round4/spotify-desktop-route.md``
+shows Windows everything needed instead (evidence: ``the design notes``
 §2): the volume slider (Slider "Change volume", RangeValue 0-1), the player controls, and each playlist row of Your
 Library with its own "Play {name}" button, which reads "Pause {name}" on the row that is playing. Everything here is
 **read-only**: no Invoke, no SetValue, no focus, no key, no pointer, no window restore (phase S adds the actions, in

@@ -1,4 +1,4 @@
-"""sWire: wave S merged onto wave F (docs/research/audit-2026-10-09/builds/sWire.md).
+"""sWire: wave S merged onto wave F (the design notes).
 
 What crosses the four S branches and fWire: the packaged app loads all seven skills (the connection and site files are
 bundled, the drivers resolve through the import system), the doctor's skills line, one request id for a thinker's

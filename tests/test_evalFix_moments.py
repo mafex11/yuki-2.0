@@ -11,13 +11,13 @@ import sqlite3
 
 import pytest
 
-from test_evalFix_world import (Rebuild, good_moments, hermetic, live, ts, write_moments)  # noqa: F401
+from test_evalFix_world import (Rebuild, bars, good_moments, hermetic, live, ts, write_moments)  # noqa: F401
 from yuki.eval import dbcopy
 from yuki.eval import habits_replay as H
 
 
 @pytest.fixture()
-def copy(live):
+def copy(live, bars):
     path = dbcopy.copy_db(live)
     yield path
     dbcopy.remove_copy(path)
@@ -40,7 +40,7 @@ def test_every_bar_passes_on_a_correct_rebuild(copy):
 
 
 def test_the_8_oct_join_is_required(copy):
-    t = ts("2026-10-08", "08:56:52")
+    t = ts("2026-10-08", "08:58:05")
     items = [m for m in good_moments(copy) if not (m[0] == "call_join" and abs(m[2] - t) < 90)]
     out = H.moments_bars(copy, runner=Rebuild(copy, items))
     day = next(d for d in out["bars"]["e1"]["days"] if d["day"] == "2026-10-08")
@@ -48,7 +48,7 @@ def test_the_8_oct_join_is_required(copy):
 
 
 def test_a_join_more_than_a_minute_off_does_not_count(copy):
-    t = ts("2026-10-07", "08:55:59")
+    t = ts("2026-10-07", "08:56:25")
     items = [(k, a, at + 75 if k == "call_join" and abs(at - t) < 1 else at, s, i, e, x)
              for k, a, at, s, i, e, x in good_moments(copy)]
     out = H.moments_bars(copy, runner=Rebuild(copy, items))
@@ -56,7 +56,7 @@ def test_a_join_more_than_a_minute_off_does_not_count(copy):
 
 
 def test_a_hold_day_marked_seen_fails_the_evidence_check(copy):
-    t = ts("2026-09-28", "09:01:01")
+    t = ts("2026-09-28", "09:02:10")
     items = [(k, a, at, s, i, "screen" if k == "call_join" and abs(at - t) < 1 else e, x)
              for k, a, at, s, i, e, x in good_moments(copy)]
     out = H.moments_bars(copy, runner=Rebuild(copy, items))

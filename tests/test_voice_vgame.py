@@ -1,4 +1,4 @@
-"""vGame (5 Oct 2026, docs/research/revamp-2026-10-02/79-build-vGame.md): a request said by name is acknowledged at
+"""vGame (5 Oct 2026, the design notes): a request said by name is acknowledged at
 once, the name alone is answered and never loses the command after it, and in a game or a call Yuki stays out of the
 way. Offline only: stand-ins, no microphone, no speakers, no network.
 """

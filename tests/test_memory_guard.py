@@ -1,6 +1,6 @@
 """The test-run guard (tests/conftest.py): default memory locations point at a temp folder.
 
-No test may write into the user's real memory (docs/research/coach-and-answers-review.md 3.2 H).
+No test may write into the user's real memory (the design notes 3.2 H).
 """
 
 from __future__ import annotations

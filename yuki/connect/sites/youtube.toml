@@ -1,4 +1,4 @@
-# YouTube's documented URL shapes as data (docs/research/audit-2026-10-09/PLAN.md D0, D16, critique M10).
+# YouTube's documented URL shapes as data (the design notes D0, D16, critique M10).
 #
 # One place for every YouTube URL template: the moments extractor reads a page's entity from them (a video id, a
 # channel handle), the skills build their links from them. Zero setup: no API key; channel uploads come from the public

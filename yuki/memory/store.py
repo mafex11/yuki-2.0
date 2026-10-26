@@ -2271,7 +2271,7 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX portrait_audits_at ON portrait_audits(at);
     """,
-    # 16: the coach listens (docs/research/coach-and-answers-review.md): a reply to one of
+    # 16: the coach listens (the design notes): a reply to one of
     # Yuki's cards is feedback about that kind of card, not a global rule - a conversation
     # fact of kind 'feedback' carries the card it answered (nudge_id); the user's reply is
     # kept on the card itself (reply, encrypted) so the coach reads their words, not a
@@ -2472,7 +2472,7 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE conversation_facts ADD COLUMN value_ciphertext TEXT;
     ALTER TABLE conversation_facts ADD COLUMN keyterms_ciphertext TEXT;
     """,
-    # 23 (2026-09-29, "connect the dots from the entire memory", docs/research/human-like-review.md §5 Phase 3):
+    # 23 (2026-09-29, "connect the dots from the entire memory", the design notes §5 Phase 3):
     # - work_threads: the user's threads of work (a project, task or workflow they pursue over days: "Yuki voice
     #   pipeline", "OpenSchool maths for Ravi", a PR review), each with where it stands, what is open, the apps,
     #   sites, repos and people involved, first and last seen and a status (active | paused | done | merged).
@@ -2578,7 +2578,7 @@ MIGRATIONS: tuple[str, ...] = (
     """
     ALTER TABLE call_digests ADD COLUMN context_ciphertext TEXT;
     """,
-    # 26 (2026-10-03, one call = one session, docs/research/revamp-2026-10-02/05-call-pill-timer.md §7; typed
+    # 26 (2026-10-03, one call = one session, the design notes §7; typed
     # offers, 06-proactive-do-it.md §4.5): the microphone hold a call row is in (calls.hold_since: the ConsentStore
     # record's start, moved on a re-grab of the same call) and the last moment the call worker saw it alive
     # (calls.last_alive_at, written at most every 15 s), so a restarted service adopts a call whose hold goes on and
@@ -2591,7 +2591,7 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE nudges ADD COLUMN outcome TEXT;
     ALTER TABLE nudges ADD COLUMN outcome_at REAL;
     """,
-    # 27 (2026-10-03, revamp A7/A9; docs/research/revamp-2026-10-02/22-build-A6-A9.md):
+    # 27 (2026-10-03, revamp A7/A9; the design notes):
     # - threads.ident_key: a capture thread's identity by the app's stable identity (its process image, app_key) and
     #   its scope, URL or title - no longer by the app's display name. On 2 Oct the name Windows gave
     #   whatsapp.root changed from "WhatsApp.Root" to "WhatsApp" and every WhatsApp chat (Hemanth, RES) split into
@@ -2614,7 +2614,7 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE conversation_turns ADD COLUMN envelope_ciphertext TEXT;
     ALTER TABLE portraits ADD COLUMN sections_ciphertext TEXT;
     """,
-    # 28 (2026-10-03, revamp Phase B1 "people and routes", docs/research/revamp-2026-10-02/24-build-B.md;
+    # 28 (2026-10-03, revamp Phase B1 "people and routes", the design notes;
     # yuki.memory.contacts): who the user talks to and where, derived from rows memory already holds (capture threads,
     # their messages, person facts, name aliases, call digests) by one model pass that links people across apps, its
     # output checked against the stored strings. Rebuilt by Yuki's own pipeline (python -m yuki.memory.contacts
@@ -2671,7 +2671,7 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX contact_prefs_name ON contact_prefs(name_key, ended_at);
     """,
-    # 29 (2026-10-03, revamp Phase C "practice memory", docs/research/revamp-2026-10-02/27-build-C.md;
+    # 29 (2026-10-03, revamp Phase C "practice memory", the design notes;
     # yuki.memory.practice, yuki.memory.practice_learn): how this user does things on this PC, learned from Yuki's own
     # runs and from what memory already observes, and never a mistake twice.
     # - runs: the structured trace of every agent request and voice hand, kept for the learners (30-day TTL, pruned
@@ -2773,7 +2773,7 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX playbook_events_pb ON playbook_events(playbook_id, at);
     CREATE INDEX playbook_events_run ON playbook_events(run_key);
     """,
-    # 30 (2026-10-03, proactive check-ins, docs/research/revamp-2026-10-02/33-build-checkins.md; yuki.memory.checkins):
+    # 30 (2026-10-03, proactive check-ins, the design notes; yuki.memory.checkins):
     # the user: "it should connect this on-screen context with more data on what I am trying to achieve ... and then
     # ask me 'did you achieve what you were trying to do'".
     # - goals: what the user is going for - a day's goal ("today's goals", ``day``), a thread of work's goal, or a
@@ -2827,7 +2827,7 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE questions ADD COLUMN folded_at REAL;
     ALTER TABLE questions ADD COLUMN reply_tone TEXT;
     """,
-    # 31 (2026-10-03, making Yuki personal, docs/research/revamp-2026-10-02/30c-build-D-personal.md; yuki.memory.brief):
+    # 31 (2026-10-03, making Yuki personal, the design notes; yuki.memory.brief):
     # - surfaced: for each reply and each card, which lines of the personal brief and which memory items were in the
     #   context it was written from (ids only, never text: ``brief_ids`` like "people.2", ``fact_ids`` like "F12",
     #   "J345", "W12"), and, once the nightly judge read it (at most 20 a night), its verdict (personal | generic |
@@ -2851,7 +2851,7 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX surfaced_at ON surfaced(at);
     CREATE INDEX surfaced_ref ON surfaced(ref);
     """,
-    # 32 (2026-10-03, review 34 fixes, docs/research/revamp-2026-10-02/35-build-review-fixes.md): two indexes.
+    # 32 (2026-10-03, review 34 fixes, the design notes): two indexes.
     # - journal(batch_id, thread_id): withdrawn_journal looks up the batch that replaced an entry (M9: a correlated
     #   SCAN of the whole journal per id before; also the re-journal readers that ask by batch).
     # - messages(thread_id, first_seen): the People list's per-route and per-day counts read a thread's messages in a
@@ -2861,7 +2861,7 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS journal_batch_thread ON journal(batch_id, thread_id);
     CREATE INDEX IF NOT EXISTS messages_thread_seen ON messages(thread_id, first_seen);
     """,
-    # 33 (2026-10-03, the 3 Oct feedback, Builder A: docs/research/revamp-2026-10-02/38-feedback-root-causes.md §2-§9,
+    # 33 (2026-10-03, the 3 Oct feedback, Builder A: the design notes §2-§9,
     # §12, 43-build-appA-memory.md): what the app shows the user, said to them.
     # - portrait_facts.shown_ciphertext: the fact as the app shows it - second person, natural dates, others by name
     #   (yuki.memory.titles.SHOWN_RULES) - written by the same model call that writes the fact (or the titles pass);
@@ -2897,7 +2897,7 @@ MIGRATIONS: tuple[str, ...] = (
         updated_at          REAL NOT NULL
     );
     """,
-    # 34 (2026-10-03, calls record both sides, docs/research/revamp-2026-10-02/60-build-call-others-capture.md;
+    # 34 (2026-10-03, calls record both sides, the design notes;
     # the owner's decision, handbook rule 9): the user's microphone plus the call app's own audio (process
     # loopback), and a game's own voice chat as a voice session of its own.
     # - calls.kind: call | game (a game's voice chat, started by the measured gaming_with_voice signal, asked with
@@ -2928,7 +2928,7 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX mic_spans_time ON mic_spans(started_at);
     """,
-    # 35 (2026-10-04, the user's feedback round 3 W1-W3, docs/research/revamp-2026-10-02/56-build-appMem2.md):
+    # 35 (2026-10-04, the user's feedback round 3 W1-W3, the design notes):
     # threads you can close, sessions with a title, corrections in your own words.
     # - work_threads.next_ciphertext: the concrete next step to continue the thread, said to the user (English),
     #   written with its shown form (the nightly review, the titles pass); cleared with it when the state changes.
@@ -2965,7 +2965,7 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE episodes ADD COLUMN summary_ciphertext TEXT;
     ALTER TABLE correction_passes ADD COLUMN target TEXT;
     """,
-    # 36 (2026-10-04, the Work page, docs/research/revamp-2026-10-02/68-build-appWork.md): work_items, one row per
+    # 36 (2026-10-04, the Work page, the design notes): work_items, one row per
     # thing the Work page shows that needs a judgement or a mark of the user's (yuki.memory.workboard):
     # - a chat (key "chat:<capture thread id>"): whether its newest messages wait on the user's reply, who and the
     #   message to quote, judged on its newest message (basis); the user's marks: no_reply (No reply needed),
@@ -2991,7 +2991,7 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX work_items_kind ON work_items(kind, updated_at);
     """,
-    # 37 (2026-10-04, leftMem, docs/research/revamp-2026-10-02/70-build-leftMem.md): conversation_facts.reopened_at,
+    # 37 (2026-10-04, leftMem, the design notes): conversation_facts.reopened_at,
     # when the user last put an ended commitment back (the Work page's Not done yet, Put it back, Undo): memory closes
     # it again only on evidence dated after that moment, never on what closed it before (yuki.memory.commitments).
     # Content-free; carried to a commitment's new version. Additive only; one self-contained entry (renumber freely
@@ -2999,7 +2999,7 @@ MIGRATIONS: tuple[str, ...] = (
     """
     ALTER TABLE conversation_facts ADD COLUMN reopened_at REAL;
     """,
-    # 38 (2026-10-07, capC1, docs/research/revamp-2026-10-02/96-build-capC1.md; design: report 78 §8): the action
+    # 38 (2026-10-07, capC1, the design notes; design: report 78 §8): the action
     # trace, in shadow (nothing reads it to change behaviour yet; yuki.memory.trace). Written only once the user
     # turned on Settings -> Record how I work.
     # - ui_actions: one row per action of the user's (or Yuki's, labelled by source): kind (click | dclick | rclick
@@ -3111,7 +3111,7 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX IF NOT EXISTS ui_files_at ON ui_files(at);
     """,
-    # 39 (2026-10-07, capC2, docs/research/revamp-2026-10-02/98-build-capC2.md; design: report 78 §5.1-5.4, §8): links
+    # 39 (2026-10-07, capC2, the design notes; design: report 78 §5.1-5.4, §8): links
     # and tasks, the "why" of the trace (yuki.memory.trace_links, trace_tasks, trace_families).
     # - ui_links (migration 38's table) gets its indexes: one row per exact machine join (clipboard | file | url);
     #   ui_actions gets two (by kind, and by file digest) so the joins never scan the trace.
@@ -3232,7 +3232,7 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS ui_task_runs_at ON ui_task_runs(at);
     CREATE INDEX IF NOT EXISTS ui_task_runs_window ON ui_task_runs(window_start);
     """,
-    # 40 (2026-10-10, fMoments; docs/research/audit-2026-10-09/PLAN.md Phase F item 4, decisions D1, D6, D7, D18;
+    # 40 (2026-10-10, fMoments; the design notes Phase F item 4, decisions D1, D6, D7, D18;
     # spec round3/map-foundations.md F1.2): moments, one table of state changes (yuki.memory.moments).
     # - Derived kinds (call_join, game_voice, page, message_sent) are computed from rows that already exist (calls,
     #   timeline, messages) and point back to them (source, source_id): `python -m yuki.memory.moments rebuild`
@@ -3272,7 +3272,7 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS timeline_updated ON timeline(updated_at);
     CREATE INDEX IF NOT EXISTS timeline_meeting_rows ON timeline(process, ended_at) WHERE meeting IS NOT NULL;
     """,
-    # 41 (2026-10-10, sCore; docs/research/audit-2026-10-09/PLAN.md Phase S, decisions D2, D3, D5, D6, D13, D14, D18,
+    # 41 (2026-10-10, sCore; the design notes Phase S, decisions D2, D3, D5, D6, D13, D14, D18,
     # D19; spec round3/map-skills.md S1.3, S4.1, round3/map-routines.md T1.1): the skill engine's tables.
     # - skills: one row per skill of a shipped connection file (yuki/skills/connections/*.toml), one live skill per
     #   (app, end_kind) (partial unique index: a retired skill frees its place). The file is the spec; the row holds
@@ -3414,7 +3414,7 @@ MIGRATIONS: tuple[str, ...] = (
         UNIQUE(kind, entity_key)
     );
     """,
-    # 42 (2026-10-10, rMiner; docs/research/audit-2026-10-09/PLAN.md Phase R, decisions D3, D6, D7, D14; spec
+    # 42 (2026-10-10, rMiner; the design notes Phase R, decisions D3, D6, D7, D14; spec
     # round3/map-routines.md R1.2): the routine miner's tables (yuki.memory.routines).
     # - routines: one row per usual moment of one skill, mined by code from the moments table (no model). key =
     #   "<skill>|<means app>[|<entity digest>]" (D3: the skill's routine_on moments; the service is never part of it);
@@ -3481,7 +3481,7 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS routine_events_r ON routine_events(routine_id, at);
     CREATE INDEX IF NOT EXISTS routine_events_at ON routine_events(at, kind);
     """,
-    # 43 (2026-10-10, lCore; docs/research/audit-2026-10-09/learner/design.md §3.4, §4.9, decisions D21-D24): the skill
+    # 43 (2026-10-10, lCore; the design notes §3.4, §4.9, decisions D21-D24): the skill
     # learner (yuki.skills.learn).
     # - occasions: one row per occasion, rebuildable (`python -m yuki.skills.learn rebuild`): one user state change (an
     #   end moment) plus the visit that led to it, or one of Yuki's runs the user asked for that reached a checked end
@@ -3534,7 +3534,7 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE moments ADD COLUMN entity_key TEXT;
     CREATE INDEX IF NOT EXISTS moments_entity ON moments(entity_key) WHERE entity_key IS NOT NULL;
     """,
-    # 44 (2026-10-10, tTaste; docs/research/audit-2026-10-09/PLAN.md Phase T with the Phase L amendment, D0, D16;
+    # 44 (2026-10-10, tTaste; the design notes Phase T with the Phase L amendment, D0, D16;
     # spec round3/map-routines.md T1.1, T1.4): YouTube's fresh uploads (yuki.skills.youtube_feed) and the offers'
     # outcomes. ``tastes`` itself is migration 41's (recomputed nightly by yuki.skills.taste.recompute).
     # - yt_channels: one row per channel the user picks (channel_key = the taste row's entity_key of the channel's
@@ -3596,7 +3596,7 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX IF NOT EXISTS taste_events_at ON taste_events(at, kind);
     """,
-    # 45 (2026-10-18, kClean; docs/research/audit-2026-10-17/00-SYNTHESIS.md section 8, decision 3): data only, no
+    # 45 (2026-10-18, kClean; the design notes section 8, decision 3): data only, no
     # schema change. The old learners are switched off and deleted; their Playbook rows (origins in
     # RETIRED_PLAYBOOK_ORIGINS) are retired (state and valid_to), their per-app state rows in nudge_state removed, and
     # what the live test harness left is purged (yuki.memory.testtag.purge). The Python step does it all
@@ -3604,7 +3604,7 @@ MIGRATIONS: tuple[str, ...] = (
     """
     SELECT 1;
     """,
-    # 46 (2026-10-18, pMem; docs/research/audit-2026-10-18/builds/pMem.md section 3): data only, no schema change.
+    # 46 (2026-10-18, pMem; the design notes section 3): data only, no schema change.
     # Migration 45 ran early under a test of the new build while the old build was still installed, and the old demo
     # learner wrote 13 more rows (state candidate) at 03:43-03:46 that night. Every row of RETIRED_PLAYBOOK_ORIGINS not
     # yet retired is retired the same way (Store._migrate_46); the count goes to nudge_state CLEANUP_STATE_46.
@@ -3639,7 +3639,7 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX IF NOT EXISTS meanings_state ON meanings(state, updated_at);
     """,
-    # 48 (2026-10-18, bDesk; phase 3.3, docs/research/audit-2026-10-18/builds/bDesk.md): the desk record. One row per
+    # 48 (2026-10-18, bDesk; phase 3.3, the design notes): the desk record. One row per
     # stretch of the desk staying the same (yuki.memory.timeline.DeskRecord): the monitor setup (``screens``, e.g.
     # "1920x1080@0,0;2560x1440@1920,0"), and per window on a monitor (JSON ``windows``: ``[[app key, monitor index,
     # how (max | full | win), plays (0/1), seconds in front, seconds mostly visible], ...]``), whether the user was

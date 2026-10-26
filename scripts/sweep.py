@@ -19,7 +19,7 @@ Usage::
     python scripts/sweep.py tests/test_cost*.py  # some files
     python scripts/sweep.py --jobs 3 --json %TEMP%\\sweep.json --clock 00:30
 
-Run it with the project's interpreter from the worktree (``C:/Users/yukidev/yuki/.venv/Scripts/python.exe``), never
+Run it with the project's interpreter from the worktree (the checkout's own ``.venv\\Scripts\\python.exe``), never
 through ``uv run`` while the app may be running.
 """
 

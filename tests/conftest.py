@@ -8,7 +8,7 @@ built without ``memory=``, ``MemoryClient.open()``, ``acting.begin(None, ...)``)
 there instead of ``%LOCALAPPDATA%\\Yuki\\memory``. On 2026-09-25 19:40 a harness
 without a path (``scripts/voice_scenarios.py hands3`` with no ``--db``) wrote three
 exchanges and the acting marker into the real memory; they later showed up in a real
-request as "Last 3 exchanges" (docs/research/coach-and-answers-review.md 2.1, 3.2 H).
+request as "Last 3 exchanges" (the design notes 2.1, 3.2 H).
 
 ``LOCALAPPDATA`` itself is left alone: other files live there (the embedding model
 cache, speech models, the voice settings), and tests only read those.

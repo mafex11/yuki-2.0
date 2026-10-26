@@ -10,7 +10,7 @@ already makes, ``VoiceBridge.begin_early``); the talker's ``tell_yuki`` then ado
 talker decides otherwise (an answer, a hand, silence) or does not hand over within ``voice_router_adopt_s``, the job is
 withdrawn before its first action, unspoken.
 
-Behind ``Settings.voice_router`` (measured in docs/research/revamp-2026-10-02/26-build-voice-speed.md; the hand-off part
+Behind ``Settings.voice_router`` (measured in the design notes; the hand-off part
 never runs under ``brain = "all"`` or ``one``: ``yuki.voice.mouth.router_on``).
 
 **The end** (D1, 20 Oct 2026; keyword audit A1): the same call also judges whether the user is ending the conversation

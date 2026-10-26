@@ -1,6 +1,6 @@
 """What the user's things mean to them, attached by entity (phase 3.2; contract M1).
 
-The 18 Oct audit (docs/research/audit-2026-10-18/dots.md section 3.3) found the dots in memory as sentences, never
+The 18 Oct audit (the design notes section 3.3) found the dots in memory as sentences, never
 joined to the thing they explain: the user told Yuki on 10 Oct that "mafex" is the MacBook in T3 Code, the portrait
 knows a throwaway browser for casual sites, and the card showed the labels bare. This module joins them.
 

@@ -32,7 +32,7 @@ on the desktop), never quotable as their words; "how's it going?" is answered fr
 "couldn't confirm", the stuck line) are said by code word for word, never re-voiced by the talker; the request turn is
 read ahead when the user's turn ends (``Brain.begin_early``). Under ``loop`` and ``typed`` nothing here runs.
 
-Fix plan of 10 Oct, Item 2 (VOICE-WORDS; docs/research/audit-2026-10-09/failure/fix-plan.md), under every brain setting:
+Fix plan of 10 Oct, Item 2 (VOICE-WORDS; the design notes), under every brain setting:
 
 * **IF-words.** A hand-off's words are the current exchange, not only the words since Yuki last replied: the user's own
   turns since the last request that ended (a job that ended without a question of its own, a hand of the talker's

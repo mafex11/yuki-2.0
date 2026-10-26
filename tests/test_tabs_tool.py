@@ -3,7 +3,7 @@
 Offline: a fake UI Automation tree stands in for a browser's tab strip; nothing reads
 or touches a real window (ARCHITECTURE.md rule 7). The 25 Sept failures this covers:
 "No GitHub tab left open" judged by tab title text, and closes reported done without
-reading the strip again (docs/research/coach-and-answers-review.md 3.2 C).
+reading the strip again (the design notes 3.2 C).
 """
 
 from __future__ import annotations

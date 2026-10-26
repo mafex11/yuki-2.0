@@ -6,7 +6,7 @@ Builders never run this (it opens a live capture stream). Run from the repositor
     python scripts/loopback_probe.py --pid 12345 --seconds 30          # a game: its full-screen window's pid
     python scripts/loopback_probe.py --exe chrome.exe --seconds 10 --no-tree
 
-What it does (docs/research/revamp-2026-10-02/60-build-call-others-capture.md):
+What it does (the design notes):
 
 1. Finds the app's root process from one Toolhelp snapshot (nothing is opened), or takes ``--pid`` as given (for
    VALORANT: the pid of ``VALORANT-Win64-Shipping.exe`` from Task Manager's Details tab; Yuki uses the pid of the

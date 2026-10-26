@@ -1,4 +1,4 @@
-"""The user's feedback round 3, memory side (builder appMem2; docs/research/revamp-2026-10-02/56-build-appMem2.md):
+"""The user's feedback round 3, memory side (builder appMem2; the design notes):
 W1 threads you can close, cards with the next step, self-closing stale threads, the Continue context; W2 session
 titles and summaries; W3 corrections from the user's own words; W5 English everywhere; W6 "maybe misheard" with
 Yuki's guess.

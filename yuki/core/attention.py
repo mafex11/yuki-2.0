@@ -66,7 +66,7 @@ class ChannelRule:
     card_gap: bool = True
 
 
-#: Defaults, matching what the coach and the voice did on their own before (docs/HANDBOOK.md §6):
+#: Defaults, matching what the coach and the voice did on their own before (the project handbook §6):
 #: one coach card per 30 min; cards 10 min apart; reminders on time but never over another card;
 #: spoken progress at most 4 lines a minute with the narrator's 1.5 s cooldown, never gated by a
 #: full-screen game (the user is talking to Yuki) but held in a meeting.

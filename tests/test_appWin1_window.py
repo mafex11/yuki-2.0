@@ -1,4 +1,4 @@
-"""The user's feedback round 3, window side (builder appWin1; docs/research/revamp-2026-10-02/62-build-appWin1.md):
+"""The user's feedback round 3, window side (builder appWin1; the design notes):
 W2 session titles and summaries; W6 "maybe misheard" as what was heard and Yuki's guess; W3 Correct from the user's
 own words (correct_item, its Undo, "fixing" then "fixed"). W1's threads and Home's current-thread tile left the
 window with appTodo (4 Oct); their replacements are tested in tests/test_appTodo_window.py.

@@ -1,4 +1,4 @@
-"""Phase C, practice memory (docs/research/revamp-2026-10-02/27-build-C.md): migration 29, the run trace, the
+"""Phase C, practice memory (the design notes): migration 29, the run trace, the
 distiller's validation, the post-mortem triggers, confidence and decay, the miner's floors, retrieval by target and
 intent, the ledger, the Playbook page API, the know-how intake, the frame and the service worker.
 

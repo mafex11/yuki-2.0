@@ -26,7 +26,7 @@ A later screen of the same app and site judged not in a call means that site's e
 *start* a call (they left: the Discord panel is gone, the Meet page shows "You left the meeting"); a screen of
 another site in the same browser does not (a Meet call goes on while they look at YouTube in another tab).
 
-**Starting is not continuing** (2026-10-03, ``docs/research/revamp-2026-10-02/05-call-pill-timer.md``): one
+**Starting is not continuing** (2026-10-03, ``the design notes``): one
 Discord frame read in the 6-21 s of an alt-tab from a game and judged "not in a call" used to delete the
 evidence, and 30 s later the call row ended (six calls cut that way in 3.5 days, 32 minutes lost on 2 Oct).
 Those frames were half drawn: 0, 0, 18, 21, 21 and 22 controls against at least 68 in all 183 in-call reads. So:
@@ -40,7 +40,7 @@ Those frames were half drawn: 0, 0, 18, 21, 21 and 22 controls against at least 
   window that stays in front), and the call worker's :class:`yuki.memory.calls.CallLife` ends a call whose
   microphone is still held only on a persistent run of them (:meth:`life`), never on one.
 
-**A meeting site the privacy rules keep unread** (2026-10-05, ``docs/research/revamp-2026-10-02/84-build-meetFix.md``):
+**A meeting site the privacy rules keep unread** (2026-10-05, ``the design notes``):
 live, the user sat in a Google Meet call in the Zen browser and no call was ever seen, because the privacy file
 blocks ``meet.google.com`` and ``zoom.us`` (and Teams' meeting paths): the watcher never reads those pages, so
 no screen of the call ever reached the judge. A blocked page's content stays unread; the watcher hands over

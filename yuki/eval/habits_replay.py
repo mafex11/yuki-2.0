@@ -5,9 +5,11 @@ Suites (:data:`SUITES`) and who fills them in:
 
 * ``moments`` (phase F, $0, here): the moments backfill bars of B.1. Yuki's own pipeline command
   (``python -m yuki.memory.moments rebuild --db <copy>``, built by ``fMoments``) runs twice on the copy; then
-  :func:`moments_bars` checks: the morning meeting (E1) joined in Zen on all 7 known weekdays within a minute, with
-  the evidence the plan expects (seen or a corroborated mic hold); no join at all for FL Studio, VALORANT or Settings;
-  a Discord join on the 15 evenings; YouTube ``page`` moments with an entity; the rebuild under 5 s and idempotent.
+  :func:`moments_bars` checks: the morning meeting (E1) joined in Zen on each expected weekday within a minute, with
+  the expected evidence (seen or a corroborated mic hold); no join at all for FL Studio, VALORANT or Settings;
+  a Discord join on the expected number of evenings; YouTube ``page`` moments with an entity; the rebuild under 5 s
+  and idempotent. The E1 weekdays and the Discord evenings are the user's own, read from :data:`BARS_NAME` in their
+  eval folder (:func:`local_bars`); without that file those two bars are skipped.
   :func:`source_reference` gives the same facts from the raw ``calls`` and ``timeline`` rows (independent of the
   moments code), and :func:`sample_moments` draws the 50 moments the reviewer checks by hand against independent
   sources (the calls row's ``via``, the timeline row's host kind, the memory log's ``call_detected``).
@@ -241,27 +243,27 @@ def fingerprint(rows: Sequence[dict[str, Any]]) -> str:
 # Phase F: the moments backfill bars (PLAN B.1)
 # ---------------------------------------------------------------------------------------------------------------------
 
+#: The user's own expectations for E1 and the Discord evenings (facts about their days, so never in the repo): this
+#: file in their eval folder (:func:`dbcopy.eval_dir`), shaped ``{"e1": [["YYYY-MM-DD", "HH:MM:SS", "seen" | "hold"],
+#: ...], "evidence_from": ["YYYY-MM-DD", "HH:MM:SS"], "evidence_to": [...], "discord_evenings_need": N}``.
+BARS_NAME = "habits_bars.json"
+#: What a bar with no expectations reports; it passes as skipped.
+NO_EXPECTATIONS = "no local expectations"
 #: E1, the weekday 09:00 meeting in Zen, on the exact sources of D7 (PLAN Appendix E): local day, onset, evidence.
-E1_EXPECTED: tuple[tuple[str, str, str], ...] = (
-    ("2026-09-25", "08:57:52", "seen"),
-    ("2026-09-28", "09:01:01", "hold"),
-    ("2026-09-29", "09:00:06", "seen"),
-    ("2026-09-30", "09:00:35", "hold"),
-    ("2026-10-05", "08:58:57", "seen"),
-    ("2026-10-07", "08:55:59", "seen"),
-    ("2026-10-08", "08:56:52", "seen"),
-)
+#: ``None`` reads :data:`BARS_NAME` (:func:`local_bars`); a test sets its own.
+E1_EXPECTED: tuple[tuple[str, str, str], ...] | None = None
 E1_APP = "zen"
 E1_TOLERANCE_S = 60.0
 #: Mic holders that were never meetings (B.1): FL Studio, VALORANT (its image key and the short form), Settings.
 NOT_MEETINGS = ("fl64", "valorant-win64-shipping", "valorant", "systemsettings")
 DISCORD_APP = "discord"
-#: The round-2 evidence window (16 days, 24 Sep - 9 Oct; a day starts at 04:00): Discord joined on 15 evenings.
-EVIDENCE_FROM = ("2026-09-24", "04:00:00")
-EVIDENCE_TO = ("2026-10-10", "04:00:00")
+#: The evidence window (local day and time; a day starts at 04:00) and the evenings in it that need a Discord join.
+#: ``None`` reads :data:`BARS_NAME`, as for :data:`E1_EXPECTED`.
+EVIDENCE_FROM: tuple[str, str] | None = None
+EVIDENCE_TO: tuple[str, str] | None = None
 DAY_START_H = 4
 EVENING_FROM_H = 17
-DISCORD_EVENINGS_NEED = 15
+DISCORD_EVENINGS_NEED: int | None = None
 #: Documented host shapes (data, not meaning): YouTube's and Google Meet's.
 YOUTUBE_HOSTS = ("www.youtube.com", "youtube.com", "m.youtube.com")
 MEET_HOSTS = ("meet.google.com",)
@@ -281,15 +283,50 @@ def _evening_day(at: float) -> str | None:
     return None
 
 
-def _window() -> tuple[float, float]:
-    return _local_ts(*EVIDENCE_FROM), _local_ts(*EVIDENCE_TO)
+def _pair(value: Any) -> tuple[str, str] | None:
+    """A ``[day, time]`` pair :func:`_local_ts` reads, else ``None``."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        _local_ts(str(value[0]), str(value[1]))
+    except ValueError:
+        return None
+    return str(value[0]), str(value[1])
+
+
+def local_bars() -> dict[str, Any]:
+    """The E1 and Discord-evening expectations, each from this module when set (a test's own), else from
+    :data:`BARS_NAME` in the user's eval folder, read on every call: ``e1``, the ``(day, onset, evidence)`` rows
+    (empty when unknown); ``window``, the evidence window as local timestamps; ``need``, the evenings (both ``None``
+    when unknown). A missing or malformed file or entry reads as unknown."""
+    data: Any = {}
+    if None in (E1_EXPECTED, EVIDENCE_FROM, EVIDENCE_TO, DISCORD_EVENINGS_NEED):
+        try:
+            data = json.loads((dbcopy.eval_dir() / BARS_NAME).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+    e1 = E1_EXPECTED
+    if e1 is None:
+        rows = data.get("e1") if isinstance(data.get("e1"), list) else []
+        e1 = tuple((*p, str(r[2])) for r in rows if isinstance(r, (list, tuple)) and len(r) == 3
+                   and str(r[2]) in ("seen", "hold") for p in [_pair(r[:2])] if p)
+    lo = EVIDENCE_FROM if EVIDENCE_FROM is not None else _pair(data.get("evidence_from"))
+    hi = EVIDENCE_TO if EVIDENCE_TO is not None else _pair(data.get("evidence_to"))
+    need = DISCORD_EVENINGS_NEED if DISCORD_EVENINGS_NEED is not None else data.get("discord_evenings_need")
+    if not isinstance(need, int) or isinstance(need, bool) or need < 1:
+        need = None
+    return {"e1": tuple(e1), "window": (_local_ts(*lo), _local_ts(*hi)) if lo and hi else None, "need": need}
 
 
 def bar_e1(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """``call_join`` app=zen on each E1 weekday within a minute, with the expected evidence class."""
+    """``call_join`` app=zen on each E1 weekday within a minute, with the expected evidence class; skipped (a pass)
+    when there are no expectations (:func:`local_bars`)."""
+    expected_days = local_bars()["e1"]
     joins = [r for r in rows if r.get("kind") == "call_join" and r.get("app") == E1_APP and r.get("at") is not None]
     days = []
-    for day, hms, expected in E1_EXPECTED:
+    for day, hms, expected in expected_days:
         t = _local_ts(day, hms)
         near = [r for r in joins if abs(float(r["at"]) - t) <= E1_TOLERANCE_S]
         best = min(near, key=lambda r: abs(float(r["at"]) - t)) if near else None
@@ -301,8 +338,11 @@ def bar_e1(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     ok_ev = sum(d["evidence_ok"] for d in days)
     weekend = sum(1 for r in joins if datetime.fromtimestamp(float(r["at"])).weekday() >= 5
                   and 8 <= datetime.fromtimestamp(float(r["at"])).hour < 10)
-    return {"days": days, "found": found, "evidence_ok": ok_ev, "of": len(E1_EXPECTED),
-            "weekend_morning_joins": weekend, "pass": found == len(E1_EXPECTED) and ok_ev == len(E1_EXPECTED)}
+    out = {"days": days, "found": found, "evidence_ok": ok_ev, "of": len(expected_days),
+           "weekend_morning_joins": weekend, "pass": found == len(expected_days) and ok_ev == len(expected_days)}
+    if not expected_days:
+        out["skipped"] = NO_EXPECTATIONS
+    return out
 
 
 def bar_not_meetings(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -313,14 +353,18 @@ def bar_not_meetings(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 
 def bar_discord_evenings(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """A Discord ``call_join`` on the evenings of the evidence window (15 of its 16 days)."""
-    lo, hi = _window()
+    """A Discord ``call_join`` on at least the expected number of evenings of the evidence window; skipped (a pass)
+    when there are no expectations (:func:`local_bars`)."""
+    bars = local_bars()
+    window, need = bars["window"], bars["need"]
+    if window is None or need is None:
+        return {"evenings": None, "need": need, "window_days": None, "skipped": NO_EXPECTATIONS, "pass": True}
+    lo, hi = window
     days = sorted({d for r in rows if r.get("kind") == "call_join" and r.get("app") == DISCORD_APP
                    and r.get("at") is not None and lo <= float(r["at"]) < hi
                    for d in [_evening_day(float(r["at"]))] if d})
     n_days = int(round((hi - lo) / 86400.0))
-    return {"evenings": len(days), "need": DISCORD_EVENINGS_NEED, "window_days": n_days,
-            "pass": len(days) >= DISCORD_EVENINGS_NEED}
+    return {"evenings": len(days), "need": need, "window_days": n_days, "pass": len(days) >= need}
 
 
 def _timeline_hosts(db_path: Path, ids: Sequence[int]) -> dict[int, str | None]:
@@ -552,8 +596,9 @@ def source_reference(db_path: Path) -> dict[str, Any]:
     for m in meetings:
         m["key"] = app_key(m.get("process")) or ""
         m["host_kind"] = _host_kind(m.get("host"))
+    bars = local_bars()
     e1 = []
-    for day, hms, expected in E1_EXPECTED:
+    for day, hms, expected in bars["e1"]:
         t = _local_ts(day, hms)
         near_calls = [c for c in calls if c["key"] == E1_APP and abs(c["onset"] - t) <= REFERENCE_WINDOW_S]
         near_rows = [m for m in meetings if abs(float(m["started_at"]) - t) <= REFERENCE_WINDOW_S
@@ -562,12 +607,12 @@ def source_reference(db_path: Path) -> dict[str, Any]:
                    "meet_host_row": any(m["host_kind"] == "meet" for m in near_rows),
                    "zen_mic_row": any(m["key"] == E1_APP and not m["host_kind"] and float(m["mic_s"] or 0) > 0
                                       for m in near_rows)})
-    lo, hi = _window()
+    lo, hi = bars["window"] or (0.0, 0.0)
     evenings = {d for c in calls if c["key"] == DISCORD_APP and c.get("kind") == "call" and lo <= c["onset"] < hi
                 for d in [_evening_day(c["onset"])] if d}
     return {"e1": e1,
             "e1_days_with_a_source": sum(1 for d in e1 if d["calls_via"] or d["meet_host_row"] or d["zen_mic_row"]),
-            "discord_call_evenings": len(evenings),
+            "discord_call_evenings": len(evenings) if bars["window"] else None,
             "meeting_rows": {a: sum(1 for m in meetings if m["key"] == a)
                              for a in (*NOT_MEETINGS, E1_APP, DISCORD_APP)},
             "call_rows": {a: dict(sorted(Counter(f"{c['kind']}/{c['via']}" for c in calls if c["key"] == a).items()))
@@ -669,18 +714,24 @@ def moments_text(out: dict[str, Any]) -> list[str]:
     lines = ["Moments backfill (phase F), on a copy of your memory"]
     ref = out.get("reference") or {}
     if ref:
+        evenings = ref.get("discord_call_evenings")
         lines.append(f"Independent sources: E1 has a call row or a meeting row on {ref.get('e1_days_with_a_source')} "
-                     f"of {len(E1_EXPECTED)} weekdays; Discord call rows on {ref.get('discord_call_evenings')} "
-                     f"evenings; meeting rows of apps that were never meetings: "
+                     f"of {len(ref.get('e1') or ())} weekdays; Discord call rows on "
+                     f"{'-' if evenings is None else evenings} evenings; "
+                     f"meeting rows of apps that were never meetings: "
                      + ", ".join(f"{a} {ref['meeting_rows'][a]}" for a in NOT_MEETINGS) + ".")
     if out.get("result") in ("not available", "error", "stopped"):
         lines.append(f"{out['result'].capitalize()}: {out.get('why')}.")
         return lines
     b = out["bars"]
     e1 = b["e1"]
-    lines.append(f"E1 (Zen, ±{E1_TOLERANCE_S:g} s): {e1['found']}/{e1['of']} weekdays found, evidence as expected on "
-                 f"{e1['evidence_ok']}/{e1['of']}; weekend-morning joins {e1['weekend_morning_joins']}. "
-                 f"{'PASS' if e1['pass'] else 'FAIL'}")
+    if e1.get("skipped"):
+        lines.append(f"E1 (Zen): {e1['skipped']} ({BARS_NAME}); weekend-morning joins "
+                     f"{e1['weekend_morning_joins']}. SKIPPED")
+    else:
+        lines.append(f"E1 (Zen, ±{E1_TOLERANCE_S:g} s): {e1['found']}/{e1['of']} weekdays found, evidence as expected "
+                     f"on {e1['evidence_ok']}/{e1['of']}; weekend-morning joins {e1['weekend_morning_joins']}. "
+                     f"{'PASS' if e1['pass'] else 'FAIL'}")
     for d in e1["days"]:
         lines.append(f"  {d['day']} {d['expected']} ({d['expected_evidence']}): "
                      + (f"found {d['delta_s']:+.1f} s, evidence {d['evidence']}" if d["found"] else "missing"))
@@ -688,8 +739,11 @@ def moments_text(out: dict[str, Any]) -> list[str]:
     lines.append("Never meetings: " + ", ".join(f"{a} {n}" for a, n in nm["by_app"].items())
                  + f". {'PASS' if nm['pass'] else 'FAIL'}")
     de = b["discord_evenings"]
-    lines.append(f"Discord evenings: {de['evenings']} of {de['window_days']} (need {de['need']}). "
-                 f"{'PASS' if de['pass'] else 'FAIL'}")
+    if de.get("skipped"):
+        lines.append(f"Discord evenings: {de['skipped']} ({BARS_NAME}). SKIPPED")
+    else:
+        lines.append(f"Discord evenings: {de['evenings']} of {de['window_days']} (need {de['need']}). "
+                     f"{'PASS' if de['pass'] else 'FAIL'}")
     yt = b["youtube_pages"]
     lines.append(f"YouTube page moments: {yt['youtube']}, with an entity {yt['youtube_with_entity']} (all pages "
                  f"{yt['pages']}, with an entity {yt['pages_with_entity']}). {'PASS' if yt['pass'] else 'FAIL'}")
@@ -1341,9 +1395,9 @@ def write_report(out: dict[str, Any], name: str, folder: Path | None = None) -> 
     return path
 
 
-__all__ = ["BACKGROUND_COST_TABLES", "Caps", "CapReached", "E1_EXPECTED", "Fixture", "HARD_BUDGET_USD", "HARD_MINUTES",
+__all__ = ["BACKGROUND_COST_TABLES", "BARS_NAME", "Caps", "CapReached", "E1_EXPECTED", "Fixture", "HARD_BUDGET_USD", "HARD_MINUTES",
            "MomentsUnavailable", "NOT_MEETINGS", "SLOT_SPEC", "SUITES", "VOLUME_TARGETS", "background_cost", "bar_discord_evenings", "bar_e1",
            "bar_not_meetings", "bar_youtube_pages", "cli_runner", "cost_report", "default_estimate", "fingerprint",
-           "load_resolver", "moments_bars", "moments_text", "plan_requests", "read_moments", "reported_cost",
+           "load_resolver", "local_bars", "moments_bars", "moments_text", "plan_requests", "read_moments", "reported_cost",
            "requests_text", "run_requests", "sample_moments", "slot_kind", "sample_text", "score_requests", "scorecard", "scorecard_text",
            "source_reference", "suite_status", "time_split", "user_words", "write_report"]
