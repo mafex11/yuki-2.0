@@ -169,7 +169,7 @@ def test_site_front_notes_whether_the_meet_tab_was_identified(store):
 
 
 def test_moments_rule_version_rebuilds_the_page_moments_with_the_templates():
-    assert M.RULE_VERSION == 2
+    assert M.RULE_VERSION == 3   # lCore (10 Oct): host-scope page moments and the entity key
     from yuki.connect import templates
 
     assert M.default_page_entity() is templates.page_entity
@@ -194,7 +194,7 @@ def test_the_privacy_file_lists_the_new_tables_with_the_code_defaults():
     data = tomllib.loads(text)
     assert M.MomentsConfig.from_dict(data["moments"]) == M.MomentsConfig()
     assert set(data["moments"]) == {"enabled", "volume_events", "media_titles", "refresh_s", "page_dwell_s",
-                                    "keep_days"}
+                                    "keep_days", "host_dwell_s"}   # host_dwell_s: zNotes (10 Oct)
     spotify, default = SpotifySettings.from_dict(data["spotify"]), SpotifySettings()
     assert set(data["spotify"]) == {"enabled", "library_reads", "read_budget_s", "warm_budget_s", "state_probe"}
     assert all(getattr(spotify, k) == getattr(default, k) for k in data["spotify"])
@@ -222,15 +222,18 @@ def test_the_tray_logs_every_refusal_and_adds_the_boards_game(monkeypatch):
 
 
 def test_a_pattern_call_on_a_games_window_is_refused_and_never_falls_back(monkeypatch):
-    from yuki.actions import patterns
+    from yuki.actions import gate, patterns
     from yuki.memory import gamegate
 
     seen: list[dict] = []
 
     def refuse(action: str, **target: Any) -> str | None:
         seen.append({"action": action, **target})
-        return "that window belongs to a game (skyrunner): Yuki never sends keys, clicks, focus or window changes"
+        # refused as the gate refuses a game: its refusal listeners fire (fHands, 18 Oct: the hands' gate tags a
+        # refusal "game" only then; a stub's bare words read "blocked")
+        return gamegate._refused(action, "skyrunner", "window")
 
+    monkeypatch.setattr(gamegate, "_refusal_listeners", [gate._heard])
     monkeypatch.setattr(gamegate, "refuse_input", refuse)
     monkeypatch.setattr(patterns, "usable", lambda element, verb: "invoke")
     monkeypatch.setattr(patterns, "_root", lambda hwnd: pytest.fail("read the window after a refusal"))
@@ -247,10 +250,12 @@ def test_a_pattern_call_on_a_games_window_is_refused_and_never_falls_back(monkey
 def test_hover_with_a_game_in_front_moves_nothing_and_says_so(monkeypatch):
     import yuki.actions.hover as hover_mod
     import yuki.actions.input as inp
+    from yuki.actions import gate
 
     def refused_move(x: int, y: int, *, why: list[str] | None = None) -> bool:
-        if why is not None:
-            why.append("a game (skyrunner) is in front: Yuki sends nothing while a game is in front")
+        if why is not None:   # the gate's refusal, as _move passes it on: a game refused it (fHands, 18 Oct)
+            why.append(gate.Refusal("a game (skyrunner) is in front: Yuki sends nothing while a game is in front",
+                                    gate.GAME))
         return False
 
     monkeypatch.setattr(inp, "_move", refused_move)
@@ -527,7 +532,9 @@ def test_a_voice_hand_marks_its_acting_and_its_trace_with_one_id(tmp_path):
                             _trace_n=0, _hand_ids={})
     hands._call_safely = lambda fn, default: Hands._call_safely(hands, fn, default)
     hands._mint_hand_id = lambda call=None: Hands._mint_hand_id(hands, call)
-    hands._run = lambda name, args: (marked.append(acting.current(db)), (True, "ok", {}))[1]
+    # qVoice: _acting_run is the _acting marker around _run(..., bracket=)
+    hands._acting = lambda n, h=None: Hands._acting(hands, n, h)
+    hands._run = lambda name, args, **k: (marked.append(acting.current(db)), (True, "ok", {}))[1]
     hand_id = Hands._mint_hand_id(hands, "call-1")
     assert hand_id == "voice-S-4-h1"
     assert Hands._acting_run(hands, "window", {}, hand_id) == (True, "ok", {})

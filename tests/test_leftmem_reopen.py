@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from _rewind import rewind
 from yuki.memory.api import MemoryClient
 from yuki.memory.store import MIGRATIONS, Store
 
@@ -256,8 +257,9 @@ def test_migration_adds_the_column_to_an_existing_database(tmp_path: Path):
     s.close()
     conn = sqlite3.connect(path)   # back to the shape before migration 37 (v36): the column is new in 37
     conn.execute("ALTER TABLE conversation_facts DROP COLUMN reopened_at")
-    conn.execute("PRAGMA user_version=36")   # v36 itself (later migrations, 38+, are additive and run again)
-    conn.commit()
+    # v36 itself. Later migrations run again: 38+ only create what is missing, except the ALTERs of 43 (lCore, 10 Oct)
+    # and 49 (mon1, 22 Oct), which can't run twice, so rewind (r30) drops their columns first
+    rewind(conn, 36)
     conn.close()
     s = Store.open(path)
     try:

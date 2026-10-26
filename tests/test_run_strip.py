@@ -230,7 +230,7 @@ def test_the_call_pill_counts_from_the_session_not_the_row(qapp):
     from yuki.ui.calls import CallIndicator
 
     pill = CallIndicator()
-    now = datetime.now().astimezone()
+    now = datetime.fromtimestamp(time.time()).astimezone()   # the clock the pill reads (r30: a pinned run's too)
     pill.set_call({"status": "recording", "app": "Discord",
                    "detected_at": (now - timedelta(minutes=2)).isoformat(timespec="seconds"),
                    "session_started_at": (now - timedelta(minutes=95)).isoformat(timespec="seconds")})

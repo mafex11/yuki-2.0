@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from _rewind import rewind
 from yuki.memory import titles
 from yuki.memory.api import MemoryClient
 from yuki.memory.store import MIGRATIONS, FactChange, ModelCall, NewFact, Store, WorkOp, _split_sql
@@ -144,7 +145,7 @@ def test_migration_33_runs_on_a_v32_file_with_rows_and_pins_user_facts_only(tmp_
     conn.execute("DROP TABLE undo_images")
     conn.execute("DROP TABLE work_items")   # migration 36 (the Work page) too
     conn.execute("ALTER TABLE conversation_facts DROP COLUMN reopened_at")   # migration 37 (put back) too
-    conn.execute("PRAGMA user_version=32")
+    rewind(conn, 32)   # r30: and the ALTERs of 43 and 49, which can't run twice; then user_version 32
     conn.close()
     s = Store.open(db)
     try:

@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from _rewind import rewind
 from yuki.memory import trace_links as TL
 from yuki.memory import trace_store
 from yuki.memory.store import MIGRATIONS, Store
@@ -95,8 +96,7 @@ def test_migration_39_from_38_keeps_the_trace_rows(tmp_path):
         conn.execute(f"DROP TABLE {t}")
     for i in ("ui_links_from", "ui_links_to", "ui_links_pair", "ui_actions_kind", "ui_actions_file"):
         conn.execute(f"DROP INDEX {i}")
-    conn.execute("PRAGMA user_version=38")
-    conn.commit()
+    rewind(conn, 38)   # r30: and the ALTERs of 43 and 49, which can't run twice; then user_version 38, committed
     conn.close()
     s = Store.open(path)
     try:

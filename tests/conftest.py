@@ -20,6 +20,14 @@ import os
 
 import pytest
 
+# r30: no test reads this PC's own settings.json for the brain or the user's names. Old loop-era tests ran on the
+# shipped plan brain (its own model client, worker hands on the real desktop), and since the scrub Settings() carried
+# the user's real names. A test that means the shipped brain says so: Settings(brain="all") or
+# SimpleNamespace(brain="all"). Set here, before any yuki import, so yuki.one.modes.process_mode() caches the pinned
+# value in every test process.
+os.environ["YUKI_BRAIN"] = "loop"
+os.environ["YUKI_USER_NAMES"] = "Kian,Mafex,mafex11"   # the scrub's stand-in and the public handle the tests keep
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _no_side_calls():
@@ -94,9 +102,12 @@ def _temp_seen_ledger(tmp_path_factory: pytest.TempPathFactory):
 # real, so pickling works). ``time.monotonic`` and ``perf_counter`` are left alone, so timeouts and waits
 # behave. Pick the time with ``@pytest.mark.clock("00:30")`` (default noon, on :data:`PINNED_DAY`). ``YUKI_TEST_CLOCK=HH:MM``
 # pins every test of the run to the latest real moment at that time (today, or yesterday when it is still ahead;
-# ``scripts/sweep.py --clock 00:30``): how the after-midnight failures are found. Never a fixed day and never the future:
-# file times and other clocks a test can't pin keep their real order. Modules first imported inside a test body keep
-# the real ``datetime`` class.
+# ``scripts/sweep.py --clock 00:30``): how the after-midnight failures are found. Never a fixed day and never the
+# future, so files older than the run keep their real order against it. A file a test writes during the run carries
+# the real time, which is AHEAD of a pin behind the real clock: a test that compares such a file's time with
+# ``time.time()`` fails (r30: ``--clock 14:00`` at midnight was 10 h behind), so it stamps the file from
+# ``time.time()`` (``os.utime``) or names it with ``time.strftime``. Pick ``--clock`` within an hour of the real time.
+# Modules first imported inside a test body keep the real ``datetime`` class.
 
 import datetime as _dt
 import sys as _sys
@@ -207,7 +218,8 @@ def _run_clock_modules(request: pytest.FixtureRequest, monkeypatch: pytest.Monke
 
 def _run_day(hhmm: str) -> _dt.date:
     """The most recent day on which ``hhmm`` has already passed: today, or yesterday when it is still ahead. A pinned
-    run is never in the future, so file times and other clocks a test can't pin stay behind it, as they really are."""
+    run is never in the future, so files older than the run stay behind it, as they really are; a file a test writes
+    during the run is stamped with the real time, ahead of the pin (see the note above ``PINNED_DAY``)."""
     hour, minute = (int(x) for x in hhmm.split(":"))
     now = _REAL_DATETIME.fromtimestamp(_REAL_TIME())
     today = now.date()

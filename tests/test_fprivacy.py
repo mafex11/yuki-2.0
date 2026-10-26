@@ -822,7 +822,9 @@ def test_the_ledger_has_the_request_id_and_the_skill_columns_as_code_words_only(
                               "recheck": "agree", "moments_after": 2})
     append_request_row(path, {"request_id": "r-2", "skill": "Quillon Marsh", "route": SECRET, "done_check": "x" * 80})
     rows = _csv_rows(path)
-    assert REQUEST_CSV_FIELDS[-6:] == ("request_id", "skill", "route", "done_check", "recheck", "moments_after")
+    # the six right after "outcome" (bWire, 10 Oct, appended the plan columns after them)
+    at = REQUEST_CSV_FIELDS.index("outcome") + 1
+    assert REQUEST_CSV_FIELDS[at:at + 6] == ("request_id", "skill", "route", "done_check", "recheck", "moments_after")
     assert rows[0]["request_id"] == "20261010-091512-worker-3" and rows[0]["skill"] == "spotify.playlist"
     assert rows[0]["moments_after"] == "2" and rows[0]["recheck"] == "agree"
     assert rows[1]["skill"] == "" and rows[1]["route"] == "" and rows[1]["done_check"] == ""
@@ -946,13 +948,12 @@ def test_follow_cli_exit_codes_and_a_missing_moments_table(tmp_path, capsys):
 
 def test_follow_finds_a_request_only_the_memory_log_knows(tmp_path):
     """A voice hand's marker: no session file names it; its own acting lines give the span."""
-    from datetime import datetime
-
     from yuki.log.follow import follow
 
     logs = tmp_path / "logs"
     logs.mkdir()
-    mem = SessionLogger(logs, session_id="memory-" + datetime.now().strftime("%Y%m%d-%H%M%S"), quiet=True)
+    # named from the clock the records are stamped with (r30: a pinned run's clock, not the real one)
+    mem = SessionLogger(logs, session_id="memory-" + time.strftime("%Y%m%d-%H%M%S"), quiet=True)
     mem.log("acting", acting=True, lane="voice", request_id="hand-1-2")
     mem.log("site_front", app="zen", service_kind="site")
     mem.log("acting", acting=False, lane=None, request_id=None)
@@ -965,8 +966,6 @@ def test_follow_finds_a_request_only_the_memory_log_knows(tmp_path):
 def test_follow_without_logs_falls_back_to_the_installed_apps_logs(tmp_path, monkeypatch, capsys):
     """Review r1 L6: in a dev checkout the default logs folder is the repo's; when it names nothing, the installed
     app's (``data_dir()/logs``) is read."""
-    from datetime import datetime
-
     from yuki.core import paths
     from yuki.log import follow as follow_mod
 
@@ -978,7 +977,8 @@ def test_follow_without_logs_falls_back_to_the_installed_apps_logs(tmp_path, mon
     monkeypatch.setattr(paths, "logs_dir", lambda: checkout)
     monkeypatch.setattr(paths, "data_dir", lambda: data)
     assert follow_mod.default_logs() == [checkout, installed]
-    mem = SessionLogger(installed, session_id="memory-" + datetime.now().strftime("%Y%m%d-%H%M%S"), quiet=True)
+    # named from the clock the records are stamped with (r30: a pinned run's clock, not the real one)
+    mem = SessionLogger(installed, session_id="memory-" + time.strftime("%Y%m%d-%H%M%S"), quiet=True)
     mem.log("acting", acting=True, lane="voice", request_id="hand-4-1")
     mem.close()
     assert follow_mod.main(["hand-4-1", "--db", str(tmp_path / "none.db")]) == 0

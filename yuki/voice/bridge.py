@@ -1290,13 +1290,21 @@ class VoiceBridge(QObject):
                 what = "withdrawn for a newer request" + (
                     f" (its list still had: {'; '.join(left)}; say so if they did not mean to drop it)" if left else "")
             outcome = condense(j.outcome or "", max_sentences=1, max_chars=120)[0] if j.state == DONE else ""
-            held = self._held_verdict(j, "done") if j.state == DONE else None
-            if held is not None:
-                # honest (87): its words are the thinker's claim; the check's level is what the talker may repeat
-                what += f", {str(held.get('label') or '').lower()} ({held.get('seen') or 'nothing showed it'})"
+            what += self._held_level(j)
             parts.append(f'task {j.job_id} "{j.brief()}" {what} {round(now - (j.finished_at or now))} s ago'
                          + (f': "{outcome}"' if outcome else ""))
         return "; ".join(parts) or None
+
+    def _held_level(self, job: Job) -> str:
+        """honest (87): for a finished job whose words may not be said as written, the check's level and what it saw
+        (``", not confirmed (the message did not show up in the chat)"``), else ``""``. Its words are the thinker's
+        claim; the level is what the talker may repeat. Both work lines (:meth:`work_line`, :meth:`_brain_work_line`)
+        add it, so they can't drift apart: r30, the lean line dropped it for a job the old loop ran (the runtime's
+        fallback under ``brain = "all"``)."""
+        held = self._held_verdict(job, "done") if job.state == DONE else None
+        if held is None:
+            return ""
+        return f", {str(held.get('label') or '').lower()} ({held.get('seen') or 'nothing showed it'})"
 
     def has_open_voice_job(self) -> bool:
         """Whether a job of this conversation is open (queued, running or waiting for the user's answer)."""
@@ -5204,6 +5212,7 @@ class VoiceBridge(QObject):
             elif j.superseded:
                 what = "withdrawn for a newer request"
             outcome = condense(j.outcome or "", max_sentences=1, max_chars=120)[0] if j.state == DONE else ""
+            what += self._held_level(j)   # honest (87): a job the old loop ran keeps its level (none for brain_run)
             parts.append(f'task {j.job_id} "{j.brief()}" {what} {round(now - (j.finished_at or now))} s ago'
                          + (f': "{outcome}"' if outcome else ""))
         return "; ".join(parts) or None

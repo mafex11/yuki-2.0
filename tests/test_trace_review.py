@@ -29,7 +29,7 @@ def _recent(tmp_path, rig):
     recent = tmp_path / "Recent"
     recent.mkdir()
     rig.rules = TraceRules.from_dict(ON)
-    rig.w._wall = time.time                                   # file times are real: so is the worker's wall here
+    rig.w._wall = time.time                                   # the test's clock; the links are stamped from it
     rig.w._recent = recent
     rig.w._recent_seen = time.time() - 5
     rig.w._opened_at = time.time() - 5
@@ -39,6 +39,15 @@ def _recent(tmp_path, rig):
 def _old_file(path, data: bytes = b"x"):
     path.write_bytes(data)
     os.utime(path, (time.time() - 3600, time.time() - 3600))
+    return path
+
+
+def _link(path):
+    """A Recent link written now, stamped from ``time.time()``, the clock the worker's wall reads (r30: a file's real
+    mtime is hours ahead of a pinned run's clock, so a link written while blocked read as opened after)."""
+    path.write_bytes(b"L")
+    now = time.time()
+    os.utime(path, (now, now))
     return path
 
 
@@ -56,7 +65,7 @@ def test_files_opened_while_the_trace_was_blocked_never_become_rows(tmp_path, ri
     elif how == "off":
         rig.rules = TraceRules.from_dict({**ON, "record_actions": False})
     time.sleep(0.02)
-    (recent / "invented-notes.txt.lnk").write_bytes(b"L")
+    _link(recent / "invented-notes.txt.lnk")
     if how != "paused":
         rig.feed("recent", rig.clock.t, dt=0.1)               # dropped at the first step
     # (paused: the controller has the hooks blocked, so no item comes at all)
@@ -81,7 +90,7 @@ def test_a_file_opened_after_the_trace_opens_again_is_recorded(tmp_path, rig):
     rig.gate = False
     rig.feed("key", rig.clock.t, "chord", "Ctrl+O", "user", 0, dt=0.1)   # the worker sees the trace open again
     time.sleep(0.02)
-    (recent / "invented-plan.txt.lnk").write_bytes(b"L")
+    _link(recent / "invented-plan.txt.lnk")
     rig.feed("recent", rig.clock.t + 1, dt=1)
     rig.settle()
     assert [r["kind"] for r in rig.rows() if r["kind"].startswith("file_")] == ["file_open"]

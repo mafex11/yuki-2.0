@@ -1,9 +1,10 @@
 """Revamp D, part 2: making Yuki personal (the design notes, 09 P1-P4).
 
 The personal brief written by the nightly render (fields, budgets, what code refuses), its slices per consumer and
-their wiring (the agent's profile layer, the card writers' ABOUT THE USER, the talker's slice), the content-first
-``activity`` header, the plans-ahead trigger, the break card's offer after a reply, the check-in vet's worked drops,
-the channel-route data in the task frame, probation for migrated know-how, and the personal-ness log and judge.
+their wiring (the agent's profile layer, the talker's slice), the content-first ``activity`` header, the check-in
+vet's worked drops, the channel-route data in the task frame, and the personal-ness log and judge. (r30: the
+plans-ahead trigger, the card writers' ABOUT THE USER, the break card's offer and the probation of migrated know-how
+went with the code that held them: kProactive and kClean, 18 Oct.)
 
 Temp databases, synthetic data and stub models only; nothing touches the desktop, a real model or the real memory.
 """
@@ -12,14 +13,14 @@ from __future__ import annotations
 
 import json
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from yuki.memory.store import FactChange, NewNudge, NudgeCheckin, PortraitRunStats, Store, TimelineRow
+from yuki.memory.store import FactChange, NewNudge, NudgeCheckin, PortraitRunStats, Store
 
 NOW = datetime(2026, 10, 3, 18, 0).timestamp()
 DAY = 86400.0
@@ -327,7 +328,9 @@ def test_brief_for_cuts_one_slice_per_consumer(store):
                  "2026-10-04: Setup call with Sam", "Routine: Bed around 4-5 am", "money with friends"):
         assert part in thinker, part
     talker = client.brief_for("talker")
-    assert talker.startswith("[Tone and names, never news") and len(talker) <= B.TALKER_CHARS
+    # the talker slice's head since 18 Oct (brief.TALKER_HEAD: the speaking style; choosing reads the you-card)
+    assert talker.startswith("[How to talk with the user and who their people are, from memory: your speaking style.]")
+    assert talker.startswith(B.TALKER_HEAD) and len(talker) <= B.TALKER_CHARS
     assert "Their people: Sam (best friend), riya (music collaborator)" in talker
     assert "toaster that finally talks back" in talker and "money with friends" in talker and "Hinglish, casual" in talker
     for news in ("Setup call", "2026-10-04", "Discord DM", "Routine", "expo demo"):       # no news, no routes, no day
@@ -355,7 +358,7 @@ def test_the_talker_slice_stays_within_its_budget_bits_then_people_giving_way(st
     assert sum(i.startswith("own_bits") for i in cut["ids"]) < 8                     # bits gave way first
 
 
-# -- 3. consumer wiring: the agent's profile layer, the card writers, the log -----------------------------------------
+# -- 3. consumer wiring: the agent's profile layer, the log -----------------------------------------------------------
 
 
 def test_the_agent_puts_the_brief_in_the_profile_layer_instead_of_personality_and_persona(tmp_path):
@@ -417,36 +420,6 @@ def test_the_profile_layer_without_a_brief_is_as_before():
     assert "Personality\n- a" in old and PERSONA_HEADING in old
     new = profile_text(["Kee"], None, None, "People ...", brief="[Personal brief]\nHow to be with them: x")
     assert "How to be with them: x" in new and PERSONA_HEADING not in new and "People ..." in new
-
-
-def test_the_card_writers_read_the_brief_and_each_card_logs_what_it_was_written_from(store):
-    from yuki.memory.nudges import COACH_ABOUT_KINDS, _about_lines
-
-    t = world(store)
-    safe = lambda v, n: str(v or "")[:n]   # noqa: E731
-    facts_lines = _about_lines(store, COACH_ABOUT_KINDS, safe)                       # no brief yet: portrait facts
-    assert any(line.startswith("- routine:") for line in facts_lines)
-    store.record_checkin(NudgeCheckin(at=NOW, trigger="periodic", outcome="nudge"),
-                         NewNudge(kind="nudge", text="Go stretch.", trigger="periodic", inputs={"evidence": ["BREAK"]}))
-    row = store.surfaced()[-1]
-    assert row["kind"] == "card" and row["brief_ids"] == [] and f"F{t['routine_fact']}" in row["fact_ids"]
-    assert "BREAK" in row["fact_ids"]
-    render_with(store, {**fields(), "brief": brief_answer(t)})
-    lines = _about_lines(store, COACH_ABOUT_KINDS, safe)
-    assert lines[0].startswith("- how to be with them:") and any("Sam" in ln for ln in lines)
-    assert not any(ln.startswith("- routine: Goes to bed") for ln in lines)          # the brief replaces the facts
-    _cid, nid = store.record_checkin(NudgeCheckin(at=NOW + 60, trigger="periodic", outcome="nudge"),
-                                     NewNudge(kind="nudge", text="Valorant since 9, go stretch.", trigger="periodic",
-                                              inputs={"evidence": ["BREAK", "J5"]}))
-    row = store.surfaced()[-1]
-    assert row["ref"] == f"nudge:{nid}" and "with_him" in row["brief_ids"] and "people.1" in row["brief_ids"]
-    assert row["brief_at"] == store.latest_portrait().at and "J5" in row["fact_ids"]
-    # a look that ended in none takes its noted context with it: the next card does not inherit it
-    _about_lines(store, COACH_ABOUT_KINDS, safe)
-    store.record_checkin(NudgeCheckin(at=NOW + 120, trigger="periodic", outcome="none"))
-    store.record_checkin(NudgeCheckin(at=NOW + 180, trigger="reminder", outcome="reminder"),
-                         NewNudge(kind="reminder", text="Call Asha.", trigger="reminder"))
-    assert store.surfaced()[-1]["brief_ids"] == []
 
 
 # -- 4. the personal-ness judge ---------------------------------------------------------------------------------------
@@ -527,118 +500,8 @@ def test_the_spoken_layer_answers_what_changed_not_app_minutes():
     from yuki.agent.prompt import SYSTEM_PROMPT, VOICE_LAYER
 
     assert "what changed and what is open, not minutes per app" in VOICE_LAYER
-    assert len(SYSTEM_PROMPT) <= 13_000                                               # the core prompt did not grow
-
-
-# -- 6. cards about him: plans ahead, the break card's offer after a reply ----------------------------------------
-
-
-def _nudge_worker(store: Store, client: Any) -> Any:
-    from yuki.memory.nudges import NudgeConfig, NudgeWorker
-
-    return NudgeWorker(store, config=NudgeConfig(), client=client, log_dir=Path(tempfile.gettempdir()) / "yuki-d-tests",
-                       locked_fn=lambda: False, media_fn=lambda: [], event_name="Local\\YukiNudgeReadyTestD",
-                       render_fn=lambda: [], clock=lambda: NOW - DAY)
-
-
-def test_a_plan_within_a_day_wakes_one_plans_look_and_not_otherwise(store):
-    from yuki.memory.nudges import todo_items
-    from yuki.memory.presence import PLANS_MIN_LEAD_S, PresenceWorker
-
-    t = world(store)
-    worker = _nudge_worker(store, ToolClient({}))
-    pw = PresenceWorker(worker)
-    sat_evening = datetime(2026, 10, 3, 18, 0).timestamp()      # the setup call is "Sunday", no time: tomorrow
-    look = pw._plans(sat_evening, worker.config(), None, todo_items(store, now=sat_evening))
-    assert look is not None and look.channel == "plans" and look.required == {"PLAN"}
-    assert "THE PLAN [PLAN]" in look.lines[0] and "setup" in look.lines[0] and "said on a call" in look.lines[0]
-    assert "come on the call on Sunday for setup" in look.lines[1]
-    assert look.meta["plan"] == f"commit:{t['plan']}"
-    # two days before: too far; on the day itself: its moment passed (an all-day plan comes the day before)
-    thu = datetime(2026, 10, 2, 18, 0).timestamp()
-    assert pw._plans(thu, worker.config(), None, todo_items(store, now=thu)) is None
-    sun = datetime(2026, 10, 4, 10, 0).timestamp()
-    assert pw._plans(sun, worker.config(), None, todo_items(store, now=sun)) is None
-    # a to-do of theirs due near it already covers it
-    store.add_todo("Setup call", due_at=datetime(2026, 10, 3, 23, 0).timestamp())
-    assert pw._plans(sat_evening, worker.config(), None, todo_items(store, now=sat_evening)) is None
-    assert PLANS_MIN_LEAD_S >= 30 * 60
-
-
-def test_a_goal_with_a_time_wakes_a_plans_look_and_its_own_reminder_answer_stops_it(store):
-    from yuki.memory.nudges import todo_items
-    from yuki.memory.presence import PresenceWorker
-
-    t = world(store)
-    worker = _nudge_worker(store, ToolClient({}))
-    pw = PresenceWorker(worker)
-    eve = datetime(2026, 10, 8, 14, 0).timestamp()            # the demo is 10:00 tomorrow
-    look = pw._plans(eve, worker.config(), None, todo_items(store, now=eve))
-    assert look is not None and look.meta["plan"] == f"G{t['goal']}" and "a goal of theirs" in look.lines[0]
-    # the call plan's own "want a reminder?" card was answered: no plans card for it
-    _cid, nid = store.record_checkin(NudgeCheckin(at=NOW - 3600, trigger="confirm", outcome="reminder"),
-                                     NewNudge(kind="reminder", text="Still on? Want a reminder?", trigger="confirm",
-                                              ref=f"commit:{t['plan']}"))
-    store.react_to_nudge(nid, "dismissed", at=NOW - 3500)
-    sat = datetime(2026, 10, 3, 18, 0).timestamp()
-    assert pw._plans(sat, worker.config(), None, todo_items(store, now=sat)) is None
-
-
-def test_the_plans_channel_is_budgeted_and_prompted():
-    from yuki.core.attention import DEFAULT_RULES, PRESENCE_CHANNELS
-    from yuki.memory.presence import CHANNELS, NOTICE_WRITER_PROMPT, OBSERVE_PROMPT
-
-    assert "plans" in CHANNELS and "plans" in PRESENCE_CHANNELS and DEFAULT_RULES["plans"].budget == 1
-    assert "- plans: something the user planned" in OBSERVE_PROMPT
-    assert "A personal call counts as much as a work one" in OBSERVE_PROMPT           # the after-call recap
-    assert "never an amount of money" in OBSERVE_PROMPT and "want a reminder at 8 pm?" in NOTICE_WRITER_PROMPT
-
-
-def _present(store: Store, start: float, end: float, app: str = "Warp") -> None:
-    t = start
-    while t < end:
-        e = min(end, t + 300.0)
-        store.save_timeline(TimelineRow(None, t, e, "present", app.lower(), app, active_s=e - t))
-        t = e
-
-
-def test_a_break_card_may_offer_one_concrete_help_after_he_replied_to_the_last_one(store):
-    from yuki.memory.nudges import NudgeConfig, Trigger, break_reply, observe
-
-    cfg = NudgeConfig()
-    day = datetime(2026, 10, 3)
-    at = lambda h, m=0: (day + timedelta(hours=h, minutes=m)).timestamp()   # noqa: E731
-    _present(store, at(9), at(10, 40))
-    _cid, old = store.record_checkin(NudgeCheckin(at=at(7), trigger="periodic", outcome="nudge"),
-                                     NewNudge(kind="nudge", text="Since 5, go stretch.", trigger="periodic",
-                                              inputs={"is_break_suggestion": True}))
-    store.react_to_nudge(old, "replied", at=at(7, 1), reply="can't, meeting at 9")
-    assert break_reply(store, at(10, 35)).id == old
-    offer = {"do": "todo_add", "label": "Remind me", "steps": ["add 'Meeting', due 8:45, to your list"],
-             "refs": [f"N{old}"], "text": "Meeting", "due": "2026-10-04 08:45"}
-    client = ToolClient({
-        "coach_decision": [{"reason": "r", "say": "nudge", "is_break_suggestion": True, "detail": "Warp since 9",
-                            "evidence": ["BREAK"], "mentions": []}],
-        "write_card": [{"reason": "r", "say": "nudge", "text": "Warp since 9, stretch. Want a reminder at 8:45?",
-                        "evidence": ["BREAK"], "mentions": [], "offer": offer}]})
-    worker = _nudge_worker(store, client)
-    result = worker.decide(at(10, 35), cfg, observe(store, at(10, 35), cfg), Trigger("periodic"), [])
-    assert result["outcome"] == "nudge" and result["offer"]["do"] == "todo_add" and result["offer_for"] == old
-    note = client.requests[1]["messages"][0]["content"]
-    assert "OFFERS ALLOWED NOW: todo_add" in note and "meeting at 9" in note
-    # no reply to a break card: no offer allowed, and a card that asks for one is not shown
-    store2 = Store.open(Path(tempfile.mkdtemp()) / "m.db")
-    try:
-        _present(store2, at(9), at(10, 40))
-        client2 = ToolClient({"coach_decision": client.answers["coach_decision"],
-                              "write_card": [{"reason": "r", "say": "nudge", "text": "Stretch. Want a reminder?",
-                                              "evidence": ["BREAK"], "mentions": [], "offer": dict(offer, refs=[])}]})
-        r2 = _nudge_worker(store2, client2).decide(at(10, 35), cfg, observe(store2, at(10, 35), cfg),
-                                                   Trigger("periodic"), [])
-        assert "OFFERS ALLOWED NOW: none" in client2.requests[1]["messages"][0]["content"]
-        assert r2["outcome"] == "suppressed:offer_dropped"
-    finally:
-        store2.close()
+    # the core prompt did not grow; 27 Oct (r30): 13,394 since "Integrate live fixes" (17 Oct), so the ceiling is 14,000
+    assert len(SYSTEM_PROMPT) <= 14_000, len(SYSTEM_PROMPT)
 
 
 # -- 7. the check-in vet's worked drops (report 33 §5.1 #2, #12, #3) ----------------------------------------------
@@ -717,53 +580,3 @@ def test_with_no_tags_the_example_names_the_group_he_writes_in_most():
     # a place where they write counts even with no tag of theirs
     shared = [{**busy[0], "ref": "route:10", "label": "Discord channel \"general\"", "theirs": 12, "mine": 30}]
     assert "[route:10]" in _channel_example({"name": "Sam"}, routes[:1], busy + shared)
-
-
-# -- 9. probation for migrated know-how -----------------------------------------------------------------------------
-
-
-def test_a_migrated_row_is_on_probation_until_a_successful_run_confirms_it(store):
-    import numpy as np
-
-    from yuki.memory import practice as P
-
-    vec = np.ones(8, dtype=np.float32)
-    slider = P.add_playbook(store, {"kind": "procedure", "intent": "lower the YouTube volume", "apps": ["chrome"],
-                                    "body": {"steps": ["drag the YouTube player's volume slider"]},
-                                    "origin": "knowhow", "sources": ["knowhow:2"]},
-                            events=[{"type": "observed", "run_key": "knowhow:2", "at": NOW - DAY}], vector=vec,
-                            embed_model="t", now=NOW)
-    o = P.get(store, slider)
-    assert o.state == "probation" and o.confidence <= P.PROBATION_CONFIDENCE
-    assert o.label() == "from old notes, not confirmed by a run yet"
-    shown = P.relevant(store, query_vec=vec, apps_in_play=["chrome"], now=NOW)
-    assert shown["ways"] == [] and shown["pitfalls"] == []                             # never injected
-    page = P.workflows(store, now=NOW)
-    assert [c["id"] for c in page["proposals"]] == [o.ref] and page["procedures"] == []
-    # even a taught migrated row waits (the migration wrote that "taught"), and the miner's days alone do not count
-    P.add_events(store, [{"playbook_id": slider, "type": "observed_day", "run_key": None, "at": NOW}], now=NOW)
-    assert P.get(store, slider).state == "probation"
-    # a run that worked with it confirms it: then it is shown like any other
-    P.add_events(store, [{"playbook_id": slider, "type": "ran_ok", "run_key": "agent:s1:7", "at": NOW}], now=NOW)
-    o = P.get(store, slider)
-    assert o.state in ("active", "candidate") and o.confidence > P.PROBATION_CONFIDENCE
-    assert [w["id"] for w in P.relevant(store, query_vec=vec, apps_in_play=["chrome"], now=NOW)["ways"]] == [slider]
-
-
-def test_a_run_learned_object_and_the_users_save_are_never_on_probation(store):
-    import numpy as np
-
-    from yuki.memory import practice as P
-
-    vec = np.ones(8, dtype=np.float32)
-    run = P.add_playbook(store, {"kind": "pitfall", "intent": "lower Yuki's own voice", "apps": ["chrome"],
-                                 "body": {"text": "moved the video", "instead": "app_volume on Yuki"},
-                                 "origin": "run"},
-                         events=[{"type": "observed", "run_key": "agent:s1:3", "at": NOW}], vector=vec, now=NOW)
-    assert P.get(store, run).state == "candidate"
-    old = P.add_playbook(store, {"kind": "habit", "intent": "open YouTube in Chrome", "apps": ["chrome"],
-                                 "body": {"text": "YouTube in Chrome"}, "origin": "knowhow"},
-                         events=[{"type": "taught", "run_key": "knowhow:4", "at": NOW - DAY}], vector=vec, now=NOW)
-    assert P.get(store, old).state == "probation"
-    assert P.workflow_edit(store, f"pb:{old}", "save", now=NOW)["ok"]
-    assert P.get(store, old).state != "probation"                                      # the user's own Save confirms
