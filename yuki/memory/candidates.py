@@ -103,6 +103,7 @@ from yuki.memory.presence import (
     STUCK_WINDOW_S,
     THREAD_AGAIN_S,
     _call_sessions,
+    event_kind,
     event_words,
     fold_events,
     recurrence,
@@ -1098,12 +1099,18 @@ def gen_event_followups(ctx: Context) -> list[Candidate]:
     ``followup:`` mark counts), and never before the event: an event with no sure time is asked from
     ``ALL_DAY_ASK_AT``, and not before ``FOLLOWUP_AFTER_S`` past the latest time any of its rows named (an offered
     07:30 made 08:30 "how did it go?" eligible two hours before a 10:30 interview). Shown, it marks the threads its
-    facts rest on as asked about (``about:W<id>``), so a thread check-in does not ask the same thing again (craft-3)."""
+    facts rest on as asked about (``about:W<id>``), so a thread check-in does not ask the same thing again (craft-3).
+
+    Only an occasion is asked (:func:`yuki.memory.presence.event_kind`: the scan's kind, kept or corrected by the vet;
+    a row stored before that field only with a sure time). A task is done or not, and nothing "goes" (26 Oct: "Tamberlane
+    Studio interview preparation - 2 days remaining (yesterday) - how did it go?")."""
     now = ctx.now
     out: list[Candidate] = []
     for ev in ctx.events:
         if ctx.live and ev.get("asked"):
             continue
+        if event_kind(ev) != "occasion":
+            continue   # a thing to get done, or a row from before the kind field with no sure time
         try:
             at, all_day = float(ev["at"]), bool(ev.get("all_day"))
             ask_from = _event_over_at(ev)
@@ -1270,7 +1277,9 @@ def dated_today(ctx: Context) -> list[Candidate]:
       rows named (T5: an interview over by 10:45 is not "waiting" at 15:00).
     * **Plain words.** The Today card says the title (clipped at a whole word), then " at HH:MM" only when sure: under
       "Here's what's waiting for you today" no "Today:" (``today_line``). Everywhere else - the away list, "what's
-      waiting?" - the line says its day: "<title>, today at 10:30", "<title>, due today" (``digest_line``, craft-2)."""
+      waiting?" - the line says its day: "<title>, today at 10:30", "<title>, due today" (``digest_line``, craft-2).
+      An event the scan gave the kind task (a thing to get done) is said like a to-do of theirs: "<title>, due
+      today"."""
     now = ctx.now
     day = user_day(now, ctx.config.resume_day_start)
     start = day_boundary(day, ctx.config.resume_day_start)
@@ -1309,7 +1318,7 @@ def dated_today(ctx: Context) -> list[Candidate]:
             ref = f"event:{ev.get('id')}"
             add(ref, {"plan": ref}, float(ev["at"]), bool(ev.get("all_day")), lambda e=ev: e.get("what"),
                 rows=[f"event:{i}" for i in ev.get("ids") or [ev.get("id")]], cites=_cited_items(ev),
-                latest=ev.get("latest"))
+                due=event_kind(ev) == "task", latest=ev.get("latest"))
     for f in found:
         f["text"] = _clip(resolve(f["words"]), 80)
         f["bag"] = event_words(f["text"])
