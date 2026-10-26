@@ -65,9 +65,10 @@ volume changes are only read when both snapshots read that part (``DeskState.err
 
 **The one legal tidy step** (desk20, final-D S1 fallback; contract C7 with the ONE brain): :func:`tidy_step` says, from
 the diff and the caller's measured facts alone (the act's own windows, the window the act took the front from, how
-many monitors there are), the one undoable window step that undoes a flagged side effect, or ``None`` when no single
-step does. Its ``says`` is code's classification of the flag in plain words for a decider; :func:`cover_line` is the
-measured sentence for a tab the act put over what played (no window step touches a tab: it is said, never undone).
+many monitors there are; final-I Y4: a move only onto a monitor measured lit), the one undoable window step that
+undoes a flagged side effect, or ``None`` when no single step does. Its ``says`` is code's classification of the
+flag in plain words for a decider; :func:`cover_line` is the measured sentence for a tab the act put over what
+played (no window step touches a tab: it is said, never undone).
 
 **Code takes that step** (tidy21, the user's decision 1 of 19 Oct): under the tidy dial "do" each brain's code runs
 :func:`tidy_step`'s step itself, through its own guarded, undoable, journaled placement path, once a turn, after
@@ -84,7 +85,7 @@ Public API::
     compare(before, after, *, acted=(), touched=(), fresh=(), opened=()) -> DeskDiff
     render(diff, max_chars=500) -> str      # plain words for the decider (no header: the caller titles it "After:")
     DeskDiff.facts() -> dict                # content-free, for log lines
-    tidy_step(d, acts, front, monitors) -> dict | None   # the one legal undoable window step (C7)
+    tidy_step(d, acts, front, monitors, lit=None) -> dict | None   # the one legal undoable window step (C7)
     cover_line(d) -> str                    # the measured tab-cover sentence, or "" (C7)
     window_flag(d) -> bool                  # a flag a window step could undo is up (not a tab cover, not a sound)
     tidy_guard(step, d, front_now, front_after, arranged=()) -> str   # "" when code may take it now, else why not
@@ -647,7 +648,19 @@ def _monitor_count(monitors: Any) -> int:
         return 0
 
 
-def tidy_step(d: Any, acts: Iterable[Any], front: Any, monitors: Any = None) -> dict[str, Any] | None:
+def _monitor_lit(index: int) -> bool:
+    """final-I Y4: whether the monitor at desk index ``index`` is measured lit now (the display driver's own read:
+    ``display_route.lit_now``, 0xD6 on and not dark by memory's monitor record). Anything not measured lit (standby,
+    off, on but dark, no reply, no driver) is ``False``. Never raises."""
+    try:
+        from yuki.skills.display_route import lit_now
+
+        return lit_now(index) is True
+    except Exception:  # noqa: BLE001 - not measured: not lit
+        return False
+
+
+def tidy_step(d: Any, acts: Iterable[Any], front: Any, monitors: Any = None, lit: Any = None) -> dict[str, Any] | None:
     """desk20 (final-D S1 fallback; contract C7): the one legal undoable window step for a flagged diff, from measured
     facts only, or ``None`` when no single step undoes it (a tab over what played, a sound left silent, nothing
     flagged, a cover by a window not the act's, one monitor and nothing taken).
@@ -655,21 +668,27 @@ def tidy_step(d: Any, acts: Iterable[Any], front: Any, monitors: Any = None) -> 
     ``acts``: the act's own windows (ids: the only windows a move may move, as the caller's tidy check holds it);
     ``front``: the window the act took the front from (the measured ``focus_from`` when ``focus_taken``; ``None``:
     the act took no front, e.g. the front went to the asked window); ``monitors``: how many monitors there are (an
-    ``int``, or the monitors themselves; ``None``: the diff's own). In order:
+    ``int``, or the monitors themselves; ``None``: the diff's own); ``lit`` (final-I Y4): whether a monitor (by its
+    measured index) is lit now, a callable ``index -> bool`` or a mapping ``{index: bool}``; ``None``: measured now
+    (:func:`_monitor_lit`) when the diff's after read is the real desk's (its ``front_how``: only
+    ``situation.snapshot`` writes it), and taken as lit for a stand-in desk's diff (it has no real monitor to read,
+    rule 7). In order:
 
     1. the front was taken and every window of theirs the act covered is that same window (or none was): give the
        front back to it (``focus_back``: raising it uncovers it too);
     2. a window of theirs (playing first, then the one in front) lies under one of the act's own windows, not
        minimised, and there is another monitor that shows none of their attention windows (safety WW5: the move
-       would cover their front or work window there): move that window of the act's to the other monitor
-       (``place``: it stays in view, theirs is uncovered);
+       would cover their front or work window there) and that is measured lit (final-I Y4: ONE's tidy moved Chrome,
+       and the all brain's tried to move a window, onto the second monitor while it was in standby: out of the user's
+       sight): move that window of the act's to the other monitor (``place``: it stays in view, theirs is uncovered);
     3. the front was taken: give it back (what is covered under something not the act's stays).
 
     ``{"action": "focus_back" | "place", "hwnd": int, "flag": "focus_taken" | "covered_attention", "covered": the
     window of theirs it uncovers or gives back (int), "monitor": "other" (place only), "to": that other monitor's
-    measured index (place only; ``None`` unknown: the step asked as a question carries it, safety timing 3), "says":
-    code's classification in plain words (window names: content, RAM only, never logged)}``. Pure: no OS call. Never
-    raises (``None``)."""
+    measured index (place only; the step asked as a question carries it, safety timing 3), "says": code's
+    classification in plain words (window names: content, RAM only, never logged)}``. Pure but for rule 2's one
+    measured read of the other monitor (``lit`` None on a real desk's diff: blocking, a DDC/CI read; call it off an
+    event loop). Never raises (``None``)."""
     try:
         if d is None or not window_flag(d):
             return None
@@ -695,6 +714,26 @@ def tidy_step(d: Any, acts: Iterable[Any], front: Any, monitors: Any = None) -> 
         if count > 1:
             ranked = sorted(covered, key=lambda c: (not c.get("playing"), not c.get("was_front")))
             seen_on = getattr(d, "seen_on", None) or {}
+            measured: dict[int, bool] = {}
+
+            def lit_at(index: int | None) -> bool:
+                # final-I Y4: only a monitor measured lit takes a window (one read per monitor per step)
+                if index is None:
+                    return False
+                if index not in measured:
+                    try:
+                        if callable(lit):
+                            measured[index] = lit(index) is True
+                        elif lit is not None:
+                            measured[index] = dict(lit).get(index) is True
+                        elif not str(getattr(d, "front_how", "") or ""):
+                            measured[index] = True   # a stand-in desk's diff: no real monitor to read (rule 7)
+                        else:
+                            measured[index] = _monitor_lit(index)
+                    except Exception:  # noqa: BLE001 - not measured: not lit
+                        measured[index] = False
+                return measured[index]
+
             for c in ranked:
                 by = _hwnd(c.get("by"))
                 # integration T1: the covering window itself must be the act's (``by_mine``), whatever ``acts`` holds
@@ -715,6 +754,10 @@ def tidy_step(d: Any, acts: Iterable[Any], front: Any, monitors: Any = None) -> 
                 # they put it meanwhile
                 indexes = sorted(int(i) for i in (getattr(d, "monitors", None) or {}))
                 to = indexes[(indexes.index(src) + 1) % len(indexes)] if src in indexes and len(indexes) > 1 else None
+                if not lit_at(to):
+                    # final-I Y4: that monitor is not measured lit (standby, off, on but dark, or not known): a window
+                    # moved there is out of their sight, so no place step; the front given back (rule 3) is the step
+                    continue
                 return {"action": "place", "hwnd": by, "monitor": "other", "to": to, "flag": "covered_attention",
                         "covered": theirs,
                         "says": f"your act's window {name(by)} covers {name(theirs)}{tag}{taken}; moving "

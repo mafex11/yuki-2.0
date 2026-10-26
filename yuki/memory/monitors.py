@@ -29,7 +29,8 @@ that monitor (the window in front on it, their own input just now): 0% is then a
   not-present devices included, with their registry EDID) to refresh the port and the removal time of the monitors
   the record already holds: never a sighting, so a monitor Yuki never saw attached (an old TV) is never theirs.
 * :func:`note_power` / :func:`note_level`: the display driver's own reads and writes (any process; the process's
-  memory store, :func:`use`).
+  memory store, :func:`use`). final-I M2: a live test's read or write (``test``) keeps only the measured state
+  (``power``, ``level`` and their times), never what the record learns from (``lit_*``, ``off_at``).
 
 **Readers** (:func:`known`, :func:`away`, :func:`match`, :func:`words`): the rows in a RAM table re-read when the
 record's, the meanings' or the learned names' stamp changes (checked at most every :data:`STAMP_EVERY_S`). ``known``
@@ -50,8 +51,8 @@ Public::
     match(rows, device_path, pnp, label) -> Known | None
     words(row, heard=True) -> tuple[str, ...]    # their words for it (learned), then heard forms
     card_stamp(store) -> tuple                   # what the you-card's monitor line depends on
-    note_power(device_path, value, *, wrote=False, pnp="", label="")
-    note_level(device_path, level, *, sat=True, used=False, pnp="", label="")
+    note_power(device_path, value, *, wrote=False, pnp="", label="", test=False)   # test: measured state only
+    note_level(device_path, level, *, sat=True, used=False, pnp="", label="", test=False)
     Recorder(store, log=None).tick(now)          # the timeline's sightings
 """
 
@@ -368,21 +369,22 @@ def _note(device_path: str, pnp: str, label: str, sets: dict[str, Any], store: A
 
 
 def note_power(device_path: str, value: int | None, *, wrote: bool = False, pnp: str = "", label: str = "",
-               store: Any = None) -> bool:
+               store: Any = None, test: bool = False) -> bool:
     """The display driver read a monitor's power (VCP 0xD6, 1 on, 2-5 standby or off) or wrote it (``wrote``: an
     off it wrote is kept as ``off_at``). ``False`` when the monitor has no row yet (the service's recorder writes
-    it)."""
+    it). final-I M2: ``test``, a read or write of a live test's run (``yuki.memory.testtag``): the measured state
+    only (``power``, ``power_at``), never ``off_at``, which the record learns from."""
     if value is None:
         return False
     now = time.time()
     sets: dict[str, Any] = {"power": int(value), "power_at": now}
-    if wrote and int(value) != 1:
+    if wrote and int(value) != 1 and not test:
         sets["off_at"] = now
     return _note(device_path, pnp, label, sets, store)
 
 
 def note_level(device_path: str, level: float | None, *, sat: bool = True, used: bool = False, pnp: str = "",
-               label: str = "", store: Any = None) -> bool:
+               label: str = "", store: Any = None, test: bool = False) -> bool:
     """The display driver read a monitor's brightness (0-100). ``sat``: a level it sat at (a level they set read back,
     a read, a turn-on that found it visible): above 0 it is the last level measured while visible (``lit_level``) and
     may be the lowest (``lit_low``). ``sat=False``: a read a turn-on found dark, or Yuki's own restore read back: the
@@ -390,11 +392,18 @@ def note_level(device_path: str, level: float | None, *, sat: bool = True, used:
     they were using that monitor (the window in front on it and their own keyboard or mouse input just now: the
     driver's ``_in_use``), so even 0 is a level they sat at and ``lit_low`` may become 0 (at 10:50 the VG271U read 0%
     as their primary while they worked on it). A 0 read without it never counts (the 24HC1QR read 0% overnight and at
-    08:44 with nothing of theirs in front on it). ``lit_level`` stays the last level above 0."""
+    08:44 with nothing of theirs in front on it). ``lit_level`` stays the last level above 0.
+
+    final-I M2 (by reading: a live test's brightness rows would leave the test's level as ``lit_level``, and a display
+    read right after the harness's own input could set ``lit_low`` to 0, ending the on-but-dark raise for good):
+    ``test``, a read of a live test's run (``yuki.memory.testtag``, as every learner skips a test item): the
+    measured state only (``level``, ``level_at``), never ``lit_level``, ``lit_low`` or ``lit_at``."""
     if level is None:
         return False
     now = time.time()
     sets: dict[str, Any] = {"level": float(level), "level_at": now}
+    if test:
+        return _note(device_path, pnp, label, sets, store)
     lit = sat and float(level) > 0.0
     if lit:
         sets.update(lit_level=float(level), lit_at=now)

@@ -1076,7 +1076,7 @@ The desktop block at the end of the latest user message is their screen now, per
 app "title", what is in front, covered, playing or has the keyboard; tabs and items numbered. One step on what it \
 shows beyond doubt is yours; open things where they won't cover what they watch (window move, or run_skill's place \
 "other"). {instant} take say_when_done: a few words said once it is verified, or "" when they watch it happen. \
-open_url (a new tab, app only when they named a browser; also a web search) and open_app take say_first. \
+open_url (a new tab or web search; app when their words decide the browser) and open_app take say_first. \
 tab shows or closes the tab their words name in any browser window (named = their word for it, app = the browser \
 only when they named one); window takes app when they name an app. Anything that sends, posts, joins or buys is \
 never a hand's."""
