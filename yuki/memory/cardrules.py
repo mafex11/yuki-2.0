@@ -20,7 +20,6 @@ Examples use invented projects and names.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import Any
@@ -108,10 +107,14 @@ def deadline_lines(store: Any, items: Sequence[Any], now: float, safe: Callable[
                    limit: int = 12, notes: dict[str, str] | None = None) -> list[str]:
     """The DEADLINES block (with its heading): every open dated item - ``items`` (yuki.memory.nudges.todo_items: to-dos,
     commitments), the open goals with a due time, the user's personal events not yet past by a week (in their own words,
-    :func:`event_status`) - soonest first, each ``- [id] what (status words; stated <day>)``. ``notes`` adds words to an
-    item's line by its ref (the welcome back's "in DUE NOW above"). ``["DEADLINES:", "(none)"]`` when there is none.
-    Never raises."""
-    rows: list[tuple[float, str]] = []
+    :func:`event_status`) - soonest first, each ``- [id] what (status words; stated <day>)``; the events already past
+    come after everything else, the latest first, so the ``limit`` drops them before anything still ahead (T1, 26 Oct:
+    past-week copies filled the 12 lines and today's interview was not in the block). An event is one line however
+    many times the events scan stored it, with a time only when it is sure (:func:`yuki.memory.presence.fold_events`:
+    the 26 Oct block listed one interview at 7:30 AM, three times at 10:30 AM and five times at 2 PM), "stated" on the
+    last day memory said it. ``notes`` adds words to an item's line by its ref (the welcome back's "in DUE NOW above").
+    ``["DEADLINES:", "(none)"]`` when there is none. Never raises."""
+    rows: list[tuple[int, float, str]] = []   # (past event, order, line)
     notes = notes or {}
     for item in items:
         due = getattr(item, "due_at", None)
@@ -121,25 +124,29 @@ def deadline_lines(store: Any, items: Sequence[Any], now: float, safe: Callable[
         status = deadline_status(float(due), now, all_day=bool(item.all_day))
         if notes.get(item.ref):
             status = f"{status}; {notes[item.ref]}"
-        rows.append((float(due), _line(item.ref, item.text, status, stated, safe)))
+        rows.append((0, float(due), _line(item.ref, item.text, status, stated, safe)))
     try:
         for g in store.goals(("open", "unknown"), limit=20):
             if g.due_at is None:   # a goal for a day is what they are going for, not a deadline
                 continue
             due = float(g.due_at)
-            rows.append((due, _line(g.ref, g.text, deadline_status(due, now, all_day=False),
-                                    getattr(g, "created_at", None), safe)))
+            rows.append((0, due, _line(g.ref, g.text, deadline_status(due, now, all_day=False),
+                                       getattr(g, "created_at", None), safe)))
     except Exception:
         pass
     for ev in _events(store):
-        at = ev.get("at")
-        if not at or float(at) < now - 7 * 86400.0:
+        try:
+            at, all_day = float(ev.get("at") or 0.0), bool(ev.get("all_day"))
+        except (TypeError, ValueError):
             continue
-        rows.append((float(at), _line(f"event:{ev.get('id')}", ev.get("what"),
-                                      event_status(float(at), now, all_day=bool(ev.get("all_day"))),
-                                      ev.get("found_at"), safe)))
-    rows.sort(key=lambda r: r[0])
-    return ["DEADLINES:"] + ([line for _due, line in rows[:limit]] or ["(none)"])
+        if not at or at < now - 7 * 86400.0:
+            continue
+        past = at + (86400.0 if all_day else 0.0) <= now
+        rows.append((1 if past else 0, -at if past else at,
+                     _line(f"event:{ev.get('id')}", ev.get("what"), event_status(at, now, all_day=all_day),
+                           ev.get("said_at") or ev.get("found_at"), safe)))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return ["DEADLINES:"] + ([line for _past, _order, line in rows[:limit]] or ["(none)"])
 
 
 def _line(ref: str, text: Any, status: str, stated: Any, safe: Callable[[Any, int], str]) -> str:
@@ -153,13 +160,13 @@ def _line(ref: str, text: Any, status: str, stated: Any, safe: Callable[[Any, in
 
 
 def _events(store: Any) -> list[dict[str, Any]]:
-    """The user's dated personal events the observation cards found (yuki.memory.presence, encrypted state)."""
+    """The user's dated personal events the events scan found (yuki.memory.presence, encrypted state), one row per
+    event as every other reader has them (:func:`yuki.memory.presence.fold_events`: a time only when it is sure,
+    else its day only)."""
     try:
-        from yuki.memory.presence import EVENTS_STATE
+        from yuki.memory.presence import fold_events, load_events
 
-        raw = store.nudge_state(EVENTS_STATE)
-        data = json.loads(store.cipher.decrypt(raw)) if raw else []
-        return [e for e in data if isinstance(e, dict)] if isinstance(data, list) else []
+        return fold_events(load_events(store))
     except Exception:
         return []
 

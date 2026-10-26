@@ -16,14 +16,18 @@ Every model call is logged to ``logs/memory/nudges-YYYYMMDD.jsonl`` (usage, cost
 response encrypted).
 
 **One event, one row, a time only when it is sure** (tc1, 26 Oct 2026: the Today card listed one interview three
-times, the first at an offered 07:30 that was never the time). Every reader of the stored events reads them through
-:func:`fold_events`: rows of one event (the same local day, their words overlapping by :data:`SAME_EVENT_MIN` of the
-shorter title's weight, each word weighted by its rarity across the stored titles; measured, no word list) are one row,
-and that row has a time only when its sure rows agree on the minute (:func:`event_time_sure`: a time the scan returned
-as settled, with the UTC offset it was stated in, converted by code). A row stored before tc1 has no settled time: its
-event shows its day only. The scan sees the known events (folded) with their ids and returns ``same_as`` to correct
-one in place (newer settled time wins); a new row that measures as a stored event without it is stored folded into
-that event (:func:`_fold_new`), so the store holds one row per event from then on.
+times, the first at an offered 07:30 that was never the time). Every reader of the stored events (the card generators,
+the card writers' DEADLINES block, the brief, the YouNow snapshot, the scan) reads them through :func:`fold_events`:
+rows of one event on the same local day are one row, and that row has a time only when it is sure
+(:func:`event_time_sure`: a time the scan returned as settled, in a zone code could resolve - the IANA zone the fact
+names, converted by code with its daylight saving, or the PC's own - converted by code). Two rows with sure times that
+differ are never one event. Rows stored before tc1 (no identity judgement was made for them) fold by how much of the
+lighter title the other holds (:func:`title_overlap`, the copies of 26 Oct); any other pair must be alike both ways
+(:func:`words_alike`), so extra words naming someone else count against it. A fold for reading writes nothing. The
+scan sees the known events (folded) with their ids and returns ``same_as`` to correct one in place, accepted only when
+the words measure as that event (newer settled time wins); a new row is written merged with a stored one only when it
+is a copy (the same day, the same sure minute or neither timed, alike both ways by :data:`COPY_MIN`): a write is for
+good, so two events alike in words are never written as one.
 
 Public API::
 
@@ -31,6 +35,8 @@ Public API::
     PresenceWorker(worker) .scan_events(now) -> bool   # the personal events scan (the judge's schedule)
     fold_events(rows) -> list[dict];  load_events(store) -> list[dict]   # one row per event (every reader)
     event_time_sure(row) -> bool;  utc_offset(text) -> timezone | None;  local_offset(at) -> "+05:30"
+    named_zone(name) -> tzinfo | None   # an IANA zone from dateutil's own zone data (no tzdata on this PC)
+    event_words(text);  word_rarity(titles);  title_overlap(a, b, w);  words_alike(a, b, w)   # measured, no word list
     recurrence(facts, vectors, *, now, ...) -> list[list[JournalEntry]];  card_feedback_lines(store, safe, now)
 """
 
@@ -124,13 +130,23 @@ FACT_CHARS = 320
 EVENTS_STATE = "presence_events"        # encrypted JSON: the dated personal events found
 EVENTS_SCAN_STATE = "presence_events_scan"   # "<journal id>|<at>": how far the event scan has read
 
-#: Two stored rows on the same local day are one event when their titles share at least this much of the lighter
-#: title's word weight, on average over the rows already in that event (each word weighted by its rarity across the
-#: stored titles, :func:`word_rarity`). Measured on the 50 rows stored on 26 Oct 2026: every row of an event joined it
-#: at 0.58 or more (the 11 rows of one interview at 0.65-1.0), every row of another event scored 0.39 or less against
-#: it (the prep task for that interview 0.32); two calls with two different friends ("Call with A" / "Call with B")
-#: score 0.54, so the bar sits above that.
+#: Two rows stored before tc1 (or two rows at one sure minute) on the same local day are one event when their titles
+#: share at least this much of the lighter title's word weight, on average over the rows already in that event (each
+#: word weighted by its rarity across the distinct stored titles, :func:`word_rarity`). Measured on the 50 rows stored
+#: on 26 Oct 2026: every copy of an event joined it at 0.59 or more (the 11 rows of one interview among them), every
+#: row of another event stayed at 0.42 or less (the prep task for that interview 0.31). It is the lenient measure (a
+#: title inside a longer one scores 1.0: "Doctor appointment" / "... for Sam"), so it is used only where no identity
+#: judgement was made (the rows before tc1, which never come again) or where the sure minute already says one event.
 SAME_EVENT_MIN = 0.55
+#: Any other two rows on one day are one event when they are alike both ways (:func:`words_alike`, the weight they
+#: share over the weight of both) by at least this much. Measured with the 50 stored titles as the corpus: two
+#: different events alike in words score 0.38-0.53 ("Interview with Dr. Adair" / "... Dr. Holt" 0.53, "Doctor
+#: appointment" / "... for Sam" 0.51, "Design review round 1" / "... 2" 0.47, "Call with Sam" / "... Ana" 0.38),
+#: so the bar sits clear above them. A copy reworded more than this stays its own line: two lines, never one lost.
+ALIKE_MIN = 0.6
+#: A new row is written merged with a stored one (for good) only when it is a copy: the same day, the same sure minute
+#: or neither timed, and alike both ways by at least this much (the copies of 26 Oct: 0.90-1.0).
+COPY_MIN = 0.8
 #: A merged event keeps at most this many evidence ids (the newest).
 EVENT_EVIDENCE_MAX = 8
 #: The scan shows at most this many known events (the ones not over yet, soonest first).
@@ -157,8 +173,9 @@ WHO THE USER IS: in the block after this one.
 For each event: what it is in a few words as memory says it (names spelled exactly as the facts spell \
 them; when a later fact corrects a name, the corrected one), the day it happens as the fact states \
 it ("YYYY-MM-DD HH:MM", or "YYYY-MM-DD" when no time was said; resolve "tomorrow" or "on Friday" \
-against the date of the fact that says it), the UTC offset of the zone that time is stated in (the \
-zone the fact names; when it names none, the user's own on the NOW line), whether that time is settled \
+against the date of the fact that says it), the zone that time is stated in (the zone the fact names, \
+as its IANA name, and its UTC offset on that date; when it names none, zone "" and the user's own offset \
+on the NOW line), whether that time is settled \
 (booked or confirmed for the event; a time only offered as one of several, proposed, preferred, asked \
 for or in an unsent draft is not), and the ids of the facts it rests on. When the fact does \
 not give the event's day - not fixed yet, "soon", "some day", "next month" without a day - leave the \
@@ -244,11 +261,14 @@ EVENTS_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["what", "when", "utc_offset", "time_settled", "same_as", "evidence"],
+                    "required": ["what", "when", "zone", "utc_offset", "time_settled", "same_as", "evidence"],
                     "properties": {
                         "what": {"type": "string", "description": "The event in a few words (at most 8), as memory "
                                                                   "has it."},
                         "when": {"type": "string", "description": "\"YYYY-MM-DD HH:MM\" or \"YYYY-MM-DD\", as stated."},
+                        "zone": {"type": "string", "description": "The IANA name of the zone the fact states the time "
+                                                                  "in (\"Asia/Tokyo\", \"America/Los_Angeles\"); \"\" "
+                                                                  "when it names none."},
                         "utc_offset": {"type": "string", "description": "The UTC offset the time is stated in "
                                                                         "(\"+05:30\", \"+09:00\"); \"\" with no time."},
                         "time_settled": {"type": "boolean", "description": "True only for a booked or confirmed "
@@ -351,7 +371,7 @@ def card_feedback_lines(store: Store, safe: Callable[[Any, int], str], now: floa
     return lines
 
 
-def _parse_when(value: Any, zone: timezone | None = None) -> tuple[float, bool] | None:
+def _parse_when(value: Any, zone: Any = None) -> tuple[float, bool] | None:
     """``"YYYY-MM-DD HH:MM"`` -> (epoch, False), read in ``zone`` (None: this PC's local time); ``"YYYY-MM-DD"`` ->
     (local midnight epoch, True); else None."""
     text = " ".join(str(value or "").split())
@@ -396,11 +416,37 @@ def local_offset(at: float) -> str:
     return _offset_text(timezone(off)) or "+00:00"
 
 
+def _offset_at(zone: Any, at: float) -> str | None:
+    """``zone``'s UTC offset at the moment ``at`` (its daylight saving on that date), as ``"+09:00"``."""
+    try:
+        off = datetime.fromtimestamp(float(at), zone).utcoffset()
+    except Exception:  # noqa: BLE001
+        return None
+    return _offset_text(timezone(off)) if off is not None else None
+
+
+def named_zone(name: Any) -> Any:
+    """An IANA zone (``"Asia/Tokyo"``, ``"America/Los_Angeles"``) as a tzinfo that knows its daylight saving, from
+    python-dateutil's own zone data (this PC's Python has no ``tzdata``, so ``zoneinfo`` cannot; dateutil ships with
+    boto3 and in the release); None for ``""`` or a name it does not hold. Only an "Area/Location" name is looked up (a
+    machine format, read by its characters): never an abbreviation or a POSIX string ("UTC+9" is UTC-9 there)."""
+    text = "".join(str(name or "").split())
+    if "/" not in text or len(text) > 64:
+        return None
+    try:
+        from dateutil.zoneinfo import get_zonefile_instance
+
+        return get_zonefile_instance().zones.get(text)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def event_time_sure(row: dict[str, Any]) -> bool:
-    """Whether a stored event's time is one to show: a timed row the scan returned as settled, with the offset it
-    was stated in, whose ``at`` is code's conversion of that stated time (to the minute). Rows stored before tc1
-    (26 Oct 2026) carry no settled time: never sure."""
-    if not isinstance(row, dict) or row.get("all_day") or row.get("settled") is not True:
+    """Whether a stored event's time is one to show: a timed row the scan returned as settled, whose zone code resolved
+    when it stored it (``zone``: the IANA name code converted it in, daylight saving included, or ``"local"``: the PC's
+    own offset), and whose ``at`` is that stated time at the stored ``offset`` (to the minute). Rows stored before tc1
+    (26 Oct 2026) carry no settled time, and a time in a zone code could not resolve is not kept as one: never sure."""
+    if not isinstance(row, dict) or row.get("all_day") or row.get("settled") is not True or not row.get("zone"):
         return False
     zone = utc_offset(row.get("offset"))
     when = _parse_when(row.get("stated"), zone) if zone is not None else None
@@ -425,25 +471,35 @@ def event_words(text: Any) -> frozenset[str]:
 
 
 def word_rarity(titles: Sequence[frozenset[str]]) -> dict[str, float]:
-    """Each word's weight, ``log(1 + N / df)`` over these titles: a word few titles share weighs most, and a word every
-    title shares still counts (three copies of one event, alone in the store, are still alike)."""
-    df = Counter(w for t in titles for w in t)
-    n = len(titles)
+    """Each word's weight, ``log(1 + N / df)`` over the DISTINCT titles: a word few titles share weighs most, and a word
+    every title shares still counts (three copies of one event, alone in the store, are still alike). Copies of one
+    title count once, so the names a much-copied event repeats (11 rows of one interview) still tell events apart."""
+    distinct = {t for t in titles if t}
+    df = Counter(w for t in distinct for w in t)
+    n = len(distinct)
     return {w: math.log(1 + n / c) for w, c in df.items()}
 
 
+def _weight(words: frozenset[str], weight: dict[str, float]) -> float:
+    return sum(weight.get(w, 1e-6) for w in words)
+
+
 def title_overlap(a: frozenset[str], b: frozenset[str], weight: dict[str, float]) -> float:
-    """The weight the two titles share, as a share of the lighter title's weight (0..1)."""
+    """The weight the two titles share, as a share of the lighter title's weight (0..1). Lenient: a title inside a
+    longer one scores 1.0, whatever the longer one adds."""
     if not a or not b:
         return 0.0
-    wa = sum(weight.get(w, 1e-6) for w in a)
-    wb = sum(weight.get(w, 1e-6) for w in b)
-    return sum(weight.get(w, 1e-6) for w in a & b) / min(wa, wb)
+    return _weight(a & b, weight) / min(_weight(a, weight), _weight(b, weight))
 
 
-def _jaccard(a: frozenset[str], b: frozenset[str], weight: dict[str, float]) -> float:
-    union = sum(weight.get(w, 1e-6) for w in a | b)
-    return sum(weight.get(w, 1e-6) for w in a & b) / union if union else 0.0
+def words_alike(a: frozenset[str], b: frozenset[str], weight: dict[str, float]) -> float:
+    """The weight the two titles share over the weight of both (weighted Jaccard, 0..1): alike both ways, so the words
+    one adds ("... for Sam", "... Dr. Holt") count against the match."""
+    union = _weight(a | b, weight)
+    return _weight(a & b, weight) / union if union else 0.0
+
+
+_jaccard = words_alike
 
 
 def _num(value: Any) -> float | None:
@@ -458,6 +514,36 @@ def _num(value: Any) -> float | None:
 def _row_ids(row: dict[str, Any]) -> list[str]:
     out = [str(row.get("id"))] if row.get("id") else []
     return out + [str(i) for i in row.get("ids") or [] if i and str(i) not in out]
+
+
+def _local_day(row: dict[str, Any]) -> str:
+    return f"{datetime.fromtimestamp(float(row['at'])):%Y-%m-%d}"
+
+
+def _sure_minute(row: dict[str, Any]) -> int | None:
+    """The minute of a row's sure time (:func:`event_time_sure`); None when it has none."""
+    return int(round(float(row["at"]) / 60.0)) if event_time_sure(row) else None
+
+
+def _before_tc1(row: dict[str, Any]) -> bool:
+    """A row stored before tc1 (26 Oct 2026; it has no ``settled`` field): the scan never saw it with its id, so no
+    identity judgement was made for it. No new row is ever stored like this."""
+    return "settled" not in row
+
+
+def _alike(a: dict[str, Any], b: dict[str, Any], wa: frozenset[str], wb: frozenset[str],
+           weight: dict[str, float]) -> float | None:
+    """How much two stored rows of one day read as one event, as a share of the bar their kind needs (1.0 or more:
+    one event), or None when they can never be one: two sure times that differ are two events (an interview at 11:00
+    and one at 16:00, two practice sessions). One sure minute, or two rows from before tc1 (copies stored when no id
+    was shown): the lenient :func:`title_overlap` against :data:`SAME_EVENT_MIN`. Any other pair: alike both ways,
+    :func:`words_alike` against :data:`ALIKE_MIN`."""
+    ma, mb = _sure_minute(a), _sure_minute(b)
+    if ma is not None and mb is not None and ma != mb:
+        return None
+    if (ma is not None and ma == mb) or (_before_tc1(a) and _before_tc1(b)):
+        return title_overlap(wa, wb, weight) / SAME_EVENT_MIN
+    return words_alike(wa, wb, weight) / ALIKE_MIN
 
 
 def _fold_group(members: list[dict[str, Any]], weight: dict[str, float],
@@ -491,7 +577,7 @@ def _fold_group(members: list[dict[str, Any]], weight: dict[str, float],
         s = max(sure, key=lambda r: _num(r.get("found_at")) or 0.0)
         at = float(s["at"])
         out.update(at=at, all_day=False, when=f"{datetime.fromtimestamp(at):%Y-%m-%d %H:%M}", settled=True,
-                   stated=s.get("stated"), offset=s.get("offset"))
+                   stated=s.get("stated"), offset=s.get("offset"), zone=s.get("zone"))
     else:
         at = _day_start(float(first["at"]))
         out.update(at=at, all_day=True, when=f"{datetime.fromtimestamp(at):%Y-%m-%d}", settled=False)
@@ -499,38 +585,61 @@ def _fold_group(members: list[dict[str, Any]], weight: dict[str, float],
     updated = [u for u in (_num(r.get("updated_at")) for r in members) if u is not None]
     if updated:
         out["updated_at"] = max(updated)
+    # the last time memory said it (a row found, a correction, a fold read before): the DEADLINES block's "stated"
+    # day, so "the one stated most recently holds" can tell a moved event from its old day
+    said = [u for r in members for u in (_num(r.get("found_at")), _num(r.get("updated_at")), _num(r.get("said_at")))
+            if u is not None]
+    if said:
+        out["said_at"] = max(said)
     return out
 
 
 def fold_events(rows: Sequence[Any]) -> list[dict[str, Any]]:
-    """The stored event rows as one row per event (soonest first), for every reader (the card generators, the brief,
-    the snapshot, the scan's KNOWN EVENTS). Rows are one event when they fall on the same local day and their titles
-    overlap (:func:`title_overlap`) by at least :data:`SAME_EVENT_MIN` on average against the rows already in it,
-    taken in (day, timed first, time, found) order. Pure: nothing is written; rows already folded fold again to
-    themselves. A row without a usable ``at`` is left out."""
+    """The stored event rows as one row per event (soonest first), for every reader (the card generators, the card
+    writers' DEADLINES block, the brief, the snapshot, the scan's KNOWN EVENTS). Rows are taken in (day, timed first,
+    time, found) order, in two passes:
+
+    1. the rows from before tc1 among themselves (copies stored when no id was shown): a row joins the event of its
+       local day it reads most as, on average against its rows (:func:`_alike`: the lenient measure), 1.0 or more -
+       the rule measured on the 50 rows of 26 Oct;
+    2. every other row joins the event of its day it reads most as, on average against its rows, where the rows from
+       before tc1 count once (the one it reads most as: they are copies of one event, and their many wordings must
+       not outvote it) - never an event holding a sure time that differs from its own (:func:`_alike` is None).
+
+    Pure: nothing is written; rows already folded fold again to themselves. A row without a usable ``at`` is left
+    out."""
     good = [r for r in rows if isinstance(r, dict) and _num(r.get("at")) is not None]
     words = {id(r): event_words(r.get("what")) for r in good}
     weight = word_rarity([words[id(r)] for r in good])
-
-    def day(r: dict[str, Any]) -> str:
-        return f"{datetime.fromtimestamp(float(r['at'])):%Y-%m-%d}"
-
-    order = sorted(good, key=lambda r: (day(r), bool(r.get("all_day")), float(r["at"]),
+    order = sorted(good, key=lambda r: (_local_day(r), bool(r.get("all_day")), float(r["at"]),
                                          _num(r.get("found_at")) or 0.0, str(r.get("id"))))
     groups: list[tuple[str, list[dict[str, Any]]]] = []
-    for r in order:
-        d = day(r)
-        best, score = None, 0.0
-        for gd, g in groups:
-            if gd != d:
+
+    def score(r: dict[str, Any], g: list[dict[str, Any]]) -> float | None:
+        alike = [_alike(r, m, words[id(r)], words[id(m)], weight) for m in g if not _before_tc1(m)]
+        if any(s is None for s in alike):
+            return None
+        old = [_alike(r, m, words[id(r)], words[id(m)], weight) for m in g if _before_tc1(m)]
+        if _before_tc1(r):
+            alike += old   # pass 1: every row of the copies counts
+        elif old:
+            alike.append(max((s for s in old if s is not None), default=0.0))   # pass 2: the copies count once
+        return sum(alike) / len(alike)   # type: ignore[arg-type]
+
+    for first in (True, False):
+        for r in order:
+            if _before_tc1(r) != first:
                 continue
-            s = sum(title_overlap(words[id(r)], words[id(m)], weight) for m in g) / len(g)
-            if s > score:
-                best, score = g, s
-        if best is not None and score >= SAME_EVENT_MIN:
-            best.append(r)
-        else:
-            groups.append((d, [r]))
+            d = _local_day(r)
+            best, top = None, 0.0
+            for gd, g in groups:
+                s = score(r, g) if gd == d else None
+                if s is not None and s > top:
+                    best, top = g, s
+            if best is not None and top >= 1.0:
+                best.append(r)
+            else:
+                groups.append((d, [r]))
     out = [_fold_group(g, weight, words) for _d, g in groups]
     return sorted(out, key=lambda r: (float(r["at"]), bool(r.get("all_day")), str(r.get("id"))))
 
@@ -565,58 +674,99 @@ def _squash(value: Any, cap: int | None = None) -> str:
 
 
 def _event_row(ev: Any, ids: dict[str, Any], now: float) -> dict[str, Any] | None:
-    """One event the scan returned, as a stored row; None without a usable day, evidence or words, or when the time
-    it states has passed. A time is kept only when the scan says it is settled and gives the UTC offset it was
-    stated in: code converts it to this PC's time (``at``) and keeps what was stated (``stated``, ``offset``). Any
-    other time - offered, proposed, preferred, a draft's, or with no offset - keeps the event's day only."""
+    """One event the scan returned, as a stored row; None without a usable day, evidence or words, or when its sure
+    time (or, without one, its day) is already over. A time is kept only when the scan says it is settled and code
+    can resolve the zone it was stated in: the IANA zone the fact names (:func:`named_zone`: converted with that zone's
+    daylight saving on that date, whatever offset the scan guessed), or, when it names none, the PC's own offset on
+    that date. Code converts it to this PC's time (``at``) and keeps what was stated (``stated``, ``offset``,
+    ``zone``). Any other time - offered, proposed, preferred, a draft's, or in a zone code cannot resolve - keeps the
+    event's day only, and the moment it named is kept as ``latest`` (never shown: the follow-up waits past it)."""
     if not isinstance(ev, dict):
         return None
     stated = _squash(ev.get("when"), 20)
-    zone = utc_offset(ev.get("utc_offset"))
-    when = _parse_when(stated, zone)
+    when = _parse_when(stated)
     evidence = [e for e in _clean_ids(ev.get("evidence")) if e in ids]
     what = _squash(ev.get("what"), 200)
     if when is None or not evidence or not what:
         return None
     at, all_day = when
-    if at + (86400.0 if all_day else 0.0) <= now:   # its time or day is already over: nothing ahead to ask
-        return None
-    settled = not all_day and zone is not None and ev.get("time_settled") is True
+    zone, zone_name = None, ""
+    named: float | None = None
+    if not all_day:
+        offset = utc_offset(ev.get("utc_offset"))
+        zone = named_zone(ev.get("zone"))
+        if zone is not None:
+            zone_name = "".join(str(ev.get("zone")).split())
+        elif offset is not None and _offset_text(offset) == local_offset(at):
+            zone, zone_name = offset, "local"   # no zone named: the time is the user's own, in the PC's offset
+        # the moment in this PC's time: in the resolved zone; else in the offset the scan gave (a hint, never shown)
+        at = (_parse_when(stated, zone if zone is not None else offset) or (at, False))[0]
+        named = at
+    settled = zone is not None and ev.get("time_settled") is True
     if not all_day and not settled:
         at, all_day = _day_start(at), True   # the day of the stated moment, here
+    if at + (86400.0 if all_day else 0.0) <= now:   # its sure time or its day is already over: nothing ahead to ask
+        return None
     row: dict[str, Any] = {"id": f"E{uuid.uuid4().hex[:10]}", "what": what, "at": at, "all_day": all_day,
                            "when": f"{datetime.fromtimestamp(at):{'%Y-%m-%d' if all_day else '%Y-%m-%d %H:%M'}}",
                            "settled": settled, "evidence": evidence, "found_at": now, "asked": False}
     if settled:
-        row.update(stated=stated, offset=_offset_text(zone))
+        row.update(stated=stated, offset=_offset_at(zone, at), zone=zone_name)
+    elif named is not None:
+        row["latest"] = named
     return row
 
 
 def _fold_new(known: list[dict[str, Any]], new: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    """The rows to store: ``known`` plus ``new``, where a new row that measures as an event already stored
-    (:func:`fold_events`) is stored with that event's rows as its one folded row (the time rule of
-    :func:`_fold_group`: sure times that disagree keep the day only). Events no new row joined stay as stored (read
-    folds them). Returns (rows, how many new rows went into a known event)."""
-    rows = known + new
-    new_ids = {str(r.get("id")) for r in new}
+    """The rows to store: ``known`` plus ``new``, where a new row that is a copy of a row this code stored (not one
+    from before tc1) - the same local day, the same sure minute or neither with a sure time, and alike both ways
+    (:func:`words_alike`) by :data:`COPY_MIN` - is written merged with it (:func:`_fold_group`). Any other new row is
+    written as its own row, even when read folds it with a stored event: a write is for good, a fold for reading is
+    not (T2, 26 Oct: "Interview with Dr. Adair" 11:00 and "... Dr. Holt" 16:00 were written as one all-day row). Returns
+    (rows, how many new rows were merged into a stored one)."""
+    rows = list(known)
+    weight = word_rarity([event_words(r.get("what")) for r in rows + list(new)])
     joined = 0
-    for g in fold_events(rows):
-        ids = set(g["ids"])
-        mine = new_ids & ids
-        if mine and len(ids) > len(mine):
-            rows = [r for r in rows if not ids & set(_row_ids(r))] + [g]
-            joined += len(mine)
+    for n in new:
+        wn, mn, dn = event_words(n.get("what")), _sure_minute(n), _local_day(n)
+        best, score = -1, 0.0
+        for i, r in enumerate(rows):
+            if _before_tc1(r) or _num(r.get("at")) is None or _local_day(r) != dn or _sure_minute(r) != mn:
+                continue
+            s = words_alike(wn, event_words(r.get("what")), weight)
+            if s > score:
+                best, score = i, s
+        if best >= 0 and score >= COPY_MIN:
+            pair = [rows[best], n]
+            rows[best] = _fold_group(pair, weight, {id(x): event_words(x.get("what")) for x in pair})
+            joined += 1
+        else:
+            rows.append(n)
     return rows, joined
 
 
+def _same_as_ok(row: dict[str, Any], target: dict[str, Any], known: list[dict[str, Any]]) -> bool:
+    """Whether the scan's ``same_as`` may stand: the new row's words measure as the event it names
+    (:func:`title_overlap` with any of its stored rows by :data:`SAME_EVENT_MIN`; a correction keeps the event's core
+    words). A wrong id (model error: "a friend's job interview" said to correct "Dentist appointment") would replace the
+    user's event for good, so the row is stored as new instead."""
+    ids = set(target.get("ids") or [target.get("id")])
+    mine = [r for r in known if ids & set(_row_ids(r))] or [target]
+    weight = word_rarity([event_words(r.get("what")) for r in known + [row]])
+    words = event_words(row.get("what"))
+    return any(title_overlap(words, event_words(r.get("what")), weight) >= SAME_EVENT_MIN for r in mine)
+
+
 def _untime(row: dict[str, Any]) -> None:
-    """The vet found the row's time not settled by its evidence: the row keeps its day only."""
+    """The vet found the row's time not settled by its evidence: the row keeps its day only (the moment it named kept
+    as ``latest``, never shown)."""
     if row.get("all_day"):
         return
-    at = _day_start(float(row["at"]))
-    row.update(at=at, all_day=True, when=f"{datetime.fromtimestamp(at):%Y-%m-%d}", settled=False)
-    row.pop("stated", None)
-    row.pop("offset", None)
+    named = float(row["at"])
+    at = _day_start(named)
+    row.update(at=at, all_day=True, when=f"{datetime.fromtimestamp(at):%Y-%m-%d}", settled=False, latest=named)
+    for key in ("stated", "offset", "zone"):
+        row.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -694,11 +844,13 @@ class PresenceWorker:
         same_day = f"{datetime.fromtimestamp(float(new['at'])):%Y-%m-%d}" == \
             f"{datetime.fromtimestamp(float(target['at'])):%Y-%m-%d}"
         if not new["all_day"] or not same_day:
-            for key in ("at", "all_day", "when", "settled", "stated", "offset"):
+            for key in ("at", "all_day", "when", "settled", "stated", "offset", "zone"):
                 row[key] = new.get(key)
-            row["latest"] = float(new["at"])
+            row["latest"] = float(new.get("latest") or new["at"])
             if not same_day:
                 row["asked"] = False
+        elif new.get("latest"):
+            row["latest"] = max(float(new["latest"]), float(row.get("latest") or row["at"]))
         return [e for e in known if not ids & set(_row_ids(e))] + [row], row
 
     def scan_events(self, now: float) -> bool:
@@ -777,8 +929,8 @@ class PresenceWorker:
         request = response = None
         found: list[dict[str, Any]] = []
         vetted: dict[str, Any] = {}
-        merged = 0
-        changed = False   # rows to store: a correction, a new row, a new row joined to a stored event
+        merged = refused = 0
+        changed = False   # rows to store: a correction, a new row, a new row merged with its stored copy
         try:
             decision, response, request = self.w._tool_call(
                 self.w.model, self.w._system(EVENTS_PROMPT, now), user, EVENTS_TOOL, 900, checkin)
@@ -787,8 +939,10 @@ class PresenceWorker:
                 if row is None:
                     continue
                 target = by_id.get(str(ev.get("same_as") or "").strip().strip("[]").strip())
-                if target is not None:
+                if target is not None and _same_as_ok(row, target, known):
                     row["same_as"] = target["id"]
+                elif target is not None:
+                    refused += 1   # its words are not that event's: stored as a new row, never over it
                 found.append(row)
             if found:
                 found, vetted = self._vet_events(found, evidence_text, now)
@@ -804,11 +958,12 @@ class PresenceWorker:
                     by_id[i] = target   # a second correction of the same event this batch builds on the first
                 merged += 1
             joined = 0
-            if appended:   # a new row that measures as a stored event joins it: never a second row for one event
+            if appended:   # a copy of a stored row is written merged with it; any other new row as its own
                 known, joined = _fold_new(known, appended)
             changed = bool(appended) or merged > 0
             checkin.outcome = (f"events:{kept}" + (f" vetted_out:{vetted.get('dropped', 0)}" if vetted else "")
                                + (f" merged:{merged}" if merged else "")
+                               + (f" same_as_refused:{refused}" if refused else "")
                                + (f" joined:{joined}" if joined else "")
                                + (f" untimed:{vetted.get('untimed', 0)}" if vetted.get("untimed") else ""))
         except Exception as exc:
@@ -913,7 +1068,8 @@ class PresenceWorker:
         blocks = []
         for n, ev in enumerate(found, 1):
             rest = "\n".join(f"    {safe(evidence.get(e, e), 700)}" for e in ev["evidence"])
-            on = (f"{safe(ev.get('stated'), 20)} at UTC{safe(ev.get('offset'), 8)}" if not ev.get("all_day")
+            zone = "" if ev.get("zone") in (None, "", "local") else f" {safe(ev.get('zone'), 64)}"
+            on = (f"{safe(ev.get('stated'), 20)}{zone} (UTC{safe(ev.get('offset'), 8)})" if not ev.get("all_day")
                   else f"{safe(ev['when'], 20)}, no time")
             blocks.append(f"{n}. {safe(ev['what'], 200)} - on {on}\n  evidence:\n{rest}")
         user = (f"NOW: {datetime.fromtimestamp(now):%A %Y-%m-%d %H:%M} local time (UTC{local_offset(now)}).\n\n"
@@ -961,7 +1117,7 @@ def _offer_object(raw: Any) -> Any:
 
 
 __all__ = [
-    "EVENTS_PROMPT", "EVENTS_TOOL", "PresenceWorker", "SAME_EVENT_MIN", "card_feedback_lines", "event_time_sure",
-    "event_words", "fold_events", "load_events", "local_offset", "recurrence", "title_overlap", "utc_offset",
-    "word_rarity",
+    "ALIKE_MIN", "COPY_MIN", "EVENTS_PROMPT", "EVENTS_TOOL", "PresenceWorker", "SAME_EVENT_MIN",
+    "card_feedback_lines", "event_time_sure", "event_words", "fold_events", "load_events", "local_offset",
+    "named_zone", "recurrence", "title_overlap", "utc_offset", "word_rarity", "words_alike",
 ]

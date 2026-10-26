@@ -2151,7 +2151,10 @@ class CardJudge:
                 head_r = None
         texts: list[tuple[Candidate, str]] = []
         for c in lines:
-            t = clip_words(resolve(c.digest_line), DIGEST_LINE_CHARS)   # at a whole word (tc1)
+            # the Today card's own wording when a line has one (under its "today" title the day goes without saying);
+            # the away list keeps the line that says its day (craft-2, 26 Oct). At a whole word (tc1).
+            said = c.today_line if kind == "today" and getattr(c, "today_line", None) is not None else c.digest_line
+            t = clip_words(resolve(said), DIGEST_LINE_CHARS)
             if t:
                 texts.append((c, t))
         if head_r is None and (not texts or (kind == "away" and len(texts) < AWAY_MIN_LINES)):

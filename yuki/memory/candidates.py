@@ -93,6 +93,7 @@ from yuki.memory.presence import (
     RECAP_MIN_SPEECH_S,
     RECAP_ROW_MIN_SPEECH_S,
     RECAP_WITHIN_S,
+    SAME_EVENT_MIN,
     STALE_MAX_S,
     STALE_MIN_IMPORTANCE,
     STALE_MIN_S,
@@ -102,8 +103,11 @@ from yuki.memory.presence import (
     STUCK_WINDOW_S,
     THREAD_AGAIN_S,
     _call_sessions,
+    event_words,
     fold_events,
     recurrence,
+    title_overlap,
+    word_rarity,
 )
 from yuki.memory.presence import EVENTS_STATE as PRESENCE_EVENTS_STATE
 from yuki.memory.presence import LOOK_CAPS as PRESENCE_LOOK_CAPS
@@ -195,6 +199,9 @@ class Candidate:
     evidence: dict[str, float] = field(default_factory=dict)  # evidence id -> when
     text: Any = None              # code text, or a function that makes it (RAM only, never logged)
     digest_line: Any = None       # <= DIGEST_LINE_CHARS, code text or a function; None for time-bound types
+    #: The line as the Today card says it, when that differs (under "Here's what's waiting for you today" the day goes
+    #: without saying; the away list and "what's waiting?" keep ``digest_line``, which says it). None: digest_line.
+    today_line: Any = None
     asks: str | None = None       # "Q<id>" (a stored question) | "checkin" (its question row is made when written)
     needs_writer: bool = False
     offer_channel: str | None = None
@@ -228,17 +235,16 @@ def resolve(value: Any) -> str | None:
 
 
 def clip_words(value: Any, cap: int) -> str | None:
-    """White space squashed; when longer than ``cap``, cut after the last whole word (one past half the cap), the
-    separators left at the end dropped, then "…" (tc1, 26 Oct: "... on Google Meet - pres… at 10:30")."""
+    """White space squashed; when longer than ``cap``, cut at the last space within the cap (one past half of it), so
+    every whole word that fits stays, the separators left at the end dropped, then "…" (tc1, 26 Oct: "... on Google
+    Meet - pres… at 10:30")."""
     text = " ".join(str(value or "").split())
     if not text:
         return None
     if len(text) <= cap:
         return text
-    cut = text[: cap - 1]
-    space = cut.rfind(" ")
-    if space > cap // 2:
-        cut = cut[:space]
+    space = text.rfind(" ", 0, cap)   # text[space] is a space: text[:space] ends on a whole word, at most cap - 1 long
+    cut = text[:space] if space > cap // 2 else text[: cap - 1]
     return cut.rstrip(" -–—,;:/(") + "…"
 
 
@@ -343,6 +349,7 @@ class Context:
         self._goals: list[Any] | None = None
         self._events: list[dict[str, Any]] | None = None
         self._referents: dict[int, dict[str, Any]] | None = None
+        self._held: dict[str, float] | None = None
         #: Every ref (an item's, ``event:<id>`` for each stored row of an event) on today's dated lines, shown, seen
         #: or not: :func:`gen_plans` makes no plans card about them (one mention of one plan a day).
         self.dated_refs: set[str] = set()
@@ -406,6 +413,68 @@ class Context:
             except Exception:  # noqa: BLE001
                 self._events = []
         return self._events
+
+    @property
+    def held(self) -> dict[str, float]:
+        """``{"W<id>" | "G<id>": until}``: the work threads and goals today's dated events and goals rest on, while
+        those are still ahead - an event until its follow-up moment (:func:`_event_over_at`), a goal until an hour past
+        its due time (or the end of its day). A check-in about one of them waits until then: the Today line already
+        says it, and "did it land?" hours before the interview it leads to is the wrong question (craft-3, 26 Oct:
+        the interview, its prep row and the W123 "did it land" check-in were three lines about one thing). Measured
+        links only - an event's evidence facts' own thread ids, a goal's own id and thread - no words read."""
+        if self._held is not None:
+            return self._held
+        held: dict[str, float] = {}
+        day = user_day(self.now, self.config.resume_day_start)
+        start = day_boundary(day, self.config.resume_day_start)
+
+        def hold(key: str, until: float) -> None:
+            if until > self.now:
+                held[key] = max(held.get(key, 0.0), until)
+
+        def thread_of(tid: Any) -> int | None:
+            try:
+                return self.store.resolve_work_thread(tid) if tid is not None else None
+            except Exception:  # noqa: BLE001
+                return None
+
+        try:
+            for ev in self.events:
+                at, all_day = float(ev["at"]), bool(ev.get("all_day"))
+                if not (f"{datetime.fromtimestamp(at):%Y-%m-%d}" == day if all_day else start <= at < start + 86400.0):
+                    continue
+                until = _event_over_at(ev)
+                if until <= self.now:
+                    continue
+                for f in _journal_meta(self.store, _fact_ids(ev.get("evidence"))):
+                    tid = thread_of(f.work_thread_id)
+                    if tid is not None:
+                        hold(f"W{tid}", until)
+            for g in self.goals:
+                if g.due_at is not None and start <= float(g.due_at) < start + 86400.0:
+                    until = float(g.due_at) + DEADLINE_AFTER_S
+                elif g.due_at is None and g.day == day:
+                    until = start + 86400.0
+                else:
+                    continue
+                hold(f"G{g.id}", until)
+                tid = thread_of(getattr(g, "work_thread_id", None))
+                if tid is not None:
+                    hold(f"W{tid}", until)
+        except Exception:  # noqa: BLE001 - unreadable: nothing held (a check-in at worst)
+            pass
+        self._held = held
+        return held
+
+    def held_until(self, goal_id: Any = None, thread_id: Any = None) -> float | None:
+        """When a check-in about this goal or thread may come again (:attr:`held`); None when it is not held. The
+        moment is a deadline: the judge looks again then."""
+        untils = [self.held[k] for k in (f"G{goal_id}" if goal_id else "", f"W{thread_id}" if thread_id else "")
+                  if k in self.held]
+        if not untils:
+            return None
+        self.deadline(max(untils))
+        return max(untils)
 
 
 @dataclass(frozen=True)
@@ -631,7 +700,11 @@ def gen_followup_checkin(ctx: Context) -> list[Candidate]:
 
     Differences: milestones are read from content-free journal columns (no decryption); "asked about it within
     ``FOLLOWUP_AGAIN_S``" is the judge's own ``about:`` mark; the per-moment spacing doubling (``checkin_scores``) is
-    the ledger's mode now. Rule 2's list-item case rests on the item id (the guard accepts it)."""
+    the ledger's mode now. Rule 2's list-item case rests on the item id (the guard accepts it).
+
+    craft-3 (26 Oct): none about a goal or a thread that today's dated events or goals rest on while those are still
+    ahead (:attr:`Context.held`): the 06:35 card would have read "Interview prep: did it
+    land, or are you still on it?" under the interview's own line, four hours before it."""
     cands: list[tuple[int, float, Candidate]] = []
     store, now = ctx.store, ctx.now
     goals = ctx.goals
@@ -733,6 +806,8 @@ def gen_followup_checkin(ctx: Context) -> list[Candidate]:
             ev[g.ref] = float(g.updated_at)
         cands.append((3, float(t.last_seen), cand(key, goal=g, thread_id=t.id, because="quiet", evidence=ev,
                                                   title=(lambda t=t: _clip(t.title, 90)))))
+    # craft-3 (26 Oct): not about a goal or thread today's dated events or goals rest on, until they are over
+    cands = [c for c in cands if ctx.held_until(c[2].refs.get("goal"), c[2].refs.get("thread")) is None]
     if not cands:
         return []
     cands.sort(key=lambda c: (c[0], -c[1]))
@@ -1022,9 +1097,8 @@ def gen_event_followups(ctx: Context) -> list[Candidate]:
     tc1 (26 Oct): one follow-up per event, however many rows it was stored as (``ctx.events`` is folded; every row's
     ``followup:`` mark counts), and never before the event: an event with no sure time is asked from
     ``ALL_DAY_ASK_AT``, and not before ``FOLLOWUP_AFTER_S`` past the latest time any of its rows named (an offered
-    07:30 made 08:30 "how did it go?" eligible two hours before a 10:30 interview)."""
-    from yuki.memory.checkins import _minutes
-
+    07:30 made 08:30 "how did it go?" eligible two hours before a 10:30 interview). Shown, it marks the threads its
+    facts rest on as asked about (``about:W<id>``), so a thread check-in does not ask the same thing again (craft-3)."""
     now = ctx.now
     out: list[Candidate] = []
     for ev in ctx.events:
@@ -1032,11 +1106,9 @@ def gen_event_followups(ctx: Context) -> list[Candidate]:
             continue
         try:
             at, all_day = float(ev["at"]), bool(ev.get("all_day"))
-            latest = float(ev.get("latest") or at)
+            ask_from = _event_over_at(ev)
         except (KeyError, TypeError, ValueError):
             continue
-        ask_from = max(at + _minutes(ALL_DAY_ASK_AT) * 60.0, latest + FOLLOWUP_AFTER_S) if all_day \
-            else at + FOLLOWUP_AFTER_S
         until = at + (86400.0 if all_day else 0.0) + FOLLOWUP_WITHIN_S
         if now < ask_from:
             ctx.deadline(ask_from)
@@ -1050,15 +1122,36 @@ def gen_event_followups(ctx: Context) -> list[Candidate]:
         facts = _journal_meta(ctx.store, _fact_ids(ev.get("evidence")))
         if not facts:
             continue
+        threads: set[int] = set()
+        for f in facts:
+            try:
+                tid = ctx.store.resolve_work_thread(f.work_thread_id) if f.work_thread_id is not None else None
+            except Exception:  # noqa: BLE001
+                tid = None
+            if tid is not None:
+                threads.add(int(tid))
         what, day = ev.get("what"), _when(at, now, all_day)
         out.append(Candidate("followup", key, created_at=ask_from, expires_at=until, home="card", confidence=0.6,
                              refs={"event": ev.get("id")}, evidence={f"J{f.id}": f.at for f in facts},
                              digest_line=(lambda w=what, d=day: _clip(f"{_clip(w, 70)} ({d}) - how did it go?",
                                                                        DIGEST_LINE_CHARS)),
                              needs_writer=True, offer_channel="followup", why=f"followup facts={len(facts)}",
-                             seen_keys=tuple(k for k in keys if k != key)))
+                             seen_keys=tuple(k for k in keys if k != key)
+                             + tuple(f"about:W{t}" for t in sorted(threads))))
         break
     return out
+
+
+def _event_over_at(ev: dict[str, Any]) -> float:
+    """When a personal event is over enough to ask how it went: ``FOLLOWUP_AFTER_S`` past its sure time; with no sure
+    time, from ``ALL_DAY_ASK_AT`` on its day and not before ``FOLLOWUP_AFTER_S`` past the latest time any of its rows
+    named (an offered 07:30 is never "over" before the event)."""
+    from yuki.memory.checkins import _minutes
+
+    at = float(ev["at"])
+    if not ev.get("all_day"):
+        return at + FOLLOWUP_AFTER_S
+    return max(at + _minutes(ALL_DAY_ASK_AT) * 60.0, float(ev.get("latest") or at) + FOLLOWUP_AFTER_S)
 
 
 def gen_plans(ctx: Context) -> list[Candidate]:
@@ -1084,7 +1177,7 @@ def gen_plans(ctx: Context) -> list[Candidate]:
         cands.append({"ref": item.ref, "at": day0 if item.all_day else float(item.due_at), "all_day": bool(item.all_day),
                       "due": float(item.due_at), "words": (lambda i=item: i.title or i.text),
                       "since": float(item.since or now), "keys": (f"plans:{item.ref}",)})
-    planned = {c["ref"] for c in cands}
+    planned = {c["ref"]: c for c in cands}
     for g in ctx.goals:
         if g.due_at is not None:
             at, all_day = float(g.due_at), False
@@ -1097,11 +1190,12 @@ def gen_plans(ctx: Context) -> list[Candidate]:
             continue
         cands.append({"ref": g.ref, "at": at, "all_day": all_day, "due": at, "words": (lambda g=g: g.text),
                       "since": float(g.updated_at), "keys": (f"plans:{g.ref}",)})
+    corpus = [event_words(e.get("what")) for e in ctx.events]
     for ev in ctx.events:
         if (ctx.live and ev.get("asked")) or not ev.get("at"):
             continue
-        if planned & _cited_items(ev):
-            continue   # the event rests on a plan on their list: that plan is the one card about it
+        if any(_same_thing(ev, planned[r], corpus) for r in _cited_items(ev) if r in planned):
+            continue   # the event is a plan on their list (cited and alike in words): that plan is its one card
         at = float(ev["at"])
         cands.append({"ref": f"event:{ev.get('id')}", "at": at, "all_day": bool(ev.get("all_day")), "due": at,
                       "words": (lambda e=ev: e.get("what")), "since": float(ev.get("found_at") or now),
@@ -1140,6 +1234,18 @@ def _cited_items(ev: dict[str, Any]) -> set[str]:
     return {f"commit:{str(e)[1:]}" for e in ev.get("evidence") or [] if str(e)[:1] == "C" and str(e)[1:].isdigit()}
 
 
+def _same_thing(ev: dict[str, Any], plan: dict[str, Any], corpus: list[frozenset[str]]) -> bool:
+    """Whether an event that cites a plan on their list is that plan (T3, 26 Oct): a cite alone is not enough - a prep
+    to-do ("Prepare 7-slide presentation") is cited as evidence for the interview's day and is a different thing. The
+    words must measure as one (:func:`yuki.memory.presence.title_overlap` by ``SAME_EVENT_MIN``, the rarity of each
+    word over the stored event titles), and a sure time of the event must be the plan's own minute."""
+    plan_words = event_words(resolve(plan["words"]))
+    if not ev.get("all_day") and not plan["all_day"] and round(float(ev["at"]) / 60.0) != round(plan["due"] / 60.0):
+        return False
+    weight = word_rarity(corpus + [plan_words])
+    return title_overlap(event_words(ev.get("what")), plan_words, weight) >= SAME_EVENT_MIN
+
+
 def dated_today(ctx: Context) -> list[Candidate]:
     """Today's dated items, the Today card's leading lines (phase 3, 3.4; 18 Oct: the card spent a line on reply counts
     while a plan for that day waited): the user's own open list items (a plan said on a call or told Yuki, a to-do of
@@ -1152,14 +1258,19 @@ def dated_today(ctx: Context) -> list[Candidate]:
     tc1 (26 Oct 2026: "Today: Hollis ... at 07:30" / "... at 10:30" / "... at 10:30" for one 10:30 interview):
 
     * **One line per thing.** An event is one row however many times the scan stored it (``ctx.events`` is folded,
-      :func:`yuki.memory.presence.fold_events`). An event and the list item it rests on (its evidence cites the plan,
-      ``C<id>`` = ``commit:<id>``) or with the same words are one line, in the item's words. A line is skipped when any
-      of its rows was shown or seen today, and every row's mark is set with it (a copy never comes back as new).
-    * **A time only when it is sure and agreed.** A list item's or goal's time is the user's own; an event has a time
-      only when the scan stated it settled, with its zone, converted by code. When a line's sure times disagree it
-      shows no time. A line with a time leaves once the time has passed; one without stays for the day.
-    * **Plain words.** The title (clipped at a whole word), then " at HH:MM" only when sure: no "Today:" on the
-      Today card."""
+      :func:`yuki.memory.presence.fold_events`). Two of today's things are one line when their words are the same, or
+      when one cites the other (an event resting on a plan on their list, ``C<id>`` = ``commit:<id>``) and their
+      words measure as one (:func:`yuki.memory.presence.title_overlap` by ``SAME_EVENT_MIN``): a prep to-do cited as
+      evidence for the interview's day is its own line (T3). Two things whose times differ are never one line. A line
+      is skipped when any of its rows was shown or seen today, and every row's mark is set with it.
+    * **A time only when it is sure, and only with its own words.** A list item's or goal's time is the user's own; an
+      event has a time only when the scan stated it settled, in a zone code resolved, converted by code. A line's words
+      are those of the thing whose time it shows (an all-day to-do never carries the event's time). A line with a time
+      leaves once the time has passed; one without stays for the day, until an hour past the latest time any of its
+      rows named (T5: an interview over by 10:45 is not "waiting" at 15:00).
+    * **Plain words.** The Today card says the title (clipped at a whole word), then " at HH:MM" only when sure: under
+      "Here's what's waiting for you today" no "Today:" (``today_line``). Everywhere else - the away list, "what's
+      waiting?" - the line says its day: "<title>, today at 10:30", "<title>, due today" (``digest_line``, craft-2)."""
     now = ctx.now
     day = user_day(now, ctx.config.resume_day_start)
     start = day_boundary(day, ctx.config.resume_day_start)
@@ -1167,7 +1278,7 @@ def dated_today(ctx: Context) -> list[Candidate]:
     found: list[dict[str, Any]] = []
 
     def add(ref: str, refs: dict[str, Any], at: float | None, all_day: bool, words: Any, *, rows: Sequence[str] = (),
-            cites: set[str] | None = None) -> None:
+            cites: set[str] | None = None, due: bool = False, latest: Any = None) -> None:
         if at is None:
             return
         if all_day:
@@ -1176,15 +1287,17 @@ def dated_today(ctx: Context) -> list[Candidate]:
         elif not (start <= float(at) < end):
             return
         found.append({"ref": ref, "refs": refs, "at": float(at), "all_day": bool(all_day), "words": words,
-                      "rows": list(rows) or [ref], "cites": cites or set(), "item": "item" in refs})
+                      "rows": list(rows) or [ref], "cites": cites or set(), "item": "item" in refs, "due": due,
+                      "minute": None if all_day else int(round(float(at) / 60.0)),
+                      "latest": float(latest) if isinstance(latest, (int, float)) else None})
 
     for item in ctx.items:
         if item.due_at is None or item.source not in ("call", "chat", "user") or not ctx.asks_ok(item):
             continue
-        add(item.ref, {"item": item.ref}, item.due_at, bool(item.all_day), lambda i=item: i.title or i.text)
+        add(item.ref, {"item": item.ref}, item.due_at, bool(item.all_day), lambda i=item: i.title or i.text, due=True)
     for g in ctx.goals:
         if g.due_at is not None:
-            add(g.ref, {"plan": g.ref}, float(g.due_at), False, lambda g=g: g.text)
+            add(g.ref, {"plan": g.ref}, float(g.due_at), False, lambda g=g: g.text, due=True)
         elif g.day:
             try:
                 at = datetime.strptime(g.day, "%Y-%m-%d").timestamp()
@@ -1195,17 +1308,30 @@ def dated_today(ctx: Context) -> list[Candidate]:
         if ev.get("at"):
             ref = f"event:{ev.get('id')}"
             add(ref, {"plan": ref}, float(ev["at"]), bool(ev.get("all_day")), lambda e=ev: e.get("what"),
-                rows=[f"event:{i}" for i in ev.get("ids") or [ev.get("id")]], cites=_cited_items(ev))
+                rows=[f"event:{i}" for i in ev.get("ids") or [ev.get("id")]], cites=_cited_items(ev),
+                latest=ev.get("latest"))
     for f in found:
         f["text"] = _clip(resolve(f["words"]), 80)
+        f["bag"] = event_words(f["text"])
+    weight = word_rarity([f["bag"] for f in found] + [event_words(e.get("what")) for e in ctx.events])
+
+    def clash(f: dict[str, Any], m: dict[str, Any]) -> bool:
+        return f["minute"] is not None and m["minute"] is not None and f["minute"] != m["minute"]
+
+    def same(f: dict[str, Any], m: dict[str, Any]) -> bool:
+        if not f["text"] or not m["text"] or clash(f, m):
+            return False
+        if f["text"].casefold() == m["text"].casefold():
+            return True
+        cited = m["ref"] in f["cites"] or f["ref"] in m["cites"]
+        return cited and title_overlap(f["bag"], m["bag"], weight) >= SAME_EVENT_MIN
+
     # one line per thing: items first (their words lead), then by (all day, time)
     lines: list[list[dict[str, Any]]] = []
     for f in sorted(found, key=lambda f: (not f["item"], f["all_day"], f["at"])):
-        same = next((g for g in lines for m in g
-                     if m["ref"] in f["cites"] or f["ref"] in m["cites"]
-                     or (f["text"] and m["text"] and f["text"].casefold() == m["text"].casefold())), None)
-        if same is not None:
-            same.append(f)
+        group = next((g for g in lines if any(same(f, m) for m in g) and not any(clash(f, m) for m in g)), None)
+        if group is not None:
+            group.append(f)
         else:
             lines.append([f])
     out: list[tuple[tuple[int, float], Candidate]] = []
@@ -1216,23 +1342,34 @@ def dated_today(ctx: Context) -> list[Candidate]:
         if any(ctx.seen.looked(k, now, 86400.0) for k in keys):
             continue
         lead = members[0]
-        text = next((m["text"] for m in members if m["text"]), None)
-        if not text:
+        minutes = {m["minute"] for m in members if m["minute"] is not None}
+        at = minutes.pop() * 60.0 if len(minutes) == 1 else None
+        if at is not None:
+            if at < now:
+                continue   # its time has passed
+            voice = next((m for m in members if m["minute"] is not None and m["text"]), None)   # whose time it is
+        else:
+            if not any(m["all_day"] or m["at"] >= now for m in members):
+                continue
+            named = [m["latest"] for m in members if m["latest"] is not None and m["latest"] > m["at"]]
+            if named and now >= max(named) + FOLLOWUP_AFTER_S:
+                continue   # every time its rows named is an hour past: it is over, not waiting
+            if named:
+                ctx.deadline(max(named) + FOLLOWUP_AFTER_S)
+            voice = next((m for m in members if m["text"]), None)
+        if voice is None:
             continue
-        sure = {int(round(m["at"] / 60.0)) for m in members if not m["all_day"]}
-        at = sure.pop() * 60.0 if len(sure) == 1 else None
-        if at is not None and at < now:
-            continue   # its time has passed
-        if at is None and not any(m["all_day"] or m["at"] >= now for m in members):
-            continue
-        line = text + (f" at {datetime.fromtimestamp(at):%H:%M}" if at is not None else "")
+        text = voice["text"]
+        hhmm = f" at {datetime.fromtimestamp(at):%H:%M}" if at is not None else ""
+        said = f"{text}, {'due today' if voice['due'] else 'today'}{hhmm}"
         key = f"dated:{lead['ref']}:{day}"
         out.append(((0 if at is not None else 1, at if at is not None else lead["at"]),
                     Candidate("plans", key, created_at=now, expires_at=end, home="digest", confidence=0.9,
                               refs=lead["refs"], evidence={"PLAN": at if at is not None else start},
-                              digest_line=_clip(line, DIGEST_LINE_CHARS), lead=True, seen_within=86400.0,
+                              digest_line=_clip(said, DIGEST_LINE_CHARS),
+                              today_line=_clip(text + hhmm, DIGEST_LINE_CHARS), lead=True, seen_within=86400.0,
                               seen_keys=tuple(k for k in keys if k != key) + tuple(f"plans:{r}" for r in rows),
-                              why=f"dated all_day={int(at is None)} rows={len(rows)}")))
+                              why=f"dated all_day={int(at is None)} rows={len(rows)} things={len(members)}")))
     return [c for _k, c in sorted(out, key=lambda x: x[0])][:DATED_MAX]
 
 
