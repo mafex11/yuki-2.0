@@ -19,6 +19,8 @@ from yuki.skills import registry as R
 from yuki.skills.resolve import Ask, Handoff, Held, Live, Plan, Refused, done_line, resolve
 
 FIXTURES = Path(__file__).with_name("skills_fixtures")
+#: The demo list slot's taste kind, derived from its ``kind`` and the connection's app (``<app>_<kind>``, lSplit).
+LIST_TASTE = "demoplayer_list"
 
 
 @pytest.fixture()
@@ -59,7 +61,7 @@ def test_given_values_are_checked_by_type_and_by_the_users_words(store: Store, d
 
 
 def test_an_entity_must_be_said_or_listed_never_invented(store: Store, demo: C.Loaded) -> None:
-    _taste(store, "demo_list", "Invented Rainy Mix", "demoplayer://list/r1")
+    _taste(store, LIST_TASTE, "Invented Rainy Mix", "demoplayer://list/r1")
     said = resolve("demo.play", {"list": "Sunday Tapes"}, ["play my Sunday Tapes list"], store=store, loaded=demo)
     assert isinstance(said, Plan) and said.values["list"] == {"name": "Sunday Tapes"} and said.filled["list"] == "words"
     listed = resolve("demo.play", {"list": "invented rainy mix"}, ["play something calm"], store=store, loaded=demo)
@@ -78,9 +80,11 @@ def test_an_entity_must_be_said_or_listed_never_invented(store: Store, demo: C.L
     assert "list" in invented.named                                       # a guess is named aloud
 
 
-def test_fill_order_told_then_preference_then_default(store: Store, demo: C.Loaded) -> None:
+def test_fill_order_told_then_preference_and_a_means_slot_has_no_default(store: Store, demo: C.Loaded) -> None:
+    # r30: the control is a means slot, which ships no default (lSplit, 10 Oct): with no words and no choice of theirs
+    # it stays unset, and no rung of the demo file runs without it
     plain = resolve("demo.volume", {"level": 30}, ["thirty"], store=store, loaded=demo)
-    assert plain.values["control"] == "in_app" and plain.filled["control"] == "default"
+    assert isinstance(plain, Handoff) and "control" not in plain.values and "control" not in plain.filled
     P.record(store, "demo.volume:control", "mixer", "observed")
     recent = resolve("demo.volume", {"level": 30}, ["thirty"], store=store, loaded=demo)
     assert recent.values["control"] == "mixer" and recent.filled["control"] == "pref" and "control" in recent.named
@@ -135,19 +139,20 @@ def test_live_playing_fills_one_and_asks_between_two(demo: C.Loaded, store: Stor
     assert isinstance(two, Ask) and two.options == ["demoplayer", "otherplayer"]
     call = resolve("demo.volume", {"level": 20}, ["quieter"], store=store, loaded=loaded, live=Live(in_call=True))
     assert isinstance(call, Ask) and call.question == "Which app?"
-    named = resolve("demo.volume", {"level": 20, "target": "Demo Player"}, ["Demo Player quieter"], store=store,
-                    loaded=loaded, live=Live(in_call=True))
+    named = resolve("demo.volume", {"level": 20, "target": "Demo Player", "control": "in_app"},
+                    ["Demo Player quieter"], store=store, loaded=loaded, live=Live(in_call=True))
     assert isinstance(named, Plan) and named.values["target"] == "demo player"
 
 
 def test_with_a_game_in_front_only_no_focus_rungs_the_data_allows_never_the_thinker(store: Store,
                                                                                    demo: C.Loaded) -> None:
     covered = Live(game="invented-game", window_state=lambda app: "covered")
-    got = resolve("demo.volume", {"level": 40}, ["forty"], store=store, loaded=demo, live=covered)
+    in_app = {"level": 40, "control": "in_app"}                           # r30: the means slot has no default
+    got = resolve("demo.volume", in_app, ["forty"], store=store, loaded=demo, live=covered)
     assert isinstance(got, Plan) and [r.key for r in got.routes] == ["A:in_app:uia_invoke"]
     assert got.handoff is False                                           # D17(2)
     minimised = Live(game="invented-game", window_state=lambda app: "minimised")
-    held = resolve("demo.volume", {"level": 40}, ["forty"], store=store, loaded=demo, live=minimised)
+    held = resolve("demo.volume", in_app, ["forty"], store=store, loaded=demo, live=minimised)
     assert isinstance(held, Held) and held.say.endswith("after the round?")
     mixer = resolve("demo.volume", {"level": 40, "control": "mixer"}, ["forty on the mixer"], store=store,
                     loaded=demo, live=minimised)
@@ -180,7 +185,7 @@ def test_words_naming_another_option_than_the_usual_ask_to_keep_it(store: Store,
 
 
 def test_the_resolver_is_fast(store: Store, demo: C.Loaded) -> None:
-    _taste(store, "demo_list", "Invented Rainy Mix", "demoplayer://list/r1")
+    _taste(store, LIST_TASTE, "Invented Rainy Mix", "demoplayer://list/r1")
     times = []
     for i in range(40):
         t0 = time.perf_counter()
@@ -217,7 +222,8 @@ def test_eval_resolver_contract_on_a_copy(tmp_path: Path, demo: C.Loaded) -> Non
     r = eval_resolver(db_path=tmp_path / "copy" / "memory.db", client=client, model="invented-model",
                       prompt=lambda menu: "PROMPT\n" + menu, connections=[FIXTURES])
     got = r.resolve("Demo Player to 25", time.time())
-    assert got["skill"] == "demo.volume" and got["slots"] == {"level": 25.0, "control": "in_app"}
+    # r30: the control is a means slot with no default (lSplit), so a fresh copy fills only the level
+    assert got["skill"] == "demo.volume" and got["slots"] == {"level": 25.0}
     assert "cost_usd" in got
     sent = client.calls[0]
     assert "- demo.volume:" in sent["system"][0]["text"] and sent["tools"][0]["name"] == "run_skill"
@@ -242,9 +248,9 @@ def test_an_entity_usual_is_kept_by_its_taste_key_never_its_name(store: Store, d
     from yuki.skills.resolve import from_pref, pref_option
 
     sk = C.Skill(**{**demo.get("demo.play").__dict__,
-                    "slots": (C.Slot(name="list", type="entity", taste="demo_list", pref="demo.play:list"),)})
+                    "slots": (C.Slot(name="list", type="entity", taste=LIST_TASTE, pref="demo.play:list"),)})
     loaded = C.Loaded((sk,), (), "x")
-    _taste(store, "demo_list", "Invented Rainy Mix", "demoplayer://list/r1")
+    _taste(store, LIST_TASTE, "Invented Rainy Mix", "demoplayer://list/r1")
     said = resolve("demo.play", {"list": "Invented Rainy Mix"}, ["play Invented Rainy Mix"], store=store, loaded=loaded)
     option = said.ask_keep["option"]
     assert option == store.cipher.digest("taste", "Invented Rainy Mix") and "Rainy" not in option

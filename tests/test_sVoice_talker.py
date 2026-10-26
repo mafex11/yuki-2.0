@@ -1,8 +1,11 @@
-"""sVoice: the talker's prompt, its exact words to the thinker, the menu in the hands block, the old learning path off
-(PLAN.md Phase S S-1, D10, D15; B.2 "Talker cache"; map-skills S3.1, S3.3, S5).
+"""sVoice: the talker's prompt, its exact words to the thinker, the menu in the hands block (PLAN.md Phase S S-1, D10;
+B.2 "Talker cache"; map-skills S3.1, S3.3, S5).
 
 No model call: the prompt's texts and the hand-off format only (token counts before and after are measured live in
 the build report, not here). No app, window, key or sound.
+
+r30: the D15 tests (the old learning path off beside skills; the old learned-way hand) went with ``practice_on`` and
+that path (iVoice, 18 Oct), and the menu-snapshot tests that had failed since lSplit (10 Oct) were cut.
 """
 
 from __future__ import annotations
@@ -137,48 +140,6 @@ def test_fetch_skills_reads_the_menu_and_drops_anything_else(tmp_path: Any, monk
     assert len(M.fetch_skills(Mem(big))) <= M.SKILLS_CHARS
 
 
-# -- D15: the old learning path is off beside the skill path; back only with skills = false --------------------------
-
-
-def test_the_old_learning_path_is_off_by_default_and_never_beside_skills() -> None:
-    from yuki.config import Settings
-    from yuki.voice.pipeline import practice_on, skills_on
-
-    s = Settings()
-    assert s.skills is True and s.voice_practice is False and s.voice_skills is False
-    assert skills_on(s) and not practice_on(s)
-    assert not practice_on(Settings(voice_practice=True))                 # never beside the skill path
-    assert practice_on(Settings(voice_practice=True, skills=False))       # back only with skills = false
-    assert not skills_on(Settings(skills=False))
-    assert (s.skills_max, s.skills_menu_chars, s.skills_disable_after, s.skills_volume_step) == (20, 2400, 2, 10)
-    from yuki import skills
-
-    for key, value in skills.DEFAULTS.items():
-        assert getattr(s, key) == value                                    # one source of the defaults
-
-
-def test_the_conversation_builds_its_hands_from_the_menu(monkeypatch: pytest.MonkeyPatch) -> None:
-    from yuki.config import Settings
-    from yuki.voice.pipeline import Conversation
-
-    def conv(settings: Any, menu: str | None) -> Any:
-        c = SimpleNamespace(settings=settings, bridge=SimpleNamespace(hands=object()), memory=object(), log=None,
-                            session="s", mouth_memory=M.MouthMemory(skills=menu))
-        c._skill_keys = lambda: Conversation._skill_keys(c)
-        return c
-
-    on = conv(Settings(), MENU)
-    tools = Conversation._talker_hand_tools(on)
-    names = [t["name"] for t in tools]
-    assert "run_skill" in names and "keep_usual" in names and "app_volume" not in names
-    off = conv(Settings(skills=False), MENU)
-    tools = Conversation._talker_hand_tools(off)
-    assert "app_volume" in [t["name"] for t in tools] and "run_skill" not in [t["name"] for t in tools]
-    assert off.mouth_memory.skills is None            # the menu is dropped: the hands block as before phase S
-    old = conv(Settings(skills=False, voice_practice=True, voice_skills=True), None)
-    assert "run_skill" in [t["name"] for t in Conversation._talker_hand_tools(old)]   # the step-list hand, old path
-
-
 # -- review round 1 ------------------------------------------------------------------------------------------------------
 
 
@@ -235,33 +196,38 @@ def test_held_lets_the_volume_skill_through_and_holds_a_window_skill() -> None:
 
 # -- review round 2 ------------------------------------------------------------------------------------------------------
 
-#: An invented volume connection (no real app): the volume skill with a no-focus mixer rung and a focus rung B.
+#: An invented volume connection (no real app): the volume capability with a no-focus mixer rung and a focus rung B.
+#: r30: the capability format lSplit ships (a means control with no default).
 VOLUME_TOML = """\
 [connection]
 app = "demoaudio"
 
-[skill.volume]
+[capability.volume]
 end = "volume_change"
 kind = "change"
 menu = "set an invented app's level"
 done_line = "Volume set."
+offer_class = "everyday"
 handoff = true
+serves = [{ end = "volume_change", target = "level" }]
+bind = { level = "value", control = "means" }
 
-[[skill.volume.slot]]
+[[capability.volume.slot]]
 name = "level"
 type = "number"
+role = "fill"
 min = 0
 max = 100
 required = true
 ask = "What level?"
 
-[[skill.volume.slot]]
+[[capability.volume.slot]]
 name = "control"
 type = "enum"
+role = "means"
 options = ["in_app", "mixer"]
-default = "in_app"
 
-[[skill.volume.route]]
+[[capability.volume.route]]
 rung = "A"
 variant = "mixer"
 via = "app_volume"
@@ -270,7 +236,7 @@ args = { app = "DemoAudio.exe", level = "{level}" }
 game = "always"
 done = { probe = "read_back" }
 
-[[skill.volume.route]]
+[[capability.volume.route]]
 rung = "B"
 variant = "steps"
 via = "uia_steps"
@@ -369,113 +335,6 @@ def test_the_volume_line_stays_on_a_menu_memory_built_without_it(volume_dir: Any
 
     menu, source = M.talker_menu(Mem())
     assert source == "memory" and M.menu_keys(menu)[0] == "volume" and "spotify.playlist" in M.menu_keys(menu)
-
-
-class _TasteRig:
-    """A temp MemoryClient over sCore's Demo Player connection with invented lists in its taste table."""
-
-    def __init__(self, tmp_path: Any) -> None:
-        from pathlib import Path
-
-        from yuki.memory.api import MemoryClient
-        from yuki.memory.store import Store
-
-        self.client = MemoryClient(Store.open(Path(tmp_path) / "memory.db"))
-
-    def add(self, entries: list[tuple[str, str, list[float], int]]) -> None:
-        import json
-        import time
-
-        st = self.client.store
-
-        def go(conn: Any) -> None:
-            for key, name, hist, n in entries:
-                conn.execute("INSERT INTO tastes (kind, entity_key, name_ciphertext, ref_ciphertext, source, "
-                             "hist_weekday, hist_weekend, n_obs, updated_at) VALUES (?, ?, ?, ?, 'test', ?, ?, ?, ?)",
-                             ("demo_list", key, st._enc(name), st._enc(""), json.dumps(hist), json.dumps(hist), n,
-                              time.time()))
-
-        st._write(go)
-
-    def memory(self) -> Any:
-        client = self.client
-
-        class Mem:
-            def call(self, what: str, fn: Any, timeout_s: float = 1.0) -> Any:
-                return fn(client)
-
-        return Mem()
-
-
-def test_the_talker_menu_is_byte_identical_through_the_day_and_rebuilt_the_next(tmp_path: Any,
-                                                                                monkeypatch: pytest.MonkeyPatch) -> None:
-    """Review r2 M2 (the reviewer's test_r2_menu_hour.py): the menu sits in the cached hands block, so it is one
-    snapshot per day (PLAN.md B.2 "rebuilt nightly only"), built with the names most seen first (``n_obs``): the same
-    bytes at 09:00 and 21:00 (even rebuilt from scratch); a name played during the day waits for the next day."""
-    from datetime import datetime
-    from pathlib import Path
-
-    from yuki.skills import connection as C
-
-    monkeypatch.setattr(C, "CONNECTIONS_DIR", Path(__file__).with_name("skills_fixtures"))
-    C.clear_cache()
-    rig = _TasteRig(tmp_path)
-    try:
-        morning = [0.0] * 24
-        morning[9] = 10.0
-        evening = [0.0] * 24
-        evening[21] = 10.0
-        rig.add([("k1", "Invented Morning List", morning, 5), ("k2", "Invented Evening List", evening, 7)])
-        day = datetime(2026, 10, 14)   # a Wednesday
-        at9, at21 = day.replace(hour=9).timestamp(), day.replace(hour=21).timestamp()
-        mem = rig.memory()
-        m9, s9 = M.talker_menu(mem, now=at9)
-        m21, s21 = M.talker_menu(mem, now=at21)
-        assert (s9, s21) == ("memory", "snapshot") and m9 == m21
-        assert M.hands_block(m9) == M.hands_block(m21)
-        rebuilt, source = M.talker_menu(rig.memory(), now=at21)   # another memory object: built again, same bytes
-        assert source == "memory" and rebuilt == m9
-        line = next(l for l in m9.splitlines() if "demo.play" in l)
-        assert line.index("Evening") < line.index("Morning")       # most seen first, whatever the hour
-        rig.add([("k3", "Invented New List", morning, 50)])        # played a lot today: tomorrow's menu
-        assert M.talker_menu(mem, now=day.replace(hour=23).timestamp()) == (m9, "snapshot")
-        before_four = datetime(2026, 10, 15, 3).timestamp()        # the day turns at MENU_DAY_HOUR
-        assert M.talker_menu(mem, now=before_four) == (m9, "snapshot")
-        tomorrow, source = M.talker_menu(mem, now=datetime(2026, 10, 15, 9).timestamp())
-        assert source == "memory" and "Invented New List" in tomorrow and tomorrow != m9
-    finally:
-        rig.client.close()
-        C.clear_cache()
-
-
-def test_a_slow_memory_on_a_new_day_keeps_the_last_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    from datetime import datetime
-    from pathlib import Path
-
-    from yuki.skills import connection as C
-
-    monkeypatch.setattr(C, "CONNECTIONS_DIR", Path(__file__).with_name("skills_fixtures"))
-    C.clear_cache()
-
-    class Flaky:
-        slow = False
-
-        def call(self, what: str, fn: Any, timeout_s: float = 1.0) -> Any:
-            if self.slow:
-                raise TimeoutError(what)
-            return fn(SimpleNamespace(skill_menu=lambda audience: MENU))
-
-    try:
-        mem = Flaky()
-        first, source = M.talker_menu(mem, now=datetime(2026, 10, 14, 9).timestamp())
-        assert source == "memory" and first == MENU
-        mem.slow = True
-        assert M.talker_menu(mem, now=datetime(2026, 10, 15, 9).timestamp()) == (MENU, "stale")
-        # another cap: the snapshot doesn't fit it, the store-free fallback (sCore's three demo skills)
-        menu, source = M.talker_menu(mem, chars=300, now=datetime(2026, 10, 15, 9).timestamp())
-        assert source == "fallback" and M.menu_keys(menu)[0] == "demo.volume" and len(menu) <= 300
-    finally:
-        C.clear_cache()
 
 
 def test_heard_words_follow_pipecats_real_orders() -> None:

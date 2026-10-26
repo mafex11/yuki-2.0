@@ -181,13 +181,11 @@ def test_with_the_volume_skill_the_mixer_hand_and_the_volume_keys_are_off() -> N
     run = next(t for t in tools if t["name"] == "run_skill")
     assert run["properties"]["skill"]["enum"] == ["volume", "spotify.playlist"]
     assert "steps" not in run["properties"] and "say_when_done" not in run["properties"]   # code says the done line
-    # back with skills = false (no menu): the hands as before phase S, the step-list hand only on the old path
+    # back with skills = false (no menu): the hands as before phase S (the old learned-way hand is deleted: iVoice)
     old = H.talker_hand_tools([])
     assert "app_volume" in [t["name"] for t in old] and "run_skill" not in [t["name"] for t in old]
     media_old = next(t for t in old if t["name"] == "media_key")
     assert "volumeup" in media_old["properties"]["key"]["enum"]
-    learned = H.talker_hand_tools([], learned_ways=True)
-    assert next(t for t in learned if t["name"] == "run_skill") is H.RUN_SKILL_TOOL
     # skills without volume: the mixer hand stays (every target is still covered)
     assert "app_volume" in [t["name"] for t in H.talker_hand_tools(["spotify.playlist"])]
 
@@ -354,14 +352,6 @@ def test_skills_now_is_short_and_names_the_last_run(rig: Any, monkeypatch: pytes
     assert len(line) <= H.SKILLS_NOW_CHARS
     rig.hands.last_skill["values"] = {"level": 40, "control": "x" * 400}
     assert len(rig.hands.skills_now() or "") <= H.SKILLS_NOW_CHARS
-
-
-def test_the_old_learned_way_hand_is_untouched_without_a_menu(rig: Any) -> None:
-    rig.hands.skill_keys = ()
-    params = _run(rig.hands, {"say_first": "", "skill": "pb:9", "steps": [], "sends": False, "say_when_done": ""})
-    result, _props = params.results[-1]
-    assert "not on the Learned ways line" in str(result)   # the v3.18 path answered, not the skill engine
-    assert rig.client.store._query("SELECT count(*) FROM skill_runs")[0][0] == 0
 
 
 def test_a_skill_that_sends_or_joins_a_call_passes_yukis_own_check_first(rig: Any,
@@ -573,34 +563,39 @@ def test_a_window_free_driver_rung_runs_with_act_off_and_a_window_rung_does_not(
     assert res.ran is False and res.outcome == "act_off" and len(ran) == 1 and state["act_off"]
 
 
-#: An invented volume skill (key "volume"): its default control has a focus rung (A), an untrusted rung B and a
-#: hand-off; the mixer control a no-focus rung.
+#: An invented volume capability (key "volume"): its in-app control has a focus rung (A), an untrusted rung B and a
+#: hand-off; the mixer control a no-focus rung. r30: the capability format lSplit ships; the control is a means slot
+#: with no default, so the test sets the user's usual.
 _VOLUME_TOML = """\
 [connection]
 app = "demoaudio"
 
-[skill.volume]
+[capability.volume]
 end = "volume_change"
 kind = "change"
 menu = "set an invented app's level"
 done_line = "Volume set."
+offer_class = "everyday"
 handoff = true
+serves = [{ end = "volume_change", target = "level" }]
+bind = { level = "value", control = "means" }
 
-[[skill.volume.slot]]
+[[capability.volume.slot]]
 name = "level"
 type = "number"
+role = "fill"
 min = 0
 max = 100
 required = true
 ask = "What level?"
 
-[[skill.volume.slot]]
+[[capability.volume.slot]]
 name = "control"
 type = "enum"
+role = "means"
 options = ["in_app", "mixer"]
-default = "in_app"
 
-[[skill.volume.route]]
+[[capability.volume.route]]
 rung = "A"
 variant = "mixer"
 via = "app_volume"
@@ -609,7 +604,7 @@ args = { app = "DemoAudio.exe", level = "{level}" }
 game = "always"
 done = { probe = "read_back" }
 
-[[skill.volume.route]]
+[[capability.volume.route]]
 rung = "A"
 variant = "keys"
 via = "focus"
@@ -617,7 +612,7 @@ when = { slot = "control", in = ["in_app"] }
 args = { window = "DemoAudio.exe" }
 done = { probe = "read_back" }
 
-[[skill.volume.route]]
+[[capability.volume.route]]
 rung = "B"
 variant = "steps"
 via = "uia_steps"
@@ -637,6 +632,7 @@ def test_an_unheld_volume_run_on_unsure_words_takes_no_focus_and_hands_nothing_o
     monkeypatch.setattr(C, "CONNECTIONS_DIR", folder)
     C.clear_cache()
     R.seed(rig.client.store, C.load())
+    P.keep_usual(rig.client.store, "volume:control", "in_app", "yes")   # the user's usual control: the focus rung
     rig.hands.skill_keys = ("volume",)
     steps = Verb(E.RouteResult(ran=True, outcome="focused", verified=True, value=40.0))
     mixer = Verb(E.RouteResult(ran=True, outcome="set", verified=True, value=40.0))
@@ -653,7 +649,8 @@ def test_an_unheld_volume_run_on_unsure_words_takes_no_focus_and_hands_nothing_o
     assert rig.client.store._query("SELECT outcome FROM skill_runs")[0][0] == "refused"
     # the no-focus rung still runs at once on unsure words
     params = _run(rig.hands, {"say_first": "", "skill": "volume", "slots": {"level": 40, "control": "mixer"}})
-    assert mixer.calls and params.said == ["Volume set."]
+    # r30: the mixer named against the usual may add "Keep this as your usual?" (the means slot has a preference key)
+    assert mixer.calls and params.said and params.said[0].startswith("Volume set.")
     # sure words: the focus rung runs
     rig.hands.unsure = lambda: False
     params = _run(rig.hands, {"say_first": "", "skill": "volume", "slots": {"level": 30}})

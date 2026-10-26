@@ -190,11 +190,19 @@ def test_identities_learned_and_the_census_finds_the_tab_again() -> None:
             t.name = "Meet - another title"
     result3 = T.census_job(Auto({1: renamed}), [(1, 999)], ident, _digest)
     assert result3["decision"] == "one" and result3["chosen"][0].match == "position"
-    # two equal Meet tabs: ask
+    # two Meet tabs that match equally (two learned names, seen as often): ask
     two = zen(base=700)
-    two.children[0].children[2].children.append(El(TAB_ITEM, "Daily Sync - Meet", (42, 700, 99)))
-    result4 = T.census_job(Auto({1: two}), [(1, 1000)], {"names": {_digest("Daily Sync - Meet"): {"n": 3}}}, _digest)
+    two.children[0].children[2].children.append(El(TAB_ITEM, "Invented Standup - Meet", (42, 700, 99)))
+    both = {"names": {_digest("Daily Sync - Meet"): {"n": 3}, _digest("Invented Standup - Meet"): {"n": 3}}}
+    result4 = T.census_job(Auto({1: two}), [(1, 1000)], both, _digest)
     assert result4["decision"] == "ask" and len(result4["chosen"]) == 2
+    # r30: fHands (18 Oct): two tabs with the very same title are one page twice, which no answer could tell apart:
+    # the one showing is taken, never a question
+    twins = zen(base=750)
+    twins.children[0].children[2].children.append(El(TAB_ITEM, "Daily Sync - Meet", (42, 750, 99)))
+    result4b = T.census_job(Auto({1: twins}), [(1, 1001)], {"names": {_digest("Daily Sync - Meet"): {"n": 3}}},
+                            _digest)
+    assert result4b["decision"] == "one" and len(result4b["chosen"]) == 1 and result4b["chosen"][0].selected
     # none
     result5 = T.census_job(Auto({1: zen(base=800)}), [(1, 1)], {"names": {_digest("nope"): {"n": 1}}}, _digest)
     assert result5["decision"] == "none"

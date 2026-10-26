@@ -19,11 +19,14 @@ from yuki.memory.api import MemoryClient
 from yuki.memory.store import Store
 from yuki.skills import connection as C
 from yuki.skills import engine as E
+from yuki.skills import prefs as P
 from yuki.skills import registry as R
 from yuki.skills.resolve import Handoff, Live, Plan, resolve
 
 FIXTURES = Path(__file__).with_name("skills_fixtures")
 SECRET_WORDS = ("Zanzibar", "Quillfeather", "Marigold Tapes")
+#: The demo volume capability's derived preference key for its means slot (``<capability>:<slot>``).
+CONTROL = "demo.volume:control"
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +60,9 @@ def demo() -> C.Loaded:
 def client(tmp_path: Path, demo: C.Loaded):
     c = MemoryClient(Store.open(tmp_path / "memory.db"))
     R.seed(c.store, demo)
+    # r30: the control is a means slot and ships no default (lSplit, 10 Oct); the user's one recent choice of it fills
+    # it (prefs rule 3: named aloud, so one word corrects it), as the old file default did
+    P.record(c.store, CONTROL, "in_app", "observed")
     yield c
     c.close()
 
@@ -129,7 +135,7 @@ def test_a_rung_that_cannot_run_passes_to_the_next_and_done_only_on_a_seen_resul
     plan = _plan(client, demo, "demo.volume", {"level": 40}, ["Demo Player to 40"])
     res = E.run(plan, _ctx(client, verbs={"uia_invoke": invoke, "uia_steps": steps}, probes={"level": level}))
     assert res.outcome == "done" and res.done and res.route == "B:steps:uia_steps"
-    assert res.done_line == "Demo Player at 40% with its in_app control."   # a default is named: one word fixes it
+    assert res.done_line == "Demo Player at 40% with its in_app control."   # a recent choice is named: one word fixes
     assert len(invoke.calls) == 1 and len(steps.calls) == 1
     assert res.tried == [{"route": "A:in_app:uia_invoke", "rung": "A", "via": "uia_invoke", "outcome": "missing"}]
     rows = _rows(client)
@@ -470,7 +476,7 @@ def test_the_logs_keep_their_code_words(client, demo) -> None:
     check = next(f for e, f in log if e == "done_check")
     assert check["check"] == "level" and check["result"] == "done"
     resolved = next(f for e, f in log if e == "skill_resolve")
-    assert resolved["slot_source"] == ["default", "words"]
+    assert resolved["slot_source"] == ["pref", "words"]                   # r30: a means slot has no default
 
 
 def test_a_contradicted_rung_is_counted_once(client, demo) -> None:
@@ -504,25 +510,27 @@ MIXER = """
 [connection]
 app = "audio"
 
-[skill."audio.level"]
+[capability."audio.level"]
 end = "volume_change"
 kind = "change"
 menu = "set an app's level in the mixer, or the whole PC's"
 done_line = "At {level}%."
 
-[[skill."audio.level".slot]]
+[[capability."audio.level".slot]]
 name = "target"
 type = "app"
+role = "fill"
 options = ["inventedplayer", "chatapp"]
 
-[[skill."audio.level".slot]]
+[[capability."audio.level".slot]]
 name = "level"
 type = "number"
+role = "fill"
 min = 0
 max = 100
 required = true
 
-[[skill."audio.level".route]]
+[[capability."audio.level".route]]
 rung = "A"
 variant = "mixer"
 via = "app_volume"
@@ -530,7 +538,7 @@ when = { slot = "target", present = true }
 args = { app = "{target}", level = "{level}" }
 recheck = { probe = "level", target = "{target}", value = "{level}", after_s = 1 }
 
-[[skill."audio.level".route]]
+[[capability."audio.level".route]]
 rung = "A"
 variant = "whole"
 via = "endpoint_volume"
@@ -584,26 +592,27 @@ CHAT = """
 [connection]
 app = "inventedchat"
 
-[skill."invented.say"]
+[capability."invented.say"]
 end = "message_sent"
 kind = "change"
 menu = "send a line in Invented Chat"
 done_line = "Sent."
 sends = true
 
-[[skill."invented.say".slot]]
+[[capability."invented.say".slot]]
 name = "text"
 type = "text"
+role = "fill"
 required = true
 
-[[skill."invented.say".route]]
+[[capability."invented.say".route]]
 rung = "A"
 variant = "box"
 via = "uia_invoke"
 args = { window = "InventedChat.exe", role = "Button", name = "Send" }
 done = { probe = "message_sent", app = "inventedchat", text = "{text}", within_s = 1 }
 
-[[skill."invented.say".route]]
+[[capability."invented.say".route]]
 rung = "A"
 variant = "again"
 via = "uia_invoke"
@@ -656,13 +665,13 @@ VOICE = """
 [connection]
 app = "inventedvoice"
 
-[skill."invented.join"]
+[capability."invented.join"]
 end = "call_join"
 kind = "change"
 menu = "join the invented voice room"
 done_line = "You're in."
 
-[[skill."invented.join".route]]
+[[capability."invented.join".route]]
 rung = "A"
 via = "uia_invoke"
 args = { window = "InventedVoice.exe", role = "Button", name = "Join" }
@@ -720,27 +729,28 @@ LADDER = """
 [connection]
 app = "demoplayer"
 
-[skill."demo.loud"]
+[capability."demo.loud"]
 end = "volume_change"
 kind = "change"
 menu = "set Demo Player's level"
 done_line = "At {level}%."
 
-[[skill."demo.loud".slot]]
+[[capability."demo.loud".slot]]
 name = "level"
 type = "number"
+role = "fill"
 min = 0
 max = 100
 required = true
 
-[[skill."demo.loud".route]]
+[[capability."demo.loud".route]]
 rung = "A"
 variant = "mixer"
 via = "app_volume"
 args = { app = "DemoPlayer.exe", level = "{level}" }
 recheck = { probe = "level", target = "DemoPlayer.exe", value = "{level}", after_s = 1 }
 
-[[skill."demo.loud".route]]
+[[capability."demo.loud".route]]
 rung = "A"
 variant = "never"
 via = "uia_invoke"
@@ -748,7 +758,7 @@ args = { window = "DemoPlayer.exe", role = "Slider", name = "Demo volume", patte
 game = "never"
 done = { probe = "level", target = "DemoPlayer.exe", value = "{level}", within_s = 1 }
 
-[[skill."demo.loud".route]]
+[[capability."demo.loud".route]]
 rung = "A"
 variant = "states"
 via = "slider"

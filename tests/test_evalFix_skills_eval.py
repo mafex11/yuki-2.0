@@ -1,8 +1,8 @@
 """evalFix: ``scripts/skills_eval.py`` - fixtures collected content-free from a copy (tool names in the run traces, a
 skill moment within 3 minutes; never the builders' live-check sessions, turns said to others or Yuki's own words),
-the words decrypted only into the fixtures file; the label menu is exactly the seven D2 skills; ``fixtures add`` and
-``status``; ``run`` and ``scorecard`` on a copy with the caps; the console carries counts only; the live database is
-only read and never opened as a store; nothing is written to the repo.
+the words decrypted only into the fixtures file; the label menu is exactly the shipped capabilities; ``fixtures add``
+and ``status``; ``run`` and ``scorecard`` on a copy with the caps; the console carries counts only; the live database
+is only read and never opened as a store; nothing is written to the repo.
 """
 
 from __future__ import annotations
@@ -22,7 +22,14 @@ from yuki.eval import habits_replay as H
 from yuki.memory.store import Store
 
 ROOT = Path(__file__).resolve().parents[1]
-D2 = ("meet.open", "youtube.home", "youtube.video", "spotify.playlist", "volume", "message", "discord.voice")
+#: The label menu: the shipped capabilities in load order (r30: phase L, lSplit/lWire 10 Oct, replaced the seven
+#: hand-written D2 skills; meet.open, youtube.home and youtube.video read as browser.site_tab, web.open_page and
+#: web.open_video).
+D2 = ("volume", "browser.site_tab", "discord.voice", "display", "message", "spotify.playlist", "app.way",
+      "web.open_page", "web.open_video")
+#: The end states the target set groups (PLAN C.4).
+TARGET_KEYS = {"browser.site_tab", "web.open_page", "web.open_video", "spotify.playlist", "volume", "message",
+               "discord.voice"}
 SESSION = "20261003-101010-abc123"
 LIVE_CHECK = "20261005-035340-def456"          # 35 s after the 5 Oct live-check stamp -035305
 
@@ -140,19 +147,22 @@ def test_collect_needs_a_copy_source(hermetic, capsys):
     assert "--copy-real" in capsys.readouterr().out
 
 
-def test_the_label_menu_is_the_seven_d2_skills():
+def test_the_label_menu_is_the_shipped_capabilities():
     assert S.SKILL_KEYS == D2
-    assert {k for name, keys, _n in S.TARGETS for k in keys} == set(D2)
+    assert {k for name, keys, _n in S.TARGETS for k in keys} == TARGET_KEYS and TARGET_KEYS <= set(D2)
     assert sum(n for _name, _keys, n in S.TARGETS) == 25
+    assert {S.label_key(old) for old in ("meet.open", "youtube.home", "youtube.video")} == {
+        "browser.site_tab", "web.open_page", "web.open_video"}
 
 
 def test_labelling_one_phrasing_at_a_time(hermetic):
     data = S.load_fixtures()
     S.add_fixtures(data, ["spotify down a bit", "play my mix", "open the thing", "message bob"])
-    answers = iter(["5", "Spotify", "-10", "", "", "IN_APP", "", "",          # volume, kept
-                    "4", "", "my mix", "n",                                    # playlist: blank slot, end, dropped
+    num = {key: str(i) for i, key in enumerate(D2, 1)}                       # r30: the menu's own numbers
+    answers = iter([num["volume"], "Spotify", "-10", "", "", "IN_APP", "", "",                  # volume, kept
+                    num["spotify.playlist"], "", "my mix", "n",          # playlist: blank slot, end, dropped
                     "s",                                                       # skipped
-                    "6", "discord", "Bob", "on my way", "maybe", "", "y",     # message: send not a choice -> blank
+                    num["message"], "discord", "Bob", "on my way", "maybe", "", "y",   # message: send -> blank
                     ])
     said: list[str] = []
     saves = []
@@ -165,7 +175,7 @@ def test_labelling_one_phrasing_at_a_time(hermetic):
     assert labels[2] is None
     assert labels[3]["slots"] == {"app": "discord", "person": "Bob", "text": "on my way"}
     menu = [line for line in said if line.startswith("  ") and ". " in line and ":" in line]
-    assert [line.split(". ", 1)[1].split(":", 1)[0] for line in menu[:7]] == list(D2)
+    assert [line.split(". ", 1)[1].split(":", 1)[0] for line in menu[:len(D2)]] == list(D2)
     st = S.status(data)
     assert st["kept"] == 2 and st["dropped"] == 1 and st["unlabelled"] == 1
     assert st["per_skill"] == {"message": 1, "volume": 1}
@@ -189,7 +199,12 @@ def test_slots_are_labelled_in_the_form_the_score_compares(skill, slot, typed, k
 
 
 def test_the_label_menu_and_the_score_share_one_slot_table():
-    assert set(H.SLOT_SPEC) == set(S.SKILL_KEYS)
+    # r30: the menu is the shipped capabilities (lSplit); a key the score's table has is labelled from that very table
+    # (the rest from the capability's own slots), and the table's old hand-written keys read as menu keys
+    shared = set(H.SLOT_SPEC) & set(S.SKILL_KEYS)
+    assert {"volume", "spotify.playlist", "message", "discord.voice"} <= shared
+    assert all(S.slot_spec(key) is H.SLOT_SPEC[key] for key in shared)
+    assert {S.label_key(key) for key in set(H.SLOT_SPEC) - shared} <= set(S.SKILL_KEYS)
     assert H.SLOT_SPEC["volume"]["target"] == ("choice", ("spotify", "app", "system", "own_voice"))
 
 
@@ -203,16 +218,16 @@ def test_q_stops_and_keeps_what_was_labelled(hermetic):
 
 def test_add_writes_blind_phrasings_and_can_label_them_at_once(hermetic, capsys):
     assert S.main(["fixtures", "add", "open my meeting", "get me into the standup", "open my meeting",
-                   "--skill", "meet.open"]) == 0
+                   "--skill", "browser.site_tab"]) == 0
     assert "2 phrasings added" in capsys.readouterr().out
     data = S.load_fixtures()
-    assert [f["label"]["skill"] for f in data["fixtures"]] == ["meet.open", "meet.open"]
+    assert [f["label"]["skill"] for f in data["fixtures"]] == ["browser.site_tab", "browser.site_tab"]
     assert all(f["origin"] == "added" for f in data["fixtures"])
     with pytest.raises(SystemExit):
-        S.main(["fixtures", "add", "x", "--skill", "calendar.open"])          # not a D2 key
+        S.main(["fixtures", "add", "x", "--skill", "calendar.open"])          # not a capability key
     assert S.main(["fixtures", "status"]) == 0
     out = capsys.readouterr().out
-    assert "meeting 2/4" in out and "open my meeting" not in out
+    assert "site tab 2/4" in out and "open my meeting" not in out
 
 
 def test_phrasings_added_after_results_were_shown_are_late(hermetic):
@@ -279,7 +294,7 @@ def test_run_requests_with_a_resolver_marks_results_shown(live, capsys, monkeypa
             if words == "spotify down a bit":
                 return {"skill": "volume", "slots": {"target": "spotify", "change": -10, "control": "in_app"},
                         "cost_usd": 0.001}
-            return {"skill": "meet.open", "slots": {}, "cost_usd": 0.001}
+            return {"skill": "browser.site_tab", "slots": {}, "cost_usd": 0.001}
 
     def load(db_path):
         built_on.append(db_path)
@@ -287,7 +302,7 @@ def test_run_requests_with_a_resolver_marks_results_shown(live, capsys, monkeypa
 
     monkeypatch.setattr(H, "load_resolver", load)
     data = S.load_fixtures()
-    S.add_fixtures(data, ["open my meeting", "bring up the call"], skill="meet.open")
+    S.add_fixtures(data, ["open my meeting", "bring up the call"], skill="browser.site_tab")
     S.add_fixtures(data, ["spotify down a bit"], skill="volume")
     data["fixtures"][-1]["label"]["slots"] = {"target": "spotify", "change": "down"}
     S.save_fixtures(data)

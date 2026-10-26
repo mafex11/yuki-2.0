@@ -86,12 +86,8 @@ def player(rows: list[tuple[str, bool]], *, offscreen: bool = False) -> Node:
 GRID = [["DataGrid", "Demo lists"]]
 
 
-def test_the_old_module_name_is_the_moved_module() -> None:
-    import yuki.voice.skills as old
-    from yuki.voice import skills as old2
-    from yuki.voice.skills import SkillRunner
-
-    assert old is U and old2 is U and SkillRunner is U.SkillRunner
+def test_a_site_is_its_host_without_www() -> None:
+    # r30: the yuki.voice.skills shim this rode on was deleted (iVoice, 18 Oct); the check on the moved module stays
     assert U.site("www.Example.org") == "example.org"
 
 

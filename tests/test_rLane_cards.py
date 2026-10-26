@@ -3,7 +3,11 @@ heading, the why line from the counts, its skill's Won't line, today's buttons (
 Open it runs the skill in the tray under the voice run's safety (desk lease, Yuki's marker, the game re-check, never
 an agent run), reports the outcome to memory and shows it with Undo, which brings back the window that was in front.
 Nothing is shown on screen, no window is focused, nothing reaches a desktop: the skill runner and the focus are
-stand-ins, and the engine's real run with a game in front is checked to touch nothing.
+stand-ins.
+
+r30: the engine's real game hold on the hand-written ``meet.open`` (gone since lSplit, 10 Oct; the engine's game holds
+are covered by test_sCore_engine on the demo capabilities) and the end-to-end lane test (its coach worker's
+``media_fn`` / ``render_fn`` went with kProactive, 18 Oct) were cut.
 """
 
 from __future__ import annotations
@@ -52,6 +56,12 @@ class Memory:
 
     def call_method(self, name, *args, timeout_s=None, **kwargs):
         self.calls.append((name, *args))
+        if name == "card_due" and name not in self.answers:
+            # r30: since jSwitch (10 Oct) the tray asks every queued card's card_due first; a stand-in with no answer
+            # is an older memory, as the tray reads it (routine_card_due for the routine card, nothing for the rest)
+            from yuki.agent.memory import MemoryUnavailable
+
+            raise MemoryUnavailable("memory has no card_due()")
         answer = self.answers.get(name)
         return answer(*args) if callable(answer) else answer
 
@@ -386,123 +396,3 @@ def test_run_card_skill_with_the_desk_lease_held_elsewhere_runs_nothing(monkeypa
         t.join(5)
     assert got["ok"] is False and got["outcome"] == "busy"
 
-
-def test_with_a_game_in_front_the_real_engine_holds_meet_open_and_touches_nothing(monkeypatch, tmp_path):
-    """The engine's own D17 path, no stand-in for the run: meet.open's routes all take focus, so with a game in front
-    the run is held ("after the round?") before any verb, focus or opened link (every verb is replaced by one that
-    fails the test)."""
-    import yuki.memory.gamegate as gamegate
-    import yuki.skills.engine as engine
-    from yuki.memory.api import MemoryClient
-    from yuki.memory.store import Store
-    from yuki.ui.nudges import run_card_skill
-
-    monkeypatch.setattr(gamegate, "game_in_front", lambda *a, **k: "valorant-win64-shipping")
-    for name in list(engine.VERB_FUNCS):
-        monkeypatch.setitem(engine.VERB_FUNCS, name, lambda call: pytest.fail("a verb ran with a game in front"))
-    import yuki.actions.launch as launch
-
-    monkeypatch.setattr(launch, "focus_window", lambda *a, **k: pytest.fail("focus with a game in front"))
-    monkeypatch.setattr(launch, "open_url", lambda *a, **k: pytest.fail("a link opened with a game in front"))
-    store = Store.open(tmp_path / "memory.db")
-    try:
-        client = MemoryClient(store)
-        marker = Marker()
-
-        class Access:
-            installed = True
-            store = client.store
-
-            def __getattr__(self, name):
-                return getattr(client, name)
-
-            acting_begin = marker.acting_begin
-            acting_end = marker.acting_end
-
-        got = run_card_skill(Access(), dict(GRANTED), nudge_id=78)
-        assert got["ok"] is False and got["outcome"] == "held_game"
-        assert got["say"] == "You're in a game, so I left it. Nothing ran."
-        assert marker.begun == []            # nothing took focus, so no marker either
-    finally:
-        store.close()
-
-
-def test_end_to_end_the_lane_writes_the_card_the_tray_runs_it_and_the_lane_learns(qapp, monkeypatch, tmp_path):
-    """The whole path on a temp database: the lane writes the card (no model), the UI shows it from memory's own row,
-    Open it goes through memory's checks (running), the tray's stand-in runner "opens" the Meet tab, memory records
-    done, and the learning pass settles it as accepted with the join after it."""
-    import sys
-
-    sys.path.insert(0, os.path.dirname(__file__))
-    from _rlane_world import Clock, add_routine, at, join, lane_worker, open_store, present
-
-    import yuki.ui.nudges as un
-    from yuki.memory import routine_offers
-    from yuki.memory.api import MemoryClient
-
-    monkeypatch.setattr(un, "_foreground_hwnd", lambda: 4242)
-    monkeypatch.setattr("yuki.skills.registry.offer_ready", lambda *a, **k: True)   # D14 stubbed (2 runs)
-    store = open_store(str(tmp_path))
-    try:
-        rid = add_routine(store)
-        present(store, at("08:30"), at("09:00"))
-        clock = Clock(at("08:52"))
-        w = lane_worker(store, clock)
-        got = w.tick(clock.t)
-        assert got and got[0]["trigger"] == "routine"
-        client = MemoryClient(store)
-
-        class Access:
-            installed = True
-
-            def ack_nudge(self, nudge_id, reaction, *, reply=None, timeout_s=None):
-                client.ack_nudge(nudge_id, reaction)
-
-            def pending_nudges(self, **kw):
-                return client.pending_nudges()
-
-            def call_method(self, name, *args, timeout_s=None, **kwargs):
-                return getattr(client, name)(*args, **kwargs)
-
-        import yuki.memory.offers as offers_mod
-
-        # the press comes at 08:53 on the invented day (memory's checks read the clock)
-        monkeypatch.setattr(offers_mod, "time", SimpleNamespace(time=lambda: at("08:53")))
-        import yuki.ui.cards as cards_mod
-
-        monkeypatch.setattr(cards_mod, "time", SimpleNamespace(time=lambda: at("08:53")))
-        row = client._nudge_dict(store.nudge(got[0]["nudge_id"]))   # pending_nudges' own row shape (an old day)
-        assert row["trigger"] == "routine" and row["offer"]["do"] == "run_skill"
-        runs: list[dict] = []
-
-        def runner(memory, granted, *, nudge_id=None, log=None):
-            runs.append(granted)
-            return {"ok": True, "outcome": "done", "verified": True, "route": "a:census:driver",
-                    "say": "Your Meet tab is up in Zen.", "focus": True, "ms": 700.0}
-
-        # the queue's path: memory's own "still due?" (no game in front, no call, not joined yet) clears it
-        import yuki.memory.gamegate as gamegate
-
-        monkeypatch.setattr(routine_offers, "time", SimpleNamespace(time=lambda: at("08:53")))
-        monkeypatch.setattr(gamegate, "game_in_front", lambda *a, **k: "")
-        ctl = _controller(Access(), runner)
-        ctl.offer([row])
-        _settle(qapp, ctl)
-        assert ctl.showing is not None and ctl.showing["id"] == row["id"]
-        assert ctl.card.title.text() == "Your usual"
-        ctl.card._on_do()
-        _settle(qapp, ctl)
-        assert runs and runs[0]["skill"] == "meet.open"
-        n = store.nudge(row["id"])
-        assert n.reaction == "accepted" and n.outcome == "done"
-        join(store, at("08:55"))
-        clock.t = at("09:10")
-        w.routines._learned_at = 0.0
-        w.routines.learn(clock.t, w.config())
-        kinds = [e["kind"] for e in routine_offers.events(store, routine_id=rid)]
-        assert kinds == ["offered", "run_ok", "accepted"]
-        acc = routine_offers.events(store, routine_id=rid, kinds=("accepted",))[0]
-        assert acc["detail"]["joined"] is True
-        ctl.card.close()
-    finally:
-        store.close()

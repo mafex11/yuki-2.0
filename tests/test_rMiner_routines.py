@@ -1,14 +1,18 @@
 """rMiner (plan rev 4, Phase R "The miner"; D3, D7, D14, D18; Appendix B.3, E): the code-only routine miner.
 
-Offline: temp databases with invented rows (app keys, times; no real names), invented skills unless a test says it
-uses the shipped connection files. Nothing reads the desktop, a microphone or the real memory; no model is called.
+Offline: temp databases with invented rows (app keys, times; no real names), invented skills. Nothing reads the
+desktop, a microphone or the real memory; no model is called.
+
+r30: the tests on removed concepts were cut: ``Store.set_routine_mode`` / ``add_routine_event`` (kClean, 18 Oct),
+``routines.due_offers`` (kProactive, 18 Oct), shipped ``routine_on`` (none since lSplit, 10 Oct), the pass and the CLI
+report over a ``load_skills()`` stand-in (now ``load_skills(store, log)``; offerable counts only learned skills since
+lWire), ``active_near`` over unlearned skills, and the content-free report over stand-in skills without the capability
+fields. The mining, the bars, the states and the portrait lines stay.
 """
 
 from __future__ import annotations
 
-import json
 import random
-import threading
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -131,20 +135,6 @@ def test_migration_42_adds_the_routine_tables_and_is_safe_to_open_again(tmp_path
         s.close()
 
 
-def test_routine_store_helpers_round_trip(store):
-    rid = store.save_routine({"key": "meet.open|zen", "skill_id": "meet.open", "app": "zen", "trigger": "clock",
-                              "dayset": "weekdays", "at_min": 538.0, "state": "active", "created_at": 1.0,
-                              "updated_at": 1.0}, events=[("state", 1.0, {"state_to": "active"})])
-    assert store.routine(rid)["offer_mode"] == "early"
-    assert store.set_routine_mode(rid, "late", 2.0, detail={"why": "self_served"})
-    assert not store.set_routine_mode(rid, "late", 3.0)
-    ev = store.routine_events(rid)
-    assert [e["kind"] for e in ev] == ["state", "mode_change"]
-    assert ev[1]["detail"] == {"mode_from": "early", "mode_to": "late", "why": "self_served"}
-    assert store.routines(states=["active"], key="meet.open|zen")[0]["offer_mode"] == "late"
-    assert store.routines(skill="discord.voice") == []
-
-
 # -- moments in, keys out ------------------------------------------------------------------------------------------
 
 
@@ -194,18 +184,6 @@ def test_a_routine_key_slot_keys_by_the_entity_digest(store):
     assert list(inp.onsets) == ["spotify.playlist|spotify|" + "a" * 64]
     assert inp.unmapped == {"media_context|spotify|no_entity": 1}
     assert R._short_key(next(iter(inp.onsets))) == "spotify.playlist|spotify|" + "a" * 12
-
-
-def test_the_shipped_connection_files_map_the_meeting_and_the_voice_channel(store):
-    d = MON
-    setup_presence(store, d, 1)
-    moment(store, at(d, 9))
-    moment(store, at(d, 20), app="discord", service="Discord")
-    moment(store, at(d, 21), app="fl64")
-    inp = R.keyed_onsets(store, at(d, 0), at(d + timedelta(days=1), 4))
-    assert set(inp.onsets) == {"meet.open|zen", "discord.voice|discord"}
-    assert inp.keys["meet.open|zen"].offerable and not inp.keys["discord.voice|discord"].offerable
-    assert inp.unmapped == {"call_join|fl64": 1}
 
 
 # -- the bars ------------------------------------------------------------------------------------------------------
@@ -602,81 +580,7 @@ def test_the_portrait_validator_refuses_model_edits_to_measured_facts(store):
     assert len(changes) == 1
 
 
-# -- the nightly pass: no model, the render, the logs ---------------------------------------------------------------
-
-
-class _Worker:
-    def __init__(self, store):
-        self.store = store
-        self._run_lock = threading.Lock()
-        self._hold_render = True
-        self._render_held = False
-        self.logs = []
-
-    def _call(self, **kw):   # pragma: no cover - the point: never reached
-        raise AssertionError("the routine miner must never call a model")
-
-    def _log(self, type, **fields):
-        self.logs.append((type, fields))
-
-
-def test_the_pass_through_the_portrait_worker_calls_no_model_and_asks_for_the_held_render(store, monkeypatch):
-    setup_presence(store, MON, 28)
-    e1(store, weeks=3)
-    monkeypatch.setattr(R, "load_skills", lambda: SKILLS)
-    worker = _Worker(store)
-    with worker._run_lock:   # as portrait._routines holds it
-        res = R.RoutineMiner(worker).run(now=R.day_start(MON + timedelta(days=21)), reason="after the nightly run")
-    assert res.ok and res.cost_usd == 0.0 and res.applied == 1 and res.run_id is not None
-    assert worker._render_held is True
-    [(kind, fields)] = worker.logs
-    assert kind == "routines_mined" and fields["ok"] and fields["active"] == 1 and fields["offerable"] == 1
-    assert fields["cpu_ms"] < 1000 and fields["keys"] == {"meet.open|zen": 15}
-
-
-def test_the_portrait_schedulers_night_runs_the_code_miner(store, tmp_path, monkeypatch):
-    from yuki.memory.portrait import PortraitScheduler, PortraitWorker
-
-    today = R.day_of(time.time())
-    first = today - timedelta(days=22)
-    setup_presence(store, first, 23)
-    for d in days(first, 22, weekdays=True):
-        moment(store, at(d, 8, 58))
-    monkeypatch.setattr(R, "load_skills", lambda: SKILLS)
-    worker = PortraitWorker(store, client=object(), log_dir=tmp_path / "logs")
-    monkeypatch.setattr(worker, "_call", lambda **kw: (_ for _ in ()).throw(AssertionError("no model call")))
-    logs = []
-    sched = PortraitScheduler(store, worker, db_path=tmp_path / "memory.db", log=lambda t, **f: logs.append((t, f)),
-                              idle_fn=lambda: 0.0)
-    with worker.one_render():
-        sched._routines("nightly")
-        assert worker._render_held is True
-        worker._render_held = False   # the one render at the end of the night (a model call) is not this test's
-    [(kind, fields)] = [x for x in logs if x[0] == "portrait_run"]
-    assert fields["kind"] == "routines" and fields["ok"] and fields["changes"] == 1 and fields["cost_usd"] == 0.0
-    mined = [json.loads(line) for line in (tmp_path / "logs").glob("portrait-*.jsonl").__next__().read_text(
-        encoding="utf-8").splitlines()]
-    assert [m["type"] for m in mined] == ["routines_mined"] and mined[0]["active"] == 1
-    assert [r["state"] for r in store.routines()] == ["active"]
-
-
-def test_the_log_and_the_report_are_content_free(store, tmp_path):
-    setup_presence(store, MON, 28)
-    e1(store, weeks=3)
-    R.tell(store, "meet.open", "zen", "weekdays", 11 * 60, label="Invented Standup Name", now=at(MON, 6))
-    playlist = Skill("spotify.playlist", (("media_context", "spotify"),), True, "change", (Slot("name", True),))
-    secret = "f" * 64
-    for d in days(MON, 21):
-        moment(store, at(d, 22, 5), app="spotify", kind="media_context", digest=secret, service=None)
-    logs = []
-    res = R.RoutineMiner(store=store, skills=SKILLS + (playlist,), log=lambda t, **f: logs.append((t, f))).run(
-        now=R.day_start(MON + timedelta(days=21)))
-    assert res.ok
-    text = json.dumps(logs, default=str)
-    assert "Invented Standup Name" not in text and "Google Meet" not in text and "Zen" not in text
-    assert secret not in text and ("spotify.playlist|spotify|" + "f" * 12) in text
-    rep = json.dumps(R.report(store, at=R.day_start(MON + timedelta(days=21))), default=str)
-    assert "Invented Standup Name" not in rep and secret not in rep
+# -- the nightly pass: no model ---------------------------------------------------------------------------------
 
 
 def test_the_mcp_never_reads_the_routine_tables():
@@ -711,66 +615,6 @@ def _routine(store, *, at_min=538.0, dayset="weekdays", mode="early", key="meet.
                                "rate": 0.75, "created_at": 1.0, "updated_at": 1.0})
 
 
-WED = MON + timedelta(days=2)
-
-
-def test_due_offers_is_the_early_window_of_an_offerable_trusted_routine(store):
-    rid = _routine(store)
-    yes = lambda s: True   # noqa: E731
-    assert R.due_offers(store, at(WED, 8, 49), skills=SKILLS, trusted=yes) == []          # before at - 8
-    [o] = R.due_offers(store, at(WED, 8, 52), skills=SKILLS, trusted=yes)
-    assert o["id"] == rid and o["mode"] == "early" and o["expires_at"] == at(WED, 9, 8)
-    assert R.due_offers(store, at(WED, 8, 58), skills=SKILLS, trusted=yes) == []          # after at - 1
-    assert R.due_offers(store, at(WED, 8, 52), skills=SKILLS, trusted=lambda s: False) == []
-    assert R.due_offers(store, at(MON + timedelta(days=5), 8, 52), skills=SKILLS, trusted=yes) == []   # Saturday
-
-
-def test_due_offers_never_twice_never_after_the_join_never_for_a_context_skill(store):
-    rid = _routine(store)
-    yes = lambda s: True   # noqa: E731
-    moment(store, at(WED, 8, 40))                                                          # joined early today
-    assert R.due_offers(store, at(WED, 8, 52), skills=SKILLS, trusted=yes) == []
-    thu = WED + timedelta(days=1)
-    store.add_routine_event(rid, "offered", at(thu, 8, 51))
-    assert R.due_offers(store, at(thu, 8, 53), skills=SKILLS, trusted=yes) == []          # offered today
-    vid = _routine(store, at_min=19 * 60, key="discord.voice|discord", skill="discord.voice", app="discord")
-    assert R.due_offers(store, at(thu, 18, 55), skills=SKILLS, trusted=yes) == []         # not offerable
-    assert vid
-
-
-def test_due_offers_keeps_the_daily_cap_and_the_modes(store):
-    yes = lambda s: True   # noqa: E731
-    a = _routine(store, at_min=8 * 60)
-    b = _routine(store, at_min=12 * 60)
-    _routine(store, at_min=17 * 60)
-    store.add_routine_event(a, "offered", at(WED, 7, 53))
-    store.add_routine_event(b, "offered", at(WED, 11, 53))
-    assert R.due_offers(store, at(WED, 16, 55), skills=SKILLS, trusted=yes) == []         # 2 a day
-    late = _routine(store, at_min=540.0, mode="late")
-    thu = WED + timedelta(days=1)
-    assert [o["id"] for o in R.due_offers(store, at(thu, 9, 2), skills=SKILLS, trusted=yes)] == [late]
-    store.set_routine_mode(late, "quiet")
-    assert R.due_offers(store, at(thu, 9, 2), skills=SKILLS, trusted=yes) == []
-
-
-def test_due_offers_asks_the_d14_trust_rule_by_default(store, monkeypatch):
-    _routine(store)
-    seen = []
-    import yuki.skills.registry as registry
-
-    monkeypatch.setattr(registry, "offer_ready", lambda st, skill, *a, **k: seen.append(skill.key) or False)
-    assert R.due_offers(store, at(WED, 8, 52), skills=SKILLS) == [] and seen == ["meet.open"]
-
-
-def test_active_near_and_the_why_line(store):
-    rid = _routine(store)
-    near = R.active_near(store, at(WED, 8, 30))
-    assert [r["id"] for r in near] == [rid] and near[0]["at"] == "08:58" and near[0]["in_min"] == 28.0
-    assert R.active_near(store, at(WED, 11, 0)) == []
-    assert R.why_line(store, store.routine(rid), skills=SKILLS) == (
-        "You've joined it around 08:58 on 7 of the last 9 weekdays.")
-
-
 # -- the CLI ---------------------------------------------------------------------------------------------------------
 
 
@@ -793,28 +637,6 @@ def test_cli_show_before_migration_42(tmp_path, capsys):
     sqlite3.connect(path).close()
     assert R.main(["--show", "--db", str(path)]) == 0
     assert "no routines table yet" in capsys.readouterr().out
-
-
-def test_cli_report_runs_on_a_copy_and_the_pass_runs_dry(tmp_path, capsys, monkeypatch):
-    path = tmp_path / "memory.db"
-    s = Store.open(path)
-    setup_presence(s, MON, 28)
-    e1(s, weeks=3)
-    s.close()
-    monkeypatch.setattr(R, "load_skills", lambda: SKILLS)
-    monkeypatch.setenv("TEMP", str(tmp_path / "tmp"))
-    (tmp_path / "tmp").mkdir()
-    assert R.main(["--report", "--db", str(path), "--at", (MON + timedelta(days=21)).isoformat() + "T04:00"]) == 0
-    rep = json.loads(capsys.readouterr().out)
-    assert rep["passed"][0]["key"] == "meet.open|zen" and rep["would_change"][0]["events"][0]["state_to"] == "active"
-    s = Store.open(path)
-    try:
-        assert s.routines() == []                      # the report wrote nothing to the database it read
-    finally:
-        s.close()
-    assert R.main(["--db", str(path), "--dry-run"]) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["ok"] is True and out["cost_usd"] == 0.0
 
 
 # -- review round 1 ------------------------------------------------------------------------------------------------
@@ -884,70 +706,6 @@ def test_a_routine_whose_best_centre_wobbles_stays_active(store):
     assert set(states) == {("active",)}, states
     [row] = store.routines()
     assert [e["detail"]["state_to"] for e in store.routine_events(row["id"], kinds=["state"])] == ["active"]
-
-
-def test_active_near_leaves_out_context_routines(store):
-    rid = _routine(store, at_min=8 * 60 + 40)
-    _routine(store, at_min=8 * 60 + 50, key="discord.voice|discord", skill="discord.voice", app="discord")
-    near = R.active_near(store, at(WED, 8, 30), skills=SKILLS)
-    assert [r["id"] for r in near] == [rid]
-
-
-def test_due_offers_never_returns_more_than_the_cards_left_today(store):
-    yes = lambda s: True   # noqa: E731
-    a = _routine(store, at_min=8 * 60)
-    _routine(store, at_min=12 * 60, key="meet.open|zen|x", app="zen")
-    _routine(store, at_min=12 * 60 + 1, key="meet.open|zen|y", app="zen")
-    store.add_routine_event(a, "offered", at(WED, 7, 53))
-    store._write(lambda c: c.execute("DELETE FROM moments"))
-    got = R.due_offers(store, at(WED, 11, 54), skills=SKILLS, trusted=yes)
-    assert len(got) == 1   # 1 offered today, 2 due at once: 1 card left
-
-
-def test_t6_a_moved_routine_offers_at_most_twice_then_the_new_time(store):
-    """Appendix E's T6 on invented rows shaped like E1 (7 hits on the 10 weekdays before a Friday, then the meeting
-    moves +60 min), through due_offers as the lane calls it (every minute, one card per routine a day, each offer
-    recorded): the old window offers at most twice more and never once it went dormant; the new window is active the
-    night after its 5th hit day and offered from then on."""
-    setup_presence(store, MON, 70, spans=((7, 0, 13, 0), (14, 0, 17, 0), (18, 0, 23, 59)))
-    shift = MON + timedelta(days=25)                                                  # a Friday
-    old_days = [d for d in days(MON + timedelta(days=11), 14, weekdays=True) if d < shift]
-    assert len(old_days) == 10
-    for i, d in enumerate(old_days):
-        if i not in (3, 7, 8):
-            moment(store, at(d, 8, 58) + 60 * (0, 2, -1, 1, -2)[i % 5])
-    new_days = days(shift, 28, weekdays=True)
-    for i, d in enumerate(new_days):
-        moment(store, at(d, 9, 58) + 60 * (0, 2, -1, 1, -2)[i % 5])
-    yes = lambda s: True   # noqa: E731
-    offers = []
-    for i in range(11, 49):
-        d = MON + timedelta(days=i)
-        assert miner(store).run(now=R.day_start(d)).ok
-        t = at(d, 8, 0)
-        while t <= at(d, 10, 30):
-            for o in R.due_offers(store, t, skills=SKILLS, trusted=yes):
-                store.add_routine_event(o["id"], "offered", t)
-                offers.append((d, o["id"]))
-            t += 60
-    rows = store.routines()
-    [old] = [r for r in rows if abs(r["at_min"] - 538) < 30]
-    [new] = [r for r in rows if abs(r["at_min"] - 598) < 30]
-    false = [d for d, rid in offers if rid == old["id"] and d >= shift]
-    dormant = [R.day_of(e["at"]) for e in store.routine_events(old["id"], kinds=["state"])
-               if e["detail"]["state_to"] == "dormant"]
-    assert [d for d, rid in offers if rid == old["id"] and d < shift]   # it was offered before the move
-    after = [d for d in dormant if d > shift]
-    assert len(false) <= 2 and after and all(d < after[0] for d in false)
-    assert not [e for e in store.routine_events(old["id"], kinds=["state"])
-                if e["detail"]["state_to"] == "active" and R.day_of(e["at"]) > after[0]]   # and stays down
-    became = [R.day_of(e["at"]) for e in store.routine_events(new["id"], kinds=["state"])
-              if e["detail"]["state_to"] == "active"]
-    assert became[0] == new_days[4] + timedelta(days=1)                   # the night after its 5th hit day
-    new_offers = [d for d, rid in offers if rid == new["id"]]
-    assert new_offers[0] == became[0] and new["state"] == "active"
-    assert all(d in new_offers for d in new_days if became[0] <= d < MON + timedelta(days=49))
-    assert len(offers) == len(set(offers))                                # one card per routine a day
 
 
 def test_a_long_held_routine_that_stopped_fails_the_bars_after_five_eligible_misses(store):

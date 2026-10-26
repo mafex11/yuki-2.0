@@ -166,29 +166,36 @@ def test_a_proposal_is_asked_once_and_confirmed_only_by_its_own_option(store: St
     assert P.usual(store, CONTROL) == "mixer"
 
 
+#: r30: the capability format lSplit ships: a means slot's preference key is derived from its ``scope``
+#: (``demo.loud:control@{target}``), never written.
 SCOPED = """
 [connection]
 app = "demoaudio"
 
-[skill."demo.loud"]
+[capability."demo.loud"]
 end = "volume_change"
 kind = "change"
 menu = "change a Demo app's volume"
 done_line = "Done."
+offer_class = "everyday"
 handoff = false
+serves = [{ end = "volume_change", target = "level" }]
+bind = { target = "app", control = "means" }
 
-[[skill."demo.loud".slot]]
+[[capability."demo.loud".slot]]
 name = "target"
 type = "enum"
+role = "fill"
 options = ["demoplayer", "demochat"]
 
-[[skill."demo.loud".slot]]
+[[capability."demo.loud".slot]]
 name = "control"
 type = "enum"
+role = "means"
 options = ["in_app", "mixer"]
-pref = "demo.loud:control@{target}"
+scope = "target"
 
-[[skill."demo.loud".route]]
+[[capability."demo.loud".route]]
 rung = "A"
 via = "app_volume"
 args = { app = "{target}", level = "40" }

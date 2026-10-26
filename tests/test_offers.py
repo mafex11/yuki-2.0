@@ -134,16 +134,17 @@ def test_offers_off_runs_nothing(store, monkeypatch):
     assert offers.allowed_dos(store, "thread", enabled=False) == ()
 
 
-def test_show_memory_draft_and_ask_return_what_the_card_shows(store):
+def test_show_memory_and_ask_return_what_the_card_shows_and_a_draft_is_never_offered(store):
     client = MemoryClient(store)
     wid = thread(store)
     nid = card(store, valid(store, {"do": "show_memory", "label": "Show", "steps": ["show where it stands"],
                                    "refs": [f"W{wid}"], "text": "", "due": ""}, ids={f"W{wid}"}))
     result = client.offer_act(nid)
     assert result["ok"] and result["items"][0]["title"] == "Operator demo" and "booth" in result["items"][0]["text"]
-    draft = card(store, valid(store, {"do": "draft", "label": "Show draft", "steps": ["show a reply to Varun"],
-                                     "refs": [], "text": "Hey Varun,\nPR #105 is merged.", "due": ""}))
-    assert client.offer_act(draft)["text"] == "Hey Varun,\nPR #105 is merged."   # shown, never sent
+    # r30: jSwitch (10 Oct) retired the draft offer (RETIRED_DOS): a reply to copy is the user's own work
+    assert offers.validate_offer({"do": "draft", "label": "Show draft", "steps": ["show a reply to Kian"], "refs": [],
+                                  "text": "Hey Kian,\nthe PR is merged.", "due": ""}, ids=set(), store=store) == \
+        (None, "not_allowed")
     ask = card(store, valid(store, {"do": "ask", "label": "Edit in ask bar", "steps": ["put it in the ask bar"],
                                    "refs": [], "text": "Check the T3 Code agent's stream failure", "due": ""}))
     assert client.offer_act(ask)["state"] == "prefilled" and store.nudge(ask).outcome == "prefilled"
@@ -173,8 +174,7 @@ def test_the_card_row_carries_the_typed_offer_its_wont_line_and_expiry(store):
 
 
 def test_three_not_nows_on_one_kind_remove_that_button_but_not_the_channel(store):
-    from yuki.memory.presence import channel_budgets
-
+    # r30: presence.channel_budgets went with the old card writers (kProactive, 18 Oct); the offer-score checks stay
     lid = link(store, "https://docs.example.com/booth", "Booth link sheet")
     back = valid(store, {"do": "bring_back", "label": "Open it again", "steps": ["open it again"],
                          "refs": [f"L{lid}"], "text": "", "due": ""}, ids={f"L{lid}"})
@@ -186,7 +186,6 @@ def test_three_not_nows_on_one_kind_remove_that_button_but_not_the_channel(store
     assert "bring_back" not in offers.allowed_dos(store, "thread", now)
     assert "todo_add" in offers.allowed_dos(store, "thread", now)        # only that kind
     assert "bring_back" in offers.allowed_dos(store, "recall", now)      # only on that channel
-    assert channel_budgets(store, now, {"thread": 2})["thread"] == 2     # the cards themselves still come
     lines = offers.feedback_lines(store, lambda v, n: str(v)[:n], now)
     assert any("bring_back offers on thread cards" in ln and "no more such offers" in ln for ln in lines)
 
@@ -207,19 +206,6 @@ def test_one_press_then_stop_counts_against_it_never_as_useful(store):
     kept = card(store, valid(store, TODO), at=time.time() - 2 * offers.UNDO_WITHIN_S, trigger="stuck")
     store.set_nudge_outcome(kept, "done", at=time.time() - offers.UNDO_WITHIN_S - 5)
     assert offers.offer_scores(store)[("stuck", "todo_add")] == 1.0     # ran and kept past the undo time: +1
-
-
-def test_card_reaction_tells_the_models_what_happened(store):
-    from yuki.memory.nudges import card_reaction
-
-    safe = lambda v, n: str(v)[:n]   # noqa: E731
-    nid = card(store, valid(store, TODO))
-    store.react_to_nudge(nid, "accepted")
-    store.set_nudge_outcome(nid, "undone")
-    assert "then Undo: not wanted" in card_reaction(store, store.nudge(nid), safe)
-    other = card(store, valid(store, TODO))
-    store.react_to_nudge(other, "less")
-    assert "Less of these" in card_reaction(store, store.nudge(other), safe)
 
 
 # -- Yuki's own words are never the user's (conversation fact 41, 1 Oct) -----------------------------------------

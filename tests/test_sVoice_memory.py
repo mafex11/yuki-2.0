@@ -1,5 +1,7 @@
-"""sVoice: the memory side of preferences and the old learners (map-skills S4.2, S4.3; PLAN.md D.2 rows
-``memory/conversations.py:399`` and ``memory/practice_learn.py:1007``, ``:1176``).
+"""sVoice: the memory side of preferences (map-skills S4.2, S4.3; PLAN.md D.2 row ``memory/conversations.py:399``).
+
+r30: the old learners' tests (no text pass for a skill run, no pitfall for an app a trusted skill covers) went with
+``memory/practice_learn.py`` (deleted by iMem, 18 Oct).
 
 Temp databases, sCore's invented "Demo Player" connection, stand-in turns and cards. No model call.
 """
@@ -100,48 +102,6 @@ def test_a_usual_not_in_their_words_or_not_said_to_yuki_is_rejected(store: Store
     assert store._query("SELECT count(*) FROM pref_events")[0][0] == 0
     assert w.usual_pass([{"quote": "x", "exchanges": [1], "usual": ""}], turns, {}, set()) == {
         "proposed": 0, "confirmed": 0, "rejected": 0, "already": 0}
-
-
-# -- the old learners: no post-mortem for a skill run, no pitfall for an app a trusted skill covers ---------------------
-
-
-def test_a_request_that_ran_a_skill_gets_no_text_pass(store: Store) -> None:
-    from yuki.memory import practice_learn as L
-
-    key = R.start_run(store, skill=C.load().get("demo.volume"), origin="voice", request_id="s-3")
-    R.finish_run(store, key, outcome="failed", checked=False)
-    header = SimpleNamespace(request_id="s-3")
-    assert L.skill_of_run(store, header) == "demo.volume"
-    assert L.skill_of_run(store, SimpleNamespace(request_id="s-4")) is None
-    signals = {"cancelled": True, "outcome": "cancelled", "actions": 2}
-    mode, reasons = L.decide(signals, [], [], skill="demo.volume")
-    assert mode is None and "skill run" in reasons[0]
-    assert L.decide(signals, [], [])[0] == "postmortem"   # without a skill the old learner is unchanged
-    # review r1 L1: a rung C hand-off runs under the thinker's own request id with no skill_runs row; the run
-    # header's own skill signal (the pinned key, once the loop records it) names it
-    pinned = SimpleNamespace(request_id="t-9", signals={"skill": "demo.volume", "actions": 2})
-    assert L.skill_of_run(store, pinned) == "demo.volume"
-    assert L.skill_of_run(store, SimpleNamespace(request_id="t-9", signals={"actions": 2})) is None
-
-
-def test_no_pitfall_is_written_for_an_app_a_trusted_skill_covers(store: Store) -> None:
-    from yuki.memory import practice_learn as L
-
-    assert L.skill_covered_apps(store) == set()          # no verified run yet: nothing is covered
-    skill = C.load().get("demo.volume")
-    mixer = next(r for r in skill.routes if r.variant == "mixer")
-    for n in range(5):
-        # review r1 L6: D14's bar (registry.offer_ready): a "change" skill needs 5 verified, none failed in the last 5
-        assert L.skill_covered_apps(store) == set(), n
-        key = R.start_run(store, skill=skill, origin="voice")
-        R.finish_run(store, key, outcome="done", checked=True, route=mixer)
-    assert L.skill_covered_apps(store) == {"demoplayer"}
-    checked = L.Checked(outcome="failed", ops=[{"op": "ADD", "kind": "pitfall", "intent": "change the volume",
-                                                "apps": ["DemoPlayer.exe"], "body": {"text": "x"}}])
-    ctx = L.Ctx(mode="postmortem", run_key="hand:s:1")
-    written = L.apply(store, checked, ctx, embedder=None, origin="postmortem", now=time.time())
-    assert written["added"] == [] and written["skipped"] == ["skill_covered"]
-    assert store._query("SELECT count(*) FROM playbooks")[0][0] == 0
 
 
 def test_a_usual_said_again_after_its_card_was_answered_gets_a_new_card(store: Store) -> None:
