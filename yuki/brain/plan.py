@@ -557,6 +557,25 @@ def seed_again(seed: Mapping[str, Any] | None) -> bool:
             and str(seed.get("why") or "").strip() == "unverified")
 
 
+def seed_rerun_ran(seed: Mapping[str, Any] | None, ran: Sequence[Any]) -> str | None:
+    """fix-r31 (A2 review): the seed's skill key when a ``run_skill`` of it (``ran``: the skill keys this plan ran, by
+    family) ran under its rerun flag (:func:`seed_again`), whatever its outcome: that was the one rerun, so the caller
+    drops the flag (:func:`seed_spent`) and bars the skill as spent; ``None`` otherwise. Code data only."""
+    if not seed_again(seed):
+        return None
+    key = str(seed.get("skill") or seed.get("key") or "").strip()
+    family = skill_family(key)
+    if family and any(skill_family(k) == family for k in ran or () if k):
+        return key
+    return None
+
+
+def seed_spent(seed: Mapping[str, Any]) -> dict[str, Any]:
+    """fix-r31 (A2 review): the seed without its rerun flag (:data:`SEED_RERUN_KEY`): its skill is barred again
+    (:func:`seed_skill`) and the repeat rule holds for it (:func:`parse_step`)."""
+    return {k: v for k, v in seed.items() if k != SEED_RERUN_KEY}
+
+
 def skill_family(key: Any) -> str:
     """A skill's family: a learned skill (``web.open_page#c841...``) and the capability it specialises run the same
     routes, so one that just handed over stands for both."""
@@ -1491,7 +1510,7 @@ __all__ = [
     "Plan", "PlanError", "Checks", "required_probe", "parse_header", "parse_step", "validate_plan", "finish_plan",
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",
     "probe_args_text", "probe_errors", "error_code", "error_codes", "SEED_RERUN_OK", "skill_family", "seed_skill",
-    "spent_skills", "unescape", "seed_sends", "SEED_RERUN_KEY", "seed_again",
+    "spent_skills", "unescape", "seed_sends", "SEED_RERUN_KEY", "seed_again", "seed_rerun_ran", "seed_spent",
     "person_open", "handoff_person_open", "SEED_ALSO_PROBE", "DONE_STRENGTH", "stronger_done", "DONE_HERE_LEAD",
     "done_here_given", "several_parts",
 ]

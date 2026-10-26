@@ -186,7 +186,10 @@ TIDIED: dict[str, str] = {
               "nothing in that window is done this turn",
     # fix-r31 (F2): an own_step window call with a declared next step: its side effect waits for the turn's end
     "later": "code left that side effect for now, as your next step goes on there; at the turn's end code undoes it "
-             "unless a later act of yours used that window. Never undo it yourself"}
+             "unless a later act of yours used that window. Never undo it yourself",
+    # fix-r31 (F2 review): a later flagged act while that one waits: it joins it, settled together at the turn's end
+    "joined": "code left that side effect with the one already waiting; at the turn's end code undoes them together "
+              "unless a later act of yours used that window. Never undo it yourself"}
 #: fix-r31 (Y3): the ONE tool that presses a shortcut in a window (typed only): a text field it brings up and that is
 #: left holding the keyboard at the turn's end gets one Escape (:meth:`Runner.turn_end`).
 KEYS_TOOL = "keys"
@@ -626,8 +629,14 @@ class RunState:
     #: final-H2 (C3): the model reply the call running now came in (the budget's round count).
     round: int = 0
     #: fix-r31 (Y3): window -> the text field a ``keys`` call of this turn brought up there (an identity, RAM only) and
-    #: no later act of the turn used; :meth:`Runner.turn_end` undoes it if it still holds the keyboard.
+    #: no later act of the turn used; ``spoiled``: the windows where a later act of the turn aimed there was then
+    #: refused or failed (R13's pattern). :meth:`Runner.turn_end` undoes only such a field, if it still holds the
+    #: keyboard.
     raised: dict[int, tuple[int, int, str, str]] = field(default_factory=dict)
+    spoiled: set[int] = field(default_factory=set)
+    #: fix-r31 (F2 review): the turn's open tidy-up whose code step waits for the turn's end (``TIDIED["later"]``):
+    #: a later flagged act joins it (its before and front kept) instead of opening a tidy-up of its own.
+    deferred: Any = None
 
 
 def state_of(turn: Any) -> RunState:
@@ -1531,7 +1540,7 @@ class Runner:
             finally:
                 _land_typed(turn, landed)
         result = self._finish(name, args, turn, ctx, ok, report, dict(facts or {}), say, state)
-        self._note_raised(name, dict(facts or {}), result, state, before_key)
+        self._note_raised(name, dict(facts or {}), result, state, before_key, ctx)
         return result
 
     def _finish(self, name: str, args: dict[str, Any], turn: policy.Turn, ctx: CallContext, ok: bool, report: str,
@@ -1816,7 +1825,7 @@ class Runner:
                 self._front_kept = None   # an act of a later turn that moved no front lets an older one go (as all)
             pending: dict[str, Any] | None = None
             step: dict[str, Any] | None = None
-            settled = told = off = ask = later = False
+            settled = told = off = ask = later = joined = False
             # integ27 (fa merge note 7, A1): a close that left the page's or the app's own question up takes no tidy
             # step around it (a focus_back would hide it, an Escape or any key would answer it): no tidy-up is opened
             asking = result.status == ASKED and _close_asking(facts)
@@ -1833,9 +1842,21 @@ class Runner:
                 # fb (final-F B1): a focus_back with no window goes to the front the act took (the one front rule),
                 # when the act's own move of the front (``moved``) was not measured
                 taken = self._taken_front(d)
-                turn.flag(own=sorted(own), attention=attention, before=ctx.before, acted=acted, touched=touched,
-                          sound_app=ctx.sound_app, focus_from=moved if moved is not None else taken, step=step,
-                          step_words=words, opened=opened)
+                # fix-r31 (F2 review): while an earlier act's tidy-up waits for the turn's end (``later``, unsettled),
+                # a new flagged diff joins it: its before and its measured front stay the earlier act's (the user's own
+                # window), and this act's windows join its scope (WW4 already joined acted, touched, opened above), so
+                # the turn's end gives the front back to the window that held it first. A new tidy-up (``turn.flag``)
+                # would replace that before with one where the earlier act's window is already in front
+                joined = (state.deferred is not None and state.deferred is open_tidy and open_tidy.open
+                          and not open_tidy.given and not open_tidy.acts)
+                if joined:
+                    open_tidy.own = {*(open_tidy.own or ()), *own}
+                    open_tidy.attention = {*(open_tidy.attention or ()),
+                                           *(h for h in (_hwnd_of(a) for a in attention) if h)}
+                else:
+                    turn.flag(own=sorted(own), attention=attention, before=ctx.before, acted=acted, touched=touched,
+                              sound_app=ctx.sound_app, focus_from=moved if moved is not None else taken, step=step,
+                              step_words=words, opened=opened)
                 mode = util.tidy_mode(getattr(turn, "policy", None))
                 do = mode == util.TIDY_DO
                 off = mode == util.TIDY_OFF
@@ -1862,10 +1883,15 @@ class Runner:
                     # act on (the hands give no look at "off": ``look = ... level != "off"``), so code settles it
                     # below (``_tidy_settled``: no agent round, no tidy debt); a sound left silent stays the agent's
                     pass
+                elif joined:
+                    # fix-r31 (F2 review): it waits with the earlier one, settled once at the turn's end against the
+                    # earlier before (``tidy_debt``); no code step now that would give the front to the wrong window
+                    later = True
                 elif step is not None and (do or as_asked):
                     if own_next and do and landed and not as_asked:
                         # fix-r31 (F2): left as the turn's tidy debt (the open tidy-up keeps its before and scope)
                         later = True
+                        state.deferred = getattr(turn, "tidy", None)
                     elif landed or not do:
                         pending = step
                     # else: code's one step waits (``state.tidied`` and ``Tidy.given`` stay unset, the flags stay on
@@ -1893,8 +1919,9 @@ class Runner:
                 self._tidy_result(pending, d, after, result, turn, state, say)
             elif later:
                 # fix-r31 (F2): no step now; the open tidy-up stays the turn's debt (``Tidy.given`` left unset)
-                self._tidy_later(result)
-                self._emit("one_tidy_code", action=str((step or {}).get("action") or ""), state="later")
+                how = "joined" if joined else "later"
+                self._tidy_later(result, how)
+                self._emit("one_tidy_code", action=str((step or {}).get("action") or ""), state=how)
             elif ask and step is not None:
                 how = self._tidy_ask(step, after, result, turn, state, say)
                 if how:
@@ -2001,13 +2028,15 @@ class Runner:
             pass
 
     @staticmethod
-    def _tidy_later(result: OneResult) -> None:
+    def _tidy_later(result: OneResult, how: str = "later") -> None:
         """fix-r31 (F2): a flagged act result whose one legal tidy step waits for the turn's end (an ``own_step`` window
         call with a declared ``then``): ``tidied`` says so, and the window flags are cleared as :meth:`_tidy_settled`
         clears them (no agent round for them now), while the turn's open tidy-up stays its debt (``Tidy.given`` unset:
-        :meth:`tidy_debt` measures it once at the turn's end). Never raises."""
+        :meth:`tidy_debt` measures it once at the turn's end). ``how``: ``later``, or ``joined`` (F2 review: a later
+        flagged act that joined the one waiting). Never raises."""
         try:
-            result.tidied, result.tidy_state = TIDIED["later"], "later"
+            how = how if how in ("later", "joined") else "later"
+            result.tidied, result.tidy_state = TIDIED[how], how
             silent = bool(dict(result.flags or {}).get("left_silent"))
             result.flags = {k: (bool(v) if k == "left_silent" else False) for k, v in dict(result.flags or {}).items()}
             result.flagged = silent
@@ -2355,18 +2384,26 @@ class Runner:
             return None
 
     def _note_raised(self, name: str, facts: Mapping[str, Any], result: OneResult, state: RunState,
-                     before: Sequence[Any] | None) -> None:
+                     before: Sequence[Any] | None, ctx: CallContext | None = None) -> None:
         """fix-r31 (Y3, final-I R13's gap under one as well): a ``keys`` call that took and moved the keyboard, inside
         the window it pressed in (its ``live_hwnd``), from what held it before (read right before it) into a text field
         (``chat.raised_field``: never a password field, never a chat app's composer): that field, kept for
-        :meth:`turn_end`. A later act of the turn that took in that window used it (a find bar typed into): let go.
-        Measured facts only. Never raises."""
+        :meth:`turn_end`. A later act of the turn aimed at that window (the window it acted in, else the one the gate
+        judged: ``ctx.facts``) that took or ran unconfirmed used it or moved on there (a find bar typed into): let go.
+        One the gate refused or that failed: R13's pattern (``RunState.spoiled``), the only field :meth:`turn_end`
+        undoes. Measured facts only. Never raises."""
         try:
             window = _hwnd_of(facts.get("live_hwnd"))
+            if not window and ctx is not None:
+                window = _hwnd_of(dict(ctx.facts or {}).get("hwnd"))
             took = result.status in (DONE, ALREADY)
-            if name != KEYS_TOOL:
-                if took and window and window in state.raised:
+            if window and window in state.raised:
+                if result.status in (REFUSED, FAILED):
+                    state.spoiled.add(window)
+                elif result.status in (DONE, ALREADY, NO_CHANGE, NOT_CONFIRMED, CHANGED, STARTING):
                     state.raised.pop(window, None)
+                    state.spoiled.discard(window)
+            if name != KEYS_TOOL:
                 return
             if not took or not window or before is None:
                 return
@@ -2378,21 +2415,29 @@ class Runner:
             held = raised_field(hands, int(window), before)
             if held is not None:
                 state.raised[int(window)] = held
+                state.spoiled.discard(int(window))   # a new field: only acts after it count
                 self._emit("one_own_field", how="raised")
         except Exception:  # noqa: BLE001 - nothing kept: nothing is undone
             return
 
     def turn_end(self, turn: Any, *, ended: str = "") -> None:
         """fix-r31 (Y3): at the turn's end (the typed loop's own end), a text field a ``keys`` call of the turn brought
-        up (:meth:`_note_raised`) that no later act used and that still holds the keyboard, by the same focus read K-S
-        uses (``chat.still_held``), gets one Escape in that window (``press`` with ``expect_hwnd``: only while it is in
-        front; the input layer's game gate, D17; the Dispatcher's input gate waits while they type) and the focus read
-        back. Never after a stop (``ended`` cancelled); never a dialog (the field is inside the window the keys pressed
-        in) and never a field the user moved to (the identity differs). Logged content-free (``one_own_field``);
-        nothing said. Never raises."""
+        up (:meth:`_note_raised`) where a later act of the turn aimed at that window was then refused or failed (R13's
+        pattern: ``RunState.spoiled``) and no act used it since, and that still holds the keyboard, by the same focus
+        read K-S uses (``chat.still_held``), gets one Escape in that window (``press`` with ``expect_hwnd``: only while
+        it is in front; the input layer's game gate, D17; the Dispatcher's input gate waits while they type) and the
+        focus read back. Never when the keys call was the turn's last act there (the field it opened may be the ask: a
+        command palette, a find bar, a search box), never after a stop (``ended`` cancelled); never a dialog (the field
+        is inside the window the keys pressed in) and never a field the user moved to (the identity differs). Logged
+        content-free (``one_own_field``); nothing said. Never raises."""
         try:
             state = state_of(turn)
             raised, state.raised = dict(state.raised), {}
+            spoiled, state.spoiled = set(state.spoiled), set()
+            kept = len(raised)
+            raised = {w: held for w, held in raised.items() if w in spoiled}
+            if kept and not raised:
+                self._emit("one_own_field", how="kept", why="no_later_miss")
             if not raised:
                 return
             if ended == "cancelled":

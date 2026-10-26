@@ -815,9 +815,11 @@ class Executor:
         self._chats_opened: set[int] = set()
         self.reads_seen: set[str] = set()
         #: fix-r31 (Y3, final-I R13): window -> the text field a key step of this request brought up in it
-        #: (:meth:`_note_raised`; an identity, RAM only): undone at the end of a request not done if it still holds the
-        #: keyboard (:meth:`_undo_raised`).
+        #: (:meth:`_note_raised`; an identity, RAM only), and the windows where a later act of the request aimed there
+        #: was then refused or failed (:meth:`_raised_after`): only such a field is undone at the request's end, if it
+        #: still holds the keyboard (:meth:`_undo_raised`).
         self._raised: dict[int, tuple[int, int, str, str]] = {}
+        self._raised_spoiled: set[int] = set()
         self.last_failed: dict[str, Any] | None = None
         self.last_act: dict[str, Any] = {}
         self.join_controls = consent.join_controls()
@@ -1173,19 +1175,47 @@ class Executor:
             held = raised_field(self._desk_hands(), int(window))
             if held is not None:
                 self._raised[int(window)] = held
+                self._raised_spoiled.discard(int(window))   # a new field: only acts after it count
                 self._emit_log("own_field", how="raised")
         except Exception:  # noqa: BLE001 - nothing kept: nothing is undone
             return
 
+    def _raised_after(self, call: Call, *, ok: bool | None, verdict: bool | None, refused: bool,
+                      kind: str | None) -> None:
+        """fix-r31 (Y3 review): a later act of the request aimed at a window where a key step brought a field up
+        (:meth:`_note_raised`; the step's own window, ``call.hwnd``). Refused (any of code's refusals: A8's typing in a
+        chat window among them) or failed (its own report or its check): that field met R13's dead end, so it is undone
+        at the request's end if it still holds the keyboard. One that took: the field was used or the request moved on
+        there, so it is let go (never undone). Reads, the user's own no to a question and a stopped countdown change
+        nothing. Called from :meth:`_trace_step`, which every act step's end passes through. Never raises."""
+        try:
+            if self.tidy is not None or not self._raised:
+                return
+            window = int(call.hwnd or 0)
+            if not window or window not in self._raised:
+                return
+            if refused or (kind == "action" and (ok is False or verdict is False)):
+                self._raised_spoiled.add(window)
+            elif kind == "action" and ok:
+                self._raised.pop(window, None)
+                self._raised_spoiled.discard(window)
+        except Exception:  # noqa: BLE001 - nothing marked: nothing more is undone
+            return
+
     def _undo_raised(self, ended: str) -> None:
         """fix-r31 (Y3): at the request's end (:meth:`close`), a field a key step of it brought up (:meth:`_note_raised`)
-        that still holds the keyboard, by the same focus read K-S uses (``chat.still_held``: the same window, control,
-        role and name), gets one Escape in that window (``press`` with ``expect_hwnd``: sent only while it is in front;
-        the input layer's game gate, D17) and the focus read back. Never after a request whose result is done (what it
-        opened may be the ask: a find bar), a stop or a takeover; never a dialog (no new window was measured) and never a
-        field the user's own hands moved to (the identity differs). Logged content-free (``own_field_undo``); nothing
-        is said. Never raises."""
+        that a later act of the request aimed at that window then failed or was refused in (:meth:`_raised_after`:
+        R13's pattern, the switcher left holding the keyboard after the typing there was refused) and that still holds
+        the keyboard, by the same focus read K-S uses (``chat.still_held``: the same window, control, role and name),
+        gets one Escape in that window (``press`` with ``expect_hwnd``: sent only while it is in front; the input
+        layer's game gate, D17) and the focus read back. Never when the key step was the request's last act there or a
+        later act there took (what it opened may be the ask: a find bar, a search box), never after a request whose
+        result is done, a stop or a takeover; never a dialog (no new window was measured) and never a field the user's
+        own hands moved to (the identity differs). Logged content-free (``own_field_undo``); nothing is said. Never
+        raises."""
         raised, self._raised = dict(self._raised), {}
+        spoiled, self._raised_spoiled = set(self._raised_spoiled), set()
+        raised = {w: held for w, held in raised.items() if w in spoiled}
         if not raised:
             return
         result = getattr(self, "_result", None)
@@ -2460,6 +2490,12 @@ class Executor:
             key, slots = consent.skill_input(call, self.head)
             self.skill_outcomes.append(_SkillRun(index, outcome, key, slots))
             self._skill_key = str(payload.get("skill") or key or "") or None
+            if self.seed is not None:
+                from yuki.brain.plan import seed_rerun_ran, seed_spent
+
+                if seed_rerun_ran(self.seed, [key, str(payload.get("skill") or "")]):
+                    # fix-r31 (A2 review): the seed's one rerun ran (whatever its outcome): the flag goes with it
+                    self.seed = seed_spent(self.seed)
             sk = util.skill(key)
             if verdict is True and sk is not None and (getattr(sk, "sends", False)
                                                       or consent.skill_sends(sk, slots, partial=True)):
@@ -4734,6 +4770,9 @@ class Executor:
         try:
             if kind is None:
                 kind = "action" if call.tool in ACT_VERBS else "read"
+            if self._raised:
+                # fix-r31 (Y3 review): a field a key step brought up, met by this later act in its window
+                self._raised_after(call, ok=ok, verdict=verdict, refused=refused, kind=kind)
             payload = getattr(outcome, "payload", None)
             payload = payload if isinstance(payload, dict) else {}
             details = payload.get("details") if isinstance(payload.get("details"), dict) else {}

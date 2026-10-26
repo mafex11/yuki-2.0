@@ -2047,8 +2047,9 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     fix-r31 (A1): ``bring_once`` (the link route): when the wait ends with another app's window in front while the
     app's own window is minimised or behind (measured), that window is brought forward once (:func:`_focus_app`,
     guarded) and the chat waited for once more. ``restored``: the route restored the app's minimised window before
-    its link (a content-free fact). A2: a chat never confirmed open ends with nothing typed and nothing pressed, said
-    as the code fact :data:`yuki.skills.engine.NOTHING_OUT`."""
+    its link (a content-free fact). A2: on the link route (``via == "link"``), a chat never confirmed open ends with
+    nothing typed and nothing pressed, said as the code fact :data:`yuki.skills.engine.NOTHING_OUT`; the switcher
+    route already typed into the switcher, so its hand-off stays an ordinary one."""
     text, send = _text_mode(call.values)
     send = send and not as_draft
     name = target.name
@@ -2087,9 +2088,12 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     if as_draft:
         facts["as_draft"] = "sound_alike"
     ram: dict[str, Any] = {"app": app, "thread_ids": list(route.thread_ids), "chat": chat}
-    if chat is not True:
-        # fix-r31 (A2): the chat was never confirmed open, so no typing step ran and no key was pressed: the code fact
-        # the engine reads (``NOTHING_OUT``), so a hand-off says "run it once more", never "type it by steps"
+    # fix-r31 (A2): the link route's chat never confirmed open: no typing step ran and no key was pressed anywhere (the
+    # link opens by the shell; A1's restore and bring-forward only focus), the code fact the engine reads
+    # (``NOTHING_OUT``), so a hand-off says "run it once more", never "type it by steps". Never the switcher route's:
+    # it already pressed the switcher's shortcut, typed the chat's name and pressed Enter (an ordinary hand-off)
+    nothing_out = chat is not True and via == "link"
+    if nothing_out:
         facts.update({"typed": "no", "pressed": False, _NOTHING_OUT: True})
     if not text:
         return RouteResult(ran=True, outcome="opened", app=app, say=SAY_OPENED.format(name=name, where=where),
@@ -2105,7 +2109,7 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
                                                                                      "pressed": False})
         return RouteResult(ran=True, outcome="chat_unconfirmed" if chat is None else "other_chat", app=app,
                            unverified_line=LINE_UNSURE_CHAT.format(app=_title(app), name=name), facts=facts,
-                           facts_ram={**ram, "typed": False, "pressed": False})
+                           facts_ram={**ram, "typed": False, "pressed": False} if nothing_out else ram)
     # chat19: the keyboard into the opened chat's composer first (found by the app's label data or by structure,
     # focused through UIA, confirmed by the focus read); nothing is read, typed or pressed anywhere else
     keyboard = _composer_focus(call, app, data, route, hwnd, own_field=own_field)
