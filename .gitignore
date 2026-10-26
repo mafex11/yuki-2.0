@@ -25,3 +25,4 @@ docs/research/
 docs/ui-mockups/
 scripts/resolver_eval.py
 scripts/judge_eval.py
+scripts/moments_bar.py
