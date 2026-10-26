@@ -49,6 +49,10 @@ ends), so it carries its session instead (``MemoryClient.remember_rule``'s prove
 before that stamp goes when it was written inside a test's span with no real exchange there (:func:`test_rules`), and a
 rule of the user's it superseded stands again. The planner's "Keep this as your usual?" answers carry their session in
 their source (``brain:<session>``) and go with the test's other preference events.
+r31 (L4): **what a test ended is put back**: a standing rule of the user's that a test's ``forget_rule`` revoked stands
+again (:func:`test_revoked`: the end note a live test's session writes, :data:`TEST_REVOKE_NOTE`; for a revocation
+before that note, one made inside a test's span with no real exchange before it). A rule the user revoked themselves
+(outside every test span, or with their own exchange right before it) is never reopened.
 Kept: what the screen showed in the span (screen journal facts, links shared in messages and pages only beside the window
 in front, the hour counts of "observed" tastes), which may be real incoming content.
 
@@ -78,6 +82,7 @@ Public API::
     store_test_spans(store) -> list[(start, end)];  sql_outside_spans(column, spans) -> (SQL, params)
     is_test_journal(entry, turn_ids) -> bool;  is_test_fact(fact, turn_ids) -> bool
     known_spans(conn) -> list[(start, end)];  test_rules(conn, known=None) -> {fact id: "session" | "span"}
+    revoke_note(session_id) -> str | None;  test_revoked(conn, dec, known=None) -> {fact id: "note" | "span"}
     report(db_path=None, *, show=False) -> dict               # read-only; the database is opened ?mode=ro
     purge(conn, dec, *, now) -> dict[str, int]                # inside the caller's write transaction; counts
 
@@ -538,6 +543,112 @@ SPAN_RULE_BEFORE = datetime(2026, 11, 1).timestamp()
 #: The preference-event sources that carry the session they were said in after ``:`` (``yuki.brain.tools.USUAL_SOURCE``,
 #: the planner's "Keep this as your usual?" answers: ``brain:<session>``).
 SESSION_SOURCES = ("brain",)
+#: r31 (L4, final-I m21_reversal_checkback under one: a test's ``forget_rule`` ended a standing rule the user had given
+#: days before, and the purge only took what a test wrote): the end note a rule revoked in a live test's session carries
+#: (``MemoryAccess._forget_rule`` through :func:`revoke_note`), followed by that session's id. Code's own format, read
+#: back by identity (:func:`test_revoked`), never words of anyone's.
+TEST_REVOKE_NOTE = "revoked in a live test session: "
+#: The end note ``MemoryClient.revoke_rule`` writes when its caller gives none (``yuki.memory.api``: the user withdrew
+#: it). Only a revocation with exactly this note is judged by time (:func:`test_revoked` ``span``): a rule code ended
+#: for another reason (moved into Yuki's defaults, a correction) carries its own note and is never reopened.
+DEFAULT_REVOKE_NOTE = "the user withdrew it"
+#: The kinds ``MemoryClient.revoke_rule`` ends.
+REVOKED_KINDS = ("rule", "preference", "feedback")
+#: The span rule of :func:`test_revoked` is for revocations made before the note existed (release 31, 27 Oct 2026; this
+#: date at the latest, as :data:`SPAN_RULE_BEFORE`): after it every revoke in a live test's session carries the note,
+#: and one without it is never taken by time.
+REVOKE_SPAN_BEFORE = datetime(2026, 11, 1).timestamp()
+
+
+def revoke_note(session_id: Any) -> str | None:
+    """r31 (L4): the end note for a rule revoked in session ``session_id``: :data:`TEST_REVOKE_NOTE` and the session's
+    id for a live test's session (:func:`is_test_session`), ``None`` for any other (``revoke_rule``'s own default
+    then says the user withdrew it). Pure."""
+    if not is_test_session(session_id):
+        return None
+    return TEST_REVOKE_NOTE + " ".join(str(session_id).split())[:120]
+
+
+def test_revoked(conn: sqlite3.Connection, dec: Callable[[Any], str | None],
+                 known: Sequence[tuple[float, float]] | None = None, *, skip: Iterable[int] = ()) -> dict[int, str]:
+    """r31 (L4): ``{conversation fact id: why}`` of the standing rules (rules, preferences, feedback) a live test ended
+    with ``forget_rule``, which :func:`purge` reopens: the user never took them back. Two measured rules, never a
+    reading of words:
+
+    * ``note``: its end note is :data:`TEST_REVOKE_NOTE` followed by a live test's session id (``dec`` decrypts it):
+      ``MemoryAccess._forget_rule`` revoked it in that session.
+    * ``span``: a revocation made before that note existed (``valid_to`` before :data:`REVOKE_SPAN_BEFORE`) with
+      ``revoke_rule``'s own default note (:data:`DEFAULT_REVOKE_NOTE`), made inside a live test's span (``known``:
+      this database's test sessions and the spans earlier purges kept; :func:`known_spans` when ``None``; judged from
+      the span's first test turn on, as :func:`test_rules` does), of a rule written before that span began, with no
+      exchange of a real session from :data:`REMEMBER_AFTER_S` before the revocation to it: nothing the user said to
+      Yuki could have asked for it (the harness had the desktop). A revocation outside every test span, or with a real
+      exchange in that stretch, is the user's own: never taken.
+
+    Either way not when a standing rule of the same kind with the very same text (folded, identity only) is in force
+    (the user said it again since: reopening would make it twice), nor for ids in ``skip``. Read-only; content-free;
+    ``{}`` on an older database. ``dec`` may return ``None`` (no key): then neither note can be read and nothing is
+    taken."""
+    out: dict[int, str] = {}
+    if not _has(conn, "conversation_facts", "end_note_ciphertext"):
+        return out
+    marks = ",".join("?" * len(REVOKED_KINDS))
+    rows = conn.execute(f"SELECT id, kind, valid_to, created_at, end_note_ciphertext, text_ciphertext FROM"
+                        f" conversation_facts WHERE status = 'revoked' AND kind IN ({marks})",
+                        REVOKED_KINDS).fetchall()
+    skipped = {int(i) for i in skip}
+    rows = [r for r in rows if int(r[0]) not in skipped]
+    if not rows:
+        return out
+    spans = [(a + SPAN_PAD_S, b) for a, b in (known_spans(conn) if known is None else known) if a + SPAN_PAD_S <= b]
+    lo, hi = _session_range()
+    turns = _has(conn, "conversation_turns", "session_id")
+
+    def text_of(raw: Any) -> str | None:
+        try:
+            got = dec(raw) if raw is not None else None
+        except Exception:  # noqa: BLE001 - unreadable: not provably a test's
+            return None
+        return got if isinstance(got, str) else None
+
+    found: dict[int, tuple[str, str, Any]] = {}
+    for fid, kind, vto, created, note_raw, text_raw in rows:
+        note = text_of(note_raw)
+        if note is None:
+            continue
+        if note.startswith(TEST_REVOKE_NOTE) and is_test_session(note[len(TEST_REVOKE_NOTE):].strip()):
+            found[int(fid)] = ("note", str(kind or ""), text_raw)
+            continue
+        if note.strip() != DEFAULT_REVOKE_NOTE or vto is None or created is None or not turns:
+            continue
+        ended = float(vto)
+        if ended >= REVOKE_SPAN_BEFORE:
+            continue
+        span = next(((a, b) for a, b in spans if a <= ended <= b), None)
+        if span is None or float(created) >= span[0]:
+            continue   # outside every test span, or a rule written inside one (the test's own: test_rules)
+        real = conn.execute("SELECT 1 FROM conversation_turns WHERE NOT (session_id >= ? AND session_id < ?) AND"
+                            " at >= ? AND at <= ? LIMIT 1", (lo, hi, ended - REMEMBER_AFTER_S, ended)).fetchone()
+        if real is None:
+            found[int(fid)] = ("span", str(kind or ""), text_raw)
+    if not found:
+        return out
+    # identity only: a rule of the same kind and the very same text in force now (said again since) stays the one
+    marks_kinds = ",".join("?" * len(REVOKED_KINDS))
+    standing: set[tuple[str, str]] = set()
+    for kind, text_raw in conn.execute(f"SELECT kind, text_ciphertext FROM conversation_facts WHERE status ="
+                                       f" 'active' AND kind IN ({marks_kinds})", REVOKED_KINDS).fetchall():
+        text = text_of(text_raw)
+        if text is not None:
+            standing.add((str(kind or ""), _fold(text)))
+    for fid, (why, kind, text_raw) in sorted(found.items()):
+        text = text_of(text_raw)
+        if text is not None:
+            if (kind, _fold(text)) in standing:
+                continue
+            standing.add((kind, _fold(text)))   # two revoked copies of one text: the first only
+        out[fid] = why
+    return out
 
 
 def known_spans(conn: sqlite3.Connection) -> list[tuple[float, float]]:
@@ -1109,6 +1220,14 @@ def purge(conn: sqlite3.Connection, dec: Callable[[Any], str | None], *, now: fl
             count(kind, n)
         _delete_ids(conn, "conversation_fact_vec", "fact_id", rules)
         count("remembered_rules", _delete_ids(conn, "conversation_facts", "id", rules))
+    # r31 (L4): a standing rule of the user's a test ended (forget_rule in a live test's session: its end note, or for a
+    # revocation before that note, a test's span with no real exchange before it) stands again, as it was; after the
+    # test's own facts and rules are gone, so only what remains is judged (:func:`test_revoked`)
+    reopen = test_revoked(conn, dec, _union_spans(spans, _kept_spans(_state_value(conn, KEPT_SPANS_STATE))))
+    for fid in sorted(reopen):
+        count("rules_reopened", conn.execute(
+            "UPDATE conversation_facts SET status = 'active', valid_to = NULL, expired_at = NULL,"
+            " end_note_ciphertext = NULL WHERE id = ? AND status = 'revoked'", (int(fid),)).rowcount or 0)
     # the user's corrections said inside the test's span (a correction carries no session) and what their pass changed
     for kind, n in _purge_corrections(conn, dec, spans, now=now).items():
         count(kind, n)
@@ -1318,7 +1437,8 @@ def report(db_path: str | Path | None = None, *, show: bool = False) -> dict[str
       route tries, playbook events, surfaced cards, moments, trace actions);
     * ``derived``: what was built from them: the session summaries, the journal facts conversation memory drew from
       test exchanges (and the portrait facts that cite any of them), the conversation facts (rules, preferences,
-      commitments) that rest on test exchanges only, each with its id, kind and status (``show``: its text too).
+      commitments) that rest on test exchanges only, each with its id, kind and status (``show``: its text too);
+      r31: the user's standing rules a test ended, which ``--purge`` reopens (:func:`test_revoked`).
 
     Never raises for a missing table (an older database): that part is just empty."""
     from yuki.memory.store import default_db_path
@@ -1431,6 +1551,29 @@ def report(db_path: str | Path | None = None, *, show: bool = False) -> dict[str
                                   "at": _when(r["valid_from"]), "why": rules[int(r["id"])],
                                   **({"text": dec(r["text_ciphertext"])} if show else {})})
             derived["remembered_rules"] = items
+        # r31 (L4): what --purge reopens of the user's standing rules a test ended (why: "note" = its live-test end
+        # note; "span" = revoked in a test's span with no real exchange before it); the notes need the key to read
+        if "end_note_ciphertext" in _columns(conn, "conversation_facts"):
+            key = cipher or _cipher(db)
+
+            def key_dec(text: Any) -> str | None:
+                if key is None or text is None:
+                    return None
+                try:
+                    return str(key.decrypt(text))
+                except Exception:  # noqa: BLE001
+                    return None
+
+            gone = set(rules) | {int(f["id"]) for f in derived.get("conversation_facts") or ()}
+            reopen = test_revoked(conn, key_dec, skip=gone)
+            items = []
+            for fid in sorted(reopen):
+                r = conn.execute("SELECT id, kind, valid_to, text_ciphertext FROM conversation_facts WHERE id = ?",
+                                 (fid,)).fetchone()
+                if r is not None:
+                    items.append({"id": int(r["id"]), "kind": r["kind"], "ended": _when(r["valid_to"]),
+                                  "why": reopen[fid], **({"text": dec(r["text_ciphertext"])} if show else {})})
+            derived["revoked_rules"] = items
         out["derived"] = derived
     except sqlite3.Error as exc:
         out["error"] = type(exc).__name__
@@ -1461,7 +1604,9 @@ def format_report(rep: Mapping[str, Any]) -> str:
               "portrait_facts_citing": "Portrait facts citing one of those journal facts",
               "conversation_facts": "Rules, preferences and commitments resting on test exchanges only",
               "remembered_rules": "Rules kept through remember in a live test's session (why: session = its "
-                                  "stamp; span = written in a test's span with no real exchange there)"}
+                                  "stamp; span = written in a test's span with no real exchange there)",
+              "revoked_rules": "Standing rules of the user's a test ended, which --purge puts back (why: note = its "
+                               "live-test end note; span = revoked in a test's span with no real exchange before it)"}
     for key, label in labels.items():
         items = derived.get(key)
         if items is None:
@@ -1515,7 +1660,8 @@ __all__ = ["TEST_SESSION_PREFIX", "is_test_session", "is_test_request", "is_test
            "sql_outside_spans", "purge", "report", "format_report",
            "main", "real_uses", "CONFIRM_RUN_S", "CONFIRM_DAYS", "known_spans", "test_rules", "REMEMBER_AFTER_S",
            "SPAN_RULE_BEFORE",
-           "SESSION_SOURCES"]
+           "SESSION_SOURCES", "TEST_REVOKE_NOTE", "DEFAULT_REVOKE_NOTE", "REVOKE_SPAN_BEFORE", "revoke_note",
+           "test_revoked"]
 
 
 if __name__ == "__main__":

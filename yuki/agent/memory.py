@@ -1530,9 +1530,30 @@ class MemoryAccess:
         )
 
     def _forget_rule(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """r31 (L4): a rule dropped in a live test's session (:attr:`session_id`, ``livetest-...``) is ended with that
+        session's end note (``yuki.memory.testtag.revoke_note``), when memory's ``revoke_rule`` takes one, so the
+        live-test purge puts it back (a test never takes back a rule of the user's); any other session's drop keeps
+        ``revoke_rule``'s own note (the user withdrew it)."""
+        from yuki.memory.testtag import revoke_note
+
         text = _need_text(tool_input, "text")
+        note = revoke_note(self.session_id)
+
+        def drop(client: Any) -> Any:
+            import inspect
+
+            fn = client.revoke_rule
+            if note:
+                try:
+                    takes = "note" in inspect.signature(fn).parameters
+                except (TypeError, ValueError):
+                    takes = False
+                if takes:
+                    return fn(text, note=note)
+            return fn(text)
+
         try:
-            revoked = self.call_method("revoke_rule", text, timeout_s=TOOL_TIMEOUT_S)
+            revoked = self.call("revoke_rule", drop, timeout_s=TOOL_TIMEOUT_S)
         except MemoryUnavailable as exc:
             return _not_saved("forget_rule", exc, {"text": text})
         if revoked:
