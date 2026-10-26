@@ -74,10 +74,13 @@ def test_an_entity_must_be_said_or_listed_never_invented(store: Store, demo: C.L
     assert [r.key for r in trusted.routes] == ["A:library:uia_invoke", "B:link:open_uri"]
     no_link = resolve("demo.play", {"list": "Sunday Tapes"}, ["play my Sunday Tapes list"], store=store, loaded=demo)
     assert no_link.skipped["B:link:open_uri"] == "when"                   # no learned link: never a guessed one
+    # Phase 2.1 (18 Oct, resolve.FROM_READING): on an undoable run a name the words don't hold is the caller's own
+    # reading, kept as given and tagged "reading" (a guess: the done line names it and one "not that" takes the next),
+    # never swapped for a taste pick; with no learned link for it, rung B never guesses one
     invented = resolve("demo.play", {"list": "Totally Made Up"}, ["play something"], store=store, loaded=demo)
-    assert isinstance(invented, Plan) and invented.dropped == ["list"]
-    assert invented.values["list"]["name"] == "Invented Rainy Mix" and invented.filled["list"] == "taste"
-    assert "list" in invented.named                                       # a guess is named aloud
+    assert isinstance(invented, Plan) and invented.dropped == []
+    assert invented.values["list"] == {"name": "Totally Made Up"} and invented.filled["list"] == "reading"
+    assert invented.sources["list"] == "reading" and invented.skipped["B:link:open_uri"] == "when"
 
 
 def test_fill_order_told_then_preference_and_a_means_slot_has_no_default(store: Store, demo: C.Loaded) -> None:

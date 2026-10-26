@@ -676,6 +676,9 @@ def _launch_world(monkeypatch: pytest.MonkeyPatch, pages: list[Any]) -> dict[str
          "source": "test"}, []))
 
     class Identity:
+        confirmable = True        # its windows can be recognised (launch._AppIdentity.confirmable)
+        via_handler = False
+
         def running_pids(self) -> set[int]:
             return set(state["running"])
 
@@ -689,6 +692,9 @@ def _launch_world(monkeypatch: pytest.MonkeyPatch, pages: list[Any]) -> dict[str
             return True
 
     monkeypatch.setattr(L, "_identity_for", lambda c, plan: Identity())
+    # r31: x8WebArc reads the pages a running browser's windows show right before the hand-off; none here (never a
+    # read of this PC's real windows)
+    monkeypatch.setattr(L, "_pages_before", lambda identity, budget_s=0.0: {})
     monkeypatch.setattr(L, "_top_level_windows", lambda pids: [])
     monkeypatch.setattr(L, "_window_snapshot", lambda: ({}, set(), {}))
     monkeypatch.setattr(L._user32, "GetForegroundWindow", lambda: 0)

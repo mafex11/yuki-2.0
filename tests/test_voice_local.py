@@ -318,6 +318,12 @@ def test_the_catalogue_matches_the_bake_off_copies() -> None:
 # -- the engine: load on its own thread, let go when quiet -------------------------------------------------------
 
 
+#: r31: how long a test waits for the models' worker to unload them. It runs below normal priority by design, so with
+#: the sweep's other test files busy on every core it waited past 3 s for the CPU (the sweep's flake, reproduced with
+#: the cores busy); each wait ends as soon as the models are gone.
+UNLOAD_WAIT_S = 60.0
+
+
 def test_models_are_let_go_after_the_quiet_time_unless_held_or_kept() -> None:
     from yuki.voice.local_models import LocalSpeech
 
@@ -332,7 +338,7 @@ def test_models_are_let_go_after_the_quiet_time_unless_held_or_kept() -> None:
     time.sleep(0.5)
     assert eng.loaded()["parakeet"]          # still held by the other conversation
     eng.release()
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + UNLOAD_WAIT_S
     while eng.loaded()["parakeet"] and time.monotonic() < deadline:
         time.sleep(0.05)
     assert not eng.loaded()["parakeet"]
@@ -345,7 +351,7 @@ def test_models_are_let_go_after_the_quiet_time_unless_held_or_kept() -> None:
     assert kept.loaded()["parakeet"]
     # review F2: turning "keep it loaded" off with no conversation on lets them go after the quiet time
     kept.configure(keep_loaded=False, unload_s=0.2)
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + UNLOAD_WAIT_S
     while kept.loaded()["parakeet"] and time.monotonic() < deadline:
         time.sleep(0.05)
     assert not kept.loaded()["parakeet"]
@@ -405,15 +411,22 @@ def _audio_frames(pcm: np.ndarray, ms: int = 20) -> list[Any]:
 
 
 @needs_lab
-def test_parakeet_ends_a_turn_once_with_one_transcript_like_flux(tmp_path: Path) -> None:
+def test_parakeet_ends_a_turn_once_with_one_transcript_like_flux(tmp_path: Path,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
     import soundfile as sf
     from pipecat.frames.frames import (
         ProposedUserStartedSpeakingFrame, ProposedUserStoppedSpeakingFrame, TranscriptionFrame,
     )
     from pipecat.tests.utils import SleepFrame
 
+    from yuki.voice import local_models
     from yuki.voice.local_models import LocalSpeech
     from yuki.voice.local_stt import ParakeetSTTService
+
+    # r31: the decode runs at normal priority here, so the sweep's other test files busy on every core never starve it
+    # past this test's windows (with the cores busy, below normal took 6.5 min); the priority itself is
+    # test_decoding_and_synthesis_run_below_normal_priority's
+    monkeypatch.setattr(local_models, "_below_normal_thread", lambda: None)
 
     pcm, rate = sf.read(str(PARAKEET_WAV), dtype="int16")
     assert rate == 16_000

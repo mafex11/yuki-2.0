@@ -241,6 +241,35 @@ def pytest_unconfigure(config: pytest.Config) -> None:
         _RUN_CLOCK.pop()[0].undo()
 
 
+#: The skill engine's process-RAM memories of the last moments (``yuki.skills.engine``): x5Fallback's recent
+#: hand-offs, the exchange's run traces, the guessed values and the form slips, each with its lock. They are kept by
+#: real ``time.monotonic`` for a minute or two, so without a reset one test's unconfirmed run sent the next test's same
+#: skill and values straight to the thinker ("handed_over", r31 sweep: sCore_engine, sVoice_hands).
+_SKILL_RAM = (("_RECENT_HANDOFFS", "_recent_lock"), ("_TRACES", "_trace_lock"), ("_GUESSES", "_guess_lock"),
+              ("_form_slips", "_form_lock"))
+
+
+def _clear_skill_ram() -> None:
+    engine = _sys.modules.get("yuki.skills.engine")
+    if engine is None:
+        return
+    for name, lock_name in _SKILL_RAM:
+        held = getattr(engine, name, None)
+        lock = getattr(engine, lock_name, None)
+        if held is None or lock is None:
+            continue
+        with lock:
+            held.clear()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_skill_ram():
+    """Every test starts with none of another test's recent skill runs (:data:`_SKILL_RAM`)."""
+    _clear_skill_ram()
+    yield
+    _clear_skill_ram()
+
+
 @pytest.fixture(autouse=True)
 def _no_live_game_check(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
     """fGate (D17, review r2 L8): the input backstop reads the live foreground window's program and the window under
@@ -251,6 +280,11 @@ def _no_live_game_check(request: pytest.FixtureRequest, monkeypatch: pytest.Monk
 
     monkeypatch.setattr(gamegate, "_front_source", None)
     monkeypatch.setattr(gamegate, "_refusal_listeners", [])
+    # r31: the hands' gate (yuki.actions.gate) adds its listener to that list once per process; with the list fresh for
+    # each test it must add it again, or every later game refusal is tagged "blocked" instead of "game"
+    hands_gate = _sys.modules.get("yuki.actions.gate")
+    if hands_gate is not None:
+        monkeypatch.setattr(hands_gate, "_installed", False)
     if getattr(request.module, "LIVE_GAMEGATE", False):
         yield
         return

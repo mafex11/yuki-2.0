@@ -181,7 +181,9 @@ def test_sessions_fold_short_hops_into_the_session(store):
 def test_the_day_begins_when_they_sat_down(store):
     from yuki.memory.api import MemoryClient
 
-    present(store, at("20:00", -1), at("05:00"))
+    # r31: a day break is at least checkins.DAY_BREAK_S (5 h) or the user's resume_after_h, the larger
+    # (younow.day_began_from, the one rule the record, the check-ins and the cards share): a night that ended at 03:00
+    present(store, at("20:00", -1), at("03:00"))
     present(store, at("08:56"), at("12:31"))
     line = MemoryClient(store).day_context(now=at("12:31"))
     assert "08:56" in line and "not since midnight" in line

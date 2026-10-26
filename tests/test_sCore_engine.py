@@ -48,6 +48,9 @@ def _no_live_verbs_or_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     from yuki.memory import gamegate
 
     monkeypatch.setattr(gamegate, "game_in_front", lambda: "")
+    # r31: nor the desk's front (C1's measure, ``RunContext.front`` None = the live read of this PC's windows): a front
+    # that can't be read leaves each rung's focus to its route's declaration (``_Measure.fold``), the same on any PC
+    monkeypatch.setattr(engine_mod, "front_now", lambda: None)
 
 
 @pytest.fixture()
@@ -142,8 +145,11 @@ def test_a_rung_that_cannot_run_passes_to_the_next_and_done_only_on_a_seen_resul
     assert len(rows) == 1                                                  # one ledger row per run
     final = rows[0]
     assert (final["outcome"], final["checked"], final["rung"], final["recheck"]) == ("done", 1, "B", None)
-    tried = [dict(r) for r in client.store._query("SELECT * FROM skill_route_tries")]
-    assert [(r["rung"], r["checked"], r["run_key"]) for r in tried] == [("A", None, final["run_key"])]
+    tried = [dict(r) for r in client.store._query("SELECT * FROM skill_route_tries ORDER BY id")]
+    # kHands brief item 6 (engine.py, the done branch's _ledger_try): every rung tried is a try row, the last one too
+    # (the counters leave the run's last rung out of that table: registry.TRY_NOT_LAST)
+    assert [(r["rung"], r["checked"], r["run_key"]) for r in tried] == [("A", None, final["run_key"]),
+                                                                        ("B", 1, final["run_key"])]
 
 
 def test_a_check_that_couldnt_read_after_acting_says_so_and_stops_the_ladder(client, demo) -> None:
@@ -152,8 +158,12 @@ def test_a_check_that_couldnt_read_after_acting_says_so_and_stops_the_ladder(cli
     invoke, steps = Verb(), Verb()
     plan = _plan(client, demo, "demo.volume", {"level": 40}, ["Demo Player to 40"])
     for _ in range(6):
-        res = E.run(plan, _ctx(client, verbs={"uia_invoke": invoke, "uia_steps": steps},
-                               probes={"level": Probe(None)}))
+        # a card's run: since x5Fallback (engine.py, ``waited.verdict is None``) the voice's and the thinker's
+        # unconfirmed run hands over to rung C, and the same values again go there at once (``_recent_handoff``); a
+        # card (and an eval) still stops at "couldn't confirm"
+        ctx = _ctx(client, verbs={"uia_invoke": invoke, "uia_steps": steps}, probes={"level": Probe(None)},
+                   origin="card")
+        res = E.run(plan, ctx)
         assert res.outcome == "unverified" and not res.done and res.say == E.LINE_UNVERIFIED
     assert steps.calls == []                                               # never done twice
     t = R.trust(client.store, vol.key)[vol.routes[0].key]
@@ -423,7 +433,8 @@ def test_the_pinned_skill_is_small_and_carries_a_machine_check(demo) -> None:
     from yuki.agent.frame import PINNED_CHARS, pinned_lines
 
     lines = pinned_lines(pin)
-    assert lines[0].startswith("The user's usual way to do this (skill demo.volume)")
+    # frame.PINNED_HEAD since the fallback engine's review r1 (12 Oct): what to do now comes first
+    assert lines[0].startswith("The user's usual way (skill demo.volume) handed this over.")
     assert sum(len(x) + 1 for x in lines) <= PINNED_CHARS
 
 
@@ -661,6 +672,8 @@ def test_a_rung_whose_data_says_no_retry_after_acting_stops_too(tmp_path: Path) 
         client.close()
 
 
+# r31: a join through a chat app's voice channel, as the shipped one is (D24, engine.COMMIT_BY_NEED: "words", the
+# user's own "join X"); a bare call_join is the user's own step (``user``) and is refused before any rung runs
 VOICE = """
 [connection]
 app = "inventedvoice"
@@ -670,6 +683,9 @@ end = "call_join"
 kind = "change"
 menu = "join the invented voice room"
 done_line = "You're in."
+commit = "words"
+handoff = true
+serves = [{ end = "call_join", target = "call", needs = "chat_voice" }]
 
 [[capability."invented.join".route]]
 rung = "A"
@@ -704,7 +720,11 @@ def test_mic_held_needs_an_onset_after_the_run_began(tmp_path: Path, monkeypatch
         plan = resolve("invented.join", {}, ["join"], store=client.store, loaded=loaded, live=Live())
         reads = _mic_script(monkeypatch, True)                     # held before, still held
         res = E.run(plan, _ctx(client, verbs={"uia_invoke": Verb()}))
-        assert res.outcome == "unverified" and not res.done and reads[0] is True
+        # not this run's doing, so never done; since x5Fallback (engine.py, ``waited.verdict is None``) the voice's
+        # unconfirmed run hands over to rung C rather than stopping at "couldn't confirm"
+        assert res.outcome == "handed_over" and not res.done and reads[0] is True
+        with E._recent_lock:
+            E._RECENT_HANDOFFS.clear()                             # a later moment: no repeat of that hand-off
         _mic_script(monkeypatch, False, True)                      # taken after the run began
         res = E.run(plan, _ctx(client, verbs={"uia_invoke": Verb()}))
         assert res.outcome == "done" and res.done
@@ -855,9 +875,10 @@ def test_a_check_after_a_slow_earlier_rung_still_gets_its_own_time(client, demo)
 
 def test_a_correction_or_the_same_values_again_marks_the_last_done_false(client, demo,
                                                                          monkeypatch: pytest.MonkeyPatch) -> None:
-    """Review r2 M2 (D19): through resolve_and_run, for the voice and the thinker: the talker's ``corrects`` flag, or
-    the same skill with the same absolute values within 60 s of a done, marks that done false (recheck 0) and logs
-    it; ``again`` and other values don't."""
+    """Review r2 M2 (D19): through resolve_and_run, for the voice and the thinker: the same skill with the same absolute
+    values within 60 s of a done, as a repeat or with the talker's ``corrects`` flag, marks that done false (recheck 0)
+    and logs it; ``again`` and other values don't (fSkills review M1), nor a repeat of a done whose second probe
+    agreed (skill19 RC1)."""
     from types import SimpleNamespace
 
     from yuki.skills import donecheck
@@ -866,8 +887,9 @@ def test_a_correction_or_the_same_values_again_marks_the_last_done_false(client,
     C.clear_cache()
     log: list = []
 
-    def go(slots: dict, **kw: Any) -> E.SkillResult:
+    def go(slots: dict, recheck: str = "inline", **kw: Any) -> E.SkillResult:
         ctx = _ctx(client, verbs={"uia_invoke": Verb()}, probes={"level": Probe(True)}, log=log)
+        ctx.recheck = recheck
         return E.resolve_and_run("demo.volume", slots, ["invented words"], ctx, live=Live(), **kw)
 
     def rechecks() -> list:
@@ -877,25 +899,41 @@ def test_a_correction_or_the_same_values_again_marks_the_last_done_false(client,
     assert go({"level": 30}).done
     assert rechecks() == [1, 1]                                  # other values: nothing marked
     assert go({"level": 30}).done                                # the same values again within 60 s
-    assert rechecks() == [1, 0, 1]
+    # skill19 (live 19 Oct, RC1; registry.false_done_after): a repeat that is no correction never marks a run whose
+    # second probe agreed (the end state held after the done)
+    assert rechecks() == [1, 1, 1]
+    assert go({"level": 35}, recheck="off").done                 # a done no second probe confirmed
+    assert go({"level": 35}).done                                # the same values again within 60 s
+    assert rechecks() == [1, 1, 1, 0, 1]
     marks = [f for e, f in log if e == "done_recheck" and f.get("result") == "false_done"]
     assert len(marks) == 1 and marks[0]["reason"] == "repeat" and marks[0]["recheck"] == "user"
-    assert go({"level": 30}, again=True).done                    # "again" is a further change, never a correction
-    assert rechecks() == [1, 0, 1, 1]
-    # the voice's correction flag marks the newest done whatever the values
+    assert go({"level": 35}, again=True).done                    # "again" is a further change, never a correction
+    assert rechecks() == [1, 1, 1, 0, 1, 1]
+    # the voice's correction flag: fSkills review M1 (engine._note_false_done) charges only the same ask redone; a
+    # correction with other values says the value was wrong, never the rung that put it on
     monkeypatch.setitem(E.VERB_FUNCS, "uia_invoke", Verb())
     monkeypatch.setitem(donecheck.PROBE_FUNCS, "level", Probe(True))
-    ok, _r, facts = E.run_for_voice(SimpleNamespace(memory=client), {"skill": "demo.volume", "slots": {"level": 25},
-                                                                     "corrects": True}, ["no, twenty five"], game="",
-                                    log=lambda event, **f: log.append((event, f)))
-    assert ok and facts["corrects"] is True
-    assert rechecks()[:4] == [1, 0, 1, 0]
+
+    def voice(level: int) -> dict:
+        ok, _r, facts = E.run_for_voice(SimpleNamespace(memory=client), {"skill": "demo.volume",
+                                                                         "slots": {"level": level}, "corrects": True},
+                                        ["no, the other level"], game="", log=lambda event, **f: log.append((event, f)))
+        assert ok and facts["corrects"] is True
+        return facts
+
+    voice(25)
+    assert rechecks()[:6] == [1, 1, 1, 0, 1, 1]                  # other values: nothing marked
+    assert go({"level": 45}, recheck="off").done
+    voice(45)                                                    # the same values: the done before it was false
+    assert rechecks()[7] == 0
     assert [f["reason"] for e, f in log if e == "done_recheck" and f.get("result") == "false_done"] == \
         ["repeat", "correction"]
     # the thinker's flag too (its run then hands over: the stand-in verbs can't run)
+    assert go({"level": 20}, recheck="off").done
+    n = len(rechecks())
     E.run_for_thinker({"skill": "demo.volume", "slots": {"level": 20}, "corrects": True}, ["twenty"], memory=client,
                       game=lambda: "")
-    assert rechecks()[4] == 0
+    assert rechecks()[n - 1] == 0
     # a relative change asked twice is never a repeat of the same values
     amp = SimpleNamespace(slots=(C.Slot(name="level", type="number"), C.Slot(name="change", type="points")))
     assert E._absolute_values(amp, {"level": None, "change": -10.0}) is None

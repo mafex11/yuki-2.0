@@ -259,7 +259,8 @@ async function inPage(F) {
     ['work', '#work', 'work', (d) => { Object.assign(d.todos.open[0], { text: 'Invented to-do, renamed', title: null }); return 'Invented to-do, renamed'; }],
     ['day', '#work/day', 'day', (d) => { d.totals[0][1] = '9h 99m'; return '9h 99m'; }],
     ['me', '#me', 'me', (d) => { d.rules[0].text = 'Invented rule, said again.'; return 'Invented rule, said again.'; }],
-    ['playbook', '#playbook', 'playbook', (d) => { d.lessons[0].dont = 'Invented lesson, updated'; return 'Invented lesson, updated'; }],
+    // r31: the Playbook no longer shows lessons (audit 17 Oct, learning.md 9.4); a standing rule is what it shows
+    ['playbook', '#playbook', 'playbook', (d) => { d.rules[0].text = 'Invented rule, kept on the Playbook.'; return 'Invented rule, kept on the Playbook.'; }],
     ['activity', '#activity', 'activity', (d) => { d.groups[0].outcome = 'Invented outcome'; return 'Invented outcome'; }],
     ['settings', '#settings', 'settings', (d) => { d.voice.end_tone = !d.voice.end_tone; return null; }],
   ];
@@ -598,25 +599,17 @@ async function inPage(F) {
     check('W8 nothing in the Calls tab overflows sideways', crs.every((r) => r.scrollWidth <= r.clientWidth + 1) && main().scrollWidth <= main().clientWidth + 1);
     withLines.querySelector('.fx-h').click(); await sleep(60);
   }
-  // ---- W7 (4 Oct): the Playbook - numbered steps per goal, app choices in plain words, lessons folded, two balanced
-  // columns under the procedures ----
+  // ---- W7 (4 Oct; r31: the Playbook since the audit of 17 Oct and 21 Oct, learning.md 9.4, pages/playbook.js): what
+  // Yuki can do, your routines, your standing rules, your own ways; the old practice sections (procedures with
+  // numbered steps, lessons, app choices) are gone, and none of the user's own things is listed ----
   await go('#playbook'); await sleep(500);
-  const pc = main().querySelector('.proc2');
-  check('W7 a procedure is a title and its steps numbered 1, 2, 3', !!pc && !!pc.querySelector('h4') && pc.querySelectorAll('.nsteps li').length >= 2
-    && Array.from(pc.querySelectorAll('.nsteps .n')).map((n) => n.textContent).join(',').startsWith('1,2'));
-  const lsn = Array.from(main().querySelectorAll('.lesson2'));
-  check('W7 lessons are a short title and one line, folded', lsn.length > 0 && lsn.every((l) => !l.classList.contains('open') && !!l.querySelector('.fx-h .lt')
-    && l.querySelector('.fx-h').getBoundingClientRect().height < 72), lsn.map((l) => Math.round(l.querySelector('.fx-h').getBoundingClientRect().height)).join(','));
-  if (lsn[0]) {
-    lsn[0].querySelector('.fx-h').click(); await sleep(80);
-    const ln = lsn[0].querySelector('.fx-h .ln');
-    check('W7 a lesson opens to its details, its one line not said twice', lsn[0].classList.contains('open') && !!lsn[0].querySelector('.fx-d .d') && (!ln || getComputedStyle(ln).display === 'none'));
-    lsn[0].querySelector('.fx-h').click(); await sleep(40);
-  }
-  const chTxt = Array.from(main().querySelectorAll('.choice')).map((c) => c.textContent).join(' | ');
-  check('W7 app choices say the choice plainly, never counts', chTxt.includes('usually') && !/\d+(\.\d+)?\s*(min|minutes|visits)\b/.test(chTxt), chTxt.slice(0, 160));
-  const pbCols = Array.from(main().querySelectorAll('.pb-grid > .col')).map((c) => c.getBoundingClientRect().height);
-  check('W7 the two columns under the procedures are about as tall', pbCols.length === 2 && Math.min(...pbCols) >= 0.6 * Math.max(...pbCols), pbCols.map(Math.round).join(' vs '));
+  const pbKeys = Array.from(main().querySelectorAll('[data-k]')).map((e) => e.dataset.k);
+  check('W7 the Playbook is what Yuki can do, your routines, your standing rules and your own ways',
+    ['can', 'routines', 'rules', 'ways'].every((k) => pbKeys.includes(k)), pbKeys.join(','));
+  check('W7 no procedure steps or lesson rows: those sections are gone', !main().querySelector('.nsteps, .lesson2'));
+  const pbRules = Array.from(main().querySelectorAll('[data-k="rules"] .rule'));
+  check('W7 each standing rule is a numbered row with its own Forget or Stop', pbRules.length > 0
+    && pbRules.every((r) => !!r.querySelector('.doto') && !!r.querySelector('[data-do="rule-forget"]')), String(pbRules.length));
   // ---- W10 (4 Oct): Settings -> quiet hours: a switch, from-to times, what they do in plain words ----
   await go('#settings'); await sleep(500);
   const qrow = () => main().querySelector('[data-k="quiet"]');

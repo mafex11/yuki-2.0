@@ -33,8 +33,23 @@ def qapp():
     L.REDUCED_OVERRIDE[0] = None
 
 
+#: r31: one clock reading per test, taken at its first status. The island keys its "what is kept" notice on the call
+#: session's start (``Island._call_changed``), so the same session must keep the same start: a status built again 0.5 s
+#: later read as a new session whenever the second ticked over in between (the sweep's flaky notice).
+_NOW: list[datetime] = []
+
+
+@pytest.fixture(autouse=True)
+def _one_clock_reading():
+    _NOW.clear()
+    yield
+    _NOW.clear()
+
+
 def _iso(minutes_ago: float) -> str:
-    return (datetime.now().astimezone() - timedelta(minutes=minutes_ago)).isoformat(timespec="seconds")
+    if not _NOW:
+        _NOW.append(datetime.now().astimezone())
+    return (_NOW[0] - timedelta(minutes=minutes_ago)).isoformat(timespec="seconds")
 
 
 def _row(row_id: int, app: str, kind: str, status: str = "recording", **extra) -> dict:

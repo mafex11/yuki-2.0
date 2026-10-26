@@ -354,16 +354,22 @@ def test_the_engine_writes_the_hand_id_beside_the_turn() -> None:
 # =====================================================================================================================
 
 
-def test_the_router_gets_a_skills_line_without_slots_or_names() -> None:
+def test_the_router_gets_a_skills_line_without_slots_or_names(monkeypatch: pytest.MonkeyPatch) -> None:
     from yuki.skills.menu import menu_text
+    from yuki.voice import router
     from yuki.voice.router import ROUTER_PROMPT, SKILLS_CHARS, router_request, skills_line
 
     menu = menu_text(None, audience="talker")
     line = skills_line(menu)
-    keys = re.findall(r"^- ([^:]+):", line, flags=re.M)
-    # r30: nine capabilities' lines outgrow SKILLS_CHARS, so the line keeps the first whole ones (menu order)
-    assert keys and set(keys) <= SHIPPED_SKILLS and "[" not in line and len(line) <= SKILLS_CHARS
-    assert keys == [k for k in re.findall(r"^- ([^:]+):", menu, flags=re.M) if k in SHIPPED_SKILLS][:len(keys)]
+    keys = re.findall(r"^- ([^:\n]+)", line, flags=re.M)
+    # r31: every capability of the menu is on the line, in menu order (each cut to its purpose; r30's whole heads
+    # outgrew SKILLS_CHARS and the last three were dropped)
+    assert set(keys) == SHIPPED_SKILLS and "[" not in line and "(" not in line and len(line) <= SKILLS_CHARS
+    assert keys == re.findall(r"^- ([^:]+):", menu, flags=re.M)
+    # a menu that outgrows the cut keeps every key: the last skills by their key alone
+    monkeypatch.setattr(router, "SKILLS_CHARS", 200)
+    short = skills_line(menu)
+    assert re.findall(r"^- ([^:\n]+)", short, flags=re.M) == keys and len(short) <= 200
     content = router_request("play my focus playlist", skills=menu)["messages"][0]["content"]
     assert content.startswith("[Skills line") and content.endswith('Their words now: "play my focus playlist"')
     assert "Skills line" not in router_request("hi")["messages"][0]["content"]
@@ -448,7 +454,9 @@ def test_a_stand_in_desk_never_reads_the_users_real_act_switches(tmp_path: Path,
     assert pressed and reads == []
     pressed.clear()
     d.backend = T._LazyRealBackend.__new__(T._LazyRealBackend)          # the real desk (never started here)
-    out = d._do_run_skill({"skill": "demo.volume", "slots": {"level": 40, "control": "in_app"}})
+    # another level: the first run acted unconfirmed (no probe here), so the same values again within 120 s go
+    # straight to the thinker without a rung (x5Fallback, engine._recent_handoff)
+    out = d._do_run_skill({"skill": "demo.volume", "slots": {"level": 45, "control": "in_app"}})
     assert not pressed and reads and out.payload["refused"] == "act_off"
     client.close()
     own = _Policy(set())

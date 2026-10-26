@@ -132,22 +132,34 @@ class Route:
 SKILLS_CHARS = 700
 
 
+def _purpose(head: str) -> str:
+    """A menu line's head (``- <key>: <what it does>``) cut to its purpose: what it does up to its first aside or
+    detail (`` (`` or ``; ``, our own menu format), which is all the router needs to tell the talker's ask from the
+    thinker's."""
+    key, _, what = head.partition(": ")
+    what = what.split(" (", 1)[0].split("; ", 1)[0].strip()
+    return f"{key}: {what}" if what else key
+
+
 def skills_line(menu: str | None) -> str:
     """The Skills line from the talker's Skills menu (:func:`yuki.skills.menu.skill_line`'s ``- <key>: <what it
-    does> [slots]`` lines, our own format): each line up to its first slot, cut to :data:`SKILLS_CHARS` at a line.
-    ``""`` without a menu (sVoice r2 L2, sWire: the router knows what the talker's ``run_skill`` covers)."""
-    out: list[str] = []
-    size = 0
-    for line in str(menu or "").splitlines():
-        line = line.strip()
-        if not (line.startswith("- ") and ":" in line):
-            continue
-        head = line.split(" [", 1)[0]
-        if size + len(head) + 1 > SKILLS_CHARS:
-            break
-        out.append(head)
-        size += len(head) + 1
-    return "\n".join(out)
+    does> [slots]`` lines, our own format): each skill's key and its purpose (:func:`_purpose`), in menu order, within
+    :data:`SKILLS_CHARS`. When they don't all fit, the last skills keep their key alone, so the router knows every skill
+    the talker's ``run_skill`` covers (r31: the whole heads of nine capabilities outgrew the cut and the last three were
+    dropped); only keys that don't fit even alone are left out. ``""`` without a menu (sVoice r2 L2, sWire)."""
+    heads = [_purpose(line.strip().split(" [", 1)[0]) for line in str(menu or "").splitlines()
+             if line.strip().startswith("- ") and ":" in line]
+
+    def size(lines: list[str]) -> int:
+        return sum(len(x) + 1 for x in lines)
+
+    i = len(heads) - 1
+    while size(heads) > SKILLS_CHARS and i >= 0:
+        heads[i] = heads[i].split(": ", 1)[0]
+        i -= 1
+    while heads and size(heads) > SKILLS_CHARS:
+        heads.pop()
+    return "\n".join(heads)
 
 
 #: D1: the measured facts the router is told as one line each (the pipeline's, never the words'): the words were said

@@ -214,13 +214,19 @@ def test_done_line_is_said_by_code_only_when_the_check_saw_it(rig: Any, monkeypa
     assert [tuple(r) for r in rows] == [("done", 1, "s-test-1")]
 
 
-def test_couldnt_confirm_is_said_plainly_and_never_done(rig: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_couldnt_confirm_is_never_done_and_goes_to_the_thinker(rig: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """r31: since x5Fallback (engine.py, ``waited.verdict is None``) a voice run that acted and couldn't be confirmed is
+    handed to the thinker with the skill pinned (it looks at the screen and finishes by steps), never said as done and
+    never counted against the rung (``checked`` NULL)."""
     monkeypatch.setitem(E.VERB_FUNCS, "app_volume", Verb(E.RouteResult(ran=True, outcome="set")))   # no read-back
     monkeypatch.setitem(donecheck.PROBE_FUNCS, "level", _level_probe(None))
     params = _run(rig.hands, {"say_first": "", "skill": "demo.volume", "slots": {"level": 40, "control": "mixer"}})
-    assert params.said == [E.LINE_UNVERIFIED]
     assert "Demo Player at 40%" not in " ".join(params.said)
-    assert rig.client.store._query("SELECT outcome, checked FROM skill_runs")[0][0] == "unverified"
+    assert rig.bridge.escalated and rig.bridge.escalated[0]["skill"]["key"] == "demo.volume"
+    result, _props = params.results[-1]
+    assert result.get("passed_on") is True and not params.said
+    assert [tuple(r) for r in rig.client.store._query("SELECT outcome, checked FROM skill_runs")] == \
+        [("handed_over", None)]
 
 
 def test_done_said_implies_the_check_returned_true_over_random_outcomes(rig: Any,
@@ -338,7 +344,9 @@ def test_a_correction_naming_another_option_updates_the_preference_not_a_lesson(
     assert events == [("in_app", "corrected"), ("mixer", "rejected")]
     assert params.said[0].endswith("Keep this as your usual?")
     marked = rig.client.store._query("SELECT count(*) FROM skill_runs WHERE recheck = 0")[0][0]
-    assert marked == 1                               # D19: the corrected run is a false done in the ledger
+    # fSkills review M1 (engine._note_false_done): a correction naming another value says the value was wrong, never
+    # the rung that put it on, so no run is a false done; the preference events above are its feedback
+    assert marked == 0
     assert rig.client.store._query("SELECT count(*) FROM playbooks")[0][0] == 0   # no text pitfall anywhere
 
 
@@ -383,7 +391,9 @@ def test_a_skill_that_sends_or_joins_a_call_passes_yukis_own_check_first(rig: An
             return SimpleNamespace(key=key, app=got.app, end="call_join", sends=False, sends_when=()) if got else None
 
     monkeypatch.setattr(C, "sends_with", lambda skill, values, partial=False: False)
-    monkeypatch.setattr(C, "load", lambda dirs=None: Joined())
+    from yuki.skills import catalog
+
+    monkeypatch.setattr(catalog, "load", lambda *a, **k: Joined())   # the hands read the catalog (lSplit, phase L)
     asked.clear()
     params = _run(rig.hands, {"say_first": "", "skill": "demo.home", "slots": {}})
     assert asked and asked[0][3] is True and not uri.calls
@@ -506,8 +516,9 @@ def test_keep_usual_without_an_answer_in_time_is_worded_as_unsure(rig: Any, monk
 def test_a_resolve_memory_doesnt_answer_in_time_refuses_the_run_and_no_hand_moves(
         rig: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """Review r2 M3 (the reviewer's test_r2_memslow.py): the usual is the mixer and memory doesn't answer the resolve
-    in time: nothing runs (neither the in-app rung the data defaults to nor the mixer), no ledger row, the plain line is
-    said by code, nothing goes to the thinker. The voice waits longer than the engine's own 1 s for this one call."""
+    in time: nothing runs (neither the in-app rung the data defaults to nor the mixer) and no ledger row. The voice
+    waits longer than the engine's own 1 s for this one call. r31: since x3 (fix-plan 3c, ``Hands._skill_fallback``)
+    the engine's refusal for memory slow falls back to the thinker by code, with nothing said."""
     P.record(rig.client.store, "demo.volume:control", "mixer", "confirmed")
     orig = rig.mem.call
     waits: list[float] = []
@@ -528,12 +539,12 @@ def test_a_resolve_memory_doesnt_answer_in_time_refuses_the_run_and_no_hand_move
     rig.hands.words = lambda: ["set demo player to 40"]
     params = _run(rig.hands, {"say_first": "", "skill": "demo.volume", "slots": {"level": 40}})
     assert not slider.calls and not mixer.calls
-    assert params.said == [H.MEMORY_SLOW_LINE]
     assert waits == [H.SKILL_RESOLVE_WAIT_S] and H.SKILL_RESOLVE_WAIT_S > 1.0
     assert rig.client.store._query("SELECT count(*) FROM skill_runs")[0][0] == 0
-    assert rig.bridge.escalated == [] and rig.hands.trouble_at == trouble and rig.hands.last_skill is None
-    result, props = params.results[-1]
-    assert result["said"] == H.MEMORY_SLOW_LINE and props.run_llm is False
+    assert len(rig.bridge.escalated) == 1 and params.said == [] and rig.hands.last_skill is None
+    assert rig.hands.trouble_at == trouble
+    result, _props = params.results[-1]
+    assert result.get("passed_on") is True and not result.get("said")
     # memory answering again: the confirmed usual decides (the mixer), as the user set it
     rig.mem.call = orig
     params = _run(rig.hands, {"say_first": "", "skill": "demo.volume", "slots": {"level": 40}})

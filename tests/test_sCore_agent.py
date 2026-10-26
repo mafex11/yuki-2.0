@@ -300,7 +300,8 @@ def test_the_thinkers_run_skill_returns_a_checked_outcome_and_pins_a_hand_off(mo
         monkeypatch.setitem(E.VERB_FUNCS, "uia_invoke", lambda call: E.RouteResult(ran=False, outcome="missing"))
         out = d.dispatch("run_skill", {"skill": "demo.volume", "slots": {"level": 40}})
         assert out.ok and out.payload["outcome"] == "handed_over" and out.payload["handoff"]["key"] == "demo.volume"
-        assert "The user's usual way to do this (skill demo.volume)" in out.content[0]["text"]
+        # frame.PINNED_HEAD since the fallback engine's review r1 (12 Oct)
+        assert "The user's usual way (skill demo.volume) handed this over." in out.content[0]["text"]
         rows = client.store._query("SELECT count(*) FROM skill_runs WHERE origin = 'thinker'")
         assert rows[0][0] == 2
     finally:

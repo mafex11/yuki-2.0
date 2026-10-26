@@ -230,6 +230,7 @@ def test_a_routine_card_waits_behind_a_card_showing_and_asks_memory_before_it_sh
     memory = Memory({"routine_card_due": lambda nid: answers[nid]})
     ctl = _controller(memory)
     ctl.offer([dict(OTHER)])
+    _settle(qapp, ctl, rounds=5)   # since jSwitch (10 Oct) every card asks memory first, off the GUI thread
     assert ctl.showing is not None and ctl.showing["id"] == 90
     ctl.offer([{**CARD, "id": 80}])
     _settle(qapp, ctl, rounds=5)
