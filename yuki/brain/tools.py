@@ -425,16 +425,22 @@ def run_fetch(dispatcher: Any, tool_input: Mapping[str, Any], *, nonce: str) -> 
                    (time.perf_counter() - started) * 1000, private=inner == "read_file")
 
 
-#: final-H2 lane D2 (contract K-R, #8 m21_reversal_checkback): the kinds that keep a standing way Yuki acts (a rule, a
-#: way they do something), the ones a reversal is checked for. A correction, a dropped rule, a to-do, a watch, an
-#: answer and a usual are their own explicit acts: never held.
-REVERSAL_KINDS: frozenset[str] = frozenset({"rule", "how"})
+#: final-H2 lane D2 (contract K-R, #8 m21_reversal_checkback): the kinds that keep or end a standing way Yuki acts (a
+#: rule, a way they do something), the ones a reversal is checked for. r31 (L4 F6, final-I m21_reversal_checkback under
+#: one: a drop declared as turning around a kept rule, with no reason, was saved at once and ended a real standing rule
+#: of the user's): a dropped rule too, by the same declared fields (the model's own ``turns_around``; code enforces it).
+#: A correction, a to-do, a watch, an answer and a usual are their own explicit acts: never held.
+REVERSAL_KINDS: frozenset[str] = frozenset({"rule", "how", "forget_rule"})
 #: A held reversal waits this long (s) for the next remember of the same item after their answer; then it lapses.
 HOLD_S = 600.0
 #: The held result: nothing was saved; the agent asks first, and the next remember of the item saves it.
 LINE_ASK_FIRST = ("Not saved yet: this turns around what was kept before ({around}), and their words gave no reason. "
                   "Ask first: one short question naming both. When they answer yes, remember it again with their "
                   "answer as their_reason: that saves it.")
+#: r31 (L4 F6): the same hold for a drop (``forget_rule``): nothing was dropped.
+LINE_ASK_FIRST_DROP = ("Not dropped: this turns around what was kept before ({around}), and their words gave no "
+                       "reason. Ask first: one short question naming both. When they answer yes, remember it again "
+                       "with their answer as their_reason: that drops it.")
 #: The held reversals of this process: ``{"at" (monotonic), "session", "words", "keys"}``, newest last.
 _HELD: list[dict[str, Any]] = []
 _HELD_LOCK = threading.Lock()
@@ -450,7 +456,8 @@ def _ident(value: Any) -> str:
 
 def reversal_hold(memory: Any, kind: str, args: Mapping[str, Any], *, words: str,
                   now: float | None = None) -> str | None:
-    """final-H2 lane D2 (contract K-R): the shared handler's check before a ``rule`` or ``how`` is kept. The model
+    """final-H2 lane D2 (contract K-R): the shared handler's check before a ``rule`` or ``how`` is kept (r31 F6: or a
+    ``forget_rule`` drops one; its held line says nothing was dropped, :data:`LINE_ASK_FIRST_DROP`). The model
     declares in two required fields whether what it keeps turns around something kept before (``turns_around``) and
     the reason their words gave (``their_reason``); code enforces it, as the commit check does with ``effect``.
 
@@ -479,15 +486,15 @@ def reversal_hold(memory: Any, kind: str, args: Mapping[str, Any], *, words: str
             _HELD.append({"at": at, "session": session, "words": said, "keys": keys})
         else:
             match["keys"] = match["keys"] | keys
-    return LINE_ASK_FIRST.format(around=around[:160])
+    return (LINE_ASK_FIRST_DROP if kind == "forget_rule" else LINE_ASK_FIRST).format(around=around[:160])
 
 
 def run_remember(memory: Any, tool_input: Mapping[str, Any], *, words: str) -> ToolRun:
     """``remember`` through the memory writes (their own quote checks read ``words``, the user's own words).
 
-    final-H2 lane D2 (K-R): a ``rule`` or ``how`` that turns around what was kept before with no reason from their
-    words is held, not saved (:func:`reversal_hold`); the result is not ok, its payload ``{"saved": False, "held":
-    "ask_first"}``. The planner and the ONE agent both come through here."""
+    final-H2 lane D2 (K-R): a ``rule``, ``how`` or (r31 F6) ``forget_rule`` that turns around what was kept before with
+    no reason from their words is held, not saved (:func:`reversal_hold`); the result is not ok, its payload
+    ``{"saved": False, "held": "ask_first"}``. The planner and the ONE agent both come through here."""
     started = time.perf_counter()
     args = _clean(tool_input)
     kind = str(args.pop("kind", "") or "")
@@ -594,4 +601,4 @@ __all__ = ["PLAN_DESCRIPTION", "LOOK_TOOL", "MEMORY_TOOL", "FETCH_TOOL", "ASK_US
            "LOOK_DISPATCH", "PRIVATE_READS", "ToolRun", "outcome_text", "run_look", "run_memory", "run_fetch",
            "run_remember", "run_knowhow", "HOW_ORIGIN", "BRAIN_LOOK_TOOL", "BRAIN_ASK_USER_TOOL", "BRAIN_FETCH_TOOL",
            "TURNS_AROUND_FIELD", "THEIR_REASON_FIELD", "REVERSAL_KINDS", "HOLD_S", "LINE_ASK_FIRST",
-           "reversal_hold", "USUAL_SOURCE"]
+           "LINE_ASK_FIRST_DROP", "reversal_hold", "USUAL_SOURCE"]

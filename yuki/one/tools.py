@@ -82,6 +82,7 @@ LOOK_KINDS: tuple[str, ...] = ("desktop", "window", "page", "tabs", "focus", APP
 _THEN = {"type": "string"}
 _DONE = {"type": "string"}
 _SAY_FIRST = {"type": "string"}
+_BOOL = {"type": "boolean"}
 _WINDOW = {"type": "integer", "description": "[hwnd]"}
 _ID = {"type": "integer", "description": "Or its [id] from look window."}
 
@@ -128,7 +129,7 @@ TAB_TOOL = _tool(
     "tab",
     "A browser's tabs in any of its windows. show (default): the tab named, its window forward. close: exactly the "
     "tabs named. new: a new tab (url: that address). reopen: the last closed (expect: its title). "
-    "named: their word for it (\"YouTube\"), never a title you read; app: only a browser they named.",
+    "named: their word for it (\"YouTube\"), never a title you read; app: as open_url's.",
     {"named": {"type": "string"},
      "app": {"type": "string"},
      "action": {"type": "string", "enum": list(TAB_ACTIONS)},
@@ -138,12 +139,18 @@ TAB_TOOL = _tool(
      "say_when_done": _DONE, "then": _THEN},
     ["then"])
 
+#: r31 (L4 B1, final-I kw_chrome_crashing_youtube: a browser named only as broken was read as no browser named, so
+#: code took the default one, the one their words ruled out): the browser is the one they want it in, the same
+#: sentence as the hands' open_url and the lean hands line (``voice.hands``, ``voice.mouth``); tab's ``app`` points
+#: here.
+_BROWSER = ("The browser they want it in: one they named for it, or, when their words rule one out (broken, closed, "
+            "not that one), their other browser; else leave it out (code opens their usual).")
 OPEN_URL_TOOL = _tool(
     "open_url",
-    "Open an address in a new tab of the browser they named or their usual (also a web search), or a Windows address "
-    "(ms-settings:bluetooth). Verified at the address.",
+    "Open an address in a new tab (also a web search), or a Windows address (ms-settings:bluetooth). Verified at the "
+    "address.",
     {"say_first": _SAY_FIRST, "url": {"type": "string", "description": "The full address."},
-     "app": {"type": "string", "description": "Optional browser."},
+     "app": {"type": "string", "description": _BROWSER},
      "say_when_done": _DONE, "then": _THEN},
     ["say_first", "url", "then"])
 
@@ -221,12 +228,14 @@ OPEN_YUKI_TOOL = _tool(
     {"page": {"type": "string", "enum": list(YUKI_PAGES)}, "say_when_done": _DONE, "then": _THEN},
     ["page", "then"])
 
-#: The send declaration on ``run_skill`` (design §4.1 row 5): a message goes out only with it; without it the gate
-#: leaves a draft (addendum must-fix 4).
+#: The send declaration on ``run_skill`` (design §4.1 row 5): a message goes out only with it. r31 (L4 F4, final-I
+#: p24_countdown_cancel under one: the optional field was left out, the gate drafted the send and nobody heard it):
+#: REQUIRED on every run_skill (an optional declaration is not always sent: the loop's lesson), every field ``""`` for
+#: anything that is not a send; a send with it empty is a fixable refusal once (``policy._skill``), the silent draft
+#: only the last net.
 CONSENT_FIELD = {
     "type": "object",
-    "description": "Only for a message they asked to send: to, text (the text slot's exact words), quote (their "
-                   "words asking for it). Without it: a draft.",
+    "description": "For a send: to, text (exactly the text slot), quote (their words asking for it); else each \"\".",
     "properties": {"to": {"type": "string"}, "text": {"type": "string"}, "quote": {"type": "string"}},
     "required": ["to", "text", "quote"],
 }
@@ -534,9 +543,12 @@ def run_skill_tool(skill_keys: Sequence[str]) -> dict[str, Any]:
     """``run_skill`` on the ONE agent: the talker's (``skills.menu.talker_tool``) with ``place``, the send
     declaration ``consent``, and a required ``then``."""
     base = talker_tool(list(skill_keys))
-    required = [r for r in base.get("required") or [] if r != "then"]
-    props = {**base["properties"], "slots": _SLOTS, "place": _PLACE, "consent": CONSENT_FIELD, "then": _THEN}
-    return _tool("run_skill", str(base["description"]), props, [*required, "then"])
+    required = [r for r in base.get("required") or [] if r not in ("then", "consent")]
+    # r31 (L4 F4/B1 room): ``again`` and ``corrects`` are explained once, in ONE's Skills paragraph (``one.prompt``:
+    # "Of its last run: again true ..., corrects true ..."), never again in the schema; ``consent`` is required
+    props = {**base["properties"], "again": _BOOL, "corrects": _BOOL, "slots": _SLOTS, "place": _PLACE,
+             "consent": CONSENT_FIELD, "then": _THEN}
+    return _tool("run_skill", str(base["description"]), props, [*required, "consent", "then"])
 
 
 def schemas(channel: str, skill_keys: Sequence[str] = (), volume_skill: bool | None = None) -> list[dict[str, Any]]:

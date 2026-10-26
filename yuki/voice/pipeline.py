@@ -536,6 +536,19 @@ def _stop_word(value: Any) -> str | None:
     return word if 0 < len(word) <= 32 and all(ch.islower() or ch == "_" for ch in word) else "other"
 
 
+def _ends_asking(text: Any) -> bool:
+    """r31 (L4 F5): whether Yuki's own heard words end as a question: the closing mark of their last sentence
+    (``narrator.asks``, as voice20 review L1 reads a spoken reply: punctuation of her own words, never the user's).
+    Never raises (unsure: no)."""
+    try:
+        from yuki.voice.narrator import asks, sentences
+
+        parts = sentences(strip_tags(str(text or "")))
+        return bool(parts) and asks(parts[-1])
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def own_words_after_user(context: Any) -> bool:
     """fc review H1: whether the context's newest messages after the user's newest message are only Yuki's own words
     (assistant messages with no calls: an early say_first heard, Pipecat's reply text; a stored thinking block,
@@ -2734,6 +2747,10 @@ class TurnObserver:
         #: V9: the last turn whose words left the speaker: ``{"written": all it wrote, "heard": what left the speaker}``
         #: (content, RAM only), for the speech channel's repeat guard.
         self.last_said: dict[str, str] | None = None
+        #: r31 (L4 F5): at the start of the user's speech, when Yuki's words last left the speaker (monotonic) and
+        #: whether those words ended as a question (their own closing mark, :func:`_ends_asking`): the end net reads it
+        #: (``Conversation._end_answers_question``). A stream fact; no words kept.
+        self.line_before_words: tuple[float, bool] = (0.0, False)
         #: vGame: ``(turn)``: the talker chose silence on a user turn (stay_quiet or a quiet marker); set by the
         #: conversation (in a game or a call that ends the conversation at once, silently).
         self.on_quiet_turn: Callable[[Any], None] | None = None
@@ -3225,6 +3242,9 @@ class TurnObserver:
         if isinstance(frame, UserStartedSpeakingFrame):
             self.user_speaking = True
             self._user_started_at = now
+            # r31 (L4 F5): the line of Yuki's these words follow, and whether it asked (punctuation of her own words)
+            said = self.last_said.get("heard") if isinstance(self.last_said, dict) else None
+            self.line_before_words = (float(self.words_heard_at or 0.0), _ends_asking(said))
             self.heard, self.heard_plain = None, False  # a new turn: the last one's doubts are not about these
             if self.bot_speaking and self.turn is not None:
                 self.turn.interrupted = True
@@ -4498,6 +4518,14 @@ ONE_FOLLOW_QUIET = ("Not quiet: their words follow your own line, and nothing ha
                     "words; only if they plainly spoke to someone else, stay_quiet again; if they signed off, "
                     "end_conversation with a word or two; if they sent you away, end_conversation with say_first \"\", "
                     "alone.")
+#: r31 (L4 F5 code net, both brains; final-I kw_not_now_answer under one: "not now", the answer to Yuki's own question,
+#: got end_conversation and the talk closed): an end_conversation on the user's words right after Yuki's own heard
+#: question (``Conversation._end_answers_question``: stream facts) is refused once with this; a second end on the same
+#: words goes through.
+END_ANSWERS_QUESTION = ("Not ended: their words answer the question you just asked (a no drops what it was for), and "
+                        "the talk stays open. If your words already answered them, stay_quiet; else answer in a few "
+                        "words. Only if they also said goodbye or sent you away: end_conversation again, say_first "
+                        "\"\".")
 
 
 def _code_word(why: str) -> dict[str, Any]:
@@ -4928,9 +4956,9 @@ class OneVoice:
         #: ... and the words mark of the turn whose end lets that line go (the turn their words began; for a line the
         #: runner gave on a changed result, the turn current when it came back).
         self._stop_mark: int | None = None
-        #: gc (final-G2 C7): the acts running through the runner now (call id -> when it began, monotonic), for code's
-        #: still-on-it line on a long act (``Conversation._hand_still_tick``).
-        self._acts: dict[str, float] = {}
+        #: gc (final-G2 C7): the acts running through the runner now (call id -> when it began, monotonic, and r31 F3:
+        #: the turn it runs for), for code's still-on-it line on a long act (``Conversation._hand_still_tick``).
+        self._acts: dict[str, tuple[float, Any]] = {}
 
     # -- plumbing ---------------------------------------------------------------------------------------------------
 
@@ -4967,9 +4995,22 @@ class OneVoice:
 
     def act_since(self) -> float | None:
         """gc (final-G2 C7): when the oldest act now running through the runner began (monotonic), ``None`` when none
-        runs. A stream fact."""
+        runs. A stream fact.
+
+        r31 (L4 F3, final-I Z6 under one: code's "Still on it." 9 s after the hard stop's own line): only the acts of
+        the turn now open count. An act of a turn that is over (the hard stop, a settle by code, their next words) is no
+        work they wait on: its late result settles silently. Each act keeps the turn it ran for, read here (a turn code
+        reopens for one more round counts its acts again), so the still line and its stale check
+        (``Conversation._hand_still_tick``, ``_still_stale``) see only the open turn."""
         try:
-            return min(self._acts.values()) if self._acts else None
+            turn = self.turn
+            if turn is None or self.over or not self._acts:
+                return None
+            budget = getattr(turn, "budget", None)
+            if budget is not None and getattr(budget, "closed", False):
+                return None
+            starts = [at for at, of in list(self._acts.values()) if of is turn]
+            return min(starts) if starts else None
         except Exception:  # noqa: BLE001
             return None
 
@@ -6294,7 +6335,8 @@ class OneVoice:
                     self._tried(group, call_id, name)
                     acting = one_kind(name) == "act" and turn is self.turn
                     if acting:
-                        self._acts[call_id] = time.monotonic()   # gc (C7): a long act gets code's still-on-it line
+                        # gc (C7): a long act gets code's still-on-it line, while its turn is open (r31 F3)
+                        self._acts[call_id] = (time.monotonic(), turn)
                     try:
                         # integ30 (lc merge note 1, F3): whether a later call of this reply is left, so a skill's
                         # question said by code never closes the turn over it (``Runner.run``'s ``last``)
@@ -6470,6 +6512,17 @@ class OneVoice:
                 await params.result_callback({"ok": True, "how_to_handle_it": ONE_LATE_NOTE},
                                              properties=FunctionCallResultProperties(run_llm=False))
                 return
+            if name == "end_conversation" and self._end_answers(group):
+                # r31 (L4 F5 code net): their words answer Yuki's own heard question ("not now" to "Who to?"): the
+                # end is refused once (stream facts, the conversation's own predicate shared with the talker); the
+                # agent runs again on the note, and a second end on the same words goes through
+                group.outcomes[call_id] = one_outcome(name, {}, {})
+                group.verdict = "model"
+                final["run_llm"] = True
+                self._log("end", refused="answers_question", round=self.rounds)
+                await params.result_callback(self.with_format({"not_ended": END_ANSWERS_QUESTION}),
+                                             properties=FunctionCallResultProperties(run_llm=True))
+                return
             unanswered = self._quiet_unanswered(group) if name == "stay_quiet" else ""
             if unanswered:
                 # final-B (one-voice RC F/O3): a read's answer is owed: the closing quiet of their turn whose only
@@ -6578,6 +6631,18 @@ class OneVoice:
             return ""
         self._quiet_refused = True
         return "read_unanswered"
+
+    def _end_answers(self, group: _OneReply) -> bool:
+        """r31 (L4 F5): whether this ``end_conversation`` of the current turn is refused once: the conversation's own
+        predicate (``Conversation._end_answers_question``: their words answer Yuki's own heard question), never for a
+        late reply of a closed turn (an end there always goes through). Never raises (unsure: the end stands)."""
+        try:
+            if group.turn is not self.turn or group.turn.budget.late():
+                return False
+            ask = getattr(self.c, "_end_answers_question", None)
+            return bool(callable(ask) and ask(via="one"))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _words_for_yuki(self) -> None:
         """integ30 (T1): a quiet refused on the user's words (``stopped_send``, ``follow_on``) marks the observer's open
@@ -7818,7 +7883,7 @@ class Conversation:
         if one is None:
             llm.register_function("more_of_result", self.bridge.more_of_result)
             llm.register_function("stay_quiet", self.bridge.stay_quiet)
-            llm.register_function("end_conversation", self.bridge.end_conversation)
+            llm.register_function("end_conversation", self._end_or_answer)   # r31 F5: the end net, then the bridge's
             llm.register_function("go_quiet", self.bridge.go_quiet)
         hands = getattr(self.bridge, "hands", None)
         if hands is not None:
@@ -10010,7 +10075,13 @@ class Conversation:
         tick). Measured facts only: the hands' busy count (``bridge.busy_tools``, when it rose above 0), the ONE
         runner's acts (``OneVoice.act_since``), the silence (:meth:`_quiet_for`). Never in a call or with a game in
         front (no step lines there), never while anything else waits for their words or has lines of its own (a send
-        counting down, a question asked, a held call, a voice task: :meth:`_words_awaited`). Logged content-free."""
+        counting down, a question asked, a held call, a voice task: :meth:`_words_awaited`). Logged content-free.
+
+        r31 (L4 F3): only for work of a turn still open. Under one, ``act_since`` counts the open turn's acts alone (the
+        hard stop closed the turn: its act running on is no work they wait on). The hands' count (``busy_tools``) is
+        already only live work: a talker hand's call that was cancelled, or whose skill run passed its own backstop,
+        gives its count back in its ``finally`` while any thread of it runs on, and an ended conversation is
+        ``dormant``."""
         now = time.monotonic()
         if int(getattr(self.bridge, "busy_tools", 0) or 0) > 0:
             if self._hand_since is None:
@@ -10046,7 +10117,9 @@ class Conversation:
         ``steps.line_stale`` matches a step line, by Yuki's own words, case and spacing aside) and no hand or act runs
         any more (``bridge.busy_tools`` is 0 and the ONE runner's ``act_since`` is ``None``): the outcome follows, so
         the line is dropped unheard (``tts_stale_dropped``). Asked by the player once per piece; answers once per line
-        sent. Measured states only; never raises (unsure: not stale)."""
+        sent. Measured states only; never raises (unsure: not stale). r31 (L4 F3): ``act_since`` counts only the open
+        turn's acts, so a line sent just before the hard stop closed the turn is dropped too (the stop's own line
+        follows)."""
         try:
             at = self._hand_still_at
             if at is None or " ".join(str(text or "").casefold().split()) != \
@@ -10415,6 +10488,58 @@ class Conversation:
         if getattr(self, "channel", "") == "marker":
             out[ONE_FORMAT_KEY] = MARKER_REMINDER
         return out
+
+    def _end_answers_question(self, *, via: str = "") -> bool:
+        """r31 (L4 F5 code net, both brains; final-I kw_not_now_answer under one, the release-30 regression: "not now",
+        the answer to Yuki's own "Who to?", got end_conversation and the talk closed): whether this end_conversation is
+        refused once. Their words answer Yuki's own question: her last words that left the speaker before they began
+        speaking ended as a question (the observer's ``line_before_words``: the closing mark of her own words, never
+        theirs), and their words follow that line (:meth:`_follows_line`: begun within ``EXCHANGE_LIVE_S``, no other
+        words of theirs between, no call live, no game in front, no dictation). Once per utterance of theirs (its
+        measured start): a second end_conversation on the same words goes through ("no, not now, bye"). Marks their
+        turn's words as said to Yuki (as the quiet refusals do). Stream facts only; logged content-free. Never raises
+        (unsure: the end stands)."""
+        try:
+            obs = self.observer
+            at, asked = getattr(obs, "line_before_words", (0.0, False)) or (0.0, False)
+            if not asked:
+                return False
+            start = float(getattr(obs, "_user_started_at", 0.0) or 0.0)
+            if start <= 0.0 or getattr(self, "_end_refused_at", None) == start:
+                return False
+            if not self._follows_line(float(at or 0.0)):
+                return False
+            self._end_refused_at = start
+            turn = getattr(obs, "turn", None)
+            if turn is not None and getattr(turn, "trigger", None) == "user":
+                turn.quiet_refused = True   # integ30 (T1)'s mark: memory never files their words as said to others
+            self.log.event("session", state="end_refused", session=self.session, why="answers_question",
+                           via=via or "bridge")
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _end_answers_result(self) -> dict[str, Any]:
+        """r31 (L4 F5): the refused end's tool result: :data:`END_ANSWERS_QUESTION`, and in the marker channel the reply
+        format last (as :meth:`_follow_quiet_result`)."""
+        from yuki.voice.mouth import MARKER_REMINDER
+
+        out: dict[str, Any] = {"not_ended": END_ANSWERS_QUESTION}
+        if getattr(self, "channel", "") == "marker":
+            out[ONE_FORMAT_KEY] = MARKER_REMINDER
+        return out
+
+    async def _end_or_answer(self, params: Any) -> None:
+        """r31 (L4 F5): the "all" talker's ``end_conversation``: refused once when their words answer Yuki's own heard
+        question (:meth:`_end_answers_question`; the talker runs again on the note), else the bridge's own handler, as
+        before. Not under one (``OneVoice.control`` asks the same predicate)."""
+        if self._end_answers_question(via="bridge"):
+            from pipecat.frames.frames import FunctionCallResultProperties
+
+            await params.result_callback(self._end_answers_result(),
+                                         properties=FunctionCallResultProperties(run_llm=True))
+            return
+        await self.bridge.end_conversation(params)
 
     def _opened_by_hand(self) -> bool:
         """fTalk (live test A, k_eating_video): the call answers the first words of a conversation the user opened

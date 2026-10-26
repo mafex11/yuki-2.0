@@ -27,7 +27,9 @@ It is a thin wrapper on the table that already exists: ``brain.consent`` (rows 1
    tolerance); the skill engine's own steps keep using Enter (a quick switcher), judged as before. One20 (final-D S17):
    the agent's own typing in a chat's window (the same test) is refused toward ``run_skill message`` unless this
    turn's message skill opened that chat (:meth:`Turn.note_chat`): nobody settled whom the words are for.
-5. **Skill sends**: no declaration (``consent`` on ``run_skill``): the gate **rewrites the send slot to a draft**
+5. **Skill sends**: no declaration (``consent`` on ``run_skill``, required since r31 and empty for a non-send): the
+   agent's own send slot set to send with consent empty is refused once a turn as fixable (r31 F4); otherwise the gate
+   **rewrites the send slot to a draft**
    (``Decision.rewrite``; Yuki's own wording typed after, ``type_after``), never a hand-over. With one: ``check.one``
    with ``consent=``: the send rule unchanged (countdown, the quote in their words, the recipient named, their text,
    the near-duplicate ask, DM only and exactly that text through the grant, once per turn).
@@ -115,9 +117,13 @@ ONE_LINES: dict[str, str] = {
     "recipient_slot": "Not sent: the skill's person and consent.to name different people; make them the same person.",
     "text_mismatch": ("Not sent: consent.text and the text slot differ; write the same message in both, in their words "
                       "and language."),
-    "declared_draft": ("Not sent: consent declares a send but send is not \"send\"; set it, or drop consent for a "
-                       "draft."),
-    "send_slot": "Not sent: set the skill's send slot to \"send\", or drop consent for a draft.",
+    "declared_draft": ("Not sent: consent declares a send but send is not \"send\"; set it, or leave consent empty "
+                       "for a draft."),
+    "send_slot": "Not sent: set the skill's send slot to \"send\", or leave consent empty for a draft.",
+    # r31 (L4 F4): a send with consent left empty, the agent's own call (once a turn, fixable: :func:`_undeclared`)
+    "undeclared_skill_send": ("Not run: send is \"send\" but consent is empty. A send needs consent: to, text (exactly "
+                              "the text slot) and quote (their words asking for it); a draft is send \"draft\". "
+                              "Nothing was done."),
     "quote": "Not sent: consent.quote must be their own words asking for it, exactly as they said them.",
     "quote_turn": "Not sent: quote the turn of their words that names the person and says what to send.",
     "no_draft": "Not done: that skill has no draft form and nothing was declared to send; nothing was done.",
@@ -388,6 +394,9 @@ class Turn:
         #: their own: the voice driver sets it): code's tidy step of a late act of this turn is left (never after they
         #: moved on; ``Runner._tidy_by_code``).
         self.moved_on = False
+        #: r31 (L4 F4): a send with consent left empty was refused this turn (once: :func:`_undeclared`); a second one
+        #: is drafted by the last net, as before.
+        self.consent_refused = False
         self._lock = threading.Lock()
         self._join: tuple[int, str, str] | None = None
         self._send: dict[str, Any] | None = None
@@ -906,8 +915,17 @@ def _skill(verb: str, vinput: dict[str, Any], args: Mapping[str, Any], facts: di
     if in_game and sk is not None and (sends or rule.skill_joins(sk)):
         # nothing reaches a game in front: a send or a join is held now, as the engine would hold it, with no check
         return Decision(REFUSE, "game", line=LINE_GAME, row=1, verb=verb, final=True, game=True)
+    if sends and declared is None and not inner and rule.skill_sends(sk, slots, partial=False) \
+            and _undeclared(turn):
+        # r31 (L4 F4, final-I p24_countdown_cancel under one: send "send" with no consent was drafted silently, so no
+        # countdown opened): the agent's own call set the send slot to send and left consent empty: a fixable refusal,
+        # once a turn, that names what a send needs (nothing done); the model's own two fields disagree, code asks it
+        # to settle them, never a reading of words
+        return Decision(REFUSE, "undeclared_skill_send", line=ONE_LINES["undeclared_skill_send"], row=4, verb=verb,
+                        game=in_game)
     if sends and declared is None:
-        # addendum must-fix 4: no declaration, no send: the send slot goes to a draft, never a hand-over
+        # addendum must-fix 4: no declaration, no send: the send slot goes to a draft, never a hand-over (r31: the last
+        # net: a second undeclared send of the turn, a send slot left out, or a refusal that would settle the turn)
         tname = rule.text_slot(sk)
         text = rule.words(slots.get(tname)) if tname else ""
         own = bool(text) and rule.in_words(text, turn.words)
@@ -1004,6 +1022,27 @@ def _act_off_name(facts: Mapping[str, Any], turn: Turn) -> str:
         return str((turn.policy or util._shared_reader()).app_off(str(facts.get("app") or "")) or "")
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _undeclared(turn: Turn) -> bool:
+    """r31 (L4 F4): whether a send whose consent is empty is refused (fixable, once a turn) rather than drafted: none
+    was refused this turn yet, and this refusal would not be the one that settles the turn (the second refusal settles
+    it: then the draft net, as before). Marks the turn when it is. Counts only; never raises (unsure: the net)."""
+    try:
+        if getattr(turn, "consent_refused", False):
+            return False
+        budget = getattr(turn, "budget", None)
+        if budget is not None:
+            used = int(getattr(budget, "refusals", 0) or 0)
+            limit = int(getattr(getattr(budget, "limits", None), "refusals", 2) or 2)
+        else:
+            used, limit = int(getattr(turn, "refusals", 0) or 0), 2
+        if used + 1 >= limit:
+            return False
+        turn.consent_refused = True
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _declaration(value: Any) -> dict[str, str] | None:
