@@ -803,13 +803,11 @@ def _same_as_ok(row: dict[str, Any], target: dict[str, Any], known: list[dict[st
     """Whether the scan's ``same_as`` may stand: the new row's words measure as the event it names
     (:func:`title_overlap` with any of its stored rows by :data:`SAME_EVENT_MIN`; a correction keeps the event's core
     words). A wrong id (model error: "a friend's job interview" said to correct "Dentist appointment") would replace the
-    user's event for good, so the row is stored as new instead. So is a row of the other kind than the event was
-    given (a prep task said to correct the interview it is for): an occasion and a task are two things. A row stored
-    before the kind field has none, so a correction may give it one."""
+    user's event for good, so the row is stored as new instead. Words only: the kind (occasion / task) is checked
+    once the vet has kept or corrected it (:meth:`PresenceWorker._scan_events`), so a kind the scan got wrong and the
+    vet put right never costs the correction."""
     ids = set(target.get("ids") or [target.get("id")])
     mine = [r for r in known if ids & set(_row_ids(r))] or [target]
-    if _other_kind(row, mine + [target]):
-        return False
     weight = word_rarity([event_words(r.get("what")) for r in known + [row]])
     words = event_words(row.get("what"))
     return any(title_overlap(words, event_words(r.get("what")), weight) >= SAME_EVENT_MIN for r in mine)
@@ -977,7 +975,9 @@ class PresenceWorker:
         folded = fold_events(known)
         by_id = {i: g for g in folded for i in g["ids"]}
         ahead = [g for g in folded if float(g["at"]) + (86400.0 if g.get("all_day") else 0.0) > now]
-        known_lines = [f"- [{g['id']}] {safe(g.get('what'), 120)} ("
+        # each with the kind it is stored as (occasion / task; none on a row from before the field): the scan sees what
+        # an event it corrects with same_as already is
+        known_lines = [f"- [{g['id']}] {safe(g.get('what'), 120)} (" + (f"{_kind(g)}; " if _kind(g) else "")
                        + (f"{g['when']} UTC{local_offset(float(g['at']))}" if not g.get("all_day")
                           else f"{g['when']}, no settled time") + ")"
                        for g in ahead[:KNOWN_EVENTS_MAX]] or ["(none)"]
@@ -1012,7 +1012,10 @@ class PresenceWorker:
             for row in found:
                 target = by_id.get(str(row.pop("same_as", "") or ""))
                 if target is not None and _other_kind(row, [target]):
-                    refused += 1   # the vet gave it the other kind than the event it names: a row of its own
+                    # the final kind (the vet's) is the other one than the event it names (a prep task said to correct
+                    # the interview it is for): an occasion and a task are two things, so a row of its own. One check,
+                    # after the vet: a kind the scan got wrong and the vet put right keeps its correction.
+                    refused += 1
                     target = None
                 if target is None:
                     appended.append(row)
