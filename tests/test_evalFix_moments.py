@@ -297,6 +297,7 @@ def test_the_time_split_cuts_only_rows_written_since(copy):
     conn = sqlite3.connect(copy)
     conn.execute("DROP TABLE IF EXISTS skill_runs")   # sWire: migration 41's real table; this test's stand-in is simpler
     conn.execute("CREATE TABLE skill_runs (id INTEGER PRIMARY KEY, at REAL NOT NULL)")
+    conn.execute("DROP TABLE IF EXISTS routines")     # r30: migration 42's real table (rMiner); the stand-in is simpler
     conn.execute("CREATE TABLE routines (id INTEGER PRIMARY KEY, created_at REAL NOT NULL, updated_at REAL)")
     cut = ts("2026-10-01", "00:00:00")
     conn.executemany("INSERT INTO skill_runs(at) VALUES (?)", [(cut - 10,), (cut,), (cut + 10,)])

@@ -324,11 +324,13 @@ def test_user_words_reads_yukis_formats_only():
 
 def _skill_tables(path, now):
     conn = sqlite3.connect(path)
-    # sWire: migration 41 builds the real skills / skill_runs; this test keeps its own spec-shaped stand-ins (the real
-    # tables are scored by test_the_scorecard_reads_the_real_skill_ledger below)
+    # sWire: migration 41 builds the real skills / skill_runs (and r30: migration 42 the real routine_events); this
+    # test keeps its own spec-shaped stand-ins (the real tables are scored by
+    # test_the_scorecard_reads_the_real_skill_ledger below)
     conn.executescript("""
         DROP TABLE IF EXISTS skill_runs;
         DROP TABLE IF EXISTS skills;
+        DROP TABLE IF EXISTS routine_events;
         CREATE TABLE skills (id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE);
         CREATE TABLE skill_runs (id INTEGER PRIMARY KEY, at REAL NOT NULL, skill_id INTEGER NOT NULL,
             outcome TEXT NOT NULL, checked INTEGER, ms REAL, recheck INTEGER, request_id TEXT);
@@ -377,6 +379,7 @@ def test_the_scorecard_says_what_is_not_built_yet(live, tmp_path):
     assert p1["available"] is True and p1["per_skill"] == {} and p1["false_done"] == 0
     conn = sqlite3.connect(path)
     conn.execute("DROP TABLE skill_runs")                                   # a database from before migration 41
+    conn.execute("DROP TABLE routine_events")                               # r30: and so before rMiner's 42
     conn.commit()
     conn.close()
     card = H.scorecard(path, days=7)
@@ -406,13 +409,15 @@ def test_the_scorecard_reads_the_real_skill_ledger(live, tmp_path):
             t0 = now - 3600 * (i + 1)
             key = R.start_run(s, skill="volume", origin="voice", t0=t0, request_id=f"voice-1-{i}")
             assert key and R.finish_run(s, key, outcome=outcome, checked=checked, t_done=t0 + secs, ms=secs * 1000)
-        key = R.start_run(s, skill="meet.open", origin="voice", t0=now - 600, request_id="voice-2-1")
+        # r30: a shipped capability (lSplit, 10 Oct, replaced the hand-written meet.open with browser.site_tab)
+        key = R.start_run(s, skill="browser.site_tab", origin="voice", t0=now - 600, request_id="voice-2-1")
         R.finish_run(s, key, outcome="done", checked=True, t_done=now - 599, ms=900)
         R.set_recheck(s, key, False)
     finally:
         s.close()
     card = H.scorecard(path, days=7, now=now)
-    vol, meet = card["purpose_1_fast_and_true"]["per_skill"]["volume"], card["purpose_1_fast_and_true"]["per_skill"]["meet.open"]
+    per_skill = card["purpose_1_fast_and_true"]["per_skill"]
+    vol, meet = per_skill["volume"], per_skill["browser.site_tab"]
     assert (vol["runs"], vol["done"], vol["unconfirmed"], vol["failed"], vol["idle"]) == (4, 2, 1, 1, 4)
     assert vol["done_rate"] == 0.5 and vol["p50_s"] == 1.2           # the two seen dones (the lower middle)
     assert meet["false_done"] == 1 and card["purpose_1_fast_and_true"]["false_done"] == 1

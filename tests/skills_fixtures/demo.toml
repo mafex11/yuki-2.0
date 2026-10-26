@@ -1,36 +1,45 @@
 # sCore's tiny test connection: an invented "Demo Player" app (no real app, no real names). The engine's tests load it
 # with yuki.skills.connection.load([this folder]); it is never bundled (the shipped files are in yuki/skills/connections).
+#
+# r30: in the capability format phase L ships (lSplit, 10 Oct): [capability.*] tables, a role on every slot, no habit
+# keys (learn_from, routine_on, offerable, preview), no default on a means slot and no written pref or taste key (both
+# are derived: the control's preference key is "demo.volume:control", the list's taste kind "demoplayer_list"). Which
+# control the user turns is their usual or a recent choice of theirs, never this file's.
 
 [connection]
 app = "demoplayer"
 
-# -- a "change" skill with a no-focus rung A (two variants), a recorded rung B and the implicit rung C -------------------
+# -- a "change" capability with a no-focus rung A (two variants), a recorded rung B and the implicit rung C -----------
 
-[skill."demo.volume"]
+[capability."demo.volume"]
 end = "volume_change"
 kind = "change"
 menu = "set Demo Player's own volume"
 done_line = "Demo Player at {level}%."
-learn_from = [["volume_change", "demoplayer"]]
+offer_class = "everyday"
 handoff = true
+serves = [{ end = "volume_change", target = "level" }]
+bind = { level = "value", control = "means" }
 
-[[skill."demo.volume".slot]]
+[[capability."demo.volume".slot]]
 name = "level"
 type = "number"
+role = "fill"
 min = 0
 max = 100
 required = true
 ask = "What level?"
 
-[[skill."demo.volume".slot]]
+# The means: the app's own control or the Windows mixer. No default: the user's words, their usual or their recent
+# choice (named aloud, so one word corrects it) picks it.
+[[capability."demo.volume".slot]]
 name = "control"
 type = "enum"
+role = "means"
 options = ["in_app", "mixer"]
-pref = "demo.volume:control"
-default = "in_app"
 say = "with its {control} control"
 
-[[skill."demo.volume".route]]
+[[capability."demo.volume".route]]
 rung = "A"
 variant = "in_app"
 via = "uia_invoke"
@@ -41,7 +50,7 @@ game_states = ["covered"]
 done = { probe = "level", target = "DemoPlayer.exe", value = "{level}", within_s = 1 }
 recheck = { probe = "level", target = "DemoPlayer.exe", value = "{level}", after_s = 1, same_source = true }
 
-[[skill."demo.volume".route]]
+[[capability."demo.volume".route]]
 rung = "A"
 variant = "mixer"
 via = "app_volume"
@@ -51,44 +60,49 @@ game = "always"
 done = { probe = "read_back" }
 recheck = { probe = "level", target = "DemoPlayer.exe", value = "{level}", after_s = 1 }
 
-[[skill."demo.volume".route]]
+[[capability."demo.volume".route]]
 rung = "B"
 variant = "steps"
 via = "uia_steps"
 args = { apps = ["DemoPlayer.exe"], steps = [{ do = "click", role = "Button", name = "Demo louder" }] }
 done = { probe = "level", target = "DemoPlayer.exe", value = "{level}", within_s = 1 }
 
-# -- an "open" skill: a URI (focus-taking), no hand-off ------------------------------------------------------------------
+# -- an "open" capability: a URI (focus-taking), no hand-off -----------------------------------------------------------
 
-[skill."demo.home"]
+[capability."demo.home"]
 end = "site_front"
 kind = "open"
 menu = "open Demo Player's home"
 done_line = "Demo home is up."
+offer_class = "logistics"
 handoff = false
 
-[[skill."demo.home".route]]
+[[capability."demo.home".route]]
 rung = "A"
 via = "open_uri"
 args = { uri = "demoplayer://home" }
 done = { probe = "foreground", process = "DemoPlayer.exe", within_s = 2 }
 
-# -- an entity slot filled from the user's words or their taste ----------------------------------------------------------
+# -- an entity slot filled from the user's words or their taste (taste kind demoplayer_list) ---------------------------
 
-[skill."demo.play"]
+[capability."demo.play"]
 end = "media_context"
 kind = "change"
 menu = "play one of their Demo Player lists"
 done_line = "Playing {list.name} in Demo Player."
+offer_class = "everyday"
+serves = [{ end = "media_context", target = "playlist" }]
+bind = { list = "entity" }
 
-[[skill."demo.play".slot]]
+[[capability."demo.play".slot]]
 name = "list"
 type = "entity"
-taste = "demo_list"
+role = "fill"
+kind = "list"
 required = true
 ask = "Which list?"
 
-[[skill."demo.play".route]]
+[[capability."demo.play".route]]
 rung = "A"
 variant = "library"
 via = "uia_invoke"
@@ -98,7 +112,7 @@ game_states = ["covered"]
 done = { probe = "all", parts = [{ probe = "uia_name", window = "DemoPlayer.exe", role = "Button", name = "Pause {list.name}", container = [["DataGrid", "Demo lists"]] }, { probe = "media_session", app = "demoplayer", status = "playing" }], within_s = 2 }
 recheck = { probe = "audio_active", process = "DemoPlayer.exe", after_s = 2 }
 
-[[skill."demo.play".route]]
+[[capability."demo.play".route]]
 rung = "B"
 variant = "link"
 via = "open_uri"

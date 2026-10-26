@@ -1,5 +1,5 @@
 """sCore: the thinker side and the plumbing (map-skills S3.4-S3.5; PLAN.md D13, D19; B.2 "the pinned bounce stops at
-2"), the memory API calls, intake, and the footprint bars (C.5: marginal import, no threads, tracemalloc).
+2"), the memory API calls and the footprint bars (C.5: marginal import, no threads, tracemalloc).
 
 Scripted fake model clients and stub desks only; temp databases only; invented names only.
 """
@@ -61,28 +61,22 @@ def demo() -> C.Loaded:
 # -- the task frame's pinned block -----------------------------------------------------------------------------------
 
 
-def test_the_pin_survives_whole_and_its_apps_paths_and_pitfalls_are_left_out() -> None:
+def test_the_pin_survives_whole_and_comes_first() -> None:
+    # r30: practice notes are no longer shown (kClean, 18 Oct: frame.build lost practice=); the pin-never-cut checks
+    # stay, with the people-lately lines as what gives way
     from yuki.agent import frame
 
-    practice = {
-        "ways": [{"ref": "pb:1", "kind": "procedure", "intent": "invented", "apps": ["DemoPlayer.exe"], "label": "x",
-                  "text": "w" * 400, "id": 1},
-                 {"ref": "pb:2", "kind": "procedure", "intent": "other", "apps": ["other.exe"], "label": "x",
-                  "text": "v" * 400, "id": 2}],
-        "pitfalls": [{"ref": "pb:3", "apps": ["demoplayer"], "intent": "i", "label": "l", "text": "p" * 400, "id": 3}],
-        "go_tos": [{"app": "demoplayer", "elements": [{"label": "Button \"Demo louder\"", "n": 9}]}],
-    }
     facts = {"named": [], "routes": {}}
-    big = frame.build(facts, practice=practice, lately=["x" * 300] * 8, chars=frame.FRAME_CHARS, pinned=PIN)
+    lately = ["x" * 300] * 8
+    big = frame.build(facts, lately=lately, chars=frame.FRAME_CHARS, pinned=PIN)
     lines = frame.pinned_lines(PIN)
     assert all(line in big.text for line in lines)                       # never cut
     assert big.text.index(lines[0]) == len(frame.LABEL) + 1              # first after the label
-    assert "w" * 50 not in big.text and "p" * 50 not in big.text and "Demo louder" not in big.text
     assert big.skill == "demo.volume"
-    tiny = frame.build(facts, practice=practice, chars=700, pinned=PIN)
+    tiny = frame.build(facts, lately=lately, chars=700, pinned=PIN)
     assert all(line in tiny.text for line in lines)                       # the others give way, never the pin
-    plain = frame.build(facts, practice=practice, chars=frame.FRAME_CHARS)
-    assert "w" * 50 in plain.text and plain.skill is None                 # no pin: as before
+    plain = frame.build(facts, lately=lately, chars=frame.FRAME_CHARS)
+    assert plain.skill is None and not any(line in plain.text for line in lines)   # no pin: as before
 
 
 # -- the finish gate -------------------------------------------------------------------------------------------------
@@ -223,28 +217,34 @@ def test_run_skill_is_in_the_block_only_with_skills_and_the_volume_skill_drops_a
     assert "run_skill" in T.ACTION_TOOL_NAMES
 
 
+#: An invented sending capability (r30: the capability format lSplit ships; its slots are fills, so "mode" keeps its
+#: default).
 SENDING = """
 [connection]
 app = "inventedchat"
 
-[skill."invented.note"]
+[capability."invented.note"]
 end = "message_sent"
 kind = "change"
 menu = "send a note in Invented Chat"
 done_line = "Sent."
+offer_class = "never"
 sends_when = { slot = "mode", in = ["now"] }
+serves = [{ end = "message_sent", target = "chat" }]
 
-[[skill."invented.note".slot]]
+[[capability."invented.note".slot]]
 name = "words"
 type = "text"
+role = "fill"
 
-[[skill."invented.note".slot]]
+[[capability."invented.note".slot]]
 name = "mode"
 type = "enum"
+role = "fill"
 options = ["now", "draft"]
 default = "now"
 
-[[skill."invented.note".route]]
+[[capability."invented.note".route]]
 rung = "A"
 via = "uia_invoke"
 args = { window = "InventedChat.exe", role = "Button", name = "Send" }
@@ -286,6 +286,10 @@ def test_the_thinkers_run_skill_returns_a_checked_outcome_and_pins_a_hand_off(mo
     C.clear_cache()
     client = MemoryClient(Store.open(tmp_path / "memory.db"))
     try:
+        # r30: the control is a means slot with no default (lSplit): the user's usual picks the in-app rung
+        from yuki.skills import prefs as P
+
+        P.keep_usual(client.store, "demo.volume:control", "in_app", "yes")
         monkeypatch.setitem(E.VERB_FUNCS, "uia_invoke", lambda call: E.RouteResult(ran=True, outcome="pressed"))
         monkeypatch.setitem(donecheck.PROBE_FUNCS, "level", lambda ctx, args: (True, {}))
         monkeypatch.setattr("yuki.memory.gamegate.game_in_front", lambda: "")
@@ -357,7 +361,7 @@ def test_a_pinned_skill_reaches_agent_run_and_survives_a_front_desk_hand_off(tmp
     assert "skill" not in worker.kwargs[-1]                                 # none: Agent.run as before
 
 
-# -- the memory API and intake -------------------------------------------------------------------------------------
+# -- the memory API ------------------------------------------------------------------------------------------------
 
 
 def test_the_memory_api_calls(monkeypatch, tmp_path: Path) -> None:
@@ -382,37 +386,6 @@ def test_the_memory_api_calls(monkeypatch, tmp_path: Path) -> None:
         assert plan.values["control"] == "mixer"
     finally:
         client.close()
-
-
-def test_intake_maps_an_old_procedure_onto_a_rung_by_identity(tmp_path: Path, demo) -> None:
-    from yuki.memory import practice
-    from yuki.skills.intake import procedure_target, route_target, run_intake
-
-    store = Store.open(tmp_path / "memory.db")
-    try:
-        vol = demo.get("demo.volume")
-        assert route_target(vol.routes[2]) == ("button", "demo louder")
-        assert procedure_target([{"do": "click", "role": "Button", "name": "Demo louder"}]) == ("button",
-                                                                                                "demo louder")
-        pb = SimpleNamespace(id=72, run=[{"do": "click", "role": "Button", "name": "Demo Louder"}],
-                             apps=["DemoPlayer.exe"], n_ran_ok=3)
-        added: list = []
-        orig_live, orig_add = practice.live, practice.add_events
-        practice.live = lambda s, kinds=None, **k: [pb]
-        practice.add_events = lambda s, events, now=None: added.extend(events) or len(events)
-        try:
-            dry = run_intake(store, loaded=demo)
-            assert dry["result"] == "dry_run" and dry["matches"] == [
-                {"procedure": 72, "skill": "demo.volume", "route": "B:steps:uia_steps", "ok": 3}]
-            assert store._query("SELECT count(*) FROM skills")[0][0] == 0      # a dry run writes nothing
-            done = run_intake(store, loaded=demo, apply=True)
-            assert done["imported"] == 1 and done["superseded"] == 1
-            assert R.trust(store, "demo.volume")["B:steps:uia_steps"].seed_ok == 3
-            assert added[0]["type"] == "superseded" and added[0]["refs"] == ["skill:demo.volume"]
-        finally:
-            practice.live, practice.add_events = orig_live, orig_add
-    finally:
-        store.close()
 
 
 # -- footprint (C.5) ---------------------------------------------------------------------------------------------------
@@ -482,7 +455,7 @@ def test_the_thinker_menu_is_byte_stable_through_the_day(tmp_path: Path, demo) -
             h = json.dumps(hist)
             store._write(lambda c, name=name, h=h, n=n: c.execute(
                 "INSERT INTO tastes (kind, entity_key, name_ciphertext, ref_ciphertext, source, hist_weekday, "
-                "hist_weekend, n_obs, updated_at) VALUES ('demo_list', ?, ?, ?, 'observed', ?, ?, ?, ?)",
+                "hist_weekend, n_obs, updated_at) VALUES ('demoplayer_list', ?, ?, ?, 'observed', ?, ?, ?, ?)",
                 (store.cipher.digest("taste", name), store._enc(name), store._enc(""), h, h, n, time.time() - 10)))
         at8 = datetime(2026, 10, 7, 8, 30).timestamp()
         at20 = datetime(2026, 10, 7, 20, 30).timestamp()

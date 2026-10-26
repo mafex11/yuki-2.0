@@ -1,10 +1,13 @@
 """sWire: wave S merged onto wave F (the design notes).
 
-What crosses the four S branches and fWire: the packaged app loads all seven skills (the connection and site files are
-bundled, the drivers resolve through the import system), the doctor's skills line, one request id for a thinker's
-``run_skill`` and a voice skill hand (follow joins a hand to its turn), the router knows the talker's skills, the
-thinker's ``run_skill`` honours the per-app "Act" switch and a slow memory, the run header records the skill for the
-old learners, and the daily taste seed.
+What crosses the four S branches and fWire: the packaged app loads every shipped capability (the connection and site
+files are bundled, the drivers resolve through the import system), the doctor's skills line, one request id for a
+thinker's ``run_skill`` and a voice skill hand (follow joins a hand to its turn), the router knows the talker's skills,
+and the thinker's ``run_skill`` honours the per-app "Act" switch and a slow memory.
+
+r30: phase L (lSplit, 10 Oct) replaced the seven hand-written skills with capabilities; the run-header test went with
+``memory/practice_learn.py`` (iMem, 18 Oct) and the daily taste seed with ``service._start_taste_seed`` (zFinal,
+10 Oct).
 
 Offline: temp databases, stub verbs and probes, invented names. Nothing reads the desktop.
 """
@@ -31,8 +34,9 @@ from yuki.skills import registry as R
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).with_name("skills_fixtures")
-SHIPPED_SKILLS = {"volume", "spotify.playlist", "youtube.home", "youtube.video", "message", "discord.voice",
-                  "meet.open"}
+#: The shipped capabilities (yuki/skills/connections/*.toml since lSplit, 10 Oct).
+SHIPPED_SKILLS = {"volume", "browser.site_tab", "discord.voice", "display", "message", "spotify.playlist", "app.way",
+                  "web.open_page", "web.open_video"}
 
 
 @pytest.fixture(autouse=True)
@@ -61,11 +65,11 @@ def demo(monkeypatch: pytest.MonkeyPatch) -> C.Loaded:
 
 
 # =====================================================================================================================
-# 1. The packaged app loads all seven skills
+# 1. The packaged app loads every shipped capability
 # =====================================================================================================================
 
 
-def test_the_shipped_folder_loads_all_seven_skills_with_no_error() -> None:
+def test_the_shipped_folder_loads_every_capability_with_no_error() -> None:
     loaded = C.load()
     assert set(loaded.keys) == SHIPPED_SKILLS and loaded.errors == ()
 
@@ -133,18 +137,19 @@ def test_the_doctor_says_what_is_loaded_proven_and_run(tmp_path: Path) -> None:
     s.close()
     got = doctor.check_skills(db, settings=SimpleNamespace(skills=True), now=now)
     assert got.status == doctor.OK
-    assert got.detail.startswith("7 loaded, 0 invalid connection files")
+    # r30: phase L's line (lSplit/lWire, 10 Oct): "skills: n capabilities / n learned / n trusted", then the invalid
+    # files; the hand-written Meet tab skill (and its "Meet tab learned" part) is gone
+    assert got.detail.startswith(f"skills: {len(SHIPPED_SKILLS)} capabilities / ")
+    assert "; 0 invalid connection files" in got.detail
     assert "Spotify routes proven: covered no, other screen no, minimised no; mixer linked both ways no" in got.detail
     assert "3 runs in the last week: 2 done, 1 couldn't confirm, 0 false done" in got.detail
-    assert "Meet tab learned: no" in got.detail
     s = Store.open(db)
-    key = R.start_run(s, skill="meet.open", origin="voice", t0=now - 30)
+    key = R.start_run(s, skill="browser.site_tab", origin="voice", t0=now - 30)
     R.finish_run(s, key, outcome="done", checked=True, t_done=now - 29)
     R.set_recheck(s, key, False)
-    s.set_nudge_state("site_tabs:Google Meet", json.dumps({"process": "zen.exe", "runtime_ids": ["x"]}))
     s.close()
     got = doctor.check_skills(db, settings=SimpleNamespace(skills=True), now=now)
-    assert got.status == doctor.WARN and "1 false done" in got.detail and "Meet tab learned: yes" in got.detail
+    assert got.status == doctor.WARN and "1 false done" in got.detail
     assert doctor.check_skills(db, settings=SimpleNamespace(skills=False)).status == doctor.SKIP
     import inspect
 
@@ -356,7 +361,9 @@ def test_the_router_gets_a_skills_line_without_slots_or_names() -> None:
     menu = menu_text(None, audience="talker")
     line = skills_line(menu)
     keys = re.findall(r"^- ([^:]+):", line, flags=re.M)
-    assert set(keys) == SHIPPED_SKILLS and "[" not in line and len(line) <= SKILLS_CHARS
+    # r30: nine capabilities' lines outgrow SKILLS_CHARS, so the line keeps the first whole ones (menu order)
+    assert keys and set(keys) <= SHIPPED_SKILLS and "[" not in line and len(line) <= SKILLS_CHARS
+    assert keys == [k for k in re.findall(r"^- ([^:]+):", menu, flags=re.M) if k in SHIPPED_SKILLS][:len(keys)]
     content = router_request("play my focus playlist", skills=menu)["messages"][0]["content"]
     assert content.startswith("[Skills line") and content.endswith('Their words now: "play my focus playlist"')
     assert "Skills line" not in router_request("hi")["messages"][0]["content"]
@@ -463,41 +470,8 @@ def test_a_resolve_memory_does_not_answer_runs_nothing_for_the_thinker(demo: C.L
     slow = SimpleNamespace(call=lambda what, fn, timeout_s=1.0: None)   # MemoryAccess's answer on a timeout
     got = E.run_for_thinker({"skill": "demo.volume", "slots": {"level": 40}}, ["set demo player to 40"], memory=slow)
     assert got.outcome == "refused" and got.say == E.LINE_MEMORY_SLOW and not ran
-    # with no memory at all the files alone still resolve (as before)
-    got = E.run_for_thinker({"skill": "demo.volume", "slots": {"level": 40}}, ["set demo player to 40"])
+    # with no memory at all the files alone still resolve (as before; r30: the means slot has no default, so the
+    # control is given)
+    got = E.run_for_thinker({"skill": "demo.volume", "slots": {"level": 40, "control": "in_app"}},
+                            ["set demo player to 40"])
     assert got.outcome != "refused"
-
-
-# =====================================================================================================================
-# 7. The old learners see the skill; the daily taste seed
-# =====================================================================================================================
-
-
-def test_the_run_header_names_the_skill_and_the_old_learner_skips_it(tmp_path: Path) -> None:
-    from yuki.memory import practice as P
-    from yuki.memory.practice_learn import skill_of_run
-
-    s = Store.open(tmp_path / "memory.db")
-    got = P.record_run(s, {"source": "agent", "session_id": "s", "request_id": "worker-1", "lane": "worker",
-                           "at": time.time(), "words": "invented", "outcome": "final", "steps": [],
-                           "skill": "spotify.playlist"})
-    assert got["ok"]
-    header = P.run_header(s, got["run_key"])
-    assert header is not None and header.signals.get("skill") == "spotify.playlist"
-    assert skill_of_run(s, header) == "spotify.playlist"
-    s.close()
-
-
-def test_the_daily_taste_seed_runs_off_the_loop_and_logs_counts(tmp_path: Path) -> None:
-    from yuki.memory import service
-
-    s = Store.open(tmp_path / "memory.db")
-    lines: list[tuple[str, dict]] = []
-    thread = service._start_taste_seed(s, lambda kind, **f: lines.append((kind, f)))
-    assert thread is not None
-    thread.join(10)
-    assert lines and lines[0][0] == "taste_seed" and lines[0][1].get("channels") == 0
-    assert all(isinstance(v, (int, float)) for v in lines[0][1].values())
-    s.close()
-    src = (ROOT / "yuki" / "memory" / "service.py").read_text(encoding="utf-8")
-    assert "_start_taste_seed(store, log)" in src and "taste_seed_at = now + TASTE_SEED_EVERY_S" in src

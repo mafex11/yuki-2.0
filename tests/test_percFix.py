@@ -701,7 +701,9 @@ def _launch_world(monkeypatch: pytest.MonkeyPatch, pages: list[Any]) -> dict[str
     monkeypatch.setattr(L, "run_powershell", start)
     waits = list(pages)
 
-    def await_page(identity: Any, targets: list[str], before: Any, timeout_s: float) -> Any:
+    # r30: x8WebArc (12/16 Oct) passes _await_page the pages already showing (``unchanged``) and _page_opened its
+    # focus floor (``focus_floor_s``, ``already``)
+    def await_page(identity: Any, targets: list[str], before: Any, timeout_s: float, unchanged: Any = None) -> Any:
         page = waits.pop(0)
         if page == "none":
             return PageWait(seen=[], windows=[700], polls=3, answered=True)
@@ -709,7 +711,7 @@ def _launch_world(monkeypatch: pytest.MonkeyPatch, pages: list[Any]) -> dict[str
                         polls=1, answered=True)
 
     monkeypatch.setattr(L, "_await_page", await_page)
-    monkeypatch.setattr(L, "_page_opened", lambda name, wait, before, details, deadline, targets, identity=None: (
+    monkeypatch.setattr(L, "_page_opened", lambda name, wait, before, details, deadline, targets, identity=None, **_k: (
         details.update(page_verified=True, hwnd=700, foreground=True) or f"{name} shows {targets[0]}"))
     return state
 

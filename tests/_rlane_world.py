@@ -1,6 +1,8 @@
 """Shared stand-ins for the routine lane's tests (rLane): temp databases with the routine tables, a clock on an
-invented weekday, presence rows, joins, and a coach worker with no model. Nothing here touches the desktop, a model
-or the real database.
+invented weekday, presence rows and joins. Nothing here touches the desktop, a model or the real database.
+
+r30: the coach worker stand-in (``lane_worker``) went with the lane's card tests: NudgeWorker lost ``media_fn`` /
+``render_fn`` in kProactive (18 Oct).
 
 The ``routines`` / ``routine_events`` tables are rMiner's migration (map-routines R1.2); until it merges they are
 created here from the same spec (test-only, ``ROUTINE_DDL``).
@@ -9,15 +11,12 @@ created here from the same spec (test-only, ``ROUTINE_DDL``).
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from yuki.memory import routine_offers
-from yuki.memory.nudges import NudgeConfig, NudgeWorker
 from yuki.memory.store import NewNudge, NudgeCheckin, Store, TimelineRow
 
 #: map-routines R1.2 (rMiner's migration 42, renumbered at merge): additive, content encrypted.
@@ -102,15 +101,6 @@ def card(store: Store, when: float, *, trigger: str = "thread", kind: str = "not
     return nid
 
 
-class NoModel:
-    """A model client that fails the test if anything calls it (the lane is code only)."""
-
-    class messages:   # noqa: N801 - the SDK's shape
-        @staticmethod
-        def create(**kw: Any) -> Any:
-            raise AssertionError("the routine lane made a model call")
-
-
 class Clock:
     def __init__(self, t: float) -> None:
         self.t = float(t)
@@ -118,50 +108,3 @@ class Clock:
     def __call__(self) -> float:
         return self.t
 
-
-def lane_worker(store: Store, clock: Clock, *, live: dict | None = None, config: NudgeConfig | None = None,
-                ready: bool = True, avail: Any = True, locked: bool = False, render: list | None = None,
-                calls: list | None = None) -> NudgeWorker:
-    """A coach worker on ``store`` with the routine lane's trust and availability stubbed (said so in the report):
-    the real gates, the real attention instance, no model (other cards are switched off so only the lane can write)."""
-    cfg = config or NudgeConfig.from_dict({"presence_enabled": False, "checkins_enabled": False,
-                                           "questions_enabled": False, "resume_enabled": False})
-    live_state = {} if live is None else live
-    tmp = Path(tempfile.gettempdir()) / "yuki-rlane-tests"
-    w = NudgeWorker(store, config=cfg, client=NoModel(), log_dir=tmp, locked_fn=lambda: locked,
-                    media_fn=lambda: [], render_fn=lambda: list(render or []), live_fn=lambda: dict(live_state),
-                    event_name=f"Local\\YukiNudgeReadyTest{os.getpid()}", clock=clock)
-    w.availability_calls = []   # type: ignore[attr-defined]
-
-    def available(st: Any, skill: Any) -> Any:
-        w.availability_calls.append(skill.key)   # type: ignore[attr-defined]
-        return avail() if callable(avail) else avail
-
-    w.routines = routine_offers.RoutineLane(w, ready=lambda st, skill: ready, available=available)
-    w.logged = []   # type: ignore[attr-defined]
-    original = w._log
-
-    def log(type: str, **fields: Any) -> None:
-        w.logged.append((type, fields))   # type: ignore[attr-defined]
-        original(type, **fields)
-
-    w._log = log   # type: ignore[method-assign]
-    return w
-
-
-def routine_cards(store: Store) -> list[Any]:
-    return [n for n in store.nudges(kinds=("notice",)) if n.trigger == "routine"]
-
-
-def held(w: NudgeWorker) -> list[str]:
-    return [f.get("reason") for t, f in w.logged if t == "routine_held"]   # type: ignore[attr-defined]
-
-
-def run_ticks(w: NudgeWorker, clock: Clock, start: float, end: float, step: float = 15.0) -> list[dict]:
-    out = []
-    t = start
-    while t <= end:
-        clock.t = t
-        out.extend(r for r in w.tick(t) if r.get("trigger") == "routine")
-        t += step
-    return out

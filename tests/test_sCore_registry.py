@@ -38,17 +38,19 @@ def _write(folder: Path, name: str, text: str) -> Path:
     return p
 
 
+#: One invented capability (r30: the capability format lSplit ships; a [skill.*] table is refused whole).
 SKILL = """
 [connection]
 app = "{app}"
 
-[skill."{key}"]
+[capability."{key}"]
 end = "{end}"
 kind = "change"
 menu = "do the invented thing"
 done_line = "Done."
+offer_class = "never"
 
-[[skill."{key}".route]]
+[[capability."{key}".route]]
 rung = "A"
 via = "{via}"
 {extra}
@@ -99,7 +101,7 @@ def test_an_invalid_route_skips_that_skill_and_says_why(tmp_path: Path, via: str
 def test_an_unknown_end_kind_or_slot_type_is_refused(tmp_path: Path) -> None:
     _write(tmp_path, "a.toml", SKILL.format(app="a", key="a.x", end="vibes", via="app_volume", extra=""))
     _write(tmp_path, "b.toml", SKILL.format(app="b", key="b.x", end="page", via="app_volume", extra="")
-           + '\n[[skill."b.x".slot]]\nname = "mood"\ntype = "feeling"\n')
+           + '\n[[capability."b.x".slot]]\nname = "mood"\ntype = "feeling"\nrole = "fill"\n')
     C.clear_cache()
     got = C.load([tmp_path])
     assert got.keys == () and any("end" in e for e in got.errors) and any("slot type" in e for e in got.errors)
@@ -123,16 +125,18 @@ def test_no_shipped_connection_or_site_file_names_an_account_key_or_token() -> N
             C._no_setup(tomllib.loads(path.read_text(encoding="utf-8")), path.name)   # raises on a setup key
 
 
-def test_at_most_twenty_skills_and_one_per_app_and_end(tmp_path: Path) -> None:
+def test_at_most_twelve_capabilities_and_one_per_app_and_end(tmp_path: Path) -> None:
+    # r30: the files hold capabilities since lSplit (10 Oct), capped at MAX_CAPABILITIES (12 since kWays); MAX_SKILLS
+    # (20) caps the learned skills, which the catalog adds
     for i in range(22):
         _write(tmp_path, f"s{i:02d}.toml", SKILL.format(app=f"app{i}", key=f"s{i:02d}.x", end="page",
                                                         via="app_volume", extra=""))
     _write(tmp_path, "zz.toml", SKILL.format(app="app0", key="zz.x", end="page", via="app_volume", extra=""))
     C.clear_cache()
     got = C.load([tmp_path])
-    assert len(got.skills) == C.MAX_SKILLS
-    assert sum("replaces one" in e for e in got.errors) == 2
-    assert any("one skill per (app, end)" in e for e in got.errors)
+    assert len(got.skills) == C.MAX_CAPABILITIES
+    assert sum(f"more than {C.MAX_CAPABILITIES} capabilities" in e for e in got.errors) == 22 - C.MAX_CAPABILITIES
+    assert any("one capability per (app, end)" in e for e in got.errors)
 
 
 def test_templates_are_filled_as_a_machine_format() -> None:
@@ -298,15 +302,12 @@ def test_the_new_tables_never_reach_the_mcp() -> None:
         assert table not in source
 
 
-def test_no_skill_setting_or_cli_option_asks_for_setup() -> None:
-    import inspect
-
-    from yuki.skills import DEFAULTS, intake
+def test_no_skill_setting_asks_for_setup() -> None:
+    # r30: the intake CLI (yuki.skills.intake) was deleted by kClean (18 Oct); the settings remain
+    from yuki.skills import DEFAULTS
 
     for name in DEFAULTS:
         assert not any(w in name for w in C.SETUP_WORDS), name
-    source = inspect.getsource(intake.main)
-    assert not any(f"--{w}" in source for w in C.SETUP_WORDS)
 
 
 def test_a_run_that_changed_nothing_claims_no_moment(store: Store, demo: C.Loaded) -> None:
@@ -482,34 +483,6 @@ def test_zero_setup_reads_addresses_too(tmp_path: Path) -> None:
     assert C._address_like("spotify:playlist:{id}") and not C._address_like("Change volume")
 
 
-def test_intake_dry_run_reads_a_copy_and_leaves_the_database_untouched(tmp_path: Path) -> None:
-    """Review L6: --dry-run opens a temporary copy (pending migrations touch only the copy)."""
-    import contextlib
-    import hashlib
-    import io
-    import json
-    import sqlite3
-
-    from yuki.skills.intake import main
-
-    db = tmp_path / "memory.db"
-    Store.open(db).close()
-    conn = sqlite3.connect(db)
-    conn.execute("PRAGMA user_version = 40")                 # as if migration 41 were still pending
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    conn.close()
-    before = hashlib.sha256(db.read_bytes()).hexdigest()
-    out = io.StringIO()
-    with contextlib.redirect_stdout(out):
-        assert main(["--db", str(db), "--dry-run", "--connections", str(FIXTURES)]) == 0
-    report = json.loads(out.getvalue())
-    assert report["read"] == "copy" and report["applied"] is False and report["result"] == "dry_run"
-    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
-    conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 40
-    conn.close()
-
-
 def test_a_drivers_window_state_hook_feeds_the_states_rule(tmp_path: Path, archived_driver: str) -> None:
     """Review M5: no entry point set ``Live.window_state``, so ``game = "states"`` could never pass; a driver module's
     ``window_state(app)`` (named by ``state_reader``) is read when the caller gives none."""
@@ -518,8 +491,8 @@ def test_a_drivers_window_state_hook_feeds_the_states_rule(tmp_path: Path, archi
 
     text = SKILL.format(app="inventedapp", key="invented.lvl", end="volume_change", via="slider",
                         extra='game = "states"\ngame_states = ["covered"]\nargs = { window = "Invented.exe" }')
-    _write(tmp_path, "a.toml", text.replace('[skill."invented.lvl"]',
-                                            f'[skill."invented.lvl"]\nstate_reader = "{archived_driver}"'))
+    _write(tmp_path, "a.toml", text.replace('[capability."invented.lvl"]',
+                                            f'[capability."invented.lvl"]\nstate_reader = "{archived_driver}"'))
     _write(tmp_path / "b", "b.toml", text.replace("invented", "other"))          # no reader
     C.clear_cache()
     got = C.load([tmp_path])
