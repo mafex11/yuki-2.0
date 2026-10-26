@@ -471,6 +471,16 @@ ALLOWED = {
     ("actions/shell.py", "Popen"),
     # WM_QUIT to Yuki's own raw-input listener thread (the thread id it started), ending its message loop: no window
     ("actions/userinput.py", "PostThreadMessageW"),
+    # r30 (read 27 Oct): pSee's placement helpers `_show` / `_set_rect` (one ShowWindow, two SetWindowPos) are only
+    # reached after their callers asked the hands' gate (`refused = _gate.refuse("window_place" | "window_maximize",
+    # hwnd=...)`, then leave on a refusal), an assignment the walk does not read as a guard
+    ("actions/place.py", "ShowWindow"),
+    ("actions/place.py", "SetWindowPos"),
+    # mb (21 Oct): the display route's `_run_app` launch (subprocess.run) is only reached after its callers check
+    # `_launch_held` / `gate.refuse("launch")`
+    ("skills/display_route.py", "run"),
+    # chat19: `apply_pattern`'s "focus" (SetFocus) is reached only from `press()`, which asks the gate first
+    ("skills/uia_route.py", "SetFocus"),
 }
 #: Read-only PowerShell (it lists the Start menu; it starts nothing). Every other ``run_powershell`` call in scope is
 #: walked, whatever its script (a script in a variable may start anything).
@@ -478,10 +488,15 @@ READ_ONLY_POWERSHELL = {("actions/launch.py", "_powershell_json")}
 SCOPES = ("actions", "perception", "skills", "connect")
 
 
+#: The guard calls: the game gate's own ``refuse_input``, and the hands' gate ``yuki.actions.gate.refuse`` (fHands,
+#: 18 Oct: the hands ask it, and it asks ``refuse_input`` among its checks).
+GUARDS = {"refuse_input", "refuse"}
+
+
 def _is_guard(node: ast.AST) -> bool:
     return isinstance(node, ast.Call) and (
-        (isinstance(node.func, ast.Name) and node.func.id == "refuse_input")
-        or (isinstance(node.func, ast.Attribute) and node.func.attr == "refuse_input"))
+        (isinstance(node.func, ast.Name) and node.func.id in GUARDS)
+        or (isinstance(node.func, ast.Attribute) and node.func.attr in GUARDS))
 
 
 def _is_guard_stmt(node: ast.AST) -> bool:

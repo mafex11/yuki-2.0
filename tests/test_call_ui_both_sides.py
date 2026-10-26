@@ -65,24 +65,37 @@ def _status(call: dict | None, rows: list[dict], mic: dict, tracks: list[dict], 
             "mic": mic, "tracks": tracks, "pending_card": pending}
 
 
-CALL = _row(1, CALL_APP, "call")
-GAME = _row(2, GAME_APP, "game")
+def _call_row() -> dict:
+    return _row(1, CALL_APP, "call")
+
+
+def _game_row() -> dict:
+    return _row(2, GAME_APP, "game")
+
+
+# Built at import: their ids, apps and states. The statuses below build their rows when a test calls them, on the
+# clock the island's timer reads (r30: rows built at import with the real clock read "00:00" under a pinned run).
+CALL = _call_row()
+GAME = _game_row()
 
 
 def call_only() -> dict:
-    return _status(CALL, [CALL], _mic(call_id=1), [_track(CALL)])
+    call = _call_row()
+    return _status(call, [call], _mic(call_id=1), [_track(call)])
 
 
 def game_only() -> dict:
-    return _status(GAME, [GAME], _mic(call_id=2), [_track(GAME)])
+    game = _game_row()
+    return _status(game, [game], _mic(call_id=2), [_track(game)])
 
 
 def call_and_game() -> dict:
-    return _status(CALL, [CALL, GAME], _mic(call_id=1), [_track(CALL), _track(GAME)])
+    call, game = _call_row(), _game_row()
+    return _status(call, [call, game], _mic(call_id=1), [_track(call), _track(game)])
 
 
 def mic_waits_for_headphones() -> dict:
-    call = dict(CALL, status="waiting_headphones", headphones=False, form_factor="speakers")
+    call = dict(_call_row(), status="waiting_headphones", headphones=False, form_factor="speakers")
     return _status(call, [call], _mic("paused", 1, "not_headphones"), [_track(call)])
 
 

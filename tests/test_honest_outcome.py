@@ -416,13 +416,13 @@ def test_the_runtime_sends_the_verdict_before_the_words() -> None:
 # -- the voice repeats it ------------------------------------------------------------------------------------------
 
 
-def _voice_bridge() -> tuple[Any, Any]:
+def _voice_bridge(**kw: Any) -> tuple[Any, Any]:
     from test_voice_v39 import FakeRuntime, _bridge
 
     class Runtime(FakeRuntime):
         outcome = Signal(str, int, dict)
 
-    return _bridge(Runtime())
+    return _bridge(Runtime(), **kw)
 
 
 async def _end(rt: Any, job: int, text: str, verdict: dict | None, *, finishing: str | None = None) -> None:
@@ -534,6 +534,9 @@ def test_the_talkers_task_line_and_the_next_hand_off_carry_the_level() -> None:
     bridge = asyncio.run(main())
     line = bridge.work_line()
     assert "finished, not confirmed (the message did not show up in the chat)" in line and '"Sent."' in line
+    # r30 fix 1.1: the lean talker (brain "all") reading a job the old loop ran (the runtime's fallback) keeps the level
+    bridge.on_brain = True
+    assert "finished, not confirmed (the message did not show up in the chat)" in bridge.work_line()
 
 
 # -- the done card, the typed reply, the island, the window -----------------------------------------------------

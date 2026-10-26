@@ -7,6 +7,7 @@ standing requests (8) and know-how from corrections (9).
 
 from __future__ import annotations
 
+import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -597,6 +598,8 @@ def test_nightly_pass_renders_once_and_the_render_flag_waits_for_its_gap(store):
                               render_debounce_s=0.0)
     sched._startup = False
     flag_path(store.path, RENDER_FLAG).write_text("x", encoding="utf-8")
+    # the flag written on the scheduler's clock (r30: its real mtime is hours ahead of a pinned run's clock)
+    os.utime(flag_path(store.path, RENDER_FLAG), (now[0], now[0]))
     assert sched.tick() != "render" and flag_path(store.path, RENDER_FLAG).exists()   # rendered a minute ago
     now[0] += 31 * 60
     assert sched.tick() == "render"

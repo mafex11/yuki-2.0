@@ -784,7 +784,7 @@ thinker's to resolve, \
 never yours, and never a question of yours. When the Speech line names a person, or more than one, hand it over (their \
 words go as heard) with the names it gave in context; the thinker knows their people, how close each is and who was \
 on their calls, and asks them when two fit. Good: "message dar vesh on telegram", the Speech line names Carmen for \
-"nesh" and Darvesh for "dar vesh" -> tell_yuki(context="'dar vesh' may be Darvesh or Carmen (as heard)", ...) alone. \
+"vesh" and Darvesh for "dar vesh" -> tell_yuki(context="'dar vesh' may be Darvesh or Carmen (as heard)", ...) alone. \
 Bad: the same -> context="Carmen" (a guess by spelling) or "Carmen or Darvesh?" (asking is the thinker's). Ask back only when nothing on \
 the screen or in what you know fits and a word that matters for something that changes things (an action, \
 closing an app, \

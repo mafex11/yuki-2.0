@@ -54,12 +54,16 @@ def test_migration_38_is_additive_and_reruns_safely(tmp_path):
     path = tmp_path / "old.db"
     Store.open(path).close()
     conn = sqlite3.connect(path)
-    conn.execute(f"PRAGMA user_version={len(MIGRATIONS) - 1}")   # back to v37: 38 runs again
-    conn.commit()
+    # 38 itself runs again on a file that has it (r30: rewinding user_version to len - 1 re-ran the last migration, not
+    # 38, and mon1's migration 49, 22 Oct, ends with an ALTER that can't run twice). Every statement of 38 only creates
+    # what is missing.
+    conn.executescript(MIGRATIONS[37])
     conn.close()
     s = Store.open(path)
     try:
         assert s._query("PRAGMA user_version")[0][0] == len(MIGRATIONS)
+        tables = {r[0] for r in s._query("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert {"ui_actions", "ui_elements", "ui_links", "ui_game_processes", "ui_files"} <= tables
     finally:
         s.close()
 

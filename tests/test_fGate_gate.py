@@ -3,12 +3,13 @@ UI Automation reads, and for cards (plus a 120 s return hold); background CPU jo
 ``[trace] game_gate = "running"`` brings the old rule back in one edit.
 
 Offline: invented process data, a fake clock, temp databases and temp privacy files; the hook thread, the sink's
-Windows reads and UI Automation are fakes. Nothing reads the live desktop.
+Windows reads and UI Automation are fakes. Nothing reads the live desktop. (r30: the three card-hold tests went with
+``nudges.observe``, kProactive 18 Oct; the cards are the card judge's now, and the return hold setting is still
+checked below.)
 """
 
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -279,76 +280,3 @@ def test_a_hook_into_a_game_process_is_refused() -> None:
     assert calls == [] and hooks._pids == () and hooks.counts["hooks_refused_game"] == 1
     hooks._follow(12)                                                                # another app: hooked as before
     assert calls == [(120,)]
-
-
-# -- cards: a game in front, plus the 120 s return hold -------------------------------------------------------------
-
-
-NOW = datetime(2026, 10, 8, 8, 30).timestamp()
-
-
-@pytest.fixture
-def store(tmp_path: Path):
-    from yuki.memory.store import Store
-
-    s = Store.open(tmp_path / "memory.db")
-    yield s
-    s.close()
-
-
-def _present(store, start: float, end: float, process: str, app: str, *, step: float = 30.0, **kw) -> None:
-    from yuki.memory.store import TimelineRow
-
-    t = start
-    while t < end:
-        e = min(end, t + step)
-        store.save_timeline(TimelineRow(None, t, e, "present", process, app, active_s=e - t, **kw))
-        t = e
-
-
-def test_cards_hold_only_with_a_game_in_front_and_come_back_after_120_s(store) -> None:
-    from yuki.memory.nudges import NudgeConfig, observe
-
-    cfg = NudgeConfig()
-    _present(store, NOW - 3 * 3600, NOW - 1800, "warp", "Warp")
-    _present(store, NOW - 1800, NOW, "valorant-win64-shipping", "VALORANT")         # windowed, in front
-    assert observe(store, NOW, cfg, {"game_front": True}).gate == "game"
-    assert observe(store, NOW, cfg).gate == "game"                    # replay: the open stretch's program
-    assert observe(store, NOW, cfg, {"game_front": False, "fullscreen": False}).gate == "fullscreen"  # just left it
-
-
-def test_the_8_oct_shape_frees_the_cards_two_minutes_after_the_game_left_the_front(store) -> None:
-    """8 Oct (memory log): VALORANT last in front 08:41:52, its process closed 08:56:56, its voice row ended 09:00:42;
-    the cards were held until 09:00:46. Now: free from 08:43:52 (critique M9: derived from the stretch's program)."""
-    from yuki.memory.nudges import NudgeConfig, observe
-
-    day = datetime(2026, 10, 8)
-    at = lambda h, m, s=0: day.replace(hour=h, minute=m, second=s).timestamp()      # noqa: E731
-    cfg = NudgeConfig()
-    _present(store, at(7, 30), at(8, 5), "warp", "Warp")
-    _present(store, at(8, 5), at(8, 41, 52), "valorant-win64-shipping", "VALORANT", fullscreen=True)
-    _present(store, at(8, 41, 52), at(9, 5), "zen", "Zen")
-    row = store.start_call(app="VALORANT", process="valorant-win64-shipping", via="game", at=at(8, 10),
-                           status="declined", kind="game")
-    store.update_call(row, last_alive_at=at(9, 0, 30))                               # the voice row lives on
-    gates = {}
-    t = at(8, 40)
-    while t <= at(9, 2):
-        gates[t] = observe(store, t, cfg).gate
-        t += 15
-    assert all(g in ("game", "fullscreen") for t, g in gates.items() if at(8, 40) <= t < at(8, 43, 52))
-    # review r2 L1: the B.1 bar's literal wording, "card gate None": nothing else holds the cards in this shape (the
-    # user was present through the game). The real 8 Oct replay reads ``settling`` 08:44:00-08:49:45 after the hold
-    # because that morning's VALORANT stretch was all "away" (the welcome-back rule, not the game gate).
-    free = min(t for t, g in gates.items() if t > at(8, 41, 52) and g is None)
-    assert at(8, 43, 52) <= free <= at(8, 43, 52) + 15
-    assert all(g is None for t, g in gates.items() if t >= free)
-
-
-def test_return_hold_is_a_setting(store) -> None:
-    from yuki.memory.nudges import NudgeConfig, observe
-
-    _present(store, NOW - 3600, NOW - 200, "valorant", "VALORANT", fullscreen=True)
-    _present(store, NOW - 200, NOW, "discord", "Discord")
-    assert observe(store, NOW, NudgeConfig()).gate not in ("game", "fullscreen")     # 200 s > 120 s
-    assert observe(store, NOW, NudgeConfig.from_dict({"return_hold_s": 300})).gate == "fullscreen"

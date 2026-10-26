@@ -141,8 +141,11 @@ _UNTAGGED = {"keybd_event", "mouse_event"}                          # Win32 call
 _PYAUTOGUI_SENDERS = {"press", "hotkey", "typewrite", "write", "click", "doubleClick", "rightClick", "scroll",
                       "hscroll", "vscroll", "keyDown", "keyUp", "mouseDown", "mouseUp", "dragTo", "drag"}
 #: The only functions that call SendInput, each building every record with the stamp (tested above).
+#: ``ui/hotkey.py`` ``send_keys`` (Item 12 review r1, 16 Oct: the key claim sends on the keys it held) builds every
+#: record with ``dwExtraInfo=INJECT_MARK`` (``focus.INJECT_MARK == YUKI_INPUT_TAG``, tested above); read, not run
+#: (r30, 27 Oct).
 _SENDINPUT_CALLERS = {("actions/input.py", "_send_each"), ("actions/input.py", "_send_text"),
-                      ("ui/focus.py", "_send")}
+                      ("ui/focus.py", "_send"), ("ui/hotkey.py", "send_keys")}
 
 
 def _calls() -> list[tuple[str, str, str, str]]:
