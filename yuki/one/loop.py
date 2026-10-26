@@ -611,11 +611,13 @@ class OneAgent(Brain):
         finally:
             self._prev_turn = turn
             # fix-r31 (Y3): a text field the turn's own keys brought up and left holding the keyboard gets one Escape
-            # (``Runner.turn_end``), before the acting marker goes
+            # (``Runner.turn_end``), before the acting marker goes; never while the user has taken over (final-I S2,
+            # as the executor's own: the field may be the one they type in now), read now and again before the key
             end = getattr(runner, "turn_end", None)
             if callable(end):
                 try:
-                    end(turn, ended="cancelled" if self._cancelled.is_set() else (self._ended_by or "error"))
+                    end(turn, ended="cancelled" if self._cancelled.is_set() else "paused" if self.paused else (
+                        self._ended_by or "error"), paused=lambda: bool(self.paused))
                 except Exception:  # noqa: BLE001 - the request ends as it would
                     pass
             host.acting_end()

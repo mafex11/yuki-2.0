@@ -1091,7 +1091,9 @@ def habit_place(ctx: RunContext, hwnd: int) -> tuple[str, str] | None:
     shows full screen now, and their habit for this app, on this desk, is another monitor (e.g. while a video plays on
     monitor 0 they keep Discord on monitor 1). A window they placed elsewhere stays where it is; a minimised one gets
     no hint (the place verb refuses it: "restore it first"); an app they keep full screen (a game) has no habit; the
-    place gate still refuses with a game in front. Content-free log line ``skill_place_habit``."""
+    place gate still refuses with a game in front; a habit's monitor not measured lit now (final-I S1: standby, off,
+    dark, no reply; :func:`yuki.actions.place.monitor_lit`, blocking) gives no hint (``skill_place_habit_held``).
+    Content-free log line ``skill_place_habit``."""
     if getattr(ctx, "memory", None) is None or not hwnd:
         return None
     try:
@@ -1111,6 +1113,11 @@ def habit_place(ctx: RunContext, hwnd: int) -> tuple[str, str] | None:
         return None
     target = int(got["monitor"])
     if where is None or target == where or where not in set(got.get("busy") or ()):
+        return None
+    if not _place.monitor_lit(target):
+        # final-I S1 (P0-5): their habit's monitor is not measured lit now (standby, off, dark, no reply): a window
+        # moved there would be out of their sight, so no hint; the window stays where it is
+        _emit(ctx, "skill_place_habit_held", why="unlit", monitor=target, was=where)
         return None
     _emit(ctx, "skill_place_habit", situational=got.get("when") == "while", n=got.get("n"), m=got.get("m"),
           monitor=target, was=where)

@@ -15,7 +15,11 @@ generic verbs for it, all undoable:
   to the front afterwards; when not asked and maximising activated it, the window that was in front gets the front
   back. Verified from Windows: ``MonitorFromWindow`` and the rectangle read back (``ok`` only when it is on the target
   monitor in the state asked). A monitor a game shows on (its top window, the game not in front) is never a target:
-  ``"other"`` skips it, a named one is refused.
+  ``"other"`` skips it, a named one is refused. Nor is a monitor not measured lit (final-I S1, P0-5: a window moved
+  onto a monitor in standby is out of the user's sight): with two or more monitors, the target is read
+  (:func:`monitor_lit`, the display driver's own 0xD6 and memory's dark record); ``"other"`` skips one that reads off,
+  standby, dark or gives no reply, and a named one (an index, ``"primary"``, ``"with:"``) is refused, the window left
+  where it is with the reason said.
 * :func:`focus_back` brings the window that was in front before Yuki's act forward again
   (:func:`yuki.actions.launch.focus_window`, which re-checks the game gate before every attempt).
 * :func:`undo_last` ("put it back") reverses the newest group of the undo journal, newest entry first: a placement
@@ -171,18 +175,25 @@ def _as_mon(m: Any) -> _Mon:
                 primary=bool(get("primary", get("is_primary", False))), dpi_scale=float(get("dpi_scale", 1.0) or 1.0))
 
 
+#: Why a monitor not measured lit takes no window (final-I S1): plain words the brain can say as they are.
+_UNLIT = "does not read as on and lit (off, in standby, dark, or no reply): a window there would be out of sight"
+
+
 def resolve_monitor(monitor: int | str, current: int | None, monitors: Sequence[Any],
-                    avoid: Iterable[int] = ()) -> tuple[int | None, str]:
+                    avoid: Iterable[int] = (), dark: Iterable[int] = ()) -> tuple[int | None, str]:
     """The target monitor's index for a ``monitor`` value, ``(index, "")``, or ``(None, why not)``. Pure.
 
     An index (or its digits); ``"other"``: the other one of two, with more the next one after ``current`` (wrapping);
     ``"primary"`` / ``"main"``: the primary monitor. ``avoid``: monitors a game shows on: ``"other"`` skips them, a
-    named one is refused. (``"with:<hwnd>"`` is resolved by the caller, who can read that window's monitor.)"""
+    named one is refused. ``dark`` (final-I S1): monitors not measured lit: the same, ``"other"`` skips them and a
+    named one is refused. The monitor the window is on (``current``) is never refused: nothing moves to it.
+    (``"with:<hwnd>"`` is resolved by the caller, who can read that window's monitor.)"""
     mons = sorted((_as_mon(m) for m in monitors), key=lambda m: m.index)
     if not mons:
         return None, "no monitor could be read"
     indexes = [m.index for m in mons]
     avoid = set(avoid or ())
+    dark = set(dark or ())
     value = monitor.strip().casefold() if isinstance(monitor, str) else monitor
     if isinstance(value, bool):
         return None, f"monitor must be an index, 'other' or 'primary', not {monitor!r}"
@@ -196,10 +207,17 @@ def resolve_monitor(monitor: int | str, current: int | None, monitors: Sequence[
         else:
             at = indexes.index(current)
             order = [indexes[(at + k) % len(indexes)] for k in range(1, len(indexes))]
-        free = [i for i in order if i not in avoid]
+        free = [i for i in order if i not in avoid and i not in dark]
         if not free:
-            return None, (f"monitor {order[0]} shows a game: no window goes over it" if len(order) == 1 else
-                          "every other monitor shows a game: no window goes over one")
+            if all(i in avoid for i in order):
+                return None, (f"monitor {order[0]} shows a game: no window goes over it" if len(order) == 1 else
+                              "every other monitor shows a game: no window goes over one")
+            if all(i in dark for i in order):
+                return None, (f"the other monitor ({order[0]}) {_UNLIT}" if len(order) == 1 else
+                              f"no other monitor reads as on and lit ({', '.join(str(i) for i in order)}: off, in "
+                              f"standby, dark, or no reply): a window there would be out of sight")
+            return None, ("every other monitor shows a game or does not read as on and lit: no window goes to "
+                          "one")
         return free[0], ""
     if value in ("primary", "main"):
         value = next((m.index for m in mons if m.primary), mons[0].index)
@@ -208,6 +226,8 @@ def resolve_monitor(monitor: int | str, current: int | None, monitors: Sequence[
             return None, f"there is no monitor {value} (monitors: {', '.join(str(i) for i in indexes)})"
         if value in avoid and value != current:
             return None, f"monitor {value} shows a game: no window goes over it"
+        if value in dark and value != current:
+            return None, f"monitor {value} {_UNLIT}"
         return value, ""
     return None, f"monitor must be an index, 'other', 'primary' or 'with:<hwnd>', not {monitor!r}"
 
@@ -279,6 +299,19 @@ def monitor_index(hwnd: int, monitors: Sequence[_Mon] | None = None) -> int | No
         if tuple(m.rect) == bounds:
             return m.index
     return None
+
+
+def monitor_lit(index: int) -> bool:
+    """final-I S1: whether the monitor at ``index`` (``windows.list_monitors``' order) is measured lit now
+    (``display_route.lit_now``: 0xD6 on, a built-in panel while listed, and not dark by memory's record). Anything not
+    measured lit (standby, off, on but dark, no DDC/CI reply) is ``False``, as code's own tidy holds it (final-I Y4).
+    Blocking (at most two DDC/CI reads under the bus lock): call it off an event loop. Never raises."""
+    try:
+        from yuki.skills.display_route import lit_now
+
+        return lit_now(index) is True
+    except Exception:  # noqa: BLE001 - not measured: not lit
+        return False
 
 
 def _game_monitors(monitors: Sequence[_Mon], skip: int) -> set[int]:
@@ -505,6 +538,15 @@ def place_window(hwnd: int, *, monitor: int | str = "other", how: str = "keep", 
         if games:
             details["game_monitors"] = sorted(games)
         index, why = resolve_monitor(asked, current, monitors, avoid=games)
+        # final-I S1 (P0-5): the target must be measured lit, whoever asked the move (the model's "other", a named
+        # monitor, a learned habit's index): read only the monitor resolved; one that does not read lit is skipped
+        # ("other": the next is resolved and read) or refused (named). Each read adds a monitor, so this ends.
+        unlit: set[int] = set()
+        while len(monitors) > 1 and index is not None and index != current and not monitor_lit(index):
+            unlit.add(index)
+            index, why = resolve_monitor(asked, current, monitors, avoid=games, dark=unlit)
+        if unlit:
+            details["unlit_monitors"] = sorted(unlit)
         if index is None:
             return _result(started, False, f"{name}: {why}", details)
         details["to_monitor"] = index

@@ -2420,16 +2420,27 @@ class Runner:
         except Exception:  # noqa: BLE001 - nothing kept: nothing is undone
             return
 
-    def turn_end(self, turn: Any, *, ended: str = "") -> None:
+    def turn_end(self, turn: Any, *, ended: str = "", paused: Callable[[], bool] | None = None) -> None:
         """fix-r31 (Y3): at the turn's end (the typed loop's own end), a text field a ``keys`` call of the turn brought
         up (:meth:`_note_raised`) where a later act of the turn aimed at that window was then refused or failed (R13's
         pattern: ``RunState.spoiled``) and no act used it since, and that still holds the keyboard, by the same focus
         read K-S uses (``chat.still_held``), gets one Escape in that window (``press`` with ``expect_hwnd``: only while
         it is in front; the input layer's game gate, D17; the Dispatcher's input gate waits while they type) and the
         focus read back. Never when the keys call was the turn's last act there (the field it opened may be the ask: a
-        command palette, a find bar, a search box), never after a stop (``ended`` cancelled); never a dialog (the field
-        is inside the window the keys pressed in) and never a field the user moved to (the identity differs). Logged
-        content-free (``one_own_field``); nothing said. Never raises."""
+        command palette, a find bar, a search box), never after a stop (``ended`` cancelled) and never while the user has
+        taken over (final-I S2, as the executor's ``_undo_raised``: ``ended`` paused, or ``paused()`` true, read again
+        right before the key: the field may be the one they type in now); never a dialog (the field is inside the window
+        the keys pressed in) and never a field the user moved to (the identity differs). Logged content-free
+        (``one_own_field``); nothing said. Never raises."""
+
+        def taken_over() -> bool:
+            if ended == "paused":
+                return True
+            try:
+                return bool(paused()) if callable(paused) else False
+            except Exception:  # noqa: BLE001 - unreadable: kept, the field may be theirs now
+                return True
+
         try:
             state = state_of(turn)
             raised, state.raised = dict(state.raised), {}
@@ -2442,6 +2453,9 @@ class Runner:
                 return
             if ended == "cancelled":
                 self._emit("one_own_field", how="kept", why="cancelled")
+                return
+            if taken_over():
+                self._emit("one_own_field", how="kept", why="paused")
                 return
             hands = self._focus_hands()
             if hands is None:
@@ -2457,6 +2471,9 @@ class Runner:
                 with _Lease(turn, wanted=self.lease, wait_s=self.lease_wait_s) as lease:
                     if not lease.got:
                         self._emit("one_own_field", how="kept", why="busy")
+                        return
+                    if taken_over():
+                        self._emit("one_own_field", how="kept", why="paused")
                         return
                     with (acting("keys") if callable(acting) else nullcontext()):
                         got = self.dispatcher.dispatch("press", {"key": "escape", "expect_hwnd": int(window)})
