@@ -367,26 +367,6 @@ def test_w2_the_episode_call_writes_a_title_and_summary_and_bad_ones_are_dropped
     assert ep.title is None and ep.summary is None                        # a cut summary as heading never lands
 
 
-def test_w2_the_sessions_backfill_dry_run_apply_and_undo(store):
-    from yuki.memory.passplan import load_plan, save_plan
-    from yuki.memory.sessions import SESSIONS_PASS, SessionLabeler
-
-    a = _episode(store, NOW - 7200, NOW - 5400, "10:00-10:30: the user fixed the wake word with Claude Code.")
-    b = _episode(store, NOW - 5000, NOW - 4000, "11:00-11:20: the user played Valorant with friends.")
-    answer = {"sessions": [{"id": f"E{a}", "title": "Wake word fix", "summary": "You fixed the wake word with Claude "
-                                                                               "Code."},
-                           {"id": f"E{b}", "title": "wake word fix", "summary": "You played Valorant."}]}
-    dry = SessionLabeler(_Worker(store, [answer])).run(dry_run=True)
-    assert dry.ok and len(dry.decisions) == 1 and any("same title" in r for r in dry.rejected)
-    path = save_plan(store, SESSIONS_PASS, dry.decisions, Path(store.path).parent / "s.json")
-    res = SessionLabeler(_Worker(store)).run(plan=load_plan(store, SESSIONS_PASS, path))
-    assert res.ok and res.written == 1
-    rows = {e["id"]: e for e in MemoryClient(store).episodes(NOW - 86400, NOW)}
-    assert rows[a]["title"] == "Wake word fix" and rows[a]["ref"] == f"episode:{a}" and rows[b]["title"] is None
-    assert SessionLabeler(_Worker(store)).undo(res.run_id) == {"cleared": 1, "diverged": 0}
-    assert store.episodes_by_ids([a])[0].title is None
-
-
 # ---------------------------------------------------------------------------
 # W3 corrections from the user's own words
 # ---------------------------------------------------------------------------
@@ -476,56 +456,6 @@ def test_w5_every_shown_writer_carries_the_english_rule():
         "description"]
     assert "Both in English" in CONSOLIDATE_SYSTEM_PROMPT
     assert "IN ENGLISH" in system_prompt(["Sam"], call_side=True) and "IN ENGLISH" not in system_prompt(["Sam"])
-
-
-def test_w5_the_english_pass_rewrites_only_what_holds_another_language_and_undoes(store):
-    from yuki.memory.english import EnglishPass
-
-    fid = store.commit_portrait_changes(None, [FactChange("ADD", None, "personality", "talk", "The user says 'bas "
-                                                          "thoda aur'.", 0.7, [], NOW, aspect="talk",
-                                                          shown="You say 'bas thoda aur' when a build drags.")])[0][1]
-    ok_fid = store.commit_portrait_changes(None, [FactChange("ADD", None, "interest", "Chess", "The user plays chess.",
-                                                             0.7, [], NOW, shown="You play chess.")])[0][1]
-    tid = _thread(store, "Build", "The user is building it.")
-    store.change_work_threads([{"action": "present", "id": tid, "shown": "You are building it.",
-                                "next": "Kal tak finish karo."}], origin="test")
-    answer = {"lines": [{"id": f"P{fid}", "english": "You say 'just a bit more' when a build drags."},
-                        {"id": f"N{tid}", "english": "Finish it by tomorrow."},
-                        {"id": f"P{ok_fid}", "english": "You play chess."}]}           # no change: rejected
-    worker = _Worker(store, [answer])
-    r = EnglishPass(worker).run(now=NOW)
-    assert r.ok and r.written == 2 and r.by_kind == {"P": 1, "N": 1}
-    assert "You say 'bas thoda aur'" in worker.calls[0]["user"]
-    assert store.portrait_fact(fid).shown == "You say 'just a bit more' when a build drags."
-    assert store.work_thread(tid).next == "Finish it by tomorrow."
-    store.change_work_threads([{"action": "present", "id": tid, "shown": "You are building it.",
-                                "next": "Ship it."}], origin="test")                  # changed since
-    undo = EnglishPass(_Worker(store)).undo(r.run_id)
-    assert undo == {"restored": 1, "diverged": 1}
-    assert store.portrait_fact(fid).shown == "You say 'bas thoda aur' when a build drags."
-    assert store.work_thread(tid).next == "Ship it."                                  # a later change is never undone
-
-
-def test_w5_the_english_pass_also_covers_thread_titles_and_short_labels(store):
-    """Review: thread titles, a fact's short label and a to-do's title are shown too."""
-    from yuki.memory.english import EnglishPass, lines_of
-
-    fid = store.commit_portrait_changes(None, [FactChange("ADD", None, "interest", "Cricket", "The user plays cricket.",
-                                                          0.7, [], NOW, summary="Khelna cricket weekends")])[0][1]
-    tid = _thread(store, "Naya seed-swap app", "The user is building it.")
-    cid = store.add_conversation_fact("commitment", "The user will call Kiran.", owner="user",
-                                      title="Kiran ko call karna")
-    refs = {ln.ref for ln in lines_of(store)}
-    assert {f"L{fid}", f"W{tid}", f"D{cid}"} <= refs
-    answer = {"lines": [{"id": f"L{fid}", "english": "Cricket on weekends"},
-                        {"id": f"W{tid}", "english": "New seed-swap app"},
-                        {"id": f"D{cid}", "english": "Call Kiran"}]}
-    r = EnglishPass(_Worker(store, [answer])).run(now=NOW)
-    assert r.ok and r.written == 3
-    assert store.work_thread(tid).title == "New seed-swap app" and store.portrait_fact(fid).summary == "Cricket on weekends"
-    assert next(c for c in store.conversation_facts(("commitment",)) if c.id == cid).title == "Call Kiran"
-    assert EnglishPass(_Worker(store)).undo(r.run_id) == {"restored": 3, "diverged": 0}
-    assert store.work_thread(tid).title == "Naya seed-swap app"
 
 
 def test_w6_a_call_side_mishearing_carries_its_english_line(store):

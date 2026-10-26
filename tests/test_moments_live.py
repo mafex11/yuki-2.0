@@ -406,8 +406,9 @@ def test_the_service_builds_beats_reports_and_stops_the_hub():
     ast.parse(src)
     for needle in ("MomentHub(store, privacy=privacy, log=log, db_path=db_path", "moments.start()",
                    "on_media_change=moments.on_media_change", "on_front_change=moments.on_front_change",
-                   "on_call_change=moments.nudge", "moments.beat()", "moments=moments.stats()",
-                   "moments.log_sources()", "moments.stop()"):
+                   "on_call_change=_call_changed", "moments.nudge(source)", "moments.beat()",
+                   "moments=moments.stats()", "moments.log_sources()", "moments.stop()"):
+        # yState (10 Oct): the call worker's change goes through _call_changed, which nudges the hub and the you-board
         assert needle in src, needle
     assert src.index("MomentHub(") < src.index("TimelineRecorder(") < src.index("CallWorker(")
 

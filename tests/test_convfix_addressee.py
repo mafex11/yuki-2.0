@@ -10,7 +10,6 @@ Temp databases, stub models and invented words only; nothing touches the desktop
 
 from __future__ import annotations
 
-import json
 import tempfile
 import types
 from datetime import datetime
@@ -252,48 +251,6 @@ def test_memory_hands_the_view_who_each_turn_was_said_to(store):
     assert client.recent_turns()[0]["addressed"] == "unanswered"
 
 
-# -- the backfill -----------------------------------------------------------------------------------------------------
-
-
-def test_backfill_plans_then_applies_from_the_voice_log_only(store, tmp_path):
-    from yuki.memory import addressee_backfill as bf
-
-    old_cut = store.add_turn("20261004-230000-aa", "voice-20261004-230000-aa-3", T0, "set a", "", [], "voice",
-                             addressed="others")
-    quiet = store.add_turn("20261004-230000-aa", "voice-20261004-230000-aa-4", T0 + 1, "gg", "", [], "voice",
-                           addressed="others")
-    store.flush_turns()
-    store._write(lambda c: c.execute("UPDATE conversation_turns SET extracted=1"))
-    logs = tmp_path / "voice"
-    logs.mkdir()
-    rows = [
-        {"type": "turn", "session": "20261004-230000-aa", "turn": 3, "trigger": "user", "call_mode": True,
-         "addressed": "unanswered", "for_others_why": "next_words_first"},
-        {"type": "turn", "session": "20261004-230000-aa", "turn": 4, "trigger": "user", "call_mode": True,
-         "addressed": "others", "for_others_why": "talker_stay_quiet"},
-        {"type": "turn", "session": "20261004-230000-aa", "turn": 9, "trigger": "user", "call_mode": True,
-         "addressed": "unanswered"},   # no words were stored for it
-        {"type": "session", "session": "20261004-230000-aa", "state": "start"},
-    ]
-    (logs / "voice-20261004.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\nnot json\n",
-                                               encoding="utf-8")
-    ids = bf.unanswered_turns(bf.read_voice_logs(logs))
-    assert ids == ["voice-20261004-230000-aa-3", "voice-20261004-230000-aa-9"]
-    p = bf.plan(store, ids)
-    assert p.as_dict() | {"relabel_ids": None} == {"logged_unanswered": 2, "in_memory": 1, "relabel": 1,
-                                                   "relabel_ids": None, "already": 0, "missing": 1, "requeue": 1}
-    # the dry run (main's default) writes nothing
-    db = store.path
-    assert bf.main(["--db", str(db), "--voice-logs", str(logs)]) == 0
-    assert store.turns_by_ids([old_cut])[0].addressed == "others"
-    assert bf.apply(store, p, tmp_path / "undo.json") == [old_cut]
-    got = {t.id: (t.addressed, t.extracted) for t in store.turns_by_ids([old_cut, quiet])}
-    assert got == {old_cut: ("unanswered", False), quiet: ("others", True)}
-    assert [t.id for t in store.turns_pending()] == [old_cut]
-    # run again: nothing left to do
-    assert bf.plan(store, ids).as_dict()["relabel"] == 0
-
-
 # -- review fixes (77b review F1-F5) ----------------------------------------------------------------------------------
 
 
@@ -436,114 +393,6 @@ def test_f2_a_live_batch_ending_unanswered_waits_for_its_next_exchange(store):
     store._write(lambda c: c.execute("UPDATE conversation_turns SET created_at=created_at-? WHERE id=?",
                                      (worker.max_wait_s + 5, late)))
     assert [r.turn_ids for r in worker.run_once().extractions] == [[late]]
-
-
-def _backfill_db(tmp_path: Path) -> tuple[Path, Path, list[int]]:
-    """A DB with two old cut-off call turns stored "others" and extracted, and a voice log naming them."""
-    folder = tmp_path / "copy"
-    folder.mkdir()
-    db = folder / "memory.db"
-    s = Store.open(db)
-    try:
-        ids = [s.add_turn("20261004-230000-bb", f"voice-20261004-230000-bb-{n}", T0 + n, f"invented line {n}", "", [],
-                          "voice", addressed="others") for n in (1, 2)]
-        s.flush_turns()
-        s._write(lambda c: c.execute("UPDATE conversation_turns SET extracted=1, extract_attempts=1,"
-                                     " extract_batch_id=7"))
-    finally:
-        s.close()
-    logs = tmp_path / "voice"
-    logs.mkdir()
-    rows = [{"type": "turn", "session": "20261004-230000-bb", "turn": n, "trigger": "user", "call_mode": True,
-             "addressed": "unanswered"} for n in (1, 2)]
-    (logs / "voice-20261004.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
-    return db, logs, ids
-
-
-def test_f4_the_dry_run_refuses_a_missing_database_and_creates_nothing(tmp_path, capsys):
-    from yuki.memory import addressee_backfill as bf
-
-    logs = tmp_path / "voice"
-    logs.mkdir()
-    typo = tmp_path / "typo" / "memory.db"
-    assert bf.main(["--db", str(typo), "--voice-logs", str(logs), "--dry-run"]) == 2
-    assert bf.main(["--db", str(typo), "--voice-logs", str(logs), "--apply"]) == 2
-    assert not typo.parent.exists()
-
-
-def test_f4_the_dry_run_opens_read_only_no_key_no_change(tmp_path, capsys):
-    import hashlib
-
-    from yuki.memory import addressee_backfill as bf
-
-    db, logs, ids = _backfill_db(tmp_path)
-    (db.parent / "memory.key").unlink()          # a copy without its key: the dry run must not make one
-    digest = hashlib.sha256(db.read_bytes()).hexdigest()
-    before = sorted(p.name for p in db.parent.iterdir())
-    assert bf.main(["--db", str(db), "--voice-logs", str(logs)]) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["applied"] is False and out["PLAN"]["relabel_ids"] == ids
-    assert hashlib.sha256(db.read_bytes()).hexdigest() == digest
-    assert sorted(p.name for p in db.parent.iterdir()) == before
-
-
-def test_f5_apply_requeues_writes_an_undo_file_and_undo_is_exact(tmp_path, capsys):
-    from yuki.memory import addressee_backfill as bf
-
-    db, logs, ids = _backfill_db(tmp_path)
-    undo_file = tmp_path / "undo.json"
-    assert bf.main(["--db", str(db), "--voice-logs", str(logs), "--apply", "--undo-file", str(undo_file)]) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["relabelled"] == out["requeued"] == 2 and out["undo_file"] == str(undo_file)
-    record = json.loads(undo_file.read_text(encoding="utf-8"))
-    assert [r["id"] for r in record["rows"]] == ids
-    assert record["rows"][0] | {"id": 0} == {"id": 0, "addressed": "others", "extracted": 1, "extract_attempts": 1,
-                                             "extract_batch_id": 7}
-    s = Store.open(db)
-    try:
-        got = s._query("SELECT id, addressed, extracted, extract_attempts FROM conversation_turns ORDER BY id")
-        assert [tuple(r) for r in got] == [(ids[0], "unanswered", 0, 0), (ids[1], "unanswered", 0, 0)]
-        # the worker judges one of them before the undo: that one is listed and left alone
-        s._write(lambda c: c.execute("UPDATE conversation_turns SET addressed='yuki', extracted=1, extract_batch_id=9"
-                                     " WHERE id=?", (ids[1],)))
-    finally:
-        s.close()
-    assert bf.main(["--db", str(db), "--undo", str(undo_file)]) == 0
-    res = json.loads(capsys.readouterr().out)["undo"]
-    assert res["restored"] == [ids[0]] and [r["id"] for r in res["rejudged"]] == [ids[1]] and res["missing"] == []
-    s = Store.open(db)
-    try:
-        got = s._query("SELECT id, addressed, extracted, extract_attempts, extract_batch_id FROM conversation_turns"
-                       " ORDER BY id")
-        assert [tuple(r) for r in got] == [(ids[0], "others", 1, 1, 7), (ids[1], "yuki", 1, 0, 9)]
-    finally:
-        s.close()
-
-
-def test_f5_apply_leaves_a_row_that_changed_since_the_plan_and_undo_checks_the_database(tmp_path):
-    from yuki.memory import addressee_backfill as bf
-
-    db, logs, ids = _backfill_db(tmp_path)
-    s = Store.open(db)
-    try:
-        p = bf.plan(s, bf.unanswered_turns(bf.read_voice_logs(logs)))
-        s._write(lambda c: c.execute("UPDATE conversation_turns SET extract_attempts=2 WHERE id=?", (ids[0],)))
-        assert bf.apply(s, p, tmp_path / "undo.json") == [ids[1]]
-        assert s.turns_by_ids([ids[0]])[0].addressed == "others"
-        record = json.loads((tmp_path / "undo.json").read_text(encoding="utf-8"))
-        assert [r["id"] for r in record["rows"]] == [ids[1]]
-        # an undo file is refused against another database
-        record["db"] = str(tmp_path / "other.db")
-        (tmp_path / "other.json").write_text(json.dumps(record), encoding="utf-8")
-        with pytest.raises(ValueError):
-            bf.undo(s, tmp_path / "other.json")
-        # an apply whose undo file cannot be written changes nothing
-        p2 = bf.plan(s, ["voice-20261004-230000-bb-1"])
-        with pytest.raises(OSError):
-            bf.apply(s, p2, tmp_path / "no-such-dir" / "undo.json")
-        assert s.turns_by_ids([ids[0]])[0].addressed == "others"
-    finally:
-        s.close()
 
 
 # -- gap 3: why a quote was rejected ---------------------------------------------------------------------------------

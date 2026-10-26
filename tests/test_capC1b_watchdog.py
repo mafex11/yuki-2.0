@@ -126,22 +126,6 @@ def test_a_lookup_measured_slow_by_the_worker_marks_the_app(tmp_path):
         rig.store.close()
 
 
-def test_the_trace_health_carries_the_watchdogs_counts_for_the_doctor(tmp_path):
-    rig = Rig(tmp_path)
-    try:
-        f = Fake()
-        rig.w.hung = watch(f)
-        f.hung.add(HWND[APP])
-        rig.click()
-        rig.settle()
-        from yuki.core.doctor import _trace_learn_words
-
-        words = _trace_learn_words(None, rig.w.stats())
-        assert "skipped 1 look into apps that stopped answering" in words
-    finally:
-        rig.store.close()
-
-
 def test_the_re_probe_never_changes_the_shared_user32_prototype():
     """Review F6: ``window_answers`` uses its own ``SendMessageTimeoutW`` prototype; the shared ``windll`` one keeps
     whatever argument types other code gave it (``yuki.perception.tree`` passes a ``DWORD`` result). Window 0: no

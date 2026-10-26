@@ -1,4 +1,5 @@
-"""Hotfix 5 Oct 2026: the strict conversation tools' grammar size, and the re-queue of the turns it cost.
+"""Hotfix 5 Oct 2026: the strict conversation tools' grammar size. (The one-off re-queue of the turns it cost,
+``yuki.memory.grammar_requeue``, was deleted on 18 Oct with its tests.)
 
 Release 2 added ``for_yuki`` (an inline integer array) to the strict ``record_conversation_memory`` tool; Bedrock then
 refused every extraction call ("The compiled grammar is too large ..."). Measured on the real service (Haiku 4.5,
@@ -15,18 +16,13 @@ So the size that matters is the schema's structure (inline arrays most, then fie
 tests hold the strict tools to that measured budget: a schema that grows past it fails here, before it can fail every
 call in the field. To grow it, measure the new schema with one real call first and update the budget.
 
-Temp databases and invented ids only; no model is called.
+Schemas only; no model is called.
 """
 
 from __future__ import annotations
 
 import json
-import tempfile
-from collections import Counter
-from pathlib import Path
 from typing import Any
-
-import pytest
 
 #: Measured 5 Oct 2026 (see above): the fixed extraction schema compiles, and so does it with one more field.
 BUDGET = {"properties": 46, "inline_arrays": 7, "refs": 4, "enum_values": 51}
@@ -113,87 +109,3 @@ def test_the_fix_changes_no_accepted_json_and_no_description():
     assert props["operations"]["items"]["properties"]["exchanges"]["items"] == {"type": "integer"}
     assert props["knowhow"]["items"]["properties"]["exchanges"]["description"].startswith("Numbers [n]")
     assert "for_yuki" in RECORD_CONVERSATION_TOOL["input_schema"]["required"]
-
-
-# -- the re-queue --------------------------------------------------------------------------------------------------
-
-GRAMMAR = ("BadRequestError: Error code: 400 - {'message': 'The compiled grammar is too large, which would cause "
-           "performance issues. Simplify your tool schemas or reduce the number of strict tools.'}")
-
-
-@pytest.fixture()
-def store():
-    from yuki.memory.store import Store
-
-    with tempfile.TemporaryDirectory() as tmp:
-        s = Store.open(Path(tmp) / "memory.db")
-        try:
-            yield s
-        finally:
-            s.close()
-
-
-def _turn(store: Any, n: int, attempts: int, extracted: int = 0) -> int:
-    tid = store.add_turn("s-hot", f"r{n}", 1_791_150_000.0 + n, f"invented words {n}", "Okay.", [], "done")
-    store._write(lambda conn: conn.execute("UPDATE conversation_turns SET extract_attempts=?, extracted=? WHERE id=?",
-                                           (attempts, extracted, tid)))
-    return tid
-
-
-def _attempts(store: Any, tid: int) -> int:
-    return store._query("SELECT extract_attempts FROM conversation_turns WHERE id=?", (tid,))[0][0]
-
-
-def test_requeue_gives_back_only_the_attempts_the_grammar_error_took(store, tmp_path):
-    from yuki.memory import grammar_requeue as g
-
-    given_up = _turn(store, 1, 3)       # three grammar failures: given up
-    mixed = _turn(store, 2, 3)          # one other error, then two grammar failures
-    done = _turn(store, 3, 1, extracted=1)
-    other = _turn(store, 4, 3)          # given up for another reason: stays given up
-    rows = [{"type": "conversation_error", "purpose": "extract", "turn_ids": [given_up, mixed, done], "error": GRAMMAR},
-            {"type": "conversation_error", "purpose": "extract", "turn_ids": [given_up, mixed], "error": GRAMMAR},
-            {"type": "conversation_error", "purpose": "extract", "turn_ids": [given_up], "error": GRAMMAR},
-            {"type": "conversation_error", "purpose": "extract", "turn_ids": [mixed, other], "error": "Timeout"},
-            {"type": "conversation_error", "purpose": "summary", "turn_ids": [other], "error": GRAMMAR},
-            {"type": "conversation_extract", "turn_ids": [done]}]
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "conversations-20261005.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\nnot json\n",
-                                                       encoding="utf-8")
-    failures, per_turn, other_errors = g.grammar_failures(g.read_conversation_logs(logs))
-    assert failures == 3 and per_turn == Counter({given_up: 3, mixed: 2, done: 1})
-    assert other_errors == Counter({mixed: 1, other: 1})
-
-    p = g.plan(store, failures, per_turn, other_errors)
-    assert p.requeue == {given_up: (3, 0), mixed: (3, 1)} and p.already_extracted == 1
-    undo_file = tmp_path / "undo.json"
-    assert g.apply(store, p, undo_file) == sorted([given_up, mixed])
-    assert (_attempts(store, given_up), _attempts(store, mixed), _attempts(store, other)) == (0, 1, 3)
-    assert {t.id for t in store.turns_pending(3)} == {given_up, mixed}
-    assert g.plan(store, failures, per_turn, other_errors).requeue == {}   # run twice: nothing more to do
-
-    assert sorted(g.undo(store, undo_file)["restored"]) == sorted([given_up, mixed])
-    assert (_attempts(store, given_up), _attempts(store, mixed)) == (3, 3)
-    assert store.turns_pending(3) == []
-
-
-def test_requeue_dry_run_reads_only_and_apply_is_exact(store, tmp_path):
-    from yuki.memory import grammar_requeue as g
-
-    tid = _turn(store, 1, 3)
-    pending = _turn(store, 2, 1)        # one grammar failure, still in the queue: the worker retries it
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "conversations-20261005.jsonl").write_text(
-        json.dumps({"type": "conversation_error", "purpose": "extract", "turn_ids": [tid, pending],
-                    "error": GRAMMAR}) + "\n",
-        encoding="utf-8")
-    db = Path(store.path)
-    assert g.main(["--db", str(db), "--logs", str(logs)]) == 0
-    assert _attempts(store, tid) == 3                               # the dry run changed nothing
-    p = g.plan(store, *g.grammar_failures(g.read_conversation_logs(logs)))
-    assert p.requeue == {tid: (3, 2)}                              # one logged grammar failure
-    store._write(lambda conn: conn.execute("UPDATE conversation_turns SET extract_attempts=2 WHERE id=?", (tid,)))
-    assert g.apply(store, p, tmp_path / "undo.json") == []          # changed since the plan: left alone
-    assert _attempts(store, tid) == 2

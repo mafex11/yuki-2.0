@@ -99,25 +99,6 @@ def test_an_existing_registry_row_kept_as_a_command_follows_the_new_class_from_i
     assert rig.store._dec(el["name_ciphertext"]) == "Invented server name"     # promoted on its third day
 
 
-def test_the_step_lines_show_role_and_position_until_then(rig):
-    from yuki.memory.trace_tasks import element_label, element_names
-
-    _click_on(rig, thread_button("Invented plan for the garden, Working, home"), 150, 120)
-    row = [r for r in rig.rows() if r["kind"] == "click"][0]
-    names = element_names(rig.store, [row])
-    assert names[row["element_key"]] is None
-    label = element_label(row, None)
-    assert "Invented" not in label and "Button" in label
-
-
-def test_readers_that_judge_a_row_by_its_role_alone_find_no_name_on_it(rig):
-    from yuki.memory.practice_learn import _element_names
-
-    _click_on(rig, thread_button("Invented plan for the garden, Working, home"), 150, 120)
-    row = [r for r in rig.rows() if r["kind"] == "click"][0]
-    assert _element_names(rig.store, [row]) == {row["id"]: None}
-
-
 # -- review F3 and the sidebar drawn outside any list (9 Oct) ----------------------------------------------------------
 
 

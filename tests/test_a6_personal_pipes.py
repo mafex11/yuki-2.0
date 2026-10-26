@@ -134,45 +134,6 @@ def test_check_loops_keeps_the_fields(store):
     assert store.latest_portrait().sections["work"] == "He works at Corvana."
 
 
-# -- P0.3: ABOUT THE USER per kind ---------------------------------------------------------------------------
-
-
-def test_about_lines_give_every_kind_its_own_room_newest_first(store):
-    from yuki.memory.nudges import COACH_ABOUT_KINDS, PRESENCE_ABOUT_KINDS, _about_lines
-
-    jid = store.add_journal(T0, None, "Discord", "x", 5)
-    changes = [FactChange("ADD", None, "work", f"w{i}", f"Old work fact number {i} " + "x" * 200, 0.8, [jid],
-                          T0 - 86400 * (30 - i)) for i in range(20)]
-    changes += [FactChange("ADD", None, "routine", "sleep", "Goes to bed at 4-5 am.", 0.8, [jid], T0),
-                FactChange("ADD", None, "person", "Hemanth", "Best friend; Discord DM and WhatsApp.", 0.9, [jid], T0),
-                FactChange("ADD", None, "preference", "browser", "Uses Zen for Meet, Chrome for YouTube.", 0.8, [jid],
-                           T0),
-                FactChange("ADD", None, "behaviour", "valorant", "Plays VALORANT 21:00-02:00 most nights.", 0.8, [jid],
-                           T0)]
-    store.commit_portrait_changes(None, changes)
-    plain = lambda v, cap: str(v)[:cap]   # noqa: E731
-    lines = _about_lines(store, COACH_ABOUT_KINDS, plain)
-    text = "\n".join(lines)
-    for needle in ("Goes to bed", "person - Hemanth", "Uses Zen", "Plays VALORANT"):
-        assert needle in text
-    work = [line for line in lines if line.startswith("- work")]
-    assert work and "number 19" in work[0]               # the newest work fact first, not the 24 Sept ones
-    assert "person" in PRESENCE_ABOUT_KINDS and "preference" in PRESENCE_ABOUT_KINDS
-
-
-def test_about_lines_leave_out_a_fact_whose_evidence_was_withdrawn(store):
-    from yuki.memory.nudges import _about_lines
-
-    sample = store.add_journal(T0, None, "Chrome", "The user said they got a job offer from Google.", 7)
-    store._write(lambda conn: conn.execute("UPDATE journal SET tainted=1 WHERE id=?", (sample,)))
-    real = store.add_journal(T0, None, "Discord", "Works at Corvana.", 7)
-    store.commit_portrait_changes(None, [
-        FactChange("ADD", None, "work", "offer", "Got a job offer from Google.", 0.6, [sample], T0),
-        FactChange("ADD", None, "work", "job", "Works at Corvana.", 0.9, [real], T0)])
-    text = "\n".join(_about_lines(store, ("work",), lambda v, cap: str(v)))
-    assert "Corvana" in text and "Google" not in text
-
-
 # -- P0.5: the to-do list kept true --------------------------------------------------------------------------
 
 

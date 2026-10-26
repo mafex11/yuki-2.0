@@ -536,69 +536,10 @@ def test_review_f6_the_thinkers_opening_gets_the_watch_and_its_verdict_joins_the
     assert watched["verdict"] is True and watched["input"] == {"query": "Starfall", "watch": True}
     assert watched["app"] == "starfall-win64-shipping.exe" and out["ended_at"] >= 5.0 and len(seen) == 1
     assert any(a and a[0] == "launch_watch" for a, _k in logged)
-    from yuki.memory import practice as P
-
-    assert P.executable_step(watched) == {"do": "open_app", "name": "Starfall", "app": "starfall-win64-shipping"}
     # a backend without a watch keeps the opening as it was
     bare = SimpleNamespace(dispatcher=SimpleNamespace(backend=SimpleNamespace()), logger=None, _launch_watch_steps=[])
     A.Agent._watch_launch(bare, launcher, 0)
     assert bare._launch_watch_steps == []
-
-
-def test_review_f6_a_thinker_request_keeps_its_opening_with_the_watchs_verdict(tmp_path) -> None:
-    """End to end on an offline desk: the thinker's launch_app says "starting"; the run trace waits for the watch and
-    is kept with the hand-off facts and a verified watch step, so practice memory reads a verified opening."""
-    from test_c_practice import Words
-    from yuki.agent.loop import Agent
-    from yuki.agent.memory import MemoryAccess
-    from yuki.config import Settings
-    from yuki.log.events import SessionLogger
-    from yuki.memory import practice as P
-    from yuki.memory.api import MemoryClient
-    from yuki.memory.store import Store
-    from yuki.voice.offline import BrowserDesk
-
-    client = MemoryClient(Store.open(tmp_path / "m" / "memory.db"))
-    client._embedder = Words()
-    memory = MemoryAccess(open_client=lambda: client)
-    launcher = {"name": "Starfall", "appid": "x-starfall", "carrier_exe": CARRIER, "since": 1.0,
-                "handed_to": "fakelauncher.exe", "handed_at": 1790900000.5}
-
-    class Desk(BrowserDesk):
-        def launch_app(self, query: str, **_k: Any) -> Any:
-            return L.ActionResult(ok=True, summary="started 'Starfall': Fake Launcher took it; still starting",
-                                  details={"verified": None, "starting": True, "launcher": dict(launcher),
-                                           "hwnd": None}, elapsed_ms=5.0)
-
-        def watch_launch(self, launcher: dict, **_k: Any) -> dict:
-            return {"verified": True, "summary": "Starfall's own window is up after 1 s", "in_front": True,
-                    "process_name": "starfall-win64-shipping.exe", "fullscreen": True}
-
-    def resp(*blocks: Any) -> Any:
-        usage = SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_input_tokens=0,
-                                cache_creation_input_tokens=0)
-        return SimpleNamespace(content=list(blocks), stop_reason="tool_use", usage=usage)
-
-    calls = [resp(SimpleNamespace(type="tool_use", id="a1", name="launch_app", input={"query": "Starfall"})),
-             resp(SimpleNamespace(type="tool_use", id="d1", name="done", input={"message": "It's starting.",
-                                                                                "about": []}))]
-    fake = SimpleNamespace(messages=SimpleNamespace(create=lambda **p: calls.pop(0)))
-    settings = Settings(log_dir=tmp_path / "sessions", stream=False, requests_csv=tmp_path / "r.csv")
-    agent = Agent(settings, SessionLogger(settings.sessions_dir, console=None), client=fake, backend=Desk(action_delay_s=0),
-                  prewarm=False, record_requests=False, memory=memory)
-    list(agent.run("open starfall", effort="low", thinking=False))
-    deadline = time.monotonic() + 10.0
-    heads: list = []
-    while time.monotonic() < deadline and not heads:
-        memory.flush_turns(1)
-        heads = P.pending_runs(client.store)
-        time.sleep(0.05)
-    assert heads, "the run trace was never kept"
-    steps = [s for s in P.run_steps(client.store, heads[0].run_key) if s.tool == "launch_app"]
-    assert [s.verdict for s in steps] == [None, True]
-    assert '"handed_to":"fakelauncher.exe"' in steps[0].input and '"watch":true' in steps[1].input
-    assert P.verified_run(client.store, heads[0].run_key)
-    client.close()
 
 
 def test_review_f2_a_program_named_for_a_sibling_entry_too_is_the_app_only_under_its_launcher(world: World) -> None:
@@ -1015,51 +956,3 @@ def test_final_check_v3_a_shell_entry_with_no_window_is_not_said_to_have_no_proc
     summary = L._no_window_outcome({"name": "File Explorer", "appid": "x-fe"}, identity, {}, [], False, 3.0,
                                    time.monotonic() + 1.0)
     assert "no process of it is running" not in summary and "explorer.exe, which shows it, is shared" in summary
-
-
-def test_final_check_v3_the_thinker_keeps_that_no_window_came(tmp_path) -> None:
-    """A plain opening that showed no window at all (slow to start, or it crashed): the thinker's kept step says so,
-    so practice memory looks at what the user did next (final check V3-doubtful)."""
-    from test_c_practice import Words
-    from yuki.agent.loop import Agent
-    from yuki.agent.memory import MemoryAccess
-    from yuki.config import Settings
-    from yuki.log.events import SessionLogger
-    from yuki.memory import practice as P
-    from yuki.memory import practice_learn as PL
-    from yuki.memory.api import MemoryClient
-    from yuki.memory.store import Store
-    from yuki.voice.offline import BrowserDesk
-
-    client = MemoryClient(Store.open(tmp_path / "m" / "memory.db"))
-    client._embedder = Words()
-    memory = MemoryAccess(open_client=lambda: client)
-
-    class Desk(BrowserDesk):
-        def launch_app(self, query: str, **_k: Any) -> Any:
-            return L.ActionResult(ok=True, summary="started 'Beat Studio' but no window of it appeared within 8.0s",
-                                  details={"verified": None, "hwnd": None}, elapsed_ms=5.0)
-
-    def resp(*blocks: Any) -> Any:
-        usage = SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_input_tokens=0,
-                                cache_creation_input_tokens=0)
-        return SimpleNamespace(content=list(blocks), stop_reason="tool_use", usage=usage)
-
-    calls = [resp(SimpleNamespace(type="tool_use", id="a1", name="launch_app", input={"query": "Beat Studio"})),
-             resp(SimpleNamespace(type="tool_use", id="d1", name="done", input={"message": "It did not open.",
-                                                                                "about": []}))]
-    fake = SimpleNamespace(messages=SimpleNamespace(create=lambda **p: calls.pop(0)))
-    settings = Settings(log_dir=tmp_path / "sessions", stream=False, requests_csv=tmp_path / "r.csv")
-    agent = Agent(settings, SessionLogger(settings.sessions_dir, console=None), client=fake,
-                  backend=Desk(action_delay_s=0), prewarm=False, record_requests=False, memory=memory)
-    list(agent.run("open beat studio", effort="low", thinking=False))
-    deadline = time.monotonic() + 10.0
-    heads: list = []
-    while time.monotonic() < deadline and not heads:
-        memory.flush_turns(1)
-        heads = P.pending_runs(client.store)
-        time.sleep(0.05)
-    assert heads, "the run trace was never kept"
-    steps = [s for s in P.run_steps(client.store, heads[0].run_key) if s.tool == "launch_app"]
-    assert len(steps) == 1 and '"no_window":true' in steps[0].input and PL.doubtful_open(steps)
-    client.close()

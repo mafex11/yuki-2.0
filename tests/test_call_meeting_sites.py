@@ -5,10 +5,11 @@ The watcher hands call detection only a blocked page's app, host and time, in me
 sites is decided from the privacy file's own lists, never per visit: the shipped list of blocked sites is judged
 once as a whole (a stub here; the real one is a model), the user's [meetings] always_sites count by their word,
 and a site the user blocked themselves never counts. A sighting of a calling site during the microphone hold
-starts a call, the Ask card still decides recording, and the call lives by the site call's rules (review fixes
-F1-F5 of 2026-10-05). Invented data, temp databases and stubbed device holders, windows and page reads only:
-nothing reads the desktop, the microphone or the speakers, and the recorder's source factory fails the test if
-anything tries to open the microphone.
+starts a call once the user's join is measured (ma, 21 Oct: the site's app plays the call's sound; a stub here), the
+Ask card still decides recording, and the call lives by the site call's rules (review fixes F1-F5 of 2026-10-05).
+Invented data, temp databases and stubbed device holders, windows and page reads only: nothing reads the desktop,
+the microphone or the speakers, and the recorder's source factory fails the test if anything tries to open the
+microphone.
 """
 
 from __future__ import annotations
@@ -54,11 +55,16 @@ def store(tmp_path):
     s.close()
 
 
-def worker(store, stubs, *, sites_fn=sites_judge, privacy=None, **cfg):
+def worker(store, stubs, *, sites_fn=sites_judge, privacy=None, joined=True, **cfg):
     w = _worker(store, stubs, **cfg)
     w.evidence = CallEvidence(judge_fn=screen_judge, sites_fn=sites_fn, rejudge_s=0.0, privacy=privacy,
                               fresh_s=cfg.get("evidence_fresh_s", 900.0))
     w.sites_fn = lambda key: 8   # every app here shows many sites: a browser
+    # ma (21 Oct, A9): the call worker turns the join gate on, so a sighting starts a call only at the user's measured
+    # join (the site's app plays the call's sound). w.joined stands in for that sound, and keeps this PC's real Core
+    # Audio out of the test
+    w.joined = joined
+    w.evidence.sound_fn = lambda holder: w.joined
     return w
 
 
@@ -107,22 +113,27 @@ def test_the_shipped_privacy_list_names_the_meeting_sites_of_the_live_case():
 
 
 def test_a_lobby_false_start_costs_one_card_and_never_is_kept_for_the_service(store):
-    """A Meet lobby holds the microphone too and is the same host: the row starts, the card asks. "Never" on it is
-    the service's standing answer, not the browser's."""
+    """A Meet lobby holds the microphone too and is the same host. Since ma (21 Oct, A9: "the pre-join page is not a
+    call, recording waits for the real join") the lobby alone starts no row; the row starts at the measured join and
+    the card asks. "Never" on it is the service's standing answer, not the browser's."""
     now = time.time()
     stubs = Stubs()
     stubs.hold("mic", ZEN, now - 20)
-    w = worker(store, stubs)
+    w = worker(store, stubs, joined=False)  # the pre-join page: it plays no call sound
     sighting(w, ZEN, now - 10)
     w.step(now)
+    assert w.active is None                 # no row, no card on the lobby
+    w.joined = True                         # the user joins: the call's sound plays
+    w.step(now + 5)
     first = w.active.call_id
+    assert store.call_record(first).detected_at == pytest.approx(now + 5)   # the row starts at the measured join
     assert store.answer_call(first, "never")
     assert store.call_pref("Google Meet") == "never" and store.call_pref("zen") is None
     stubs.mic.clear()
-    for t in (5, 100, 200):
+    for t in (10, 100, 200):
         w.step(now + t)
     assert w.active is None
-    stubs.hold("mic", ZEN, now + 300)       # the next Meet call
+    stubs.hold("mic", ZEN, now + 300)       # the next Meet call, joined
     sighting(w, ZEN, now + 305)
     w.step(now + 306)
     row = store.call_record(w.active.call_id)
