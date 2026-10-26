@@ -235,10 +235,11 @@
   const LINE_SAID = { open: 'Opened', not_useful: 'Not useful: noted' };
   function digestLines(g) {
     const said = g.line_reactions || {};
-    return h('div', { class: 'lsteps', data: { k: 'lines:' + g.card } }, (g.lines || []).filter((ln) => ln && ln.n > 0).map((ln) => {
+    const rows = (g.lines || []).filter((ln) => ln && ln.n > 0);
+    return h('div', { class: 'lsteps', data: { k: 'lines:' + g.card } }, rows.map((ln) => {
       const r = said[String(ln.n)];
       return h('div', { class: 'lstep', data: { row: `line:${g.card}:${ln.n}` } },
-        h('span', { class: 'tm', text: `${ln.n}.` }),
+        h('span', { class: 'tm', text: rows.length > 1 ? `${ln.n}.` : '' }),   /* one line: no "1." (tc1) */
         h('span', { class: 'wh' }, h('span', { class: 'w1', text: ln.text || '' })),
         h('span', { class: 'rs' }, r ? h('span', { text: LINE_SAID[r] || r })
           : [key('Open', { cls: 'xs', data: { do: 'digest-line', card: g.card, n: ln.n, way: 'open' } }),

@@ -985,7 +985,8 @@ class NudgeCard(LatticeCard):
         self.body._lh = 1.45
         self.body.set_font(L.ui_font(15, 400))
         self.body.set_text(head)
-        self.rest.set_text(LINE_SEP.join(f"{ln['n']}. {ln['text']}" for ln in lines))
+        self.rest.set_text(LINE_SEP.join(f"{ln['n']}. {ln['text']}" if len(lines) > 1 else ln["text"]
+                                         for ln in lines))   # one line: no "1." (tc1)
         self.rest.setVisible(bool(lines))
         self.rest_gap.setVisible(bool(lines))
         self.detail.set_plain("")

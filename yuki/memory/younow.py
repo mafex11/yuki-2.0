@@ -1572,16 +1572,20 @@ class YouBuilder:
             known = False
         plans: list[dict[str, Any]] = []
         try:
-            raw = self.store.nudge_state("presence_events")
-            events = json.loads(self.store.cipher.decrypt(raw)) if raw else []
-            for ev in events if isinstance(events, list) else []:
-                at = ev.get("at") if isinstance(ev, dict) else None
+            from yuki.memory.presence import fold_events, load_events
+
+            # one row per event, a time only when it is sure (tc1: one interview was 12 rows at 07:30, 10:30, 14:00)
+            for ev in fold_events(load_events(self.store)):
+                at = ev.get("at")
                 if not isinstance(at, (int, float)) or ev.get("asked"):
                     continue
-                turns += [t for t in (at - PLANS_AHEAD_S, at) if t > now]   # enters the window, passes
-                if not now <= at <= now + PLANS_AHEAD_S:
+                all_day = bool(ev.get("all_day"))
+                gone = at + (86400.0 if all_day else 0.0)   # an all-day plan stays through its day
+                turns += [t for t in (at - PLANS_AHEAD_S, gone) if t > now]   # enters the window, passes
+                if not (at <= now + PLANS_AHEAD_S and now <= gone):
                     continue
-                plans.append({"id": ev.get("id"), "at": _r(at), "title": _text(ev.get("what"), TITLE_CHARS)})
+                plans.append({"id": ev.get("id"), "at": _r(at), "all_day": all_day,
+                              "title": _text(ev.get("what"), TITLE_CHARS)})
             plans = sorted(plans, key=lambda p: p["at"])[:PLANS_MAX]
         except Exception:  # noqa: BLE001
             known = False
@@ -1898,10 +1902,10 @@ def _render_cards(you: Any, now: float) -> list[tuple[int, str]]:
     lines.append((4, f"Their list: {work.get('list_n', 0)} open; replies owed {b.get('replies_owed', 0)}, "
                      f"waiting on others {b.get('waiting_on', 0)}, coming up {b.get('coming_up_n', 0)}."))
     for pl in work.get("plans") or []:
-        if pl["at"] < now:   # passed since the build
+        if pl["at"] + (86400.0 if pl.get("all_day") else 0.0) < now:   # passed since the build
             continue
-        lines.append((4, f"Plan [event:{pl.get('id')}]: {pl.get('title') or ''}, "
-                         f"{datetime.fromtimestamp(pl['at']):%a %H:%M}"))
+        when = datetime.fromtimestamp(pl["at"]).strftime("%a" if pl.get("all_day") else "%a %H:%M")
+        lines.append((4, f"Plan [event:{pl.get('id')}]: {pl.get('title') or ''}, {when}"))
     about = you.get("about") or {}
     if about.get("with_him"):
         lines.append((3, f"How to be with them: {about['with_him']}"))

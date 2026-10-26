@@ -117,6 +117,7 @@ from yuki.memory.candidates import (
     Context,
     Memo,
     Seen,
+    clip_words,
     evidence_lines,
     generate,
     guard_ok,
@@ -247,6 +248,14 @@ class JudgeConfig:
 
 #: Room for one more ``changed`` item (bytes): a section this far under YouNow's byte cap lost nothing to it.
 CHANGED_ITEM_ROOM = 320
+
+
+def digest_text(lead: str, lines: Sequence[str]) -> str:
+    """A Today card's or away list's text: the lead, then its lines; numbered "1) ..." only when there are two or more
+    (tc1: one line under a "1)" read as a form). ``inputs.lines`` keep their numbers either way (replies cite them)."""
+    if len(lines) == 1:
+        return "\n".join([lead, lines[0]])
+    return "\n".join([lead, *(f"{n}) {t}" for n, t in enumerate(lines, 1))])
 
 
 def _changed_whole(changed: Any) -> bool:
@@ -2142,9 +2151,8 @@ class CardJudge:
                 head_r = None
         texts: list[tuple[Candidate, str]] = []
         for c in lines:
-            t = resolve(c.digest_line)
+            t = clip_words(resolve(c.digest_line), DIGEST_LINE_CHARS)   # at a whole word (tc1)
             if t:
-                t = t if len(t) <= DIGEST_LINE_CHARS else t[: DIGEST_LINE_CHARS - 1].rstrip() + "…"
                 texts.append((c, t))
         if head_r is None and (not texts or (kind == "away" and len(texts) < AWAY_MIN_LINES)):
             return None
@@ -2159,7 +2167,7 @@ class CardJudge:
         meta = [{"n": i + 1, "type": c.type, "ref": f"Q{asked[c.key]}" if c.key in asked else line_ref(c), "text": t}
                 for i, (c, t) in enumerate(texts)]
         lead = head_text or (TODAY_LEAD if kind == "today" else AWAY_LEAD)
-        text = "\n".join([lead, *(f"{m['n']}) {m['text']}" for m in meta)])
+        text = digest_text(lead, [m["text"] for m in meta])
         inputs = {"judge": kind, "key": key, "class": klass, "head": head_text, "lines": meta,
                   "asking": sum(1 for c, _t in texts if c.asks), **({"day_began": began} if began is not None else {})}
         reason = ("Your Today card: " if kind == "today" else "Your \"while you were away\" list: ") + (
@@ -2239,7 +2247,7 @@ class CardJudge:
             if not text:
                 continue
             lines.append({"type": c.type, "ref": line_ref(c), "asks": bool(c.asks), "queued_at": round(first, 1),
-                          "expires_at": c.expires_at, "text": text[:DIGEST_LINE_CHARS]})
+                          "expires_at": c.expires_at, "text": clip_words(text, DIGEST_LINE_CHARS)})
             if len(lines) >= 12:
                 break
         try:
@@ -2642,8 +2650,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "BAR", "DIGEST_REACTIONS_STATE", "DIGEST_STATE", "QUEUE_STATE", "TIMING", "TYPES_STATE", "CardJudge", "CardWriter",
-    "JudgeConfig", "Ledger", "ShadowBook", "WRITE_CARD_TOOL", "WRITER_PROMPT", "kind_list", "moment_class", "report",
-    "set_kind_mode", "type_of",
+    "JudgeConfig", "Ledger", "ShadowBook", "WRITE_CARD_TOOL", "WRITER_PROMPT", "digest_text", "kind_list",
+    "moment_class", "report", "set_kind_mode", "type_of",
 ]
 
 

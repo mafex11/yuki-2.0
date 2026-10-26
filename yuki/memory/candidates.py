@@ -102,6 +102,7 @@ from yuki.memory.presence import (
     STUCK_WINDOW_S,
     THREAD_AGAIN_S,
     _call_sessions,
+    fold_events,
     recurrence,
 )
 from yuki.memory.presence import EVENTS_STATE as PRESENCE_EVENTS_STATE
@@ -226,11 +227,22 @@ def resolve(value: Any) -> str | None:
     return text or None
 
 
-def _clip(value: Any, cap: int) -> str | None:
+def clip_words(value: Any, cap: int) -> str | None:
+    """White space squashed; when longer than ``cap``, cut after the last whole word (one past half the cap), the
+    separators left at the end dropped, then "…" (tc1, 26 Oct: "... on Google Meet - pres… at 10:30")."""
     text = " ".join(str(value or "").split())
     if not text:
         return None
-    return text if len(text) <= cap else text[: cap - 1].rstrip() + "…"
+    if len(text) <= cap:
+        return text
+    cut = text[: cap - 1]
+    space = cut.rfind(" ")
+    if space > cap // 2:
+        cut = cut[:space]
+    return cut.rstrip(" -–—,;:/(") + "…"
+
+
+_clip = clip_words
 
 
 def _when(at: float, now: float, all_day: bool = False) -> str:
@@ -331,6 +343,9 @@ class Context:
         self._goals: list[Any] | None = None
         self._events: list[dict[str, Any]] | None = None
         self._referents: dict[int, dict[str, Any]] | None = None
+        #: Every ref (an item's, ``event:<id>`` for each stored row of an event) on today's dated lines, shown, seen
+        #: or not: :func:`gen_plans` makes no plans card about them (one mention of one plan a day).
+        self.dated_refs: set[str] = set()
 
     def deadline(self, at: float | None) -> None:
         if at is not None and float(at) > self.now:
@@ -380,12 +395,14 @@ class Context:
 
     @property
     def events(self) -> list[dict[str, Any]]:
-        """The user's dated personal events the events scan found (``presence_events``, encrypted state)."""
+        """The user's dated personal events the events scan found (``presence_events``, encrypted state), one row per
+        event (:func:`yuki.memory.presence.fold_events`: its stored rows' ids in ``ids``; a time only when it is
+        sure, else ``all_day``)."""
         if self._events is None:
             try:
                 raw = self.store.nudge_state(PRESENCE_EVENTS_STATE)
                 data = json.loads(self.store.cipher.decrypt(raw)) if raw else []
-                self._events = [e for e in data if isinstance(e, dict)] if isinstance(data, list) else []
+                self._events = fold_events(data if isinstance(data, list) else [])
             except Exception:  # noqa: BLE001
                 self._events = []
         return self._events
@@ -1000,7 +1017,12 @@ def gen_event_followups(ctx: Context) -> list[Candidate]:
     Today line is code (the event's own few words and its day).
 
     Differences: the 3-hourly events scan is not run here (``PresenceWorker._followup`` still runs it; jSwitch moves it
-    onto the judge's schedule); an event's ``asked`` flag is read only live; once per event by the judge's own mark."""
+    onto the judge's schedule); an event's ``asked`` flag is read only live; once per event by the judge's own mark.
+
+    tc1 (26 Oct): one follow-up per event, however many rows it was stored as (``ctx.events`` is folded; every row's
+    ``followup:`` mark counts), and never before the event: an event with no sure time is asked from
+    ``ALL_DAY_ASK_AT``, and not before ``FOLLOWUP_AFTER_S`` past the latest time any of its rows named (an offered
+    07:30 made 08:30 "how did it go?" eligible two hours before a 10:30 interview)."""
     from yuki.memory.checkins import _minutes
 
     now = ctx.now
@@ -1010,17 +1032,20 @@ def gen_event_followups(ctx: Context) -> list[Candidate]:
             continue
         try:
             at, all_day = float(ev["at"]), bool(ev.get("all_day"))
+            latest = float(ev.get("latest") or at)
         except (KeyError, TypeError, ValueError):
             continue
-        ask_from = (at + _minutes(ALL_DAY_ASK_AT) * 60.0) if all_day else at + FOLLOWUP_AFTER_S
+        ask_from = max(at + _minutes(ALL_DAY_ASK_AT) * 60.0, latest + FOLLOWUP_AFTER_S) if all_day \
+            else at + FOLLOWUP_AFTER_S
         until = at + (86400.0 if all_day else 0.0) + FOLLOWUP_WITHIN_S
         if now < ask_from:
             ctx.deadline(ask_from)
             continue
         if now > until:
             continue
+        keys = [f"followup:{i}" for i in ev.get("ids") or [ev.get("id")]]
         key = f"followup:{ev.get('id')}"
-        if ctx.seen.looked(key, now):
+        if any(ctx.seen.looked(k, now) for k in keys):
             continue
         facts = _journal_meta(ctx.store, _fact_ids(ev.get("evidence")))
         if not facts:
@@ -1030,7 +1055,8 @@ def gen_event_followups(ctx: Context) -> list[Candidate]:
                              refs={"event": ev.get("id")}, evidence={f"J{f.id}": f.at for f in facts},
                              digest_line=(lambda w=what, d=day: _clip(f"{_clip(w, 70)} ({d}) - how did it go?",
                                                                        DIGEST_LINE_CHARS)),
-                             needs_writer=True, offer_channel="followup", why=f"followup facts={len(facts)}"))
+                             needs_writer=True, offer_channel="followup", why=f"followup facts={len(facts)}",
+                             seen_keys=tuple(k for k in keys if k != key)))
         break
     return out
 
@@ -1048,7 +1074,7 @@ def gen_plans(ctx: Context) -> list[Candidate]:
     line for it seen (one mention per plan a day)."""
     now = ctx.now
     dated = dated_today(ctx)
-    dated_refs = {c.refs.get("item") or c.refs.get("plan") for c in dated}
+    dated_refs = set(ctx.dated_refs) | {c.refs.get("item") or c.refs.get("plan") for c in dated}
     today = user_day(now, ctx.config.resume_day_start)
     cands: list[dict[str, Any]] = []
     for item in ctx.items:
@@ -1057,7 +1083,8 @@ def gen_plans(ctx: Context) -> list[Candidate]:
         day0 = datetime.fromtimestamp(item.due_at).replace(hour=0, minute=0, second=0).timestamp()
         cands.append({"ref": item.ref, "at": day0 if item.all_day else float(item.due_at), "all_day": bool(item.all_day),
                       "due": float(item.due_at), "words": (lambda i=item: i.title or i.text),
-                      "since": float(item.since or now)})
+                      "since": float(item.since or now), "keys": (f"plans:{item.ref}",)})
+    planned = {c["ref"] for c in cands}
     for g in ctx.goals:
         if g.due_at is not None:
             at, all_day = float(g.due_at), False
@@ -1069,13 +1096,17 @@ def gen_plans(ctx: Context) -> list[Candidate]:
         else:
             continue
         cands.append({"ref": g.ref, "at": at, "all_day": all_day, "due": at, "words": (lambda g=g: g.text),
-                      "since": float(g.updated_at)})
+                      "since": float(g.updated_at), "keys": (f"plans:{g.ref}",)})
     for ev in ctx.events:
         if (ctx.live and ev.get("asked")) or not ev.get("at"):
             continue
+        if planned & _cited_items(ev):
+            continue   # the event rests on a plan on their list: that plan is the one card about it
         at = float(ev["at"])
         cands.append({"ref": f"event:{ev.get('id')}", "at": at, "all_day": bool(ev.get("all_day")), "due": at,
-                      "words": (lambda e=ev: e.get("what")), "since": float(ev.get("found_at") or now)})
+                      "words": (lambda e=ev: e.get("what")), "since": float(ev.get("found_at") or now),
+                      "keys": tuple(f"plans:event:{i}" for i in ev.get("ids") or [ev.get("id")]),
+                      "refs": {f"event:{i}" for i in ev.get("ids") or [ev.get("id")]}})
     todos = [float(i.due_at) for i in ctx.items if i.source == "user" and i.due_at is not None]
     answered = _confirm_answered(ctx.store, now)
     for c in sorted(cands, key=lambda c: c["at"]):
@@ -1088,17 +1119,25 @@ def gen_plans(ctx: Context) -> list[Candidate]:
         if any(abs(t - c["due"]) <= PLANS_TODO_NEAR_S for t in todos):
             continue   # a timed to-do of theirs already sits by it
         key = f"plans:{c['ref']}"
-        if ctx.seen.looked(key, now, PLANS_AGAIN_S) or c["ref"] in answered or c["ref"] in dated_refs:
+        refs = c.get("refs") or {c["ref"]}
+        if any(ctx.seen.looked(k, now, PLANS_AGAIN_S) for k in c["keys"]) or refs & answered or refs & dated_refs:
             continue
-        when = _when(c["due"], now, c["all_day"])
+        when = _when(c["due"], now, c["all_day"])   # an event with no sure time: its day only
         return [Candidate("plans", key, created_at=now, expires_at=c["at"] - PLANS_MIN_LEAD_S, home="card",
-                          confidence=0.7, refs={"plan": c["ref"]}, evidence={"PLAN": c["due"], c["ref"]: c["since"]},
+                          confidence=0.7, refs={"plan": c["ref"], "all_day": bool(c["all_day"])},
+                          evidence={"PLAN": c["due"], c["ref"]: c["since"]},
                           digest_line=(lambda w=c["words"], d=when: _clip(f"Coming up: {_clip(resolve(w), 80)} ({d})",
                                                                          DIGEST_LINE_CHARS)),
                           needs_writer=True, offer_channel="plans", seen_within=PLANS_AGAIN_S,
-                          seen_keys=(f"dated:{c['ref']}:{today}",),
+                          seen_keys=tuple(k for k in c["keys"] if k != key)
+                          + tuple(f"dated:{r}:{today}" for r in sorted(refs)),
                           why=f"plans lead_h={lead / 3600.0:.1f} all_day={int(c['all_day'])}"), *dated]
     return dated
+
+
+def _cited_items(ev: dict[str, Any]) -> set[str]:
+    """The list items an event rests on: its evidence's ``C<id>`` lines are the user's dated plans (``commit:<id>``)."""
+    return {f"commit:{str(e)[1:]}" for e in ev.get("evidence") or [] if str(e)[:1] == "C" and str(e)[1:].isdigit()}
 
 
 def dated_today(ctx: Context) -> list[Candidate]:
@@ -1106,25 +1145,38 @@ def dated_today(ctx: Context) -> list[Candidate]:
     while a plan for that day waited): the user's own open list items (a plan said on a call or told Yuki, a to-do of
     theirs) due today, a goal for today, a personal event today. "Today" is the user's day (``resume_day_start``); an
     all-day item by its date, a timed one only while still ahead. A call promise only once known what it is about
-    (:meth:`Context.asks_ok`). The same words twice (an event and the promise it came from) are one line (identity,
-    case folded). Code text "Today: <title>[ at HH:MM]", type ``plans`` (its ledger and toggle), home ``digest``,
-    ``lead`` (first on the card), timed ones first; at most :data:`DATED_MAX`. Each once a day; shown, it marks its
-    plans card seen (one mention per plan). Content-free ``why``."""
+    (:meth:`Context.asks_ok`). Type ``plans`` (its ledger and toggle), home ``digest``, ``lead`` (first on the card),
+    timed ones first; at most :data:`DATED_MAX`. Each once a day; shown, it marks its plans card seen (one mention per
+    plan). Content-free ``why``.
+
+    tc1 (26 Oct 2026: "Today: Hollis ... at 07:30" / "... at 10:30" / "... at 10:30" for one 10:30 interview):
+
+    * **One line per thing.** An event is one row however many times the scan stored it (``ctx.events`` is folded,
+      :func:`yuki.memory.presence.fold_events`). An event and the list item it rests on (its evidence cites the plan,
+      ``C<id>`` = ``commit:<id>``) or with the same words are one line, in the item's words. A line is skipped when any
+      of its rows was shown or seen today, and every row's mark is set with it (a copy never comes back as new).
+    * **A time only when it is sure and agreed.** A list item's or goal's time is the user's own; an event has a time
+      only when the scan stated it settled, with its zone, converted by code. When a line's sure times disagree it
+      shows no time. A line with a time leaves once the time has passed; one without stays for the day.
+    * **Plain words.** The title (clipped at a whole word), then " at HH:MM" only when sure: no "Today:" on the
+      Today card."""
     now = ctx.now
     day = user_day(now, ctx.config.resume_day_start)
     start = day_boundary(day, ctx.config.resume_day_start)
     end = start + 86400.0
-    found: list[tuple[int, float, str, dict[str, Any], Any]] = []   # (all day, when, ref, refs, words)
+    found: list[dict[str, Any]] = []
 
-    def add(ref: str, refs: dict[str, Any], at: float | None, all_day: bool, words: Any) -> None:
+    def add(ref: str, refs: dict[str, Any], at: float | None, all_day: bool, words: Any, *, rows: Sequence[str] = (),
+            cites: set[str] | None = None) -> None:
         if at is None:
             return
         if all_day:
             if datetime.fromtimestamp(float(at)).strftime("%Y-%m-%d") != day:
                 return
-        elif not (start <= float(at) < end) or float(at) < now:
+        elif not (start <= float(at) < end):
             return
-        found.append((int(bool(all_day)), float(at), ref, refs, words))
+        found.append({"ref": ref, "refs": refs, "at": float(at), "all_day": bool(all_day), "words": words,
+                      "rows": list(rows) or [ref], "cites": cites or set(), "item": "item" in refs})
 
     for item in ctx.items:
         if item.due_at is None or item.source not in ("call", "chat", "user") or not ctx.asks_ok(item):
@@ -1142,25 +1194,46 @@ def dated_today(ctx: Context) -> list[Candidate]:
     for ev in ctx.events:
         if ev.get("at"):
             ref = f"event:{ev.get('id')}"
-            add(ref, {"plan": ref}, float(ev["at"]), bool(ev.get("all_day")), lambda e=ev: e.get("what"))
-    out: list[Candidate] = []
-    said: set[str] = set()
-    for all_day, at, ref, refs, words in sorted(found, key=lambda f: (f[0], f[1])):
-        key = f"dated:{ref}:{day}"
-        if ctx.seen.looked(key, now, 86400.0):
+            add(ref, {"plan": ref}, float(ev["at"]), bool(ev.get("all_day")), lambda e=ev: e.get("what"),
+                rows=[f"event:{i}" for i in ev.get("ids") or [ev.get("id")]], cites=_cited_items(ev))
+    for f in found:
+        f["text"] = _clip(resolve(f["words"]), 80)
+    # one line per thing: items first (their words lead), then by (all day, time)
+    lines: list[list[dict[str, Any]]] = []
+    for f in sorted(found, key=lambda f: (not f["item"], f["all_day"], f["at"])):
+        same = next((g for g in lines for m in g
+                     if m["ref"] in f["cites"] or f["ref"] in m["cites"]
+                     or (f["text"] and m["text"] and f["text"].casefold() == m["text"].casefold())), None)
+        if same is not None:
+            same.append(f)
+        else:
+            lines.append([f])
+    out: list[tuple[tuple[int, float], Candidate]] = []
+    for members in lines:
+        rows = [r for m in members for r in m["rows"]]
+        ctx.dated_refs.update(rows)
+        keys = [f"dated:{r}:{day}" for r in rows]
+        if any(ctx.seen.looked(k, now, 86400.0) for k in keys):
             continue
-        text = _clip(resolve(words), 80)
-        if not text or text.casefold() in said:
+        lead = members[0]
+        text = next((m["text"] for m in members if m["text"]), None)
+        if not text:
             continue
-        said.add(text.casefold())
-        line = f"Today: {text}" + ("" if all_day else f" at {datetime.fromtimestamp(at):%H:%M}")
-        out.append(Candidate("plans", key, created_at=now, expires_at=end, home="digest", confidence=0.9, refs=refs,
-                             evidence={"PLAN": at}, digest_line=_clip(line, DIGEST_LINE_CHARS), lead=True,
-                             seen_within=86400.0, seen_keys=(f"plans:{ref}",),
-                             why=f"dated all_day={all_day}"))
-        if len(out) >= DATED_MAX:
-            break
-    return out
+        sure = {int(round(m["at"] / 60.0)) for m in members if not m["all_day"]}
+        at = sure.pop() * 60.0 if len(sure) == 1 else None
+        if at is not None and at < now:
+            continue   # its time has passed
+        if at is None and not any(m["all_day"] or m["at"] >= now for m in members):
+            continue
+        line = text + (f" at {datetime.fromtimestamp(at):%H:%M}" if at is not None else "")
+        key = f"dated:{lead['ref']}:{day}"
+        out.append(((0 if at is not None else 1, at if at is not None else lead["at"]),
+                    Candidate("plans", key, created_at=now, expires_at=end, home="digest", confidence=0.9,
+                              refs=lead["refs"], evidence={"PLAN": at if at is not None else start},
+                              digest_line=_clip(line, DIGEST_LINE_CHARS), lead=True, seen_within=86400.0,
+                              seen_keys=tuple(k for k in keys if k != key) + tuple(f"plans:{r}" for r in rows),
+                              why=f"dated all_day={int(at is None)} rows={len(rows)}")))
+    return [c for _k, c in sorted(out, key=lambda x: x[0])][:DATED_MAX]
 
 
 def _confirm_answered(store: Any, now: float) -> set[str]:
@@ -1723,6 +1796,11 @@ def evidence_lines(store: Any, c: Candidate, now: float, safe: Callable[[Any, in
             elif ":" in k and k.split(":", 1)[0] in ("todo", "commit", "loop", "event"):
                 ids[k] = float(c.evidence[k])
                 lines.append(f"- [{k}] (an item of theirs, as DEADLINES and TO-DOS show it)")
+            elif k == "PLAN" and c.type == "plans":
+                # the plan's own day and time, as their list or the events scan holds it (not a measurement); a plan
+                # with no sure time gives its day only (tc1: an offered 07:30 and a Japan 14:00 were not its time)
+                ids[k] = float(c.evidence[k])
+                lines.append(f"- [{k}] when it is: {_when(float(c.evidence[k]), now, bool(c.refs.get('all_day')))}")
             elif k in ("DAY", "HOURS", "BREAK", "S", "PLAN", "BOARD") or (k[:1] == "R" and k[1:].isdigit()):
                 ids[k] = float(c.evidence[k])
                 lines.append(f"- [{k}] measured at {_when(float(c.evidence[k]), now)} ({c.why})")
@@ -1733,6 +1811,6 @@ def evidence_lines(store: Any, c: Candidate, now: float, safe: Callable[[Any, in
 
 __all__ = [
     "BEST_CLASSES", "CALL_UNKNOWN_GENERATORS", "Candidate", "Context", "DIGEST_LINE_CHARS", "GENERATORS", "Memo",
-    "SEEN_STATE", "Seen", "TYPES", "TypeInfo", "evidence_lines", "gen_routine", "gen_usual", "generate", "guard_ok",
-    "line_ref", "remind_at", "resolve", "usual_now", "usual_offerable",
+    "SEEN_STATE", "Seen", "TYPES", "TypeInfo", "clip_words", "dated_today", "evidence_lines", "gen_routine",
+    "gen_usual", "generate", "guard_ok", "line_ref", "remind_at", "resolve", "usual_now", "usual_offerable",
 ]

@@ -326,9 +326,10 @@ def _live_lines(store: Store, now: float, safe: Callable[[Any, int], str], out: 
     except Exception:
         pass
     try:
-        raw = store.nudge_state("presence_events")   # yuki.memory.presence.EVENTS_STATE: vetted personal events
-        events = json.loads(store.cipher.decrypt(raw)) if raw else []
-        ahead = sorted((e for e in events if isinstance(e, dict) and float(e.get("at") or 0.0) >= now - 86400.0),
+        from yuki.memory.presence import fold_events, load_events
+
+        events = fold_events(load_events(store))   # vetted personal events, one row per event (tc1)
+        ahead = sorted((e for e in events if float(e.get("at") or 0.0) >= now - 86400.0),
                        key=lambda e: float(e.get("at") or 0.0))[:INPUT_EVENTS]
         for i, e in enumerate(ahead, 1):
             ev_id = str(e.get("id") or i)
