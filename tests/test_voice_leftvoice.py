@@ -45,10 +45,11 @@ def test_the_look_comes_after_a_few_words_and_every_other_call_stays_alone() -> 
     # what the Earlier block holds is answered from it, with no look
     assert "answer from the Earlier block when it holds it" in " ".join(MOUTH_PROMPT.split())
     # no say_first field (its tokens were the reason vfix4 left this open), and no then field either (third check
-    # LVV-1: the turn's end no longer rests on the talker filling it): still vfix4's 700
-    assert list(QUICK_MEMORY["properties"]) == ["action", "items", "query"]
+    # LVV-1: the turn's end no longer rests on the talker filling it). lThink (17 Oct) added day and part (a look at
+    # one day, or part of it), which took it to 933 characters: the ceiling is 950 since
+    assert list(QUICK_MEMORY["properties"]) == ["action", "items", "query", "day", "part"]
     assert QUICK_MEMORY["required"] == ["action"]
-    assert len(json.dumps(QUICK_MEMORY)) <= 700
+    assert len(json.dumps(QUICK_MEMORY)) <= 950
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -102,7 +103,7 @@ def test_words_before_a_look_reach_the_voice_before_the_call_and_count_as_said()
             async def gen() -> Any:
                 for e in events[1:]:
                     yield e
-            return gen(), events[0]
+            return gen(), [events[0]]   # kMind review M2 (18 Oct): the head read is a list
 
         llm._yuki_open = fake_open
         llm._yuki_call = LlmCall(entered=time.monotonic(), user_turn=True)
@@ -329,8 +330,11 @@ def _conversation(spoke: set[str], report: dict[str, Any], *, by_code: bool = Fa
                 await params.result_callback(report)
 
     llm = SimpleNamespace(_yuki_spoke=spoke, _yuki_solo=set(spoke) if solo is None else solo, queue_frame=queue_frame)
+    # one19 (19 Oct): the look counts reads running, stamps when the last ended, may say a lead by code, and an
+    # answer at once passes through the ONE driver when there is one
     conv = SimpleNamespace(_llm=llm, quick_memory=Tool(), log=_Log(), session="s1",
-                           observer=SimpleNamespace(bot_speaking=True, user_speaking=user_speaking), queued=queued)
+                           observer=SimpleNamespace(bot_speaking=True, user_speaking=user_speaking), queued=queued,
+                           _reads_running=0, _read_done_at=0.0, _memory_lead=lambda call_id: None, one_driver=None)
     conv._answer_look_now = lambda params, result: Conversation._answer_look_now(conv, params, result)
     return conv
 

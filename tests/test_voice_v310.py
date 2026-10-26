@@ -243,35 +243,8 @@ def test_the_same_opening_twice_runs_once_with_one_done_line() -> None:
     asyncio.run(main())
 
 
-def test_a_refused_hand_on_a_stale_tab_goes_to_the_thinker_by_code() -> None:
-    async def main() -> None:
-        from yuki.voice.hands import Snapshot
-
-        rt, bridge = _bridge()
-        announced: list = []
-
-        async def announce(payload: dict, run_llm: bool = True) -> None:
-            announced.append(payload)
-
-        bridge.announce = announce
-        desk = _OpenDesk()
-        desk.tab = lambda *a, **k: None
-        hands = _hands(desk, bridge)
-        hands.last = Snapshot(text="x", hwnds={42}, tabs={42: ["YouTube"]}, tab_ids={42: ["id-1"]})
-        params = _hand_params("tab", {"window": 42, "action": "close", "tabs": [9], "named": "the second YouTube tab"})
-        await hands.handle(params)
-        result, props = params.results[-1]
-        # v3.14: nothing was said for their words yet, so one talker run says a couple of words that Yuki is on it
-        # (the note forbids narrating the refusal); already acknowledged, no run at all (below, v3.9's rule)
-        from yuki.voice.hands import _PASSED_ACK_NOTE
-
-        assert result.get("passed_on") is True and _run_llm(props) is True
-        assert result["how_to_handle_it"] == _PASSED_ACK_NOTE
-        await _settle()
-        assert len(rt.submitted) == 1 and rt.submitted[0][2].get("lane") == "worker"
-        assert "tabs line you were shown" in rt.submitted[0][1]   # the thinker gets the report and reads afresh
-
-    asyncio.run(main())
+# The stale-tab refusal by number ("the tabs line you were shown") and its _PASSED_ACK_NOTE went with pVoice and kHands
+# (17-18 Oct: tabs are found by title, refusals carry a reason code); its test went with them.
 
 
 def test_a_calls_hold_is_decided_once_when_the_reply_ends() -> None:

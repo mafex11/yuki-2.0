@@ -336,10 +336,9 @@ def test_the_return_card_widget_has_no_undo_or_cant_undo_text(qapp: Any) -> None
     from yuki.ui.lattice_cards import ReturnCard
 
     card = ReturnCard()
+    # iUI (18 Oct) took the Learned box off the card, so show_run has no learned= and the card no .learn
     card.show_run(icon="check", head="Done", title="Closed Slack.", at="9:12 PM",
-                  rows=[{"text": "Closed Slack", "icon": "check"}], more=0, took="4 s",
-                  learned={"id": "pb:1", "text": "Close Slack from the tray first."})
-    card.learn._decide("save")                    # the Learned box's confirmation: no Undo key either
+                  rows=[{"text": "Closed Slack", "icon": "check"}], more=0, took="4 s")
     texts = " | ".join(_all_texts(card)).casefold()
     assert "undo" not in texts and "can’t" not in texts and "can't" not in texts
     assert all("undo" not in k.text().casefold() for k in card.findChildren(L.Key))

@@ -626,14 +626,20 @@ def test_a_media_key_with_no_session_presses_nothing() -> None:
     asyncio.run(main())
 
 
-def test_every_hand_halts_after_a_wrong_effect_until_the_user_speaks() -> None:
+def test_every_hand_halts_after_a_wrong_effect_until_the_user_speaks(monkeypatch: pytest.MonkeyPatch) -> None:
+    import yuki.voice.hands as hands_module
+
+    # Phase 2 (18 Oct): after a wrong effect the hands may try other ways for RETRY_BUDGET_S (8 s); with none left,
+    # every further hand of the turn is "not tried" (the old "stay still" wording went with it)
+    monkeypatch.setattr(hands_module, "RETRY_BUDGET_S", 0)
+
     async def main() -> None:
         _rt, bridge = _bridge()
         desk = _MediaDesk(None)
         hands = _hands(desk, bridge)
         hands._run("media_key", {"key": "playpause"})  # no session: nothing could be checked
         ok, report, facts = hands._run("media_key", {"key": "playpause"})
-        assert not ok and facts.get("refused") and "stay still" in report
+        assert not ok and facts.get("refused") and facts.get("halted") and report.startswith("not tried")
         hands.new_user_turn()
         _ok, report, facts = hands._run("media_key", {"key": "playpause"})
         assert not facts.get("refused")

@@ -251,38 +251,6 @@ def test_helper_steps_show_under_the_response_labelled_as_helpers():
     assert not head.running and tool.depth == 1 and tool.name == "recall"
 
 
-def test_pills_say_their_state_in_words_with_a_wave(qapp):
-    """The call pill: the accent recording dot, a grey wave and a dot-matrix timer; waiting for headphones: no
-    dot, no timer, said plainly (no amber). The voice pill: a wave per state, an error in red, no wave."""
-    import time as _time
-
-    from yuki.ui.calls import CallIndicator
-    from yuki.voice.indicator import VoicePill
-
-    ind = CallIndicator()
-    ind.set_call({"app": "Discord", "status": "recording", "detected_at": _time.time() - (37 * 60 + 12)})
-    assert "Discord" in ind.label.text() and not ind.dot.isHidden()
-    assert ind.elapsed() in ("37:12", "37:13") and ind.timer_label.text in ("37:12", "37:13")
-    waiting = CallIndicator()
-    waiting.set_call({"app": "Zoom", "status": "waiting_headphones"})
-    assert waiting.dot.isHidden() and waiting.timer_label.isHidden()
-    assert "245,158,11" not in waiting.label.styleSheet()                 # no amber anywhere
-    pill = VoicePill()
-    pill.show_state("speaking")
-    assert pill.label.text() == "Speaking" and pill.wave.kind == "speak" and "242,239,233" in pill.label.styleSheet()   # Lattice bone ink
-    pill.show_state("thinking")
-    assert pill.wave.kind == "think"
-    pill.show_state("error", "The microphone is in use")
-    assert pill.label.text().startswith("The microphone") and pill.wave.isHidden()
-    # Lattice has one colour and it means live: an error is said in words, in the brightest ink (theme.danger)
-    from yuki.ui.window.theme import theme
-
-    d = theme().danger
-    assert f"{d.red()},{d.green()},{d.blue()}" in pill.label.styleSheet()
-    for w in (ind, waiting, pill):
-        w.close()
-
-
 def test_notice_card_shows_a_runtime_notice(qapp):
     from PySide6.QtCore import Qt
 

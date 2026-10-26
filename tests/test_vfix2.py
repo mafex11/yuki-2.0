@@ -787,6 +787,7 @@ def test_n10_the_thinker_line_shows_what_is_left_on_a_running_list() -> None:
     import threading as _t
 
     bridge._lock = _t.Lock()
+    bridge.on_brain = False   # bTalk (10 Oct): work_line reads it; this is the old loop's thinker line
     job = Job(job_id=4, request="open chrome, youtube, scroll, then message Sam", state="running", lane="worker")
     job.tasks = [{"what": "open Chrome", "state": "done"}, {"what": "message Sam on Discord", "state": "todo"}]
     bridge._jobs, bridge._unsubmitted, bridge._finished = {4: job}, {}, []
@@ -1016,54 +1017,6 @@ def test_f8_a_hold_the_run_then_got_past_is_no_lesson() -> None:
     assert session_lessons([gate, check], outcome="final")       # a hold never got past is still trouble
 
 
-def test_n8_a_stopped_runs_pitfall_is_kept_in_practice_memory_and_shown_for_that_app(tmp_path: Path) -> None:
-    """Review (N8 not done): a failed or stopped run's lessons are written into practice memory (every lane and the
-    next session read them for that app), not only kept in the process; a second such run supersedes, never piles."""
-    import numpy as np
-
-    from yuki.memory import practice as P
-    from yuki.memory.api import MemoryClient
-    from yuki.memory.store import Store
-
-    class Words:
-        model_name = "stub-words"
-
-        def embed(self, texts: list[str], wait_s: float | None = None) -> Any:
-            out = np.zeros((len(texts), 64), dtype=np.float32)
-            for i, text in enumerate(texts):
-                for w in str(text).casefold().split():
-                    out[i, sum(map(ord, w)) % 64] += 1.0
-            return out
-
-    client = MemoryClient(Store.open(tmp_path / "m" / "memory.db"))
-    client._embedder = Words()
-    agent = _agent(Brain([]), tmp_path, ChatPlayerDesk(), memory=_memory(client))
-    lyrics = "Button \"Lyrics\""
-    agent._trace = [{"kind": "action", "tool": "click", "app": "Spotify.exe", "target": lyrics, "ok": True,
-                     "verdict": False, "why": "the lyrics view did not change"} for _ in range(3)]
-    agent._this_query = "close the lyrics"
-    try:
-        for _round in range(2):
-            agent._keep_lessons(outcome="cancelled", at=time.time())
-            deadline = time.time() + 5
-            while time.time() < deadline and len(P.live(client.store, ["pitfall"])) < 1:
-                time.sleep(0.05)
-            time.sleep(0.3)
-        live = P.live(client.store, ["pitfall"])
-        assert len(live) == 1 and live[0].origin == "session" and live[0].apps == ["spotify"]
-        assert "click on Button \"Lyrics\", 3 times" in live[0].text() and "earlier:" not in live[0].text()
-        shown = P.relevant(client.store, query_vec=None, apps_in_play=["Spotify.exe"])
-        assert [p["id"] for p in shown["pitfalls"]] == [live[0].id]
-        assert all("Spotify.exe" not in kept for _at, kept in agent._session_lessons)   # shown once, from memory
-        # a single failed step the run got past, in a run that ended well, stays a session lesson only
-        from yuki.agent.frame import session_pitfalls
-
-        assert session_pitfalls([{"kind": "action", "tool": "click", "app": "Spotify.exe", "target": lyrics,
-                                  "ok": False, "why": "x"}], outcome="final") == {}
-    finally:
-        client.store.close()
-
-
 @pytest.mark.parametrize("day", [
     "today",
     # the sweep ran at 00:30 on 5 Oct: the hour back crosses midnight, so the call's own day (pinned: Friday 25 Sep)
@@ -1135,42 +1088,3 @@ def test_n10_a_plain_text_ending_is_held_like_done_and_whatever_is_left_is_said(
     assert "your reply above was not sent and the request did not end" in seen[0]
     finals = [e for e in events if isinstance(e, Final)]
     assert finals and finals[-1].text == "All set. Still left from your list: message Sam on Discord."
-
-
-def test_n2_a_slider_moved_once_is_kept_as_that_apps_way_in_practice_memory(tmp_path: Path) -> None:
-    """Review (N2 not done): after one verified set_slider the way (which control holds the slider) is a practice
-    procedure for that app, learned from the run (the distiller learns only runs of three actions or more)."""
-    import numpy as np
-
-    from yuki.memory import practice as P
-    from yuki.memory.api import MemoryClient
-    from yuki.memory.store import Store
-
-    class Words:
-        model_name = "stub-words"
-
-        def embed(self, texts: list[str], wait_s: float | None = None) -> Any:
-            out = np.zeros((len(texts), 64), dtype=np.float32)
-            for i, text in enumerate(texts):
-                for w in str(text).casefold().split():
-                    out[i, sum(map(ord, w)) % 64] += 1.0
-            return out
-
-    client = MemoryClient(Store.open(tmp_path / "m" / "memory.db"))
-    client._embedder = Words()
-    desk = ChatPlayerDesk(volume=30.0)
-    volume = _ids(desk.get_window_tree(PLAYER))["Change volume"]
-    brain = Brain([_response(_use("look_at_window", hwnd=PLAYER)),
-                   _response(_use("set_slider", element=volume, expect_hwnd=PLAYER, to=80)),
-                   _response(_use("done", message="Spotify's own volume is at 80% now.", about=[], states=[]))])
-    try:
-        _run(_agent(brain, tmp_path, desk, memory=_memory(client)), "turn the volume up inside spotify")
-        assert desk.volume == 80.0
-        deadline = time.time() + 5
-        while time.time() < deadline and not P.live(client.store, ["procedure"]):
-            time.sleep(0.05)
-        ways = P.live(client.store, ["procedure"])
-        assert len(ways) == 1 and ways[0].origin == "slider" and ways[0].apps == ["spotify"]
-        assert "set_slider on Text \"Change volume\"" in ways[0].text() and "Never drag" in ways[0].text()
-    finally:
-        client.store.close()

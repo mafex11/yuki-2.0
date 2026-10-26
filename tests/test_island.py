@@ -193,18 +193,14 @@ def test_the_strip_interface_drives_the_island_and_frees_the_corner_when_done(qa
         isl.stop()
 
 
-def test_the_frame_and_playbooks_become_the_run_cards_chips(qapp):
+def test_the_frame_becomes_the_run_cards_chips(qapp):
+    # the playbook-lesson half (step_meta, lesson_refs, set_lessons) went with iUI (18 Oct)
     isl = _island(qapp)
     try:
         isl.strip.start_run(6, steps=0)
         isl.set_frame(6, {"persons": [{"name": "Riya", "routes": [{"label": "WhatsApp chat", "app": "WhatsApp",
                                                                     "mine": 64}]}]})
         assert isl.inputs.run.chips[1][0] == ("memory", "from memory: you message Riya on WhatsApp chat, 64 times")
-        isl.strip.run_step(6, "Typing it", 1)
-        isl.step_meta(6, "type_text", {"text": "hi", "playbook": "pb:3"})
-        assert isl.lesson_refs() == ["pb:3"]
-        isl.set_lessons({"pb:3": "type it key by key"})
-        assert isl.lesson_refs() == []
     finally:
         isl.stop()
 

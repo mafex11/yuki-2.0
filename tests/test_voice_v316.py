@@ -902,7 +902,7 @@ def test_the_talkers_stream_carries_only_speech_downstream_in_marker_mode() -> N
             async def gen() -> Any:
                 for e in events[1:]:
                     yield e
-            return gen(), events[0]
+            return gen(), [events[0]]   # kMind review M2 (18 Oct): the head read is a list
 
         llm._yuki_open = fake_open
         llm._yuki_call = LlmCall(entered=time.monotonic(), user_turn=True)

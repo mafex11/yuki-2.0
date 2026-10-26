@@ -4,13 +4,13 @@ survives device changes, and the deferred transcriber's "present" path (docs/VOI
 Rule 7: no microphone, no speakers, no desktop. Yuki's reply is played into a simulated room
 (:class:`yuki.voice.offline.Room`: delay, reverberation, a speaker's distortion, device latencies
 that differ from what the devices report) and mixed into the mic path; PortAudio is a fake module;
-the transcriber's facts are stubs; the pill runs on Qt's offscreen platform in a subprocess.
+the transcriber's facts are stubs. (The voice pill's own test went with yuki.voice.indicator, deleted by kClean on
+18 Oct.)
 """
 
 from __future__ import annotations
 
 import asyncio
-import subprocess
 import sys
 import time
 import types
@@ -769,21 +769,6 @@ def test_a_wake_during_teardown_starts_the_next_conversation(tmp_path: Path) -> 
     session._thread = None
     session._on_thread_done("idle", "")
     assert started and started[0][0] == "wake" and started[0][1]["wake_at"] == 6.0
-
-
-def test_pill_keeps_an_error_up_and_wide_enough_to_read() -> None:
-    code = (
-        "import os; os.environ['QT_QPA_PLATFORM']='offscreen'\n"
-        "from PySide6.QtWidgets import QApplication; app = QApplication([])\n"
-        "from yuki.voice.indicator import VoicePill, PILL_WIDTH\n"
-        "p = VoicePill(); msg = \"Voice can't reach the speech services right now (network?).\"\n"
-        "p.show_state('error', msg); w = p.width()\n"
-        "p.show_state('wake', ''); app.processEvents()\n"
-        "print(p.isVisible() and not p.closing, w > PILL_WIDTH + 40,\n"
-        "      msg in p.toolTip() and p.label.text().startswith(\"Voice can't reach\"))\n"
-    )
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
-    assert out.stdout.strip().splitlines()[-1] == "True True True", out.stderr[-800:]
 
 
 # ---------------------------------------------------------------------------

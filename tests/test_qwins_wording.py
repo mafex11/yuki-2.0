@@ -89,7 +89,8 @@ def test_blocks_is_only_for_the_vocabulary():
         model_drop, vocab_drop, pending = loop.create_future(), loop.create_future(), loop.create_future()
         model_drop.set_result(Verdict(False, "reasoning", by="model"))
         vocab_drop.set_result(Verdict(False, "internals", by="vocab"))
-        return SpeechGuard.blocks(model_drop), SpeechGuard.blocks(vocab_drop), SpeechGuard.blocks(pending)
+        g = SpeechGuard(None, "m")   # kMind (18 Oct): blocks reads the guard's own claim-gate waits, so an instance
+        return g.blocks(model_drop), g.blocks(vocab_drop), g.blocks(pending)
 
     assert asyncio.run(run()) == (False, True, False)
 

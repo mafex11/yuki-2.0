@@ -124,9 +124,11 @@ def test_no_acknowledgement_once_the_outcome_was_said() -> None:
         _rt, bridge = _bridge()
         bridge.user_turns = lambda: 7
         assert bridge.may_ack()
-        bridge._outcome_said(SimpleNamespace(user_turn=6))   # an older request's outcome: this one may still be acked
+        # hands19 (19 Oct): turns are keyed (conversation, turn), so a job carries the conversation it came from.
+        # An older request's outcome: this one may still be acked
+        bridge._outcome_said(SimpleNamespace(convo=bridge._convo(), user_turn=6))
         assert bridge.may_ack()
-        bridge._outcome_said(SimpleNamespace(user_turn=7))
+        bridge._outcome_said(SimpleNamespace(convo=bridge._convo(), user_turn=7))
         assert not bridge.may_ack()
 
     asyncio.run(main())
@@ -154,6 +156,8 @@ def _fake_window(monkeypatch: Any, user32: _FakeUser32, full: dict) -> Any:
     monkeypatch.setattr(launch.win32gui, "ShowWindow", lambda h, cmd: setattr(user32, "zoomed", True))
     monkeypatch.setattr(launch, "window_info", lambda h: SimpleNamespace(process_name="warp.exe", title="Warp"))
     monkeypatch.setattr(launch, "_is_fullscreen", lambda h: full["on"])
+    # fa A4 (20 Oct): maximize and full screen are verified in view too; this stand-in window is (never the real 77)
+    monkeypatch.setattr(launch, "_in_view", lambda h, d: "")
     return launch
 
 

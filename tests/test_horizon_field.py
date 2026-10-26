@@ -466,15 +466,14 @@ def test_todays_cards_lead_to_their_sections_with_hover_and_press_states(qapp):
                                                      Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
         assert act.went[-1] == want, key
     assert page.cards["questions"].lit and not page.cards["people"].lit   # the accent only where something waits
-    # hover and press paint differently (the card lifts, then drops)
-    from yuki.ui.window.shots import grab
-
+    # hover and press paint differently (the card lifts, then drops); Qt's own grab, since kClean (18 Oct) deleted
+    # ui.window.shots and its grab helper
     card = page.cards["people"]
-    rest = grab(card)
+    rest = card.grab().toImage()
     card.setAttribute(Qt.WidgetAttribute.WA_UnderMouse, True)
-    hot = grab(card)
+    hot = card.grab().toImage()
     card.setDown(True)
-    down = grab(card)
+    down = card.grab().toImage()
     assert rest != hot and hot != down
     page.close()
 

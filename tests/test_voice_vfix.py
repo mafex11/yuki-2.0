@@ -378,6 +378,10 @@ def _bridge() -> Any:
     bridge.acked = lambda: None
     bridge.mark_spoken = None
     bridge.end_requested = None
+    # voice21 (19 Oct) and la A2 (22 Oct): the conversation's opened / follow-on quiet readers (none here); fc (20 Oct):
+    # the words said for each call
+    bridge.opened_quiet = bridge.follow_quiet = None
+    bridge._acked_words = {}
     return bridge
 
 
@@ -955,6 +959,7 @@ def test_f9_an_app_named_between_the_job_starting_and_its_run_beginning_is_kept(
             self.seen.append(self._request_app_named)   # what the judge reads on the first action
 
     lane.agent = _Agent()
+    lane.active = lane.agent   # bWire (10 Oct): the agent running the lane's job; the old loop's own here
     Lane._drive(lane, job)
     assert lane.agent.seen == ["Telegram"] and lane._named_late == {}
 
@@ -1021,7 +1026,8 @@ def test_f13_an_empty_goodbye_ends_the_conversation_in_about_a_third_of_a_second
     stops: list[str] = []
     convo = SimpleNamespace(observer=SimpleNamespace(bot_speaking=False), QUICK_END_S=Conversation.QUICK_END_S,
                             log=SimpleNamespace(event=lambda *a, **k: None), session="t",
-                            _set_stop=lambda why: stops.append(why))
+                            _set_stop=lambda why: stops.append(why),
+                            _end_cue_now=lambda: None)   # kw1 D1 (20 Oct): the end cue for a goodbye with no words
     started = time.monotonic()
     asyncio.run(Conversation._end_after_speech(convo, quick=True))
     took = time.monotonic() - started

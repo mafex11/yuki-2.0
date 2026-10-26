@@ -15,7 +15,8 @@ def test_defaults_follow_the_users_rules(tmp_path):
     assert levels == policy.DEFAULTS
     assert levels["send_messages"] == "ask" and policy.BY_KEY["send_messages"].ceiling == "ask"
     assert levels["money"] == "suggest" and policy.BY_KEY["money"].ceiling == "ask"
-    assert set(levels) == {"read_screen", "open_apps", "click_type", "send_messages", "files", "money"}
+    # qBrain (18 Oct) added the "tidy" dial: tidy-ups inside the user's own requests
+    assert set(levels) == {"read_screen", "open_apps", "click_type", "send_messages", "files", "money", "tidy"}
     assert policy.LEVELS == ("suggest", "show_plan", "ask", "do_and_tell")
     assert any("plain instruction" in rule for rule in policy.FIXED_RULES)
 

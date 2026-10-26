@@ -464,7 +464,7 @@ class _Runtime:
     def paused_id(self):
         return self.paused
 
-    def submit(self, text, origin_hwnd=None):
+    def submit(self, text, origin_hwnd=None, **_k):    # bWire (10 Oct): _op_start also passes typed_words=()
         self.calls.append(("submit", text))
         return "worker", 51
 

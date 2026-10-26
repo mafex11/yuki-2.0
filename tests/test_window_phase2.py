@@ -1,6 +1,6 @@
-"""The Yuki window, phase 2: settings writers, the frameless chrome, pages offscreen (nothing clipped in a
-narrow window), the overlay's thread, and yuki-ui's translation of the voice side's chat events. Offscreen only
-(rule 7)."""
+"""The Yuki window, phase 2: settings writers, the frameless chrome, the overlay's thread, and yuki-ui's translation
+of the voice side's chat events. Offscreen only (rule 7). The Qt pages' paint and width tests went with
+ui.window.shots (kClean, 18 Oct); the web window replaced those pages."""
 
 from __future__ import annotations
 
@@ -134,78 +134,6 @@ def test_hit_test_edges_caption_and_snap_layout_button():
     assert ht(640, 400) == chrome.HTCLIENT
     assert ht(640, 1, True) == chrome.HTCAPTION       # maximised: no resize edges
     assert ht(-1, 5) == 0
-
-
-# -- pages, offscreen --------------------------------------------------------------------------------------
-
-
-def test_every_page_builds_and_paints_on_an_empty_memory(qapp, tmp_path):
-    from datetime import date
-
-    from yuki.memory.api import MemoryClient
-    from yuki.ui.chat_model import ChatModel
-    from yuki.ui.window import data as D
-    from yuki.ui.window.pages import chat, me, settings, status, today, yuki_page
-    from yuki.ui.window.shots import demo_thread, grab
-    from yuki.ui.window.theme import theme
-
-    memory = MemoryClient.open(tmp_path / "memory.db")
-    try:
-        t = theme("light")
-        model = ChatModel()
-        demo_thread(model)
-        widgets = {
-            "today": today.build(t, D.build_day(memory, date.today()), today=True),
-            "me": me.build(t, D.build_me(memory)),
-            "yuki": yuki_page.build(t, D.build_yuki(memory)),
-            "status": status.build(t, D.build_status(memory)),
-            "settings": settings.build(t, D.build_settings(memory), advanced=True),
-            "chat": chat.build(t, model, connected=False),
-        }
-        for key, w in widgets.items():
-            w.resize(1000, 800)
-            w.show()
-            qapp.processEvents()
-            img = grab(w)
-            assert img.width() == 1000 and not img.isNull(), key
-            w.close()
-    finally:
-        memory.close()
-
-
-def test_pages_never_ask_for_more_width_than_the_smallest_window(qapp, tmp_path):
-    """The window's smallest size (900 px) leaves the pages 668 px: every page fits, so nothing is clipped at
-    the edges (the cards go to one column instead, and text wraps inside them)."""
-    from datetime import date
-
-    from yuki.memory.api import MemoryClient
-    from yuki.ui.chat_model import ChatModel
-    from yuki.ui.window import data as D
-    from yuki.ui.window.live import LiveWindow
-    from yuki.ui.window.pages import chat, me, settings, status, today, yuki_page
-    from yuki.ui.window.shots import demo_thread
-    from yuki.ui.window.theme import theme
-
-    memory = MemoryClient.open(tmp_path / "memory.db")
-    try:
-        t = theme()
-        win = LiveWindow(t)
-        room = 900 - win.sidebar.width()
-        model = ChatModel()
-        demo_thread(model)
-        pages = {
-            "today": today.build(t, D.build_day(memory, date.today()), today=True),
-            "me": me.build(t, D.build_me(memory), progressive=False),
-            "yuki": yuki_page.build(t, D.build_yuki(memory)),
-            "status": status.build(t, D.build_status(memory)),
-            "settings": settings.build(t, D.build_settings(memory), advanced=True),
-            "chat": chat.build(t, model, connected=False),
-        }
-        for key, w in pages.items():
-            assert w.minimumSizeHint().width() <= room, (key, w.minimumSizeHint().width(), room)
-        win.close()
-    finally:
-        memory.close()
 
 
 # -- the overlay's live thread ----------------------------------------------------------------------------

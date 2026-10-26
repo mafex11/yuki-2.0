@@ -188,9 +188,13 @@ def test_a_tab_no_longer_there_is_reported_never_swapped(browser: FakeStrip) -> 
     assert len(result.details["tabs_after"]) == 3
 
 
-def test_close_refused_without_a_single_close_control(browser: FakeStrip) -> None:
+def test_close_refused_without_a_single_close_control(browser: FakeStrip, monkeypatch: pytest.MonkeyPatch) -> None:
+    import yuki.actions.tabs
     from yuki.actions.tabs import tab_action
 
+    # desk20 (19 Oct): with no close control the browser's close-tab key is the next rung; this test is the rung
+    # below it, a browser with no such key
+    monkeypatch.setattr(yuki.actions.tabs, "close_keys", lambda: ())
     browser.tabs[0].children = []                   # no close control of its own: nothing is guessed
     result = tab_action(4242, "42.7.4.101", "close")
     assert not result.ok and browser.closed == []
