@@ -210,8 +210,7 @@ def test_app_volume_hand_leaves_the_window_in_front_and_says_its_line() -> None:
 
     desk = TabsDesk(action_delay_s=0)
     hands = Hands(desk)
-    snap = hands.snapshot()
-    assert "app volumes (Windows volume mixer" in snap.text and "chrome.exe 100% playing" in snap.text
+    hands.snapshot()   # qVoice P1 (18 Oct): the app volumes moved to the Situation's Sound line, off the hands' block
     front = desk.front
     done = _hand(hands, "app_volume", app="chrome.exe", change=-20, say_when_done="Turned YouTube down.")
     assert done.spoken == ["Turned YouTube down."] and desk.mixer.levels["chrome.exe"] == 80.0
@@ -241,10 +240,20 @@ def test_close_the_named_tabs_never_the_video_or_gmail() -> None:
     assert 'tabs of [' in snap.text and "Claude Platform" in snap.text
     unnamed = _hand(hands, "tab", window=desk.CHROME, action="close", tabs=[7], say_when_done="Closed.")
     assert unnamed.spoken == [] and not desk.closed  # a tab their words do not name is never closed
+    # kHands (18 Oct): tabs are named by the words of their titles (named); numbers count only on the tabs line shown
+    # and only when those titles fit the words. A word two tabs fit, the video one of them, is asked about by title,
+    # never guessed
     hands.new_user_turn()
-    done = _hand(hands, "tab", window=desk.CHROME, action="close", tabs=[3, 4, 6],
-                 named="the Claude tabs; the ElevenLabs tab", say_when_done="Closed them.")
+    several = _hand(hands, "tab", window=desk.CHROME, action="close", named="YouTube", say_when_done="Closed.")
+    assert several.spoken == [] and not desk.closed and "2 tabs fit those words" in str(several.result)
+    hands.new_user_turn()
+    done = _hand(hands, "tab", window=desk.CHROME, action="close", tabs=[3, 4], named="Claude",
+                 say_when_done="Closed them.")
     assert done.spoken == ["Closed them."]
+    hands.new_user_turn()
+    last = _hand(hands, "tab", window=desk.CHROME, action="close", named="ElevenLabs",
+                 say_when_done="Closed ElevenLabs.")
+    assert last.spoken == ["Closed ElevenLabs."]
     assert [t["name"] for t in desk.closed] == ["Sign in successful | Claude Platform", "Claude",
                                                 "Settings | ElevenLabs"]
     names = [t["name"] for t in desk.tabs]
@@ -260,18 +269,24 @@ def test_a_tab_that_moved_is_closed_by_identity_and_a_gone_one_is_refused() -> N
     hands = Hands(desk)
     hands.snapshot()
     desk.tabs.insert(0, {"name": "New", "url": "x", "scroll": 0.0, "titled_at": 0.0, "id": "42.9"})  # moved
-    _hand(hands, "tab", window=desk.CHROME, action="close", tab=6, named="the ElevenLabs tab", say_when_done="Closed.")
+    # kHands (18 Oct): the number is read on the tabs line shown, with the words of its title in named
+    _hand(hands, "tab", window=desk.CHROME, action="close", tab=6, named="ElevenLabs", say_when_done="Closed.")
     assert desk.closed[-1]["name"] == "Settings | ElevenLabs"  # not whatever is 6th now
     hands.new_user_turn()
-    again = _hand(hands, "tab", window=desk.CHROME, action="close", tab=6, named="the ElevenLabs tab",
+    again = _hand(hands, "tab", window=desk.CHROME, action="close", tab=6, named="ElevenLabs",
                   say_when_done="Closed.")
     assert again.spoken == [] and len(desk.closed) == 1  # that tab is gone: nothing else is closed
+    assert "no tab's title holds those words" in str(again.result)   # kHands' refusal: nothing guessed in its place
 
 
-def test_reopen_is_verified_by_title_and_a_wrong_tab_stops_the_hands() -> None:
+def test_reopen_is_verified_by_title_and_a_wrong_tab_stops_the_hands(monkeypatch: pytest.MonkeyPatch) -> None:
+    import yuki.voice.hands as hands_module
     from yuki.voice.hands import Hands
     from yuki.voice.offline import TabsDesk
 
+    # Phase 2 (18 Oct): after a wrong effect the hands may try other ways for RETRY_BUDGET_S; with none left the next
+    # call is "not tried" (the old "stay still until the user speaks" wording went with it)
+    monkeypatch.setattr(hands_module, "RETRY_BUDGET_S", 0)
     desk = TabsDesk(action_delay_s=0)
     hands = Hands(desk)
     hands.snapshot()
@@ -283,7 +298,7 @@ def test_reopen_is_verified_by_title_and_a_wrong_tab_stops_the_hands() -> None:
     assert wrong.spoken == [] and "NOT the one wanted" in str(wrong.result)
     blocked = _hand(hands, "tab", window=desk.CHROME, action="reopen",
                     expect="Wasureranneyo - Nannmonee Music Video - YouTube", say_when_done="It's back.")
-    assert "stay still until the user speaks" in str(blocked.result)  # never repeated blindly
+    assert "Not tried" in str(blocked.result)  # never repeated blindly
     assert [t["name"] for t in desk.tabs].count("Claude") == 1  # only the one reopen happened
     hands.new_user_turn()
     right = _hand(hands, "tab", window=desk.CHROME, action="reopen",
@@ -361,7 +376,8 @@ def test_end_conversation_ends_it_and_saves_nothing() -> None:
     from yuki.voice.bridge import VoiceBridge
     from yuki.voice.mouth import END_CONVERSATION, REMEMBER_NOTE
 
-    assert "not a rule" in END_CONVERSATION["description"] and "not a rule" in REMEMBER_NOTE
+    # ge (21 Oct): END_CONVERSATION says "Tasks go on; nothing is saved." (its "not a rule" wording went)
+    assert "nothing is saved" in END_CONVERSATION["description"] and "not a rule" in REMEMBER_NOTE
 
     async def main() -> None:
         bridge = VoiceBridge(SimpleNamespace(), hands_backend=None)

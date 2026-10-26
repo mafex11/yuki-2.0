@@ -3,7 +3,6 @@ show, wired to memory, and the window's own frame.
 
 * E11 contact rhythm: messages a day with each person, 14 days, both ways (memory's people index + messages);
 * E12 thread checklists (milestones landed / open items) and "involves" typed person / app by identity;
-* E13 the Playbook page from practice memory's ``workflows`` (procedures, lessons, proposals) and its edits;
 * E14 the Activity ledger: each action with time, what, where, why (the user's words, a lesson or procedure it used,
   a rule), result and its Undo window;
 * goals on Home's Now strip and on threads;
@@ -25,7 +24,6 @@ from typing import Any
 import pytest
 
 from yuki.memory import contacts as C
-from yuki.memory import practice as P
 from yuki.memory.api import MemoryClient
 from yuki.memory.store import Store, WorkOp
 
@@ -191,45 +189,9 @@ def test_involves_is_typed_person_or_app_by_identity_never_by_a_word_inside(stor
     assert row["involves"] == ["Riya", "RIYACLIMBS", "chrome", "Riya's notes", "seed list.xlsx"]   # unchanged
 
 
-# -- E14: the run ledger -------------------------------------------------------------------------------------------
-
-
-def _run(store: Store, words: str, steps: list[dict[str, Any]], *, at: float, outcome: str = "final",
-         rid: str = "r1", lane: str = "voice") -> dict:
-    return P.record_run(store, {"source": "agent", "session_id": "s", "request_id": rid, "lane": lane, "at": at,
-                                "ended_at": at + 9, "words": words, "reply": "done", "outcome": outcome,
-                                "steps": steps, "cost_usd": 0.05, "model_calls": 2, "wall_s": 9.0}, now=at + 10)
-
-
-def test_the_run_ledger_lists_acting_steps_with_the_playbooks_they_used(store):
-    proc = P.add_playbook(store, {"kind": "procedure", "intent": "Restore the browser after a restart",
-                                  "apps": ["firefox"], "body": {"steps": ["Open it", "Click Restore"]}})
-    lesson = P.add_playbook(store, {"kind": "pitfall", "intent": "Pause music only with the player in front",
-                                    "apps": ["music"], "body": {"text": "a background click is dropped",
-                                                                "instead": "bring it forward first"}})
-    _thread(store, "Firefox", "firefox.exe", "tabs")
-    at = time.time() - 600
-    _run(store, "bring my tabs back", [
-        {"tool": "look_at_window", "kind": "read", "ok": True, "at": at + 1},
-        {"tool": "launch_app", "kind": "action", "app": "firefox.exe", "input": {"name": "firefox"}, "ok": True,
-         "verdict": True, "result": "Firefox is open", "ms": 900, "at": at + 2, "playbook": f"pb:{proc}"},
-        {"tool": "click", "kind": "action", "app": "firefox.exe", "target": "button \"Restore\"", "ok": True,
-         "verdict": None, "result": "clicked", "ms": 300, "at": at + 3, "playbook": f"pb:{lesson}"},
-        {"tool": "todo", "kind": "memory", "input": {"action": "add", "text": "Order seed trays"}, "ok": True,
-         "result": "to-do added", "at": at + 4},
-        {"tool": "ask_user", "kind": "ask", "ok": True, "at": at + 5}], at=at)
-    rows = MemoryClient(store).run_ledger(since=at - 60)
-    assert len(rows) == 1 and rows[0]["words"] == "bring my tabs back" and rows[0]["lane"] == "voice"
-    steps = rows[0]["steps"]
-    assert [s["tool"] for s in steps] == ["launch_app", "click", "todo"]          # reads and questions left out
-    assert steps[0]["cited"] == [{"ref": f"pb:{proc}", "kind": "procedure", "title": "Restore the browser after a restart"}]
-    assert steps[1]["cited"][0]["kind"] == "pitfall" and steps[1]["target"] == "button \"Restore\""
-    assert steps[0]["app_name"] == "Firefox" and steps[0]["verdict"] is True and steps[1]["verdict"] is None
-    assert json.loads(steps[2]["input"]) == {"action": "add", "text": "Order seed trays"}
-    assert MemoryClient(store).run_ledger(since=at + 60) == []
-
-
 # -- the window's data: rhythm words, Work, Playbook, ledger, goals ------------------------------------------------
+# E13's Playbook-page and edit tests and E14's run-ledger test went with practice memory's playbook (kClean, 18 Oct:
+# practice.add_playbook / pending_edits; the Playbook rework dropped PROPOSALS_SHOWN).
 
 from yuki.ui import web_data as W  # noqa: E402
 
@@ -273,79 +235,6 @@ def test_home_has_todays_goals_open_first_on_the_now_strip():
     assert d["now"]["goals"] == [{"ref": "G2", "text": "finish the schedule", "status": "open", "done": False},
                                  {"ref": "G1", "text": "send the invoice", "status": "done", "done": True}]
     assert W.goals_today(object()) == []                                            # a memory without goals
-
-
-def test_the_playbook_page_is_practice_memorys_workflows(store):
-    proc = P.add_playbook(store, {"kind": "procedure", "intent": "Restore the browser after a restart", "apps": ["firefox"],
-                                  "body": {"steps": ["Open it", "Click Restore"]}, "origin": "distill"},
-                          events=[{"type": "observed", "run_key": "a"}, {"type": "observed", "run_key": "b"},
-                                  {"type": "succeeded", "run_key": "b"}])   # appLearn: a way rests on a success
-    P.add_playbook(store, {"kind": "pitfall", "intent": "Pause the music", "apps": ["music"], "origin": "postmortem",
-                           "body": {"text": "a click behind another window went nowhere", "instead": "bring it forward first"},
-                           "avoid": "clicking a background window"},
-                   events=[{"type": "taught", "run_key": "c", "refs": {"words": "bring it forward"}}])
-    P.add_playbook(store, {"kind": "style", "intent": "Write emails to the team", "origin": "postmortem",
-                           "body": {"text": "In English, short."}},
-                   events=[{"type": "observed", "run_key": "e"},
-                           {"type": "taught", "run_key": "e", "refs": {"quote": "in English please"}}])
-    cand = P.add_playbook(store, {"kind": "habit", "intent": "Videos in Firefox", "apps": ["firefox"],
-                                  "body": {"text": "You watch videos in Firefox."}, "origin": "miner"},
-                          events=[{"type": "observed_day", "run_key": "miner:site"}])
-    d = W.build_playbook(MemoryClient(store))
-    assert d["workflows_available"] and d["know_how"] == []
-    p = next(x for x in d["procedures"] if x["ref"] == f"pb:{proc}")
-    assert p["title"] == "Restore the browser after a restart" and p["steps"] == ["Open it", "Click Restore"]
-    assert p["app"] == "Firefox" and p["uses"] == 0 and p["conf"] is not None and p["conf_word"]
-    assert p["learned"].startswith("From a run that worked")
-    # appLearn: the pitfall is a quiet note for Yuki, never on the page; lessons are the user's style notes
-    assert [x["dont"] for x in d["lessons"]] == ["Write emails to the team"]
-    assert d["lessons"][0]["because"] == "In English, short." and d["lessons"][0]["from"].startswith("In your words")
-    assert "Pause the music" not in json.dumps(d)
-    prop = next(x for x in d["proposals"] if x["ref"] == f"pb:{cand}")
-    assert prop["title"] == "Videos in Firefox" and "Seen" in prop["basis"] and prop["app"] == "Firefox"
-    # more things seen once than NEW blocks: the rest stay visible in their own lists, marked tentative
-    for n in range(2):
-        P.add_playbook(store, {"kind": "procedure", "intent": f"Open the planner {n}", "body": {"steps": ["a", "b"]}},
-                       events=[{"type": "observed", "run_key": f"x{n}"}, {"type": "succeeded", "run_key": f"x{n}"}])
-    d = W.build_playbook(MemoryClient(store))
-    assert len(d["proposals"]) == W.PROPOSALS_SHOWN == 2
-    tentative = [p for p in d["procedures"] + d["choices"] if p.get("tentative")]   # a habit is an app choice (appWin2 W7)
-    assert len(tentative) == 1 and tentative[0]["conf_word"] == "tentative, seen once"
-
-
-def test_save_edit_and_no_map_onto_memorys_own_playbook_actions(store, tmp_path):
-    from yuki.ui import web_window
-    from yuki.ui.web_window import workflow_action
-
-    assert workflow_action("pb:3", "save") == "save" and workflow_action("pb:3", "no") == "forget"
-    assert workflow_action("pb:3", "edit", "in my words") == "edit" and workflow_action("pb:3", "edit", "") is None
-    assert workflow_action("question:4", "edit", "the DM") == "save" and workflow_action("question:4", "no") == "disable"
-    assert workflow_action("question:4", "save", "") is None and workflow_action("pb:3", "delete") is None
-    pid = P.add_playbook(store, {"kind": "procedure", "intent": "Open the planner", "body": {"steps": ["a", "b"]}})
-    win = web_window.WebWindow(db_path=tmp_path / "x.db", connect=False)
-    win.memory = MemoryClient(store)
-    assert win.a_workflow_edit({"ref": f"pb:{pid}", "verb": "edit", "words": "open it from the start menu"})["queued"]
-    assert [w for _o, w, _at in P.pending_edits(store)] == ["open it from the start menu"]   # re-distilled later
-    assert win.a_workflow_edit({"ref": f"pb:{pid}", "verb": "no"})["ok"]
-    assert P.get(store, pid).valid_to is not None                                    # retired, history kept
-    assert not win.a_workflow_edit({"ref": f"pb:{pid}", "verb": "edit", "words": ""})["ok"]
-
-
-def test_the_trays_playbook_ops_reach_memory_the_same_way(store):
-    from types import SimpleNamespace
-
-    from yuki.ui.window_host import WindowHost
-
-    pid = P.add_playbook(store, {"kind": "procedure", "intent": "Open the planner", "body": {"steps": ["a", "b"]}})
-    client = MemoryClient(store)
-    logged = []
-    fake = SimpleNamespace(_memory=lambda: SimpleNamespace(call=lambda what, fn, timeout_s: fn(client)),
-                           _log=lambda kind, **f: logged.append(f))
-    page = WindowHost._op_workflows(fake, {})
-    assert page["available"] and [c["id"] for c in page["procedures"] + page["proposals"]] == [f"pb:{pid}"]
-    assert WindowHost._op_workflow_edit(fake, {"ref": f"pb:{pid}", "verb": "save"})["ok"]
-    assert WindowHost._op_workflow_edit(fake, {"ref": f"pb:{pid}", "verb": "edit"})["ok"] is False   # words needed
-    assert logged == [{"op": "workflow_edit", "action": "save", "ok": True}]
 
 
 def test_the_ledger_says_why_in_the_users_words_with_lessons_procedures_and_rules(tmp_path):

@@ -272,8 +272,9 @@ def test_the_tool_schema_is_lean_and_the_prompt_stays_in_its_budget() -> None:
     from yuki.voice.mouth import HANDS_PROMPT, MOUTH_PROMPT, SPEECH_CHANNEL_PROMPT, VOICE_MARKS_PROMPT
 
     # measured 4 Oct: the talker's prompt sat just under a step near 18k tokens (+0.3-0.4 s per reply past it); the
-    # tool is kept small and the marks section (useless with a voice that strips marks) is sent only with Gemini
-    assert QUICK_MEMORY["required"] == ["action"] and len(json.dumps(QUICK_MEMORY)) <= 700
+    # tool is kept small and the marks section (useless with a voice that strips marks) is sent only with Gemini.
+    # lThink (17 Oct) added the tool's day and part (933 characters): its ceiling is 950 since
+    assert QUICK_MEMORY["required"] == ["action"] and len(json.dumps(QUICK_MEMORY)) <= 950
     assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) + len(VOICE_MARKS_PROMPT) <= 41_800
     assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) <= 39_900
     # the judgement is the talker's, with a worked example of the live case; no word list decides it
@@ -328,6 +329,7 @@ def test_a_woken_conversation_reads_the_hour_again_and_its_first_call_waits_for_
 
     conv = Conversation.__new__(Conversation)
     conv.memory, conv.mouth_memory, conv.log, conv.session = Access(), MouthMemory(recent=None), _Log(), "s"
+    conv.talker = "full"   # kMind (18 Oct): the wake read takes the lean talker's you-card too; this one is full
     conv._recent_job = None
     _warm()
     conv._refresh_recent()
@@ -374,7 +376,7 @@ def test_a_search_marks_another_ais_text_and_says_whose_words_each_hit_is() -> N
 
     report, facts = QuickMemory(Access()).run({"action": "search", "query": "pay back"})
     found = report["found"]
-    assert facts == {"ok": True, "items": 3}
+    assert facts == {"ok": True, "items": 3, "routine": False}   # desk19 (19 Oct): whether a routine was searched
     first, second, third = found.split("\n- ")
     assert "pay 500 back" in first and "from: Discord, Sat 03 Oct 21:00; someone else said, not the user" in first
     assert "move to Lisbon" in second and recall.OTHER_AI_MARK.strip() in second and "from: ChatGPT" in second
@@ -444,6 +446,7 @@ def _woken(access: Any, recent: str | None) -> Any:
 
     conv = Conversation.__new__(Conversation)
     conv.memory, conv.mouth_memory, conv.log, conv.session = access, MouthMemory(recent=recent), _Log(), "s"
+    conv.talker = "full"   # kMind (18 Oct): the wake read takes the lean talker's you-card too; this one is full
     conv._recent_job = conv._recent_close = None
     _warm()
 

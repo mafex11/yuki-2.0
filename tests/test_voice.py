@@ -330,7 +330,8 @@ def test_voice_off_imports_nothing_heavy() -> None:
     import subprocess
     import sys
 
-    code = ("import sys, yuki.voice.session, yuki.voice.indicator; "
+    # kClean (18 Oct) deleted yuki.voice.indicator (the old voice pill): the session module is what is left to check
+    code = ("import sys, yuki.voice.session; "
             "print(any(m in sys.modules for m in ('pipecat', 'sounddevice', 'sherpa_onnx')))")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert out.stdout.strip() == "False"
@@ -998,7 +999,8 @@ def test_hands_act_only_on_windows_they_were_shown() -> None:
     desk = _Desk()
     hands = Hands(desk)
     snap = hands.snapshot()
-    assert "Spotify" in snap.text and "media: Spotify \"Song\" by A playing" in snap.text
+    # qVoice P1 (18 Oct): what is playing moved to the Situation; the hands' block no longer has a media line
+    assert "Spotify" in snap.text
     assert snap.hwnds == {0x1001, 0x1002}
     ok, report, _ = hands._run("window", {"window": 0x1003, "action": "minimize"})
     assert not ok and "not in the desktop block" in report and not desk.calls  # never guessed

@@ -513,13 +513,15 @@ def test_the_router_is_on_by_default_off_when_set_and_never_runs_on_doubtful_wor
     from yuki.voice.pipeline import Conversation
 
     assert Settings().voice_router is True
+    # kw1 D1 (20 Oct): the router also judges the end of the conversation on every user turn (voice_router_end, on by
+    # default); that is off here, so these checks are the hand-off start alone
     rt_bridge = SimpleNamespace(has_open_voice_job=lambda: False, not_heard=None)
-    conv = Conversation(settings=Settings(voice_qos=False, voice_router=False), bridge=rt_bridge, transport=None, memory=None,
-                        mouth_memory=MouthMemory(), log=Log(), speech_end=lambda: None, on_state=lambda *a: None,
-                        session="t")
+    conv = Conversation(settings=Settings(voice_qos=False, voice_router=False, voice_router_end=False),
+                        bridge=rt_bridge, transport=None, memory=None, mouth_memory=MouthMemory(), log=Log(),
+                        speech_end=lambda: None, on_state=lambda *a: None, session="t")
     conv._route_turn(SimpleNamespace(get_messages=lambda: []), SimpleNamespace(user_turn=True))
     assert getattr(conv, "_router_task", None) is None
-    conv = _router_conversation(tmp_path, rt_bridge)
+    conv = _router_conversation(tmp_path, rt_bridge, voice_router_end=False)
     conv.observer.heard, conv.observer.heard_plain = "unsure of 'brochure' (0.4)", False
     conv._route_turn(SimpleNamespace(get_messages=lambda: [{"role": "user", "content": "x"}]),
                      SimpleNamespace(user_turn=True))
@@ -650,6 +652,9 @@ def test_the_conversation_measures_the_states_from_the_hands_and_the_bridge(tmp_
     conv = Conversation(settings=Settings(voice_qos=False), bridge=bridge, transport=None, memory=None,
                         mouth_memory=MouthMemory(), log=Log(), speech_end=lambda: None, on_state=lambda *a: None,
                         session="t")
+    # fTalk (18 Oct): a fresh conversation the user opened themselves has the "opened" state on its first words; this
+    # one was woken by name, so only the hands' and the bridge's states are measured here
+    conv.woken_by_name = True
     assert conv._prompt_state() == {}
     hands.trouble_at = time.monotonic()
     bridge.closed_at = time.monotonic()
@@ -825,7 +830,8 @@ def test_other_visible_windows_are_listed_only_when_mostly_seen_and_freshly_read
                 "controls": ["Send"]}]
     hands.now_source = lambda: {"windows": windows, "popups": []}
     snap = hands.snapshot()
-    assert "items in [501] Discord" in snap.text and "[502]" not in snap.text and "[503]" not in snap.text
+    # qVoice P1.1 (18 Oct): the head is the hwnd alone; the Situation names the app and how much of it is seen
+    assert "items in [501]," in snap.text and "[502]" not in snap.text and "[503]" not in snap.text
     assert 501 in snap.hwnds and 502 not in snap.hwnds
 
 
@@ -994,7 +1000,7 @@ def test_the_talkers_stream_holds_back_after_the_more_line_and_past_the_cap() ->
             async def gen() -> Any:
                 for e in events[1:]:
                     yield e
-            return gen(), events[0]
+            return gen(), [events[0]]   # kMind review M2 (18 Oct): the head read is a list
 
         llm._yuki_open = fake_open
         llm._yuki_call = LlmCall(entered=time.monotonic(), user_turn=True)

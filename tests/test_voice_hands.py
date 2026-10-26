@@ -49,24 +49,41 @@ def _hand(hands: Hands, name: str, **args: Any) -> _Params:
 # -- the live cases, on the stub desktop ------------------------------------------------------------
 
 
+class _Log:
+    """The hands' log, kept in RAM: their ``hands`` lines carry a refused hand's code word (``refused_why``)."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def event(self, kind: str, **fields: Any) -> None:
+        self.events.append((kind, fields))
+
+    def refused_why(self, op: str) -> list[Any]:
+        return [f.get("refused_why") for k, f in self.events if k == "hands" and f.get("op") == op and "ok" in f]
+
+
 def test_tab_switch_is_the_tab_hand_and_verified() -> None:
     """"Switch to the video tab": a tab of the tabs line, selected and read back; never a window focus."""
     desk = BrowserDesk(action_delay_s=0)
-    hands = Hands(desk)
+    log = _Log()
+    hands = Hands(desk, log=log)
     snap = hands.snapshot()
     assert 'tabs of [12291] (3, * = the one showing): 1 "Getting the most out of Opus 5.5 - YouTube"; 2*' in snap.text
     p = _hand(hands, "tab", window=desk.CHROME, tab=1, say_when_done="There you go.")
     assert p.spoken == ["There you go."] and desk.selected == 0  # said only once the tab is the one showing
     assert "is now the one showing" in p.results[0]["done"]
-    # a tab not on the line is refused, never guessed
+    # kHands (18 Oct, tabs by what they are): a number counts only on the tabs line shown; one not on it is never
+    # guessed, and with no words of theirs for the tab the call is refused by its code word: nothing selected or said
     p = _hand(hands, "tab", window=desk.CHROME, tab=9, say_when_done="Done.")
-    assert p.spoken == [] and "not on the tabs line" in p.results[0]["failed"]
-    # the tabs changed between the block and the call: refused
+    assert p.spoken == [] and desk.selected == 0 and "done" not in p.results[0]
+    assert log.refused_why("tab")[-1] == "no_words"
+    # the tabs changed between the block and the call: the number's tab is selected only under the title it was shown
+    # with, so the read-back refuses it and nothing is selected
     hands.snapshot()
     desk.tabs[2]["name"] = "Something else"
     params = _Params("tab", {"window": desk.CHROME, "tab": 3, "say_when_done": "Done."})
     asyncio.run(hands.handle(params))
-    assert params.spoken == [] and "the tabs changed" in params.results[0]["failed"]
+    assert params.spoken == [] and desk.selected == 0 and "the tabs changed" in params.results[0]["failed"]
     # the window hand's description says it never changes the tab
     from yuki.voice.hands import HAND_TOOLS
 

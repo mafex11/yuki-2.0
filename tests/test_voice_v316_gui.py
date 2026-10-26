@@ -1,6 +1,6 @@
-"""Voice v3.16's visible bits, offscreen (QT_QPA_PLATFORM=offscreen; nothing is shown on screen): the pill's end
-line, the tray icon when Yuki is not listening, and the call pill's "Yuki isn't listening". Run apart from the
-non-GUI tests."""
+"""Voice v3.16's visible bits, offscreen (QT_QPA_PLATFORM=offscreen; nothing is shown on screen): the tray icon when
+Yuki is not listening, and the call pill's "Yuki isn't listening". (The voice pill's end-line test went with
+yuki.voice.indicator, deleted by kClean on 18 Oct.) Run apart from the non-GUI tests."""
 
 from __future__ import annotations
 
@@ -16,22 +16,6 @@ def app():
     from PySide6.QtWidgets import QApplication
 
     return QApplication.instance() or QApplication([])
-
-
-def test_the_pill_shows_the_end_line_for_three_seconds(app) -> None:
-    from yuki.voice.indicator import ENDED_MS, VoicePill
-    from yuki.voice.session import ENDED_NOTE
-
-    pill = VoicePill()
-    pill.show_state("ended", ENDED_NOTE)
-    app.processEvents()
-    assert pill.label.text() == ENDED_NOTE and not pill.wave.isVisible()
-    assert pill._fade.isActive() and pill._fade.interval() == ENDED_MS == 3000
-    pill.show_state("wake", "")     # the wake state that follows does not cut the line short
-    assert pill._fade.isActive() and pill.label.text() == ENDED_NOTE
-    image = pill.grab().toImage()   # it renders
-    assert image.width() > 0 and image.height() > 0
-    pill.close()
 
 
 def test_the_tray_icon_shows_when_yuki_is_not_listening(app) -> None:
