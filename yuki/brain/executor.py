@@ -193,6 +193,13 @@ LINE_BEHIND_TAB = "What was playing is still playing behind it."
 LINE_PAGE_NAMED = "{what} is open in {App}."
 LINE_PAGE_NAMED_PLAIN = "{what} is open."
 PAGE_NAMED_CHARS = 80
+#: fix-r33 (final-K k_resume_anime under all, the third run in a row by a third way in: "Chrome is playing; I couldn't
+#: check the rest."): a media check that read true with target fields left is read against the title of the very
+#: session it read (:meth:`Executor._media_named`); the line names what plays by the plan's own words that title holds
+#: (``{what}``, cut to :data:`PAGE_NAMED_CHARS` on whole words), never by the title itself, with the status the check
+#: read (``{status}``: the OS's own word).
+LINE_MEDIA_NAMED = "{what} is {status} in {App}."
+LINE_MEDIA_NAMED_PLAIN = "{what} is {status}."
 #: fix-r32 (K1): an open_url step's note for the planner when the program its window or the plan's target app named is
 #: no browser by machine data (:meth:`Executor._is_browser`) and the address went elsewhere: to the browser the site's
 #: own visits use (``{app}``, as Windows names it), or to Windows' default handler. Code's words with program names
@@ -1122,6 +1129,8 @@ class Executor:
             # fe (E4): a page that read open is named by what its title holds; what was opened to be played and
             # plays nothing goes back to the planner once (or says so)
             base = self._page_named(result)
+            # fix-r33: what a media check read playing (or paused) is named the same way, by the session it read
+            self._media_named(result)
             again = self._not_playing(result, base)
             if again is not None:
                 return self._finished(again)
@@ -4599,6 +4608,98 @@ class Executor:
         except Exception as exc:  # noqa: BLE001 - the check's own line stands
             self._emit_log("done_page_named", error=type(exc).__name__)
             return ""
+
+    def _media_named(self, result: RunResult) -> None:
+        """fix-r33 (F2 of the qp2 analysis; final-K k_resume_anime under all: the episode played in their own tab and
+        the line was "Chrome is playing; I couldn't check the rest.", naming neither the show nor the episode; final-I,
+        J2 and K each reached this check by another way in): a ``media_session`` done that read true but left target
+        fields it doesn't read (``item``: the episode, the song; ``window``) is read against the very session the probe
+        read: the sessions read once more (``donecheck._sessions``), that app's first one by the probe's own rule
+        (``actions.media.session_matches``), and only while its status is still the one the check read. Its title
+        stays in RAM: a target field whose planner-written words stand whole in it (``contacts.span_in``) is covered;
+        so is a ``window`` given as an hwnd when the desk ties that session to that very window
+        (:meth:`_session_window`: ``situation.map_media``, the rule every desk read uses). The line names what plays by
+        the plan's own words (the item, else the window) with the status the check read: "<item> is playing in
+        Chrome." (:data:`LINE_MEDIA_NAMED`); the title itself is never said, logged or kept. Level ``verified`` when no
+        field is left, else ``likely`` with "; I couldn't check the rest.". The way the request came in doesn't matter
+        (a hand handed over, a key, a click the talker couldn't confirm, a player that started after the hand's one
+        read): only this check and the session it read. Measured facts and the plan's own fields; no word lists. Never
+        raises (the check's own line stands)."""
+        found = result.done
+        if found is None or found.verdict is not True or found.probe != "media_session" or not found.uncovered:
+            return
+        try:
+            args = dict(found.args or {})
+            status = str((found.evidence or {}).get("status") or "").casefold()
+            target = field_of(self.head, "target", None)
+            if not status.isalpha() or target is None:
+                return
+            from yuki.actions.media import session_matches
+            from yuki.memory.contacts import span_in
+            from yuki.skills.donecheck import _sessions
+
+            sessions = _sessions() or []
+            app = args.get("app")
+            mine = [s for s in sessions if session_matches(str(s.get("app_id") or ""), app)]
+            if not mine or str(mine[0].get("status") or "").casefold() != status:
+                # the session moved since the check read it (or is gone): its title is no longer what the check saw
+                self._emit_log("done_media_named", named=False, same=False)
+                return
+            session = mine[0]
+            title = " ".join(str(session.get("title") or "").split())
+            holds: dict[str, str] = {}
+            for key in ("item", "window"):
+                want = words(field_of(target, key, ""))
+                if want and key in found.uncovered and title and span_in(want, title):
+                    holds[key] = want
+            covers = set(holds)
+            hwnd = done.as_hwnd(field_of(target, "window", None))
+            if "window" in found.uncovered and "window" not in covers and hwnd is not None \
+                    and self._session_window(sessions, session) == hwnd:
+                covers.add("window")   # the session plays in the very window the plan named, by the desk's own rule
+            if not covers:
+                self._emit_log("done_media_named", named=False, titled=bool(title))
+                return
+            what = _cut_words((holds.get("item") or holds.get("window") or "").rstrip(". "), PAGE_NAMED_CHARS)
+            raw = str(args.get("process") or app or "")
+            shown = util.app_name(raw) if raw else ""
+            if not what:
+                named = done.line_for("media_session", args, found.evidence or {}, window_entry=found.window)
+            elif shown and shown != "It":
+                named = LINE_MEDIA_NAMED.format(what=what, status=status, App=shown)
+            else:
+                named = LINE_MEDIA_NAMED_PLAIN.format(what=what, status=status)
+            left = [k for k in found.uncovered if k not in covers]
+            found.covered = [*found.covered, *(k for k in found.uncovered if k in covers)]
+            found.uncovered = left
+            found.level = util.LIKELY if left else util.VERIFIED
+            found.line = done.LINE_REST.format(line=named.rstrip(". ")) if left else named
+            result.line = found.line
+            result.outcome = done.outcome(found, self.trace, step_words=self._step_words(),
+                                          refused=self._refused_count())
+            self._emit_log("done_media_named", named=bool(what), fields=len(covers), left=len(left))
+        except Exception as exc:  # noqa: BLE001 - the check's own line stands
+            self._emit_log("done_media_named", error=type(exc).__name__)
+
+    @staticmethod
+    def _session_window(sessions: Sequence[Mapping[str, Any]], session: Mapping[str, Any]) -> int | None:
+        """fix-r33: the window ``session`` (one of ``sessions``, as ``donecheck._sessions`` read them) plays in, by the
+        desk's own rule (``situation.snapshot`` with those very sessions, so no second media read: ``map_media`` ties
+        each to the one window of its app by identity, or among several the one whose title holds the session's).
+        ``None``: not tied to one window, or the desk can't be read. No mixer or volume read. Never raises."""
+        try:
+            from yuki.perception import situation
+
+            index = next((i for i, s in enumerate(sessions) if s is session), None)
+            if index is None:
+                return None
+            state = situation.snapshot(media=list(sessions), audio=[], master=False, holds="")
+            media = list(getattr(state, "media", None) or [])
+            if len(media) != len(sessions) or "windows" in (getattr(state, "errors", None) or {}):
+                return None
+            return done.as_hwnd(getattr(media[index], "hwnd", None))
+        except Exception:  # noqa: BLE001 - not read: not tied
+            return None
 
     def _site_plays(self, url: Any) -> bool | None:
         """Whether a page's site is one the user plays media on, from their own measured time: over the last
