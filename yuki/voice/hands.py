@@ -432,6 +432,20 @@ _UNDO_STALE_NOTE = (
 )
 #: A verified hand whose done line was left empty (v3.12: "on every scroll it says done, it's very repetitive").
 _SILENT_NOTE = "It worked, verified, and, as you chose, nothing was said: they can see it. Say nothing now."
+#: fix-r33 (review of qp2): a click verified only by the media change measured in its own window (``effect`` "media":
+#: :meth:`Hands._media_effect`) toggled the player one way or the other, so the line written before it was not said
+#: (on a player already playing, "Episode 9 is playing." over playing -> paused); the talker words what was measured,
+#: as ONE's model does after its after-diff (gc C6). One talker run, cheaper than the thinker hand-off it replaces.
+_MEDIA_MEASURED_NOTE = (
+    "It took: right after the click, the PC read that window's media session change, as measured says (the OS's own "
+    "statuses, before -> after; none: no session). Nothing was said yet: your line written before the click was not "
+    "said, since a player's control can toggle either way. Say in a few words what was measured: what they asked for "
+    "is playing (or paused) when it went that way; if it went the other way from what they asked, say that plainly, "
+    "never that it is done. No other hand and no hand-off now."
+)
+#: fix-r33: code's fallback for that run (said only when no words of the talker's are heard for it): the status it
+#: went to, the OS's own word (as the brain's media check says it, ``done.LINES["media_session"]``).
+_FALLBACK_MEDIA = "It's {status} now."
 _UNCONFIRMED_NOTE = (
     "The report does not show that it took effect. Say so honestly in a few words from the report, never "
     "that it is done. If the report says why nothing more can happen (already at the end, already showing), "
@@ -2764,7 +2778,13 @@ class Hands:
         transition in the very window the act acted on (``util.media_effect``: window identity and the session's own
         status or track, never a title or a word), ``facts["verified"]`` is ``True`` and ``facts["effect"]`` is
         ``"media"`` (a code word, logged), and the report's added clause comes back (the statuses as the OS gives
-        them, never the session's title); else ``""`` and nothing is set. Never raises."""
+        them, never the session's title); else ``""`` and nothing is set. Never raises.
+
+        fix-r33 (review of qp2): the transition may run either way (paused -> playing, playing -> paused, a session
+        gone, another track), so ``effect`` "media" never lets the talker's line written before the act be said
+        (:meth:`_handle_one` gives the talker one run to word the measured direction): ``facts["media_moved"]`` keeps
+        the clause for that run's result (RAM only: the statuses, never a title), and ``facts["media_to"]`` the status
+        it went to (the OS's own word, logged) for code's fallback line."""
         try:
             ids: list[int] = []
             for hwnd in (facts.get("live_hwnd"), args.get("window")):
@@ -2792,8 +2812,11 @@ class Hands:
                 return text if text.isalpha() and len(text) <= 12 else ""
 
             was, now = word(hit.get("from")), word(hit.get("to"))
+            if now:
+                facts["media_to"] = now
             moved = (f"went {was} -> {now}" if was and now and was != now
                      else "moved to another item" if hit.get("track") else "changed")
+            facts["media_moved"] = f"read right after the click, that window's media session {moved}"
             return f"; read right after it, that window's media session {moved}"
         except Exception:  # noqa: BLE001 - no measure: the click stays as its own report says
             return ""
@@ -4170,6 +4193,13 @@ class Hands:
             # line written before the act (a call with no line says it as its step line, below). gb (B5): so is a tab
             # shown in a window that is not the app the call named (measured by program identity)
             line, coded = focus_line, True
+        # fix-r33 (review of qp2): a click whose only evidence is the media change measured in its own window
+        # (:meth:`_media_effect`) toggled the player whichever way it went; a line written before the act is never
+        # said for it (nor code's: a click has none), and the talker words the measured direction (below). An empty
+        # line written on purpose stays their chosen silence
+        measured = bool(confirmed and facts.get("effect") == "media" and (line or omitted))
+        if measured:
+            line, coded = "", False
         game = _game_trouble(facts)
         turn = self._call_safely(self.user_turn, None)
         # lVoice (problem 3): the reply's next call waits behind this one: the rest of their request is that call's
@@ -4383,6 +4413,26 @@ class Hands:
             already = "" if op == "new" else _STEP_ALREADY
             await params.result_callback({"done": report[:700], "said": said, "how_to_handle_it": note.format(
                 shown=said, already=already)})
+            return
+        if measured:
+            # fix-r33 (review of qp2; option a): the look after the act as for any verified act, then one talker run
+            # with the report's measured "before -> after" (as ONE's model words its after-diff), never the line
+            # written before the act; code's fallback (the status it went to) only if no words of the talker's come
+            look = dict(await self._look_after(params, name, args, facts, desk_before,
+                                               queued=self._queued_behind(gate), hand_id=hand_id) or {})
+            cover = str(look.pop("_cover", "") or "")   # desk20 (S3): said by code already
+            if look.pop("_quiet", False):
+                # tidy21: code's tidy step was taken (or asked) and said; its "say nothing now" is about that step, and
+                # the media words are still owed
+                look.pop("how_to_handle_it", None)
+            went = str(facts.get("media_to") or "")
+            if went.isalpha() and went != "none":
+                self._owe_fallback(_FALLBACK_MEDIA.format(status=went))
+            if self.log is not None:
+                self.log.event("hands", op=name, media_words=True, call=params.tool_call_id)
+            await params.result_callback({"done": report[:700], "said": cover, **look,
+                                          "measured": str(facts.get("media_moved") or ""),
+                                          "how_to_say_it": _MEDIA_MEASURED_NOTE})
             return
         if (confirmed and not line) or speak:
             from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
@@ -9630,7 +9680,7 @@ def _chosen_browser(facts: dict[str, Any] | None) -> str:
 
 #: morning21 (A3, A8): string facts that are code words, logged on the hands' line (never a name or an address).
 _CODE_WORD_FACTS: tuple[str, ...] = ("browser_from", "toggle_to", "toggle_before", "toggle_after", "page_state",
-                                     "effect")
+                                     "effect", "media_to")
 #: morning21 (A10): after an act on a calling site's page the user is not in the call of, the board is read for a
 #: join (or the page taking the microphone) every :data:`JOIN_WATCH_POLL_S` for :data:`JOIN_WATCH_S` (the call
 #: worker's pass is every 5 s, its sound read cached 4 s).
