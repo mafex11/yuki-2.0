@@ -1177,12 +1177,14 @@ def _close_own(call: RouteCall, hands: Any, data: Mapping[str, Any], *, apps: Se
     did not finish. A code word: ``sent`` (the key went out), ``not_sent`` (refused, held or stopped), ``no_key`` (the
     app's data has none: nothing is pressed).
 
-    gb (B2, final-G2 R13; contract K-U, writer): ``field`` is the text field this run's own shortcut gave the keyboard
-    to, as this run measured it (:func:`_field`: window, native window, role, name). With hands that take it
-    (``hands.own_undo``, the voice hands), the close key is declared as the run's own undo of that field: Yuki's check
-    is told so only while its own focus read at that key shows that very field still holding the keyboard (the name
-    Yuki typed into the switcher's search is then this run's own act, never a message to send). ``None`` (no field was
-    seen opening): nothing is declared and the check reads the key as before."""
+    gb (B2, final-G2 R13; contract K-U, writer): ``field`` is what holds the keyboard by this run's own shortcut, as
+    this run measured it (window, native window, role, name): the text field the shortcut gave the keyboard to
+    (:func:`_field`), or the switcher's own element that takes no text and took it in that field's place
+    (:func:`_tidy_switch`, fix-r33). With hands that take it (``hands.own_undo``, the voice hands), the close key is
+    declared as the run's own undo of that holder: Yuki's check is told so only while its own focus read at that key
+    shows that very holder still holding the keyboard (the name Yuki typed into the switcher's search is then this
+    run's own act, never a message to send). ``None`` (no field was seen opening): nothing is declared and the check
+    reads the key as before."""
     keys = _close_key(data)
     if not keys:
         return "no_key"
@@ -1228,11 +1230,14 @@ def _tidy_switch(call: RouteCall, hands: Any, data: Mapping[str, Any], run: dict
     (the focus can't be read) / ``unchanged`` (nothing opened) / ``already`` (it closed itself: nothing pressed) /
     ``theirs`` / ``no_key`` / ``not_sent``.
 
-    gb (B2): the close key goes as the run's own undo of the field it opened (``opened``, :func:`_close_own`). gb (B3,
-    contract K-S): ``run["switcher_held"]`` (bool, measured by the focus read; left out when it can't be told, or when
-    the user took over): what the shortcut opened still holds the keyboard as the run ends. After a close key it is
-    told only of ``opened`` (the field measured taking the keyboard after the shortcut), never of a holder merely read
-    later (gb review F3: with the holder before the shortcut unread, that may be the app's own composer)."""
+    gb (B2): the close key goes as the run's own undo of what it opened (:func:`_close_own`): the field it opened
+    (``opened``), or (fix-r33, final-K R13) the switcher's own element that takes no text, holding the keyboard in that
+    field's place, new since the shortcut, while that field is still in the app's window. gb (B3, contract K-S):
+    ``run["switcher_held"]`` (bool, measured by the focus read; left out when it can't be told, or when the user took
+    over): what the shortcut opened still holds the keyboard as the run ends. After a close key it is told only of
+    that same holder (with ``opened`` measured taking the keyboard after the shortcut), never of a holder merely read
+    later with nothing seen opening (gb review F3: with the holder before the shortcut unread, that may be the app's
+    own composer)."""
     if run.get("took_over_at"):
         run["switcher_closed"] = "theirs"
         return
@@ -1250,13 +1255,23 @@ def _tidy_switch(call: RouteCall, hands: Any, data: Mapping[str, Any], run: dict
         run["switcher_closed"] = "already"
         run["switcher_held"] = False
         return
-    held_by = opened if opened is not None else now
-    sent = _close_own(call, hands, data, apps=apps, key=key, field=opened)
+    # fix-r33 (final-K R13): with a name typed into it, the switcher's own element that takes no text can hold the
+    # keyboard instead of the field its shortcut opened. Past the two checks above, such a holder (``now``) is neither
+    # that field nor any text field (never the app's composer), and differs from what held the keyboard before the
+    # shortcut (read, so measured new since it). While that field is still found in the app's window (the switcher
+    # still open: one read-only look-up), that holder is what this run's close key undoes, and what "still held" is
+    # told against. Gone, unknown or unread: the opened field, as before
+    own = opened
+    if opened is not None and before is not None and now is not None and now != tuple(opened) \
+            and _shortcut_closed(data, tuple(opened), None) == "there":
+        own = now
+    held_by = own if own is not None else now
+    sent = _close_own(call, hands, data, apps=apps, key=key, field=own)
     if sent != "sent":
         run["switcher_closed"] = sent
-        # gb review F3: ``switcher_held`` only from what the shortcut was measured opening (``opened``); with none seen,
+        # gb review F3: ``switcher_held`` only from what the shortcut was measured opening (``own``); with none seen,
         # the holder now may be the app's own composer (the holder before the shortcut unread): left out, unknown
-        _mark_held(run, hands, opened)
+        _mark_held(run, hands, own)
         return
     deadline = call.ctx.clock() + SWITCHER_WAIT_S
     while True:
