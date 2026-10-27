@@ -121,7 +121,9 @@ def test_the_real_package_freezes_and_its_memory_modules_load_from_the_copy():
     got = json.loads(out.stdout.strip().splitlines()[-1])
     assert got["files"] > 100 and got["changed"] == []
     assert set(got["loaders"].values()) == {"_Loader"}
-    assert got["kb"] < 6_000   # a few MB compressed, far below loading every module (+72 MB measured)
+    # a few MB compressed, far below loading every module (+72 MB measured); the bound grows with the package's own
+    # source (r31: 5,998 KB on disk; r32: 6,015 KB), so it keeps headroom rather than tracking it to the KB
+    assert got["kb"] < 7_000
     print(got)
 
 

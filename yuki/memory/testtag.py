@@ -720,9 +720,9 @@ def test_rules(conn: sqlite3.Connection, known: Sequence[tuple[float, float]] | 
 
 def _restore_before_rules(conn: sqlite3.Connection, gone: set[int]) -> dict[str, int]:
     """final-H2 lane D1: before the test's rules (``gone``) are deleted, a fact one of them superseded (``remember_rule``
-    supersedes a near-duplicate: a test's "don't use X" can end the user's own "use X") stands again when the test's
-    rules are all that came after it and the last of them is still in force; when a fact that stays carries its line
-    on, it points at that one. A line the test itself ended (revoked or done) leaves it ended. Counts."""
+    ends the active rule its caller names in ``supersedes``; since r32 never one by similarity) stands again when the
+    test's rules are all that came after it and the last of them is still in force; when a fact that stays carries its
+    line on, it points at that one. A line the test itself ended (revoked or done) leaves it ended. Counts."""
     rows = conn.execute("SELECT id, status, superseded_by FROM conversation_facts").fetchall()
     after = {int(r[0]): (int(r[2]) if r[2] is not None else None) for r in rows}
     status = {int(r[0]): str(r[1] or "") for r in rows}

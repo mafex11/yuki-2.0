@@ -1492,7 +1492,12 @@ class Brain:
             try:   # the plan's step in the island's words (ui/step_words.py): "clicking Send in WhatsApp"
                 from yuki.ui.step_words import describe_plan_step
 
-                words = describe_plan_step(plan.steps[done], app=plan.target.app)
+                step, app = plan.steps[done], plan.target.app
+                opened = getattr(getattr(self, "_executor", None), "opened_in", None)
+                went = opened(done) if callable(opened) and step.verb == "open_url" else None
+                if went is not None:
+                    app = went or None   # fix-r32 (K1): where the open's call went ("": the default handler)
+                words = describe_plan_step(step, app=app)
                 now = words[:1].lower() + words[1:] if words else now
             except Exception:  # noqa: BLE001 - presentation only
                 pass
