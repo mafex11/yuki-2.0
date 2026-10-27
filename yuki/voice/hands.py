@@ -2757,6 +2757,47 @@ class Hands:
         except Exception:  # noqa: BLE001 - no read: no look after this act
             return None
 
+    def _media_effect(self, name: str, args: dict[str, Any], facts: dict[str, Any], before: Any) -> str:
+        """qp2 (final-K k_resume_anime; gc's C6 rule of ONE's runner, for the talker's hands): one desk read right after
+        an act its own report could not verify, compared with that act's own ``before`` (read right before it, after
+        its checks: never an earlier act's, so no earlier change is credited to it). When the diff holds a media
+        transition in the very window the act acted on (``util.media_effect``: window identity and the session's own
+        status or track, never a title or a word), ``facts["verified"]`` is ``True`` and ``facts["effect"]`` is
+        ``"media"`` (a code word, logged), and the report's added clause comes back (the statuses as the OS gives
+        them, never the session's title); else ``""`` and nothing is set. Never raises."""
+        try:
+            ids: list[int] = []
+            for hwnd in (facts.get("live_hwnd"), args.get("window")):
+                try:
+                    if hwnd is not None and not isinstance(hwnd, bool) and int(hwnd) and int(hwnd) not in ids:
+                        ids.append(int(hwnd))
+                except (TypeError, ValueError):
+                    continue
+            if not ids:
+                return ""
+            after = self._desk_read(self._desk_apps(name, args, facts))
+            if after is None:
+                return ""
+            from yuki.brain.util import media_effect
+            from yuki.perception import diff as desk_diff
+
+            changes = list(getattr(desk_diff.compare(before, after, acted=tuple(ids)), "media_changes", None) or [])
+            hit = next((c for c in changes if isinstance(c, dict) and media_effect([c], ids)), None)
+            if hit is None:
+                return ""
+            facts["verified"], facts["effect"] = True, "media"
+
+            def word(value: Any) -> str:
+                text = str(value or "")
+                return text if text.isalpha() and len(text) <= 12 else ""
+
+            was, now = word(hit.get("from")), word(hit.get("to"))
+            moved = (f"went {was} -> {now}" if was and now and was != now
+                     else "moved to another item" if hit.get("track") else "changed")
+            return f"; read right after it, that window's media session {moved}"
+        except Exception:  # noqa: BLE001 - no measure: the click stays as its own report says
+            return ""
+
     def _keep_before(self, name: str, args: dict[str, Any], facts: dict[str, Any], before: Any) -> None:
         """hands19 (final-B all-desk): one bracketed act's before kept for its user turn (:attr:`_turn_before`): the
         turn's first before stays the one a look compares from; each act adds its scope facts (the act's own ids and
@@ -6716,6 +6757,11 @@ class Hands:
                 if bracket and self._brackets(name, args) else None
             began = (self._turn_now(), time.monotonic())   # safety timing 4: the user turn the act began in, and when
             ok, report, facts = self._act(name, args, facts)
+            if ok and name == "click" and facts.get("verified") is None and before is not None and one is None:
+                # qp2 (final-K k_resume_anime): a click its own report could not verify (a player's Play button moves
+                # no focus, title or page) is verified by the media transition measured in the very window it clicked,
+                # from this act's own before (ONE's runner keeps its own rule: gc C6)
+                report += self._media_effect(name, args, facts, before)
             if before is not None:
                 facts["_desk_before"] = before
                 facts["_desk_turn"] = began
@@ -9583,7 +9629,8 @@ def _chosen_browser(facts: dict[str, Any] | None) -> str:
 
 
 #: morning21 (A3, A8): string facts that are code words, logged on the hands' line (never a name or an address).
-_CODE_WORD_FACTS: tuple[str, ...] = ("browser_from", "toggle_to", "toggle_before", "toggle_after", "page_state")
+_CODE_WORD_FACTS: tuple[str, ...] = ("browser_from", "toggle_to", "toggle_before", "toggle_after", "page_state",
+                                     "effect")
 #: morning21 (A10): after an act on a calling site's page the user is not in the call of, the board is read for a
 #: join (or the page taking the microphone) every :data:`JOIN_WATCH_POLL_S` for :data:`JOIN_WATCH_S` (the call
 #: worker's pass is every 5 s, its sound read cached 4 s).
