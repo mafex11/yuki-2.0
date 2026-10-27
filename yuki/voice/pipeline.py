@@ -581,6 +581,11 @@ SAY_FIRST_TOOLS = frozenset({"tell_yuki", "open_url", "open_app", "end_conversat
 #: wrote one of Yuki's acting or reading calls out as text (:func:`text_call_why`); a control written so
 #: (``text_control``) is the talker's own judgement, never a lost act, as :func:`lost_calls` leaves controls out.
 LOST_ACTS: frozenset[str] = frozenset({"broken", "act", "text_call"})
+#: integ32 review F4: the talkers' cancels of a passed-on job (the lean talker's, the full talker's). One that
+#: was lost (never came through, or written out as text, twice) is never handed to the thinker as a job of its own
+#: (:meth:`Conversation._hand_lost`): their words would reach it as a new request while the job they meant to stop
+#: runs on; code's owed line says it did not go through.
+CANCEL_CALLS: frozenset[str] = frozenset({"cancel_hand_over", "cancel_tell_yuki"})
 #: r32 (final-J2 kw_dismiss_after_answer, T1 b): the calls that end or silence the talk. One written out as text in a
 #: settled reply with no call (``ReplyChannel.text_call``) agrees with the router's end of the same words
 #: (:meth:`Conversation._route_end_reply`): two separate judgements, never one alone, and only when the real call
@@ -2658,6 +2663,7 @@ class _Turn:
     rerun_why: str = ""                  # fc (C1-C3): why it was answered again: broken | act | unmarked | ""
     #                                      (r32: text_call | text_control, a call of Yuki's written out as text)
     text_call: str = ""                  # r32 (T1): its newest reply wrote this call of Yuki's out as text (a tool name)
+    rerun_text_call: str = ""            # integ32 F4: the call its reason names, when that was a call written as text
     unmarked_refused: bool = False       # fc review M1: a rerun's unmarked text was refused by the guard's check
     quiet_refused: bool = False          # integration F4: its quiet on their opening words was refused (S10, any path)
     follow_refused: bool = False         # la A2: under all, its lone quiet on words after Yuki's own line refused once
@@ -10009,6 +10015,9 @@ class Conversation:
                 # fc (C1-C3): why nothing reached them, from the stream (a call written that never came through, a
                 # reply marked act with no call, a reply with no marker line): the rerun's note says that fact
                 turn.rerun_why = self._rerun_why(turn)
+                # integ32 F4: the name of the call that reason read (a tool name), kept past the rerun's own reply
+                turn.rerun_text_call = (str(turn.text_call or "") if turn.rerun_why in ("text_call", "text_control")
+                                        else "")
                 turn.broken_call = False   # the rerun answers it; a call of its own reply that breaks marks it again
                 obs.rerun_turn = turn
                 self.log.event("reply_watch", op="rerun", turn=turn.n, cut=bool(turn.cut),
@@ -10121,6 +10130,14 @@ class Conversation:
             names = [n for n in lost_calls(call) if n] if call is not None and getattr(call, "broken", ()) else []
             if names:
                 break
+        # integ32 review F4: a lost cancel (:data:`CANCEL_CALLS`: one that never came through, else one
+        # written out as text, the rerun's own reply's or the one its reason read) is never a job of its own: the
+        # caller's owed line says it did not go through. Tool names only
+        written = str(getattr(turn, "text_call", "") or "") or str(getattr(turn, "rerun_text_call", "") or "")
+        if any(n in CANCEL_CALLS for n in (names or [written])):
+            self.log.event("reply_watch", op="hand_lost", turn=turn.n, handed=False, why=turn.rerun_why or None,
+                           cancel=True)
+            return False
         try:
             handed = bool(hand(context, names[-1] if names else "", why=str(turn.rerun_why or "broken")))
         except Exception as exc:  # noqa: BLE001 - the owed line then

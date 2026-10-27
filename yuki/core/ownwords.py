@@ -121,28 +121,103 @@ def _runs(line: str) -> list[tuple[int, int, str]]:
     return out
 
 
-def _call_shaped(line: str, runs: list[tuple[int, int, str]], k: int) -> bool:
-    """Whether ``runs[k]`` (one of :data:`CALL_WORDS`) stands in ``line`` as a call written out, in the shapes a call
-    is written in: its arguments follow (``name(`` or ``name {``, a ``:`` or ``=`` between allowed); an element named
-    for it (``<name``); the value of a call's ``name`` key (``name="..."``, ``"name": "..."``); or it opens its line
-    (nothing but marks before it) and is either alone there or followed by an argument (a run, then ``=`` or ``:``).
-    Format only: a tool's name inside a sentence of prose is not a call."""
-    start, end, _name = runs[k]
-    after = line[end:].lstrip()
-    if after[:1] in (":", "="):
-        after = after[1:].lstrip()
-    if after[:1] in ("(", "{"):
+#: Brackets a call's arguments are written in, opening and closing.
+_OPENS, _CLOSES = "({[", ")}]"
+#: How a written argument's value starts: a string, an object or a list.
+_VALUE_STARTS = "\"'“‘{["
+#: Bare values an argument may take (casefolded).
+_LITERALS = frozenset({"true", "false", "null", "none"})
+
+
+def _value_follows(text: str) -> bool:
+    """Whether ``text`` starts with a written value: a string, an object, a list, a number or a bare literal."""
+    text = text.lstrip()
+    if not text:
+        return False
+    if text[0] in _VALUE_STARTS or text[0].isdigit() or (text[0] == "-" and text[1:2].isdigit()):
         return True
+    runs = _runs(text)
+    return bool(runs) and runs[0][0] == 0 and runs[0][2] in _LITERALS
+
+
+def _argument_follows(text: str) -> bool:
+    """Whether ``text`` starts with one of a call's arguments: a run, then ``=``; or a run, then ``:`` and a value
+    (:func:`_value_follows`). A label in prose ("reason: they asked") has no value after it."""
+    runs = _runs(text)
+    if not runs or runs[0][0] != 0:
+        return False
+    rest = text[runs[0][1]:].lstrip()
+    return rest[:1] == "=" or (rest[:1] == ":" and _value_follows(rest[1:]))
+
+
+def _holds_arguments(bracketed: str) -> bool:
+    """Whether the bracket ``bracketed`` opens holds a call's arguments: nothing yet (its line ends there, the call goes
+    on below), none (it closes at once), a value or an argument. A bracket of prose words holds none."""
+    inner = bracketed[1:].lstrip()
+    return not inner or inner[0] in _CLOSES or inner[0] in _VALUE_STARTS or _argument_follows(inner)
+
+
+def _closes_at_end(bracketed: str) -> bool:
+    """Whether the bracket ``bracketed`` opens closes with nothing but marks after it on its line, or is still open at
+    the line's end (a call written over several lines). Strings in double quotes are skipped."""
+    depth, quoted, escaped = 0, False, False
+    for i, ch in enumerate(bracketed):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                quoted = False
+        elif ch == '"':
+            quoted = True
+        elif ch in _OPENS:
+            depth += 1
+        elif ch in _CLOSES:
+            depth -= 1
+            if depth <= 0:
+                return not any(c.isalnum() for c in bracketed[i + 1:])
+    return True
+
+
+def _call_shaped(line: str, runs: list[tuple[int, int, str]], k: int) -> bool:
+    """Whether ``runs[k]`` (one of :data:`CALL_WORDS`) stands in ``line`` as a call written out. The structured
+    shapes, anywhere in the line: an element named for it (``<name``); the value of a call's ``name`` key
+    (``name="..."``, ``"name": "..."``). Otherwise the call is its line: nothing before its word but marks (a namespace
+    glued to it, ``x.name``, or one of :data:`MARKER_WORDS` alone, allowed), and then either nothing but marks after it
+    (not a question), or its arguments: a bracket glued to it, or after a space, ``:`` or ``=`` a bracket that holds
+    arguments (:func:`_holds_arguments`), closing at the line's end or going on below (:func:`_closes_at_end`); or,
+    after a space, an argument (:func:`_argument_follows`).
+
+    Format only. A tool's name inside a sentence of prose is not a call, and neither is a line that only weighs it: "Not
+    end_conversation (they asked a follow-up).", "end_conversation?", "end_conversation() is wrong here"
+    (integ32 review F1 / F3)."""
+    start, end, _name = runs[k]
     if line[:start].rstrip().endswith("<"):
         return True
-    if k > 0 and runs[k - 1][2] == "name" and not line[runs[k - 1][1]:start].strip(" \t\"'=:"):
-        return True
-    if k == 0:
-        if len(runs) == 1:
+    if k > 0 and runs[k - 1][2] == "name":
+        between = line[runs[k - 1][1]:start]
+        if not between.strip(" \t\"'=:") and ("=" in between or ":" in between):
             return True
-        nxt_end = runs[1][1]
-        return line[nxt_end:].lstrip()[:1] in ("=", ":")
-    return False
+    token = start
+    while token > 0 and not line[token - 1].isspace():
+        token -= 1
+    before = [w for w in _words(line[:token]) if any(ch.isalnum() for ch in w)]
+    if before and not (len(before) == 1 and before[0] in MARKER_WORDS):
+        return False   # words before it on its line (a marker word alone aside: "act open_app(...)"): prose
+    tail = line[end:]
+    after = tail.lstrip()
+    glued = len(after) == len(tail)
+    if after[:1] in (":", "="):
+        after = after[1:].lstrip()
+        glued = False
+    if after[:1] in ("(", "{"):
+        return (glued or _holds_arguments(after)) and _closes_at_end(after)
+    if k + 1 >= len(runs):
+        return not any(ch in "?？" for ch in tail)   # alone on its line, never asked
+    if line[end:runs[k + 1][0]].strip() not in ("", ":"):
+        return False   # a mark between it and the next word: "stay_quiet? No: ..."
+    return _argument_follows(line[runs[k + 1][0]:])
 
 
 def text_call(text: str) -> str | None:
