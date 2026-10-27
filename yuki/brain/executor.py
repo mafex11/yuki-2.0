@@ -870,6 +870,11 @@ class Executor:
         #: went to, never one the plan wrote and the open passed over (:meth:`_probe_args`). A later open of the site
         #: that went to Windows' default handler drops its entry.
         self._page_browsers: dict[str, str] = {}
+        #: fix-r32 (K1, review M1): each site whose last open in this request passed over a program the plan named as no
+        #: browser by machine data and went where no browser is known (Windows' default handler; ``site_key`` -> that
+        #: program's name): a page check of that site that wrote that program reads the window the open showed, never
+        #: the program it passed over (:meth:`_probe_args`). An open of the site in a known browser drops its entry.
+        self._page_passed: dict[str, str] = {}
         #: x9 (review r1 M1): the programs that are browsers by machine data, read once per request
         #: (:meth:`_browsers`; ``None``: not read yet)
         self._browser_rows: list[dict[str, Any]] | None = None
@@ -961,6 +966,10 @@ class Executor:
         #: fix-r32 (K1): code's note for the planner on an open_url step whose address went to another browser than the
         #: program the plan wrote (step index -> the note), so a revision keeps it there (:meth:`_open_url_browser`)
         self._open_moved: dict[int, str] = {}
+        #: fix-r32 (K1, review M1): the program a web open_url step's resolution passed over as no browser (step index
+        #: -> its name), so a page check of its site never reads it when the open went where no browser is known
+        #: (:meth:`_note_page_browser`)
+        self._open_passed: dict[int, str] = {}
         #: jBrain (fSkills merge note 2): each open_url step's page its own report confirmed (step index -> the page's
         #: title, as launch.open_url read it), for a done that saw only the app (:meth:`_pages_cover`)
         self._open_pages: dict[int, str] = {}
@@ -3147,6 +3156,10 @@ class Executor:
                 self._open_moved[index] = moved
             else:
                 self._open_moved.pop(index, None)
+            if passed and host:
+                self._open_passed[index] = passed   # review M1: its site's check never reads the program passed over
+            else:
+                self._open_passed.pop(index, None)
         if log:
             # a code word (log enum); ``passed``: a program the plan named was passed over as no browser
             self._emit_log("brain_open_url", source=source, open=bool(chosen and chosen[0]),
@@ -3225,17 +3238,26 @@ class Executor:
     def _note_page_browser(self, call: Call) -> None:
         """fix-r32 (K1): a web ``open_url`` that ran: its site (``donecheck.site_key`` of the address the call gave)
         now reads in the browser :meth:`_note_browser` just noted (:attr:`browser`), or in none known (Windows'
-        default handler, or a program that is no browser by machine data: the entry goes). Never raises."""
+        default handler, or a program that is no browser by machine data: the entry goes). Never raises.
+
+        Review M1: when it went where no browser is known and its resolution passed over a program the plan named as
+        no browser (:attr:`_open_passed`), the site keeps that program (:attr:`_page_passed`), so a check of it that
+        wrote that program reads the window the open showed (:meth:`_probe_args`)."""
         try:
             from yuki.skills.donecheck import site_key
 
             key = site_key(_web_host(call.input.get("url")))
             if not key:
                 return
+            passed = self._open_passed.get(call.index, "") if not self.browser else ""
             if self.browser:
                 self._page_browsers[key] = self.browser
             else:
                 self._page_browsers.pop(key, None)
+            if passed:
+                self._page_passed[key] = passed
+            else:
+                self._page_passed.pop(key, None)
         except Exception:  # noqa: BLE001 - bookkeeping: a check reads the browser the plan wrote, as before
             pass
 
@@ -3247,6 +3269,18 @@ class Executor:
 
             key = site_key(site)
             return self._page_browsers.get(key, "") if key else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _passed_over(self, site: str) -> str:
+        """fix-r32 (K1, review M1): the program this request's last open of the page check's site passed over as no
+        browser while the address went where no browser is known (:meth:`_note_page_browser`), ``""`` when none. Never
+        raises."""
+        try:
+            from yuki.skills.donecheck import site_key
+
+            key = site_key(site)
+            return self._page_passed.get(key, "") if key else ""
         except Exception:  # noqa: BLE001
             return ""
 
@@ -3284,7 +3318,13 @@ class Executor:
         browser was passed over as no browser, and the check read the written one's window, "couldn't check"): a
         page_at whose written ``process`` is another program than the browser this request's open of that very site
         went to by identity (:meth:`_act_browser`, the program identity ``util.app_names``) reads that browser: the
-        check follows the act, never the plan's guess. Logged ``probe_browser`` (code words only)."""
+        check follows the act, never the plan's guess. Logged ``probe_browser`` (code words only).
+
+        Review M1 (the same, when no site browser was measured: the open passed the written program over and Windows'
+        default handler took the address): a page_at whose written ``process`` is the program this request's last open
+        of that site passed over (:meth:`_passed_over`, by the same identity) drops it, so the check reads the window
+        the open showed, as a page_at with none written after a default-handler open does (never :meth:`_page_process`:
+        :attr:`browser` could only be another site's open then). Logged ``probe_browser source=passed``."""
         out = dict(args)
         spec = done.PROBE_ARGS.get(probe, ((), ()))
         if "process" not in spec[0] + spec[1]:
@@ -3294,10 +3334,15 @@ class Executor:
             image = "" if written.casefold().endswith(".exe") else self._listed_image(written)   # an image already
             if image:
                 out["process"] = image
-            act = self._act_browser(str(out.get("site") or "")) if probe == "page_at" else ""
-            if act and not util.app_names(act) & (util.app_names(written) | util.app_names(image)):
+            site = str(out.get("site") or "")
+            act = self._act_browser(site) if probe == "page_at" else ""
+            names = util.app_names(written) | util.app_names(image)
+            if act and not util.app_names(act) & names:
                 out["process"] = act
                 self._emit_log("probe_browser", source="act")
+            elif not act and probe == "page_at" and util.app_names(self._passed_over(site)) & names:
+                out.pop("process", None)   # the open passed it over: the window it showed, never that program's
+                self._emit_log("probe_browser", source="passed")
             return out
         if probe != "page_at":
             return out
@@ -3988,10 +4033,11 @@ class Executor:
         the stuck ending): the step's verb and the app it acts in (its target window's program, else the plan's target
         app; :data:`STOPPED_WHAT_APP`), and the plan's act steps after it that were not done (each in the island's
         words, :meth:`_step_said`, at most :data:`STOPPED_REST_MAX`; ``""`` none). Never the plan's free text. May
-        raise (callers keep their own plain line)."""
-        target = field_of(field_of(self.head, "target", None), "app", None) if self.head is not None else None
-        app = util.app_name(call.app) if call.app else (words(target) if target else "")
-        app = "" if app in ("", "It") else app
+        raise (callers keep their own plain line).
+
+        fix-r32 (K1, review M1): the app is :meth:`_call_app`'s, so a web open names where its call went (or none, for
+        Windows' default handler), never the program the plan named and the open passed over."""
+        app = self._call_app(call)
         what = (STOPPED_WHAT_APP[call.tool].format(app=app) if app and call.tool in STOPPED_WHAT_APP
                 else STOPPED_WHAT.get(call.tool, "there"))
         rest: list[str] = []
@@ -4004,6 +4050,34 @@ class Executor:
         shown = ", ".join(rest[:STOPPED_REST_MAX]) + (", and more" if len(rest) > STOPPED_REST_MAX else "") \
             if rest else ""
         return what, shown
+
+    def _call_app(self, call: Any) -> str:
+        """The app a step's call acts in, as people say it (:meth:`_stop_words`, :meth:`_slow_line`): its target
+        window's program, else the plan's target app; ``""`` when none. fix-r32 (K1, review M1): a web ``open_url``
+        this plan resolved (:meth:`opened_in`) names the app its call handed the address to, or none when Windows'
+        default handler took it, never the program the plan named and the open passed over. May raise."""
+        went = self.opened_in(getattr(call, "index", None)) \
+            if str(getattr(call, "tool", "") or "") == "open_url" else None
+        if went is not None:
+            app = util.app_name(went) if went else ""
+        else:
+            target = field_of(field_of(self.head, "target", None), "app", None) if self.head is not None else None
+            raw = str(getattr(call, "app", "") or "")
+            app = util.app_name(raw) if raw else (words(target) if target else "")
+        return "" if app in ("", "It") else app
+
+    def opened_in(self, index: Any) -> str | None:
+        """fix-r32 (K1, review L1): the app the running plan's web ``open_url`` step at ``index`` handed its address to
+        as its call was resolved (:attr:`_open_apps`; ``""``: Windows' default handler), so words about that step name
+        where it went; ``None`` when that step is no web open resolved in this plan (the caller keeps its own app).
+        Read by the brain's "how's it going?" line too. Never raises."""
+        try:
+            if isinstance(index, int) and not isinstance(index, bool) and index in self._open_apps \
+                    and 0 <= index < len(self.steps) and self._verb(self.steps[index]) == "open_url":
+                return self._open_apps[index]
+        except Exception:  # noqa: BLE001 - presentation only
+            pass
+        return None
 
     def _note_stuck(self, index: int, call: Call) -> None:
         """desk20 (final-D S20, k_t3_draft: "I got stuck typing. Try another way?" named neither T3 Code nor what was
@@ -5063,13 +5137,11 @@ class Executor:
         app it acts in (its target window's program, else the plan's target app: :data:`STOPPED_WHAT_APP`, as
         :meth:`_stop_words` names a stopped step), else the app alone, else the verb alone (:data:`STOPPED_WHAT`), else
         plainly. Never the plan's goal or a step's free text. ``form`` is content-free (``step_app``, ``app``,
-        ``step``, ``plain``) for the log. Never raises."""
+        ``step``, ``plain``) for the log. Never raises. fix-r32 (K1, review M1): the app is :meth:`_call_app`'s (a web
+        open names where its call went, never the program the plan named and the open passed over)."""
         try:
-            target = field_of(field_of(self.head, "target", None), "app", None) if self.head is not None else None
             tool = str(getattr(call, "tool", "") or "")
-            raw = str(getattr(call, "app", "") or "")
-            app = util.app_name(raw) if raw else (words(target) if target else "")
-            app = "" if app in ("", "It") else app
+            app = self._call_app(call)
             if app and tool in STOPPED_WHAT_APP:
                 return LINE_SLOW_STEP.format(what=STOPPED_WHAT_APP[tool].format(app=app)), "step_app"
             if app:
