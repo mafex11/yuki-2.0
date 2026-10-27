@@ -5161,9 +5161,14 @@ class Hands:
                 # integ22 fix names-2: an address taken for one of their own channels is named as what opened
                 # ("Opened Deji's channel."), never the handle as heard
                 named = _opened_name(facts)
-                if named and (facts or {}).get("names_match", {}).get("kind") == "channel":
-                    return f"Opened {named}'s channel."
                 chosen = _chosen_browser(facts)
+                if named and (facts or {}).get("names_match", {}).get("kind") == "channel":
+                    if (facts or {}).get("page_state") == "already":
+                        # fix-r32 (Y-D1): the launch measured that channel's page already showing: it is up, never
+                        # "Opened" (fixed words chosen by the launch's measured state, never by reading words)
+                        return (f"{named}'s channel is already up in {chosen}." if chosen
+                                else f"{named}'s channel is already up.")
+                    return f"Opened {named}'s channel."
                 if chosen:
                     return f"It's up in {chosen}."   # morning21 (A3): code chose it: named, one word corrects it
                 return "It's up."   # verified at the address and titled (never silent after "On it.")
@@ -8212,6 +8217,10 @@ class Hands:
         # is never its proof nor its identity. An address "already" showing made no tab: its tab is kept for the
         # line's liveness only. A window not read before: its selected tab is the title proof as before, no identity.
         already = details.get("page_state") == "already"
+        if already:
+            # fix-r32 (Y-D1): the launch measured the page already showing (nothing typed, no tab made): code's done
+            # line says it is up, never "Opened" (a code word, logged: :data:`_CODE_WORD_FACTS`)
+            facts["page_state"] = "already"
         try:
             known = None if already or not hwnd else strips_before.get(int(hwnd))
             fresh = bool(not already and hwnd and listed and int(hwnd) not in listed)
@@ -9574,7 +9583,7 @@ def _chosen_browser(facts: dict[str, Any] | None) -> str:
 
 
 #: morning21 (A3, A8): string facts that are code words, logged on the hands' line (never a name or an address).
-_CODE_WORD_FACTS: tuple[str, ...] = ("browser_from", "toggle_to", "toggle_before", "toggle_after")
+_CODE_WORD_FACTS: tuple[str, ...] = ("browser_from", "toggle_to", "toggle_before", "toggle_after", "page_state")
 #: morning21 (A10): after an act on a calling site's page the user is not in the call of, the board is read for a
 #: join (or the page taking the microphone) every :data:`JOIN_WATCH_POLL_S` for :data:`JOIN_WATCH_S` (the call
 #: worker's pass is every 5 s, its sound read cached 4 s).
