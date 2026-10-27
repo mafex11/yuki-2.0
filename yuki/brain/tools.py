@@ -494,7 +494,11 @@ def run_remember(memory: Any, tool_input: Mapping[str, Any], *, words: str) -> T
 
     final-H2 lane D2 (K-R): a ``rule``, ``how`` or (r31 F6) ``forget_rule`` that turns around what was kept before with
     no reason from their words is held, not saved (:func:`reversal_hold`); the result is not ok, its payload
-    ``{"saved": False, "held": "ask_first"}``. The planner and the ONE agent both come through here."""
+    ``{"saved": False, "held": "ask_first"}``. The planner and the ONE agent both come through here.
+
+    r32 (Y-M4): a kept ``rule`` or ``how`` says what memory did (``MemoryAccess._remember_rule``,
+    :func:`_remember_how`): already kept as rule:N (nothing written), or saved, with the close items that stay in
+    force; never a silent end."""
     started = time.perf_counter()
     args = _clean(tool_input)
     kind = str(args.pop("kind", "") or "")
@@ -531,10 +535,14 @@ HOW_ORIGIN = "taught"
 
 def _remember_how(memory: Any, args: Mapping[str, Any], *, words: str, started: float) -> ToolRun:
     """morning21 C4 (contract K4): ``remember(how)``: a way they told Yuki they do something on this PC, kept as
-    know-how at once (``MemoryClient.remember_how``: a restatement supersedes the entry it restates), with origin
-    :data:`HOW_ORIGIN` when that method takes an origin (else memory's default), so the next request's how-block shows
-    it as taught. ``text``: the way in their words; ``app``: the app it is about, when they named one. Their words go
-    with it as its source request. Never raises."""
+    know-how at once (``MemoryClient.remember_how``), with origin :data:`HOW_ORIGIN` when that method takes an origin
+    (else memory's default), so the next request's how-block shows it as taught. ``text``: the way in their words;
+    ``app``: the app it is about, when they named one. Their words go with it as its source request. Never raises.
+
+    r32 (Y-M1, Y-M4): memory never ends a way of theirs by similarity (a restatement ends only an entry of Yuki's own),
+    and the result says what it did (``remember_how_outcome`` when the client has it,
+    ``yuki.agent.memory.how_kept_note``): already kept (the same words; nothing written), or kept, with the entry of
+    Yuki's own it replaced and the close ways that stay in force; the payload carries those as ids."""
     text = " ".join(str(args.get("text") or "").split())
     app = " ".join(str(args.get("app") or "").split()) or None
     call = {"text": text, **({"app": app} if app else {})}
@@ -545,7 +553,9 @@ def _remember_how(memory: Any, args: Mapping[str, Any], *, words: str, started: 
     def go(client: Any) -> Any:
         import inspect
 
-        keep = client.remember_how
+        keep = getattr(client, "remember_how_outcome", None)
+        if not callable(keep):
+            keep = client.remember_how
         try:
             takes_origin = "origin" in inspect.signature(keep).parameters
         except (TypeError, ValueError):
@@ -559,9 +569,16 @@ def _remember_how(memory: Any, args: Mapping[str, Any], *, words: str, started: 
     except Exception as exc:  # noqa: BLE001
         return ToolRun("remember", "remember_how", False, f"Not saved ({type(exc).__name__}).", input=call,
                        ms=(time.perf_counter() - started) * 1000)
+    from yuki.agent.memory import LINE_HOW_ALREADY, how_kept_note, keep_ids, keep_outcome
+
+    got = keep_outcome(row)
     where = f" for {app}" if app else ""
-    return ToolRun("remember", "remember_how", True, f"Kept{where}: Yuki does it this way from now on.",
-                   {"saved": True, "id": row}, call, (time.perf_counter() - started) * 1000)
+    if got["kept_as"] is not None:
+        line = LINE_HOW_ALREADY.format(where=where)
+    else:
+        line = " ".join(x for x in (f"Kept{where}: Yuki does it this way from now on.", how_kept_note(got)) if x)
+    return ToolRun("remember", "remember_how", True, line, {"saved": True, "id": got["id"], **keep_ids(got)}, call,
+                   (time.perf_counter() - started) * 1000)
 
 
 #: The source the planner's "Keep this as your usual?" answers are recorded with (``pref_events.source``), followed by
