@@ -292,8 +292,9 @@ class Live:
     ``None``: :func:`window_page` reads the board itself when a step needs it (typing with Enter outside a chat app's
     program). ``kinds``: the same for the extraction's kind of each window (``windows[].kind``: ``conversation`` for
     a chat), read by :func:`window_kind`. ``own_undo`` (final-G2 R13, A6; gb's contract K-U): the hand measured this
-    key step as the run's own close of what its own shortcut opened, while that very field holds the keyboard
-    (``Hands.own_undo``): undoable, row 6 after rows 1-2, never sent to the commit check as a possible send.
+    key step as the run's own close of what its own shortcut opened, while that very holder (the field it opened, or
+    the switcher's own element that takes no text in its place: fix-r33) holds the keyboard (``Hands.own_undo``):
+    undoable, row 6 after rows 1-2, never sent to the commit check as a possible send.
     ``calling_tabs`` (morning21 A4): the Now board's ``calling_tabs`` entries by hwnd, for a caller that read the board
     already; ``None``: row 3 reads the board itself when a step needs it (:func:`calling_tab_now`)."""
 

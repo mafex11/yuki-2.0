@@ -715,8 +715,9 @@ def one(name: str, tool_input: Mapping[str, Any], target: Mapping[str, Any] | No
     final-G2 R13 (A5, A6; gb's contracts, each absent is today's behaviour exactly): ``target["typed_field"]`` /
     ``typed_field_held`` / ``typed_to_field`` (K-T): the field Yuki's text waits in and whether this step goes there,
     stated on the check's step line (:func:`typed_field`). ``target["own_undo"] is True`` (K-U, set by the hand only
-    when measured): a key step that is the run's own close of what its own shortcut opened, while that field still
-    holds the keyboard: undoable (row 6, after rows 1-2), never sent to the commit check."""
+    when measured): a key step that is the run's own close of what its own shortcut opened, while that holder (the
+    field, or the switcher's own element that takes no text in its place: fix-r33) still holds the keyboard: undoable
+    (row 6, after rows 1-2), never sent to the commit check."""
     declared = consent
     try:
         target = dict(target or {})

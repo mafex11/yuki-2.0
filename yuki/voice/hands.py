@@ -2014,6 +2014,18 @@ class Hands:
                 " ".join(str(getattr(snap, "role", "") or "").split()),
                 " ".join(str(getattr(snap, "name", "") or "").split()))
 
+    @staticmethod
+    def _holder_ident(snap: Any) -> tuple[int, int, str, str] | None:
+        """fix-r33 (final-K R13; contract K-U): what a focus read shows holding the keyboard, text field or not, as the
+        same identity :meth:`_field_ident` forms (``yuki.skills.chat._ident``'s shape, whitespace folded): a run's own
+        undo may be declared of the switcher's own element that takes no text. ``None`` when nothing was read, the read
+        failed, or a password field holds it."""
+        if snap is None or not getattr(snap, "ok", False) or getattr(snap, "is_password", False):
+            return None
+        return (int(getattr(snap, "window", 0) or 0), int(getattr(snap, "hwnd", 0) or 0),
+                " ".join(str(getattr(snap, "role", "") or "").split()),
+                " ".join(str(getattr(snap, "name", "") or "").split()))
+
     def _typed_live(self, hwnd: int | None) -> list[tuple[float, tuple[int, int, str, str] | None]]:
         """gb (B1): the fields of window ``hwnd`` holding Yuki's unsent text now (within :data:`TYPED_WAIT_S`), oldest
         first; expired ones are let go."""
@@ -2099,7 +2111,8 @@ class Hands:
         own shortcut opened and did not finish (the chat driver's ``_close_own``: Discord's Quick Switcher, whose
         search field Yuki typed a name into), a key step of that run on this thread whose keys are exactly ``keys``
         carries ``own_undo`` to Yuki's check, but only when this step's own focus read shows ``field`` (the identity
-        the run measured when its shortcut gave that field the keyboard: window, native window, role, name) still
+        the run measured holding the keyboard by its own shortcut: window, native window, role, name; the field that
+        shortcut opened, or fix-r33 the switcher's own element that takes no text in that field's place) still
         holding the keyboard. The key then closes the run's own act (its undo), not anything of the user's. ``field``
         ``None`` or no keys: nothing is declared (the check as today). Every gate still applies (a game in front, the
         Act switch)."""
@@ -2122,8 +2135,9 @@ class Hands:
     def _own_undo_measured(self, tool: str, tool_input: dict[str, Any], hwnd: int | None,
                            held: tuple[int, int, str, str] | None) -> bool:
         """gb (B2): whether this step is the declared own undo (:meth:`own_undo`) of this thread's run: a key step whose
-        keys are exactly the declared ones, into the declared field's window, while the focus read ``held`` shows that
-        very field holding the keyboard. Identity and keys only."""
+        keys are exactly the declared ones, into the declared holder's window, while the focus read ``held`` (what holds
+        the keyboard, text field or not: :meth:`_holder_ident`, fix-r33) shows that very holder. Identity and keys
+        only."""
         decl = self._own_undo.get(threading.get_ident())
         if decl is None or held is None or tool not in ("hotkey", "press"):
             return False
@@ -2150,7 +2164,7 @@ class Hands:
                 return False
             raw = (target or {}).get("hwnd")
             hwnd = int(raw) if raw is not None and str(raw).lstrip("-").isdigit() else None
-            held = self._field_ident(self._focus(timeout_s=self.TYPED_FOCUS_S))
+            held = self._holder_ident(self._focus(timeout_s=self.TYPED_FOCUS_S))
             return self._own_undo_measured(tool, dict(tool_input or {}), hwnd, held)
         except Exception:  # noqa: BLE001 - unsure: not the run's own undo (the check as today)
             return False
@@ -2205,15 +2219,16 @@ class Hands:
         # gb (B1): the field the type hand's own focus read named (RAM only; never a fact for the check)
         typing_into = _as_field(facts.pop("field_ident", None))
         # gb (B1, B2; contracts K-T, K-U): one focus read for this step, only where Yuki's text waits in its window or
-        # while this thread's run declared its own undo; what holds the keyboard now (a text field's identity)
+        # while this thread's run declared its own undo; what holds the keyboard now (a text field's identity for K-T;
+        # fix-r33: for K-U the holder's, text field or not, so the switcher's own element can be the declared holder)
         declared = self._own_undo.get(threading.get_ident()) is not None and tool in ("hotkey", "press")
-        read, held = False, None
+        read, held, holder = False, None, None
         if hwnd is not None and (self._typed_live(hwnd) or declared):
             snap = self._focus(timeout_s=self.TYPED_FOCUS_S)
-            read, held = snap is not None, self._field_ident(snap)
+            read, held, holder = snap is not None, self._field_ident(snap), self._holder_ident(snap)
         self._typed_facts(tool, tool_input, hwnd, facts, held, read)
-        if declared and self._own_undo_measured(tool, tool_input, hwnd, held):
-            facts["own_undo"] = True   # K-U: the run's own close of the field its own shortcut opened, held now
+        if declared and self._own_undo_measured(tool, tool_input, hwnd, holder):
+            facts["own_undo"] = True   # K-U: the run's own close of what its own shortcut opened, held now
         try:
             verdict = one(tool, tool_input, facts, words=words, checker=self._checker(), earlier=before,
                           log=self._check_log)
