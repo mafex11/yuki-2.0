@@ -193,6 +193,12 @@ LINE_BEHIND_TAB = "What was playing is still playing behind it."
 LINE_PAGE_NAMED = "{what} is open in {App}."
 LINE_PAGE_NAMED_PLAIN = "{what} is open."
 PAGE_NAMED_CHARS = 80
+#: fix-r32 (K1): an open_url step's note for the planner when the program its window or the plan's target app named is
+#: no browser by machine data (:meth:`Executor._is_browser`) and the address went elsewhere: to the browser the site's
+#: own visits use (``{app}``, as Windows names it), or to Windows' default handler. Code's words with program names
+#: only, so a revision keeps the page where it went and the check reads it there (``{plan}``: the program passed over).
+OPEN_MOVED_SITE = "it opened in {app}, the browser this site's own visits use ({plan} is no browser by this PC's data)"
+OPEN_MOVED_DEFAULT = "Windows' default browser opened it ({plan} is no browser by this PC's data)"
 #: fe (E4): what a plan opened to be played is open and nothing plays (:meth:`Executor._not_playing`): the page's own
 #: line, then this. ``{line}``: that line without its full stop.
 LINE_OPEN_NOT_PLAYING = "{line}, but it isn't playing."
@@ -859,6 +865,11 @@ class Executor:
         #: by name; a page_at check reads that browser's page, never another browser's (``""``: none named, or the
         #: last one went to Windows' default handler)
         self.browser = ""
+        #: fix-r32 (K1): each site this request opened by name in a browser by identity (``donecheck.site_key`` -> that
+        #: browser's process image, as :attr:`browser` is noted): a page check of that site reads the browser the act
+        #: went to, never one the plan wrote and the open passed over (:meth:`_probe_args`). A later open of the site
+        #: that went to Windows' default handler drops its entry.
+        self._page_browsers: dict[str, str] = {}
         #: x9 (review r1 M1): the programs that are browsers by machine data, read once per request
         #: (:meth:`_browsers`; ``None``: not read yet)
         self._browser_rows: list[dict[str, Any]] | None = None
@@ -943,6 +954,13 @@ class Executor:
         self._batch_words = -1   # how many of the user's words the batch was checked on (they only grow)
         #: x9: each open_url step's browser image as its resolution found it (step index -> image)
         self._open_images: dict[int, str] = {}
+        #: fix-r32 (K1): each web open_url step's app as its resolution set it (step index -> the name the call hands
+        #: open_url; ``""``: Windows' default handler), so its step words name where the call went, never the plan's
+        #: target app it passed over (:meth:`_step_said`)
+        self._open_apps: dict[int, str] = {}
+        #: fix-r32 (K1): code's note for the planner on an open_url step whose address went to another browser than the
+        #: program the plan wrote (step index -> the note), so a revision keeps it there (:meth:`_open_url_browser`)
+        self._open_moved: dict[int, str] = {}
         #: jBrain (fSkills merge note 2): each open_url step's page its own report confirmed (step index -> the page's
         #: title, as launch.open_url read it), for a done that saw only the app (:meth:`_pages_cover`)
         self._open_pages: dict[int, str] = {}
@@ -1862,7 +1880,7 @@ class Executor:
         if current is None:
             return f"{goal}: all {total} steps done, checking it." if goal else f"All {total} steps done, checking it."
         step = self.steps[current.index] if current.index < len(self.steps) else {}
-        what = _mid(self._step_said(step))   # mid-sentence: "step 2 of 3, opening a page in Arc"
+        what = _mid(self._step_said(step, index=current.index))   # mid-sentence: "step 2 of 3, opening a page in Arc"
         lead = f"{goal}: " if goal else ""
         return f"{lead}step {current.index + 1} of {total}" + (f", {what}" if what else "") + \
             (f" ({done_n} done)" if done_n else "")
@@ -2452,6 +2470,7 @@ class Executor:
                 self._note_browser(call, outcome)
             else:
                 self.browser = ""
+            self._note_page_browser(call)
         own, why = util.action_verdict(call.tool, outcome)
         verdict = own
         expect = field_of(step, "expect", None)
@@ -2521,6 +2540,7 @@ class Executor:
             self._tray_launches.add(index)
         if call.tool == "run_skill":
             return self._skill_result(index, step, call, outcome)
+        moved = self._open_moved.get(index, "") if call.tool == "open_url" and self.tidy is None else ""
         if not outcome.ok or verdict is False:
             status.state, status.why = "failed", why
             if self.tidy is None:
@@ -2536,8 +2556,12 @@ class Executor:
                 status.state, status.why = "refused", "input_gate"
                 self._emit_log("brain_gate_no_game", verb=call.tool, kind=kind)
                 return RunResult("refused", line=self._stopped_line(index, call), final=True)
+            if moved and not (external and body):
+                shown = f"{moved}. {shown}" if shown else moved   # fix-r32 (K1): where it went, for the revision
             return self._mismatch_result(index, why, seen=shown, call=call, seen_fenced=external and bool(body))
-        status.state, status.why = "ok", why
+        # fix-r32 (K1): an address that went to another browser than the program the plan wrote says so in the step's
+        # note for the planner (code's words), so a revision keeps it where it went
+        status.state, status.why = "ok", (f"{why}; {moved}" if why and moved else why or moved)
         if self.tidy is None and call.tool in ACT_VERBS:
             self._stuck_said = None   # desk20 (S20): a later act took: an earlier stuck step is no longer the ending
         if self.tidy is not None:
@@ -2998,7 +3022,8 @@ class Executor:
         return origin
 
     def _open_url_browser(self, tool_input: dict[str, Any], ref: Any, hwnd: int | None, entry: Mapping[str, Any],
-                          payload: Mapping[str, Any], *, log: bool = True) -> tuple[int | None, dict[str, Any], str]:
+                          payload: Mapping[str, Any], *, log: bool = True,
+                          index: int | None = None) -> tuple[int | None, dict[str, Any], str]:
         """An ``open_url`` step's browser (x9, C5: the plan's ``window: Arc`` never reached the tool, so Windows'
         default handler opened YouTube in Chrome three times on 10 Oct). Only for a web page address whose step value
         gives no ``app``; the browser is the step's own ``window``, else the plan's target app, each read so:
@@ -3024,6 +3049,12 @@ class Executor:
         r1 L1); it goes to that browser as ``https://``, as a browser opens it. An ``app`` the step value wrote is kept
         as written, and the call's window is that app's when one is listed (review r1 L4).
 
+        fix-r32 (K1): a program the step's window or the plan's target app named that is no browser by machine data
+        is passed over; when the address then goes to the site's own browser (source ``site``) or to Windows' default
+        handler, the step at ``index`` (a run's resolution, :meth:`_resolve`) keeps code's note saying so
+        (:data:`OPEN_MOVED_SITE`, :data:`OPEN_MOVED_DEFAULT`; :attr:`_open_moved`), for the planner, so a revision
+        never fights where it went.
+
         Sets ``tool_input["app"]`` (and ``"url"`` for a bare host); returns the window the address goes to (``None``
         when its app isn't open; the step's own window when no browser was chosen), its entry, and its program's
         process image (``""``: not known before it opens)."""
@@ -3036,6 +3067,7 @@ class Executor:
         bare = "" if host else _bare_host(url)
         chosen: tuple[int | None, dict[str, Any], str] | None = None
         source = "none"
+        passed = ""   # fix-r32 (K1): the first program the plan named that was passed over as no browser
         if given:
             # the plan wrote its app itself: kept as written; the call is that app's window when it is listed (its Act
             # switch, the screen gate and the done-check's window are the app the address goes to), else none
@@ -3066,6 +3098,7 @@ class Executor:
                     image = str(found[0].get("process_name") or "")
                     if not self._is_browser(image):
                         source = "not_browser"   # a program that isn't a browser (the chat app a link is in)
+                        passed = passed or _launch_name(image)
                         continue
                     tool_input["app"] = _launch_name(image)
                     chosen, source = (done.as_hwnd(found[0].get("hwnd")), found[0], image), kind
@@ -3079,6 +3112,7 @@ class Executor:
                     continue   # a title hint for windows on screen that fit no one program: nothing to start
                 if not self._is_browser(name):
                     source = "not_browser"   # no browser goes by that name on this PC: nothing to start
+                    passed = passed or name
                     continue
                 tool_input["app"] = name   # a browser that isn't open: open_url starts it with the address
                 chosen, source = (None, {}, ""), "named_" + kind
@@ -3102,8 +3136,21 @@ class Executor:
                 tool_input["url"] = "https://" + url   # a bare host its browser opens as https
             elif bare:
                 source = "not_web"   # no browser named: a bare name.tld goes to its own handler, as before
+        moved = ""
+        if passed and host and source in ("site", "not_browser"):
+            # fix-r32 (K1): it went to another browser than the program the plan wrote: code's words for the planner
+            app = words(tool_input.get("app"))
+            moved = (OPEN_MOVED_SITE.format(app=app, plan=passed) if source == "site" and app
+                     else OPEN_MOVED_DEFAULT.format(plan=passed) if source == "not_browser" else "")
+        if index is not None:
+            if moved:
+                self._open_moved[index] = moved
+            else:
+                self._open_moved.pop(index, None)
         if log:
-            self._emit_log("brain_open_url", source=source, open=bool(chosen and chosen[0]))   # a code word (log enum)
+            # a code word (log enum); ``passed``: a program the plan named was passed over as no browser
+            self._emit_log("brain_open_url", source=source, open=bool(chosen and chosen[0]),
+                           passed=True if passed else None)
         return chosen if chosen is not None else (hwnd, dict(entry), "")
 
     def _browsers(self) -> list[dict[str, Any]]:
@@ -3175,6 +3222,34 @@ class Executor:
             image = ""
         self.browser = image if image and self._is_browser(image) else ""
 
+    def _note_page_browser(self, call: Call) -> None:
+        """fix-r32 (K1): a web ``open_url`` that ran: its site (``donecheck.site_key`` of the address the call gave)
+        now reads in the browser :meth:`_note_browser` just noted (:attr:`browser`), or in none known (Windows'
+        default handler, or a program that is no browser by machine data: the entry goes). Never raises."""
+        try:
+            from yuki.skills.donecheck import site_key
+
+            key = site_key(_web_host(call.input.get("url")))
+            if not key:
+                return
+            if self.browser:
+                self._page_browsers[key] = self.browser
+            else:
+                self._page_browsers.pop(key, None)
+        except Exception:  # noqa: BLE001 - bookkeeping: a check reads the browser the plan wrote, as before
+            pass
+
+    def _act_browser(self, site: str) -> str:
+        """fix-r32 (K1): the browser (process image) this request's open of the page check's site went to by identity
+        (:meth:`_note_page_browser`), ``""`` when none. Never raises."""
+        try:
+            from yuki.skills.donecheck import site_key
+
+            key = site_key(site)
+            return self._page_browsers.get(key, "") if key else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _page_process(self, site: str = "") -> str:
         """The program a page_at check reads (x9: YouTube in Chrome is never "likely" for an Arc request): the browser
         this request's last open_url opened its address in by name, else the plan's target app when it is a browser
@@ -3203,7 +3278,13 @@ class Executor:
         plan wrote as an app's name ("Arc") becomes that program's image when a window of it is listed ("Arc.exe":
         "Arc" would never equal it, so the check would always read "another app", never what is there). For page_at
         with none written, it is the browser of this request (:meth:`_page_process`, :func:`done.with_browser`): a page
-        in another browser is "not so", never "likely done". Every other argument as given."""
+        in another browser is "not so", never "likely done". Every other argument as given.
+
+        fix-r32 (K1, final-J2 k_resume_anime: the page played in the browser its site's visits use, the plan's written
+        browser was passed over as no browser, and the check read the written one's window, "couldn't check"): a
+        page_at whose written ``process`` is another program than the browser this request's open of that very site
+        went to by identity (:meth:`_act_browser`, the program identity ``util.app_names``) reads that browser: the
+        check follows the act, never the plan's guess. Logged ``probe_browser`` (code words only)."""
         out = dict(args)
         spec = done.PROBE_ARGS.get(probe, ((), ()))
         if "process" not in spec[0] + spec[1]:
@@ -3213,6 +3294,10 @@ class Executor:
             image = "" if written.casefold().endswith(".exe") else self._listed_image(written)   # an image already
             if image:
                 out["process"] = image
+            act = self._act_browser(str(out.get("site") or "")) if probe == "page_at" else ""
+            if act and not util.app_names(act) & (util.app_names(written) | util.app_names(image)):
+                out["process"] = act
+                self._emit_log("probe_browser", source="act")
             return out
         if probe != "page_at":
             return out
@@ -3239,11 +3324,16 @@ class Executor:
         if verb == "open_url":
             # x9: the step's window (else the plan's target app) is the browser to open it in, handed to open_url as
             # its app; a browser that isn't open (or is open twice) still runs: open_url starts or picks it
-            hwnd, entry, image = self._open_url_browser(tool_input, ref, hwnd, entry, payload)
+            hwnd, entry, image = self._open_url_browser(tool_input, ref, hwnd, entry, payload, index=index)
             if image:
                 self._open_images[index] = image
             else:
                 self._open_images.pop(index, None)
+            if _web_host(tool_input.get("url")):
+                # fix-r32 (K1): the app this web address goes to as the call hands it ("": the default handler)
+                self._open_apps[index] = words(tool_input.get("app"))
+            else:
+                self._open_apps.pop(index, None)
         elif ref and hwnd is None:
             return None, "no single window fits that window"
         front = self._front(payload)
@@ -3905,10 +3995,10 @@ class Executor:
         what = (STOPPED_WHAT_APP[call.tool].format(app=app) if app and call.tool in STOPPED_WHAT_APP
                 else STOPPED_WHAT.get(call.tool, "there"))
         rest: list[str] = []
-        for step in list(self.steps)[index + 1:]:
+        for later, step in enumerate(list(self.steps)[index + 1:], start=index + 1):
             if self._verb(step) not in ACT_VERBS:
                 continue
-            said = _mid(self._step_said(step))
+            said = _mid(self._step_said(step, index=later))
             if said and said not in rest:
                 rest.append(said)
         shown = ", ".join(rest[:STOPPED_REST_MAX]) + (", and more" if len(rest) > STOPPED_REST_MAX else "") \
@@ -4187,10 +4277,10 @@ class Executor:
             ran = [i for i, st in enumerate(self.statuses) if st.state == "ok" and i < len(self.steps)
                    and self._verb(self.steps[i]) in ACT_VERBS and self._verb(self.steps[i]) != "run_skill"]
             if ran:
-                out["did"] = self._step_said(self.steps[ran[-1]], done=True)
+                out["did"] = self._step_said(self.steps[ran[-1]], done=True, index=ran[-1])
             failed = next((st for st in self.statuses if st.state in ("failed", "refused")), None)
             if failed is not None and failed.index < len(self.steps):
-                out["stuck"] = _mid(self._step_said(self.steps[failed.index]))
+                out["stuck"] = _mid(self._step_said(self.steps[failed.index], index=failed.index))
                 why = words(failed.why)
                 if why and " " in why and "_" not in why and len(why) <= 120:
                     out["why"] = why   # a code word ("done_false", "input_gate") is for the log and the planner
@@ -4633,7 +4723,7 @@ class Executor:
         hwnd = call.hwnd if call is not None else None
         # the stuck line is said to the user: outside text (fenced) never goes into it, only the reason
         self.last_failed = {"step": step, "verb": self._verb(step), "seen": why if seen_fenced else (seen or why),
-                            "words": self._step_said(step) or self._verb(step)}
+                            "words": self._step_said(step, index=index) or self._verb(step)}
         expected = ""
         expect = field_of(step, "expect", None)
         if expect is not None:
@@ -4941,13 +5031,17 @@ class Executor:
         failed = next((s for s in self.statuses if s.state in ("failed", "refused")), None)
         if failed is None or failed.index >= len(self.steps):
             return ""
-        return self._step_said(self.steps[failed.index])[:80]
+        return self._step_said(self.steps[failed.index], index=failed.index)[:80]
 
-    def _step_said(self, step: Any, *, done: bool = False) -> str:
+    def _step_said(self, step: Any, *, done: bool = False, index: int | None = None) -> str:
         """A step in the island's words (``yuki.ui.step_words.describe_plan_step``: its verb, its control's role and
         name, the plan's target app; never its free text), as it runs or (``done``) as done. ``""`` when none come.
         Typing is said without its Enter (review r1 M2, as the old ``plan.step_line``: "Typed in the Search box", never
-        "Typed and sent a message": Enter in an address bar sends nothing, and the brain never sends by raw typing)."""
+        "Typed and sent a message": Enter in an address bar sends nothing, and the brain never sends by raw typing).
+
+        fix-r32 (K1): a web ``open_url`` step this plan resolved (``index``, :attr:`_open_apps`) names the app its call
+        handed the address to ("Opened a page in Google Chrome"), or none when Windows' default handler took it, never
+        the plan's target app the open passed over."""
         try:
             from dataclasses import is_dataclass, replace
 
@@ -4958,6 +5052,8 @@ class Executor:
             elif is_dataclass(step) and getattr(step, "submit", False):
                 step = replace(step, submit=False)
             app = field_of(field_of(self.head, "target", None), "app", None) if self.head is not None else None
+            if index is not None and index in self._open_apps and self._verb(step) == "open_url":
+                app = self._open_apps[index] or None   # where the call went (K1), never the plan's guess
             return " ".join(str(describe_plan_step(step, app=app, done=done) or "").split())
         except Exception:  # noqa: BLE001 - presentation only
             return ""
