@@ -27,8 +27,14 @@ Conversation memory (Yuki's own exchanges; extracted by the service, yuki.memory
     memory.standing_context() -> str                  # rules/preferences/feedback (<= 2,400) + commitments (<= 1,200)
     memory.resume_context(within_hours=6.0) -> str | None   # last session's summary + last 6 exchanges, <= 4,000
     memory.remember_rule(text, source_turn=None, supersedes=None, *, session=None) -> int   # immediate, the user's
-                                                             # words; supersedes a near-duplicate (or the given id);
+                                                             # words; the same words (folded) already kept: no write,
+                                                             # that id; a close rule is never ended (it stays in
+                                                             # force); supersedes: only the id the caller names;
                                                              # session: the Yuki session it was said in (K-P)
+    memory.remember_rule_outcome(...same...) -> dict         # the same, and what happened: {"id", "written",
+                                                             # "kept_as", "near": [{"id", "text"}], "ended"} (r32 Y-M4)
+    memory.remember_how_outcome(app, text, ...) -> dict      # remember_how's id and what happened, the same shape; a
+                                                             # way the user gave is never ended by similarity (r32)
     memory.revoke_rule(ref) -> int                           # "rule:12" as standing_context shows it; 0 if not one
     (both ask the service for a debounced portrait re-render, for its Relationship section)
     memory.recall(...)                                       # also kind "chat" (turns) and "session" (summaries)
@@ -175,11 +181,21 @@ REQUEST_COOLDOWN_S = 30 * 60.0
 REQUEST_DAYS = 14.0
 
 #: Know-how for the same app whose embedding is at least this close to a new
-#: entry is treated as the same procedure restated, and superseded by it.
+#: entry is treated as the same procedure restated: an entry of Yuki's own origin
+#: (:data:`KNOWHOW_OWN_ORIGINS`) is superseded by it; any other (a way the user
+#: gave) stays in force and is only reported as close (r32 Y-M1).
 KNOWHOW_DUPLICATE_COSINE = 0.85
+#: r32 (Y-M1, final-J2 P0-1): the know-how origins that are Yuki's own record (its agent loop's remember_how, what
+#: did not work), the only ones a new entry may end by similarity. A way the user gave (``taught``, ``told``, the
+#: worker's ``conversation``), or an origin not known here, is never ended by similarity: an embedding cannot tell
+#: "use X" from "don't use X", and a restatement wrongly kept beside costs a line, never their way.
+KNOWHOW_OWN_ORIGINS = ("agent", "failed")
 #: A rule given with :meth:`MemoryClient.remember_rule` whose embedding is at
-#: least this close to an active rule or preference supersedes it.
+#: least this close to an active rule or preference is reported as close to it
+#: (information only: r32 Y-M1, nothing is ever ended by similarity).
 RULE_DUPLICATE_COSINE = 0.85
+#: r32 (Y-M4): how many close items a remember reports (best first).
+CLOSE_ITEMS = 3
 #: final-H2 lane D1 (contract K-P): the purpose of the provenance row a rule kept by ``remember`` is written with
 #: (``conversation_batches``: no model call, no tokens; its ``session_id`` is the Yuki session the rule was said in,
 #: cleartext metadata like ``conversation_turns.session_id``). The fact's ``batch_id`` names it, so the live-test purge
@@ -978,27 +994,92 @@ class MemoryClient:
         ``app`` is the process name of the app it applies to ("arc.exe"; stored
         normalised as "arc", see :meth:`knowhow`), ``None`` for general
         know-how; ``text`` the procedure in one or two sentences;
-        ``source_request`` the user request it came from. If a current entry for
-        the same app says the same thing (embedding cosine >= 0.85, or identical
-        text), that entry is superseded (its ``valid_to`` set, history kept)
-        instead of piling up near-duplicates. ``origin``: who it came from (``agent`` by default; integ29, mc merge
-        note M1: the brain's ``remember`` kind ``how`` passes ``taught``, a way the user told Yuki, so the next
-        request's how-block shows it as taught at once).
+        ``source_request`` the user request it came from. ``origin``: who it came from (``agent`` by default; integ29,
+        mc merge note M1: the brain's ``remember`` kind ``how`` passes ``taught``, a way the user told Yuki, so the
+        next request's how-block shows it as taught at once).
+
+        r32 (Y-M1, final-J2 P0-1): a current entry for the same app with the same words (folded) that is a way the
+        user gave is already kept: nothing is written and its id comes back. One of Yuki's own origin
+        (:data:`KNOWHOW_OWN_ORIGINS`) with the same words, or the closest one at embedding cosine >= 0.85, is
+        superseded (its ``valid_to`` set, history kept) instead of piling up near-duplicates. A way the user gave is
+        never ended by similarity: it stays in force and the new entry is written beside it.
+        :meth:`remember_how_outcome` says which happened.
         """
+        return int(self.remember_how_outcome(app, text, source_request, origin=origin)["id"])
+
+    def remember_how_outcome(self, app: str | None, text: str, source_request: str | None = None, *,
+                             origin: str = "agent") -> dict[str, Any]:
+        """r32 (Y-M4): :meth:`remember_how`, and what happened, for the tool result to say: ``{"id": the entry in
+        force for these words, "written": a new entry was written, "kept_as": the id of a way of the user's with the
+        same words (nothing written) or None, "near": [{"id", "text"}] close entries that stay in force (best first, at
+        most :data:`CLOSE_ITEMS`; never acted on), "ended": {"id", "text"} the entry of Yuki's own it superseded, or
+        None}``. Logged ``knowhow_keep`` with ids and counts only."""
         text = secret_filter.redact_text((text or "").strip())
         source_request = secret_filter.redact_text(source_request) if source_request else source_request
         if not text:
             raise ValueError("know-how text is empty")
         app = app_key(app)
         vec = self._embed(text)
-        supersedes = self.store.knowhow_duplicate(app, text, vec, KNOWHOW_DUPLICATE_COSINE)
-        if supersedes is not None and self._fresh_way_held(supersedes, text):
+        kept, mine, close = self._knowhow_match(app, text, vec)
+        if kept is not None:
+            self._skills_log("knowhow_keep", knowhow=int(kept.id), outcome="already")
+            return {"id": int(kept.id), "written": False, "kept_as": int(kept.id), "near": [], "ended": None}
+        supersedes = mine.id if mine is not None else None
+        if mine is not None and self._fresh_way_held(mine.id, text):
+            close.insert(0, mine)   # a fresh way of Yuki's own stays in force beside it (integ29 S2)
             supersedes = None
         model = getattr(self._embedder, "model_name", None) if vec is not None else None
-        return self.store.add_knowhow(
+        new_id = int(self.store.add_knowhow(
             app, text, source_request=source_request, vector=vec, embed_model=model, supersedes=supersedes,
             origin=str(origin or "agent"),
-        )
+        ))
+        ended = None
+        if supersedes is not None and mine is not None:
+            rows = self.store._query("SELECT superseded_by FROM knowhow WHERE id = ?", (int(supersedes),))
+            if rows and rows[0]["superseded_by"] == new_id:
+                ended = {"id": int(mine.id), "text": " ".join((mine.text or "").split())}
+        near = [{"id": int(k.id), "text": " ".join((k.text or "").split())} for k in close[:CLOSE_ITEMS]]
+        self._skills_log("knowhow_keep", knowhow=new_id, outcome="written", close=len(close),
+                         ended=ended["id"] if ended else None)
+        return {"id": new_id, "written": True, "kept_as": None, "near": near, "ended": ended}
+
+    def _knowhow_match(self, app: str | None, text: str, vec: Any) -> tuple[Any, Any, list[Any]]:
+        """r32 (Y-M1): the current entries (of ``app``, or general ones) a new know-how entry meets, by identity and
+        measured similarity, never by reading the words: ``(kept, mine, close)``. ``kept``: an entry with the same
+        words (folded: :func:`yuki.memory.conversations.normalize_quote`) whose origin is not Yuki's own
+        (:data:`KNOWHOW_OWN_ORIGINS`): already kept. ``mine``: the entry of Yuki's own the new one supersedes (the
+        same words, else the closest at cosine >= :data:`KNOWHOW_DUPLICATE_COSINE`), or None. ``close``: every other
+        entry at that cosine, best first; it stays in force."""
+        from yuki.memory.conversations import normalize_quote
+
+        candidates = self.store.knowhow_current(app) if app else self.store.knowhow_current(None, any_app=False)
+        if not candidates:
+            return None, None, []
+        rows = self.store._query("SELECT id, origin FROM knowhow WHERE id IN (%s)" % ",".join("?" * len(candidates)),
+                                 [int(k.id) for k in candidates])
+        origin = {int(r["id"]): str(r["origin"] or "") for r in rows}
+        own = {int(k.id) for k in candidates if origin.get(int(k.id)) in KNOWHOW_OWN_ORIGINS}
+        wanted = normalize_quote(text)
+        same = [k for k in candidates if wanted and normalize_quote(k.text) == wanted]
+        theirs = next((k for k in same if int(k.id) not in own), None)
+        if theirs is not None:
+            return theirs, None, []
+        mine = same[0] if same else None
+        scored: list[tuple[float, Any]] = []
+        if vec is not None:
+            v = np.asarray(vec, dtype=np.float32).ravel()
+            stored = self.store.knowhow_vectors([k.id for k in candidates])
+            for k in candidates:
+                other = stored.get(k.id)
+                if other is None or other.shape != v.shape or (mine is not None and k.id == mine.id):
+                    continue
+                score = float(np.dot(v, other) / ((np.linalg.norm(other) * np.linalg.norm(v)) or 1.0))
+                if score >= KNOWHOW_DUPLICATE_COSINE:
+                    scored.append((score, k))
+        scored.sort(key=lambda s: -s[0])
+        if mine is None:
+            mine = next((k for _s, k in scored if int(k.id) in own), None)
+        return None, mine, [k for _s, k in scored if mine is None or k.id != mine.id]
 
     def _fresh_way_held(self, kid: int, text: str) -> bool:
         """integ29 (S2, the D8 hold of :meth:`yuki.memory.conversations.ConversationWorker.fresh_way` for every caller):
@@ -1006,7 +1087,8 @@ class MemoryClient:
         written at most ``FRESH_ITEM_S`` ago, its text not the same as ``text``. A misheard "don't use X" reads as close
         to "use X" as a restatement does, so it is then written beside that way, which stays in force; a confirmed
         reversal supersedes it in the worker's pass or when said again later. Logged ``knowhow_held`` with the id only.
-        ``False`` when it can't be read."""
+        ``False`` when it can't be read. r32 (Y-M1): only an entry of Yuki's own origin is ever superseded by
+        similarity here (a way the user gave never is), so this hold now meets Yuki's own fresh ways only."""
         try:
             from yuki.memory.conversations import FRESH_ITEM_S, WAY_ORIGINS
 
@@ -1738,15 +1820,18 @@ class MemoryClient:
         ``text``: the rule as the user said it ("call me captain always");
         ``source_turn``: the :meth:`log_turn` id it came from, if known. Stored
         at once (kind ``rule``, origin ``user``), so it shows in
-        :meth:`standing_context` from the next request. An active rule or
-        preference that says the same thing (identical words, or embedding
-        cosine >= 0.85) is superseded by it (bi-temporal: the old version ends,
-        history kept). ``supersedes``: the id of an active rule or preference
-        this one restates or replaces, when the caller knows it (the words may
-        differ too much for the embedding to tell); an id that is not an active
-        rule or preference is ignored. Asks the service for a portrait
-        re-render (:meth:`rerender_portrait`). Raises ``ValueError`` for an
-        empty text.
+        :meth:`standing_context` from the next request. Raises ``ValueError``
+        for an empty text.
+
+        r32 (Y-M1, final-J2 P0-1: a restatement within cosine 0.85 ended a standing rule of the user's, and a misheard
+        "don't use X" would end their "use X" the same way): nothing is ever ended by similarity. An active rule or
+        preference with the same words (folded: :func:`yuki.memory.conversations.normalize_quote`, its text or its
+        quote) is already kept: nothing is written and its id comes back. One whose embedding is within cosine
+        :data:`RULE_DUPLICATE_COSINE` stays in force; the new rule is written beside it and the close ids are
+        information only (:meth:`remember_rule_outcome` reports them). ``supersedes``: the id of an active rule or
+        preference this one replaces, only when the caller names it (no tool caller does today); it then ends, history
+        kept (bi-temporal); an id that is not an active rule or preference is ignored. A write asks the service for a
+        portrait re-render (:meth:`rerender_portrait`).
 
         ``session`` (final-H2 lane D1, contract K-P): the Yuki session the rule was said in (``MemoryAccess.session_id``,
         the one its exchanges are logged under). The rule is then written with its provenance row
@@ -1754,43 +1839,68 @@ class MemoryClient:
         the rule came from is logged only after the exchange ends, so the session is the stamp a remember can carry
         when it writes. A live test's rule is then found by its session (``yuki.memory.testtag``), never by its words.
         """
+        return int(self.remember_rule_outcome(text, source_turn, supersedes, session=session)["id"])
+
+    def remember_rule_outcome(self, text: str, source_turn: int | None = None, supersedes: int | None = None, *,
+                              session: str | None = None) -> dict[str, Any]:
+        """r32 (Y-M4, final-J2 P0-4: "Saved as a standing rule" while a rule of theirs had ended):
+        :meth:`remember_rule`, and what happened, for the tool result to say: ``{"id": the rule in force for these
+        words, "written": a new rule was written, "kept_as": the id of the active rule or preference with the same
+        words (nothing written) or None, "near": [{"id", "text"}] active rules or preferences within cosine
+        :data:`RULE_DUPLICATE_COSINE` (best first, at most :data:`CLOSE_ITEMS`; they stay in force, never acted on),
+        "ended": {"id", "text"} the rule the caller named in ``supersedes`` when this write ended it, or None}``.
+        Logged ``rule_keep`` with ids and counts only."""
         from yuki.memory.conversations import normalize_quote
 
         text = secret_filter.redact_text(" ".join((text or "").split()))
         if not text:
             raise ValueError("rule text is empty")
-        vec = self._embed(text)
         candidates = self.store.conversation_facts(("rule", "preference"))
         given = int(supersedes) if supersedes else None
-        supersedes = given if any(f.id == given for f in candidates) else None
-        best = 1.0 if supersedes is not None else -1.0
-        wanted = normalize_quote(text)
-        for f in candidates if supersedes is None else ():
-            if wanted in (normalize_quote(f.text), normalize_quote(f.quote)):
-                supersedes, best = f.id, 1.0
-                break
-        if supersedes is None and vec is not None and candidates:
-            stored = self.store.conversation_fact_vectors([f.id for f in candidates])
-            for f in candidates:
+        named = next((f for f in candidates if f.id == given), None) if given is not None else None
+        if named is None:
+            wanted = normalize_quote(text)
+            same = next((f for f in candidates if wanted and wanted in (normalize_quote(f.text),
+                                                                        normalize_quote(f.quote))), None)
+            if same is not None:
+                self._skills_log("rule_keep", rule=int(same.id), outcome="already")
+                return {"id": int(same.id), "written": False, "kept_as": int(same.id), "near": [], "ended": None}
+        vec = self._embed(text)
+        close: list[tuple[float, ConversationFact]] = []
+        others = [f for f in candidates if named is None or f.id != named.id]
+        if vec is not None and others:
+            v = np.asarray(vec, dtype=np.float32).ravel()
+            stored = self.store.conversation_fact_vectors([f.id for f in others])
+            for f in others:
                 other = stored.get(f.id)
-                if other is None or other.shape != vec.shape:
+                if other is None or other.shape != v.shape:
                     continue
-                score = float(np.dot(vec, other) / ((np.linalg.norm(other) * np.linalg.norm(vec)) or 1.0))
-                if score >= RULE_DUPLICATE_COSINE and score > best:
-                    supersedes, best = f.id, score
+                score = float(np.dot(v, other) / ((np.linalg.norm(other) * np.linalg.norm(v)) or 1.0))
+                if score >= RULE_DUPLICATE_COSINE:
+                    close.append((score, f))
+        close.sort(key=lambda s: -s[0])
         model = getattr(self._embedder, "model_name", None) if vec is not None else None
         cited = [int(source_turn)] if source_turn else []
         session = " ".join(str(session or "").split())[:120]
+        ends = named.id if named is not None else None
         if session:
-            fact_id = self._rule_with_session(text, cited, vec, model, supersedes, session)
+            fact_id = int(self._rule_with_session(text, cited, vec, model, ends, session))
         else:
-            fact_id = self.store.add_conversation_fact(
+            fact_id = int(self.store.add_conversation_fact(
                 "rule", text, quote=text, subject="", origin="user",
                 source_turn_ids=cited, vector=vec, embed_model=model,
-                supersedes=supersedes,
-            )
+                supersedes=ends,
+            ))
         self.rerender_portrait()
-        return fact_id
+        ended = None
+        if named is not None:
+            was = self.store.conversation_fact(named.id)
+            if was is not None and was.superseded_by == fact_id:
+                ended = {"id": int(named.id), "text": " ".join((named.text or named.quote or "").split())}
+        near = [{"id": int(f.id), "text": " ".join((f.text or f.quote or "").split())} for _s, f in close[:CLOSE_ITEMS]]
+        self._skills_log("rule_keep", rule=fact_id, outcome="written", close=len(close),
+                         ended=ended["id"] if ended else None)
+        return {"id": fact_id, "written": True, "kept_as": None, "near": near, "ended": ended}
 
     def _rule_with_session(self, text: str, cited: list[int], vec: Any, model: str | None, supersedes: int | None,
                            session: str) -> int:
@@ -5021,7 +5131,8 @@ class MemoryClient:
     def set_skills_log(self, log: Any) -> None:
         """Where the catalog tells what it skipped (``log(type, **fields)``, content-free: ``connection_error`` with
         the file and a code word, ``learned_error`` with the row id and a code word; integ29 S2: ``knowhow_held`` with
-        the know-how id, :meth:`remember_how`'s hold). The process that owns a log
+        the know-how id, :meth:`remember_how`'s hold; r32: ``rule_keep`` / ``knowhow_keep`` with the id, a code word
+        and counts, what a remember did). The process that owns a log
         (the tray's UI log, the memory service's) sets it once; without one nothing is told."""
         self._skills_log_fn = log if callable(log) else None
 
@@ -5139,8 +5250,8 @@ class MemoryClient:
 
 
 __all__ = [
-    "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE",
-    "STANDING_CONTEXT_CHARS", "RESUME_CONTEXT_CHARS", "RESUME_EXCHANGES",
+    "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE", "KNOWHOW_OWN_ORIGINS",
+    "CLOSE_ITEMS", "STANDING_CONTEXT_CHARS", "RESUME_CONTEXT_CHARS", "RESUME_EXCHANGES",
 ]
 
 

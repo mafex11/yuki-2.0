@@ -1480,37 +1480,56 @@ class MemoryAccess:
                            payload={"asked": asked, "call": result})
 
     def _remember_how(self, tool_input: dict[str, Any], request: str | None) -> ToolOutcome:
+        """The agent loop's ``remember_how`` (origin ``agent``, memory's default). r32 (Y-M4): its result says what
+        memory did (``remember_how_outcome`` when the client has it): already kept (a way the user gave with the same
+        words; nothing written), or saved, with the entry of Yuki's own it replaced and the close ways that stay in
+        force. ``saved`` is true for both: the way is kept."""
         text = _need_text(tool_input, "text")
         app = _opt_text(tool_input, "app")
+
+        def keep(client: Any) -> Any:
+            fn = getattr(client, "remember_how_outcome", None)
+            if callable(fn):
+                return fn(app, text, source_request=request)
+            return client.remember_how(app, text, source_request=request)
+
         try:
-            row = self.call(
-                "remember_how",
-                lambda c: c.remember_how(app, text, source_request=request),
-                timeout_s=TOOL_TIMEOUT_S,
-            )
+            row = self.call("remember_how", keep, timeout_s=TOOL_TIMEOUT_S)
         except MemoryUnavailable as exc:
             return _not_saved("remember_how", exc, {"app": app, "text": text})
+        got = keep_outcome(row)
         where = f" for {app}" if app else ""
+        already = got["kept_as"] is not None
+        line = (LINE_HOW_ALREADY.format(where=where) if already else
+                " ".join(x for x in (f"Saved{where}: {text}", how_kept_note(got)) if x))
         return ToolOutcome(
             name="remember_how",
             ok=True,
-            summary=f"saved know-how{where}",
-            content=[{"type": "text", "text": f"Saved{where}: {text}"}],
-            payload={"saved": True, "id": row, "app": app, "text": text, "source_request": request},
+            summary=f"know-how already kept{where}" if already else f"saved know-how{where}",
+            content=[{"type": "text", "text": line}],
+            payload={"saved": True, "id": got["id"], "app": app, "text": text, "source_request": request,
+                     **keep_ids(got)},
         )
 
     def _remember_rule(self, tool_input: dict[str, Any]) -> ToolOutcome:
         """final-H2 lane D1 (contract K-P): the rule is stamped with this app run's session (:attr:`session_id`, the
         one its exchanges are logged under: ``livetest-...`` in a live test), when memory's ``remember_rule`` takes
         one, so the live-test purge finds a test's rule by its session. Every caller comes through here: the planner's
-        and the ONE agent's ``remember`` (``yuki.brain.tools.run_remember``) and the agent loop's ``remember_rule``."""
+        and the ONE agent's ``remember`` (``yuki.brain.tools.run_remember``) and the agent loop's ``remember_rule``.
+
+        r32 (Y-M4, final-J2 P0-4): the result says what memory did (``remember_rule_outcome`` when the client has it,
+        :func:`rule_kept_text`): "Already kept as rule:N" (the same words; nothing written), or "Saved as rule:M" with
+        the close rules, which stay in force; the payload carries ``written``, ``kept_as``, ``near`` and ``ended`` as
+        ids (:func:`keep_ids`). ``saved`` is true for both: the rule is kept."""
         text = _need_text(tool_input, "text")
         session = self.session_id
 
         def keep(client: Any) -> Any:
             import inspect
 
-            fn = client.remember_rule
+            fn = getattr(client, "remember_rule_outcome", None)
+            if not callable(fn):
+                fn = client.remember_rule
             try:
                 takes = "session" in inspect.signature(fn).parameters
             except (TypeError, ValueError):
@@ -1521,12 +1540,13 @@ class MemoryAccess:
             row = self.call("remember_rule", keep, timeout_s=TOOL_TIMEOUT_S)
         except MemoryUnavailable as exc:
             return _not_saved("remember_rule", exc, {"text": text})
+        got = keep_outcome(row)
         return ToolOutcome(
             name="remember_rule",
             ok=True,
-            summary="standing rule saved",
-            content=[{"type": "text", "text": f"Saved as a standing rule: {text}"}],
-            payload={"saved": True, "id": row, "text": text},
+            summary="standing rule already kept" if got["kept_as"] is not None else "standing rule saved",
+            content=[{"type": "text", "text": rule_kept_text(text, got)}],
+            payload={"saved": True, "id": got["id"], "text": text, **keep_ids(got)},
         )
 
     def _forget_rule(self, tool_input: dict[str, Any]) -> ToolOutcome:
@@ -2772,3 +2792,80 @@ def _not_saved(name: str, exc: Exception, payload: dict[str, Any]) -> ToolOutcom
         content=[{"type": "text", "text": text}],
         payload={**payload, "saved": False, "error": str(exc)},
     )
+
+
+# -- what a remember did (r32 Y-M4, final-J2 P0-4) ---------------------------------------------------------------------
+
+#: r32 (Y-M4): a remember's result says what memory did (``MemoryClient.remember_rule_outcome`` /
+#: ``remember_how_outcome``), in code's words, so a reply can be honest about it: already kept, written, which close
+#: items stay in force, and what ended. It names at most this many close items, each cut to this many characters.
+KEEP_NEAR_SHOWN = 2
+KEEP_NEAR_CHARS = 140
+#: A know-how entry with the same words, a way the user gave, was already kept: nothing was written.
+LINE_HOW_ALREADY = ("Already kept{where}: this way was kept before; nothing new was written, and it stays in force as "
+                    "it is.")
+
+
+def keep_outcome(got: Any) -> dict[str, Any]:
+    """r32 (Y-M4): memory's remember outcome (``remember_rule_outcome`` / ``remember_how_outcome``, a dict) or an older
+    client's bare id, as one shape: ``{"id", "written", "kept_as", "near": [{"id", "text"}], "ended": {"id", "text"}
+    or None}``. Never raises."""
+    if not isinstance(got, dict):
+        return {"id": got, "written": True, "kept_as": None, "near": [], "ended": None}
+    near = [n for n in (got.get("near") or []) if isinstance(n, dict) and n.get("id") is not None]
+    ended = got.get("ended") if isinstance(got.get("ended"), dict) and got["ended"].get("id") is not None else None
+    return {"id": got.get("id"), "written": bool(got.get("written", True)), "kept_as": got.get("kept_as"),
+            "near": near, "ended": ended}
+
+
+def keep_ids(got: dict[str, Any]) -> dict[str, Any]:
+    """r32 (Y-M4): an outcome's ids for a payload, no text: ``written``, ``kept_as`` (the id already kept, or None),
+    ``near`` (the close ids that stay in force), ``ended`` (the id this write ended, or None)."""
+    ended = got.get("ended")
+    return {"written": bool(got.get("written")), "kept_as": got.get("kept_as"),
+            "near": [n["id"] for n in got.get("near") or []], "ended": ended["id"] if ended else None}
+
+
+def _clip_words(text: Any, limit: int = KEEP_NEAR_CHARS) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _sentence(text: str) -> str:
+    text = " ".join(str(text or "").split())
+    return text if not text or text[-1] in ".!?…" else text + "."
+
+
+def rule_kept_text(text: str, got: dict[str, Any]) -> str:
+    """r32 (Y-M4): a ``remember_rule``'s result in code's words, from :func:`keep_outcome`'s shape. The same words
+    already kept: "Already kept as rule:N". Written: "Saved as rule:M: <text>", then the rule it replaces when the
+    caller named one, then the close rules, which stay in force (never acted on). Memory's own ids and stored texts
+    only; never raises."""
+    if got.get("kept_as") is not None:
+        return f"Already kept as rule:{got['kept_as']}: nothing new was written, and it stays in force as it is."
+    line = f"Saved as rule:{got.get('id')}: {_sentence(text)}"
+    ended = got.get("ended")
+    if ended:
+        line += f" It replaces rule:{ended['id']} ({_clip_words(ended.get('text'))}), which has ended."
+    near = list(got.get("near") or [])[:KEEP_NEAR_SHOWN]
+    if near:
+        named = " and ".join(f"rule:{n['id']} ({_clip_words(n.get('text'))})" for n in near)
+        one = len(near) == 1
+        line += f" {named} {'is' if one else 'are'} close and {'stays' if one else 'stay'} in force."
+    return line
+
+
+def how_kept_note(got: dict[str, Any]) -> str:
+    """r32 (Y-M4): what a written know-how entry did beside the save, in code's words: the entry of Yuki's own it
+    replaced, and the close ways kept before, which stay in force. ``""`` when neither. Never raises."""
+    parts = []
+    ended = got.get("ended")
+    if ended:
+        parts.append(f"It replaces a close way Yuki had kept on its own: {_sentence(_clip_words(ended.get('text')))}")
+    near = list(got.get("near") or [])[:KEEP_NEAR_SHOWN]
+    if len(near) == 1:
+        parts.append(f"A close way kept before stays in force too: {_sentence(_clip_words(near[0].get('text')))}")
+    elif near:
+        parts.append("Close ways kept before stay in force too: "
+                     + "; ".join(_clip_words(n.get("text")) for n in near) + ".")
+    return " ".join(parts)
