@@ -12,6 +12,11 @@ vocabulary is the right tool here (the speech guard's model judgement stays for 
   last word after a sentence has ended ("Opening Chrome. act"); "act" inside a sentence is English.
 
 :func:`internal_word` finds one; :func:`strip_internal` drops the sentences that carry one (a card keeps the rest).
+
+r32 (final-J2 kw_dismiss_after_answer, both brains): :func:`text_call` reads the talker's own unspoken text (a reply with
+no marker line, or what follows its act line) for one of Yuki's own calls (:data:`CALL_WORDS`) written out as text in a
+call's shape, so the stream can tell "a call written as text, nothing ran" from "no marker". Yuki's own output and
+its closed vocabulary only, never the user's words.
 """
 
 from __future__ import annotations
@@ -32,6 +37,10 @@ TOOL_WORDS: frozenset[str] = frozenset({
     # bTalk (brain = "all"): the lean talker's cancel tool, beside hand_over; the full talker's own cancel tool
     "cancel_hand_over", "cancel_tell_yuki",
 })
+#: Yuki's field and format words among :data:`TOOL_WORDS`: never the name of a call.
+FIELD_WORDS: frozenset[str] = frozenset({"say_first", "say_when_done", "tool_use", "tool_result"})
+#: The names of Yuki's own calls: :data:`TOOL_WORDS` without its field and format words.
+CALL_WORDS: frozenset[str] = TOOL_WORDS - FIELD_WORDS
 #: The speech channel's marker words (yuki.voice.mouth.MARKERS; its "more" divider is an everyday answer, "More.").
 MARKER_WORDS: frozenset[str] = frozenset({"say", "act", "quiet"})
 #: Marks that end a sentence (Latin, Devanagari danda, CJK).
@@ -98,4 +107,55 @@ def strip_internal(text: str) -> str:
     return " ".join(s.strip() for s in kept if s.strip())
 
 
-__all__ = ["INTERNAL_WORDS", "MARKER_WORDS", "TOOL_WORDS", "internal_word", "strip_internal"]
+def _runs(line: str) -> list[tuple[int, int, str]]:
+    """The line's runs of letters, digits and underscores, as ``(start, end, run casefolded)``."""
+    out: list[tuple[int, int, str]] = []
+    start: int | None = None
+    for i, ch in enumerate(line + " "):
+        if ch.isalnum() or ch == "_":
+            if start is None:
+                start = i
+        elif start is not None:
+            out.append((start, i, line[start:i].casefold()))
+            start = None
+    return out
+
+
+def _call_shaped(line: str, runs: list[tuple[int, int, str]], k: int) -> bool:
+    """Whether ``runs[k]`` (one of :data:`CALL_WORDS`) stands in ``line`` as a call written out, in the shapes a call
+    is written in: its arguments follow (``name(`` or ``name {``, a ``:`` or ``=`` between allowed); an element named
+    for it (``<name``); the value of a call's ``name`` key (``name="..."``, ``"name": "..."``); or it opens its line
+    (nothing but marks before it) and is either alone there or followed by an argument (a run, then ``=`` or ``:``).
+    Format only: a tool's name inside a sentence of prose is not a call."""
+    start, end, _name = runs[k]
+    after = line[end:].lstrip()
+    if after[:1] in (":", "="):
+        after = after[1:].lstrip()
+    if after[:1] in ("(", "{"):
+        return True
+    if line[:start].rstrip().endswith("<"):
+        return True
+    if k > 0 and runs[k - 1][2] == "name" and not line[runs[k - 1][1]:start].strip(" \t\"'=:"):
+        return True
+    if k == 0:
+        if len(runs) == 1:
+            return True
+        nxt_end = runs[1][1]
+        return line[nxt_end:].lstrip()[:1] in ("=", ":")
+    return False
+
+
+def text_call(text: str) -> str | None:
+    """r32: the first of Yuki's own calls (:data:`CALL_WORDS`) that ``text`` writes out as a call (:func:`_call_shaped`,
+    line by line), or ``None``. For the talker's unspoken text only (a reply with no marker line, what follows its act
+    line): no tool block came for such a call, so nothing ran. Returns a name of the closed set, never the text."""
+    for line in (text or "").splitlines():
+        runs = _runs(line)
+        for k, (_start, _end, run) in enumerate(runs):
+            if run in CALL_WORDS and _call_shaped(line, runs, k):
+                return run
+    return None
+
+
+__all__ = ["CALL_WORDS", "FIELD_WORDS", "INTERNAL_WORDS", "MARKER_WORDS", "TOOL_WORDS", "internal_word",
+           "strip_internal", "text_call"]

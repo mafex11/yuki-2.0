@@ -471,6 +471,8 @@ class LlmCall:
     one_unmarked: bool = False
     one_marker: str | None = None
     one_repeat: bool = False
+    #: r32 (T1): one of Yuki's own calls this reply wrote out as text (``ReplyChannel.text_call``, a tool name), or ""
+    one_text_call: str = ""
     #: voice20 review L1: what of this reply was spoken ends a sentence as a question (its own closing mark)
     one_asks: bool = False
     #: voice22 (review L3): the ids of the tool results its context ends with (:func:`_trailing_tool_ids`): the run a
@@ -575,8 +577,48 @@ def own_words_after_user(context: Any) -> bool:
 #: Tools whose spoken acknowledgement travels in the call itself (``say_first``), said as soon as it is written.
 SAY_FIRST_TOOLS = frozenset({"tell_yuki", "open_url", "open_app", "end_conversation", "run_skill", "hand_over"})
 #: fc (C1/C2): the reasons a turn was answered again that mean its reply meant to act and nothing ran (a call written
-#: that never came through; a reply marked act with no call). Stream facts.
-LOST_ACTS: frozenset[str] = frozenset({"broken", "act"})
+#: that never came through; a reply marked act with no call). Stream facts. r32 (T1 a): ``text_call``, a reply that
+#: wrote one of Yuki's acting or reading calls out as text (:func:`text_call_why`); a control written so
+#: (``text_control``) is the talker's own judgement, never a lost act, as :func:`lost_calls` leaves controls out.
+LOST_ACTS: frozenset[str] = frozenset({"broken", "act", "text_call"})
+#: r32 (final-J2 kw_dismiss_after_answer, T1 b): the calls that end or silence the talk. One written out as text in a
+#: settled reply with no call (``ReplyChannel.text_call``) agrees with the router's end of the same words
+#: (:meth:`Conversation._route_end_reply`): two separate judgements, never one alone.
+TEXT_END_CALLS: frozenset[str] = frozenset({"end_conversation", "stay_quiet", "go_quiet"})
+
+
+def text_call_why(name: Any) -> str:
+    """r32 (T1 a): the rerun reason for a reply that wrote ``name`` (one of Yuki's own calls, ``ReplyChannel.text_call``)
+    out as text: ``text_control`` for a control (:data:`ONE_CONTROLS`, or a control by its own ONE spec), else
+    ``text_call`` (an act or a read that never ran: :data:`LOST_ACTS`); ``""`` with none. Tool kinds only."""
+    name = str(name or "").strip()
+    if not name:
+        return ""
+    try:
+        return "text_control" if name in ONE_CONTROLS or one_kind(name) == "control" else "text_call"
+    except Exception:  # noqa: BLE001 - unsure: as written (an act, as lost_calls counts it)
+        return "text_call"
+
+
+def text_end(turn: Any) -> bool:
+    """r32 (T1 b): the user turn's newest reply wrote an end of Yuki's (:data:`TEXT_END_CALLS`) out as text
+    (``turn.text_call``), with no words of it for them and no call but stay_quiet: the talker's own end, which never
+    ran. Stream facts only (a tool name, the turn's calls, whether it has words); never raises."""
+    try:
+        if turn is None or getattr(turn, "trigger", None) != "user":
+            return False
+        if str(getattr(turn, "text_call", "") or "") not in TEXT_END_CALLS:
+            return False
+        if any(getattr(turn, flag, False) for flag in ("quiet_refused", "follow_refused", "opened_quiet",
+                                                       "follow_quiet")):
+            return False   # its quiet was refused or waived once (S10, la A2): another run answers them
+        if [t for t in (getattr(turn, "tools", ()) or ()) if t != "stay_quiet"]:
+            return False
+        return not strip_tags("".join(getattr(turn, "reply", ()) or ())).strip()
+    except Exception:  # noqa: BLE001 - unsure: no agreement (the reply watch answers it again)
+        return False
+
+
 #: fc (C1/C2, never silent): code's owed line when two replies both meant to act and nothing ran, and no thinker took
 #: their words (``brain = "one"``, or no runtime): said at the next quiet moment unless words of Yuki's come first.
 LINE_LOST_ACT = "That didn't go through, so nothing was done."
@@ -2609,6 +2651,8 @@ class _Turn:
     follow_quiet: bool = False           # integ28 fix T2: ONE's quiet marker on a follow-on, waived once
     broken_call: bool = False            # fc (C1): a reply to it wrote a call that never came through (nothing ran)
     rerun_why: str = ""                  # fc (C1-C3): why it was answered again: broken | act | unmarked | ""
+    #                                      (r32: text_call | text_control, a call of Yuki's written out as text)
+    text_call: str = ""                  # r32 (T1): its newest reply wrote this call of Yuki's out as text (a tool name)
     unmarked_refused: bool = False       # fc review M1: a rerun's unmarked text was refused by the guard's check
     quiet_refused: bool = False          # integration F4: its quiet on their opening words was refused (S10, any path)
     follow_refused: bool = False         # la A2: under all, its lone quiet on words after Yuki's own line refused once
@@ -5489,7 +5533,7 @@ class OneVoice:
             self._log("unheard_close", round=int(getattr(call, "one_round", 0) or 0), why=why,
                       stop=_stop_word(getattr(call, "stop_reason", None)))
             return
-        if rerun_why in LOST_ACTS and (broken or self._act_unmade(call)):
+        if rerun_why in LOST_ACTS and (broken or self._act_unmade(call) or self._text_lost(call)):
             # fc (C1/C2, never silent): the rerun of a reply that meant to act ran nothing again: code's owed line
             # says nothing was done (said at the next quiet moment unless words of Yuki's are heard first)
             self._log("unheard_close", round=int(getattr(call, "one_round", 0) or 0), why=rerun_why, lost_again=True)
@@ -5598,7 +5642,10 @@ class OneVoice:
           of Yuki's was heard since it began;
         * fc (C2) ``act``: it was marked act and made no call (nothing ran), nothing spoken, nothing heard since;
         * fc (C1) ``broken``: it wrote calls and none of them reached the runner (``broken``): nothing ran, whatever of
-          it was heard (its say_first, its words).
+          it was heard (its say_first, its words);
+        * r32 (T1 a) ``text_call`` / ``text_control``: an ``unmarked`` or ``act`` reply that wrote one of Yuki's own
+          calls out as text (``one_text_call``, :func:`text_call_why`), the reason the conversation's reply watch gives
+          too.
 
         A round 1 reply is the reply watch's (the user's own turn answered again, told why: ``rerun_why``)."""
         if self._rerun_used or not self.anchor_text or int(getattr(call, "one_round", 0) or 0) < 2:
@@ -5609,14 +5656,26 @@ class OneVoice:
             return ""
         if self.heard_since(float(getattr(call, "entered", 0.0) or 0.0)):
             return ""
-        if getattr(call, "one_unmarked", False):
+        unmarked, unmade = bool(getattr(call, "one_unmarked", False)), self._act_unmade(call)
+        if unmarked or unmade:
+            text = text_call_why(getattr(call, "one_text_call", ""))
+            if text:
+                return text
+        if unmarked:
             return "unmarked"
-        return "act" if self._act_unmade(call) else ""
+        return "act" if unmade else ""
 
     @staticmethod
     def _act_unmade(call: Any) -> bool:
         """fc (C2): the reply was marked act (its first marker line) and made no call: nothing ran. Stream facts."""
         return getattr(call, "one_marker", None) == "act" and not getattr(call, "tool", False)
+
+    @staticmethod
+    def _text_lost(call: Any) -> bool:
+        """r32 (T1 a): the reply wrote one of Yuki's acting or reading calls out as text (``one_text_call``) and made no
+        call: nothing ran (a control written so is the agent's own judgement, never a lost act). Stream facts."""
+        return (text_call_why(getattr(call, "one_text_call", "")) == "text_call"
+                and not getattr(call, "tool", False))
 
     def rerun_due(self) -> bool:
         """The reply watch's ONE rerun is due (:meth:`reply_end`)."""
@@ -9185,7 +9244,10 @@ class Conversation:
         that came after a line of Yuki's was heard (the decision's ``fresh``, and never S10's first words) and that
         recognition was sure of (integ30 S3: the decision's ``unsure``, or the final turn's own ``heard_low`` /
         ``heard_near``): the end acts once those words were heard (:meth:`_route_end_after_words`). The reply's words
-        are never the block. Else
+        are never the block. r32 (T1 b, final-J2 kw_dismiss_after_answer): ``""`` too for a reply with no words and no
+        call that wrote an end of Yuki's (:data:`TEXT_END_CALLS`) out as text (:func:`text_end`): the talker's own end,
+        so the two judgements agree (the reply watch holds its rerun and give-up meanwhile, :meth:`_text_end_waits`).
+        Else
         a code word: ``no_quiet`` (it ended with no words and no quiet chosen: unmarked text, an act marker with no
         call, a broken call or an empty reply; the reply watch answers it again), the block's reason as soon as one
         holds (they spoke again, the reply made a call, a new run of it began), ``quiet_refused`` (its quiet on these
@@ -9234,8 +9296,15 @@ class Conversation:
                             return self.ROUTE_END_AFTER_WORDS
                         # integ28 fix T1: the talker's measured choice of silence (a stay_quiet call or a quiet marker:
                         # ``turn.quiet``) is the only agreement; unmarked text, an act marker with no call, a broken
-                        # call or an empty reply is the reply watch's to answer (its rerun), never a silent end
+                        # call or an empty reply is the reply watch's to answer (its rerun), never a silent end.
+                        # r32 (T1 b, final-J2 kw_dismiss_after_answer, both brains): but a reply with no words and no
+                        # call that wrote an end of Yuki's out as text (:func:`text_end`) is the talker's own end: the
+                        # two judgements agree (garbled words answered in unmarked text name no end, as before)
                         if not getattr(turn, "quiet", False):
+                            if text_end(turn):
+                                self.log.event("router", op="text_end", session=self.session,
+                                               call=getattr(turn, "text_call", "") or None)
+                                return ""
                             return "no_quiet"
                         if one is not None or "stay_quiet" in turn.tools:
                             return ""
@@ -9901,6 +9970,13 @@ class Conversation:
                     continue
                 if self._quiet_for() < self.REPLY_WATCH_QUIET_S:
                     continue
+                if self._text_end_waits(turn):
+                    # r32 (T1 b): the router's end of these words judges this reply (an end written as text): no rerun
+                    # (its start would void that decision) and no give-up tone while it may still act
+                    if getattr(self, "_text_end_logged", None) != turn.n:
+                        self._text_end_logged = turn.n
+                        self.log.event("reply_watch", op="end_waits", turn=turn.n, call=turn.text_call or None)
+                    continue
                 if turn.rerun:
                     started = turn.rerun_at or now
                     if turn.responses <= turn.responses_at_rerun and now - started < self.RERUN_WAIT_S:
@@ -9933,14 +10009,46 @@ class Conversation:
     def _rerun_why(self, turn: Any) -> str:
         """fc (C1-C3): why the user's turn got nothing, from the stream's own facts of its reply: ``broken`` (a call it
         wrote never came through), ``act`` (marked act, no call), ``unmarked`` (no marker line at all), else ``""``.
-        Never the words."""
+        r32 (T1 a, final-J2 kw_dismiss_after_answer): such a reply (marked act with no call, or with no marker line)
+        that wrote one of Yuki's own calls out as text (``turn.text_call``) is that, ahead of ``act`` and ``unmarked``:
+        ``text_call`` (an act or read: :data:`LOST_ACTS`) or ``text_control`` (:func:`text_call_why`). Never the
+        words."""
         if getattr(turn, "broken_call", False):
             return "broken"
-        if getattr(turn, "marker", None) == "act" and not getattr(turn, "tools", ()):
+        act = getattr(turn, "marker", None) == "act" and not getattr(turn, "tools", ())
+        unmarked = bool(getattr(turn, "unmarked", False))
+        if act or unmarked:
+            text = text_call_why(getattr(turn, "text_call", ""))
+            if text:
+                return text
+        if act:
             return "act"   # fc review L4: no call came with it at all (a read is a call: ACT_RERUN_NOTE says none)
-        if getattr(turn, "unmarked", False):
+        if unmarked:
             return "unmarked"
         return ""
+
+    def _text_end_waits(self, turn: Any) -> bool:
+        """r32 (T1 b, final-J2 kw_dismiss_after_answer under all: the rerun began 50 ms after the reply ended, before
+        the router's end had settled on that reply, and the rerun's own run voided the decision; the rerun wrote the
+        same text, the give-up tone played and the talk stayed open): the turn's reply wrote an end of Yuki's out as
+        text (:func:`text_end`) and the router's decision on the same words is an end still to act (decided ``end``,
+        not skipped, its task running, the same start of speech): :meth:`_route_end_reply` judges this reply, so the
+        reply watch neither answers the turn again nor gives up on it meanwhile. Bounded by that task's own bounds
+        (:data:`ROUTE_END_REPLY_MAX_S`); once it skipped or is gone, the watch goes on as before. State only; never
+        raises."""
+        try:
+            if not text_end(turn):
+                return False
+            state = getattr(self, "_route_state", None)
+            task = getattr(self, "_router_task", None)
+            if not isinstance(state, dict) or task is None or task.done():
+                return False
+            if not state.get("ends") or state.get("to") != "end" or state.get("skipped"):
+                return False
+            started = float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)
+            return float(state.get("start", 0.0) or 0.0) == started
+        except Exception:  # noqa: BLE001 - unsure: the reply watch as before
+            return False
 
     def _give_up(self, turn: Any) -> None:
         """The rerun of an unheard turn was silent too: the error tone, and one more idle window (04 F1).
@@ -10801,6 +10909,9 @@ class Conversation:
             turn.marker = facts.get("marker") or turn.marker
             turn.scratch += int(facts.get("scratch_chars") or 0)
             turn.unmarked = bool(turn.unmarked or facts.get("unmarked"))
+            # r32 (T1): the newest reply's own call written out as text (its name), for the rerun's reason and the
+            # router's end (a later reply of the turn that wrote none clears it)
+            turn.text_call = str(facts.get("text_call") or "")
             if facts.get("repeat_dropped"):
                 turn.repeat_dropped = True   # V9: answered again with the repeat note, never with the same line
         if call is not None:
@@ -10810,6 +10921,7 @@ class Conversation:
                 call.one_unmarked = bool(facts.get("unmarked")) and not getattr(call, "voiced_unmarked", False)
                 call.one_marker = facts.get("marker")
                 call.one_repeat = bool(facts.get("repeat_dropped"))
+                call.one_text_call = str(facts.get("text_call") or "")   # r32 (T1): a tool name, never the text
                 call.one_asks = bool(getattr(channel, "spoken_asks", False))   # voice20 review L1 (punctuation)
             except Exception:  # noqa: BLE001 - a stand-in call that takes no attribute
                 pass

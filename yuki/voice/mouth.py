@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from yuki.core.ownwords import text_call as _text_call
 from yuki.one import modes as _modes
 from yuki.voice.recall import RECENT_TIMEOUT_S, fetch_recent
 
@@ -1182,7 +1183,9 @@ to its title from the done lines."""
 #: The lean talker's ``hand_over``: no paraphrase field (code passes the exact words); an optional understanding, the
 #: talker's reading as a seed for the brain (contract C3: never an order, the exact words win). Review L5: the work
 #: starts when the call is complete, so only what the reading adds, in few words (measured 18 Oct: a full reading kept
-#: the start ~1.2-1.5 s after the call's first bytes).
+#: the start ~1.2-1.5 s after the call's first bytes). r32 K2a (final-J2 k_resume_anime: the seed guessed a browser
+#: that neither the words nor the data gave, and the planner followed it): context takes B1's principle (the open_url
+#: hand's ``app`` field): no app or browser to do it in unless their words or the You block name it for that thing.
 UNDERSTANDING: dict[str, Any] = {
     "type": "object",
     "description": (
@@ -1191,8 +1194,10 @@ UNDERSTANDING: dict[str, Any] = {
         "it). Leave it out when their words say it all. goal: one short line; parts: only when they asked for several "
         "things, each in a few words with the skill key that covers it (\"\" if none) and values you know from the You "
         "block; choose: true when they left a pick to Yuki; context: what you know that their words do not say "
-        "(which project, person or app they mean, what they are doing). A question or offer of Yuki's own from "
-        "before goes in goal or parts only when their newest words take it up."),
+        "(which project, person or app they mean, what they are doing), never an app or browser to do it in unless "
+        "their words or the You block name it for that very thing (code opens a site where their own visits to it "
+        "are). A question or offer of Yuki's own from before goes in goal or parts only when their newest words take "
+        "it up."),
     "properties": {
         "goal": {"type": "string"},
         "parts": {"type": "array", "items": {"type": "object", "properties": {
@@ -1349,6 +1354,10 @@ class ReplyChannel:
         #: such reply with no call can still be spoken (:attr:`unmarked_text`); at most :data:`UNMARKED_KEEP_CHARS`.
         self._unmarked: list[str] = []
         self._unmarked_chars = 0
+        #: r32 (final-J2 kw_dismiss_after_answer): the first of Yuki's own calls its unspoken text writes out as a
+        #: call (``ownwords.text_call``: a name of the closed set, content-free), else ``None``: no tool block came
+        #: for it, so nothing ran.
+        self.text_call: str | None = None
 
     @property
     def unmarked(self) -> bool:
@@ -1506,6 +1515,8 @@ class ReplyChannel:
         kept = line.strip()
         if kept:
             self.scratch += len(kept)
+            if self.text_call is None:
+                self.text_call = _text_call(kept)   # r32: a call of Yuki's written out as text (its name only)
             if self.first is None:
                 self.before += len(kept)
                 if self._unmarked_chars < UNMARKED_KEEP_CHARS:
@@ -1533,6 +1544,8 @@ class ReplyChannel:
             facts["repeat_dropped"] = True
         if self.after_marker:
             facts["marker_in_speech"] = self.after_marker
+        if self.text_call:
+            facts["text_call"] = self.text_call   # r32: a tool name of Yuki's own closed set, never the text
         return facts
 
 
@@ -2554,8 +2567,16 @@ ACT_RERUN_NOTE = ("[Your last reply to these words was marked act, but no call c
 BROKEN_RERUN_NOTE = ("[Your last reply to these words wrote a call that never came through: nothing ran. Any first words "
                      "of it were heard already, so never say them again. Make that call again now (its say_first "
                      "\"\"); if no call fits, tell them in a few words.]")
+#: r32 (final-J2 kw_dismiss_after_answer, both brains): the rerun of a turn whose reply, with no marker line or marked
+#: act with no call, wrote one of Yuki's own calls out as text (``ReplyChannel.text_call``, ``text_call`` /
+#: ``text_control``): no tool block came, so nothing ran. The note names that format fact, and the shape that works,
+#: where the unmarked note did not (the rerun wrote the same text again). Rides in the volatile block, on reruns only.
+TEXT_CALL_RERUN_NOTE = ("[Your last reply to these words wrote a call out as text, so nothing ran and they heard "
+                        "nothing. Make that call itself now: the line act, then the call, never its name or values "
+                        "as words; if no call fits, start with say and tell them in a few words.]")
 #: fc: the rerun notes by ``state["rerun_why"]`` (the pipeline's reading of the reply that was not heard).
-RERUN_WHY_NOTES = {"unmarked": UNMARKED_RERUN_NOTE, "act": ACT_RERUN_NOTE, "broken": BROKEN_RERUN_NOTE}
+RERUN_WHY_NOTES = {"unmarked": UNMARKED_RERUN_NOTE, "act": ACT_RERUN_NOTE, "broken": BROKEN_RERUN_NOTE,
+                   "text_call": TEXT_CALL_RERUN_NOTE, "text_control": TEXT_CALL_RERUN_NOTE}
 #: kMind (the claim gate): the rerun of a turn whose reply told them something was done while nothing had run for
 #: their words (that line was not said).
 CLAIM_NOTE = ("[Your last reply told them what they asked for was done or already so, but nothing ran for their words, "
@@ -2700,8 +2721,9 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     ``state["follow_quiet"]`` (ONE's quiet marker on words that follow Yuki's own line, waived once) gives
     :data:`FOLLOW_RERUN_NOTE`.
 
-    fc (C1-C3): ``state["rerun_why"]`` on a rerun (``unmarked``, ``act``, ``broken``: the stream's own reading of the
-    reply that was not heard) gives that note of :data:`RERUN_WHY_NOTES` in place of :data:`RERUN_NOTE`.
+    fc (C1-C3): ``state["rerun_why"]`` on a rerun (``unmarked``, ``act``, ``broken``, r32 ``text_call`` /
+    ``text_control``: the stream's own reading of the reply that was not heard) gives that note of
+    :data:`RERUN_WHY_NOTES` in place of :data:`RERUN_NOTE`.
     """
     state = state or {}
     keys = state.get("skill_keys") or ()
